@@ -37,6 +37,10 @@ pub const SCOPE_PACK_MARKER: &str = "CRUCIBLE_SCOPE_PACK:";
 /// `cat` of the run's `state/session.jsonl`.
 pub const RUN_SESSION_DELIMITER: &str = "SESSION (rc=";
 
+/// The file under a run's state directory that marks its session log as not uploaded, so the
+/// loop-run wrapper prints the log after the session delimiter for the controller to scrape.
+pub const RUN_SESSION_UNDELIVERED: &str = "session.undelivered";
+
 /// The `managed-by` label key every rendered loop/turn pod carries, so `crucible ps` and the
 /// controller's pod-completion watch can select the pods this system owns.
 pub const MANAGED_BY_KEY: &str = "app.kubernetes.io/managed-by";
@@ -55,25 +59,16 @@ pub const ENV_RUN_NAME: &str = "CRUCIBLE_RUN_NAME";
 /// show it; links keep [`ENV_RUN_NAME`], the id.
 pub const ENV_RUN_DISPLAY_NAME: &str = "CRUCIBLE_RUN_DISPLAY_NAME";
 
-/// Env var carrying the controller's Tier 2 ingest base URL into a turn pod (Tier 2 ingest).
-/// Absent means no drop-box is available, and the engine falls back to marker emission.
-pub const ENV_INGEST_URL: &str = "CRUCIBLE_INGEST_URL";
+/// Env var carrying the controller's base URL as a pod reaches it. A run pod uploads its evidence
+/// under `<url>/api/evidence/runs/{run}/{kind}` and a rerun fetches its parent's from there.
+/// Absent means the pod has no controller to deliver to.
+pub const ENV_CONTROLLER_URL: &str = "CRUCIBLE_CONTROLLER_URL";
 
-/// Env var carrying the filesystem path of the pod's projected ingest ServiceAccount token, which
-/// the engine reads and sends as the bearer to the ingest endpoint.
-pub const ENV_INGEST_TOKEN_PATH: &str = "CRUCIBLE_INGEST_TOKEN_PATH";
+/// Env var carrying the pod token (RFC-0004:C-RUN-EVIDENCE), projected from the pod's Secret: a
+/// run pod's bearer for its run's evidence and its parent's, a turn pod's for its pack and
+/// transcript.
+pub const ENV_POD_TOKEN: &str = "CRUCIBLE_POD_TOKEN";
 
-/// Env var carrying the turn pod's own name (downward API `metadata.name`), which the engine uses as
-/// the `{pod}` path segment of its ingest POST. It MUST equal the token's bound-pod claim, so the
-/// downward-API value and the TokenReview `authentication.kubernetes.io/pod-name` claim are the same
-/// pod name by construction.
+/// Env var carrying the turn pod's own name (downward API `metadata.name`), the `{pod}` path
+/// segment its pack and transcript upload under.
 pub const ENV_POD_NAME: &str = "CRUCIBLE_POD_NAME";
-
-/// The audience the ingest projected ServiceAccount token is minted for. The ingest extractor
-/// requires TokenReview to echo this audience, so the token is useless against the kube API or any
-/// other service.
-pub const INGEST_TOKEN_AUDIENCE: &str = "crucible-ingest";
-
-/// The TokenReview claim carrying the bound pod's name; the ingest extractor requires it to equal
-/// the `{pod}` path segment, so binding the token to the pod also scopes it to the turn.
-pub const INGEST_POD_NAME_CLAIM: &str = "authentication.kubernetes.io/pod-name";

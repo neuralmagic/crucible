@@ -19,6 +19,8 @@ export interface ParamFieldSpec {
   defaultValue: string | null;
   pattern: string | null;
   description: string | null;
+  /// Typed in a text area: a string that may span lines, such as a pasted log.
+  multiline: boolean;
 }
 
 /// A schema outside the closed subset renders nothing rather than a wrong form: the launch
@@ -60,6 +62,16 @@ function valueTypeOf(property: Record<string, unknown>): ParamValueType | null {
     default:
       return null;
   }
+}
+
+function boolField(
+  property: Record<string, unknown>,
+  key: string
+): { ok: true; value: boolean } | { ok: false } {
+  const raw = property[key];
+  if (raw === undefined) return { ok: true, value: false };
+  if (typeof raw !== 'boolean') return { ok: false };
+  return { ok: true, value: raw };
 }
 
 /// A declared default in the spelling the form types it in.
@@ -159,6 +171,13 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     if (!pattern.ok) {
       return { kind: 'unrenderable', reason: `param ${name} has a non-string pattern` };
     }
+    const multiline = boolField(raw, 'x-multiline');
+    if (!multiline.ok) {
+      return { kind: 'unrenderable', reason: `param ${name} has a non-boolean x-multiline` };
+    }
+    if (multiline.value && valueType !== 'string') {
+      return { kind: 'unrenderable', reason: `param ${name} is multiline but not a string` };
+    }
     const description = stringField(raw, 'description');
     specs.push({
       name,
@@ -167,6 +186,7 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       defaultValue: defaultValue.value,
       pattern: pattern.value,
       description: description.ok ? description.value : null,
+      multiline: multiline.value,
     });
   }
   return { kind: 'form', specs };

@@ -1232,6 +1232,7 @@ async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> 
             links,
             agent: None,
             repairs: Vec::new(),
+            output: None,
         },
     )
     .await?;
@@ -1283,6 +1284,7 @@ async fn run_graph_serves_what_each_agent_task_ran_on(pool: PgPool) -> Result<()
                 links: Vec::new(),
                 agent,
                 repairs: Vec::new(),
+                output: None,
             },
         )
         .await?;
@@ -1331,6 +1333,7 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
                 links: Vec::new(),
                 agent: None,
                 repairs: Vec::new(),
+                output: None,
             },
         )
         .await?;
@@ -3376,6 +3379,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/runs/{run_id}/tasks/{task}/evidence",
         "/api/runs/{run_id}/log",
         "/api/runs/{run_id}/files",
+        "/api/runs/{run_id}/rerun",
         "/api/runs/{run_id}/files/{key}",
         "/api/runs/{run_id}/artifacts",
         "/api/runs/{run_id}/artifacts/{path}",
@@ -3419,6 +3423,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/origin/files",
         "/api/playbook-drafts/{id}/tarball",
         "/api/playbook-drafts/{id}/versions",
+        "/api/playbook-drafts/{id}/rename",
+        "/api/playbook-drafts/{id}/clone",
         "/api/playbook-drafts/{id}/launch",
         "/api/playbook-drafts/{id}/graduate",
         "/api/playbook-drafts/{id}/publish",
@@ -4639,7 +4645,7 @@ async fn adopt_authoritative_scenario_persists_the_flag(pool: PgPool) -> Result<
     );
 
     // The detail DTO carries the flag out to the SPA.
-    let detail = crate::api::dto::issue_detail(&db, &key)
+    let detail = crate::api::dto::issue_detail(&db, &key, false)
         .await?
         .expect("issue detail");
     assert!(
@@ -5152,6 +5158,76 @@ async fn approve_scenario_stamps_approved_at(pool: PgPool) -> Result<()> {
     let events = db.events().read_for_key("scenario:approve-1").await?;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].actor.as_deref(), Some("wren"));
+    let requested: Option<String> =
+        sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+            .bind("scenario:approve-1")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(
+        requested, None,
+        "without the agent token issuer an approval records no dispatcher"
+    );
+    Ok(())
+}
+
+/// With the agent token issuer configured, the approval's dispatch acts for the approver.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn with_the_issuer_an_approval_dispatches_for_the_approver(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("scenario:approve-1")).await?;
+    sqlx::query("UPDATE issues SET input_kind = 'scenario' WHERE key = $1")
+        .bind("scenario:approve-1")
+        .execute(db.pool())
+        .await?;
+    let scope_id = crate::issues::store::insert_scope(
+        db.pool(),
+        &crate::issues::model::NewScope {
+            issue: "scenario:approve-1".to_string(),
+            pack_digest: Some("v1:deadbeef".to_string()),
+            check_outcome: Some("OK".to_string()),
+        },
+    )
+    .await?;
+    let app = router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
+        agent_tools: true,
+        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+    });
+
+    let res = app
+        .oneshot(
+            HttpRequest::post("/api/scenarios/scenario%3Aapprove-1/approve")
+                .header("x-auth-request-user", "wren")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+    let v: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(v["scope_id"], scope_id);
+    assert_eq!(v["approved_by"], "wren");
+    assert!(v["approved_at"].as_str().is_some());
+
+    let scope = crate::issues::store::latest_scope_for_issue(db.pool(), "scenario:approve-1")
+        .await?
+        .expect("scope");
+    assert!(scope.is_approved());
+    assert_eq!(scope.approved_by.as_deref(), Some("wren"));
+
+    let events = db.events().read_for_key("scenario:approve-1").await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor.as_deref(), Some("wren"));
+    let requested: Option<String> =
+        sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+            .bind("scenario:approve-1")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(
+        requested.as_deref(),
+        Some("user:wren"),
+        "the approval's dispatch acts for the approver"
+    );
     Ok(())
 }
 
@@ -5723,6 +5799,7 @@ async fn app_with_sessions(db: Db, pool: PgPool) -> Router {
                 credential_keys: None,
                 proxy_prefix: "/oauth2".to_string(),
             },
+            issuer: None,
         },
         crate::spa::Source::Embedded,
     )
@@ -9182,6 +9259,121 @@ async fn a_draft_launches_with_ceilings_and_freezes_its_version(pool: PgPool) ->
     Ok(())
 }
 
+/// A workflow whose `prepare` task declares a 110 minute timeout.
+const TIMED_WORKFLOW: &str = concat!(
+    "params = {\n",
+    "    \"topic\": {\"type\": \"string\", \"required\": True, \"pattern\": \"^[a-z ]+$\"},\n",
+    "    \"depth\": {\"type\": \"string\", \"required\": True},\n",
+    "}\n",
+    "\n",
+    "prepare = command(name = \"prepare\", run = \"true\", timeout = \"110m\")\n",
+    "\n",
+    "workflow(type = \"playbook\", tasks = [prepare], result = prepare)\n",
+);
+
+/// What the engine refuses a one hour run of [`TIMED_WORKFLOW`] with.
+const TIMED_REFUSAL: &str = "task \"prepare\" declares timeout 110m, longer than this run's \
+                             --max-time 1h. The run's ceiling is the longest any task may \
+                             declare; shorten the timeout or raise --max-time";
+
+async fn launch_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
+        .fetch_one(pool)
+        .await
+        .expect("count launches")
+}
+
+/// A draft launch whose `max_time` is shorter than a task's declared timeout is refused with the
+/// engine's own message on `max_time`, and adopts nothing; one that covers the timeout launches.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_launch_shorter_than_a_task_timeout_is_refused(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(TIMED_WORKFLOW);
+    let saved = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    let launch = |max_time: &str| {
+        serde_json::json!({
+            "params": {"topic": "attention", "depth": "deep"},
+            "max_cost": 1.0,
+            "max_time": max_time,
+        })
+    };
+
+    let (status, body) = post_admin(&app, "/api/playbook-drafts/studio/launch", launch("1h")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["field"], "max_time", "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+    assert_eq!(
+        launch_count(&pool).await,
+        0,
+        "a refused launch adopts nothing"
+    );
+
+    let (status, body) = post_admin(&app, "/api/playbook-drafts/studio/launch", launch("2h")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(launch_count(&pool).await, 1);
+    Ok(())
+}
+
+/// A registered launch, and a one-shot deferring one, is refused the same way: both authorize
+/// through the same path, so a deferred launch cannot store a ceiling its firing would fail on.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_registered_launch_shorter_than_a_task_timeout_is_refused(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), TIMED_WORKFLOW).await;
+    let launch = |max_time: &str| {
+        serde_json::json!({
+            "params": {"topic": "attention", "depth": "deep"},
+            "max_cost": 1.0,
+            "max_time": max_time,
+        })
+    };
+
+    let (status, body) = post_launch(&app, "survey", launch("1h")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["field"], "max_time", "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+
+    let mut deferred = launch("1h");
+    deferred["playbook"] = serde_json::json!("survey");
+    deferred["fire_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    let (status, body) = post_admin(&app, "/api/one-shots", deferred).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+    let one_shots: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_one_shots")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(one_shots, 0, "a refused one-shot stores nothing");
+    assert_eq!(
+        launch_count(&pool).await,
+        0,
+        "a refused launch adopts nothing"
+    );
+
+    let (status, body) = post_launch(&app, "survey", launch("110m")).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a timeout equal to the ceiling fits: {body}"
+    );
+    Ok(())
+}
+
 /// Put a recording `git` and `gh` on PATH for the duration of a body: graduation's push and PR
 /// open are the two shells, and this is what proves which refs it pushed. The `git` stub delegates
 /// everything but `push` to the real binary, so a test running beside this one still gets git.
@@ -9933,6 +10125,7 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
                 links: Vec::new(),
                 agent: None,
                 repairs: Vec::new(),
+                output: None,
             },
         )
         .await?;
@@ -10004,6 +10197,88 @@ async fn task_evidence_serves_the_payload_note_and_captured_files(pool: PgPool) 
     assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
     let (status, no_run) = get_json_value(&app, "/api/runs/nobody/tasks/scan/evidence").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{no_run}");
+    Ok(())
+}
+
+/// What an attempt emitted is part of the run's stored result: the graph serves each attempt's
+/// output, a failing evaluate's verdict included, and with no session stored the evidence payload
+/// is the latest attempt's.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_and_evidence_serve_each_attempts_output(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: "run-out".to_string(),
+            scope: None,
+            issue: None,
+            identity_digest: None,
+            status: "succeeded".to_string(),
+            pod: None,
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    let plan = r#"[{"name":"build","kind":"command","depends_on":[],"session":"","needs":"all","required":true},
+                   {"name":"verify","kind":"evaluate","depends_on":["build"],"session":"","needs":"all","required":true}]"#;
+    crate::runs::task_results::upsert_run_plan(db.pool(), "run-out", 1, plan).await?;
+    let failed = serde_json::json!({"pass": false, "score": 3.2, "failures": ["under 5x"]});
+    let passed = serde_json::json!({"pass": true, "score": 7.5, "speedup": 7.5});
+    for (iter, task, status, output) in [
+        (0_i64, "build", "pass", None),
+        (0, "verify", "fail", Some(failed.clone())),
+        (1, "verify", "pass", Some(passed.clone())),
+    ] {
+        crate::runs::task_results::upsert_task_result(
+            db.pool(),
+            "run-out",
+            &crate::runs::model::TaskResult {
+                iter,
+                task: task.to_string(),
+                status: status.to_string(),
+                note: String::new(),
+                cost_usd: None,
+                secs: None,
+                blocked: None,
+                links: Vec::new(),
+                agent: None,
+                repairs: Vec::new(),
+                output,
+            },
+        )
+        .await?;
+    }
+    let app = router(ApiState {
+        scratch_dir: dir.path().to_path_buf(),
+        ..ApiState::test(db, Arc::new(Recorder::default()))
+    });
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-out/graph").await;
+    assert_eq!(st, StatusCode::OK);
+    let results = v["results"].as_array().expect("results");
+    let output = |iter: i64, task: &str| {
+        results
+            .iter()
+            .find(|r| r["iter"] == iter && r["task"] == task)
+            .map(|r| r["output"].clone())
+            .unwrap_or_else(|| panic!("no {task} at {iter}: {v}"))
+    };
+    assert_eq!(
+        output(0, "build"),
+        serde_json::Value::Null,
+        "emitted nothing"
+    );
+    assert_eq!(output(0, "verify"), failed, "the failing verdict is kept");
+    assert_eq!(output(1, "verify"), passed);
+
+    let (st, ev) = get_json_value(&app, "/api/runs/run-out/tasks/verify/evidence").await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    assert_eq!(
+        ev["payload"], passed,
+        "no session stored, so the latest attempt's output"
+    );
     Ok(())
 }
 
@@ -10109,9 +10384,10 @@ async fn a_run_lists_and_serves_the_files_its_tasks_captured(pool: PgPool) -> Re
     assert_eq!(status, StatusCode::OK, "{empty}");
     assert!(empty["files"].as_array().expect("files").is_empty());
 
-    crate::runs::blob_store::put_run_files(
+    crate::runs::blob_store::put_run_bundle(
         &pool,
         "run-pod",
+        crucible_contract::ArtifactKind::RunFiles,
         run_files_bundle(&[
             ("roundup/FINDINGS.json", b"{\"broken\":21}"),
             ("propose/fix.patch", b"diff --git a/x b/x\n"),
@@ -10503,6 +10779,7 @@ async fn seed_provider(
             harness: None,
             enabled,
             created_by: "wren",
+            price: None,
         },
     )
     .await
@@ -10593,6 +10870,7 @@ async fn config_providers_lists_enabled_providers_and_the_defaults(pool: PgPool)
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -10684,6 +10962,7 @@ async fn an_owned_provider_is_offered_and_pinned_only_by_those_who_may_read_it(
                 harness: None,
                 enabled,
                 created_by: "reed",
+                price: None,
             },
         )
         .await?;
@@ -12183,6 +12462,127 @@ async fn a_custom_provider_needs_an_endpoint_a_protocol_and_a_default_model(
         "http://vllm.internal:8000/v1"
     );
     assert_eq!(picker["providers"][0]["protocol"], "responses");
+    Ok(())
+}
+
+/// A provider's price is per million tokens for each billed bucket: registered, shown to the
+/// picker and the admin list, replaced or cleared by a PUT, and refused when a rate is negative, a
+/// bucket is missing, or the provider serves no agent.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_provider_carries_a_price_per_million_tokens(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let glm = |price: serde_json::Value| {
+        serde_json::json!({
+            "id": "selfhosted", "display_name": "Self-hosted", "kind": "custom",
+            "default_model": "zai-org/glm-5", "protocol": "messages",
+            "endpoint": "https://selfhosted.example/v1", "price": price,
+        })
+    };
+
+    for (body, expected) in [
+        (
+            glm(
+                serde_json::json!({"input": -0.6, "output": 2.2, "cache_read": 0.11,
+                "cache_write": 0.6}),
+            ),
+            "price.input must be a finite, non-negative number",
+        ),
+        (
+            glm(
+                serde_json::json!({"input": 0.6, "output": 2.2, "cache_read": -1,
+                "cache_write": 0.6}),
+            ),
+            "price.cache_read",
+        ),
+        (
+            serde_json::json!({"id": "dgemma", "display_name": "dgemma", "kind": "custom",
+                "default_model": "dgemma", "protocol": "system_one",
+                "endpoint": "http://dgemma.internal:8011/v1/systemone",
+                "price": {"input": 1, "output": 1, "cache_read": 1, "cache_write": 1}}),
+            "takes no price",
+        ),
+    ] {
+        let (status, refused) = post_admin(&app, "/api/providers", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected),
+            "{expected}: {refused}"
+        );
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "POST",
+            "/api/providers",
+            glm(serde_json::json!({"input": 0.6, "output": 2.2, "cache_read": 0.11})),
+        )?)
+        .await?;
+    assert!(
+        res.status().is_client_error(),
+        "a price names all four buckets: {}",
+        res.status()
+    );
+
+    let price = serde_json::json!({"input": 0.6, "output": 2.2, "cache_read": 0.11,
+        "cache_write": 0.6});
+    let (status, created) = post_admin(&app, "/api/providers", glm(price.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["price"], price);
+    let stored = crate::playbooks::providers::get(db.pool(), "selfhosted")
+        .await?
+        .expect("the row");
+    assert_eq!(
+        stored.price.map(|p| p.output.get()),
+        Some(2.2),
+        "the registry holds what the API took"
+    );
+
+    let (status, picker) = get_json_object(&app, "/api/config/providers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(picker["providers"][0]["price"], price);
+
+    let repriced = serde_json::json!({"input": 1.0, "output": 4.0, "cache_read": 0.1,
+        "cache_write": 1.25});
+    let mut body = glm(repriced.clone());
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("id");
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/providers/selfhosted",
+            body.clone(),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(json_of(res).await?["price"], repriced);
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("price");
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json("PUT", "/api/providers/selfhosted", body)?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        json_of(res).await?["price"].is_null(),
+        "a PUT without a price clears it"
+    );
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/providers")
+                .header("x-auth-request-user", "wren")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert!(json_of(res).await?[0]["price"].is_null());
     Ok(())
 }
 

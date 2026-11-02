@@ -1,7 +1,7 @@
 import { useMemo } from 'react';
 import type { components } from '../api/schema';
 import { $api } from '../api/client';
-import { Section, SectionBody, SectionHeader } from '../ui';
+import { FoldSection, Section, SectionBody, SectionHeader } from '../ui';
 import { runGraphView, targetLabel } from './taskGraph';
 import type { OutputNode } from './taskGraph';
 import { WorkflowGraph } from './WorkflowGraph';
@@ -11,7 +11,7 @@ export type RunGraph = components['schemas']['RunGraphDto'];
 /// The run's admitted work graph on the shared flow surface. The endpoint 404s for a run that never
 /// admitted a plan (every run from before the work-graph executor), which leaves `data` undefined —
 /// so the whole panel simply isn't there rather than showing an error a reader can do nothing about.
-export function RunTaskGraph({ runId }: { runId: string }) {
+export function RunTaskGraph({ runId, engineBounds = false }: { runId: string; engineBounds?: boolean }) {
   const query = $api.useQuery(
     'get',
     '/api/runs/{run_id}/graph',
@@ -42,21 +42,23 @@ export function RunTaskGraph({ runId }: { runId: string }) {
 
   if (!graph || view === null || graph.tasks.length === 0) return null;
   return (
-    <Section>
-      <SectionHeader title="Task graph" note={`plan v${graph.plan_version}`} />
-      <SectionBody>
-        <WorkflowGraph
-          graph={view.graph}
-          runtime={view.runtime}
-          runId={runId}
-          outputs={view.outputs}
-          fanoutState={view.fanout}
-          links={view.links}
-          decisions={view.decisions}
-        />
-        <EngineDefaults bounds={view.engineDefaults} />
-      </SectionBody>
-    </Section>
+    <>
+      <Section>
+        <SectionHeader title="Task graph" note={`plan v${graph.plan_version}`} />
+        <SectionBody>
+          <WorkflowGraph
+            graph={view.graph}
+            runtime={view.runtime}
+            runId={runId}
+            outputs={view.outputs}
+            fanoutState={view.fanout}
+            links={view.links}
+            decisions={view.decisions}
+          />
+        </SectionBody>
+      </Section>
+      {engineBounds && <EngineDefaults bounds={view.engineDefaults} />}
+    </>
   );
 }
 
@@ -66,20 +68,18 @@ export function RunTaskGraph({ runId }: { runId: string }) {
 function EngineDefaults({ bounds }: { bounds: OutputNode[] }) {
   if (bounds.length === 0) return null;
   return (
-    <details className="mt-2 text-micro text-ink-2">
-      <summary className="cursor-pointer select-none">
-        {bounds.length} engine-default {bounds.length === 1 ? 'bound' : 'bounds'} (not declared by
-        the pack)
-      </summary>
-      <ul className="mt-1 ml-4 list-disc font-mono">
-        {bounds.map((b) => (
-          <li key={b.kind}>
-            {b.kind} {'\u00d7'}
-            {b.count}
-            {targetLabel(b.target) !== null && ` -> ${targetLabel(b.target)}`}
-          </li>
-        ))}
-      </ul>
-    </details>
+    <FoldSection title="Engine bounds" note={`${bounds.length} undeclared ${bounds.length === 1 ? 'kind' : 'kinds'}`}>
+      <SectionBody>
+        <ul className="m-0 grid list-none gap-0.5 p-0 font-mono text-data text-ink-2">
+          {bounds.map((b) => (
+            <li key={b.kind}>
+              {b.kind} {'\u00d7'}
+              {b.count}
+              {targetLabel(b.target) !== null && ` -> ${targetLabel(b.target)}`}
+            </li>
+          ))}
+        </ul>
+      </SectionBody>
+    </FoldSection>
   );
 }

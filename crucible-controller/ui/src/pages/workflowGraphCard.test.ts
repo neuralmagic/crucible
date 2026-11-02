@@ -4,13 +4,18 @@ import {
   decisionLines,
   decisionRows,
   detailRows,
+  fanoutCount,
   fanoutLine,
   fanoutRows,
+  kindGlyph,
   metaFor,
+  pillChip,
+  pillChipChars,
   runsLine,
   runtimeLine,
   runtimeRows,
   sourceFor,
+  statusMark,
 } from './workflowGraphCard';
 import type { FanOutState, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
@@ -193,6 +198,16 @@ function rowValue(runtime: TaskRuntime, label: string): string | undefined {
 }
 
 describe('what a run adds to the card', () => {
+  /// A first attempt that cost nothing has nothing to say: no `iter 0`, no `$0.00`, no line.
+  it('leaves out a zero iteration, a zero cost and a zero duration', () => {
+    expect(runtimeLine(ran({ latestIter: 0 }))).toBeNull();
+    expect(runtimeLine(ran({ latestIter: 0, costUsd: 0, secs: 0 }))).toBeNull();
+    expect(runtimeLine(ran({ latestIter: 0, costUsd: -0 }))).toBeNull();
+    expect(runtimeLine(ran({ latestIter: 0, costUsd: 0.12 }))).toBe('$0.12');
+    expect(runtimeLine(ran({ latestIter: 1, costUsd: 0 }))).toBe('iter 1');
+    expect(runtimeLine(ran({ latestIter: 0, attempts: 2 }))).toBe('2 attempts');
+  });
+
   it('states the iteration, and the rest only when there is something to state', () => {
     expect(runtimeLine(ran())).toBe('iter 2');
     expect(runtimeLine(ran({ attempts: 3, costUsd: 0.75, secs: 42 }))).toBe(
@@ -226,6 +241,12 @@ describe('what a run made of a mapped task', () => {
     ...overrides,
   });
   const failed = (count: number) => [{ status: 'fail', count }];
+
+  it('counts a fan-out by its items, or by what started when the items are unknown', () => {
+    expect(fanoutCount(spread())).toBe(4);
+    expect(fanoutCount(spread({ items: 0, started: 0 }))).toBe(0);
+    expect(fanoutCount(spread({ items: null, started: 3 }))).toBe(3);
+  });
 
   it('reads what passed against what went in', () => {
     expect(fanoutLine(spread())).toBe('4 · 4 passed');
@@ -386,5 +407,61 @@ describe('a fan-out a when partitioned', () => {
 
   it('spells the not-taken count out in the panel', () => {
     expect(fanoutRows(state).find((row) => row.label === 'not taken')?.value).toBe('38');
+  });
+});
+
+describe('the one status signal', () => {
+  it('marks how a task ended, or that the run has not reached it yet', () => {
+    expect(statusMark(ran())).toBe('pass');
+    expect(statusMark(ran({ tone: 'fail', status: 'fail' }))).toBe('fail');
+    expect(statusMark(ran({ tone: 'fail', status: 'transport' }))).toBe('fail');
+    expect(statusMark(ran({ tone: 'none', status: 'pending', reported: false }))).toBe('active');
+    expect(statusMark(ran({ tone: 'none', status: 'blocked' }))).toBe('blocked');
+    for (const status of ['never ran', 'skipped', 'not_taken', 'truncated']) {
+      expect(statusMark(ran({ tone: 'none', status }))).toBe('idle');
+    }
+  });
+
+  it('gives every kind of task its own glyph, a mapped one the map glyph', () => {
+    const over = { over_task: 'a', over_field: 'b', max_fanout: null };
+    const glyphs = [
+      kindGlyph(task('a', { kind: 'route' })),
+      kindGlyph(task('a', { kind: 'agent', fanout: over })),
+      kindGlyph(task('a', { kind: 'agent' })),
+      kindGlyph(task('a', { kind: 'command' })),
+      kindGlyph(task('a', { kind: 'engine' })),
+      kindGlyph(task('a', { kind: 'other' })),
+    ];
+    expect(new Set(glyphs).size).toBe(glyphs.length);
+    expect(kindGlyph(task('a', { kind: 'route', fanout: over }))).toBe(
+      kindGlyph(task('a', { kind: 'route' }))
+    );
+  });
+});
+
+describe('pillChip', () => {
+  const jira = (key: string) => ({ url: `https://tracker.example.com/browse/${key}`, provider: 'jira', kind: 'issue', label: key });
+  const pr = { url: 'https://github.com/example/repo-a/pull/9', provider: 'github', kind: 'pull_request', label: '#9' };
+
+  it('keeps a lone link as the chip it is', () => {
+    expect(pillChip({ kind: 'links', links: [pr] })).toEqual({ kind: 'link', link: pr });
+    expect(pillChipChars(pillChip({ kind: 'links', links: [pr] }))).toBe(5);
+  });
+
+  it('counts several links under the mark they share', () => {
+    const chip = pillChip({ kind: 'links', links: [jira('ITEM-1306'), jira('ITEM-1307')] });
+    expect(chip).toEqual({ kind: 'count', provider: 'jira', count: 2 });
+    expect(pillChipChars(chip)).toBe(4);
+  });
+
+  it('counts mixed links under no one provider', () => {
+    expect(pillChip({ kind: 'links', links: [jira('ITEM-1306'), pr] })).toEqual({ kind: 'count', provider: '', count: 2 });
+  });
+
+  it('draws nothing for no links or a deck count', () => {
+    expect(pillChip(null)).toBeNull();
+    expect(pillChip({ kind: 'links', links: [] })).toBeNull();
+    expect(pillChip({ kind: 'counts', counts: [{ provider: 'jira', count: 2 }] })).toBeNull();
+    expect(pillChipChars(null)).toBe(0);
   });
 });

@@ -56,3 +56,14 @@ describe('teamsView', () => {
     expect(validSlug('')).toBe(false);
   });
 });
+
+describe('sortedTeams with stars and activity', () => {
+  it('puts starred teams first, then memberships, then teams that own something', () => {
+    const rows = sortedTeams(
+      [team('zeta', null), team('beta', null), team('alpha', null), team('core', 'owner'), team('mid', 'member')],
+      new Set(['zeta']),
+      new Set(['beta', 'core']),
+    );
+    expect(rows.map((t) => t.slug)).toEqual(['zeta', 'core', 'mid', 'beta', 'alpha']);
+  });
+});

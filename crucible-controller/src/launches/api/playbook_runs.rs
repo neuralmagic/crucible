@@ -188,6 +188,15 @@ pub struct PlaybookLaunchDetailDto {
     pub dispatch: LaunchDispatchDto,
     /// Every run this launch dispatched, newest first.
     pub runs: Vec<LaunchRunDto>,
+    /// The finished run this launch reruns, when it is a rerun.
+    pub rerun: Option<RerunOfDto>,
+}
+
+/// The run a rerun launch reruns, and the tasks it dispatched again.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RerunOfDto {
+    pub run_id: String,
+    pub from: Vec<String>,
 }
 
 /// `GET /api/playbook-runs/{key}` — one launch: its frozen snapshot (the source a relaunch
@@ -218,6 +227,13 @@ pub(crate) async fn get_playbook_run(
             .await?
             .is_some(),
     };
+    let rerun = crate::launches::store::get_playbook_launch(state.db.pool(), &key)
+        .await?
+        .and_then(|launch| launch.rerun)
+        .map(|rerun| RerunOfDto {
+            run_id: rerun.run,
+            from: rerun.from,
+        });
     let runs = crate::launches::store::list_runs_for_launch(state.db.pool(), &key).await?;
     let dispatch = dispatch_state(&state.db.events().read_for_key(&key).await?, &runs);
     let runs = runs
@@ -238,6 +254,7 @@ pub(crate) async fn get_playbook_run(
         source_exists,
         dispatch,
         runs,
+        rerun,
     })
     .into_response())
 }

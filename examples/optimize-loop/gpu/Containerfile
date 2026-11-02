@@ -1,0 +1,5 @@
+FROM docker.io/pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+WORKDIR /bench
+COPY bench.py kernel.py ./
+USER 65532:65532
+ENTRYPOINT ["python", "/bench/bench.py"]

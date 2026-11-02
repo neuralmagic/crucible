@@ -1,29 +1,32 @@
 # The autoresearch loop, in one read
 
-Autoresearch is crucible's scored lane: a **goal-driven, gated, keep/discard loop** for
-letting an agent improve a codebase against a frozen objective. The loop itself is
-domain-agnostic; a *domain* is a problem packaged for it. For a graph that runs once and
-ships, see [Your first playbook](./playbooks.md).
+Autoresearch is the scored lane of Crucible. It is a **keep/discard loop with a goal and a
+gate**, in which an agent improves a codebase against a frozen objective. The loop does not
+depend on a domain. A *domain* is a problem packaged for the loop. For a graph that runs one
+time and ships, see [Your first playbook](./playbooks.md).
 
-This doc explains the whole system in higher-order concepts and then shows exactly how
-the `examples/counter` domain maps onto them. For *why the judge is frozen*, see
-[ADR 0001](./adr/0001-adaptive-harness.md).
+This page describes the system in general concepts. Then it shows how the
+`examples/counter` domain maps to those concepts. [ADR 0001](./adr/0001-adaptive-harness.md)
+gives the reason that the judge is frozen.
 
-> **Scope.** The engine, the `World`/`Judge` boundary, `CommandWorld`/`CommandJudge`, and the
-> `crucible.toml` manifest form the core. A **composite** manifest
-> ([ADR 0009](./adr/0009-composite-domains.md)) exercises the engine across multiple
-> components. Around the loop: mediated provisioning + issue-tracker grounding over an MCP
-> broker ([ADR 0002](./adr/0002-mediated-provisioning-mcp.md)), a profiler over MCP
-> ([ADR 0006](./adr/0006-profiling-over-mcp.md)), engine-side build/deploy
+> **Scope.** The core is the engine, the `World`/`Judge` boundary, `CommandWorld` and
+> `CommandJudge`, and the `crucible.toml` manifest. A **composite** manifest
+> ([ADR 0009](./adr/0009-composite-domains.md)) runs the engine across more than one
+> component. Around the loop there are: provisioning and issue-tracker grounding through an
+> MCP broker ([ADR 0002](./adr/0002-mediated-provisioning-mcp.md)), a profiler over MCP
+> ([ADR 0006](./adr/0006-profiling-over-mcp.md)), build and deploy in the engine
 > ([ADR 0005](./adr/0005-engine-side-builds.md)) with rendered deployment manifests
-> ([ADR 0012](./adr/0012-rendered-deployments.md)), and publish-on-keep with a draft PR
-> per fork whose authorized review comments re-steer the run.
+> ([ADR 0012](./adr/0012-rendered-deployments.md)), and publish-on-keep with a draft PR for
+> each fork. Authorized review comments on the PR steer the run again.
 
-## The one sentence
+## Summary
 
-An optimization loop where the **proposal** step is an LLM agent and the **objective** is
-a frozen, expensive black-box evaluation, over a **reversibly-mutable** world, with
-**durable memory** and **human-in-the-loop control**.
+The loop is an optimization loop with these properties:
+
+- The **proposal** step is an LLM agent.
+- The **objective** is a frozen, expensive black-box evaluation.
+- The **world** is state that the engine can change and restore.
+- The loop has **durable memory** and **human-in-the-loop control**.
 
 ## The loop
 
@@ -40,71 +43,76 @@ flowchart LR
     next --> propose
 ```
 
-- **propose**: the agent edits the world toward the goal. The proposal policy is a
-  pluggable backend (`local` in-process Claude / `openshell` sandboxed / `command`),
-  selected by `[agent].backend`, not the engine.
-- **apply**: make the candidate live (for a code repo: the edits *are* the apply).
+- **propose**: the agent edits the world toward the goal. A backend supplies the proposal
+  policy: `local` (the harness on the host), `openshell` (sandboxed), or `command`.
+  `[agent].backend` selects it.
+- **apply**: makes the candidate live. For a code repository, the edits are the apply step.
 - **measure**: the frozen Judge scores the candidate.
-- **accept?**: keep if it's strictly better; otherwise restore the last good state.
-- **remember**: kept states are git commits; every step is an NDJSON event.
+- **accept?**: keeps the candidate if it is strictly better. Otherwise, restores the last
+  good state.
+- **remember**: kept states are Git commits. Each step is an NDJSON event.
 
-This single-candidate line of descent is the default, and it's not the only shape: a
-**wide round** ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) can fan `N`
-independent propose turns out in parallel first, biased to distinct `[search].approaches`,
-rank them by the same Judge, and seed the loop above with the winner. `--wide 0` (the
-default) skips it entirely, no engine change, just a pre-loop step.
+By default, the loop has one candidate in each iteration. A **wide round**
+([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) can first run `N` independent
+propose turns in parallel, each biased to a different `[search].approaches` entry. The same
+Judge ranks them, and the winner is the start point of the loop. With `--wide 0` (the
+default), there is no wide round. The wide round is a step before the loop and does not
+change the engine.
 
-## The contract: framework owns it, the repo owns the implementations
+## The contract
 
-Crucible defines a small contract; a repo fills it however it
-likes, in any language. A domain is **a manifest + a few executables**, not Rust code.
-Each command runs in the workspace with the domain's env:
+Crucible defines a small contract. A repository implements it in any language. A domain is
+**a manifest and some executables**. It is not Rust code. Each command runs in the workspace
+with the environment of the domain:
 
 | Command | Required | Contract |
 | --- | --- | --- |
-| `measure` | yes | last stdout line = `{ "valid": bool, "score": number, "solved"?: bool, "note"?, "detail"? }`; nonzero exit = invalid. **The judge.** Gets `BASELINE_*`/`BEST_SCORE` in env. |
-| `apply` | no | apply the candidate. Omit for code repos (the agent edits files); deploy domains build+push+set-image. |
-| `snapshot` | no | stdout = an opaque token for the current state. Default: git commit ref. |
-| `restore <token>` | no | roll back to a token. Default: `git reset --hard` + `clean`. |
-| `setup` | no | prepare the workspace. Default: git clone + checkout. |
+| `measure` | yes | The last stdout line is `{ "valid": bool, "score": number, "solved"?: bool, "note"?, "detail"? }`. A nonzero exit status makes the result invalid. **This is the judge.** It gets `CRUCIBLE_BASELINE_*` and `CRUCIBLE_BEST_SCORE` in its environment. |
+| `apply` | no | Applies the candidate. Omit it for code repositories, where the agent edits files. Deploy domains build, push, and set the image. |
+| `snapshot` | no | Prints an opaque token for the current state. Default: a Git commit ref. |
+| `restore <token>` | no | Rolls back to a token. Default: `git reset --hard` and `clean`. |
+| `setup` | no | Prepares the workspace. Default: Git clone and checkout. |
 
-The accept policy is generic: *keep if `valid` and `score` beats the best per
-`direction`; solved iff `measure` says so.* No per-domain code for the keep/win logic.
+The accept policy is the same for all domains. The engine keeps a candidate if it is `valid`
+and its `score` is better than the best score in the `direction`. The run is solved only if
+`measure` reports it. A domain does not supply code for the keep logic.
 
 ### Carrying pipeline artifacts across a discard
 
-A discard resets the workspace and cleans untracked files, so anything an iteration derived
-on the way to its candidate (code traces, a generated port tree) is gone by the next turn and
-gets re-derived. `[workspace] carry_forward` names workspace-relative paths that survive:
+A discard resets the workspace and removes untracked files. Any files that an iteration
+generated for its candidate (code traces, a generated port tree) are gone in the next turn,
+and the agent must generate them again. `[workspace] carry_forward` names paths, relative to
+the workspace, that the discard keeps:
 
 ```toml
 [workspace]
 carry_forward = ["codegen-out/"]
 ```
 
-Each entry is written to `.git/info/exclude` and spared by the discard's clean, so carried
-content never reaches a candidate diff, snapshot commit, or tree hash: a turn that only
-regenerates it still reads as no candidate change.
+The engine writes each entry to `.git/info/exclude`, and the clean step of the discard keeps
+it. Carried content does not go into a candidate diff, a snapshot commit, or a tree hash. If a
+turn only generates the carried content again, the engine sees no candidate change.
 
-Limits worth knowing before you use it:
+Limits:
 
-- A path the repo **tracks** is not protected. Git excludes only apply to untracked files, and
-  the discard's `git reset --hard` reverts tracked content regardless. Carry pipeline output
-  the repo doesn't track.
-- A path that doesn't exist yet is fine; the exclude is prospective.
-- Nested paths (`target/codegen-out`) work: the clean descends into the parent instead of
-  deleting it. Entries must be plain relative paths, so no `.`, `..`, or leading `/`.
-- Wide-tournament rounds run in fresh worktrees with no untracked carried dirs, so they don't
-  benefit.
-- Composite manifests reject the key; per-component carry-forward is a non-goal.
+- A path that the repository **tracks** is not protected. Git excludes apply only to
+  untracked files, and `git reset --hard` in the discard reverts tracked content. Carry only
+  pipeline output that the repository does not track.
+- A path can be absent when the run starts. The exclude applies when the path appears.
+- Nested paths (`target/codegen-out`) work. The clean step goes into the parent directory and
+  does not delete it. Entries must be plain relative paths, without `.`, `..`, or a leading
+  `/`.
+- Wide-tournament rounds run in new worktrees without the carried directories, so the
+  setting does not apply to them.
+- Composite manifests reject the key. Carry-forward for each component is not supported.
 
-Omitting it is the default and keeps today's fresh-start behavior exactly, which is what a
-methodology-sensitive campaign wants.
+If you omit the key, each iteration starts from a clean workspace. Use this default for a
+campaign whose method needs a clean start.
 
 ### Declared artifacts: carried AND published
 
-`[[workspace.artifact]]` is `carry_forward` plus publishing, for derived output a reviewer
-should see without it riding in the candidate diff:
+`[[workspace.artifact]]` is `carry_forward` with publishing. Use it for generated output
+that a reviewer must see, but that must not be in the candidate diff:
 
 ```toml
 [[workspace.artifact]]
@@ -114,27 +122,29 @@ upload = "summary.pptx"          # newest match → record only (binaries a PR c
 title  = "Runtime investigation" # PR-body section heading (default: the path)
 ```
 
-Newest match wins, so versioned pipeline dirs (`V1 … V7`, same-named summary in each) surface
-the final iteration's. The record destination accepts `s3://bucket[/prefix]` or
-`file:///abs/path` (the same layout written to a mounted PVC, for clusters with no S3 reach).
-The PR body also charts per-iteration scores as a mermaid `xychart-beta` when at least two
-iterations measured.
+The newest match is used. If versioned pipeline directories (`V1 … V7`) each have a summary
+with the same name, the summary of the final iteration is published. The record destination
+accepts `s3://bucket[/prefix]` or `file:///abs/path`. The file form writes the same layout to
+a mounted PVC, for clusters that cannot reach S3. If two or more iterations have a
+measurement, the PR body also shows the score of each iteration as a mermaid `xychart-beta`
+chart.
 
-### Languages: pick per command, the engine doesn't care
+### Languages
 
-The contract is JSON + exit codes, so each command can be whatever fits:
+The contract is JSON and exit codes, so you can write each command in any language:
 
-- **Thin glue** (apply / ops / steer / stop): **nushell** is the recommended default.
-  The work is "run kubectl/prometheus, parse, compute," and nushell is structured-data
-  native (`... | from json | ...` in, a record `| to json` out), cleaner than bash,
-  lighter than python. (It's its own shell, not posix; pin `nu` in the sandbox image.)
-- **Heavy `measure`** with real math (percentiles, replay): a compiled binary
-  (Rust/go) earns its keep.
-- bash / python / anything else is equally valid: only the JSON/exit shape is fixed.
+- **Small glue commands** (apply, operations, steer, stop): we recommend **nushell**. These
+  commands run kubectl or Prometheus, parse the output, and compute a value. Nushell works
+  with structured data (`... | from json | ...` in, a record `| to json` out). Nushell is
+  not a POSIX shell, so pin `nu` in the sandbox image.
+- **A large `measure`** with real math (percentiles, replay): use a compiled binary (Rust or
+  Go).
+- Bash, Python, and other languages are also valid. Only the JSON and exit status format is
+  fixed.
 
 `measure_cmd` is any executable that prints one JSON object on stdout
-(`{"valid": bool, "score": number, "note": string}`). A plain POSIX shell script
-satisfies the whole contract:
+(`{"valid": bool, "score": number, "note": string}`). A plain POSIX shell script satisfies
+the full contract:
 
 ```sh
 #!/bin/sh
@@ -142,52 +152,52 @@ p99=$(make bench | jq .p99_ms)
 printf '{"valid": true, "score": %s, "note": "p99 %sms"}\n' "$p99" "$p99"
 ```
 
-Any language works the same way, because the engine reads only the JSON verdict.
+The engine reads only the JSON verdict, so all languages work the same way.
 
-## What the engine gives you for free
+## What the engine supplies
 
 | Concept | What it does | Where |
 | --- | --- | --- |
-| **Engine** | the loop, budget, keep/discard, baseline | `main::run_loop` |
-| **World** | reversibly-mutable state; opaque `Snapshot` | `crucible::World` → `GitWorld` / `CommandWorld` |
-| **Judge** | frozen objective: measure + decide | `crucible::Judge` → `CommandJudge` |
-| **Agent** | proposal policy + transport (local / remote pod) | `agent::AgentSource` |
-| **Reporters** | console / NDJSON / session-log frontends | `reporter::Reporter` + `console`/`stream` |
-| **Session log** | versioned NDJSON event stream (the source of truth) | `session.rs` |
-| **Memory** | git-as-memory (kept commits) + `RESULTS.md` | `crucible-vcs/src/vcs.rs` + `write_results` |
-| **Control plane** | steer / stop-park / resume / escalate | `STEER.md` / `state/control.json` / `--resume` / `ESCALATION.json` |
-| **Distress** | the agent pages the operator; `severity=error` suspends the run with the pod alive | `crucible-broker::distress` + `crucible/src/distress.rs` |
-| **Durable run state** | `[cluster] state_pvc` mounts a claim over the domain's `state/` dir, so a replaced pod resumes instead of restarting the run, loop or playbook. A named (shared) claim is keyed per run by a `state/<run>` subPath and needs RWX; a `[cluster.state_pvc]` table materializes a dedicated `<run>-state` claim mounted at its root | `deploy/profile.rs` + `deploy/render/kube.rs` |
-| **Provisioning** | mediated MCP broker: the agent asks, the host holds the keys (GPU capture, issue-tracker grounding, draft PRs) | `crucible-broker` (ADR-0002) |
-| **Profiler** | generic profile-over-MCP: pprof for a Go service, GPU traces for a model server | `crucible-broker::profile` (ADR-0006) |
-| **Build + deploy** | engine-side build, and `crucible deploy render` projects the loop/deployment manifests, digest-pinned | `forge` + `crucible/src/deploy/` (ADR-0005 / 0012) |
-| **Publish** | publish-on-keep to S3 + a draft PR per fork; authorized review comments re-steer the run | `crucible/src/runloop/publish.rs` / `crucible-broker::draft_pr` |
-| **Search (wide round)** | optional fan-out of N parallel propose turns, ranked by the same Judge, before the deep loop ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) | `crucible/src/wide/` |
-| **Self-test** | `crucible check` proves the Judge can tell a known-good config from a known-bad one before a run trusts it | `[judge.selftest]` + `selftest.rs` |
-| **On-ramp** | `crucible init` scaffolds a manifest + measure stub onto an existing repo; `crucible check` validates it with no agent turn; `crucible scope` ingests a goal and freezes a `SCOPE.md` (ADR-0014 S0) | `crucible/src/cli/init.rs` / `crucible/src/cli/check.rs` / `crucible-contract/src/scope.rs` |
-| **Preflight** | runs the domain's rung ladder against the unmodified tree before iteration 1; a failure refuses the run, and the optional baseline rung seeds `segment.baseline_score` | `[preflight]` + `preflight.rs` |
+| **Engine** | The loop, budget, keep/discard, baseline. | `crucible/src/runloop/driver.rs` (`run_loop`) |
+| **World** | State that the engine can change and restore. Opaque `Snapshot`. | `crucible::World` → `GitWorld` / `CommandWorld` |
+| **Judge** | The frozen objective: measure and decide. | `crucible::Judge` → `CommandJudge` |
+| **Agent** | Proposal policy and transport (local or sandbox). | `agent::AgentSource` |
+| **Reporters** | Console, NDJSON, and session-log output. | `report::reporter::Reporter`, `report::console`, `report::stream` |
+| **Session log** | Versioned NDJSON event stream. It is the source of truth. | `crucible/src/report/session.rs` |
+| **Memory** | Kept Git commits and `RESULTS.md`. | `crucible-vcs/src/vcs.rs`, `write_results` |
+| **Run controls** | Steer, stop or park, resume, escalate. | `STEER.md` / `state/control.json` / `--resume` / `ESCALATION.json` |
+| **Distress** | The agent pages the operator. `severity=error` suspends the run and keeps the pod. | `crucible-broker::distress`, `crucible/src/control/distress.rs` |
+| **Durable run state** | `[cluster] state_pvc` mounts a claim over the `state/` directory of the domain. A replacement pod resumes the run (loop or playbook) and does not start it again. A named (shared) claim uses a `state/<run>` subPath for each run and needs RWX. A `[cluster.state_pvc]` table creates a dedicated `<run>-state` claim, mounted at its root. | `deploy/profile.rs`, `deploy/render/kube.rs` |
+| **Provisioning** | MCP broker. The agent sends requests, and the host keeps the credentials (GPU capture, issue-tracker grounding, draft PRs). | `crucible-broker` (ADR-0002) |
+| **Profiler** | Profiling over MCP: pprof for a Go service, GPU traces for a model server. | `crucible-broker::profile` (ADR-0006) |
+| **Build and deploy** | Build in the engine. `crucible deploy render` writes digest-pinned loop and deployment manifests. | `forge`, `crucible/src/deploy/` (ADR-0005 / 0012) |
+| **Publish** | Publish-on-keep to S3 and a draft PR for each fork. Authorized review comments steer the run again. | `crucible/src/runloop/publish.rs`, `crucible-broker::draft_pr` |
+| **Search (wide round)** | Optional N parallel propose turns before the deep loop. The same Judge ranks them ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)). | `crucible/src/runloop/graph.rs` (`wide_template`) |
+| **Self-test** | Before a run uses the Judge, `crucible check` proves that the Judge can tell a known-good configuration from a known-bad one. | `[judge.selftest]`, `crucible/src/cli/selftest.rs` |
+| **Setup** | `crucible init` creates a manifest and a measure script in an existing repository. `crucible check` validates it without an agent turn. `crucible scope` reads a goal and freezes a `SCOPE.md` (ADR-0014 S0). | `crucible/src/cli/init.rs`, `crucible/src/cli/check.rs`, `crucible-contract/src/scope.rs` |
+| **Preflight** | Runs the rung ladder of the domain against the unmodified tree before iteration 1. A failure stops the run. The optional baseline rung sets `segment.baseline_score`. | `[preflight]`, `crucible/src/runloop/preflight.rs` |
 
-An optional private control plane can sit above all of this: a controller that discovers
-candidate issues, scopes them into packs, launches runs, and renders run records into
-leaderboards. It consumes the public `crucible-contract` ingest API over HTTP; the engine
-and loop pods never link it, and everything on this page runs identically without one.
+The control plane (`crucible-controller`) is optional. It finds candidate issues, scopes
+them into packs, launches runs, and shows run records as leaderboards. The controller links
+the engine. The engine binary does not link the controller, and everything on this page
+works without a controller.
 
-Trust boundary (ADR-0001): the engine hands the agent a `World`, never a `Judge`. The
-objective is frozen and out of the agent's reach: the agent can't tune the test it's
-graded on. The same boundary runs through provisioning: the agent can only *ask* the broker
-(over MCP); the privilege (GPU/Kueue, capture RBAC, the forge token, the issue-tracker
-credential) stays host-side, never in the agent's sandbox.
+Trust boundary (ADR-0001): the engine gives the agent a `World` but not a `Judge`. The
+objective is frozen, and the agent cannot reach it, so the agent cannot change the test that
+grades it. The same boundary applies to provisioning. The agent can only send requests to the
+broker over MCP. The privileges (GPU and Kueue, capture RBAC, the forge token, the
+issue-tracker credential) stay on the host and do not go into the sandbox of the agent.
 
 <div class="cru-callout">
-  <p><strong>Two ways to build a candidate, neither runs in the agent.</strong> When a candidate is a real source build (a compiled service's Dockerfile), <code>forge</code> drives <strong>buildah</strong>. When it's just "the base image plus an edited file or two" (an interpreted-source overlay, e.g. one Python file), <code>forge::oci::derive_layer</code> appends one tar+gzip layer onto the base and pushes an immutable, digest-pinned image with <strong>no container runtime</strong> (<code>oci-client</code> + <code>sha2</code>/<code>tar</code>/<code>flate2</code>): base layers move by a server-side blob <em>mount</em> when the registries match, else a low-memory pull→push stream. That replaces the old runtime configmap-overlay (version skew, <code>subPath</code> mounts, volume juggling on restore) with <code>set image</code> to a digest, so snapshot/restore collapses to a ref. <code>forge-derive-layer</code> is the CLI that validates the round-trip on-cluster.</p>
+  <p><strong>Two ways to build a candidate. Neither runs in the agent.</strong> If a candidate is a source build (the Dockerfile of a compiled service), <code>forge</code> runs <strong>buildah</strong>. If a candidate is the base image with one or two edited files (an interpreted-source overlay, for example one Python file), <code>forge::oci::derive_layer</code> adds one tar+gzip layer to the base and pushes an immutable, digest-pinned image. It needs <strong>no container runtime</strong> (<code>oci-client</code>, <code>sha2</code>, <code>tar</code>, <code>flate2</code>). If the registries are the same, base layers move by a server-side blob <em>mount</em>. If not, they move by a low-memory pull and push stream. The deployment then uses <code>set image</code> with a digest, so a snapshot or restore is only a ref. <code>forge-derive-layer</code> is the CLI that validates the round trip on a cluster.</p>
 </div>
 
 ## `[preflight]`: prove the environment before spending an iteration
 
-Every rung a candidate is graded on can fail for reasons that have nothing to do with the
-candidate: a missing dev header, a pip install shadowing the built wheel, an unwritable cache
-dir. Discovering those at iteration 1 costs a full agent turn. `[preflight]` runs the same
-ladder against the *unmodified* tree first, at zero agent cost:
+A rung that grades a candidate can fail for reasons that are not related to the candidate:
+a missing dev header, a pip install that hides the built wheel, a cache directory that is not
+writable. If the run finds these problems in iteration 1, it loses a full agent turn.
+`[preflight]` runs the same ladder against the *unmodified* tree first, with no agent cost:
 
 ```toml
 [preflight]
@@ -198,65 +208,67 @@ commands = [
 baseline = "python3 tools/gate.py --only-rung 3 --digest {digest}"
 ```
 
-- Each command runs `sh -c` in the workspace. Its last non-empty stdout line must be a JSON
-  object; the rung passed when it exited 0 and `pass` is absent or true. Recognized keys:
-  `digest`, `score`, `tiebreak`, `note`, `logs`.
-- `{mode}` fans a command out over every build mode declared in
+- Each command runs with `sh -c` in the workspace. Its last non-empty stdout line must be a
+  JSON object. The rung passes if the command exits with status 0 and `pass` is absent or
+  true. The recognized keys are `digest`, `score`, `tiebreak`, `note`, and `logs`.
+- `{mode}` runs the command once for each build mode in
   `[measure.build].mutable_kwargs.mode`, in declared order. A `{mode}` command without that
-  list is a manifest load error: a derive-only preflight passes while full mode is broken.
-- `{digest}` interpolates the most recent `digest` an earlier rung emitted, so the build rung
-  hands its artifact to the correctness rung. Using it before any rung produced one fails.
-- Any failure is an **environment verdict**: the run refuses to start, logging the failing
-  command, its note, and a stderr tail, as a `preflight-failed` row. No iteration is burned.
-- `baseline` is optional. Its `score`/`tiebreak` become `segment.baseline_score`, so a
-  `skip_baseline` (codegen) domain decides iteration 1 against a real number instead of the
-  direction's worst-score sentinel. Without it, that sentinel stands.
+  list is a manifest load error. Without this rule, a preflight could pass in derive mode
+  while full mode is broken.
+- `{digest}` inserts the most recent `digest` that an earlier rung emitted, so the build rung
+  gives its artifact to the correctness rung. If no rung produced a digest yet, the command
+  fails.
+- Any failure is an **environment verdict**. The run does not start. It logs the failed
+  command, its note, and the end of its stderr as a `preflight-failed` row. The run uses no
+  iteration.
+- `baseline` is optional. Its `score` and `tiebreak` become `segment.baseline_score`. A
+  `skip_baseline` (codegen) domain then decides iteration 1 against a real number, not
+  against the worst-score sentinel of the direction. Without `baseline`, the sentinel is
+  used.
 
 ## The three extension points
 
-- **New domain →** common case: a manifest pointing `CommandWorld` + `CommandJudge` at a
-  repo and a `measure` command. *No Rust.* Custom `World`/`Judge` impls only for
-  in-process measurement or a non-file world.
-- **Composite domain →** assemble N existing component domains into one run: a top-level
-  `[composite]` table referencing component domain dirs (reused verbatim), a `CompositeWorld`
-  (a tuple of per-component git overlays + the live deployment), and one combined gate over
-  the assembled stack. No engine changes: the engine just runs a *vector* of workspaces
-  ([ADR 0009](./adr/0009-composite-domains.md)).
-- **New frontend →** implement `Reporter`.
-- **New agent transport →** add an `AgentSource`.
+- **New domain:** usually a manifest that points `CommandWorld` and `CommandJudge` at a
+  repository, and a `measure` command. *No Rust.* Write a custom `World` or `Judge` only for
+  in-process measurement or a world that is not files.
+- **Composite domain:** combine N existing component domains into one run. It has a top-level
+  `[composite]` table that references the component domain directories (used without
+  change), a `CompositeWorld` (a tuple of Git overlays, one for each component, and the live
+  deployment), and one combined gate over the full stack. The engine does not change. It runs
+  a *list* of workspaces ([ADR 0009](./adr/0009-composite-domains.md)).
+- **New frontend:** implement `Reporter`.
+- **New agent transport:** add an `AgentSource`.
 
 ## The canonical example: the counter, mapped to the contract
 
-`examples/counter/` is the whole system with every heavy part swapped for the smallest
-thing that satisfies the contract. Five small files, and each one fills a **contract
-role**. This table *is* the example:
+`examples/counter/` is the full system, with each large part replaced by the smallest part
+that satisfies the contract. Each of its five small files has a **contract role**:
 
 | File | Lang | Contract role |
 | --- | --- | --- |
 | `crucible.toml` | toml | **manifest** (`[repo] path = "."`, `direction = "higher"`, no `[world]` → GitWorld) |
 | `measure.nu` | nu | **measure** (score = the integer in `value.txt`; `solved` at ≥ 5) |
-| `bump.nu` | nu | **propose** via the `command` backend (deterministic: `value.txt += 1`; no LLM, no cost) |
+| `bump.nu` | nu | **propose** with the `command` backend (deterministic: `value.txt += 1`, no LLM, no cost) |
 | `setup_cmd` (inline in the manifest) | sh | **setup** (seed a fresh git workspace with only the runtime files) |
-| `method.md` | md | **method prompt** (only used if you flip `backend = "local"`) |
+| `method.md` | md | **method prompt** (used only if you set `backend = "local"`) |
 
-Because there is no `[world]` block, GitWorld supplies reversibility for free: kept
-iterations are commits, discards are `git reset --hard`. Because the backend is `command`,
-the whole loop runs in milliseconds and costs nothing, yet it is a real end-to-end run
-(manifest → setup → propose → measure → keep/discard → git memory), not a mock.
+There is no `[world]` block, so GitWorld supplies the restore: kept iterations are commits,
+and discards use `git reset --hard`. The backend is `command`, so the whole loop runs in
+milliseconds and costs nothing. It is still a real end-to-end run (manifest → setup →
+propose → measure → keep/discard → Git history).
 
-A production domain fills the same roles with heavier pieces. A serving-stack domain has
-*two* reversible things (the code tree **and** a live deployment), so it adds
-`snapshot_cmd`/`restore_cmd` that capture image + config alongside the git half; its
-`measure` becomes a compiled benchmark binary; its propose backend becomes `local` or
-`openshell`; and its thin glue (apply pipelines, deployment introspection, steer/stop)
-lands on PATH as **bare names** so the contract vocabulary reads the same regardless of
-what's behind each one. A normal repo needs none of that: one `measure` command and the
-git default.
+A production domain fills the same roles with larger parts. A serving-stack domain has *two*
+reversible parts: the code tree **and** a live deployment. It adds `snapshot_cmd` and
+`restore_cmd` that capture the image and configuration together with the Git state. Its
+`measure` is a compiled benchmark binary. Its propose backend is `local` or `openshell`. Its
+glue commands (apply pipelines, deployment inspection, steer and stop) are on PATH as
+**bare names**, so the contract names are the same for every implementation. A normal
+repository needs none of this. It needs one `measure` command and the Git default.
 
-## Adding a new domain (the target workflow)
+## Add a new domain
 
-1. `crucible init` scaffolds a starter `crucible.toml` + measure stub onto the repo (or write
-   one by hand):
+1. `crucible init` creates a starter `crucible.toml` and a measure script in the repository.
+   You can also write the manifest by hand:
    ```toml
    [repo]      url|path, ref
    [workspace] setup_cmd          # optional; default: git clone + checkout
@@ -267,21 +279,22 @@ git default.
    [world]     apply_cmd?, snapshot_cmd?, restore_cmd?   # omitted → git
    ```
 2. Write a `measure` command (any language) that prints `{valid, score, solved?}`.
-3. `crucible check --manifest crucible.toml` validates it (every referenced file resolves,
-   `measure_cmd` runs once and prints the contract shape) with no agent turn spent.
-4. Run `crucible --manifest crucible.toml`. You get the loop, budget, all frontends,
-   steer/stop/resume, the session log, and escalation, free.
+3. `crucible check --manifest crucible.toml` validates the manifest without an agent turn.
+   It checks that every referenced file resolves, and it runs `measure_cmd` one time to check
+   the output format.
+4. Run `crucible --manifest crucible.toml`. The engine supplies the loop, the budget, all
+   frontends, steer, stop, and resume, the session log, and escalation.
 
-The litmus test for "framework, not demo": any second repo runs this way with **no
-new Rust**.
+Any other repository can run this way with **no new Rust**.
 
 ## The task lane: no `[judge]`
 
-Some work has no objective to score: "consolidate the open dependabot PRs", "fix flaky
-tests nightly". Omit `[judge]` entirely and the run becomes a **task**: the loop runs as
-ever (sandbox, broker, session log, publish, resume), but with the built-in keep-everything
-`TaskJudge` — no baseline measure, no score, every completed turn is kept and snapshotted,
-and the run exits 0 when the iterations are spent ([ADR-0026](./adr/0026-no-judge-task-lane.md)).
+Some work has no objective to score, for example "consolidate the open dependabot PRs" or
+"fix flaky tests every night". If you omit `[judge]`, the run is a **task**. The loop runs as
+usual (sandbox, broker, session log, publish, resume), with the built-in `TaskJudge`, which
+keeps everything. There is no baseline measure and no score. The engine keeps and snapshots
+every completed turn. The run exits with status 0 when no iterations remain
+([ADR-0026](./adr/0026-no-judge-task-lane.md)).
 
 ```toml
 [repo]
@@ -293,87 +306,91 @@ goal = "Consolidate the open dependabot PRs into one branch; run the tests."
 pr_repo = "you/repo-fork"   # the deliverable: kept commits as one draft PR
 ```
 
-On the wire the run is the normal shape with `gate: "task"` as the discriminator: an iter-0
-`baseline-skipped` row, then `keep` rows with `score: null`, `Summary.best_score` null.
-`crucible check` skips the measure probe and instead requires a goal, printing a loud
-"task mode" notice. Things to know:
+On the wire, the run has the normal format, with `gate: "task"` as the discriminator: an
+iteration-0 `baseline-skipped` row, then `keep` rows with `score: null`, and
+`Summary.best_score` null. `crucible check` does not probe the measure. It requires a goal
+and prints a "task mode" notice. Notes:
 
-- Exit 0 means the run completed, not that the chore succeeded — inspect the rows or the PR.
-- `solved` never fires; the iteration budget is the only terminator (`--no-early-stop` is a
-  no-op).
-- The trust boundary is unchanged: the agent still holds no credentials. Output lands as a
-  draft PR; privileged write actions (merging, closing issues) stay broker-tool material.
-- Composites still require `[judge]`; so do `[search]`, `[workflow]`, and `[preflight]`,
-  which a task manifest rejects at load. The scope pipeline still rejects judge-less
-  proposed packs, and a scored judge may not claim `objective = "task"`.
+- Exit status 0 means that the run completed. It does not mean that the task succeeded.
+  Examine the rows or the PR.
+- `solved` does not occur. Only the iteration limit ends the run (`--no-early-stop` has no
+  effect).
+- The trust boundary does not change. The agent has no credentials. The output is a draft
+  PR. Privileged write actions (merge, close issues) stay in broker tools.
+- Composites still need `[judge]`. `[search]`, `[workflow]`, and `[preflight]` also need it,
+  and a task manifest rejects them at load. The scope pipeline rejects proposed packs without
+  a judge, and a scored judge cannot use `objective = "task"`.
 
-`examples/task/` is the runnable reference (deterministic `command` backend, no LLM), and
-[Tasks: general-purpose orchestration](./task-lane.md) is the full how-to.
+`examples/task/` is the runnable reference (deterministic `command` backend, no LLM).
+[Tasks: the no-judge lane](./task-lane.md) is the full guide.
 
 ## Distress: the agent can page you
 
-A doomed run used to burn its budget quietly. The broker exposes a `distress` tool so the
-agent can say so, with a required severity that decides what happens:
+The broker has a `distress` tool. The agent uses it to report that a run cannot succeed. The
+required severity sets the result:
 
 | severity | Slack | Run |
 | --- | --- | --- |
-| `info` | posted | continues; the note lands on the next decided row in `RESULTS.md` |
-| `warn` | posted | continues; same note channel |
-| `error` | posted | **suspends**: the current turn finishes and is decided, then the loop parks with the pod alive and state preserved |
+| `info` | posted | continues. The note goes on the next decided row in `RESULTS.md`. |
+| `warn` | posted | continues. The note goes to the same place. |
+| `error` | posted | **suspends**. The current turn finishes and the engine decides it. Then the loop parks. The pod stays alive and keeps its state. |
 
-`error` is for runs that cannot succeed without you: the same environment failure recurring
-across iterations, a missing capability, a goal that is infeasible as specified. It is not for
-hard-but-possible tasks. The tool replies `{"status":"suspending"}` and the agent wraps up its
-turn; the suspend happens at the next iteration head, after that turn's bookkeeping, so nothing
-is lost. Repeat `error` calls while suspended are no-ops. If the marker cannot be written (a full
-or read-only volume) the tool returns an error instead of `suspending` and posts nothing: the run
-is not suspended, so neither the agent nor the page may claim it is.
+Use `error` for a run that cannot succeed without an operator: the same environment failure
+in many iterations, a missing capability, or a goal that is not possible as written. Do not
+use it for a task that is difficult but possible. The tool replies `{"status":"suspending"}`,
+and the agent finishes its turn. The suspend occurs at the start of the next iteration, after
+the engine records that turn, so no data is lost. More `error` calls during the suspend have
+no effect. If the engine cannot write the marker (a full or read-only volume), the tool
+returns an error, not `suspending`, and posts nothing. The run is not suspended, so the agent
+and the page must not report that it is.
 
-Mechanically the suspend is a pending approval: the loop opens the same `approval_wait` bracket
-provisioning uses, so suspended wall-clock accrues to `parked_total` and is excluded from
-`--max-time`. The distressed iteration still counts (its turn ran); the suspended time counts
-against nothing. `--max-park` bounds the wait.
+The suspend is a pending approval. The loop opens the same `approval_wait` bracket that
+provisioning uses, so suspended wall-clock time goes to `parked_total` and does not count
+toward `--max-time`. The distressed iteration still counts, because its turn ran. The
+suspended time counts against no limit. `--max-park` limits the wait.
 
-The handoff is one file on the loop pod's forge-storage volume, `/var/lib/forge/distress`.
-Deleting it is the resume grant:
+The signal is one file on the forge-storage volume of the loop pod:
+`/var/lib/forge/distress`. To resume the run, delete the file:
 
 ```sh
 oc exec <pod> -n <ns> -- rm /var/lib/forge/distress   # resume in place
 ```
 
-For a fix that has to be baked at pod start (image pins, the pack, resources), re-roll the pod
-instead: the marker lives on an emptyDir, so the replacement starts clean, and a resume that
-finds the dangling distress bracket does not re-park. Info/warn notes ride
-`/var/lib/forge/distress-notes.jsonl` and are consumed onto the next row.
+If the fix must be in place at pod start (image pins, the pack, resources), replace the pod.
+The marker is on an emptyDir, so the new pod starts without it. A resume that finds the open
+distress bracket does not park again. Info and warn notes go to
+`/var/lib/forge/distress-notes.jsonl`, and the engine adds them to the next row.
 
-Env the render stamps on the loop pod (the broker inherits it, so the page can name the run):
-`CRUCIBLE_RUN_NAME`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_LOOP_IMAGE`, alongside the existing
-downward-API `CRUCIBLE_POD_NAME` / `CRUCIBLE_POD_NAMESPACE`. A controller-dispatched pod also
-carries `CRUCIBLE_RUN_DISPLAY_NAME`, the run's two-word name (`benevolent-monkey`), which the page
-and report cards show in place of the run id; links still use the id. Slack is webhook-only: point
-`SLACK_WEBHOOK_URL` at an incoming webhook through the profile's `[[secret_env]]`, and set
-`DATADOG_BASE_URL` if your Datadog site is not `app.datadoghq.com`. With no webhook configured
-the suspend still happens; delivery is fire-and-forget by design.
+The render sets these variables on the loop pod. The broker inherits them, so the page can
+name the run: `CRUCIBLE_RUN_NAME`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_LOOP_IMAGE`, and the
+downward-API `CRUCIBLE_POD_NAME` and `CRUCIBLE_POD_NAMESPACE`. A pod that the controller
+dispatches also has `CRUCIBLE_RUN_DISPLAY_NAME`, the two-word name of the run
+(`benevolent-monkey`). The page and report cards show this name instead of the run id. Links
+still use the id. Slack supports only webhooks. Set `SLACK_WEBHOOK_URL` to an incoming
+webhook through the `[[secret_env]]` of the profile. Set `DATADOG_BASE_URL` if your Datadog
+site is not `app.datadoghq.com`. Without a webhook, the suspend still occurs. The engine sends
+the page one time and does not retry.
 
 ## `crucible flow`: explain a finished run
 
-`crucible flow --session state/session.jsonl --out flow.html` folds a finished run into a
-small flow-model IR and renders it; the `--out` extension picks `.json` (the IR itself),
-`.dot`, `.mmd`, or `.html` — a self-contained explainer page: header strip, a swimlane of
-iterations (agent turn + check ladder per column, scores vs baseline), per-iteration
-detail, and the draft-PR footer. An optional `--spans <dd-export.json>` (Datadog APM) adds
-real wall-clock: time-proportional columns, check durations, the agent's tool-call timeline.
+`crucible flow --session state/session.jsonl --out flow.html` converts a finished run into a
+small flow-model IR and renders it. The `--out` extension selects the format: `.json` (the
+IR), `.dot`, `.mmd`, or `.html`. The HTML format is a self-contained page with a header, a
+swimlane of iterations (agent turn and check ladder in each column, scores against the
+baseline), detail for each iteration, and the draft-PR footer. The optional
+`--spans <dd-export.json>` (Datadog APM) adds real wall-clock time: columns in proportion to
+time, check durations, and the tool-call timeline of the agent.
 
-## Concept → code (where to look)
+## Concept to code
 
-- loop / budget / keep-discard: `crucible/src/run.rs` + `crucible/src/loop_driver.rs`
+- loop, budget, keep/discard: `crucible/src/runloop/driver.rs`, `crucible/src/runloop/graph.rs`
 - the contract traits: `crucible/src/crucible.rs`
-- World/Judge batteries: `crucible/src/command_world.rs` (`GitWorld`/`CommandWorld`/`CompositeWorld`), `crucible/src/command_judge.rs` (`CommandJudge`)
-- composite domains: `crucible/src/manifest.rs` (`CompositeManifest`) + `crucible/src/run.rs` (`run_composite`)
-- mediated broker (provisioning / issue tracker / profiler / draft PR): `crucible-broker/`
-- distress (agent-raised suspend + the Slack page): `crucible-broker/src/distress.rs` + `crucible/src/distress.rs`
-- engine-side build + rendered deploy: `forge/` (build, native-OCI derive, kube-rs) + `crucible/src/deploy/`
-- agent transport: `crucible/src/agent.rs`
-- frontends: `crucible/src/{console,jsonl,stream}.rs`
-- session log wire format: `crucible/src/session.rs`
-- the example domain: `examples/counter/` (manifest + `measure.nu` + `bump.nu`)
+- World and Judge implementations: `crucible/src/command_world.rs` (`GitWorld`, `CommandWorld`, `CompositeWorld`), `crucible/src/command_judge.rs` (`CommandJudge`)
+- composite domains: `crucible/src/manifest/mod.rs` (`CompositeManifest`), `crucible/src/cli/scored.rs` (`run_composite`)
+- broker (provisioning, issue tracker, profiler, draft PR): `crucible-broker/`
+- distress (suspend from the agent, and the Slack page): `crucible-broker/src/distress.rs`, `crucible/src/control/distress.rs`
+- build and rendered deploy in the engine: `forge/` (build, native-OCI derive, kube-rs), `crucible/src/deploy/`
+- agent transport: `crucible/src/agent/`
+- frontends: `crucible/src/report/{console,stream}.rs`
+- session log wire format: `crucible/src/report/session.rs`
+- the example domain: `examples/counter/` (manifest, `measure.nu`, `bump.nu`)

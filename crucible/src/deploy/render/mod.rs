@@ -16,6 +16,7 @@
 //! WorkPod turn renderer), the two share only the profile-derived helpers (`resources`,
 //! `secret_env_vars`, `node_avoid_affinity`) and a handful of mount-path consts.
 
+pub mod gateway;
 mod kube;
 mod turn;
 
@@ -53,7 +54,7 @@ pub(in crate::deploy) fn pin_image(
 
 pub use kube::{
     MANAGED_BY_LABEL, PACK_TARBALL_KEY, PackDelivery, PlaybookLaunch, RUN_INPUTS_KEY, RenderInput,
-    RenderOpts, render,
+    RenderOpts, RerunLaunch, render,
 };
 pub(in crate::deploy) use kube::{node_avoid_affinity, role_binding};
 pub use turn::{PackPath, PackPathError, ProposeTier, TurnKind, TurnOpts, render_turn};

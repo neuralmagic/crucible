@@ -1,9 +1,10 @@
 # How the loop works
 
-The autoresearch lane in one diagram: a goal goes in, an agent proposes a change, the change is
-applied to a reversible **world**, a **frozen judge** measures it once, and the loop keeps it
-only if it strictly beats the best so far. Git is the memory; the operator can steer; the
-privileged operations live host-side behind a mediated broker the agent can only *ask*.
+This diagram shows the autoresearch lane. A goal goes in, and an agent proposes a change.
+The engine applies the change to a reversible **world**. A **frozen judge** measures it one
+time. The loop keeps the change only if it is strictly better than the best result so far.
+Git stores the accepted states, and the operator can steer the run. Privileged operations run
+on the host in a broker. The agent can only send requests to the broker.
 
 ```mermaid
 flowchart TD
@@ -38,7 +39,7 @@ flowchart TD
 
     control -. "steer / stop / resume / budget" .-> loop
 
-    subgraph broker["Mediated MCP broker: host holds the keys, agent only asks"]
+    subgraph broker["MCP broker: the host keeps the credentials, the agent sends requests"]
         direction TB
         prov["provisioning<br/>GPU / Kueue, capture RBAC"]
         jira["issue-tracker grounding"]
@@ -53,47 +54,47 @@ flowchart TD
     remember -->|publish-on-keep| s3[("S3 run records<br/>session.jsonl · summary.json · diffs")]
     remember --> draft
     draft -->|review comments re-steer| steer
-    remember -->|ingest API, optional| ctl["control plane<br/>(crucible-contract ingest)"]
+    remember -->|evidence upload, pod token| ctl["control plane<br/>(crucible-controller)"]
 ```
 
-The control shell around that loop, the gates between iterations and the ways a run ends, is
-its own generated diagram: [Loop control states](./loop-states.md).
+[Loop control states](./loop-states.md) is a generated diagram of the controls around the
+loop: the gates between iterations and the ways a run ends.
 
 ## The stages
 
 | Stage | What happens | Deeper |
 | --- | --- | --- |
-| **Goal** | A GitHub issue or Jira ticket becomes a frozen run objective. The objective never moves once the run starts. | [ADR 0001](./adr/0001-adaptive-harness.md) |
-| **wide round** | Optional: `--wide N` fans out N independent propose turns (one per `[search].approaches` entry) in parallel, ranks them by the gate, and the winner seeds the deep loop below. 0 (default) skips straight to propose. | [ADR 0010](./adr/0010-candidate-portfolios-and-search.md) |
-| **propose** | The agent reads the history and edits the world toward the goal. The proposal policy is a pluggable backend (`local` / `openshell` / `command`), not the engine. | [The loop in one read](./crucible.md) |
-| **apply** | Make the candidate live. For a code repo the edits *are* the apply; for a deploy domain it builds + sets the image. | [ADR 0005](./adr/0005-engine-side-builds.md), [ADR 0012](./adr/0012-rendered-deployments.md) |
-| **measure** | The frozen judge scores the candidate once. The agent is handed a `World`, never the `Judge`, so it can't tune the test it's graded on. | [ADR 0001](./adr/0001-adaptive-harness.md) |
-| **accept?** | Keep iff `valid` and the score strictly beats the best per `direction`; otherwise restore the last good state. | [Contract](./crucible-contract.md) |
-| **as a plan** | Every iteration runs as a work-graph plan (`propose -> apply -> measure -> decide`) through the shared executor; an authored workflow replaces the default graph. | [Work graphs](./work-graphs.md) |
-| **remember** | Kept states are git commits; every step is an NDJSON session event. Git is the durable memory. Every run also emits exactly one `shutdown` event as its last line, so the viewer (and any published record) can tell a clean end from a pod that died mid-run. | [ADR 0004](./adr/0004-core-loop-state-model.md) |
-| **broker** | Provisioning, issue-tracker grounding, the profiler, build/deploy, and draft PRs live host-side. The agent asks over MCP; the privilege never enters its sandbox. | [ADR 0002](./adr/0002-mediated-provisioning-mcp.md), [ADR 0006](./adr/0006-profiling-over-mcp.md) |
-| **publish** | On keep, the run record ships to S3 and a draft PR per fork; authorized review comments re-steer the run. An optional private control plane can ingest run records over the `crucible-contract` HTTP API and render leaderboards and per-run pages; the loop never links it. | [Contract](./crucible-contract.md) |
+| **Goal** | A GitHub issue or Jira ticket becomes a frozen run objective. The objective does not change after the run starts. | [ADR 0001](./adr/0001-adaptive-harness.md) |
+| **wide round** | Optional. `--wide N` runs N independent propose turns in parallel, one for each `[search].approaches` entry. The gate ranks them, and the winner is the start point of the deep loop. With 0 (default), the run starts at propose. | [ADR 0010](./adr/0010-candidate-portfolios-and-search.md) |
+| **propose** | The agent reads the history and edits the world toward the goal. A backend (`local`, `openshell`, or `command`) supplies the proposal policy. The engine does not. | [The loop in one read](./crucible.md) |
+| **apply** | Makes the candidate live. For a code repository, the edits are the apply step. For a deploy domain, apply builds and sets the image. | [ADR 0005](./adr/0005-engine-side-builds.md), [ADR 0012](./adr/0012-rendered-deployments.md) |
+| **measure** | The frozen judge scores the candidate one time. The agent gets a `World` but not the `Judge`, so it cannot change the test that grades it. | [ADR 0001](./adr/0001-adaptive-harness.md) |
+| **accept?** | Keeps the candidate only if it is `valid` and its score is strictly better than the best score in the `direction`. Otherwise, restores the last good state. | [Contract](./crucible-contract.md) |
+| **as a plan** | Every iteration runs as a work-graph plan (`propose -> apply -> measure -> decide`) through the shared executor. An authored workflow replaces the default graph. | [Work graphs](./work-graphs.md) |
+| **remember** | Kept states are Git commits. Each step is an NDJSON session event. Git is the durable store. Each run writes exactly one `shutdown` event as its last line, so the viewer and any published record can tell a clean end from a pod that stopped during the run. | [ADR 0004](./adr/0004-core-loop-state-model.md) |
+| **broker** | Provisioning, issue-tracker grounding, the profiler, build and deploy, and draft PRs run on the host. The agent sends requests over MCP. The privileges do not go into its sandbox. | [ADR 0002](./adr/0002-mediated-provisioning-mcp.md), [ADR 0006](./adr/0006-profiling-over-mcp.md) |
+| **publish** | On keep, the engine sends the run record to S3 and opens a draft PR for each fork. Authorized review comments steer the run again. A pod that the control plane dispatches uploads its evidence to the controller with its pod token, and the controller shows leaderboards and run pages. The engine binary does not link the controller. | [Contract](./crucible-contract.md) |
 
 ## Glossary
 
-The loop leans on a few overloaded words. The two that trip people up most are **World**
-and **Judge**: they're the trust boundary, and they mean something specific here.
+Some words have a specific meaning in the loop. **World** and **Judge** are the most
+important, because they define the trust boundary.
 
 | Term | Plain English | What it actually is |
 | --- | --- | --- |
-| **World** | The workspace the agent is allowed to change. | The reversibly-mutable state: the code tree, and for a deploy domain the live deployment too. `GitWorld` / `CommandWorld`. The agent only ever touches the World. |
-| **Judge** | The measurement script + the pass/win threshold. | The frozen objective: runs `measure`, gets `{valid, score, solved}`, and decides keep-or-discard per `direction`. `CommandJudge`. The agent never gets to touch it. |
-| **Candidate** | The change being graded this iteration. | One proposed mutation of the World, applied and then measured once. |
-| **measure / gate** | "Score this candidate." | The command that prints `{valid, score, solved?}`; nonzero exit = invalid. The Judge's scoring step. |
-| **keep / discard** | Accept or reject. | Keep iff `valid` and the score strictly beats the best per `direction`; otherwise restore the last good state. |
-| **direction** | Which way is "better." | `lower` (e.g. p99 latency) or `higher` (e.g. success rate). |
-| **Agent / backend** | Who proposes the change. | The proposal policy that edits the World: `local` (in-process Claude), `openshell` (sandboxed), or `command`. Set by `[agent].backend`. |
-| **snapshot / restore** | Save point and rollback. | An opaque token for the current World state, and rolling back to it. Defaults to a git ref + `git reset --hard`. |
-| **Domain** | A problem packaged for the loop. | A `crucible.toml` manifest + a few executables (`measure`, optional `apply`/`snapshot`/`restore`). Mostly no Rust. |
-| **Composite domain** | Several domains run as one. | A vector of component domains assembled into a single run (e.g. a router plus the model server it fronts), with one combined gate. |
-| **Deployment** | The live test environment. | The cluster topology a deploy domain stands up to measure against. |
-| **Broker** | The host-side keykeeper. | The mediated MCP service that holds all privilege (provisioning, issue-tracker access, profiler, build/deploy, draft PRs). The agent *asks*; the broker acts. |
-| **forge** | The builder. | Engine-side image build + deploy: `buildah` for real source builds, native-OCI `derive_layer` for "base image + an edited file." |
-| **publish-on-keep** | Ship a winner. | On a kept candidate, push the run record to S3 and open/update a draft PR per fork. |
+| **World** | The workspace that the agent can change. | The state that the engine can change and restore: the code tree, and for a deploy domain also the live deployment. `GitWorld` / `CommandWorld`. The agent changes only the World. |
+| **Judge** | The measurement script and the pass threshold. | The frozen objective. It runs `measure`, gets `{valid, score, solved}`, and decides keep or discard in the `direction`. `CommandJudge`. The agent cannot change it. |
+| **Candidate** | The change that the iteration grades. | One proposed change of the World. The engine applies it and measures it one time. |
+| **measure / gate** | The scoring step. | The command that prints `{valid, score, solved?}`. A nonzero exit status makes the result invalid. This is the scoring step of the Judge. |
+| **keep / discard** | Accept or reject. | Keep only if the result is `valid` and the score is strictly better than the best score in the `direction`. Otherwise, restore the last good state. |
+| **direction** | The meaning of better. | `lower` (for example, p99 latency) or `higher` (for example, success rate). |
+| **Agent / backend** | The source of the change. | The proposal policy that edits the World: `local` (the harness on the host), `openshell` (sandboxed), or `command`. `[agent].backend` sets it. |
+| **snapshot / restore** | Save point and rollback. | An opaque token for the current World state, and the rollback to it. The default is a Git ref and `git reset --hard`. |
+| **Domain** | A problem packaged for the loop. | A `crucible.toml` manifest and some executables (`measure`, and optionally `apply`, `snapshot`, `restore`). Usually no Rust. |
+| **Composite domain** | Several domains that run as one. | A list of component domains in one run (for example, a router and the model server behind it), with one combined gate. |
+| **Deployment** | The live test environment. | The cluster topology that a deploy domain creates for measurement. |
+| **Broker** | The host-side service that keeps credentials. | The MCP service that holds all privileges (provisioning, issue-tracker access, profiler, build and deploy, draft PRs). The agent sends a request, and the broker does the operation. |
+| **forge** | The builder. | Image build and deploy in the engine: `buildah` for source builds, and native-OCI `derive_layer` for a base image with an edited file. |
+| **publish-on-keep** | Publish a kept result. | For a kept candidate, push the run record to S3 and open or update a draft PR for each fork. |
 
-For the prose version of the same model, see [The loop in one read](./crucible.md).
+[The loop in one read](./crucible.md) describes the same model in text.

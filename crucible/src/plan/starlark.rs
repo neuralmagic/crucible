@@ -5,9 +5,10 @@
 
 pub mod error;
 mod globals;
-mod idents;
+pub mod idents;
 mod loader;
 pub mod params;
+pub mod placeholder;
 pub mod reference;
 mod values;
 
@@ -34,7 +35,7 @@ use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
     MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SCHEMA_BYTES, MAX_SOURCE_BYTES,
-    MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, SourceAnchor,
+    MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, Site, SourceAnchor,
 };
 use crate::plan::starlark::values::{SchemaFile, SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
@@ -441,6 +442,8 @@ enum Value {
     Answer(values::AnswerRef),
     /// `schema_file(path)`.
     Schema(SchemaFile),
+    /// `optional(task)`: a dependency whose settling not taken satisfies an `all` join.
+    Optional(TaskName),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -465,12 +468,28 @@ impl CompileError {
     /// Where the error was found, if it was located. A consumer places a marker from this rather
     /// than parsing the `file:line:col` out of the rendered message.
     pub fn anchor(&self) -> Option<SourceAnchor> {
+        self.anchors().into_iter().next()
+    }
+
+    /// Every place the error was found.
+    pub fn anchors(&self) -> Vec<SourceAnchor> {
         match self {
             CompileError::At { at, inner } => {
-                Some(inner.anchor().unwrap_or_else(|| SourceAnchor::from(at)))
+                let inner = inner.anchors();
+                if inner.is_empty() {
+                    vec![SourceAnchor::from(at)]
+                } else {
+                    inner
+                }
             }
-            CompileError::Parse { at, .. } => at.clone(),
-            _ => None,
+            CompileError::Parse { at, .. } => at.iter().cloned().collect(),
+            CompileError::DroppedTasks { sites }
+            | CompileError::LateSessionDeclaration { sites }
+            | CompileError::UnboundSessions { sites } => sites
+                .iter()
+                .map(|site| SourceAnchor::from(&site.at))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -540,7 +559,7 @@ const SCORED_FUNCTIONS: &[&str] = &[
 ];
 
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
-const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route", "score"];
+const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "optional", "route", "score"];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
@@ -795,7 +814,7 @@ fn constructor(
     }
     if matches!(
         function,
-        "prompt_file" | "schema_file" | "param" | "default_autoresearch"
+        "prompt_file" | "schema_file" | "param" | "optional" | "default_autoresearch"
     ) {
         return Err(CompileError::NotOnePositional {
             function: function.to_owned(),
@@ -893,6 +912,7 @@ fn constructor(
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -935,6 +955,7 @@ fn constructor(
                 when: None,
                 history: None,
                 repair: 0,
+                optional: Vec::new(),
             }
         }
         "route" => {
@@ -957,9 +978,11 @@ fn constructor(
                 (None, Some(task)) => (Decider::Output { task }, "any"),
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
             };
+            let (depends_on, optional) = take_dependencies(&mut named)?;
             let task = Task {
                 task: TaskKind::Route { questions, decider },
-                depends_on: take_task_names(&mut named)?,
+                depends_on,
+                optional,
                 session: None,
                 needs: needs.to_owned(),
                 required: take_bool_default(&mut named, "required", true)?,
@@ -1212,10 +1235,12 @@ fn dsl_task(
 ) -> Result<Task> {
     let when = take_when(named, state, &name)?;
     let repair = take_repair(named, &kind)?;
+    let (depends_on, optional) = take_dependencies(named)?;
     let task = Task {
         name,
         task: kind,
-        depends_on: take_task_names(named)?,
+        depends_on,
+        optional,
         session,
         needs: take_string_default(named, "needs", "any")?,
         required: take_bool_default(named, "required", true)?,
@@ -1708,6 +1733,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         timeout: None,
         history: None,
         repair: 0,
+        optional: Vec::new(),
     }
 }
 
@@ -2111,6 +2137,32 @@ fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>>
     take_named_task_names_optional(named, "depends_on")
 }
 
+/// `depends_on` where an entry may be `optional(...)`: every dependency, and the optional ones.
+fn take_dependencies(
+    named: &mut BTreeMap<String, Value>,
+) -> Result<(Vec<TaskName>, Vec<TaskName>)> {
+    let Some(value) = named.remove("depends_on") else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let Value::List(entries) = value else {
+        return Err(CompileError::TaskNamesNotList {
+            argument: "depends_on".to_owned(),
+        });
+    };
+    let mut depends_on = Vec::with_capacity(entries.len());
+    let mut optional = Vec::new();
+    for entry in entries {
+        match entry {
+            Value::Optional(name) => {
+                optional.push(name.clone());
+                depends_on.push(name);
+            }
+            entry => depends_on.push(task_name_entry("depends_on", entry)?),
+        }
+    }
+    Ok((depends_on, optional))
+}
+
 fn take_named_task_names(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Vec<TaskName>> {
     if !named.contains_key(name) {
         return Err(CompileError::MissingArgument {
@@ -2137,14 +2189,21 @@ fn task_names(argument: &str, value: Value) -> Result<Vec<TaskName>> {
     };
     names
         .into_iter()
-        .map(|name| match name {
-            Value::String(name) => Ok(TaskName(name)),
-            Value::Task(task) => Ok(task.name),
-            _ => Err(CompileError::TaskNameEntryWrongType {
-                argument: argument.to_owned(),
-            }),
-        })
+        .map(|name| task_name_entry(argument, name))
         .collect()
+}
+
+fn task_name_entry(argument: &str, entry: Value) -> Result<TaskName> {
+    match entry {
+        Value::String(name) => Ok(TaskName(name)),
+        Value::Task(task) => Ok(task.name),
+        Value::Optional(_) => Err(CompileError::OptionalOutsideDependsOn {
+            argument: argument.to_owned(),
+        }),
+        _ => Err(CompileError::TaskNameEntryWrongType {
+            argument: argument.to_owned(),
+        }),
+    }
 }
 
 fn isolation(isolated: bool) -> Option<Isolation> {
@@ -2446,28 +2505,32 @@ fn compile_source_here(
     })??;
     let context = state.into_context();
     let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
-    let dropped: Vec<String> = context
+    let site = |name: &String, at: &FileSpan| Site {
+        name: name.clone(),
+        at: at.clone(),
+    };
+    let dropped: Vec<Site> = context
         .constructed_tasks
         .iter()
         .filter(|(name, _)| !included.contains(name.as_str()))
-        .map(|(name, site)| format!("{name:?} ({site})"))
+        .map(|(name, at)| site(name, at))
         .collect();
     if !dropped.is_empty() {
         return Err(CompileError::DroppedTasks { sites: dropped });
     }
     if !context.sessions.is_empty() && !context.string_session_refs.is_empty() {
-        let refs: Vec<String> = context
+        let refs: Vec<Site> = context
             .string_session_refs
             .iter()
-            .map(|(name, site)| format!("{name:?} ({site})"))
+            .map(|(name, at)| site(name, at))
             .collect();
         return Err(CompileError::LateSessionDeclaration { sites: refs });
     }
-    let unbound: Vec<String> = context
+    let unbound: Vec<Site> = context
         .sessions
         .iter()
         .filter(|(name, _)| !context.bound_sessions.contains(*name))
-        .map(|(name, (_, site))| format!("{name:?} ({site})"))
+        .map(|(name, (_, at))| site(name, at))
         .collect();
     if !unbound.is_empty() {
         return Err(CompileError::UnboundSessions { sites: unbound });
@@ -2502,7 +2565,7 @@ fn budgets(eval: &mut Evaluator<'_, '_, '_>) -> Result<()> {
 /// (`not not not x`, `1 + 1 + 1`, `1 if c else 1 if c else 1` all recurse and none of them
 /// bracket). Over-counting only refuses sources no author writes: a real statement is a handful
 /// of operators inside two or three brackets.
-pub(crate) fn reject_deep_nesting(source: &str, filename: &Path) -> Result<()> {
+pub fn reject_deep_nesting(source: &str, filename: &Path) -> Result<()> {
     let mut depth: usize = 0;
     let mut operators: usize = 0;
     let mut line: usize = 1;
@@ -2637,7 +2700,7 @@ fn catching_panics<T>(evaluate: impl FnOnce() -> T) -> Result<T> {
 /// The globals one lane sees. The scored constructors are not merely refused for a playbook,
 /// they are absent, so `measure` in a playbook is an unknown name rather than a name that
 /// compiles and fails validation later.
-fn lane_globals(lane: WorkflowType) -> Globals {
+pub fn lane_globals(lane: WorkflowType) -> Globals {
     let builder = GlobalsBuilder::standard().with(globals::common);
     match lane {
         WorkflowType::Playbook => builder.with(globals::routed).build(),
@@ -2646,7 +2709,8 @@ fn lane_globals(lane: WorkflowType) -> Globals {
     }
 }
 
-fn dialect() -> Dialect {
+/// The dialect every workflow source and loaded module is parsed with.
+pub fn dialect() -> Dialect {
     Dialect {
         enable_top_level_stmt: true,
         enable_load_reexport: false,
@@ -3291,6 +3355,80 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
         assert_eq!(when("page").as_deref(), Some("gate.urgent in yes"));
         assert_eq!(when("wrap"), None);
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn with_report(dependencies: &str) -> String {
+        ROUTED
+            .replace(
+                "workflow(type = \"playbook\", tasks = [classify, gate, fix, punt, page, wrap], result = wrap)",
+                &format!(
+                    "report = command(name = \"report\", run = \"./report.sh\", {dependencies})\n\
+                     workflow(type = \"playbook\", tasks = [classify, gate, fix, punt, page, wrap, report], result = wrap)"
+                ),
+            )
+    }
+
+    #[test]
+    fn optional_marks_a_dependency_in_the_compiled_graph() {
+        let pack = temp_pack("routed-optional");
+        for dependencies in [
+            "depends_on = [classify, optional(fix)]",
+            "depends_on = [\"classify\", optional(\"fix\")]",
+        ] {
+            let source = with_report(dependencies);
+            let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+            let report = compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == "report")
+                .unwrap();
+            assert_eq!(report.depends_on, ["classify".into(), "fix".into()]);
+            assert_eq!(report.optional, [TaskName::from("fix")]);
+            let text = toml::to_string(&compiled.workflow).unwrap();
+            assert!(text.contains("optional = [\"fix\"]"), "{text}");
+            let back: WorkflowCfg = toml::from_str(&text).unwrap();
+            back.validate().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn optional_is_refused_where_it_cannot_apply() {
+        let cases = [
+            (
+                "depends_on = [optional(fix), punt], join = \"passed\"",
+                "an optional dependency needs join = \"all\"",
+            ),
+            (
+                "depends_on = [optional(classify)]",
+                "optional dependency \"classify\" can never settle not taken",
+            ),
+            (
+                "depends_on = [fix], revise = [optional(fix)], max_rounds = 2",
+                "here revise takes plain tasks",
+            ),
+            (
+                "depends_on = [optional(fix, punt)]",
+                "optional() takes exactly one positional argument",
+            ),
+        ];
+        for (dependencies, expected) in cases {
+            let err = routed_error("routed-optional-refused", &with_report(dependencies));
+            assert!(err.contains(expected), "{dependencies}: {err}");
+        }
+    }
+
+    #[test]
+    fn optional_is_not_callable_in_an_autoresearch_workflow() {
+        let names: BTreeSet<String> = lane_globals(WorkflowType::Autoresearch)
+            .names()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        assert!(!names.contains("optional"));
+        for lane in [WorkflowType::Playbook, WorkflowType::Custom] {
+            assert!(dsl_functions(lane).contains(&"optional"), "{lane:?}");
+        }
     }
 
     #[test]
@@ -5639,6 +5777,10 @@ workflow(type = "playbook", tasks = [a])
                 "\"x\": {\"type\": \"string\"}",
                 "neither required nor defaulted",
             ),
+            (
+                "\"x\": {\"type\": \"list<string>\", \"default\": [], \"multiline\": True}",
+                "declares multiline but is a list<string>",
+            ),
         ];
         for (decl, expected) in bad {
             let source =
@@ -5689,6 +5831,10 @@ workflow(type = "playbook", tasks = [a])
             (
                 "\"x\": {\"type\": 5, \"default\": \"d\"}",
                 "field type must be a string literal",
+            ),
+            (
+                "\"x\": {\"type\": \"string\", \"default\": \"d\", \"multiline\": 1}",
+                "field multiline must be True or False",
             ),
         ];
         for (decl, expected) in bad {

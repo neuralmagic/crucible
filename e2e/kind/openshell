@@ -1,0 +1,5 @@
+#!/bin/sh
+# Stand-in for the openshell CLI: `gateway add` registers nothing and succeeds, so a boot fails its
+# health probe at once instead of retrying the registration; anything else fails.
+set -eu
+[ "${1:-} ${2:-}" = "gateway add" ] || { echo "openshell stand-in: only gateway add" >&2; exit 1; }

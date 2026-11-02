@@ -940,6 +940,8 @@ mod tests {
                     emits: Vec::new(),
                     emits_files: Vec::new(),
                     history_depth: 0,
+                    definition: String::new(),
+                    optional: Vec::new(),
                 },
                 PlanTaskWire {
                     name: "measure".into(),
@@ -960,6 +962,8 @@ mod tests {
                     emits: Vec::new(),
                     emits_files: Vec::new(),
                     history_depth: 0,
+                    definition: String::new(),
+                    optional: Vec::new(),
                 },
             ],
             history_record: String::new(),

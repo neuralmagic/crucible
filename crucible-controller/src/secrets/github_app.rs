@@ -10,8 +10,10 @@
 //! mint covers both halves of `engine::open_pack_pr`.
 //!
 //! Configured by three env vars (all-or-nothing, see [`GithubAppTokenSource::from_env`]):
-//! `CONTROLLER_GITHUB_APP_ID`, `CONTROLLER_GITHUB_APP_INSTALLATION_ID`, and
-//! `CONTROLLER_GITHUB_APP_KEY_PATH` (the PEM the chart mounts from a secret). The handle is
+//! `CONTROLLER_GITHUB_APP_ID`, `CONTROLLER_GITHUB_APP_INSTALLATION_ID` (the home installation the
+//! pack PRs push through), and `CONTROLLER_GITHUB_APP_KEY_PATH` (the PEM the chart mounts from a
+//! secret). A token for another account the App is installed on is minted through that account's
+//! installation, looked up by login. The handle is
 //! threaded onto [`crate::config::ControllerCfg`] at startup — the same `#[arg(skip)]` shape as
 //! the autopilot flag — so every `cfg.clone()` shares the one token cache.
 
@@ -55,6 +57,55 @@ struct InstallationTokenResponse {
     expires_at: String,
 }
 
+/// One `GET /app/installations` entry (the fields we use). `account` is null for an enterprise
+/// installation.
+#[derive(Debug, Deserialize)]
+struct InstallationResponse {
+    id: u64,
+    account: Option<AccountResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AccountResponse {
+    login: String,
+}
+
+/// `GET /app/installations` page size; GitHub's maximum.
+const INSTALLATIONS_PER_PAGE: usize = 100;
+
+/// A GitHub account login, org or user, that the App can be installed on. Logins compare
+/// case-insensitively, so the parsed form is lowercase.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GithubOwner(String);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{0:?} is not a GitHub login (letters, digits, and inner hyphens, at most 39)")]
+pub struct InvalidOwner(String);
+
+impl GithubOwner {
+    pub fn parse(raw: &str) -> Result<Self, InvalidOwner> {
+        let login = raw.trim();
+        let valid = (1..=39).contains(&login.len())
+            && !login.starts_with('-')
+            && !login.ends_with('-')
+            && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        match valid {
+            true => Ok(Self(login.to_ascii_lowercase())),
+            false => Err(InvalidOwner(raw.to_string())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for GithubOwner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// `GET /app` response (the field we use). The slug is the App's URL name, and the bot account
 /// GitHub attributes its writes to is that slug with a `[bot]` suffix.
 #[derive(Debug, Deserialize)]
@@ -95,10 +146,10 @@ struct CachedToken {
 /// wall-clock `expires_at`, then the next read re-mints.
 struct TokenExpiry;
 
-impl moka::Expiry<(), CachedToken> for TokenExpiry {
+impl moka::Expiry<String, CachedToken> for TokenExpiry {
     fn expire_after_create(
         &self,
-        _key: &(),
+        _key: &String,
         value: &CachedToken,
         _created_at: Instant,
     ) -> Option<Duration> {
@@ -107,7 +158,7 @@ impl moka::Expiry<(), CachedToken> for TokenExpiry {
 
     fn expire_after_update(
         &self,
-        _key: &(),
+        _key: &String,
         value: &CachedToken,
         _updated_at: Instant,
         _duration_until_expiry: Option<Duration>,
@@ -126,9 +177,9 @@ pub struct GithubAppTokenSource {
     key_path: PathBuf,
     api_base: String,
     http: reqwest::Client,
-    /// A single-slot cache (unit key). `try_get_with` coalesces concurrent mints so parallel
-    /// callers never stampede GitHub, and a failed mint is not cached.
-    cache: moka::future::Cache<(), CachedToken>,
+    /// The home installation's token, keyed by its installation id. `try_get_with` coalesces
+    /// concurrent mints so parallel callers never stampede GitHub, and a failed mint is not cached.
+    cache: moka::future::Cache<String, CachedToken>,
     /// The App's bot account, resolved once. A failed resolve is not stored.
     identity: std::sync::Arc<tokio::sync::OnceCell<BotIdentity>>,
 }
@@ -196,7 +247,9 @@ impl GithubAppTokenSource {
         let this = self.clone();
         let minted = self
             .cache
-            .try_get_with((), async move { this.mint(now).await })
+            .try_get_with(self.installation_id.clone(), async move {
+                this.mint(&this.installation_id, now).await
+            })
             .await
             .map_err(|e| anyhow::anyhow!("{e:#}"))?;
         Ok(minted.token)
@@ -268,16 +321,59 @@ impl GithubAppTokenSource {
             .with_context(|| format!("decoding the response to {method} {url}"))
     }
 
-    /// A token for one consumer, bypassing the cache. Lives an hour from issuance.
-    pub(crate) async fn token_for_one_consumer(&self) -> Result<String> {
-        Ok(self.mint(Timestamp::now()).await?.token)
+    /// A token for one consumer, bypassing the cache. Lives an hour from issuance. `None` is the
+    /// home installation; an owner is minted through that account's installation.
+    pub(crate) async fn token_for_one_consumer(
+        &self,
+        owner: Option<&GithubOwner>,
+    ) -> Result<String> {
+        let installation_id = match owner {
+            None => self.installation_id.clone(),
+            Some(owner) => self
+                .installation_of(owner)
+                .await?
+                .with_context(|| format!("the GitHub App is not installed on {owner}"))?,
+        };
+        Ok(self.mint(&installation_id, Timestamp::now()).await?.token)
+    }
+
+    /// The id of the App's installation on `owner`, from the App's own installation list.
+    /// `Ok(None)` is an account the App is not installed on.
+    pub(crate) async fn installation_of(&self, owner: &GithubOwner) -> Result<Option<String>> {
+        let context = || format!("finding the GitHub App's installation on {owner}");
+        let jwt = app_jwt(
+            &self.app_id,
+            &self.read_key().with_context(context)?,
+            Timestamp::now(),
+        )?;
+        for page in 1.. {
+            let installations: Vec<InstallationResponse> = self
+                .get(
+                    &format!("/app/installations?per_page={INSTALLATIONS_PER_PAGE}&page={page}"),
+                    &jwt,
+                )
+                .await
+                .with_context(context)?;
+            let found = installations.iter().find(|i| {
+                i.account
+                    .as_ref()
+                    .is_some_and(|a| a.login.eq_ignore_ascii_case(owner.as_str()))
+            });
+            if let Some(installation) = found {
+                return Ok(Some(installation.id.to_string()));
+            }
+            if installations.len() < INSTALLATIONS_PER_PAGE {
+                return Ok(None);
+            }
+        }
+        Ok(None)
     }
 
     /// Sign the app JWT and exchange it for an installation token.
-    async fn mint(&self, now: Timestamp) -> Result<CachedToken> {
+    async fn mint(&self, installation_id: &str, now: Timestamp) -> Result<CachedToken> {
         let pem = self.read_key().context("minting the installation token")?;
         let jwt = app_jwt(&self.app_id, &pem, now)?;
-        let path = format!("/app/installations/{}/access_tokens", self.installation_id);
+        let path = format!("/app/installations/{installation_id}/access_tokens");
         let body: InstallationTokenResponse = self
             .call(reqwest::Method::POST, &path, &jwt)
             .await
@@ -394,8 +490,8 @@ uTnXwtXUVaeuNSyCL+BD6N9tOF3eFWUW1jO18BDP2BWAK6IHlxWkFm6WcKb4B3DR
 
 #[cfg(test)]
 mod tests {
-    use super::testkey::{TEST_KEY_PEM, TEST_PUB_PEM, write_test_key};
-    use super::*;
+    use crate::secrets::github_app::testkey::{TEST_KEY_PEM, TEST_PUB_PEM, write_test_key};
+    use crate::secrets::github_app::*;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -560,7 +656,7 @@ mod tests {
         source
             .cache
             .insert(
-                (),
+                "99".to_string(),
                 CachedToken {
                     token: "ghs_stale".into(),
                     expires_at: stale_at,
@@ -586,6 +682,172 @@ mod tests {
         let err = format!("{:#}", source.token().await.unwrap_err());
         assert!(err.contains("minting the installation token"), "{err}");
         assert!(err.contains("401"), "{err}");
+    }
+
+    fn owner(login: &str) -> GithubOwner {
+        GithubOwner::parse(login).unwrap()
+    }
+
+    /// One `GET /app/installations` page, as `(installation id, login)` pairs; a `None` login is
+    /// an enterprise installation with a null account.
+    async fn mount_installations(server: &MockServer, page: u32, entries: &[(u64, Option<&str>)]) {
+        let body: Vec<_> = entries
+            .iter()
+            .map(|(id, login)| {
+                serde_json::json!({
+                    "id": id,
+                    "account": login.map(|l| serde_json::json!({"login": l})),
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/app/installations"))
+            .and(wiremock::matchers::query_param("page", page.to_string()))
+            .and(wiremock::matchers::query_param("per_page", "100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn an_owners_installation_is_found_by_login_ignoring_case() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        mount_installations(
+            &server,
+            1,
+            &[
+                (7, None),
+                (99, Some("neuralmagic")),
+                (4242, Some("Red-Hat-Data-Services")),
+            ],
+        )
+        .await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+
+        assert_eq!(
+            source
+                .installation_of(&owner("red-hat-data-services"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("4242")
+        );
+        let requests = server.received_requests().await.unwrap();
+        let auth = requests[0].headers.get("authorization").unwrap();
+        assert!(
+            auth.to_str().unwrap().starts_with("Bearer eyJ"),
+            "the installation list is an app-JWT route"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_installation_lookup_reads_past_a_full_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let logins: Vec<String> = (0..100).map(|i| format!("org-{i}")).collect();
+        let first: Vec<(u64, Option<&str>)> = logins
+            .iter()
+            .enumerate()
+            .map(|(i, l)| (i as u64, Some(l.as_str())))
+            .collect();
+        mount_installations(&server, 1, &first).await;
+        mount_installations(&server, 2, &[(4242, Some("red-hat-data-services"))]).await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+
+        assert_eq!(
+            source
+                .installation_of(&owner("red-hat-data-services"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("4242")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_account_without_the_app_has_no_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        mount_installations(&server, 1, &[(99, Some("neuralmagic"))]).await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+
+        assert_eq!(source.installation_of(&owner("acme")).await.unwrap(), None);
+    }
+
+    /// The minted token for an account comes from that account's installation, and the home
+    /// installation's cache is not touched.
+    #[tokio::test]
+    async fn a_token_for_an_owner_is_minted_through_its_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        mount_installations(
+            &server,
+            1,
+            &[
+                (99, Some("neuralmagic")),
+                (4242, Some("red-hat-data-services")),
+            ],
+        )
+        .await;
+        let in_an_hour = Timestamp::from_second(Timestamp::now().as_second() + 3600).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/app/installations/4242/access_tokens"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "token": "ghs_rhds",
+                "expires_at": in_an_hour.to_string(),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+
+        assert_eq!(
+            source
+                .token_for_one_consumer(Some(&owner("red-hat-data-services")))
+                .await
+                .unwrap(),
+            "ghs_rhds"
+        );
+        assert_eq!(source.cache.entry_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_token_for_an_account_without_the_app_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        mount_installations(&server, 1, &[(99, Some("neuralmagic"))]).await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+
+        let err = format!(
+            "{:#}",
+            source
+                .token_for_one_consumer(Some(&owner("acme")))
+                .await
+                .unwrap_err()
+        );
+        assert!(err.contains("not installed on acme"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_home_token_for_one_consumer_uses_the_configured_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = MockServer::start().await;
+        let in_an_hour = Timestamp::from_second(Timestamp::now().as_second() + 3600).unwrap();
+        mount_exchange(&server, "ghs_home", in_an_hour, 1).await;
+        let source =
+            GithubAppTokenSource::new("4210340", "99", write_test_key(dir.path()), server.uri());
+
+        assert_eq!(
+            source.token_for_one_consumer(None).await.unwrap(),
+            "ghs_home"
+        );
     }
 
     #[tokio::test]

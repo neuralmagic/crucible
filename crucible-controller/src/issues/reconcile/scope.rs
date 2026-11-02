@@ -409,7 +409,7 @@ async fn extract_scope_exposure(
         anyhow::bail!("no stored pack for {key}");
     };
     let extraction = tokio::task::spawn_blocking(move || {
-        crate::playbooks::exposure::extract(pack.path(), pr_repo.as_deref())
+        crate::playbooks::exposure::extract(pack.path(), pr_repo.as_deref(), None)
     })
     .await
     .context("joining the scope exposure worker")?;

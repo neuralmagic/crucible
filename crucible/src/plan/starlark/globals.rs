@@ -16,10 +16,11 @@ use starlark::values::tuple::{TupleRef, UnpackTuple};
 use starlark::values::{Heap, Value, ValueLike};
 use starlark_syntax::codemap::FileSpan;
 
+use crate::plan::ir::TaskName;
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    AnswerRefValue, CONVERTED, ExternalText, OutputRefValue, QuestionValue, SchemaValue,
-    SessionValue, TaskValue, WorkflowValue,
+    AnswerRefValue, CONVERTED, ExternalText, OptionalValue, OutputRefValue, QuestionValue,
+    SchemaValue, SessionValue, TaskValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -28,6 +29,7 @@ const POSITIONAL: &[&str] = &[
     "prompt_file",
     "schema_file",
     "param",
+    "optional",
     "workflow",
     "default_autoresearch",
 ];
@@ -133,6 +135,14 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("noul", args, kwargs, eval)
+    }
+
+    fn optional<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("optional", args, kwargs, eval)
     }
 
     fn route<'v>(
@@ -264,43 +274,43 @@ fn call<'v>(
             return Err(one_positional());
         };
         let argument = convert(*argument).map_err(|error| located(at, error))?;
-        return match (function, argument) {
+        let value = match (function, argument) {
             ("prompt_file", dsl::Value::String(path)) => state
                 .context_mut()
                 .prompt_file(&path)
-                .map(dsl::Value::String)
-                .map_err(|error| located(at, error)),
+                .map(dsl::Value::String),
             ("schema_file", dsl::Value::String(path)) => state
                 .context_mut()
                 .schema_file(&path)
-                .map(dsl::Value::Schema)
-                .map_err(|error| located(at, error)),
+                .map(dsl::Value::Schema),
             ("param", dsl::Value::String(name)) => state.context_mut().param(&name),
+            ("optional", dsl::Value::Task(task)) => Ok(dsl::Value::Optional(task.name)),
+            ("optional", dsl::Value::String(name)) => Ok(dsl::Value::Optional(TaskName(name))),
             ("workflow", dsl::Value::List(tasks)) => {
-                let tasks = dsl::task_list("workflow", tasks)?;
-                let workflow = WorkflowCfg {
-                    workflow_type: WorkflowType::Autoresearch,
-                    result: None,
-                    tasks,
-                    file: None,
-                    resolved_from: None,
-                    params: BTreeMap::new(),
-                    history_record: None,
-                };
-                workflow.validate()?;
-                Ok(dsl::Value::Workflow(workflow))
+                dsl::task_list("workflow", tasks).and_then(|tasks| {
+                    let workflow = WorkflowCfg {
+                        workflow_type: WorkflowType::Autoresearch,
+                        result: None,
+                        tasks,
+                        file: None,
+                        resolved_from: None,
+                        params: BTreeMap::new(),
+                        history_record: None,
+                    };
+                    workflow.validate()?;
+                    Ok(dsl::Value::Workflow(workflow))
+                })
             }
             ("default_autoresearch", dsl::Value::List(tasks)) => {
-                dsl::default_autoresearch(dsl::task_list("default_autoresearch", tasks)?)
+                dsl::task_list("default_autoresearch", tasks)
+                    .and_then(dsl::default_autoresearch)
                     .map(dsl::Value::Workflow)
             }
-            _ => Err(located(
-                at,
-                dsl::CompileError::WrongPositionalType {
-                    function: function.to_owned(),
-                },
-            )),
+            _ => Err(dsl::CompileError::WrongPositionalType {
+                function: function.to_owned(),
+            }),
         };
+        return value.map_err(|error| located(at, error));
     }
     if !args.items.is_empty() {
         return Err(located(
@@ -440,6 +450,9 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(schema) = SchemaValue::from_value(value) {
         return Ok(dsl::Value::Schema(schema.0.clone()));
     }
+    if let Some(optional) = OptionalValue::from_value(value) {
+        return Ok(dsl::Value::Optional(optional.0.clone()));
+    }
     Ok(dsl::Value::Opaque)
 }
 
@@ -495,5 +508,6 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Answer(answer) => heap.alloc(AnswerRefValue(answer)),
         dsl::Value::Workflow(workflow) => heap.alloc(WorkflowValue(workflow)),
         dsl::Value::Schema(schema) => heap.alloc(SchemaValue(schema)),
+        dsl::Value::Optional(name) => heap.alloc(OptionalValue(name)),
     }
 }

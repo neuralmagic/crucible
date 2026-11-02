@@ -8,6 +8,10 @@ members = [
     "forge",
     "crucible-controller",
     "crux",
+    "crucible-lsp",
+    "crucible-kueue",
+    "crucible-mcp-auth",
+    "buildit",
     "capability",
     "xtask",
 ]
@@ -18,7 +22,7 @@ exclude = ["third_party/dagre_rust", "third_party/graphlib_rust", "third_party/m
 resolver = "3"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.1"
 # Dual-licensed like the repo (LICENSE-MIT / LICENSE-APACHE); the public export's cargo-deny
 # licenses check requires every workspace crate to declare it.
 license = "MIT OR Apache-2.0"
@@ -39,10 +43,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 uuid = { version = "1", features = ["v7"] }
 # The OpenShell gateway's native gRPC clients + auth interceptor — one pin for every crate that
 # talks to the gateway (engine + broker), so the two can never link different protos.
-openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "3441f91a1de8ee1688c2add95d72fec53d404812", default-features = false }
+openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "5097812377b46afd8327c702e1bc1b58e68e49d6", default-features = false }
 # Same rev as openshell-core: the sandbox filesystem defaults (/dev/null, /usr, /etc ...) live here,
 # and crucible extends them rather than restating them.
-openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "3441f91a1de8ee1688c2add95d72fec53d404812", default-features = false }
+openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "5097812377b46afd8327c702e1bc1b58e68e49d6", default-features = false }
 tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 thiserror = "2"
 strum = { version = "0.28", features = ["derive"] }
@@ -56,7 +60,13 @@ croner = { version = "4", default-features = false }
 jsonschema = { version = "0.59", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
 url = "2"
+# One Kubernetes client and API pin for every crate that talks to a cluster, so the engine,
+# controller, forge, and crucible-kueue never link two kube stacks. Members add features.
+kube = { version = "4.0", default-features = false }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
 percent-encoding = "2"
+# CEL for MCP tool policy, at the controller's pin.
+cel = { git = "https://github.com/cel-rust/cel-rust", rev = "92f4376e200124e8dbafe5323a69cbe6bc3765c6" }
 
 [profile.release]
 opt-level = 2

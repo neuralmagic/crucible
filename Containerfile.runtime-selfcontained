@@ -1,5 +1,5 @@
 # produces: ghcr.io/neuralmagic/crucible
-# Domain-neutral runtime image: the crucible engine + crucible-broker + forge bins on a
+# Domain-neutral runtime image: the crucible engine + crucible-broker + forge + buildit bins on a
 # self-contained UBI10/OpenShell runtime. Crucible drives the agent directly over OpenShell
 # (podman as the compute driver), the agent runs inside the sandbox image OpenShell launches
 # at runtime, NOT in this image. No domain pack is baked in: mount one at /opt/crucible/domains
@@ -55,7 +55,7 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-
 WORKDIR /src
 COPY . .
 # The same bins, flags and staging docker.yml uses, so the packaged output matches CI's.
-RUN cargo build --release --locked -p crucible -p crucible-broker -p forge --bins \
+RUN cargo build --release --locked -p crucible -p crucible-broker -p forge -p buildit --bins \
     --features crucible/autoresearch \
     && mkdir -p /prebuilt/bin \
     && find target/release -maxdepth 1 -type f -executable -exec cp {} /prebuilt/bin/ \; \
@@ -142,7 +142,7 @@ RUN curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSIO
     && chmod +x /usr/local/bin/nu \
     && rm -rf /tmp/nu-${NU_VERSION}-x86_64-unknown-linux-gnu
 
-# crucible (engine) + crucible-broker + forge bins on PATH (compiled by the `bins` stage above).
+# crucible (engine) + crucible-broker + forge + buildit bins on PATH (compiled by the `bins` stage above).
 COPY --from=bins /prebuilt/bin/ /usr/local/bin/
 RUN test "$(crucible --contract-version)" = "${CONTRACT_VERSION}" \
     || { echo "io.crucible.contract-version=${CONTRACT_VERSION} does not match the shipped binary ($(crucible --contract-version))" >&2; exit 1; }

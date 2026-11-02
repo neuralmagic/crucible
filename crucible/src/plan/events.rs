@@ -9,6 +9,7 @@ pub(crate) fn plan_admitted_event(
     history_record: Option<&TaskName>,
 ) -> crate::report::session::SessionEvent {
     let p = plan.plan();
+    let definitions = crate::plan::rerun::definition_digests(plan);
     crate::report::session::SessionEvent::PlanAdmitted {
         plan_version: p.version,
         reason: p.reason.clone().unwrap_or_default(),
@@ -19,6 +20,7 @@ pub(crate) fn plan_admitted_event(
                 name: t.name.0.clone(),
                 kind: t.task.label().to_string(),
                 depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                optional: t.optional.iter().map(|d| d.0.clone()).collect(),
                 session: t.session.clone().unwrap_or_default(),
                 needs: t.needs.clone(),
                 required: t.required,
@@ -54,6 +56,7 @@ pub(crate) fn plan_admitted_event(
                     .map(ToString::to_string)
                     .unwrap_or_default(),
                 history_depth: t.history.unwrap_or_default(),
+                definition: definitions.get(&t.name).cloned().unwrap_or_default(),
             })
             .collect(),
         history_record: history_record.map(|t| t.0.clone()).unwrap_or_default(),
@@ -107,9 +110,26 @@ pub(crate) fn task_result_event(
         secs: 0.0,
         trace_id,
         span_id,
-        agent: args.and_then(|args| crate::plan::harness::resolved_agent(args, task)),
+        agent: args
+            .and_then(|args| crate::plan::harness::resolved_agent(args, task))
+            .map(Box::new),
         repairs: r.repairs.clone(),
+        reused_from: None,
     }
+}
+
+/// A row a rerun reused rather than dispatched, naming the run that settled it.
+pub(crate) fn reused_result_event(
+    plan_version: u32,
+    task: &crate::plan::ir::Task,
+    r: &crate::plan::exec::TaskResult,
+    from: &str,
+) -> crate::report::session::SessionEvent {
+    let mut event = task_result_event(plan_version, 0, task, r, None);
+    if let crate::report::session::SessionEvent::TaskResult { reused_from, .. } = &mut event {
+        *reused_from = Some(from.to_string());
+    }
+    event
 }
 
 /// The external results an output carries, read only out of the fields declared `link`/`links`.

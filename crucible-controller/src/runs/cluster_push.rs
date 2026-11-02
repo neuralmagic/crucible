@@ -1,6 +1,6 @@
 //! The cluster-snapshot push surface: `POST /api/clusters/push` for spokes the hub cannot reach
 //! (corp-internal clusters have no inbound path from the hub, but plenty of outbound). Mounted
-//! OUTSIDE the human bearer guard, like the ingest drop-box — it authenticates with its own
+//! OUTSIDE the human bearer guard, like `/metrics` — it authenticates with its own
 //! per-cluster static token (`CONTROLLER_PUSH_TOKENS`, `cluster=token[,cluster=token…]`).
 //!
 //! TokenReview-style validation is deliberately not used here: reviewing a spoke's ServiceAccount
@@ -52,6 +52,11 @@ impl PushTokens {
 
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Whether `cluster` reports by push: the hub holds a push credential for it.
+    pub fn pushes_for(&self, cluster: &str) -> bool {
+        self.0.values().any(|c| c == cluster)
     }
 
     /// The cluster this bearer token pushes for, if it is a configured push credential.

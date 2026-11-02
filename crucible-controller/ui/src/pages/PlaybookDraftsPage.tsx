@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
-import { narrow, withOwner } from '../ownerContext';
+import { eyebrowFor, narrow, withOwner } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import { OwnerField } from './OwnerField';
 import type { components } from '../api/schema';
@@ -203,7 +203,7 @@ export function PlaybookDraftsPage() {
     <>
       <Breadcrumb items={CRUMBS} />
       <PageHeader
-        eyebrow="Queue"
+        eyebrow={eyebrowFor(ownerContext.team, 'Queue')}
         title="Draft packs"
         description="Packs authored here instead of imported. Every save compiles against the pinned engine; graduation exports one as a pull request."
         actions={<SkillLink />}
