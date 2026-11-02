@@ -119,6 +119,8 @@ pub(crate) struct Standing {
     /// The adopted bytes' digest, and the adopted tree once one is recorded.
     pub adopted_tar_digest: Option<String>,
     pub adopted_tree_digest: Option<String>,
+    /// The manifest variant adopted with the pack.
+    pub adopted_variant: Option<String>,
     pub eligible_draft_version: Option<i64>,
     pub params: serde_json::Value,
     pub schema_digest: String,
@@ -184,7 +186,7 @@ pub(crate) fn adopted_label(rev: Option<&str>, tree: Option<&str>) -> String {
 /// it: `SELECT {COLUMNS}, s.cron_expr FROM playbook_standing_launches c JOIN playbook_schedules s
 /// USING (id)`.
 pub(crate) const COLUMNS: &str = "c.id, c.playbook, c.target_kind, c.adopted_repo, c.adopted_path, \
-    c.adopted_rev, c.adopted_tar_digest, c.adopted_tree_digest, c.eligible_draft_version, c.params, c.schema_digest, c.max_cost, c.max_time, \
+    c.adopted_rev, c.adopted_tar_digest, c.adopted_tree_digest, c.adopted_variant, c.eligible_draft_version, c.params, c.schema_digest, c.max_cost, c.max_time, \
     c.advance_dedupe, c.enabled, c.consecutive_failures, c.created_by, c.owner_principal, \
     c.owner_groups, c.owner_groups_at, c.owner_signin_required, c.owner_refresh_error, \
     c.owner_refresh_at, c.dispatch_target, c.agent_provider, c.agent_model, c.created_at, \
@@ -208,11 +210,11 @@ pub(crate) async fn insert(
             owner_groups, owner_groups_at, dispatch_target, agent_provider, agent_model,
             created_at, updated_at,
             adopted_repo, adopted_path, adopted_rev, adopted_tar_gz, adopted_tar_digest,
-            adopted_tar_bytes, adopted_params_schema, adopted_tree_digest)
+            adopted_tar_bytes, adopted_params_schema, adopted_tree_digest, adopted_variant)
         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                CASE WHEN $13::text IS NULL THEN NULL ELSE $18 END, $15, $16, $17, $18, $18,
                p.repo, p.path, p.rev, p.tar_gz, p.tar_digest, p.tar_bytes, p.params_schema,
-               p.tree_digest
+               p.tree_digest, p.variant
         FROM (VALUES (1)) one
         LEFT JOIN playbooks p ON p.id = $3 AND $4 = 'adopted'
         "#,
@@ -264,7 +266,7 @@ pub(crate) async fn replace(
             adopted_repo = p.repo, adopted_path = p.path, adopted_rev = p.rev,
             adopted_tar_gz = p.tar_gz, adopted_tar_digest = p.tar_digest,
             adopted_tar_bytes = p.tar_bytes, adopted_params_schema = p.params_schema,
-            adopted_tree_digest = p.tree_digest
+            adopted_tree_digest = p.tree_digest, adopted_variant = p.variant
         FROM (VALUES (1)) one
         LEFT JOIN playbooks p ON p.id = $2 AND $3 = 'adopted'
         WHERE c.id = $1
@@ -518,9 +520,11 @@ pub(crate) async fn fire(
         .await
         .map_err(|e| format!("{noun} adopted pack copy: {e}"))?;
         sqlx::query(
-            "UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL WHERE key = $1",
+            "UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL, variant = $2 \
+             WHERE key = $1",
         )
         .bind(key)
+        .bind(core.adopted_variant.as_deref())
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("{noun} adopted pack exposure: {e}"))?;

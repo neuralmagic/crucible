@@ -54,6 +54,8 @@ pub struct ImportCandidateDto {
     pub path: String,
     /// The `[workflow].file` the pack declares, relative to `path`.
     pub workflow_file: String,
+    /// The `[variant.<name>]` tables the pack's manifest declares, in name order.
+    pub variants: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -121,6 +123,7 @@ pub(crate) async fn import_candidates(
             .map(|c| ImportCandidateDto {
                 path: c.path,
                 workflow_file: c.workflow_file,
+                variants: c.variants.into_iter().map(String::from).collect(),
             })
             .collect(),
     })
@@ -154,6 +157,9 @@ pub struct PackImportDto {
     pub path: String,
     /// The commit everything below was taken at; the preview is this pack even after the ref moves.
     pub rev: String,
+    /// The `[variant.<name>]` of the manifest the preview read and a registration runs; null is
+    /// the base manifest.
+    pub variant: Option<String>,
     /// The `tree1:` digest of the frozen pack; null until startup conversion reaches a row an
     /// older controller wrote.
     pub tree_digest: Option<String>,
@@ -206,6 +212,7 @@ impl PackImportDto {
             git_ref: i.git_ref,
             path: i.path,
             rev: i.rev,
+            variant: i.variant.map(String::from),
             tree_digest: i.tree_digest.map(|t| t.to_string()),
             params_schema: i.params_schema,
             schema_digest: i.schema_digest,
@@ -240,6 +247,10 @@ pub(crate) struct ProposeImportBody {
     /// The pack directory inside the repo; omitted ⇒ the repo root.
     #[serde(default)]
     path: Option<String>,
+    /// The `[variant.<name>]` of the pack's manifest to preview and register. Omitted ⇒ the base
+    /// manifest.
+    #[serde(default)]
+    variant: Option<String>,
 }
 
 /// `POST /api/playbooks/imports` — fetch a pack at a ref, compile it with the pinned engine, and
@@ -274,6 +285,11 @@ pub(crate) async fn propose_pack_import(
             return unprocessable(msg);
         }
     };
+    let variant = match crate::playbooks::api::registry::requested_variant(body.variant.as_deref())
+    {
+        Ok(v) => v,
+        Err(msg) => return unprocessable(msg),
+    };
     let repo = normalize_repo(body.repo.trim()).to_string();
     let path = body.path.unwrap_or_default().trim().to_string();
     let actor = identity.as_deref();
@@ -304,6 +320,7 @@ pub(crate) async fn propose_pack_import(
         },
         actor,
         &owner,
+        variant,
     )
     .await
     {

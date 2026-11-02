@@ -163,12 +163,12 @@ struct SandboxTable {
 
 /// Read a pack tree's `[agent]` backend and sandbox image. `Err` is a manifest that is not there or
 /// does not parse; a manifest with no `[agent]` table is the engine's default backend and no image.
-pub fn pack_agent(pack_root: &Path) -> Result<PackAgent> {
-    let manifest = pack_root.join("crucible.toml");
-    let text = std::fs::read_to_string(&manifest)
-        .with_context(|| format!("reading {}", manifest.display()))?;
-    let parsed: ManifestAgent =
-        toml::from_str(&text).with_context(|| format!("parsing {}", manifest.display()))?;
+pub fn pack_agent(
+    pack_root: &Path,
+    variant: Option<&crucible::manifest::variant::VariantName>,
+) -> Result<PackAgent> {
+    let text = crate::playbooks::packs::manifest_text(pack_root, variant)?;
+    let parsed: ManifestAgent = toml::from_str(&text).context("parsing the pack's [agent]")?;
     let agent = parsed.agent.unwrap_or_default();
     Ok(PackAgent {
         backend: agent
@@ -366,8 +366,13 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
     use sqlx::Row as _;
     let mut filled = 0usize;
     for (table, key) in AGENT_TABLES {
+        let variant = if table == "playbook_draft_versions" {
+            "NULL::text AS variant"
+        } else {
+            "variant"
+        };
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {key}, {PACK_COLS} FROM {table}
+            "SELECT {key}, {variant}, {PACK_COLS} FROM {table}
              WHERE agent_backend IS NULL OR agent_requirements IS NULL",
             PACK_COLS = crate::playbooks::pack_trees::PACK_COLS,
         )))
@@ -388,9 +393,10 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
                     continue;
                 }
             };
+            let variant = crate::playbooks::packs::variant_from_row(&row)?;
             let agent = tokio::task::spawn_blocking(move || {
                 let pack = crate::playbooks::packs::materialize_tree(&tree)?;
-                pack_agent(pack.path())
+                pack_agent(pack.path(), variant.as_ref())
             })
             .await
             .context("joining the pack agent backfill worker")?;
@@ -511,7 +517,7 @@ mod tests {
         )
         .expect("manifest");
         assert_eq!(
-            pack_agent(dir.path()).expect("parses"),
+            pack_agent(dir.path(), None).expect("parses"),
             PackAgent::new("local".to_string(), None)
         );
     }
@@ -525,7 +531,7 @@ mod tests {
         )
         .expect("manifest");
         assert_eq!(
-            pack_agent(dir.path()).expect("parses"),
+            pack_agent(dir.path(), None).expect("parses"),
             PackAgent::new("openshell".to_string(), Some("quay.io/x/y:tag".to_string()))
         );
     }
@@ -541,7 +547,7 @@ mod tests {
             ),
         )
         .expect("manifest");
-        let agent = pack_agent(dir.path()).expect("parses");
+        let agent = pack_agent(dir.path(), None).expect("parses");
         assert_eq!(
             agent.sandboxes,
             [("go".to_string(), "ghcr.io/acme/go@sha256:bb".to_string())].into()
@@ -561,7 +567,7 @@ mod tests {
             ),
         )
         .expect("manifest");
-        let agent = pack_agent(dir.path()).expect("parses");
+        let agent = pack_agent(dir.path(), None).expect("parses");
         assert_eq!(agent.harness.as_deref(), Some("codex"));
         assert_eq!(agent.requires["toolchain.go"], ">=1.25");
         assert_eq!(agent.prefers["toolchain.go"], ">=1.26");
@@ -602,7 +608,7 @@ mod tests {
              node_selector = { \"nvidia.com/gpu.product\" = \"NVIDIA-H100-80GB-HBM3\" }\n",
         )
         .expect("manifest");
-        let agent = pack_agent(dir.path()).expect("parses");
+        let agent = pack_agent(dir.path(), None).expect("parses");
         assert_eq!(agent.resources.gpus, 2);
         let json = agent.requirements_json();
         assert_eq!(
@@ -635,7 +641,7 @@ mod tests {
             "[agent]\nbackend = \"openshell\"\n\n[agent.resources]\nmemory = \"32GB\"\n",
         )
         .expect("manifest");
-        assert!(pack_agent(dir.path()).is_err());
+        assert!(pack_agent(dir.path(), None).is_err());
     }
 
     /// A resource request needs a sandbox the scheduler places: the openshell backend, on a
@@ -721,7 +727,7 @@ mod tests {
     #[test]
     fn a_missing_manifest_is_an_error_not_a_default() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert!(pack_agent(dir.path()).is_err());
+        assert!(pack_agent(dir.path(), None).is_err());
     }
 
     #[test]

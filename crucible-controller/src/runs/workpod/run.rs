@@ -137,6 +137,8 @@ pub enum RunRenderOpts {
         agent: AgentSelection,
         /// The finished run this launch reruns.
         rerun: Option<crate::launches::model::RerunOf>,
+        /// The manifest variant the run reads.
+        variant: Option<crucible::manifest::variant::VariantName>,
     },
 }
 
@@ -218,6 +220,7 @@ impl RunRenderOpts {
                 max_cost,
                 max_time,
                 rerun,
+                variant,
                 ..
             } => RenderOpts {
                 max_cost: *max_cost,
@@ -231,6 +234,7 @@ impl RunRenderOpts {
                         parent: r.run.clone(),
                         from: r.from.clone(),
                     }),
+                    variant: variant.clone(),
                 }),
                 harness: agent.harness,
                 model: agent.model.clone(),
@@ -682,7 +686,9 @@ pub async fn dispatch_run(
     // row, no Secret, and no pod behind.
     let mints = match secrets {
         Some(ls) => {
-            let declared = crate::secrets::manifest::declared_secrets(pack.path())?;
+            let variant = crate::launches::store::launch_variant(db.pool(), issue_key).await?;
+            let declared =
+                crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
             match crate::secrets::launch::resolve(
                 db.pool(),
                 &ls.scope,

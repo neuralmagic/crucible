@@ -1403,6 +1403,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: sandboxed_args(),
@@ -1564,6 +1565,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -1827,6 +1829,7 @@ mod tests {
 
         let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
+            None,
             &BTreeMap::new(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
@@ -3550,6 +3553,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -4822,6 +4826,7 @@ workflow(type = "playbook", tasks = [echo])
         .unwrap();
         let mut runner = crate::cli::setup::prep_plan_runner_with_params(
             &manifest_path,
+            None,
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),

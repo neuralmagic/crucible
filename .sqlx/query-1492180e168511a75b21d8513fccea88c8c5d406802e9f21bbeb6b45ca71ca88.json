@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from FROM playbook_launches WHERE key = $1",
+  "query": "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from, variant FROM playbook_launches WHERE key = $1",
   "describe": {
     "columns": [
       {
@@ -134,6 +134,17 @@
             "name": "rerun_from"
           }
         }
+      },
+      {
+        "ordinal": 12,
+        "name": "variant",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "variant"
+          }
+        }
       }
     ],
     "parameters": {
@@ -153,8 +164,9 @@
       true,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "e18e264d5a01afc8b507c2fd7cd5213a23220bde879f06642ceb84d80ecbf645"
+  "hash": "1492180e168511a75b21d8513fccea88c8c5d406802e9f21bbeb6b45ca71ca88"
 }

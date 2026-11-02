@@ -423,6 +423,12 @@ draft is ready, `crux draft-graduate` opens a PR that exports it to a repository
 After registration, `crux launch` starts the playbook with parameters, and
 `crux playbook-runs` lists its runs.
 
+A registration runs one variant of the pack's manifest
+([variants](crucible-contract.md#1-the-manifest-crucibletoml)). Add `--variant offline` to
+`playbook-import`, or pick the variant in the import wizard, which lists the base manifest and
+every variant of each pack. Every launch of the registration then runs that variant. To run
+another variant of the same pack, register it again under another id.
+
 ### Let your own agent write it
 
 If an agent writes the pack, give it the co-draft skill before it starts. The controller

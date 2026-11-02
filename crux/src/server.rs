@@ -268,6 +268,10 @@ pub struct ImportArgs {
     /// The pack directory inside the repo. Omit for the repo root.
     #[serde(default)]
     pub path: Option<String>,
+    /// The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the base
+    /// manifest.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// The registry id you propose registering this pack under. Prefills the review page.
     #[serde(default)]
     pub id: Option<String>,
@@ -612,9 +616,12 @@ impl CrucibleMcp {
         flatten(
             ops::playbook_import(
                 &self.client,
-                &a.repo,
-                a.git_ref.as_deref(),
-                a.path.as_deref(),
+                &crate::client::PackImportSource {
+                    repo: &a.repo,
+                    git_ref: a.git_ref.as_deref(),
+                    path: a.path.as_deref(),
+                    variant: a.variant.as_deref(),
+                },
                 a.id.as_deref(),
                 a.description.as_deref(),
                 a.json,

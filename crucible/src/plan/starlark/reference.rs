@@ -64,7 +64,7 @@ fn task_knobs() -> Vec<Kwarg> {
     vec![
         Kwarg::new(
             "depends_on",
-            "list[task]",
+            "list[task | optional(task)]",
             "Dependencies. Readiness decides execution order; declaration order does not.",
         ),
         Kwarg::new(
@@ -192,8 +192,9 @@ fn when_kwarg() -> Kwarg {
         "route.question",
         "Run only on a listed answer to one question of a `route()` this task depends on. \
          Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, \
-         and every `all`-join dependent is not taken with it. Rejoin branches with \
-         `join = \"passed\"` or `join = \"settled\"`. Playbook and custom workflows only.",
+         and every `all`-join dependent is not taken with it unless it lists the task as \
+         `optional(...)`. Rejoin branches with `join = \"passed\"` or `join = \"settled\"`. \
+         Playbook and custom workflows only.",
     )
 }
 
@@ -677,6 +678,17 @@ pub fn functions() -> Vec<Function> {
                     "Answers that deliberately lead nowhere, so no `when` has to list them.",
                 ),
             ],
+        },
+        Function {
+            name: "optional",
+            lane: Lane::Routed,
+            purpose: "Mark an entry of `depends_on` that may settle `not_taken`. Under \
+                      `join = \"all\"` the task dispatches past it as though it passed, and its \
+                      inputs carry no entry for it; one that failed or was blocked still blocks. \
+                      Refused under another join, on a dependency that can never settle \
+                      `not_taken`, and on a task the reviewer revises.",
+            positional: Some("task"),
+            kwargs: vec![],
         },
         Function {
             name: "default_autoresearch",

@@ -57,6 +57,10 @@ MUTANTS = {
         "  last t := s\n  dispatched t := true\n  if plan = p_draining then",
         "  last t := s\n  status t := s\n  dispatched t := true\n  if plan = p_draining then",
     ),
+    "optional_admits_a_failure": (
+        "ghost relation dep_held (t d : task) := status d = t_pass ∨ (optional t d ∧ status d = t_not_taken)",
+        "ghost relation dep_held (t d : task) := status d = t_pass ∨ optional t d",
+    ),
     "serial_task_joins_a_batch": (
         "  require isolated t ∧ batch_open ∧ (∀ u, status u = t_running → isolated u) ∨ idle",
         "  require batch_open ∨ idle",
