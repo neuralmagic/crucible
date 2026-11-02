@@ -1,4 +1,4 @@
--- 0073_run_created_at.sql — when a run row was recorded. Existing rows are dated from their id:
+-- 0075_run_created_at.sql — when a run row was recorded. Existing rows are dated from their id:
 -- an engine-minted id leads with `YYYYMMDDTHHMMSSZ`, a controller-minted one ends in `-<unix secs>`.
 ALTER TABLE runs ADD COLUMN created_at TEXT;
 
