@@ -15,10 +15,9 @@
 //! with a `fetch` that rewrites each request into Vertex's `rawPredict` shape and signs it with
 //! the token the metadata emulator serves.
 //!
-//! Pi has no MCP client of its own; the sandbox image carries the `pi-mcp-adapter` extension,
-//! which the turn loads by path when it reaches an MCP server ([`MCP_ADAPTER`]) and points at the
-//! turn's servers through a seeded `mcp.json` ([`MCP_CONFIG`]). The agent sees one proxy `mcp`
-//! tool that discovers and calls their tools on demand.
+//! The turn's MCP servers ride Pi's built-in client through a seeded `mcp.json`
+//! ([`MCP_CONFIG`]). Their tools keep Pi's default `codemode` exposure: the agent reaches them
+//! from `codemode` scripts, which the turn enables explicitly whenever a server is in scope.
 
 use crate::agent::harness::{
     ApiEndpoint, AuthProvider, Backend, CRUCIBLE_PROVIDER_ID, HarnessSpec, McpServer, SandboxAuth,
@@ -117,20 +116,13 @@ fn heredoc_delimiter(prompt: &str) -> String {
 /// Where the Vertex extension is seeded: pi loads every extension under its agent dir.
 pub(crate) const VERTEX_EXTENSION: &str = "/sandbox/.pi/agent/extensions/crucible-vertex.ts";
 
-/// The MCP adapter extension's entry, where the sandbox image's global npm install puts it.
-/// Loaded with `-e` only when the turn reaches a server, so any other turn carries no `mcp` tool.
-pub(crate) const MCP_ADAPTER: &str = "/usr/local/lib/node_modules/pi-mcp-adapter/index.ts";
-
-/// The adapter's Pi-owned config under the relocated agent dir: one remote server per server in
-/// the turn's scope, each bearer in a header (the token, or the provider placeholder the egress
-/// proxy resolves).
+/// Pi's user-level MCP config under the relocated agent dir: one streamable-HTTP server per
+/// server in the turn's scope, each bearer in a header (the token, or the provider placeholder
+/// the egress proxy resolves).
 pub(crate) const MCP_CONFIG: &str = "/sandbox/.pi/agent/mcp.json";
 
 fn mcp_json(servers: &[McpServer<'_>]) -> String {
-    let servers = json_servers(
-        servers,
-        |s| json!({ "url": s.url, "protocolVersion": "auto" }),
-    );
+    let servers = json_servers(servers, |s| json!({ "url": s.url }));
     json!({ "mcpServers": servers }).to_string()
 }
 
@@ -283,13 +275,14 @@ impl Backend for Pi {
     }
 
     /// No message positional: `--print` reads a piped stdin as the prompt, which the shared exec
-    /// wrapper redirects from the uploaded prompt file. With an MCP server in scope, the adapter
-    /// is loaded by path; it reads the seeded [`MCP_CONFIG`] itself.
+    /// wrapper redirects from the uploaded prompt file. With an MCP server in scope, `codemode`
+    /// is added to the default tools up front, so the first request declares it whether or not
+    /// the servers in [`MCP_CONFIG`] have connected yet.
     fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String> {
         let mut a = Self::base_args(args);
         if mcp_seeded {
-            a.push("-e".to_string());
-            a.push(MCP_ADAPTER.to_string());
+            a.push("--tools".to_string());
+            a.push("+codemode".to_string());
         }
         a
     }
@@ -308,7 +301,7 @@ impl Backend for Pi {
         )
     }
 
-    /// The turn's servers as the adapter's remote servers.
+    /// The turn's servers as Pi's remote MCP servers.
     fn mcp_config(&self, servers: &[McpServer<'_>]) -> Option<SeedFile> {
         Some(SeedFile {
             content: mcp_json(servers),
@@ -516,7 +509,7 @@ fn session_records(content: &[u8]) -> Vec<GenAiRecord> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::agent::harness::pi::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
 
@@ -571,13 +564,13 @@ mod tests {
         assert_eq!(
             sandbox.len(),
             PREFIX.len() + 1,
-            "no message positional: stdin carries it; no server, no adapter"
+            "no message positional: stdin carries it; no server, no codemode"
         );
 
-        // With a server in scope, the MCP adapter is loaded by its image path.
+        // With a server in scope, codemode joins the default tools.
         let with_mcp = Pi.sandbox_argv(&a, true);
         assert_eq!(&with_mcp[..sandbox.len()], &sandbox[..]);
-        assert_eq!(&with_mcp[sandbox.len()..], &["-e", MCP_ADAPTER]);
+        assert_eq!(&with_mcp[sandbox.len()..], &["--tools", "+codemode"]);
 
         a.reasoning_effort = Some(ReasoningEffort::Max);
         let sandbox = Pi.sandbox_argv(&a, false);
@@ -645,8 +638,8 @@ mod tests {
     }
 
     /// A custom OpenAI-speaking endpoint becomes the `crucible` provider on the completions API
-    /// (or responses, per the wire API), keyed off `OPENAI_API_KEY`. The MCP servers ride the
-    /// adapter's `mcp.json`, never `models.json`.
+    /// (or responses, per the wire API), keyed off `OPENAI_API_KEY`. The MCP servers ride Pi's
+    /// `mcp.json`, never `models.json`.
     #[test]
     fn models_json_registers_a_custom_endpoint_and_the_servers_ride_mcp_json() {
         let mut a = args();
@@ -656,7 +649,7 @@ mod tests {
             &[server("broker", Some("tok")), server("jira", None)],
             &custom_endpoint(),
         );
-        assert_eq!(seeds.len(), 2, "models.json, then the adapter's mcp.json");
+        assert_eq!(seeds.len(), 2, "models.json, then mcp.json");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["providers"]["crucible"];
@@ -670,12 +663,18 @@ mod tests {
         let names: Vec<&String> = m["mcpServers"].as_object().unwrap().keys().collect();
         assert_eq!(names, ["broker", "jira"]);
         let broker = &m["mcpServers"]["broker"];
-        assert_eq!(broker["url"], "http://10.0.0.1:8000/mcp");
-        assert_eq!(broker["protocolVersion"], "auto");
-        assert_eq!(broker["headers"]["Authorization"], "Bearer tok");
-        assert_eq!(seeds[1].content.matches("Bearer").count(), 1);
-        assert_eq!(m["mcpServers"]["jira"]["protocolVersion"], "auto");
-        assert!(m["mcpServers"]["jira"].get("headers").is_none());
+        assert_eq!(
+            broker,
+            &json!({
+                "url": "http://10.0.0.1:8000/mcp",
+                "headers": { "Authorization": "Bearer tok" },
+            }),
+            "exactly the keys Pi's built-in client reads"
+        );
+        assert_eq!(
+            m["mcpServers"]["jira"],
+            json!({ "url": "http://10.0.0.1:8000/mcp" })
+        );
 
         let responses = InferenceEnv {
             wire_api: Some(WireApi::Responses),
