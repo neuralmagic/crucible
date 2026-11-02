@@ -1289,6 +1289,9 @@ pub(crate) struct GraduateDraftBody {
     /// The pack directory inside that repo; omitted ⇒ the repo root.
     #[serde(default)]
     path: Option<String>,
+    /// A caller-owned secret to push and open the PR as. Omitted means the controller identity.
+    #[serde(default)]
+    github_secret_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1330,11 +1333,23 @@ pub(crate) async fn graduate_playbook_draft(
     }
     let repo = normalize_repo(body.repo.trim()).to_string();
     let path = body.path.unwrap_or_default().trim().to_string();
-    let token =
-        match crate::runs::engine::resolve_pack_pr_token_for(state.pack_pr_app.as_ref()).await {
-            Ok(t) => t,
-            Err(e) => return AppError::from(e).into_response(),
-        };
+    let token = match body
+        .github_secret_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(secret_id) => match personal_github_pat(&state, &caller, secret_id).await {
+            Ok(token) => Some(token),
+            Err(response) => return response,
+        },
+        None => {
+            match crate::runs::engine::resolve_pack_pr_token_for(state.pack_pr_app.as_ref()).await {
+                Ok(t) => t,
+                Err(e) => return AppError::from(e).into_response(),
+            }
+        }
+    };
 
     let actor = identity.as_deref();
     let url =
@@ -1357,6 +1372,50 @@ pub(crate) async fn graduate_playbook_draft(
         )
         .await;
     Json(GraduateAck { pr_url: url }).into_response()
+}
+
+/// Read one caller-owned GitHub token out of the secrets registry. The secret is addressed by id,
+/// so its name is whatever the owner chose; ownership is exact rather than policy-derived because
+/// this is a personal credential, not a shared team secret.
+async fn personal_github_pat(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    secret_id: &str,
+) -> Result<String, Response> {
+    let Some(actor) = caller.actor() else {
+        return Err(forbidden("a personal GitHub secret needs a signed-in user"));
+    };
+    let row = match crate::secrets::store::get(state.db.pool(), secret_id).await {
+        Ok(Some(row)) => row,
+        Ok(None) => return Err(not_found(format!("no secret {secret_id:?}"))),
+        Err(e) => return Err(AppError::from(e).into_response()),
+    };
+    if row.owner != *actor {
+        return Err(forbidden(format!(
+            "secret {secret_id:?} is not owned by {actor}"
+        )));
+    }
+    if row.kind != crate::secrets::SecretKind::Opaque
+        || row.visibility != crate::secrets::Visibility::BrokerOnly
+        || row.mode == crate::secrets::SecretMode::Minted
+    {
+        return Err(unprocessable(
+            "a GitHub credential is an opaque, broker-only, stored secret; minted App tokens are \
+             not personal PATs",
+        ));
+    }
+    let Some(vault) = state.vault.as_deref() else {
+        return Err(unavailable(
+            "this deployment has no Vault client, so personal GitHub secrets are off",
+        ));
+    };
+    let (token, _) = crate::secrets::read::current_value(vault, &row)
+        .await
+        .map_err(|e| unavailable(format!("reading secret {}: {e}", row.name)))?;
+    if token.trim().is_empty() {
+        return Err(unprocessable(format!("secret {} is empty", row.name)));
+    }
+    Ok(token)
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
