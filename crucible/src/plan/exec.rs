@@ -132,6 +132,17 @@ impl AttemptOutcome {
             Some(DeclaredStatus::Pass) | None => AttemptOutcome::Pass(value),
         }
     }
+
+    /// A failure the runner measured on the task's own result, as that result's declared `status`
+    /// settles it: `"skipped"` skips it, and no value passes it.
+    pub fn failed_as_declared(note: String, output: Option<Value>) -> Self {
+        match output {
+            Some(value) if DeclaredStatus::of(&value) == Some(DeclaredStatus::Skipped) => {
+                AttemptOutcome::Skipped(value, note)
+            }
+            output => AttemptOutcome::Fail { note, output },
+        }
+    }
 }
 
 pub struct Attempt {
@@ -2521,11 +2532,18 @@ impl DeclaredStatus {
     }
 }
 
-/// The note a self-declaring task gave, or a stand-in naming what it declared.
-fn declared_note(value: &Value, declared: DeclaredStatus) -> String {
+/// The reason a task's result states in its `note` field, when that is a non-blank string.
+pub fn own_note(value: &Value) -> Option<&str> {
     value
         .get(crate::plan::ir::NOTE_FIELD)
         .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+}
+
+/// The note a self-declaring task gave, or a stand-in naming what it declared.
+fn declared_note(value: &Value, declared: DeclaredStatus) -> String {
+    own_note(value)
         .map(str::to_string)
         .unwrap_or_else(|| format!("task declared status={}", declared.as_str()))
 }

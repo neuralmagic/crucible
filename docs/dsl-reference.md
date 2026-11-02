@@ -114,7 +114,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `run` | `str` | The command, run through `sh -c`. |
-| `threshold` | `number` | Grade the emitted score against this bound. An explicit `pass` wins. |
+| `threshold` | `number` | Grade the emitted score against this bound. `pass = false` fails a score within it; `pass` cannot pass a score outside it. |
 | `direction` | `"lower" \| "higher"` | Which side of the threshold passes. |
 | `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
@@ -333,8 +333,8 @@ Read out of the object the task returns.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
-| `note` | `str` | Why the task failed or was skipped, recorded as its note: in place of the default note when `status` is `"fail"` or `"skipped"`, and after the exit status in place of the stderr tail when a command exits nonzero. The control plane shows it as a parked run's reason. Read only from a result that fails or skips. |
+| `status` | `"pass" \| "fail" \| "skipped"` | `"fail"` or `"skipped"` settles the task that way, whatever its exit status, `pass` or threshold. `"pass"` cannot pass a task that exited nonzero or did not pass its grade. Any other value is ignored. |
+| `note` | `str` | Why the task failed or was skipped, recorded as its note when it is a non-blank string: after the exit status in place of the stderr tail when a command exits nonzero, before the threshold and log handles when an evaluation does not pass, and in place of the default note when `status` is `"fail"` or `"skipped"`. The control plane shows it as a parked run's reason. Read only from a result that fails or skips. |
 | `complete` | `bool` | `true` on a passing main-graph task of a playbook ends the run early and valid: nothing else in the main graph dispatches, undispatched tasks stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it in `emits`. |
 | `reason` | `str` | Why the run completed early, recorded with the shutdown. A task may not list it in `emits`. |
 
