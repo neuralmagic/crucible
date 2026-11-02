@@ -11,6 +11,7 @@ use crate::plan::exec::{Substrate, TaskStatus, required_tasks_held, runnable_set
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{Plan, Stage, TaskKind, TaskName, ValidPlan};
 use crate::plan::record::declared_output;
+use crate::plan::rerun::ParentRef;
 use crate::plan::resume::RunStart;
 use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
@@ -125,6 +126,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     crate::plan::ir::Decider::Model { min_confidence, .. } =>
                         format!("model >= {min_confidence}"),
                     crate::plan::ir::Decider::Output { task } => format!("from {task}"),
+                    crate::plan::ir::Decider::Human { .. } => "human".to_string(),
                 }
             ),
             TaskKind::Report { .. } => "report".to_string(),
@@ -521,7 +523,29 @@ pub struct RunOpts {
     pub agent: AgentOverride,
     /// Continue the playbook run the manifest's state dir holds instead of starting one.
     pub resume: bool,
+    /// The manifest variant the run reads.
+    pub variant: Option<crate::manifest::variant::VariantName>,
+    /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
+    pub rerun: Option<Rerun>,
 }
+
+/// A rerun's parent and the tasks it dispatches again.
+#[derive(Debug, Clone)]
+pub struct Rerun {
+    /// The finished run: its state directory, or its evidence on the controller.
+    pub parent: ParentRef,
+    pub from: Vec<TaskName>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--rerun-of reruns a playbook run; {manifest} does not declare a playbook")]
+struct RerunNeedsPlaybook {
+    manifest: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--rerun-of {} is this run's own state directory; copy the parent's state elsewhere first", .0.display())]
+struct RerunIntoParent(std::path::PathBuf);
 
 #[derive(Debug, thiserror::Error)]
 #[error("--resume continues a playbook run; {manifest} does not declare a playbook")]
@@ -542,36 +566,6 @@ struct MissingCeiling {
 #[error("--max-time {raw:?} is not a duration (try `90s`, `30m`, `2h`)")]
 struct BadDuration {
     raw: String,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "task {task:?} declares timeout {timeout}, longer than this run's --max-time {ceiling}. The \
-     run's ceiling is the longest any task may declare; shorten the timeout or raise --max-time"
-)]
-struct TimeoutPastCeiling {
-    task: String,
-    timeout: crucible::duration::TaskTimeout,
-    ceiling: String,
-}
-
-/// Refuse a plan whose task declares a limit the operator's wall-clock ceiling does not allow.
-fn check_timeouts(plan: &ValidPlan, ceiling: Option<std::time::Duration>) -> Result<()> {
-    let Some(ceiling) = ceiling else {
-        return Ok(());
-    };
-    match plan
-        .tasks_topo()
-        .find_map(|t| Some((t, t.timeout?)).filter(|(_, limit)| limit.get() > ceiling))
-    {
-        Some((task, timeout)) => Err(TimeoutPastCeiling {
-            task: task.name.0.clone(),
-            timeout,
-            ceiling: crucible::duration::Shown(ceiling).to_string(),
-        }
-        .into()),
-        None => Ok(()),
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -597,6 +591,57 @@ pub fn parse_params(pairs: &[String]) -> Result<BTreeMap<String, String>> {
         .collect()
 }
 
+/// Keep the run's task commits beside its other evidence, so a rerun can replay them.
+fn record_git_memory(paths: &crate::args::Paths) -> Result<()> {
+    let start = RunStart::read(&paths.state)?;
+    let commits = crucible_vcs::git_memory::task_commits(&paths.workspace, &start.base)?;
+    crate::plan::rerun::write_git_memory(&paths.state, &start, &commits)?;
+    Ok(())
+}
+
+/// Where a rerun fetches a parent named by URL, inside its own state directory.
+const FETCHED_PARENT_DIR: &str = "rerun-parent";
+
+/// Seed a rerun: rebuild the workspace from the parent's base and the reused tasks' commits,
+/// restore their captured files, and record where this run started.
+fn start_rerun(
+    manifest: &Path,
+    loaded: &crate::manifest::Manifest,
+    paths: &crate::args::Paths,
+    run: &str,
+    plan: &ValidPlan,
+    rerun: &Rerun,
+) -> Result<Prior> {
+    let dir = match &rerun.parent {
+        ParentRef::Dir(dir) => {
+            let same =
+                |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+                    (Ok(a), Ok(b)) => a == b,
+                    _ => false,
+                };
+            if same(dir, &paths.state) {
+                return Err(RerunIntoParent(dir.clone()).into());
+            }
+            dir.clone()
+        }
+        ParentRef::Url(url) => {
+            let dir = paths.state.join(FETCHED_PARENT_DIR);
+            crate::report::evidence_client::fetch_parent(url, &dir)?;
+            dir
+        }
+    };
+    let parent = crate::plan::rerun::ParentDir::read(&dir)?;
+    let seeded = crate::plan::rerun::plan(plan, &parent.parent, &rerun.from)?;
+    let commits = seeded.evidence(plan, &parent)?;
+    let base = crate::cli::setup::restore_for_rerun(manifest, loaded, &parent.start, &commits)?;
+    seeded
+        .restore_captured(&parent, &paths.state)
+        .context("restoring the parent's captured files")?;
+    let tree = crucible_vcs::git_memory::tree_of(&paths.workspace, &base)?.unwrap_or_default();
+    RunStart::begin(run, base, tree, plan, loaded.variant.clone()).write(&paths.state)?;
+    Ok(seeded.prior)
+}
+
 pub fn run(
     path: Option<&Path>,
     params: &BTreeMap<String, String>,
@@ -612,6 +657,8 @@ pub fn run(
         compute_driver,
         agent,
         resume,
+        variant,
+        rerun,
     } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
@@ -628,6 +675,7 @@ pub fn run(
     let mut series_entry: Option<Option<TaskName>> = None;
     let mut playbook = false;
     let mut prior: Option<Prior> = None;
+    let mut resuming = false;
     // The run's agent knobs; None for a precompiled plan, which has no manifest.
     let mut agent_args: Option<crate::args::Args> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
@@ -637,6 +685,7 @@ pub fn run(
                 let resumed = resume.then(|| RunStart::read(&state)).transpose()?;
                 let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
                     m,
+                    variant.as_ref(),
                     params,
                     compute_driver,
                     agent,
@@ -649,6 +698,12 @@ pub fn run(
                 });
                 if resume && !playbook {
                     return Err(ResumeNeedsPlaybook {
+                        manifest: m.display().to_string(),
+                    }
+                    .into());
+                }
+                if rerun.is_some() && !playbook {
+                    return Err(RerunNeedsPlaybook {
                         manifest: m.display().to_string(),
                     }
                     .into());
@@ -674,24 +729,14 @@ pub fn run(
                         let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
                             manifest: m.display().to_string(),
                         })?;
-                        let caps =
-                            crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
-                                .with_persistent_sessions();
                         if workflow.workflow_type == crate::plan::workflow::WorkflowType::Playbook {
-                            workflow
-                                .admit(&caps)
-                                .context("admitting one-pass playbook")?;
                             series_entry = Some(workflow.history_record.clone());
-                            Plan {
-                                version: 1,
-                                reason: None,
-                                budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
-                                params: workflow.params.clone(),
-                                tasks: workflow.tasks.clone(),
-                            }
-                            .validate()
-                            .context("building one-pass playbook")?
+                            workflow.playbook_plan()?
                         } else {
+                            let caps = crate::plan::workflow::WorkflowCaps::for_lane(
+                                workflow.workflow_type,
+                            )
+                            .with_persistent_sessions();
                             crate::plan::template::iteration_template(Some(workflow), &caps)?
                         }
                     }
@@ -699,23 +744,31 @@ pub fn run(
                 if let Some(usd) = ceilings.usd {
                     plan = plan.with_budget(usd)?;
                 }
-                match resumed {
-                    Some(resumed) => {
-                        resumed.continues(run, &plan)?;
+                match (resumed, &rerun) {
+                    (Some(resumed), _) => {
+                        resumed.continues(run, &plan, variant.as_ref())?;
                         crate::cli::setup::restore_pristine(m, &loaded, &resumed.base)?;
                         prior = Some(crate::plan::resume::fold_log(
                             &session_log,
                             &plan,
                             resumed.elapsed(jiff::Timestamp::now()),
                         )?);
+                        resuming = true;
                         prepared.take_over();
                     }
-                    None if playbook => {
-                        let base = crucible_vcs::vcs::head_sha(&prepared.paths.workspace)
-                            .context("reading the workspace's starting commit")?;
-                        RunStart::begin(run, base, &plan).write(&state)?;
+                    (None, Some(rerun)) => {
+                        prior = Some(start_rerun(m, &loaded, &prepared.paths, run, &plan, rerun)?);
+                        prepared.take_over();
                     }
-                    None => {}
+                    (None, None) if playbook => {
+                        let workspace = &prepared.paths.workspace;
+                        let base = crucible_vcs::vcs::head_sha(workspace)
+                            .context("reading the workspace's starting commit")?;
+                        let tree = crucible_vcs::git_memory::tree_of(workspace, &base)?
+                            .unwrap_or_default();
+                        RunStart::begin(run, base, tree, &plan, variant.clone()).write(&state)?;
+                    }
+                    (None, None) => {}
                 }
                 let f = std::fs::OpenOptions::new()
                     .create(true)
@@ -741,7 +794,9 @@ pub fn run(
             }
             (None, None) => unreachable!("clap requires --file without --manifest"),
         };
-    check_timeouts(&plan, ceilings.wall_clock)?;
+    if let Some(ceiling) = ceilings.wall_clock {
+        plan.check_timeouts(ceiling)?;
+    }
     // A task under a deadline runs in a process group of its own, where the terminal's SIGINT
     // does not reach it.
     let _ = ctrlc::set_handler(|| {
@@ -750,7 +805,6 @@ pub fn run(
     });
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
     let append = |f: &std::fs::File, ev: &crate::report::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;
@@ -759,8 +813,15 @@ pub fn run(
     // A log that already ends in a shutdown is closed: the run finished, and nothing may follow
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
+    // A run with an ingest surface can open decision requests, which is the `human` capability.
+    let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    let mut caps = caps.clone();
+    if desk.is_some() {
+        caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
+    }
+    let substrate = Substrate::detecting(caps, &crucible::inference::from_process_env()?);
     if let Some(f) = &events {
-        if let Some(prior) = &prior {
+        if let Some(prior) = prior.as_ref().filter(|_| resuming) {
             append(
                 f,
                 &crate::report::session::SessionEvent::Recovery {
@@ -786,6 +847,21 @@ pub fn run(
                     series_entry.as_ref().and_then(Option::as_ref),
                 ),
             );
+            if let Some(prior) = &prior {
+                for (task, result) in prior.rows(&plan) {
+                    if let Some(from) = prior.reused.get(&task.name) {
+                        append(
+                            f,
+                            &crate::plan::events::reused_result_event(
+                                plan.plan().version,
+                                &task,
+                                result,
+                                from,
+                            ),
+                        );
+                    }
+                }
+            }
         }
     }
     let selected_results: std::collections::BTreeSet<_> = plan
@@ -880,6 +956,9 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
+            decisions: desk
+                .as_ref()
+                .map(|d| d as &dyn crucible::plan::decide::DecisionDesk),
             ..ExecCfg::default()
         },
         runner.as_mut(),
@@ -931,6 +1010,11 @@ pub fn run(
             None => format!("completed early by {task}"),
         },
     };
+    if let Some(p) = evidence.as_ref().filter(|_| playbook)
+        && let Err(error) = record_git_memory(p)
+    {
+        eprintln!("git memory could not be kept for a rerun: {error:#}");
+    }
     if let (Some(f), Some(record)) = (&events, &series_entry)
         && !prior.as_ref().is_some_and(|p| p.recorded_history)
     {
@@ -951,7 +1035,7 @@ pub fn run(
         );
     }
     if let Some(p) = &evidence {
-        crate::report::ingest_client::deliver_run_evidence(p);
+        crate::report::evidence_client::deliver_run_evidence(p);
     }
     println!(
         "plan v{}: {} — spent ${:.4} of ${}",
@@ -973,6 +1057,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::variant::VariantName;
 
     const SRC: &str = r#"
         version = 1
@@ -1053,6 +1138,82 @@ mod tests {
         assert!(inline_error.contains("nope"), "{inline_error}");
         assert!(backed_error.contains("nope"), "{backed_error}");
         assert!(!sentinel.exists(), "neither run may dispatch a task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A variant's tables replace the base's whole for the run that selects it, and a resume
+    /// of that run must select it again.
+    #[test]
+    fn a_variant_run_reads_its_own_graph_and_resumes_only_as_itself() {
+        let dir = crate::testing::tempdir("plan-run-variant");
+        let base_ran = dir.join("base-ran");
+        let offline_ran = dir.join("offline-ran");
+        for (file, sentinel) in [("base.star", &base_ran), ("offline.star", &offline_ran)] {
+            std::fs::write(
+                dir.join(file),
+                format!(
+                    "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"touch {} && echo '{{}}'\")])\n",
+                    sentinel.display()
+                ),
+            )
+            .expect("workflow");
+        }
+        let manifest = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest,
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [workflow]
+            type = "playbook"
+            file = "base.star"
+            [variant.offline.workflow]
+            type = "playbook"
+            file = "offline.star"
+            "#,
+        )
+        .expect("manifest");
+        let launch = |variant: Option<&str>, resume: bool| {
+            run(
+                None,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                Some(&manifest),
+                RunOpts {
+                    ceilings: Ceilings {
+                        usd: Some(1.0),
+                        wall_clock: Some(std::time::Duration::from_secs(60)),
+                        wall_clock_raw: Some("60s".to_string()),
+                    },
+                    variant: variant.map(|v| VariantName::parse(v).expect("variant name")),
+                    resume,
+                    ..Default::default()
+                },
+            )
+        };
+
+        launch(Some("offline"), false).expect("the offline variant runs");
+        assert!(offline_ran.exists(), "the variant's graph ran");
+        assert!(!base_ran.exists(), "the base [workflow] was replaced whole");
+
+        let error = launch(None, true).expect_err("a resume under the base is another run");
+        assert!(
+            format!("{error:#}").contains(
+                "reads the base manifest, but the interrupted run read [variant.offline]"
+            ),
+            "{error:#}"
+        );
+        launch(Some("missing"), false).expect_err("an undeclared variant is refused");
+        launch(Some("offline"), true).expect("a resume under the same variant continues");
+        assert!(!base_ran.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1497,7 +1658,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Process-global env vars, removed on drop so a panicking assertion cannot leak the drop-box
+    /// Process-global env vars, removed on drop so a panicking assertion cannot leak the controller
     /// URL into every later test in this process. Pair with [`crate::test_env_lock`].
     struct ScopedEnv(Vec<&'static str>);
 
@@ -1518,62 +1679,41 @@ mod tests {
         }
     }
 
-    /// Read one HTTP POST off `s`, answer 200, and return `(path, body)`. The drop-box client is
+    /// Read one HTTP POST off `s`, answer 200, and return `(path, body)`. The evidence client is
     /// real `reqwest`, so the receiver has to be a real socket.
     fn read_one_post(s: &mut std::net::TcpStream) -> (String, Vec<u8>) {
-        use std::io::{Read, Write};
-        let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let (head_end, len) = loop {
-            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length:"))
-                    .and_then(|v| v.trim().parse().ok())
-                    .expect("a content-length");
-                if buf.len() >= i + 4 + len {
-                    break (i, len);
-                }
-            }
-            let n = s.read(&mut chunk).expect("read");
-            assert!(n > 0, "the client hung up mid-request");
-            buf.extend_from_slice(&chunk[..n]);
-        };
-        let path = String::from_utf8_lossy(&buf[..head_end])
-            .lines()
-            .next()
-            .and_then(|l| l.split_whitespace().nth(1))
-            .expect("a request line")
+        let (line, _, body) = crate::testing::read_one_request(s);
+        let path = line
+            .split_whitespace()
+            .nth(1)
+            .expect("a request path")
             .to_string();
-        let body = buf[head_end + 4..head_end + 4 + len].to_vec();
-        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("respond");
-        let _ = s.flush();
         (path, body)
     }
 
-    /// The ingest contract a pod-dispatched playbook rides: a manifest `plan run` publishes its
-    /// session to the Tier 2 drop-box exactly as a loop run does, on the failing path too.
+    /// The evidence contract a pod-dispatched playbook rides (RFC-0004:C-RUN-EVIDENCE): a
+    /// manifest `plan run` uploads its git memory and then its session to its own run under its
+    /// run token, on the failing path too.
     #[test]
-    fn manifest_plan_run_delivers_its_session_to_the_dropbox() {
+    fn manifest_plan_run_uploads_its_evidence_to_its_run() {
         let _guard = crucible::test_support::env_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = listener.local_addr().expect("addr").port();
         let receiver = std::thread::spawn(move || {
-            listener
-                .incoming()
-                .take(2)
-                .map(|s| read_one_post(&mut s.expect("accept")))
-                .collect::<Vec<_>>()
+            let mut got = Vec::new();
+            for s in listener.incoming() {
+                let request = crate::testing::read_one_request(&mut s.expect("accept"));
+                if request.0.starts_with("GET /done ") {
+                    break;
+                }
+                got.push(request);
+            }
+            got
         });
 
-        let dir = std::env::temp_dir().join(format!("crucible-dropbox-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("crucible-evidence-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let token = dir.join("token");
-        std::fs::write(&token, "fake-token").expect("token");
-
         let manifest_for = |name: &str, script: &str| {
             let pack = dir.join(name);
             std::fs::create_dir_all(&pack).expect("mkdir pack");
@@ -1613,14 +1753,11 @@ mod tests {
 
         let _ingest = ScopedEnv::set(&[
             (
-                crucible_contract::ENV_INGEST_URL,
-                format!("http://127.0.0.1:{port}"),
+                crucible_contract::ENV_CONTROLLER_URL,
+                format!("http://127.0.0.1:{port}/"),
             ),
-            (
-                crucible_contract::ENV_INGEST_TOKEN_PATH,
-                token.display().to_string(),
-            ),
-            (crucible_contract::ENV_POD_NAME, "crucible-run-pod".into()),
+            (crucible_contract::ENV_POD_TOKEN, "crr_id_secret".into()),
+            (crucible_contract::ENV_RUN_NAME, "acme_x_7-1700".into()),
         ]);
 
         let ceilings = || Ceilings {
@@ -1654,12 +1791,29 @@ mod tests {
         .expect_err("the failing playbook has no valid verdict");
 
         drop(_ingest);
+        reqwest::blocking::get(format!("http://127.0.0.1:{port}/done")).expect("stop");
 
-        let posts = receiver.join().expect("receiver");
-        assert_eq!(posts.len(), 2, "both runs deliver");
-        for ((path, body), outcome) in posts.iter().zip(["finished", "error"]) {
-            assert_eq!(path, "/api/pods/crucible-run-pod/artifacts/run-session");
+        let requests = receiver.join().expect("receiver");
+        let lines: Vec<&str> = requests.iter().map(|(l, _, _)| l.as_str()).collect();
+        let commits = "PUT /api/evidence/runs/acme_x_7-1700/run-commits HTTP/1.1";
+        let session = "PUT /api/evidence/runs/acme_x_7-1700/run-session HTTP/1.1";
+        assert_eq!(
+            lines,
+            [commits, session, commits, session],
+            "each run uploads its git memory, then its session last"
+        );
+        for (_, headers, body) in &requests {
+            assert!(
+                headers.contains("authorization: bearer crr_id_secret"),
+                "{headers}"
+            );
             assert_eq!(&body[..2], b"\x1f\x8b", "the body is gzip");
+        }
+        let sessions = requests
+            .iter()
+            .filter(|(l, _, _)| l.as_str() == session)
+            .map(|(_, _, body)| body);
+        for (body, outcome) in sessions.zip(["finished", "error"]) {
             let mut text = String::new();
             std::io::Read::read_to_string(
                 &mut flate2::read::GzDecoder::new(body.as_slice()),

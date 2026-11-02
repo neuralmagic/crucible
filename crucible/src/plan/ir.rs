@@ -9,6 +9,7 @@ use crucible_contract::decision::{
     CompiledQuestion, Label, OptionSource, Question, QuestionError, QuestionId, QuestionKind,
     UNCERTAIN,
 };
+use crucible_contract::decision_request::DECISION_KEY;
 use crucible_contract::emits::{DeclaredFile, FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,8 @@ pub const FILES_INPUT: &str = "files";
 pub const COMPLETE_FIELD: &str = "complete";
 /// The output field carrying an early completion's reason.
 pub const REASON_FIELD: &str = "reason";
+/// The output field a failing or skipped task states its own reason in.
+pub const NOTE_FIELD: &str = "note";
 /// Output fields a task may not declare in `emits`.
 pub const RESERVED_OUTPUTS: [&str; 2] = [COMPLETE_FIELD, REASON_FIELD];
 
@@ -383,6 +386,38 @@ impl TaskKind {
             },
         }
     }
+
+    /// Whether an attempt of this kind asks a model, and so draws on the run's cost ceiling.
+    pub fn spends(&self) -> bool {
+        match self {
+            TaskKind::Agent { .. }
+            | TaskKind::Route {
+                decider: Decider::Model { .. },
+                ..
+            }
+            | TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => true,
+            TaskKind::Command { .. }
+            | TaskKind::Evaluate { .. }
+            | TaskKind::Report { .. }
+            | TaskKind::TopK { .. }
+            | TaskKind::Route {
+                decider: Decider::Output { .. } | Decider::Human { .. },
+                ..
+            }
+            | TaskKind::Engine {
+                op:
+                    EngineOp::Apply
+                    | EngineOp::Measure
+                    | EngineOp::Grade
+                    | EngineOp::Decide
+                    | EngineOp::MeasureDiff,
+                ..
+            } => false,
+        }
+    }
 }
 
 /// `f64` fields deserialized through [`serde_json::Number`].
@@ -419,6 +454,12 @@ pub enum Decider {
     },
     /// A dependency's output, which carries one declared label per question id.
     Output { task: TaskName },
+    /// A person allowed to approve the run, answering a decision request the run opens.
+    Human {
+        /// A pack template rendered into the review shown above the evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
 }
 
 /// Run a task only when one question of a route it depends on resolved to a listed label.
@@ -440,6 +481,15 @@ impl When {
     pub fn admits(&self, label: &str) -> bool {
         self.is.iter().any(|l| l.as_str() == label)
             || (self.any_option && Label::new(label).is_ok_and(|l| !l.is_uncertain()))
+    }
+
+    /// Whether a route's recorded `answer` satisfies the condition: any label it chose does.
+    pub fn admitted_by(&self, answer: &crucible_contract::decision::Answer) -> bool {
+        if answer.labels.is_empty() {
+            self.admits(answer.label.as_str())
+        } else {
+            answer.labels.iter().any(|l| self.admits(l.as_str()))
+        }
     }
 }
 
@@ -475,6 +525,9 @@ fn reads_keyed_source<'a>(route: &Task, lookup: impl Fn(&TaskName) -> Option<&'a
 
 /// The capability a model-decided route task needs.
 pub const NEEDS_DECISION: &str = "decision";
+
+/// The capability a human-decided route task needs: an orchestrator that takes answers.
+pub const NEEDS_HUMAN: &str = "human";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -537,6 +590,10 @@ pub struct Task {
     pub keyed: Vec<OutputRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<When>,
+    /// Dependencies that satisfy an `all` join by settling not taken. Such a dependency gives the
+    /// task no input entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<TaskName>,
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
@@ -554,6 +611,33 @@ pub struct Task {
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+/// Tasks that carry a `when`, or reach one through `all` joins on dependencies not declared
+/// optional.
+pub(crate) fn may_settle_not_taken(tasks: &[Task]) -> BTreeSet<&TaskName> {
+    let mut conditional: BTreeSet<&TaskName> = tasks
+        .iter()
+        .filter(|t| t.when.is_some())
+        .map(|t| &t.name)
+        .collect();
+    loop {
+        let grown: Vec<&TaskName> = tasks
+            .iter()
+            .filter(|t| {
+                t.join == Join::All
+                    && !conditional.contains(&t.name)
+                    && t.depends_on
+                        .iter()
+                        .any(|d| !t.optional.contains(d) && conditional.contains(d))
+            })
+            .map(|t| &t.name)
+            .collect();
+        if grown.is_empty() {
+            return conditional;
+        }
+        conditional.extend(grown);
+    }
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `tasks` run again with the
@@ -675,6 +759,35 @@ impl ValidPlan {
             })
             .collect()
     }
+
+    /// Refuse a plan whose task declares a timeout the run's wall-clock ceiling does not allow.
+    pub fn check_timeouts(&self, ceiling: std::time::Duration) -> Result<(), TimeoutPastCeiling> {
+        match self
+            .tasks_topo()
+            .find_map(|t| Some((t, t.timeout?)).filter(|(_, limit)| limit.get() > ceiling))
+        {
+            Some((task, timeout)) => Err(TimeoutPastCeiling {
+                task: task.name.clone(),
+                timeout,
+                ceiling,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A task whose declared timeout is longer than the run's `--max-time`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "task {:?} declares timeout {timeout}, longer than this run's --max-time {}. The run's \
+     ceiling is the longest any task may declare; shorten the timeout or raise --max-time",
+    task.0,
+    crate::duration::Shown(*ceiling)
+)]
+pub struct TimeoutPastCeiling {
+    pub task: TaskName,
+    pub timeout: TaskTimeout,
+    pub ceiling: std::time::Duration,
 }
 
 pub struct ReviseLoop<'a> {
@@ -686,6 +799,11 @@ pub struct ReviseLoop<'a> {
 impl ReviseLoop<'_> {
     pub fn contains(&self, name: &TaskName) -> bool {
         self.body.iter().any(|t| &t.name == name)
+    }
+
+    /// Whether a round can spend: the loop dispatches as one unit, so one task that can makes it.
+    pub fn spends(&self) -> bool {
+        self.body.iter().any(|t| t.task.spends())
     }
 }
 
@@ -730,6 +848,25 @@ pub enum PlanError {
     },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
+    #[error("task {task:?}: optional names {dependency:?}, which is not one of its dependencies")]
+    OptionalNotADependency { task: String, dependency: String },
+    #[error("task {task:?} lists optional dependency {dependency:?} twice")]
+    RepeatedOptional { task: String, dependency: String },
+    #[error(
+        "task {task:?}: an optional dependency needs join = \"all\"; a {join:?} join already \
+         dispatches past a dependency that was not taken"
+    )]
+    OptionalOutsideAllJoin { task: String, join: &'static str },
+    #[error(
+        "task {task:?}: optional dependency {dependency:?} can never settle not taken: it has \
+         no when and joins no conditional task with join = \"all\""
+    )]
+    OptionalNeverNotTaken { task: String, dependency: String },
+    #[error(
+        "task {task:?}: optional names {target:?}, which it revises; a reviewer reviews what its \
+         targets produced"
+    )]
+    OptionalReviseTarget { task: String, target: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
     JoinPassedWithoutDependencies { task: String },
     #[error("task {task:?}: join = \"settled\" needs at least one dependency")]
@@ -870,10 +1007,13 @@ pub enum PlanError {
     },
     #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
     MinConfidenceOutOfRange { task: String, got: f64 },
-    #[error(
-        "model-decided route task {task:?} must declare needs = \"{NEEDS_DECISION}\", got {got:?}"
-    )]
-    RouteNeeds { task: String, got: String },
+    #[error("{decider}-decided route task {task:?} must declare needs = \"{want}\", got {got:?}")]
+    RouteNeeds {
+        task: String,
+        decider: &'static str,
+        want: &'static str,
+        got: String,
+    },
     #[error(
         "route task {task:?} decides from {source_task:?}, which is not one of its dependencies"
     )]
@@ -1001,6 +1141,70 @@ pub enum PlanError {
         source_task: String,
         question: String,
         declared: Box<FieldType>,
+    },
+    #[error(
+        "human-decided route task {task:?} declares `over`; a person answers one request per \
+         route, not one per element"
+    )]
+    HumanRouteWithOver { task: String },
+    #[error(
+        "human-decided route task {task:?} declares question {question:?}; the route files its \
+         answer record under that key"
+    )]
+    ReservedQuestion { task: String, question: String },
+    #[error("route task {task:?}, question {question:?}: only a person answers a {what} question")]
+    HumanOnlyQuestion {
+        task: String,
+        question: String,
+        what: &'static str,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, but does not depend on \
+         its producer"
+    )]
+    PickNotADependency {
+        task: String,
+        question: String,
+        field: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which its producer's \
+         emits omits"
+    )]
+    PickFieldOmitted {
+        task: String,
+        question: String,
+        field: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which is declared \
+         {declared}; a pick needs a list of strings"
+    )]
+    PickNotAList {
+        task: String,
+        question: String,
+        field: String,
+        declared: Box<FieldType>,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which is declared \
+         {declared}, but {why}; a pick needs a list of strings"
+    )]
+    PickItemsNotStrings {
+        task: String,
+        question: String,
+        field: String,
+        declared: Box<FieldType>,
+        why: String,
+    },
+    #[error(
+        "task {task:?}: when names {route}.{question}, a pick question; a pick has no labels to \
+         route on"
+    )]
+    WhenOnPick {
+        task: String,
+        route: String,
+        question: String,
     },
     #[error("task {task:?}: when names {route:?}, which is not one of its dependencies")]
     WhenNotADependency { task: String, route: String },
@@ -1282,7 +1486,9 @@ fn answerable_types(question: &Question) -> String {
     let labels = format!("labels from {}", labels.join("|"));
     match question.kind {
         QuestionKind::Noul => format!("\"boolean\" or {labels}"),
-        QuestionKind::Choice { .. } | QuestionKind::Score { .. } => labels,
+        QuestionKind::Choice { .. } | QuestionKind::Score { .. } | QuestionKind::Pick { .. } => {
+            labels
+        }
     }
 }
 
@@ -1468,6 +1674,35 @@ impl Plan {
                     });
                 }
             }
+            let mut optional = BTreeSet::new();
+            for d in &t.optional {
+                if !t.depends_on.contains(d) {
+                    return Err(PlanError::OptionalNotADependency {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                if !optional.insert(d) {
+                    return Err(PlanError::RepeatedOptional {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                if let Some(revise) = &t.revise
+                    && revise.tasks.contains(d)
+                {
+                    return Err(PlanError::OptionalReviseTarget {
+                        task: task(),
+                        target: d.0.clone(),
+                    });
+                }
+            }
+            if !t.optional.is_empty() && t.join != Join::All {
+                return Err(PlanError::OptionalOutsideAllJoin {
+                    task: task(),
+                    join: t.join.as_str(),
+                });
+            }
             if let Some(depth) = t.history {
                 if !(1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) {
                     return Err(PlanError::HistoryDepthOutOfRange {
@@ -1526,7 +1761,13 @@ impl Plan {
             if t.timeout.is_some()
                 && !matches!(
                     t.task,
-                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                    TaskKind::Agent { .. }
+                        | TaskKind::Command { .. }
+                        | TaskKind::Evaluate { .. }
+                        | TaskKind::Route {
+                            decider: Decider::Human { .. },
+                            ..
+                        }
                 )
             {
                 return Err(PlanError::TimeoutOnUntimedTask {
@@ -1608,6 +1849,68 @@ impl Plan {
                             question: id.to_string(),
                             error,
                         })?;
+                    let human = matches!(decider, Decider::Human { .. });
+                    if human && id.as_str() == DECISION_KEY {
+                        return Err(PlanError::ReservedQuestion {
+                            task: task(),
+                            question: id.to_string(),
+                        });
+                    }
+                    if let Some(what) = match question.declared().map(|q| &q.kind) {
+                        Some(QuestionKind::Pick { .. }) => Some("pick"),
+                        Some(QuestionKind::Choice { multiple: true, .. }) => {
+                            Some("multiple choice")
+                        }
+                        _ => None,
+                    }
+                    .filter(|_| !human)
+                    {
+                        return Err(PlanError::HumanOnlyQuestion {
+                            task: task(),
+                            question: id.to_string(),
+                            what,
+                        });
+                    }
+                    if let Some(source) = question.pick_source() {
+                        let reference = format!("{}.{}", source.task, source.field);
+                        let producer = TaskName(source.task.clone());
+                        if !t.depends_on.contains(&producer) {
+                            return Err(PlanError::PickNotADependency {
+                                task: task(),
+                                question: id.to_string(),
+                                field: reference,
+                            });
+                        }
+                        match self.tasks[index[&producer]].emits.field(&source.field) {
+                            Declared::Unchecked | Declared::Untyped => {}
+                            Declared::Typed(declared) if declared.is_list() => {
+                                if let Some(why) = declared.item_refusal() {
+                                    return Err(PlanError::PickItemsNotStrings {
+                                        task: task(),
+                                        question: id.to_string(),
+                                        field: reference,
+                                        declared: Box::new(declared.clone()),
+                                        why,
+                                    });
+                                }
+                            }
+                            Declared::Omitted => {
+                                return Err(PlanError::PickFieldOmitted {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    field: reference,
+                                });
+                            }
+                            Declared::Typed(declared) => {
+                                return Err(PlanError::PickNotAList {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    field: reference,
+                                    declared: Box::new(declared.clone()),
+                                });
+                            }
+                        }
+                    }
                     if let Some(source) = question.options_from() {
                         self.validate_options_from(t, id, source, &index)?;
                     }
@@ -1623,8 +1926,23 @@ impl Plan {
                         if t.needs != NEEDS_DECISION {
                             return Err(PlanError::RouteNeeds {
                                 task: task(),
+                                decider: "model",
+                                want: NEEDS_DECISION,
                                 got: t.needs.clone(),
                             });
+                        }
+                    }
+                    Decider::Human { .. } => {
+                        if t.needs != NEEDS_HUMAN {
+                            return Err(PlanError::RouteNeeds {
+                                task: task(),
+                                decider: "human",
+                                want: NEEDS_HUMAN,
+                                got: t.needs.clone(),
+                            });
+                        }
+                        if t.over.is_some() {
+                            return Err(PlanError::HumanRouteWithOver { task: task() });
                         }
                     }
                     Decider::Output { task: source } => {
@@ -1762,6 +2080,13 @@ impl Plan {
                         declared: questions.keys().map(ToString::to_string).collect(),
                     });
                 };
+                if asked.pick_source().is_some() {
+                    return Err(PlanError::WhenOnPick {
+                        task: task(),
+                        route: route(),
+                        question: question(),
+                    });
+                }
                 if when.is.is_empty() && !when.any_option {
                     return Err(PlanError::WhenWithoutLabels {
                         task: task(),
@@ -2102,6 +2427,15 @@ impl Plan {
                 }
             }
         }
+        let conditional = may_settle_not_taken(&self.tasks);
+        for t in &self.tasks {
+            if let Some(d) = t.optional.iter().find(|d| !conditional.contains(d)) {
+                return Err(PlanError::OptionalNeverNotTaken {
+                    task: t.name.0.clone(),
+                    dependency: d.0.clone(),
+                });
+            }
+        }
         let mut handled: BTreeMap<(&TaskName, &QuestionId), (BTreeSet<&Label>, bool)> =
             BTreeMap::new();
         for t in &self.tasks {
@@ -2315,6 +2649,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -2348,6 +2683,7 @@ mod tests {
                         description: None,
                     })
                     .collect(),
+                multiple: false,
             },
             drop: drop.iter().map(|l| label(l)).collect(),
         }
@@ -2416,6 +2752,95 @@ mod tests {
     #[test]
     fn a_fully_routed_question_validates() {
         plan(routed()).validate().unwrap();
+    }
+
+    fn optional_on(mut task: Task, optional: &[&str]) -> Task {
+        task.optional = optional.iter().map(|d| (*d).into()).collect();
+        task
+    }
+
+    #[test]
+    fn an_optional_dependency_on_a_conditional_task_validates_and_round_trips() {
+        let mut tasks = routed();
+        tasks.push(optional_on(agent("report", &["scan", "fix"]), &["fix"]));
+        tasks.push(agent("verify", &["fix"]));
+        tasks.push(optional_on(agent("summary", &["verify"]), &["verify"]));
+        let original = plan(tasks);
+        let text = toml::to_string(&original).unwrap();
+        assert!(text.contains(r#"optional = ["fix"]"#), "{text}");
+        let json = serde_json::to_value(&original).unwrap();
+        assert!(json["task"][0].get("optional").is_none(), "{json}");
+        for back in [
+            Plan::from_toml_str(&text).unwrap(),
+            Plan::from_json_str(&json.to_string()).unwrap(),
+        ] {
+            assert_eq!(back.tasks[4].optional, vec![TaskName::from("fix")]);
+            assert_eq!(back.tasks[6].optional, vec![TaskName::from("verify")]);
+            back.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_optional_dependency_is_refused_where_it_cannot_apply() {
+        let with = |task: Task| {
+            let mut tasks = routed();
+            tasks.push(task);
+            plan(tasks).validate().unwrap_err()
+        };
+        assert_eq!(
+            with(optional_on(agent("report", &["scan"]), &["fix"])),
+            PlanError::OptionalNotADependency {
+                task: "report".into(),
+                dependency: "fix".into(),
+            }
+        );
+        assert_eq!(
+            with(optional_on(agent("report", &["fix"]), &["fix", "fix"])),
+            PlanError::RepeatedOptional {
+                task: "report".into(),
+                dependency: "fix".into(),
+            }
+        );
+        for join in [Join::Passed, Join::Settled] {
+            let mut report = optional_on(agent("report", &["fix"]), &["fix"]);
+            report.join = join;
+            assert_eq!(
+                with(report),
+                PlanError::OptionalOutsideAllJoin {
+                    task: "report".into(),
+                    join: join.as_str(),
+                }
+            );
+        }
+        assert_eq!(
+            with(optional_on(agent("report", &["scan", "fix"]), &["scan"])),
+            PlanError::OptionalNeverNotTaken {
+                task: "report".into(),
+                dependency: "scan".into(),
+            }
+        );
+
+        let mut tasks = routed();
+        tasks.push(optional_on(agent("report", &["fix"]), &["fix"]));
+        tasks.push(optional_on(agent("tail", &["report"]), &["report"]));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::OptionalNeverNotTaken {
+                task: "tail".into(),
+                dependency: "report".into(),
+            },
+            "a task that dispatches past every untaken dependency is not conditional"
+        );
+
+        let mut tasks = routed();
+        tasks.push(optional_on(reviewer("check", &["fix"], "fix", 3), &["fix"]));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::OptionalReviseTarget {
+                task: "check".into(),
+                target: "fix".into(),
+            }
+        );
     }
 
     #[test]
@@ -2567,6 +2992,8 @@ mod tests {
             plan(vec![gate]).validate().unwrap_err(),
             PlanError::RouteNeeds {
                 task: "gate".into(),
+                decider: "model",
+                want: NEEDS_DECISION,
                 got: "any".into()
             }
         );
@@ -2576,6 +3003,267 @@ mod tests {
         ])
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn a_human_route_must_need_human() {
+        let mut gate = model_route("gate", &[], &[]);
+        if let TaskKind::Route { decider, .. } = &mut gate.task {
+            *decider = Decider::Human { review: None };
+        }
+        gate.needs = NEEDS_DECISION.into();
+        assert_eq!(
+            plan(vec![gate.clone()]).validate().unwrap_err(),
+            PlanError::RouteNeeds {
+                task: "gate".into(),
+                decider: "human",
+                want: NEEDS_HUMAN,
+                got: NEEDS_DECISION.into()
+            }
+        );
+        gate.needs = NEEDS_HUMAN.into();
+        plan(vec![gate]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_human_route_round_trips_through_toml_with_its_review() {
+        let decider = Decider::Human {
+            review: Some("reviews/gate.md.j2".into()),
+        };
+        let text = toml::to_string(&decider).unwrap();
+        assert_eq!(toml::from_str::<Decider>(&text).unwrap(), decider);
+        let bare = toml::to_string(&Decider::Human { review: None }).unwrap();
+        assert!(!bare.contains("review"), "{bare}");
+    }
+
+    #[test]
+    fn a_human_route_does_not_spend() {
+        let gate = human_route("gate", &[], &[("pick", pick_question("a", "items", false))]);
+        assert!(!gate.task.spends());
+    }
+
+    fn human_route(name: &str, deps: &[&str], questions: &[(&str, Question)]) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: questions
+                    .iter()
+                    .map(|(id, q)| (qid(id), q.clone().into()))
+                    .collect(),
+                decider: Decider::Human { review: None },
+            },
+            needs: NEEDS_HUMAN.into(),
+            ..agent(name, deps)
+        }
+    }
+
+    fn pick_question(task: &str, field: &str, multiple: bool) -> Question {
+        Question {
+            instructions: "which?".into(),
+            kind: QuestionKind::Pick {
+                source: crucible_contract::decision::OptionSource {
+                    task: task.into(),
+                    field: field.into(),
+                },
+                multiple,
+            },
+            drop: Vec::new(),
+        }
+    }
+
+    fn multiple_area() -> Question {
+        let mut q = area_question(&[]);
+        if let QuestionKind::Choice { multiple, .. } = &mut q.kind {
+            *multiple = true;
+        }
+        q
+    }
+
+    #[test]
+    fn only_a_human_route_takes_a_pick_or_a_multiple_choice() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        for (question, what) in [
+            (pick_question("scan", "nodes", false), "pick"),
+            (multiple_area(), "multiple choice"),
+        ] {
+            let mut gate = model_route("gate", &["scan"], &[]);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                questions.insert(qid("area"), question.clone().into());
+            }
+            assert_eq!(
+                plan(vec![scan.clone(), gate]).validate().unwrap_err(),
+                PlanError::HumanOnlyQuestion {
+                    task: "gate".into(),
+                    question: "area".into(),
+                    what,
+                }
+            );
+            let mut gate = output_route("gate", "scan", &[]);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                questions.insert(qid("area"), question.clone().into());
+            }
+            assert!(matches!(
+                plan(vec![scan.clone(), gate]).validate().unwrap_err(),
+                PlanError::HumanOnlyQuestion { .. }
+            ));
+            let gate = human_route("gate", &["scan"], &[("area", question)]);
+            let routed = on(
+                agent("go", &["gate"]),
+                "gate",
+                "area",
+                &["frontend", "scheduler", "uncertain"],
+            );
+            let tasks = if what == "pick" {
+                vec![scan.clone(), gate]
+            } else {
+                vec![scan.clone(), gate, routed]
+            };
+            plan(tasks).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_human_route_may_not_map_over_a_list() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("items", FieldType::List)]);
+        let mut gate = human_route("gate", &["scan"], &[("area", area_question(&[]))]);
+        gate.over = Some(OutputRef {
+            task: "scan".into(),
+            field: OutputField("items".into()),
+        });
+        gate.max_fanout = Some(4);
+        assert_eq!(
+            plan(vec![scan, gate]).validate().unwrap_err(),
+            PlanError::HumanRouteWithOver {
+                task: "gate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_human_route_may_not_ask_a_question_named_decision() {
+        let gate = human_route("gate", &[], &[("decision", area_question(&[]))]);
+        assert_eq!(
+            plan(vec![gate]).validate().unwrap_err(),
+            PlanError::ReservedQuestion {
+                task: "gate".into(),
+                question: "decision".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pick_reads_a_list_of_strings_from_a_dependency() {
+        let gate = |deps: &[&str]| {
+            human_route(
+                "gate",
+                deps,
+                &[("nodes", pick_question("scan", "nodes", true))],
+            )
+        };
+        let scan = |emits: Emits| Task {
+            emits,
+            ..agent("scan", &[])
+        };
+        assert!(matches!(
+            plan(vec![scan(Emits::default()), gate(&[])])
+                .validate()
+                .unwrap_err(),
+            PlanError::PickNotADependency { .. }
+        ));
+        assert!(matches!(
+            plan(vec![scan(fields(&["other"])), gate(&["scan"])])
+                .validate()
+                .unwrap_err(),
+            PlanError::PickFieldOmitted { .. }
+        ));
+        assert!(matches!(
+            plan(vec![
+                scan(typed(&[("nodes", FieldType::String)])),
+                gate(&["scan"])
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::PickNotAList { .. }
+        ));
+        let numbers = crucible_contract::emits::JsonSchema::new(
+            serde_json::json!({"type": "array", "items": {"type": "integer"}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan(vec![
+                scan(typed(&[("nodes", FieldType::Schema(numbers))])),
+                gate(&["scan"])
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::PickItemsNotStrings { .. }
+        ));
+        for emits in [
+            Emits::default(),
+            fields(&["nodes"]),
+            typed(&[("nodes", FieldType::List)]),
+        ] {
+            plan(vec![scan(emits), gate(&["scan"])]).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn no_when_routes_on_a_pick() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        let gate = human_route(
+            "gate",
+            &["scan"],
+            &[("nodes", pick_question("scan", "nodes", false))],
+        );
+        let go = on(agent("go", &["gate"]), "gate", "nodes", &["uncertain"]);
+        assert_eq!(
+            plan(vec![scan, gate, go]).validate().unwrap_err(),
+            PlanError::WhenOnPick {
+                task: "go".into(),
+                route: "gate".into(),
+                question: "nodes".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pick_question_round_trips_through_toml() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        let gate = human_route(
+            "gate",
+            &["scan"],
+            &[
+                ("nodes", pick_question("scan", "nodes", true)),
+                ("area", multiple_area()),
+            ],
+        );
+        let original = plan(vec![
+            scan,
+            gate,
+            on(
+                agent("go", &["gate"]),
+                "gate",
+                "area",
+                &["frontend", "scheduler", "uncertain"],
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        assert!(text.contains("multiple = true"), "{text}");
+        let back = Plan::from_toml_str(&text).unwrap();
+        let (
+            TaskKind::Route { questions: got, .. },
+            TaskKind::Route {
+                questions: want, ..
+            },
+        ) = (&back.tasks[1].task, &original.tasks[1].task)
+        else {
+            panic!("gate is not a route");
+        };
+        assert_eq!(got, want);
+        back.validate().unwrap();
     }
 
     #[test]
@@ -2958,6 +3646,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -3110,6 +3799,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -4675,6 +5365,57 @@ emits = ["lines"]
                 task: "fold".into(),
                 kind: "top_k",
             }
+        );
+    }
+
+    #[test]
+    fn a_timeout_past_the_wall_clock_ceiling_is_refused_naming_the_task() {
+        let timed = |name: &str, deps: &[&str], timeout: &str| {
+            let mut t = agent(name, deps);
+            t.timeout = Some(timeout.parse().unwrap());
+            t
+        };
+        let graph = plan(vec![
+            agent("scan", &[]),
+            timed("prepare", &["scan"], "110m"),
+            timed("report", &["prepare"], "3h"),
+        ])
+        .validate()
+        .unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+
+        let refused = graph.check_timeouts(hour).unwrap_err();
+        assert_eq!(
+            refused,
+            TimeoutPastCeiling {
+                task: "prepare".into(),
+                timeout: "110m".parse().unwrap(),
+                ceiling: hour,
+            },
+            "the first task in dependency order past the ceiling is the one named"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "task \"prepare\" declares timeout 110m, longer than this run's --max-time 1h. The \
+             run's ceiling is the longest any task may declare; shorten the timeout or raise \
+             --max-time"
+        );
+        assert_eq!(
+            graph.check_timeouts(2 * hour).unwrap_err().task,
+            TaskName::from("report")
+        );
+        assert_eq!(
+            graph.check_timeouts(3 * hour),
+            Ok(()),
+            "a timeout equal to the ceiling fits"
+        );
+        assert_eq!(
+            plan(vec![agent("a", &[])])
+                .validate()
+                .unwrap()
+                .check_timeouts(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "a task without a timeout is bounded by the ceiling alone"
         );
     }
 

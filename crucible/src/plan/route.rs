@@ -48,11 +48,12 @@ pub fn model_attempt(
     }
 }
 
-type Resolved = BTreeMap<QuestionId, Vec<ChoiceOption>>;
+/// The options each dynamic choice of one decision resolved to.
+pub(crate) type Resolved = BTreeMap<QuestionId, Vec<ChoiceOption>>;
 
 /// The questions as this decision asks them, each dynamic choice turned into a choice over the
 /// options its source supplies, and the options each dynamic choice resolved to.
-fn asked_questions(
+pub(crate) fn asked_questions(
     route: &Task,
     questions: &BTreeMap<QuestionId, CompiledQuestion>,
     inputs: &BTreeMap<TaskName, Value>,
@@ -184,7 +185,7 @@ type = "noul"
             json!({"packages": [{"value": "p1", "description": "golang.org/x/net"}, "none"]}),
         )]);
         let (asked, resolved) = asked_questions(&task, &questions, &state).unwrap();
-        let QuestionKind::Choice { options } = &asked[&package()].kind else {
+        let QuestionKind::Choice { options, .. } = &asked[&package()].kind else {
             panic!("the dynamic choice is asked as a choice");
         };
         assert_eq!(labels(&asked[&package()]), ["p1", "none"]);

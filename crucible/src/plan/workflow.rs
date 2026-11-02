@@ -469,7 +469,7 @@ impl WorkflowCfg {
                     result: result.0.clone(),
                 });
             }
-            if self.may_settle_not_taken().contains(result) {
+            if crate::plan::ir::may_settle_not_taken(&self.tasks).contains(result) {
                 return Err(WorkflowError::ConditionalResult {
                     result: result.0.clone(),
                 });
@@ -507,30 +507,21 @@ impl WorkflowCfg {
         Ok(())
     }
 
-    /// Tasks that carry a `when`, or reach one through `all` joins alone.
-    fn may_settle_not_taken(&self) -> BTreeSet<&TaskName> {
-        let mut conditional: BTreeSet<&TaskName> = self
-            .tasks
-            .iter()
-            .filter(|t| t.when.is_some())
-            .map(|t| &t.name)
-            .collect();
-        loop {
-            let grown: Vec<&TaskName> = self
-                .tasks
-                .iter()
-                .filter(|t| {
-                    t.join == Join::All
-                        && !conditional.contains(&t.name)
-                        && t.depends_on.iter().any(|d| conditional.contains(d))
-                })
-                .map(|t| &t.name)
-                .collect();
-            if grown.is_empty() {
-                return conditional;
-            }
-            conditional.extend(grown);
+    /// The graph one playbook run executes: these tasks and params, admitted under the playbook
+    /// lane, with no budget of its own because the launcher's ceiling replaces it.
+    pub fn playbook_plan(&self) -> anyhow::Result<crate::plan::ir::ValidPlan> {
+        use anyhow::Context;
+        let caps = WorkflowCaps::for_lane(self.workflow_type).with_persistent_sessions();
+        self.admit(&caps).context("admitting one-pass playbook")?;
+        crate::plan::ir::Plan {
+            version: 1,
+            reason: None,
+            budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+            params: self.params.clone(),
+            tasks: self.tasks.clone(),
         }
+        .validate()
+        .context("building one-pass playbook")
     }
 
     /// Require orchestrator authority for the workflow and its engine operations.
@@ -828,6 +819,15 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_result_reaching_a_conditional_task_only_through_optional_is_accepted() {
+        let workflow = parse(&format!(
+            "type = \"playbook\"\nresult = \"after\"\n{ROUTED}\
+             [[task]]\nname = \"after\"\nkind = \"command\"\ncommand = \"true\"\ndepends_on = [\"fix\"]\noptional = [\"fix\"]\n"
+        ));
+        workflow.validate().unwrap();
     }
 
     #[test]

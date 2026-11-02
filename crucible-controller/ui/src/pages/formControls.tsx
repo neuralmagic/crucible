@@ -134,6 +134,9 @@ export interface TextAreaFieldProps {
   hint?: ReactNode;
   required?: boolean;
   autoFocus?: boolean;
+  mono?: boolean;
+  error?: string | null;
+  onBlur?: () => void;
 }
 
 export function TextAreaField({
@@ -146,9 +149,12 @@ export function TextAreaField({
   hint,
   required,
   autoFocus,
+  mono = false,
+  error,
+  onBlur,
 }: TextAreaFieldProps) {
   return (
-    <FieldShell label={label} htmlFor={id} required={required} hint={hint}>
+    <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
       <textarea
         id={id}
         value={value}
@@ -158,7 +164,9 @@ export function TextAreaField({
         onChange={(event) => {
           onChange(event.target.value);
         }}
-        className={cn(CONTROL, 'resize-y leading-normal')}
+        onBlur={onBlur}
+        aria-invalid={Boolean(error)}
+        className={cn(CONTROL, 'resize-y leading-normal', mono && MONO_CONTROL, Boolean(error) && 'border-red')}
       />
     </FieldShell>
   );

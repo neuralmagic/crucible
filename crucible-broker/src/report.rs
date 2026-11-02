@@ -211,7 +211,7 @@ fn slack_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn template_value(value: &serde_json::Value) -> minijinja::Value {
+pub fn template_value(value: &serde_json::Value) -> minijinja::Value {
     match value {
         serde_json::Value::Null => minijinja::Value::from(()),
         serde_json::Value::Bool(value) => minijinja::Value::from(*value),
@@ -230,10 +230,11 @@ fn template_value(value: &serde_json::Value) -> minijinja::Value {
         serde_json::Value::Array(items) => {
             minijinja::Value::from(items.iter().map(template_value).collect::<Vec<_>>())
         }
-        serde_json::Value::Object(object) => object
-            .iter()
-            .map(|(key, value)| (key.as_str(), template_value(value)))
-            .collect(),
+        serde_json::Value::Object(object) => minijinja::Value::from_pairs(
+            object
+                .iter()
+                .map(|(key, value)| (key.as_str(), template_value(value))),
+        ),
     }
 }
 
@@ -284,7 +285,7 @@ fn render(
     };
     let body = env
         .get_template("report")
-        .and_then(|t| t.render(context))
+        .and_then(|t| t.render(minijinja::value::Serde(context)))
         .map_err(ReportError::Render)?;
     if body.len() > limits.body_max_bytes {
         return Err(ReportError::OversizedBody {

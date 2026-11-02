@@ -1,8 +1,8 @@
 //! A run's captured files: the declared task outputs a finished run exposes, and the content of
 //! each ([`RFC-0001:C-RUN-OUTPUTS`]).
 //!
-//! Two backings, one shape. A pod run's files reach the controller as the `run-files` drop-box
-//! artifact — one gzipped tar of the loop's `state/files`, adopted onto the run at completion and
+//! Two backings, one shape. A pod run's files reach the controller as the `run-files` evidence
+//! the pod uploads — one gzipped tar of the loop's `state/files`, adopted onto the run at completion and
 //! read back out of [`crate::runs::blob_store`]. A local run's files never left this machine, so they are
 //! walked off the scratch disk instead. Both answer with the same [`RunFile`] listing and the same
 //! keys, so the API and the CLI never branch on dispatch.

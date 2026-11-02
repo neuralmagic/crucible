@@ -1,28 +1,30 @@
 # Getting started: zero to a running loop
 
-This is the hands-on path from nothing to an autoresearch loop. For a graph that runs once,
-start with [Your first playbook](./playbooks.md) instead. This page is end to end, in two
-acts:
+This page shows how to start an autoresearch loop from nothing. For a graph that runs one
+time, start with [Your first playbook](./playbooks.md). This page has two parts:
 
-1. **Run a loop locally** — the hello-world domain, no cluster, no LLM, runs in milliseconds.
-2. **Onboard your own domain** — the manifest + the `measure` contract, the only two things you have to write.
+1. **Run a loop locally.** The example domain needs no cluster and no LLM, and it runs in
+   milliseconds.
+2. **Onboard your own domain.** You write two things: the manifest and the `measure`
+   command.
 
-For the *why* behind any of this, read [How the loop works](./how-it-works.md) (the diagram +
-glossary) and [The autoresearch loop, in one read](./crucible.md) first. The manifest and command shapes
-below are the hands-on expansion of [the contract](./crucible-contract.md), which is the
-normative reference. When this page and the contract disagree, the contract wins.
+[How the loop works](./how-it-works.md) (the diagram and glossary) and
+[The autoresearch loop, in one read](./crucible.md) explain the design. The manifest and
+command formats on this page expand on [the contract](./crucible-contract.md), which is the
+normative reference. If this page and the contract are different, the contract is correct.
 
 ## Before you start
 
-**Tooling** (from the [README](https://github.com/neuralmagic/crucible)): Rust + cargo, go,
-`kubectl`/`oc`, `helm`/`helmfile`, [`just`](https://github.com/casey/just),
-[`nu`](https://www.nushell.sh/) (nushell, the glue language), `podman`/`buildah`, `gitleaks`,
-and the `claude` CLI. Act 1 only needs Rust, `just`, and `nu`.
+**Tools.** To build, you need Rust and Cargo. Part 1 also needs
+[`nu`](https://www.nushell.sh/) (nushell, the glue language). Development and deployment use
+more tools: Go, `kubectl` or `oc`, `helm` and `helmfile`,
+[`just`](https://github.com/casey/just), `podman` and `buildah`, `gitleaks`, and the
+`claude` CLI.
 
-**Credentials** (Act 2 with a real agent backend): Claude access for the `claude` CLI. The
-`command` backend and `crucible init`/`check`/`scope` need no credentials at all.
+**Credentials.** Part 2 with a real agent backend needs Claude access for the `claude` CLI.
+The `command` backend and `crucible init`, `check`, and `scope` need no credentials.
 
-**Build the binary.** Clone the repo (Act 1 uses the `examples/counter` files anyway) and
+**Build the binary.** Clone the repository (part 1 uses the `examples/counter` files) and
 build from source:
 
 ```bash
@@ -32,32 +34,32 @@ cargo build --release -p crucible --features autoresearch
 install -m 755 target/release/crucible ~/.local/bin/   # or anywhere on PATH
 ```
 
-Or grab a prebuilt binary from the
-[releases page](https://github.com/neuralmagic/crucible/releases) when one is available for
-your platform. With just the binary you can already onboard your own repo (Act 2's
-`crucible init` → `crucible check` → `crucible scope` path needs nothing else).
+You can also download a prebuilt binary from the
+[releases page](https://github.com/neuralmagic/crucible/releases), if there is one for your
+platform. The binary alone is sufficient to onboard your own repository with the
+`crucible init` → `crucible check` → `crucible scope` steps of part 2.
 
-One convention worth knowing before Act 2: a manifest refers to a pack's tools by **bare
-name**. The counter example sidesteps this entirely (its `bump.nu` and `measure.nu` live in
-the pack directory and are invoked by relative path); a pack that ships tool binaries is
-responsible for putting them on `$PATH` before the loop runs.
+Before part 2, note this convention: a manifest refers to the tools of a pack by **bare
+name**. The counter example does not use this convention, because `bump.nu` and `measure.nu`
+are in the pack directory and the manifest calls them by relative path. A pack that ships
+tool binaries must put them on `$PATH` before the loop runs.
 
 ---
 
-## Act 1 — Run a loop locally
+## Part 1: run a loop locally
 
-The fastest way to see the whole engine is `examples/counter`. The "repo under test" is a git
-tree whose entire source is an integer in `value.txt`; the score *is* that integer; a
-deterministic `command` backend (`bump.nu`) stands in for the LLM so it runs for free. It
-exercises the real generic path (manifest → setup → propose → measure → keep/discard → git
-memory) with no cluster and no model.
+`examples/counter` is the fastest way to see the full engine. The repository under test is a
+Git tree with one integer in `value.txt`. The score is that integer. A deterministic
+`command` backend (`bump.nu`) replaces the LLM, so the run costs nothing. It uses the real
+generic path (manifest → setup → propose → measure → keep/discard → Git history) without a
+cluster or a model.
 
 ```bash
 crucible --manifest examples/counter/crucible.toml --iterations 6
 # or, from a source checkout: cargo run -p crucible --features autoresearch -- --manifest examples/counter/crucible.toml --iterations 6
 ```
 
-The manifest is the whole story (`examples/counter/crucible.toml`):
+The manifest (`examples/counter/crucible.toml`) defines the full run:
 
 ```toml
 [repo]
@@ -80,67 +82,75 @@ objective   = "value"
 # No [world] block -> GitWorld: kept iterations are commits, discards reset --hard + clean.
 ```
 
-**What happens each iteration:** the engine runs `agent_cmd` to mutate the workspace, runs
-`measure_cmd` to score it, and keeps the change (a git commit) iff it's strictly better per
-`direction`, else rolls the workspace back. What you get out:
+**Each iteration:** the engine runs `agent_cmd` to change the workspace and runs
+`measure_cmd` to score it. It keeps the change as a Git commit only if the score is strictly
+better in the `direction`. If not, it rolls the workspace back. The run writes:
 
-- `examples/counter/state/session.jsonl` — the append-only NDJSON event log (the source of truth for a run).
-- The workspace git history — kept iterations are commits. **Git is the memory.**
+- `examples/counter/state/session.jsonl`: the append-only NDJSON event log. It is the source
+  of truth for the run.
+- The Git history of the workspace. Each kept iteration is a commit.
 
-That's the engine. Everything else is swapping the deterministic proposer for a real agent and
-pointing `measure` at a real objective.
+To use the engine on real work, replace the deterministic proposer with a real agent and
+point `measure` at a real objective.
 
 ---
 
-## Act 2 — Onboard your own domain
+## Part 2: onboard your own domain
 
-A domain is **a manifest plus a few executables**, not Rust. The litmus test for "framework,
-not demo" is that a new domain runs with no engine changes. You write two things: a
-`crucible.toml` and a `measure` command.
+A domain is **a manifest and some executables**. It is not Rust. A new domain runs without
+engine changes. You write two things: a `crucible.toml` and a `measure` command.
 
-`crucible init` scaffolds both onto the current directory (a minimal manifest + a measure stub
-that always reports the same score), so onboarding starts as editing two generated files rather
-than writing them from scratch. Once you've pointed `[judge].measure_cmd` at the real gate,
-`crucible check --manifest crucible.toml` validates the whole thing (every referenced file
-resolves, `measure_cmd` runs once and prints the contract shape, and it warns if the gate sits
-unprotected inside the workspace the agent edits) before you spend a real agent turn on it.
-`crucible scope --pack <dir>` chains ingest (resolve the goal) → `check` → render
-`WORKFLOW.png` → freeze (`SCOPE.md` with a `RunIdentity` digest) into one pipeline (ADR-0014 S0);
-add `--issue owner/repo#N` to
-ground the goal in a GitHub issue (native API fetch, honors `GITHUB_TOKEN`/`GH_TOKEN`).
+`crucible init` creates both in the current directory: a minimal manifest and a measure
+script that always reports the same score. You then edit the two generated files. After you
+point `[judge].measure_cmd` at the real gate, run `crucible check --manifest crucible.toml`.
+It validates the configuration before you spend an agent turn:
+
+- every referenced file resolves;
+- `measure_cmd` runs one time and prints the contract format;
+- it warns if the gate is unprotected in the workspace that the agent edits.
+
+`crucible scope --pack <dir>` runs one pipeline (ADR-0014 S0): it resolves the goal, runs
+`check`, renders `WORKFLOW.png`, and freezes `SCOPE.md` with a `RunIdentity` digest. Add
+`--issue owner/repo#N` to take the goal from a GitHub issue. It fetches the issue through the
+GitHub API and uses `GITHUB_TOKEN` or `GH_TOKEN`.
 
 ### The manifest
 
-Sections (full schema + per-field semantics in [the contract](./crucible-contract.md); the
-parser rejects unknown keys, so typos fail loudly):
+[The contract](./crucible-contract.md) gives the full schema and the meaning of each field.
+The parser rejects unknown keys, so a typo causes an error.
 
 | Section | Purpose | Key fields |
 | --- | --- | --- |
 | `[repo]` | The code under test. | `url` or `path`, `ref` |
-| `[workspace]` | Where it's checked out + fixtures. | `dir`, `setup_cmd`, `[[workspace.inject]]` (`src`/`dst`/`frozen`) |
-| `[agent]` | Who proposes and how. | `model`, `backend`, `method_prompt`, `goal`/`goal_file`, `toolbox_dir`, `[agent.env]`, `[agent.openshell]`, `[agent.broker]` |
+| `[workspace]` | The checkout location and fixtures. | `dir`, `setup_cmd`, `[[workspace.inject]]` (`src`/`dst`/`frozen`) |
+| `[agent]` | The proposer and its settings. | `model`, `backend`, `method_prompt`, `goal`/`goal_file`, `toolbox_dir`, `[agent.env]`, `[agent.openshell]`, `[agent.broker]` |
 | `[judge]` | The frozen objective. | `measure_cmd`, `direction` (`lower`/`higher`), `[judge.selftest]` (`good_cmd`/`bad_cmd`) |
-| `[world]` | Reversibility beyond git. | `apply_cmd`, `snapshot_cmd`, `restore_cmd` (omit all three → pure `GitWorld`) |
+| `[world]` | Restore of state outside Git. | `apply_cmd`, `snapshot_cmd`, `restore_cmd` (omit all three for `GitWorld`) |
 | `[deploy]` | Image rebuild targets (deploy domains). | `[deploy.buildah]` `registry`/`dockerfile`, `[deploy.env]` |
-| `[search]` | Wide-round fan-out before the deep loop. | `wide`, `approaches` (required when `wide > 0`), `policy_k` |
-| `[composite]` | Assemble N domains into one run. | `[composite].name`, `[[component]]` `domain`/`pr_repo` |
+| `[search]` | Wide round before the deep loop. | `wide`, `approaches` (required if `wide > 0`), `policy_k` |
+| `[composite]` | Combine N domains into one run. | `[composite].name`, `[[component]]` `domain`/`pr_repo` |
 
-The single most important rule: **omit `[world]` entirely and you get `GitWorld`** (git is the
-only thing that needs rolling back). Set any of the three `*_cmd`s and you get `CommandWorld`
-(git plus your snapshot/restore, e.g. a live cluster).
+The most important rule: **if you omit `[world]`, you get `GitWorld`**, and Git is the only
+state that the engine rolls back. If you set any of the three `*_cmd` keys, you get
+`CommandWorld`: Git and your snapshot and restore commands, for example for a live cluster.
 
 ### The `measure` contract
 
-`measure_cmd` is the judge. Its **last stdout line beginning with `{`** is parsed as JSON:
+`measure_cmd` is the judge. The engine parses the **last stdout line that starts with `{`**
+as JSON:
 
 ```json
 { "valid": true, "score": 234.1, "solved": false, "note": "p99 234.1ms" }
 ```
 
-- `valid` (required bool), `score` (number), `solved` (bool, default false), `note`/`detail` (optional).
-- A **nonzero exit forces `valid=false`** regardless of what you printed.
-- The engine injects `CRUCIBLE_BASELINE_SCORE`, `CRUCIBLE_BASELINE_TOTAL`, `CRUCIBLE_BEST_SCORE` so your gate can compare.
-- Keep rule: keep iff `valid` and `score` strictly beats the best per `direction` (or `solved` is true, which forces a keep and ends the run, that's the bug-fix-gate case).
+- `valid` (required bool), `score` (number), `solved` (bool, default false), `note` and
+  `detail` (optional).
+- A **nonzero exit status sets `valid=false`**, whatever the command printed.
+- The engine sets `CRUCIBLE_BASELINE_SCORE`, `CRUCIBLE_BASELINE_TOTAL`, and
+  `CRUCIBLE_BEST_SCORE`, so your gate can compare.
+- Keep rule: the engine keeps a candidate only if it is `valid` and its `score` is strictly
+  better than the best in the `direction`. If `solved` is true, the engine keeps the
+  candidate and ends the run. Use `solved` for a bug-fix gate.
 
 `measure_cmd` is any executable that prints one JSON object. A plain `sh` script is a
 complete judge:
@@ -151,31 +161,36 @@ p99=$(make bench | jq .p99_ms)
 printf '{"valid": true, "score": %s, "note": "p99 %sms"}\n' "$p99" "$p99"
 ```
 
-Any language works; the engine only reads stdout.
+You can use any language. The engine reads only stdout.
 
-### Backends: who actually proposes
+### Backends
 
-Set by `[agent].backend`:
+`[agent].backend` selects the proposer:
 
-- **`local`** (default) — spawns the `claude` CLI on this machine in the workspace. Needs the CLI + Claude creds.
-- **`openshell`** — runs the turn inside a sandboxed pod (Landlock + deny-by-default egress). Needs `sandbox_image` + an `[agent.openshell].endpoints` egress allowlist. This is the in-cluster path.
-- **`command`** — a fixed `sh -c` command as the "proposal," deterministic, no LLM, cost 0. The Act 1 counter case.
+- **`local`** (default): runs the selected harness (default `claude`) on this machine in the
+  workspace. Needs the harness CLI and its credentials.
+- **`openshell`**: runs the turn in a sandboxed pod (Landlock and deny-by-default egress).
+  Needs `sandbox_image` and an egress allowlist in `[agent.openshell].endpoints`. Use this
+  backend in a cluster.
+- **`command`**: runs a fixed `sh -c` command as the proposal. It is deterministic, uses no
+  LLM, and costs nothing. The counter example in part 1 uses it.
 
 ### Composite domains
 
-A manifest with a top-level `[composite]` table assembles ≥2 existing component domains
-(reused verbatim) into one run with a single combined gate. Picture a `server` domain and a
-`router` domain: each keeps its own workspace and repo, but one `measure_cmd` scores the
-assembled system, so a change to either component is judged by how the pair behaves
-together. No engine changes; the engine just runs a vector of workspaces. Beyond the
-manifest, the work of a composite is the shared plumbing: a combined gate that exercises
-both components, and per-component deploy targets if the domains rebuild images.
+A manifest with a top-level `[composite]` table combines two or more existing component
+domains, without changes to them, into one run with one combined gate. For example, a
+`server` domain and a `router` domain each keep their own workspace and repository. One
+`measure_cmd` scores the combined system, so the gate judges a change to either component by
+the behavior of the pair. The engine does not change. It runs a list of workspaces. In
+addition to the manifest, a composite needs a combined gate that tests both components, and
+deploy targets for each component if the domains rebuild images.
 
 ---
 
 ## Where to go next
 
-- [How the loop works](./how-it-works.md) — the full diagram + glossary.
-- [The loop in one read](./crucible.md) — the conceptual deep-dive and the contract table.
-- [Implementation contract](./crucible-contract.md) — the normative manifest + command spec.
-- [JIRA tools (mediated)](./jira-proxy.md) — grounding a goal in an issue.
+- [How the loop works](./how-it-works.md): the full diagram and glossary.
+- [The loop in one read](./crucible.md): the concepts and the contract table.
+- [Implementation contract](./crucible-contract.md): the normative manifest and command
+  specification.
+- [JIRA tools (mediated)](./jira-proxy.md): take a goal from an issue.

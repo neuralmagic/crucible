@@ -23,6 +23,18 @@ fn field(v: i8) -> u32 {
     u32::try_from(v).unwrap_or(0)
 }
 
+fn weekday(w: civil::Weekday) -> croner::Weekday {
+    match w {
+        civil::Weekday::Sunday => croner::Weekday::Sunday,
+        civil::Weekday::Monday => croner::Weekday::Monday,
+        civil::Weekday::Tuesday => croner::Weekday::Tuesday,
+        civil::Weekday::Wednesday => croner::Weekday::Wednesday,
+        civil::Weekday::Thursday => croner::Weekday::Thursday,
+        civil::Weekday::Friday => croner::Weekday::Friday,
+        civil::Weekday::Saturday => croner::Weekday::Saturday,
+    }
+}
+
 /// A validated schedule: a five-field cron expression plus the IANA zone it is read in.
 #[derive(Debug, Clone)]
 pub struct CronSpec {
@@ -117,6 +129,7 @@ impl CronSpec {
                 i32::from(date.year()),
                 field(date.month()),
                 field(date.day()),
+                weekday(date.weekday()),
             )
             .unwrap_or(false)
             && self

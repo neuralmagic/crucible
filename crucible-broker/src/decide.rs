@@ -54,7 +54,9 @@ impl DecisionApi {
         match (&question.kind, self) {
             (QuestionKind::Score { .. }, DecisionApi::OpenAi) => Some(AskedAs::Score),
             (QuestionKind::Score { .. }, DecisionApi::SystemOne) => Some(AskedAs::Choice),
-            (QuestionKind::Noul | QuestionKind::Choice { .. }, _) => None,
+            (QuestionKind::Noul | QuestionKind::Choice { .. } | QuestionKind::Pick { .. }, _) => {
+                None
+            }
         }
     }
 
@@ -161,7 +163,8 @@ fn system_one_body(
             let mut body = json!({ "instructions": q.instructions });
             match &q.kind {
                 QuestionKind::Noul => body["type"] = json!("noul"),
-                QuestionKind::Choice { options } | QuestionKind::Score { levels: options } => {
+                QuestionKind::Pick { .. } => body["type"] = json!("pick"),
+                QuestionKind::Choice { options, .. } | QuestionKind::Score { levels: options } => {
                     body["type"] = json!("choice");
                     body["criteria"] = Value::Object(
                         options
@@ -221,7 +224,12 @@ fn openai_body(model: &str, questions: &BTreeMap<QuestionId, Question>, state: &
                 "name": id.as_str(),
                 "instructions": q.instructions,
             }),
-            QuestionKind::Choice { options } => {
+            QuestionKind::Pick { .. } => json!({
+                "type": "pick",
+                "name": id.as_str(),
+                "instructions": q.instructions,
+            }),
+            QuestionKind::Choice { options, .. } => {
                 let choices: Vec<Value> = options
                     .iter()
                     .map(|o| {
@@ -381,6 +389,7 @@ pub fn parse_response(
                 score: None,
                 asked_as,
                 options: Vec::new(),
+                labels: Vec::new(),
             },
             Reply::Answered(answer) => Answer {
                 asked_as,
@@ -444,12 +453,16 @@ fn probabilities(
         {
             distribution(probabilities)
         }
+        (QuestionKind::Pick { .. }, _) => Err(invalid(format!(
+            "question {id:?} is a pick, which only a person answers"
+        ))),
         (kind, answer) => {
             let asked = match (kind, asked_as) {
                 (QuestionKind::Noul, _) => "a noul",
                 (QuestionKind::Choice { .. }, _) => "a choice",
                 (QuestionKind::Score { .. }, Some(AskedAs::Choice)) => "a score asked as a choice",
                 (QuestionKind::Score { .. }, _) => "a score",
+                (QuestionKind::Pick { .. }, _) => "a pick",
             };
             let answered = match answer {
                 WireAnswer::Noul(_) => "a noul",
@@ -551,6 +564,7 @@ mod tests {
                                 description: None,
                             },
                         ],
+                        multiple: false,
                     },
                     drop: vec![],
                 },
@@ -619,6 +633,7 @@ mod tests {
             url: Some("http://dgemma:8011/v1/systemone".into()),
             model: "dgemma".into(),
             key_env: key_env.map(|name| EnvName::new(name).unwrap()),
+            price: None,
         }
     }
 
@@ -1214,7 +1229,10 @@ mod tests {
             qid("package"),
             Question {
                 instructions: "Which shipped package?".into(),
-                kind: QuestionKind::Choice { options },
+                kind: QuestionKind::Choice {
+                    options,
+                    multiple: false,
+                },
                 drop: vec![],
             },
         )])

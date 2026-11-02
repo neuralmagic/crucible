@@ -1,0 +1,9 @@
+FROM registry.access.redhat.com/ubi9/go-toolset:latest AS build
+WORKDIR /opt/app-root/src/bench
+COPY --chown=1001:0 . .
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOFLAGS=-trimpath go build -o bench .
+
+FROM scratch
+COPY --from=build /opt/app-root/src/bench/bench /bench
+USER 65532:65532
+ENTRYPOINT ["/bench"]

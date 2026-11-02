@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use rust_embed::Embed;
@@ -136,10 +136,19 @@ async fn serve_spa(State(source): State<Arc<Source>>, uri: Uri) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    match source.as_ref() {
+    let mut response = match source.as_ref() {
         Source::Embedded => embedded(path),
         Source::Dir(root) => from_dir(root, path).await,
-    }
+    };
+    // The consent page is one of the SPA's routes: framed by another page, its Allow button could
+    // be clicked through a disguise.
+    let headers = response.headers_mut();
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    response
 }
 
 #[cfg(test)]
@@ -287,5 +296,30 @@ mod tests {
             cache_control("fonts/IoskeleyMono-Regular.woff2"),
             "no-cache"
         );
+    }
+
+    #[tokio::test]
+    async fn no_page_of_the_spa_may_be_framed() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("index.html"), "<html>shell</html>").expect("index");
+        for path in ["/consent?id=abc", "/settings", "/index.html", "/"] {
+            let answer = router(Source::Dir(dir.path().to_path_buf()))
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("a request"),
+                )
+                .await
+                .expect("a response");
+            assert_eq!(answer.status(), StatusCode::OK, "{path}");
+            let headers = answer.headers();
+            assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY", "{path}");
+            assert_eq!(
+                headers[header::CONTENT_SECURITY_POLICY],
+                "frame-ancestors 'none'",
+                "{path}"
+            );
+        }
     }
 }

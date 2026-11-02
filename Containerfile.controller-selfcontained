@@ -1,0 +1,48 @@
+# produces: crucible-controller, for cluster builds and e2e runs
+# SELF-CONTAINED variant of Containerfile.controller for the CLUSTER build backend: it compiles
+# crucible-controller and crux in a builder stage instead of packaging docker.yml's prebuilt/bin/,
+# and lays them over CRUCIBLE_RUNTIME (a Containerfile.runtime-selfcontained image from the same
+# checkout, so the engine the controller launches matches it). No SPA: ui/dist is not built here,
+# and the controller answers `/` with its "UI not built" page. amd64 only.
+
+ARG CRUCIBLE_RUNTIME=unset--pass-build-arg-CRUCIBLE_RUNTIME
+ARG VERSION=dev
+ARG REVISION=unknown
+
+FROM registry.access.redhat.com/ubi10/ubi:10.2 AS bins
+RUN dnf install -y --nodocs \
+        gcc gcc-c++ make cmake \
+        openssl-devel pkgconfig zlib-devel \
+        git curl tar gzip findutils unzip \
+    && dnf clean all \
+    && curl -fsSL -o /tmp/protoc.zip \
+        https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*' \
+    && rm /tmp/protoc.zip \
+    && protoc --version
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
+    && cargo --version
+WORKDIR /src
+COPY . .
+ARG CRUCIBLE_GIT_SHA
+ENV SQLX_OFFLINE=true CRUCIBLE_GIT_SHA=${CRUCIBLE_GIT_SHA}
+RUN cargo build --release --locked -p crucible-controller -p crux \
+        --bin crucible-controller --bin crux \
+    && mkdir -p /prebuilt/bin \
+    && cp target/release/crucible-controller target/release/crux /prebuilt/bin/
+
+FROM ${CRUCIBLE_RUNTIME}
+ARG CRUCIBLE_RUNTIME
+ARG VERSION
+ARG REVISION
+LABEL org.opencontainers.image.title="crucible-controller" \
+      org.opencontainers.image.description="The crucible control plane: ledger, daemon and API, on the crucible runtime" \
+      org.opencontainers.image.source="https://github.com/neuralmagic/crucible" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      io.crucible.base-image="${CRUCIBLE_RUNTIME}"
+COPY --from=bins /prebuilt/bin/ /usr/local/bin/
+RUN crucible-controller --help >/dev/null && crux --help >/dev/null
+ENTRYPOINT ["crucible-controller"]

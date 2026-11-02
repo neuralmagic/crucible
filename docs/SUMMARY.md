@@ -10,6 +10,7 @@
 - [Workflow DSL reference](./dsl-reference.md)
 - [Work graphs](./work-graphs.md)
 - [Plan execution states](./plan-states.md)
+- [Example: build, run, measure, iterate](./examples/optimize-loop.md)
 
 # Autoresearch
 

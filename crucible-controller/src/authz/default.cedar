@@ -85,3 +85,13 @@ when { resource has run && resource.run == principal.id };
 @id("run-publish-self")
 permit(principal is RunPrincipal, action == Action::"run:publish", resource)
 when { resource has run && resource.run == principal.id };
+
+@id("team-maintainer-approve-run")
+permit(principal, action == Action::"run:approve", resource)
+when {
+    resource.owner_kind == "team" && resource has owner_role
+    && ["maintainer", "owner"].contains(resource.owner_role)
+};
+
+@id("runs-never-approve")
+forbid(principal is RunPrincipal, action == Action::"run:approve", resource);

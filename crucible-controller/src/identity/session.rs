@@ -44,6 +44,9 @@ const ID_TOKEN_KEY: &str = "oidc_id_token";
 /// The session slot an in-flight authorization-code request parks its PKCE verifier, nonce, and
 /// state under, between `/auth/login` and `/auth/callback`.
 const FLOW_KEY: &str = "oidc_flow";
+/// The session slot a cluster link parks its state and PKCE verifier under, between starting the
+/// link and the cluster's callback.
+const CLUSTER_LINK_KEY: &str = "cluster_link_flow";
 /// The session slot an administrator's view-as snapshot of another user lives under.
 const IMPERSONATION_KEY: &str = "impersonation";
 /// How long a view-as lasts before the session answers as its own identity again.
@@ -199,6 +202,22 @@ pub async fn take_login(
     session: &Session,
 ) -> Result<Option<LoginFlow>, tower_sessions::session::Error> {
     take_slot(session, FLOW_KEY).await
+}
+
+/// Park a cluster link on the session, replacing any link this browser started before.
+pub async fn start_cluster_link(
+    session: &Session,
+    pending: &PendingLink,
+) -> Result<(), tower_sessions::session::Error> {
+    write_slot(session, CLUSTER_LINK_KEY, pending).await
+}
+
+/// Take the parked cluster link off the session. Removed whatever the callback carries, so one
+/// authorization response can never be replayed.
+pub async fn take_cluster_link(
+    session: &Session,
+) -> Result<Option<PendingLink>, tower_sessions::session::Error> {
+    take_slot(session, CLUSTER_LINK_KEY).await
 }
 
 /// Promote a validated login into a session: everything the pre-login session held is dropped, the
@@ -509,6 +528,30 @@ pub(crate) fn asserted_groups(headers: &HeaderMap) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A link waiting for its callback, parked on the browser session.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingLink {
+    pub cluster: String,
+    pub sub: String,
+    pub(crate) state: String,
+    pub(crate) pkce_verifier: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) started_at: jiff::Timestamp,
+    /// The in-app page the callback lands on; Settings when `None`.
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+impl std::fmt::Debug for PendingLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLink")
+            .field("cluster", &self.cluster)
+            .field("sub", &self.sub)
+            .field("started_at", &self.started_at)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

@@ -32,6 +32,21 @@ function CommandBlock({ commands }: { commands: string[] }) {
   );
 }
 
+/// The skill download on its own, so it outlives a dismissed hint.
+export function SkillLink() {
+  const setup = $api.useQuery('get', '/api/playbooks/drafts/co-draft');
+  if (setup.data === undefined) return null;
+  return (
+    <a
+      href={setup.data.skill_url}
+      download
+      className="font-mono text-label font-normal text-ink-3 hover:text-ink hover:underline"
+    >
+      Agent skill
+    </a>
+  );
+}
+
 /// The loop this studio is for: your own agent writes the pack, you read the saves. The commands
 /// come from the controller so they name this deployment rather than an example one.
 export function CoDraftHint() {

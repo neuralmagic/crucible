@@ -632,7 +632,8 @@ describe('a routed plan a run folds to', () => {
   });
 
   /// Instance k of fix reads instance k of triage, so once both have expanded the edges pair up:
-  /// the deck-to-deck edge carries the when, and each paired edge the answer that decided it.
+  /// each paired edge carries the answer that decided it, and the deck-to-deck edge, which would
+  /// repeat it, is gone.
   it('pairs the instances of an aligned edge once both ends have expanded', () => {
     const ran = [
       result(0, 'triage[a]', 'pass'),
@@ -641,8 +642,7 @@ describe('a routed plan a run folds to', () => {
     ];
     const edges = fold(plan, ran, [], [], false, decisions).graph.edges;
     const between = (from: string, to: string) => edges.filter((e) => e.from === from && e.to === to);
-    expect(between('triage', 'fix')).toHaveLength(1);
-    expect(between('triage', 'fix')[0]?.when?.labels).toEqual(['high', 'low']);
+    expect(between('triage', 'fix')).toEqual([]);
     expect(between('triage[a]', 'fix[a]')).toEqual([
       {
         from: 'triage[a]',

@@ -953,17 +953,19 @@ mod tests {
         age_every_tree(&pool).await;
 
         assert!(
-            crate::playbooks::drafts::delete(&pool, "first")
+            crate::playbooks::drafts::delete(&pool, "first", None, None)
                 .await
                 .expect("delete")
+                .is_some()
         );
         assert_eq!(collect(&pool).await.expect("collect").trees, 0);
         assert_eq!(stored(&pool, &first).await, (true, files));
 
         assert!(
-            crate::playbooks::drafts::delete(&pool, "second")
+            crate::playbooks::drafts::delete(&pool, "second", None, None)
                 .await
                 .expect("delete")
+                .is_some()
         );
         assert_eq!(collect(&pool).await.expect("collect").trees, 1);
         assert_eq!(stored(&pool, &first).await, (false, 0));
@@ -989,9 +991,10 @@ mod tests {
         .await
         .expect("alias");
         assert!(
-            crate::playbooks::drafts::delete(&pool, "studio")
+            crate::playbooks::drafts::delete(&pool, "studio", None, None)
                 .await
                 .expect("delete")
+                .is_some()
         );
         age_every_tree(&pool).await;
 

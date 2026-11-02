@@ -6,7 +6,9 @@ Veil models of the engine, checked by `just formal` (`lake build` in this direct
 tables in `crucible/src/plan/machine.rs`: serial dispatch, concurrent isolated batches, revise
 rounds, truncation, halts, and epilogues, with the RFC-0002 playbook obligations as invariants.
 `#model_check` explores every well-formed three-task graph and every run of it;
-`#check_invariants` proves the same invariants inductive for graphs of any size. Fan-out and
+`#check_invariants` proves the same invariants inductive for graphs of any size. The cost
+ceiling stops only tasks that can spend; in the model check only the last task in topological
+order may not spend, and a second ceiling after the first halt is not modelled. Fan-out and
 transport retries are not modelled yet.
 
 `just formal-mutants` breaks one executor rule per copy of the model and fails unless the model

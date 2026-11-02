@@ -1,0 +1,26 @@
+[package]
+name = "crucible-lsp"
+description = "Language server for crucible workflow Starlark: the engine's own compile errors, lints, completion, hover, signature help, go-to-definition, and document symbols."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "crucible-lsp"
+path = "src/main.rs"
+
+[dependencies]
+# The compiler, DSL reference, dialect, and lane globals. No S3 publishing.
+crucible = { path = "../crucible", default-features = false }
+crucible-contract = { path = "../crucible-contract" }
+# Pinned to the engine's versions so an `AstModule` parsed here is the type the engine accepts.
+starlark = "0.14.2"
+starlark_syntax = "0.14.2"
+tower-lsp-server = "0.23"
+tokio = { workspace = true, features = ["io-std"] }
+serde_json.workspace = true
+# Reads `[agent.sandbox.<name>]` keys out of the pack's crucible.toml.
+toml = "1.1"
+
+[dev-dependencies]
+tempfile = "3"

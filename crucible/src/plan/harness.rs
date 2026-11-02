@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::Context;
 use clap::ValueEnum;
 
 use serde_json::Value;
@@ -16,6 +17,7 @@ use serde_json::Value;
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
 use crate::agent::turn::TurnFailure;
+use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
@@ -39,6 +41,9 @@ use crate::plan::STAGED_INPUTS;
 /// The most a single run may capture. Operator-owned, and the run's bound rather than any one
 /// task's: a pipeline that captures a little at every stage can still fill a disk.
 const MAX_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Upstream results larger than this reach an agent as a file instead of inline in its prompt.
+const MAX_INLINE_INPUTS_BYTES: usize = 64 * 1024;
 
 /// A declared path resolved inside the workspace, or why it is refused. Symlinks are refused per
 /// component and a second name is refused outright, for the same reason the pack's own paths are:
@@ -240,6 +245,7 @@ impl TaskRunner for HarnessRunner {
                 inputs,
                 deadline,
                 budget_left: self.budget_left,
+                lane: None,
             },
             None,
         )
@@ -312,8 +318,11 @@ impl TaskRunner for HarnessRunner {
         }
         let workspace = &self.paths.workspace;
         let outcome = if passed {
-            crucible_vcs::git_memory::snapshot(workspace, &format!("task {}", task.name))
-                .map(|_| ())
+            crucible_vcs::git_memory::snapshot(
+                workspace,
+                &crucible_vcs::git_memory::task_label(&task.name.0),
+            )
+            .map(|_| ())
         } else {
             crucible_vcs::vcs::head_sha(workspace)
                 .and_then(|head| crucible_vcs::git_memory::restore(workspace, &head, &[]))
@@ -332,76 +341,47 @@ impl TaskRunner for HarnessRunner {
     /// Isolated tasks that are ready together run concurrently, each in its own worktree.
     /// Concurrency is what isolation buys: two reviewers reading the same artifact would
     /// otherwise race on the single `PLAN_TASK_RESULT.json` in the shared workspace.
-    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
-        if batch.len() == 1 {
-            let b = &batch[0];
-            return vec![run_task(
+    fn run_many(
+        &mut self,
+        batch: &[BatchItem<'_>],
+        admission: &Admission,
+    ) -> Vec<Result<Attempt, Refusal>> {
+        // Every item clones the same workspace, so its pending state is captured once here:
+        // concurrent `git add -A` in one repo races on `.git/index.lock`.
+        let pending = match batch {
+            [_] => None,
+            _ => match crate::plan::worktree::capture_diff(&self.paths.workspace) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let note = format!("capturing the workspace's uncommitted state failed: {e:#}");
+                    return batch
+                        .iter()
+                        .map(|_| Ok(Attempt::failed(0.0, note.clone())))
+                        .collect();
+                }
+            },
+        };
+        let budget_left = self.budget_left;
+        let (args, paths, captured_bytes, staged) =
+            (&self.args, &self.paths, &self.captured_bytes, &self.staged);
+        admission.run_all(batch, |b, lane| {
+            run_task(
                 &Dispatch {
-                    args: &self.args,
-                    paths: &self.paths,
-                    captured_bytes: &self.captured_bytes,
-                    staged: self.staged.get(&b.task.name).map(Vec::as_slice),
+                    args,
+                    paths,
+                    captured_bytes,
+                    staged: staged.get(&b.task.name).map(Vec::as_slice),
                 },
                 b.task,
                 Job {
                     attempt: b.attempt,
                     inputs: &b.inputs,
-                    deadline: b.deadline,
-                    budget_left: self.budget_left,
+                    deadline: lane.deadline(),
+                    budget_left,
+                    lane: Some(lane),
                 },
-                None,
-            )];
-        }
-        // Every item clones the same workspace, so its pending state is captured once here:
-        // concurrent `git add -A` in one repo races on `.git/index.lock`.
-        let pending = match crate::plan::worktree::capture_diff(&self.paths.workspace) {
-            Ok(p) => p,
-            Err(e) => {
-                let note = format!("capturing the workspace's uncommitted state failed: {e:#}");
-                return batch
-                    .iter()
-                    .map(|_| Attempt::failed(0.0, note.clone()))
-                    .collect();
-            }
-        };
-        let captured = &self.captured_bytes;
-        let staged = &self.staged;
-        let budget_left = self.budget_left;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = batch
-                .iter()
-                .map(|b| {
-                    let args = self.args.clone();
-                    let paths = self.paths.clone();
-                    let pending = pending.as_str();
-                    scope.spawn(move || {
-                        run_task(
-                            &Dispatch {
-                                args: &args,
-                                paths: &paths,
-                                captured_bytes: captured,
-                                staged: staged.get(&b.task.name).map(Vec::as_slice),
-                            },
-                            b.task,
-                            Job {
-                                attempt: b.attempt,
-                                inputs: &b.inputs,
-                                deadline: b.deadline,
-                                budget_left,
-                            },
-                            Some(pending),
-                        )
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Attempt::failed(0.0, "task thread panicked".to_string())
-                    })
-                })
-                .collect()
+                pending.as_deref(),
+            )
         })
     }
 }
@@ -415,14 +395,15 @@ struct Dispatch<'a> {
     staged: Option<&'a [StagedInput]>,
 }
 
-/// One attempt of one task: its number, its inputs, when it must be over by, and what the run
-/// may still spend on it.
+/// One attempt of one task: its number, its inputs, when it must be over by, what the run may
+/// still spend on it, and the lane it reports its spend through while it runs.
 #[derive(Clone, Copy)]
 struct Job<'a> {
     attempt: u32,
     inputs: &'a BTreeMap<TaskName, Value>,
     deadline: Option<Deadline>,
     budget_left: f64,
+    lane: Option<&'a Lane<'a>>,
 }
 
 /// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
@@ -640,17 +621,45 @@ fn withheld(attempt: Attempt, why: String) -> Attempt {
 fn agent_prompt(
     prompt: &str,
     inputs: &BTreeMap<TaskName, Value>,
-) -> Result<String, serde_json::Error> {
+    workspace: &Path,
+) -> anyhow::Result<String> {
     let history_key = TaskName(crate::plan::ir::HISTORY_INPUT.to_string());
     let mut upstream = inputs.clone();
     let history = upstream.remove(&history_key);
-    let inputs_json = serde_json::to_string_pretty(&upstream)?;
+    let inputs_json =
+        serde_json::to_string_pretty(&upstream).context("serializing upstream task results")?;
+
+    let inputs_section = if inputs_json.len() > MAX_INLINE_INPUTS_BYTES {
+        let declared = format!("{STAGED_INPUTS}/.task-results.json");
+        let path = confined(workspace, &declared).map_err(anyhow::Error::msg)?;
+
+        std::fs::create_dir_all(workspace.join(STAGED_INPUTS))
+            .context("creating the agent inputs directory")?;
+        engine_mode(&path);
+        std::fs::write(&path, &inputs_json).context("writing complete agent task inputs")?;
+
+        let mut permissions = std::fs::metadata(&path)
+            .context("reading agent input file permissions")?
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions)
+            .context("making agent task inputs read-only")?;
+
+        format!(
+            "Full upstream task results are in `{declared}` ({} bytes). Read and query this JSON file as needed; it contains every upstream result.",
+            inputs_json.len(),
+        )
+    } else {
+        format!("Upstream task results, as JSON:\n\n{inputs_json}")
+    };
+
     let history_section = match history {
-        Some(history) => crate::plan::history::history_section(&history)?,
+        Some(history) => crate::plan::history::history_section(&history)
+            .context("rendering agent task history")?,
         None => String::new(),
     };
     Ok(format!(
-        "{prompt}\n\n## Task inputs\n\nUpstream task results, as JSON:\n\n{inputs_json}\n\n\
+        "{prompt}\n\n## Task inputs\n\n{inputs_section}\n\n\
          {history_section}## Result contract\n\nWhen done, write your final result as a single \
          JSON object to `{RESULT_FILE}` in the workspace root. The run is graded on that file."
     ))
@@ -828,6 +837,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         inputs,
         deadline,
         budget_left,
+        lane,
     } = job;
     let (prompt, harness, model, effort, sandbox) = match &task.task {
         TaskKind::Agent {
@@ -885,9 +895,9 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         );
     }
 
-    let full_prompt = match agent_prompt(prompt, inputs) {
+    let full_prompt = match agent_prompt(prompt, inputs, &paths.workspace) {
         Ok(p) => p,
-        Err(e) => return Attempt::failed(0.0, format!("inputs not serializable: {e}")),
+        Err(e) => return Attempt::failed(0.0, format!("preparing task prompt failed: {e:#}")),
     };
 
     let ledgered = task.session.is_some();
@@ -908,8 +918,9 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         name: &task.name.0,
         deadline,
         ledgered,
+        lane,
     };
-    let (cost, end) = agent_turn(&cx, &full_prompt, session.as_ref());
+    let (cost, end) = agent_turn(&cx, &full_prompt, session.as_ref(), 0.0);
     let attempt = end.into_attempt(cost);
     match session {
         Some(session) if task.repair > 0 => repaired(&cx, task, session, attempt, budget_left),
@@ -926,6 +937,7 @@ struct TurnCx<'a> {
     /// Whether the session is a named one whose ledger cursor advances after the turn. A task's
     /// own repair conversation is not, so a later attempt starts it fresh.
     ledgered: bool,
+    lane: Option<&'a Lane<'a>>,
 }
 
 /// How one agent turn ended, before it is read as an attempt.
@@ -956,11 +968,13 @@ impl TurnEnd {
     }
 }
 
-/// Run one agent turn in `cx.paths.workspace` and read the result file it left.
+/// Run one agent turn in `cx.paths.workspace` and read the result file it left. `banked` is what
+/// the attempt spent on earlier turns, so the lane's running figure covers the whole attempt.
 fn agent_turn(
     cx: &TurnCx<'_>,
     prompt: &str,
     session: Option<&crate::agent::agent_session::SessionTurn>,
+    banked: f64,
 ) -> (f64, TurnEnd) {
     let paths = cx.paths;
     let result_path = paths.workspace.join(RESULT_FILE);
@@ -991,6 +1005,9 @@ fn agent_turn(
                 for progress in log.on_event(ev, Instant::now()) {
                     eprintln!("[{name}] {progress}");
                 }
+            }
+            if let (Some(lane), Some(cost)) = (cx.lane, ev.and_then(crate::agent::event::cost_of)) {
+                lane.spent_so_far(banked + cost);
             }
             if let Some(failure) = ev.and_then(agent_transport_error) {
                 transport_error = Some(failure);
@@ -1088,6 +1105,7 @@ fn repaired(
             cx,
             &repair_prompt(round, task.repair, &notes),
             Some(&session),
+            attempt.cost_usd,
         );
         attempt.cost_usd += cost;
         attempt.repairs.push(TaskRepair {
@@ -1372,6 +1390,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: sandboxed_args(),
@@ -1533,6 +1552,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -1796,6 +1816,7 @@ mod tests {
 
         let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
+            None,
             &BTreeMap::new(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
@@ -3519,6 +3540,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -4791,6 +4813,7 @@ workflow(type = "playbook", tasks = [echo])
         .unwrap();
         let mut runner = crate::cli::setup::prep_plan_runner_with_params(
             &manifest_path,
+            None,
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
@@ -5235,6 +5258,124 @@ workflow(type = "playbook", tasks = [author, repro])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_real_agent_backend_reads_large_upstream_results_without_a_large_prompt() {
+        let dir = playbook_pack(
+            "large-agent-input-backend",
+            r#"
+produce = command(
+    name = "produce",
+    run = "python3 -c 'import json; print(json.dumps({\"blob\": \"x\" * 180000}))'"
+)
+review = agent(
+    name = "review",
+    prompt = "Inspect all upstream results.",
+    depends_on = [produce]
+)
+workflow(type = "playbook", tasks = [produce, review])
+"#,
+        );
+
+        let script = dir.join("read-inputs.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, pathlib
+
+assert len(os.environ['CRUCIBLE_PROMPT']) < 4096
+
+path = pathlib.Path('inputs/.task-results.json')
+assert path.stat().st_mode & 0o222 == 0
+
+inputs = json.loads(path.read_text())
+assert inputs['produce']['blob'] == 'x' * 180000
+
+pathlib.Path('PLAN_TASK_RESULT.json').write_text(
+    json.dumps({'saw': len(inputs['produce']['blob'])})
+)
+"#,
+        )
+        .unwrap();
+
+        let manifest = dir.join("crucible.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        let text = text
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("agent_cmd =") {
+                    format!("agent_cmd = \"python3 {}\"", script.display())
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(manifest, text).unwrap();
+
+        let out = run_playbook(&dir);
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            out.results[&TaskName("review".into())]
+                .output
+                .as_ref()
+                .unwrap()["saw"],
+            180000
+        );
+        assert!(
+            git_output(
+                &dir.join("workspace"),
+                &["ls-tree", "-r", "--name-only", "HEAD", "--", "inputs"]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn large_agent_inputs_remain_complete_in_a_read_only_file() {
+        let dir = crate::testing::tempdir("large-agent-inputs");
+        let inputs = BTreeMap::from([(
+            TaskName("measurement".into()),
+            serde_json::json!({"detail": "evidence".repeat(20000)}),
+        )]);
+        let prompt = agent_prompt("Review the evidence.", &inputs, &dir).unwrap();
+
+        assert!(prompt.len() < 4096);
+        assert!(prompt.contains("inputs/.task-results.json"));
+
+        let path = dir.join("inputs/.task-results.json");
+        let held: BTreeMap<TaskName, Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(held, inputs);
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+
+        let updated = BTreeMap::from([(
+            TaskName("measurement".into()),
+            serde_json::json!({"detail": "changed".repeat(20000)}),
+        )]);
+        agent_prompt("Review again.", &updated, &dir).unwrap();
+
+        let held: BTreeMap<TaskName, Value> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(held, updated);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn large_agent_inputs_refuse_a_symlinked_destination() {
+        let dir = crate::testing::tempdir("agent-input-symlink");
+        let outside = dir.join("outside.json");
+        std::fs::write(&outside, "untouched").unwrap();
+        std::fs::create_dir(dir.join("inputs")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("inputs/.task-results.json")).unwrap();
+
+        let inputs = BTreeMap::from([(
+            TaskName("measurement".into()),
+            serde_json::json!({"detail": "evidence".repeat(20000)}),
+        )]);
+
+        assert!(agent_prompt("Review.", &inputs, &dir).is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "untouched");
+    }
+
     /// History is text earlier agents wrote. It reaches the prompt inside the external-input
     /// markers and nowhere else, and a marker it carries cannot close the region early.
     #[test]
@@ -5247,7 +5388,12 @@ workflow(type = "playbook", tasks = [author, repro])
                 serde_json::json!({"records": [{"run": "r9", "entry": {"output": {"note": hostile}}}], "dropped": 0}),
             ),
         ]);
-        let prompt = agent_prompt("Fix what broke.", &inputs).unwrap();
+        let prompt = agent_prompt(
+            "Fix what broke.",
+            &inputs,
+            &crate::testing::tempdir("agent-history"),
+        )
+        .unwrap();
         let (head, marked) = prompt
             .split_once("<<<EXTERNAL INPUT")
             .unwrap_or_else(|| panic!("no marked region: {prompt}"));
@@ -5267,7 +5413,12 @@ workflow(type = "playbook", tasks = [author, repro])
         assert_eq!(prompt.matches("<<<END EXTERNAL INPUT>>>").count(), 1);
 
         let without = BTreeMap::from([(TaskName("scan".into()), serde_json::json!({"found": 2}))]);
-        let prompt = agent_prompt("Fix what broke.", &without).unwrap();
+        let prompt = agent_prompt(
+            "Fix what broke.",
+            &without,
+            &crate::testing::tempdir("agent-no-history"),
+        )
+        .unwrap();
         assert!(!prompt.contains("EXTERNAL INPUT"), "{prompt}");
         assert!(!prompt.contains("Run history"), "{prompt}");
         assert!(

@@ -147,6 +147,17 @@ test.describe('draft authoring studio', () => {
     await expect(page.getByText('Co-draft with your own agent')).toHaveCount(0);
   });
 
+  test('the agent skill stays reachable after the hint is dismissed', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, '/playbooks/drafts');
+    await page.getByRole('button', { name: 'Dismiss' }).click();
+
+    await expect(page.getByRole('link', { name: 'Agent skill' })).toHaveAttribute(
+      'href',
+      'https://crucible.example.com/api/playbooks/drafts/skill',
+    );
+  });
+
   /// The one-motion entry: a repo, a ref and a path go in and the studio opens on the draft. The
   /// controller mints the import behind it; the page just has to ask for the right thing.
   test('a draft is opened straight from a git repo', async ({ page }) => {

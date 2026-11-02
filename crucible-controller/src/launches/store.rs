@@ -43,6 +43,8 @@ pub(crate) async fn insert_playbook_launch_with(
     let tier = Tier::T1.as_str();
     let max_time = launch.max_time.as_str();
     let origin = launch.origin.as_str();
+    let rerun_of = launch.rerun.map(|r| r.run.as_str());
+    let rerun_from = serde_json::json!(launch.rerun.map(|r| r.from.as_slice()).unwrap_or_default());
     sqlx::query!(
         "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) \
          VALUES ($1, $2, $3, 'new', 0, 'playbook', $4, $5)",
@@ -58,8 +60,8 @@ pub(crate) async fn insert_playbook_launch_with(
     sqlx::query!(
         "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, \
          advance_dedupe, dedupe_schedule, origin, draft_version, created_by, launcher_groups, \
-         created_at, exposure, exposure_digest) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+         created_at, exposure, exposure_digest, rerun_of, rerun_from) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         key,
         launch.playbook,
         launch.params,
@@ -75,6 +77,8 @@ pub(crate) async fn insert_playbook_launch_with(
         now,
         exposure_json,
         exposure_digest,
+        rerun_of,
+        rerun_from,
     )
     .execute(&mut **tx)
     .await
@@ -100,7 +104,8 @@ pub(crate) async fn get_playbook_launch(
 ) -> Result<Option<PlaybookLaunch>> {
     let row = sqlx::query!(
         "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, \
-         launcher_groups, created_at, draft_version, exposure FROM playbook_launches WHERE key = $1",
+         launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from, variant \
+         FROM playbook_launches WHERE key = $1",
         key,
     )
     .fetch_optional(pool)
@@ -125,7 +130,35 @@ pub(crate) async fn get_playbook_launch(
             .exposure
             .map(crate::playbooks::exposure::Exposure::from_value)
             .transpose()?,
+        rerun: row.rerun_of.map(|run| crate::launches::model::RerunOf {
+            run,
+            from: serde_json::from_value(row.rerun_from).unwrap_or_default(),
+        }),
+        variant: row
+            .variant
+            .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+            .transpose()
+            .with_context(|| format!("stored manifest variant for {key}"))?,
     }))
+}
+
+/// The manifest variant the launch under `key` runs. `None` for the base manifest, and for a key
+/// that names no playbook launch.
+pub(crate) async fn launch_variant(
+    pool: &PgPool,
+    key: &str,
+) -> Result<Option<crucible::manifest::variant::VariantName>> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT variant FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .context("reading a launch's manifest variant")?;
+    stored
+        .flatten()
+        .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+        .transpose()
+        .with_context(|| format!("stored manifest variant for {key}"))
 }
 
 /// The stored group snapshot as plain strings. A row written before the snapshot existed, or one
@@ -513,10 +546,12 @@ pub(crate) async fn launch_exposure(
     let pack = crate::playbooks::packs::materialize_pack(pool, issue_key)
         .await?
         .with_context(|| format!("no stored pack for launch {issue_key}"))?;
-    let extracted =
-        tokio::task::spawn_blocking(move || crate::playbooks::exposure::extract(pack.path(), None))
-            .await
-            .context("joining the launch exposure worker")?;
+    let variant = launch.variant.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        crate::playbooks::exposure::extract(pack.path(), None, variant.as_ref())
+    })
+    .await
+    .context("joining the launch exposure worker")?;
     let exposure = match extracted {
         Ok(exposure) => exposure,
         Err(crate::playbooks::exposure::ExtractError::Refused(message)) => {

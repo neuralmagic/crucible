@@ -334,6 +334,148 @@ async fn a_minted_secret_must_be_an_opaque_run_credential(pool: PgPool) {
     assert!(store::list(&pool, None).await.expect("list").is_empty());
 }
 
+/// The registry router with the GitHub App pointed at `server`, which lists the App on
+/// `neuralmagic` and `red-hat-data-services`.
+async fn app_with_installations(
+    pool: PgPool,
+    server: &wiremock::MockServer,
+    key_dir: &std::path::Path,
+) -> Router {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/app/installations"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 99, "account": {"login": "neuralmagic"}},
+            {"id": 4242, "account": {"login": "red-hat-data-services"}},
+        ])))
+        .mount(server)
+        .await;
+    router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec![], vec!["alice".into()], vec![]),
+        pack_pr_app: Some(crate::secrets::github_app::GithubAppTokenSource::new(
+            "4210340",
+            "99",
+            crate::secrets::github_app::testkey::write_test_key(key_dir),
+            server.uri(),
+        )),
+        ..ApiState::test(Db::new(pool), Arc::new(NoSink))
+    })
+}
+
+fn mint_body(mint: &str) -> Value {
+    json!({"name": "pr-token", "kind": "opaque", "mint": mint})
+}
+
+/// A secret minted for another account stores that account in its source.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_minted_secret_can_name_the_account_it_is_issued_for(pool: PgPool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = wiremock::MockServer::start().await;
+    let app = app_with_installations(pool.clone(), &server, dir.path()).await;
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/Red-Hat-Data-Services")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["vault_path"], "mint://github-app/red-hat-data-services",
+        "{body}"
+    );
+}
+
+/// An account the App is not installed on could never be issued a token.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_minted_secret_for_an_account_without_the_app_is_refused(pool: PgPool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = wiremock::MockServer::start().await;
+    let app = app_with_installations(pool.clone(), &server, dir.path()).await;
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/acme")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not installed on acme"),
+        "{body}"
+    );
+    assert!(store::list(&pool, None).await.expect("list").is_empty());
+}
+
+/// GitHub being unreachable is not the registrant's mistake.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_failed_installation_lookup_is_unavailable(pool: PgPool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/app/installations"))
+        .respond_with(wiremock::ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+    let app = router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec![], vec!["alice".into()], vec![]),
+        pack_pr_app: Some(crate::secrets::github_app::GithubAppTokenSource::new(
+            "4210340",
+            "99",
+            crate::secrets::github_app::testkey::write_test_key(dir.path()),
+            server.uri(),
+        )),
+        ..ApiState::test(Db::new(pool.clone()), Arc::new(NoSink))
+    });
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/red-hat-data-services")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(store::list(&pool, None).await.expect("list").is_empty());
+}
+
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_minted_secret_with_a_malformed_account_is_refused(pool: PgPool) {
+    let app = app(pool.clone(), None);
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/not a login")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a GitHub login"),
+        "{body}"
+    );
+}
+
 /// The three sources are exclusive, and an unknown minter is refused by name.
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_registration_names_exactly_one_source(pool: PgPool) {
@@ -771,6 +913,7 @@ async fn a_transfer_moves_the_bytes_and_the_row_to_the_new_owner(pool: PgPool) {
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await
@@ -2096,4 +2239,252 @@ async fn an_outsiders_pre_tree_binding_pins_what_conversion_would(pool: PgPool) 
     assert_eq!(report.pinned, 0, "{report:?}");
     assert_eq!(pin().await, Some(digest.to_string()));
     assert_eq!(launch().await, Ok(1));
+}
+
+// --- draft rename and clone ----------------------------------------------------------------------
+
+/// Register a secret as `user` from `body` and bind it to playbook scope `scope` as `projection`.
+async fn register_and_bind(
+    app: &Router,
+    user: &str,
+    body: Value,
+    scope: &str,
+    projection: &str,
+    vault_token: Option<&str>,
+) -> String {
+    let (status, created) = call(app, as_user("POST", "/api/secrets", user, &[], Some(body))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an id").to_string();
+    let mut bind = json!({
+        "scope_kind": "playbook", "scope_id": scope,
+        "projection_kind": "env", "projection": projection,
+    });
+    if let Some(token) = vault_token {
+        bind["vault_token"] = json!(token);
+    }
+    let (status, bound) = call(
+        app,
+        as_user(
+            "POST",
+            &format!("/api/secrets/{id}/bindings"),
+            user,
+            &[],
+            Some(bind),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{bound}");
+    id
+}
+
+async fn declared_on(pool: &PgPool, scope: &str) -> Vec<String> {
+    store::bindings_for_scope(pool, crate::secrets::ScopeKind::Playbook, scope)
+        .await
+        .expect("bindings")
+        .into_iter()
+        .map(|(b, _)| b.declared_name.to_string())
+        .collect()
+}
+
+/// A renamed draft keeps every binding without anyone rebinding. A clone copies a binding only
+/// when the cloner could have made it through the bind route: `bind` on its secret, and for a
+/// reference, the cloner's own Vault token. The rest are named in the response, not dropped
+/// silently.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_renamed_draft_keeps_its_bindings_and_a_clone_copies_what_the_cloner_could_bind(
+    pool: PgPool,
+) {
+    let Some(rig) = rig(&pool).await else { return };
+    let other = uniq("other");
+    rig.vault.ensure_kv_mount(&other).await;
+    rig.vault
+        .put(&other, "team/creds", "api", "elsewhere")
+        .await;
+    let policy = uniq("reader");
+    rig.vault.write_mount_policy(&policy, &other).await;
+    let reader = rig.vault.issue_token(&[&policy]).await;
+    let reference = format!("vault://{other}/team/creds#api");
+
+    let (status, created) = call(
+        &rig.app,
+        as_user(
+            "POST",
+            "/api/playbook-drafts",
+            "alice",
+            &[],
+            Some(json!({"id": "studio", "description": "a drafted pack"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let gh = register_and_bind(
+        &rig.app,
+        "alice",
+        register_body("gh-token", None, "hunter2"),
+        "studio",
+        "GH_TOKEN",
+        None,
+    )
+    .await;
+    register_and_bind(
+        &rig.app,
+        "alice",
+        json!({
+            "name": "api-key", "kind": "opaque", "visibility": "agent_visible",
+            "value": "harmless"
+        }),
+        "studio",
+        "API_KEY",
+        None,
+    )
+    .await;
+    register_and_bind(
+        &rig.app,
+        "alice",
+        json!({
+            "name": "elsewhere", "kind": "opaque", "reference": reference,
+            "vault_token": reader
+        }),
+        "studio",
+        "ELSEWHERE",
+        Some(&reader),
+    )
+    .await;
+    register_and_bind(
+        &rig.app,
+        "bob",
+        register_body("bob-token", None, "s3cr3t"),
+        "studio",
+        "BOB_TOKEN",
+        None,
+    )
+    .await;
+    let all = vec!["api-key", "bob-token", "elsewhere", "gh-token"];
+    assert_eq!(declared_on(&pool, "studio").await, all);
+
+    let (status, body) = call(
+        &rig.app,
+        as_user(
+            "POST",
+            "/api/playbook-drafts/studio/rename",
+            "bob",
+            &[],
+            Some(json!({"id": "hijacked"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(declared_on(&pool, "studio").await, all);
+
+    let (status, renamed) = call(
+        &rig.app,
+        as_user(
+            "POST",
+            "/api/playbook-drafts/studio/rename",
+            "alice",
+            &[],
+            Some(json!({"id": "survey-v2"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{renamed}");
+    assert_eq!(renamed["id"], "survey-v2");
+    assert_eq!(renamed["prior"], "studio");
+    assert_eq!(renamed["bindings"], 4);
+    assert_eq!(declared_on(&pool, "survey-v2").await, all);
+    assert!(declared_on(&pool, "studio").await.is_empty());
+    let (status, _) = call(
+        &rig.app,
+        as_user("GET", "/api/playbook-drafts/studio", "alice", &[], None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, cloned) = call(
+        &rig.app,
+        as_user(
+            "POST",
+            "/api/playbook-drafts/survey-v2/clone",
+            "alice",
+            &[],
+            Some(json!({"id": "copy"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{cloned}");
+    assert_eq!(cloned["id"], "copy");
+    assert_eq!(cloned["version"], 1);
+    let copied: Vec<&str> = cloned["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| b["declared_name"].as_str().expect("a name"))
+        .collect();
+    assert_eq!(copied, vec!["api-key", "gh-token"]);
+    for binding in cloned["bindings"].as_array().expect("bindings") {
+        assert_eq!(binding["scope_id"], "copy");
+        assert_eq!(binding["created_by"], "alice");
+    }
+    let left = cloned["left_bindings"].as_array().expect("left");
+    assert_eq!(
+        left.iter()
+            .map(|l| l["declared_name"].as_str().expect("a name"))
+            .collect::<Vec<_>>(),
+        vec!["bob-token", "elsewhere"]
+    );
+    assert_eq!(left[0]["reason"], "you may not bind its secret");
+    assert!(
+        left[1]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("vault_token"),
+        "{cloned}"
+    );
+    assert_eq!(
+        declared_on(&pool, "copy").await,
+        vec!["api-key", "gh-token"]
+    );
+    assert_eq!(
+        declared_on(&pool, "survey-v2").await,
+        all,
+        "the source keeps its own"
+    );
+    let trail = store::audit_for_secret(&pool, &gh, 10)
+        .await
+        .expect("trail");
+    assert_eq!(
+        trail.first().and_then(|e| e.detail.as_deref()),
+        Some("playbook copy as env GH_TOKEN, copied from playbook survey-v2")
+    );
+    assert_eq!(
+        trail.get(1).and_then(|e| e.detail.as_deref()),
+        Some("playbook survey-v2 as env GH_TOKEN, renamed from playbook studio")
+    );
+
+    let (status, cloned) = call(
+        &rig.app,
+        as_user(
+            "POST",
+            "/api/playbook-drafts/survey-v2/clone",
+            "alice",
+            &[],
+            Some(json!({"id": "copy-2", "vault_token": reader})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{cloned}");
+    assert_eq!(
+        cloned["left_bindings"]
+            .as_array()
+            .expect("left")
+            .iter()
+            .map(|l| l["declared_name"].as_str().expect("a name"))
+            .collect::<Vec<_>>(),
+        vec!["bob-token"]
+    );
+    assert_eq!(
+        declared_on(&pool, "copy-2").await,
+        vec!["api-key", "elsewhere", "gh-token"]
+    );
+    assert!(!cloned.to_string().contains(&reader));
 }

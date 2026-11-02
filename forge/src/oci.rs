@@ -438,7 +438,7 @@ pub(crate) async fn push_layer(
                         .stream
                         .map_err(|e| OciDistributionError::GenericError(Some(e.to_string())));
                     client
-                        .push_blob_stream(&target, stream, &l.digest)
+                        .push_blob_stream(&target, stream, &l.digest, u64::try_from(l.size).ok())
                         .await
                         .context("pushing to the target repo")?;
                     Ok(())

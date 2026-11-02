@@ -1,15 +1,16 @@
 # Minimal loop image for the kind e2e: the engine plus what a command-only playbook pod runs, and
-# tools/fake-agent.py for packs whose agent is the command backend with no model, and a stand-in
-# openshell-gateway that lets a sandboxed turn boot as far as publishing its client-TLS Secret.
+# tools/fake-agent.py for packs whose agent is the command backend with no model, and stand-ins for
+# openshell-gateway and the openshell CLI that let a sandboxed turn boot as far as publishing its
+# client-TLS Secret.
 ARG BASE=ubuntu:24.04
 FROM ${BASE}
-ARG CONTRACT_VERSION=unset--pass-build-arg-CONTRACT_VERSION-from-crucible-binary
-ARG CONTRACT_LABEL=${CONTRACT_VERSION}
 RUN apt-get update -qq \
     && apt-get install -y -qq --no-install-recommends git ca-certificates python3 \
     && rm -rf /var/lib/apt/lists/*
+ARG CONTRACT_VERSION=unset--pass-build-arg-CONTRACT_VERSION-from-crucible-binary
+ARG CONTRACT_LABEL=${CONTRACT_VERSION}
 COPY crucible /usr/local/bin/crucible
 COPY fake-agent.py /usr/local/share/fake-agent/fake-agent.py
-COPY openshell-gateway /usr/local/bin/openshell-gateway
+COPY openshell-gateway openshell /usr/local/bin/
 RUN test "$(crucible --contract-version)" = "${CONTRACT_VERSION}"
 LABEL io.crucible.contract-version="${CONTRACT_LABEL}"

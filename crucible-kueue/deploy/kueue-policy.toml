@@ -1,0 +1,16 @@
+# crucible-kueue tool policy (--tool-policy, optional). Rules see `claims` (the access token's)
+# and `args` (the call's arguments).
+#
+# The tools, the scope each needs, and the Kubernetes access each needs are the server's own
+# (crucible-kueue/src/access.rs): every call but whoami is a SubjectAccessReview for the token's
+# kube_user (a person, or a run's launcher), and the server acts with its own service account.
+# Granting someone a queue is ordinary RBAC:
+#
+#   apiGroups: [kueue.x-k8s.io]  resources: [localqueues]  resourceNames: [<queue>]  verbs: [use]
+#
+# `use` is a verb only crucible-kueue asks about.
+
+[[tools.workload_scale.validate]]
+name = "replica-cap"
+rule = "args.replicas >= 0 && args.replicas <= 8"
+message = "replicas must be between 0 and 8"

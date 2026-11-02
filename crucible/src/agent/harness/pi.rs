@@ -47,6 +47,7 @@ impl Pi {
             "/usr/local/bin/pi",
             "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/**",
             "/usr/bin/node",
+            "/usr/bin/node-*",
             "/usr/local/bin/node",
         ],
         // Pi discovers project skills under `.agents/skills` (the Agent Skills layout).

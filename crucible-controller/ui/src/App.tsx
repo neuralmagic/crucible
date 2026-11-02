@@ -7,22 +7,28 @@ import {
   type LazyExoticComponent,
   type ReactNode,
 } from 'react';
-import { Route, Routes, Link, NavLink, Navigate } from 'react-router-dom';
+import { Route, Routes, Link, NavLink, Navigate, useLocation } from 'react-router-dom';
 import { $api } from './api/client';
-import { useAutoresearch } from './api/lanes';
+import { useAgentTools, useAutoresearch, useIdentities } from './api/lanes';
 import { budgetPercent, budgetState, usd, yourSpendToday, type BudgetState } from './budget';
-import { cn, Spinner, Status, Tooltip } from './ui';
+import { cn, ErrorBoundary, Spinner, Status, Tooltip } from './ui';
 import { useDeviceFlag } from './useDeviceFlag';
 import { relativeTime } from './pages/journeyView';
 import { DisplayPrefs } from './DisplayPrefs';
 import { IdentityBadge } from './IdentityBadge';
 import { OwnerSwitcher } from './OwnerSwitcher';
+import { AgentToolsBanner } from './AgentToolsBanner';
 import { AutopilotBanner } from './AutopilotBanner';
 import { ViewAsBanner } from './ViewAsBanner';
 import { CommandPalette } from './palette/CommandPalette';
-import { useResetOnActAs } from './actAs';
+import { actAsFor, useResetOnActAs } from './actAs';
+import { scopedPath } from './ownerContext';
+import { useOwnerContext } from './useOwnerContext';
+import { pickTeams } from './teamPicks';
+import { useActiveTeams, useStarredTeams } from './useTeamPicks';
 import { HomePage } from './pages/HomePage';
 import { approvalsWaiting } from './pages/home';
+import { useDecisionNotifications } from './pages/useDecisionNotifications';
 import { MoltenLogo } from './MoltenLogo';
 
 /// A page loads when first visited, so the first paint carries only the shell and Home.
@@ -42,6 +48,7 @@ const NewScenarioPage = page(() => import('./pages/NewScenarioPage'), 'NewScenar
 const NewJiraPage = page(() => import('./pages/NewJiraPage'), 'NewJiraPage');
 const InboxPage = page(() => import('./pages/InboxPage'), 'InboxPage');
 const ApprovalsPage = page(() => import('./pages/ApprovalsPage'), 'ApprovalsPage');
+const DecisionPage = page(() => import('./pages/DecisionPage'), 'DecisionPage');
 const ReposPage = page(() => import('./pages/ReposPage'), 'ReposPage');
 const RunsPage = page(() => import('./pages/RunsPage'), 'RunsPage');
 const RunDetailPage = page(() => import('./pages/RunDetailPage'), 'RunDetailPage');
@@ -69,8 +76,10 @@ const PolicyPage = page(() => import('./pages/PolicyPage'), 'PolicyPage');
 const SecretsPage = page(() => import('./pages/SecretsPage'), 'SecretsPage');
 const ProvidersPage = page(() => import('./pages/ProvidersPage'), 'ProvidersPage');
 const SettingsPage = page(() => import('./pages/SettingsPage'), 'SettingsPage');
+const ConsentPage = page(() => import('./pages/ConsentPage'), 'ConsentPage');
 const TeamsPage = page(() => import('./pages/TeamsPage'), 'TeamsPage');
 const TeamDetailPage = page(() => import('./pages/TeamDetailPage'), 'TeamDetailPage');
+const TeamMembersPage = page(() => import('./pages/TeamDetailPage'), 'TeamMembersPage');
 // Explore carries the DuckDB-WASM bundle (multi-MB of wasm).
 const ExplorePage = lazy(() => import('./pages/ExplorePage'));
 
@@ -114,6 +123,12 @@ interface StripItem {
 const STRIP_TONE: Record<StripTone, string> = { green: 'text-green', amber: 'text-amber', red: 'text-red' };
 
 const BUDGET_TONE: Record<BudgetState, StripTone> = { uncapped: 'green', ok: 'green', near: 'amber', spent: 'red' };
+
+/// Mounted once in the shell, so a request that opens while any page is up raises its notification.
+function DecisionNotifications() {
+  useDecisionNotifications();
+  return null;
+}
 
 function DatasheetStrip() {
   const autoresearch = useAutoresearch() === true;
@@ -186,6 +201,8 @@ interface RailItem {
   autoresearch?: boolean;
   /// Shown only to platform administrators.
   admin?: boolean;
+  /// Active only on its own path, not on the paths under it.
+  end?: boolean;
 }
 
 interface RailSection {
@@ -193,10 +210,11 @@ interface RailSection {
   items: RailItem[];
 }
 
-function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch' | 'admin'>) {
+function RailLink({ to, label, count, end }: Omit<RailItem, 'icon' | 'autoresearch' | 'admin'>) {
   return (
     <NavLink
       to={to}
+      end={end}
       data-ui="nav-link"
       className={({ isActive }) =>
         cn(
@@ -217,11 +235,12 @@ function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch' |
   );
 }
 
-function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch' | 'admin'>) {
+function RailIcon({ to, label, icon, count, end }: Omit<RailItem, 'autoresearch' | 'admin'>) {
   return (
     <Tooltip side="right" delay={120} content={count === undefined ? label : `${label} · ${count}`}>
       <NavLink
         to={to}
+        end={end}
         aria-label={label}
         data-ui="nav-link"
         className={({ isActive }) =>
@@ -272,12 +291,71 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
   const autoresearch = useAutoresearch() === true;
   const overview = $api.useQuery('get', '/api/overview', {}, POLL);
   const approvals = $api.useQuery('get', '/api/approvals', {}, POLL);
+  const decisions = $api.useQuery('get', '/api/decisions', {}, POLL);
   const repos = $api.useQuery('get', '/api/repos', {}, { enabled: autoresearch });
   const whoami = $api.useQuery('get', '/api/whoami');
 
+  const owner = useOwnerContext();
+
   const statuses = overview.isSuccess ? overview.data.statuses : [];
   const teams = [...(whoami.data?.teams ?? [])].sort((a, b) => a.team.localeCompare(b.team));
-  const allSections: RailSection[] = [
+  const team = owner.team ?? actAsFor(owner.stored);
+  const [starred] = useStarredTeams();
+  const active = useActiveTeams();
+  const picked = pickTeams(
+    teams.map((membership) => membership.team),
+    starred,
+    active,
+    team === null ? null : team.slice('team:'.length),
+  );
+  const teamItems = (except: string | null): RailItem[] => [
+    ...picked.shown
+      .filter((pick) => `team:${pick.slug}` !== except)
+      .map((pick) => ({
+        to: `/teams/${encodeURIComponent(pick.slug)}`,
+        label: pick.starred ? `★ ${pick.slug}` : pick.slug,
+        icon: pick.slug.slice(0, 2).toUpperCase(),
+      })),
+    {
+      to: '/teams',
+      label: 'All teams',
+      icon: 'TM',
+      count: picked.hidden > 0 ? picked.hidden : undefined,
+      end: true,
+    },
+  ];
+  const teamRail = (team: string): RailSection[] => {
+    const at = (page: string) => scopedPath(team, page);
+    return [
+      {
+        heading: team.slice('team:'.length),
+        items: [
+          { to: at('/'), label: 'Home', icon: 'HM', end: true },
+          { to: at('/playbooks'), label: 'Playbooks', icon: 'PB' },
+          { to: at('/playbooks/drafts'), label: 'Drafts', icon: 'DR' },
+          { to: at('/playbook-runs'), label: 'Runs', icon: 'PR' },
+          { to: at('/schedules'), label: 'Schedules', icon: 'SC' },
+          { to: at('/webhooks'), label: 'Webhooks', icon: 'WH' },
+        ],
+      },
+      {
+        heading: 'Resources',
+        items: [
+          { to: at('/secrets'), label: 'Secrets', icon: 'SE' },
+          { to: at('/providers'), label: 'Providers', icon: 'PV' },
+          { to: at('/members'), label: 'Members', icon: 'MB' },
+        ],
+      },
+      {
+        heading: 'Teams',
+        items: [
+          ...teamItems(team),
+          ...(actAsFor(owner.stored) === null ? [{ to: '/', label: 'Everything', icon: 'EV' }] : []),
+        ],
+      },
+    ];
+  };
+  const allSections: RailSection[] = team !== null ? teamRail(team) : [
     {
       heading: 'Queue',
       items: [
@@ -287,7 +365,9 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
           to: '/approvals',
           label: 'Approvals',
           icon: 'AP',
-          count: approvals.isSuccess ? approvalsWaiting(approvals.data) : undefined,
+          count: approvals.isSuccess
+            ? approvalsWaiting(approvals.data) + (decisions.data?.open.length ?? 0)
+            : undefined,
         },
         { to: '/playbooks', label: 'Playbooks', icon: 'PB' },
         { to: '/playbooks/drafts', label: 'Drafts', icon: 'DR' },
@@ -320,14 +400,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
     },
     {
       heading: 'Teams',
-      items: [
-        ...teams.map((membership) => ({
-          to: `/teams/${encodeURIComponent(membership.team)}`,
-          label: membership.team,
-          icon: membership.team.slice(0, 2).toUpperCase(),
-        })),
-        { to: '/teams', label: 'All teams', icon: 'TM' },
-      ],
+      items: teamItems(null),
     },
     {
       heading: 'System',
@@ -405,6 +478,9 @@ export function App() {
   useResetOnActAs();
   const [collapsed, toggleRail] = useRailCollapsed();
   const autoresearch = useAutoresearch() === true;
+  const { pathname } = useLocation();
+  const agentTools = useAgentTools() === true;
+  const identities = useIdentities() === true;
 
   return (
     <div className="flex h-screen min-h-0 flex-col">
@@ -432,13 +508,16 @@ export function App() {
       </header>
 
       <CommandPalette />
+      <DecisionNotifications />
       <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
+      {agentTools ? <AgentToolsBanner /> : null}
 
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
         <main data-ui="main" className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+          <ErrorBoundary key={pathname}>
           <Suspense
             fallback={
               <div className="p-4">
@@ -457,6 +536,7 @@ export function App() {
             <Route path="/issues/:key/scope/progress" element={<Lane page={<ScopeProgressPage />} />} />
             <Route path="/inbox" element={<Lane page={<InboxPage />} />} />
             <Route path="/approvals" element={<ApprovalsPage />} />
+            <Route path="/decisions/:id" element={<DecisionPage />} />
             <Route path="/repos" element={<Lane page={<ReposPage />} />} />
             <Route path="/runs" element={<Lane page={<RunsPage />} />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />
@@ -485,8 +565,17 @@ export function App() {
             <Route path="/secrets" element={<SecretsPage />} />
             <Route path="/providers" element={<ProvidersPage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            {identities ? <Route path="/consent" element={<ConsentPage />} /> : null}
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/teams/:slug" element={<TeamDetailPage />} />
+            <Route path="/teams/:slug/members" element={<TeamMembersPage />} />
+            <Route path="/teams/:slug/playbooks" element={<PlaybooksPage />} />
+            <Route path="/teams/:slug/playbooks/drafts" element={<PlaybookDraftsPage />} />
+            <Route path="/teams/:slug/playbook-runs" element={<PlaybookRunsPage />} />
+            <Route path="/teams/:slug/schedules" element={<SchedulesPage />} />
+            <Route path="/teams/:slug/webhooks" element={<WebhooksPage />} />
+            <Route path="/teams/:slug/secrets" element={<SecretsPage />} />
+            <Route path="/teams/:slug/providers" element={<ProvidersPage />} />
             <Route path="/admin" element={<AdminPage />} />
             <Route path="/policy" element={<PolicyPage />} />
             <Route
@@ -495,6 +584,7 @@ export function App() {
             />
             </Routes>
           </Suspense>
+          </ErrorBoundary>
         </main>
       </div>
     </div>

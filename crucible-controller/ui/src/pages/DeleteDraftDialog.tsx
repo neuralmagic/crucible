@@ -30,8 +30,9 @@ export function DeleteDraftDialog({
             Delete draft {id}?
           </AlertDialog.Title>
           <AlertDialog.Description className="m-0 px-4 py-3.5 text-ink-2">
-            Drops <Mono size="data">{id}</Mono> and every saved version of it. Runs it already
-            launched keep their own records; the pack source does not come back.
+            Drops <Mono size="data">{id}</Mono>, every saved version of it, and its secret
+            bindings, shares and schedules. Runs it already launched keep their own records; the
+            pack source does not come back.
           </AlertDialog.Description>
           {error === null ? null : (
             <div className="px-4 pb-3.5">

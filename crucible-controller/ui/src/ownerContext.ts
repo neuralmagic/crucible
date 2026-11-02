@@ -62,6 +62,30 @@ export function effectiveContext(stored: string | null, principals: readonly Act
   return principals.some((p) => p.value === stored) ? stored : ALL;
 }
 
+/// The team a path is scoped to: `team:<slug>` for `/teams/<slug>` and everything under it.
+export function teamScope(pathname: string): string | null {
+  const match = /^\/teams\/([^/]+)(?:\/|$)/.exec(pathname);
+  if (match === null) return null;
+  try {
+    return `team:${decodeURIComponent(match[1])}`;
+  } catch {
+    return null;
+  }
+}
+
+/// The global `page` inside the team's workspace, which mirrors the global paths under
+/// `/teams/<slug>`, or the global page itself outside one.
+export function scopedPath(team: string | null, page: string): string {
+  if (team === null) return page;
+  const base = `/teams/${encodeURIComponent(team.slice('team:'.length))}`;
+  return page === '/' ? base : `${base}${page}`;
+}
+
+/// What a list page's eyebrow reads: the team it is scoped to, else the page's own section.
+export function eyebrowFor(team: string | null, section: string): string {
+  return team === null ? section : team.slice('team:'.length);
+}
+
 /// Whether a resource with `owner` is in `context`.
 export function inContext(context: string, owner: string | null | undefined): boolean {
   if (context === ALL) return true;

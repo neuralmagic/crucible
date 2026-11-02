@@ -114,8 +114,7 @@ impl Reporter for ConsoleReporter {
                 if let Some(AgentEvent::Tokens(t)) = ev {
                     // Same mid-turn cap check as the session reporter; the console
                     // skips per-sample budget lines to keep the echo readable.
-                    let spent = budget.spent_before
-                        + crate::agent::event::provisional_cost(args.model(), t);
+                    let spent = budget.spent_before + args.pricing().provisional(t);
                     budget.record_provisional(it, spent);
                     if budget.over_cap(spent) && !over_cap_stopped {
                         over_cap_stopped = true;
