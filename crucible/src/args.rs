@@ -339,6 +339,14 @@ impl Paths {
             workspace: worktree,
         }
     }
+
+    /// The run's buildit socket: in its state dir, building from its workspace.
+    pub(crate) fn buildit_socket(&self) -> crate::openshell::buildit::RunSocket {
+        crate::openshell::buildit::RunSocket {
+            path: self.state.join("buildit.sock"),
+            workdir: self.workspace.clone(),
+        }
+    }
 }
 
 /// Inputs resolved once before the loop (and before any UI takes the screen).

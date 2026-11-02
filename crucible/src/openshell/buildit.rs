@@ -32,15 +32,6 @@ pub struct RunSocket {
     pub workdir: PathBuf,
 }
 
-impl RunSocket {
-    pub(crate) fn of(paths: &crate::args::Paths) -> Self {
-        Self {
-            path: paths.state.join("buildit.sock"),
-            workdir: paths.workspace.clone(),
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("buildit's run issuer {0:?} is not <issuer>=<jwks uri>")]
 pub struct BadIssuer(String);
@@ -323,7 +314,7 @@ mod tests {
     fn the_runs_own_socket_sits_in_its_state_dir_and_builds_from_its_workspace() {
         let dir = std::path::Path::new("/runs/r1/pack");
         let paths = crate::args::Paths::for_manifest(dir.join("ws"), dir.join("state"), dir, None);
-        let socket = RunSocket::of(&paths);
+        let socket = paths.buildit_socket();
         assert_eq!(socket.path, dir.join("state/buildit.sock"));
         assert_eq!(socket.workdir, dir.join("ws"));
         let s = site(ISSUER, None);
