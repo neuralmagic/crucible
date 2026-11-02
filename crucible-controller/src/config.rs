@@ -7,7 +7,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use crucible_contract::Tier;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -298,12 +298,6 @@ pub struct ControllerCfg {
         default_value = "autoresearch"
     )]
     pub pod_namespace: String,
-    /// The service account the turn pods run as (`[cluster].service_account` in the deploy
-    /// profile). The Tier 2 ingest drop-box's TokenReview extractor requires an uploader's token
-    /// to belong to exactly this SA in `pod_namespace`. Unset accepts any SA in the namespace,
-    /// which is looser than ideal — the Helm chart sets it to pin the exact account.
-    #[arg(long = "turn-service-account", env = "CONTROLLER_TURN_SERVICE_ACCOUNT")]
-    pub turn_service_account: Option<String>,
     /// The cluster new turn/run pods dispatch to: `hub` (the controller's own cluster) or a
     /// spoke name resolvable under `clusters_dir`. Each row records its cluster, so changing
     /// this affects only new dispatches; in-flight pods are driven on their recorded cluster.
@@ -336,18 +330,6 @@ pub struct ControllerCfg {
         value_delimiter = ','
     )]
     pub dispatch_cluster_by_contract: Vec<String>,
-    /// The turn service account on each spoke, as `cluster=sa` entries. A spoke pod's ingest token
-    /// is TokenReviewed against its own cluster, where the service account is the spoke's rather
-    /// than the hub's; a spoke with no entry uses `turn_service_account`'s value (a name, or any
-    /// service account in that spoke's namespace when it too is unset). The spoke's namespace is
-    /// not configured here: it comes from the spoke's kubeconfig context. Malformed entries fail
-    /// the startup validation.
-    #[arg(
-        long = "spoke-service-accounts",
-        env = "CONTROLLER_SPOKE_SERVICE_ACCOUNTS",
-        value_delimiter = ','
-    )]
-    pub spoke_service_accounts: Vec<String>,
     /// The TCP port a loop pod's in-process control bridge listens on, dialed by the read-only live
     /// relay (`GET /api/runs/:id/live`). Must match the `--control-port` the rendered loop-pod
     /// wrapper passes (`crucible/src/deploy/render.rs`, currently 7777).
@@ -618,6 +600,26 @@ pub struct ControllerCfg {
     /// comments. Unset ⇒ comments omit the link.
     #[arg(long = "public-url", env = "CONTROLLER_PUBLIC_URL")]
     pub public_url: Option<String>,
+    /// The agent token issuer identifier, the same `CONTROLLER_AGENT_ISSUER` the issuer serves
+    /// under. Runs on a `[kueue]` cluster get it as their sandboxes' SVID audience, and its token
+    /// endpoint for their token grants.
+    #[arg(long = "agent-issuer", env = "CONTROLLER_AGENT_ISSUER")]
+    pub agent_issuer: Option<String>,
+    /// Where sandbox supervisors reach the agent token endpoint when not at the issuer itself, for
+    /// a spoke that reaches the controller through a route.
+    #[arg(long = "agent-token-endpoint", env = "CONTROLLER_AGENT_TOKEN_ENDPOINT")]
+    pub agent_token_endpoint: Option<String>,
+    /// SPIRE entries for clusters whose SPIRE discovery cannot find
+    /// (`<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`, comma
+    /// separated); every other agent cluster's SPIRE is discovered ([`Self::spire`]).
+    #[arg(long = "agent-spire", env = "CONTROLLER_AGENT_SPIRE")]
+    pub agent_spire: Option<String>,
+    /// `deploy_profile`, read once on first use.
+    #[arg(skip)]
+    pub profile_cache: ProfileCache,
+    /// Each agent cluster's SPIRE as discovery last found it, shared by the issuer and dispatch.
+    #[arg(skip)]
+    pub spire: crate::agent_auth::cluster_spire::SpireDirectory,
     /// The externally reachable base URL of the webhook delivery surface (e.g.
     /// `https://hooks.crucible.example.com`). A created webhook's delivery URL is built on it;
     /// unset ⇒ the API returns the delivery path alone.
@@ -806,7 +808,59 @@ fn parse_broker_contracts(raw: &str) -> Result<BrokerContracts, String> {
     Ok(BrokerContracts(out))
 }
 
+/// A deploy profile read once and shared by every clone of the config that holds it. A failed read
+/// is not cached, so the next caller tries again.
+#[derive(Clone, Default)]
+pub struct ProfileCache(
+    std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<crucible::deploy::DeployProfile>>>>,
+);
+
+impl std::fmt::Debug for ProfileCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileCache")
+            .field("read", &self.0.initialized())
+            .finish()
+    }
+}
+
+impl ProfileCache {
+    /// The profile at `path`, with its fleet file folded in; `None` without a path.
+    pub async fn get(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<Option<std::sync::Arc<crucible::deploy::DeployProfile>>> {
+        let profile = self
+            .0
+            .get_or_try_init(|| async {
+                let Some(path) = path.map(Path::to_path_buf) else {
+                    return Ok(None);
+                };
+                tokio::task::spawn_blocking(move || {
+                    crucible::deploy::DeployProfile::load_with_fleet(&path, None)
+                        .map(|p| Some(std::sync::Arc::new(p)))
+                })
+                .await
+                .context("joining the deploy profile read")?
+            })
+            .await?;
+        Ok(profile.clone())
+    }
+}
+
 impl ControllerCfg {
+    /// The deploy profile, read once.
+    pub async fn profile(&self) -> Result<Option<std::sync::Arc<crucible::deploy::DeployProfile>>> {
+        self.profile_cache.get(self.deploy_profile.as_deref()).await
+    }
+
+    /// Whether the issuer mints agent tokens for some cluster's sandboxes, which is what gives runs
+    /// agent tools and records who each dispatch acts for: an issuer, and agent clusters, named by
+    /// `CONTROLLER_AGENT_SPIRE` or found by the issuer at startup ([`Self::spire`]).
+    pub fn issues_agent_tokens(&self) -> bool {
+        let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
+        set(&self.agent_issuer) && (set(&self.agent_spire) || self.spire.enabled())
+    }
+
     /// How a pod render pins its image tags: the registry, unless `render_no_pin` is set.
     pub fn digest_resolver(&self) -> Option<std::sync::Arc<dyn crucible::deploy::DigestResolver>> {
         match self.render_no_pin {
@@ -967,30 +1021,6 @@ impl ControllerCfg {
         Ok(())
     }
 
-    /// The per-cluster turn service accounts the ingest drop-box validates uploaders against.
-    /// Parsed at startup so a `spoke_service_accounts` entry that is not `cluster=sa` fails the
-    /// boot rather than being ignored.
-    pub fn turn_accounts(&self) -> Result<TurnAccounts> {
-        let spokes = parse_kv_list(
-            &self.spoke_service_accounts,
-            "CONTROLLER_SPOKE_SERVICE_ACCOUNTS",
-            "cluster=serviceaccount",
-        )?;
-        // The hub's account has its own knob; accepting it here would give one cluster two
-        // sources of truth.
-        if let Some(sa) = spokes.get(crate::runs::clusters::HUB_CLUSTER) {
-            let entry = format!("{}={sa}", crate::runs::clusters::HUB_CLUSTER);
-            bail!(
-                "CONTROLLER_SPOKE_SERVICE_ACCOUNTS entry `{entry}` names the hub: set the hub's \
-                 account with CONTROLLER_TURN_SERVICE_ACCOUNT"
-            );
-        }
-        Ok(TurnAccounts {
-            hub: self.turn_service_account.clone(),
-            spokes,
-        })
-    }
-
     /// The contract-to-cluster routing map. Parsed at startup so a malformed entry fails the boot
     /// rather than silently routing to the default, which is what the unread env did before.
     pub fn contract_clusters(&self) -> Result<BTreeMap<String, String>> {
@@ -1055,18 +1085,6 @@ fn parse_kv_list(
         map.insert(key.trim().to_string(), value.trim().to_string());
     }
     Ok(map)
-}
-
-/// The service accounts an uploader's token may belong to, per cluster.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TurnAccounts {
-    /// The hub's turn service account (`CONTROLLER_TURN_SERVICE_ACCOUNT`). `None` accepts any
-    /// service account in the hub's loop namespace.
-    pub hub: Option<String>,
-    /// Per-spoke turn service accounts (`CONTROLLER_SPOKE_SERVICE_ACCOUNTS`). A spoke with no
-    /// entry uses [`TurnAccounts::hub`]'s value: its name, or any service account in that spoke's
-    /// namespace when the hub's is unset.
-    pub spokes: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -1231,50 +1249,6 @@ mod tests {
                 .is_empty(),
             "no flag, no contracts"
         );
-    }
-
-    #[test]
-    fn spoke_service_accounts_parse_into_a_map_and_malformed_entries_fail_at_startup() {
-        let ok = crate::testing::cfg_from_args([
-            "ctl",
-            "--turn-service-account",
-            "crucible-turn",
-            "--spoke-service-accounts",
-            "wharf=wharf-turn,slate=slate-turn",
-        ])
-        .turn_accounts()
-        .expect("well-formed entries parse");
-        assert_eq!(ok.hub.as_deref(), Some("crucible-turn"));
-        assert_eq!(
-            ok.spokes.get("wharf").map(String::as_str),
-            Some("wharf-turn")
-        );
-        assert_eq!(
-            ok.spokes.get("slate").map(String::as_str),
-            Some("slate-turn")
-        );
-
-        // Unset is the hub-only default: no spokes, and no pinned hub service account.
-        let bare = crate::testing::cfg_from_args(["ctl"])
-            .turn_accounts()
-            .expect("no entries parse");
-        assert_eq!(bare, TurnAccounts::default());
-
-        for bad in ["wharf", "wharf=", "=wharf-turn"] {
-            let err = crate::testing::cfg_from_args(["ctl", "--spoke-service-accounts", bad])
-                .turn_accounts()
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(bad), "names the offending entry: {err}");
-        }
-
-        // The hub's account has its own knob; naming `hub` here is a config mistake, not a spoke.
-        let err =
-            crate::testing::cfg_from_args(["ctl", "--spoke-service-accounts", "hub=crucible-turn"])
-                .turn_accounts()
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("CONTROLLER_TURN_SERVICE_ACCOUNT"), "{err}");
     }
 
     #[test]

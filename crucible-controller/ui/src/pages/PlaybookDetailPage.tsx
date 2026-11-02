@@ -100,6 +100,7 @@ export function PlaybookDetailPage() {
             {playbook.tree_digest && playbook.tree_digest !== playbook.rev ? (
               <span>{playbook.tree_digest}</span>
             ) : null}
+            {playbook.variant ? <span data-testid="playbook-variant">variant {playbook.variant}</span> : null}
           </div>
           <div className="flex min-h-[32rem] flex-col gap-3 min-[900px]:flex-row">
             <FileTreePanel paths={paths} active={active} onSelect={setActive} />

@@ -223,14 +223,13 @@ pub fn run(a: ScopeArgs) -> Result<()> {
     let over_budget = report.cost.is_some_and(|c| max_cost > 0.0 && c > max_cost);
     let failed = report.stages.last().is_some_and(|r| !r.passed) || over_budget;
 
-    // Tier 2 (large artifacts to drop-box): when the controller injected the ingest drop-box env, the
-    // pack + transcript POST there (before the termination message) and ride the Tier 1 manifest.
-    // Absent = the old marker path (a local run, or an old controller). `artifacts` is the manifest the
-    // envelope carries.
-    let ingest = crate::report::ingest_client::IngestConfig::from_env();
+    // When the controller gave this turn its URL, the pod's name and a pod token, the pack and
+    // transcript upload to it (before the termination message) and ride the Tier 1 manifest.
+    // Absent = the marker path (a local run). `artifacts` is the manifest the envelope carries.
+    let upload = crate::report::evidence_client::Upload::turn_from_env();
     let mut artifacts: Vec<crucible_contract::ArtifactRef> = Vec::new();
 
-    // Deliver the preserved transcript (capped, gzipped). Over the drop-box it POSTs; on the marker
+    // Deliver the preserved transcript (capped, gzipped). With an upload it PUTs; on the marker
     // path it prints before the report so the report marker stays the command's last line for the
     // log scraper.
     if !report.transcript.is_empty() {
@@ -241,9 +240,9 @@ pub fn run(a: ScopeArgs) -> Result<()> {
                 .with_context(|| format!("writing --transcript-out {}", path.display()))?;
         }
         if a.json && a.marker {
-            if let Some(cfg) = &ingest {
-                artifacts.push(crate::report::ingest_client::post_artifact(
-                    cfg,
+            if let Some(upload) = &upload {
+                artifacts.push(crate::report::evidence_client::upload_turn_artifact(
+                    upload,
                     crucible_contract::ArtifactKind::ScopeTranscript,
                     &gz,
                 ));
@@ -255,16 +254,16 @@ pub fn run(a: ScopeArgs) -> Result<()> {
     }
 
     // A surviving pack must reach the controller (`scope_executor = pod`, where this process's
-    // filesystem dies with the pod). Over the drop-box it POSTs as the `scope-pack` artifact; on the
+    // filesystem dies with the pod). With an upload it PUTs as the `scope-pack` artifact; on the
     // marker path it rides one log line before the report. A pack that can't be built at all still
     // emits the `{"error":…}` marker so the controller fails the scope loudly, never silently.
     if a.json && a.marker {
         let survived = report.digest.is_some() && report.stages.iter().all(|r| r.passed);
         if survived {
-            match &ingest {
-                Some(cfg) => match pack_gz(&pack) {
-                    Ok(gz) => artifacts.push(crate::report::ingest_client::post_artifact(
-                        cfg,
+            match &upload {
+                Some(upload) => match pack_gz(&pack) {
+                    Ok(gz) => artifacts.push(crate::report::evidence_client::upload_turn_artifact(
+                        upload,
                         crucible_contract::ArtifactKind::ScopePack,
                         &gz,
                     )),

@@ -42,7 +42,8 @@ impl TextKind {
 /// Stateful decoder: feed it one stdout line at a time via [`StreamJsonParser::push`].
 #[derive(Default)]
 pub struct StreamJsonParser {
-    // Cumulative token counts: input/cache from `message_start`, output from `message_delta`.
+    // Cumulative token counts: input/cache from `message_start`, output from `message_delta`,
+    // and input/cache again from `message_delta` when it carries them.
     input: u64,
     output: u64,
     cache_read: u64,
@@ -204,6 +205,18 @@ impl StreamJsonParser {
             }
             Some("message_delta") => {
                 let usage = event.get("usage").unwrap_or(&Value::Null);
+                if let Some(input) = usage.get("input_tokens").and_then(Value::as_u64) {
+                    self.input = input;
+                }
+                if let Some(read) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+                    self.cache_read = read;
+                }
+                if let Some(write) = usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(Value::as_u64)
+                {
+                    self.cache_write = write;
+                }
                 let out_tokens = u64_field(usage, "output_tokens");
                 if out_tokens > 0 {
                     self.output = out_tokens;
@@ -709,6 +722,24 @@ mod tests {
                 assert_eq!(t.cache_write, 6439);
                 assert_eq!(t.total, 3968 + 4 + 14376 + 6439);
                 assert!(t.rate.is_none() && t.cost_usd.is_none());
+            }
+            other => panic!("expected one Tokens, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_delta_that_splits_out_the_cache_replaces_the_start_counts() {
+        let ev = run(&[
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{"usage":{"input_tokens":9017,"output_tokens":0}}}}"#,
+            r#"{"type":"stream_event","event":{"type":"message_delta","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":8704,"input_tokens":313,"output_tokens":3}}}"#,
+        ]);
+        match &ev[..] {
+            [AgentEvent::Tokens(t)] => {
+                assert_eq!(t.input, 313);
+                assert_eq!(t.output, 3);
+                assert_eq!(t.cache_read, 8704);
+                assert_eq!(t.cache_write, 0);
+                assert_eq!(t.total, 313 + 3 + 8704);
             }
             other => panic!("expected one Tokens, got {other:?}"),
         }

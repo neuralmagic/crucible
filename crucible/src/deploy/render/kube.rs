@@ -9,6 +9,7 @@ use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
+use k8s_openapi::api::admissionregistration::v1 as admission;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::networking::v1 as networking;
 use k8s_openapi::api::rbac::v1 as rbac;
@@ -55,6 +56,11 @@ pub enum RenderError {
     },
     #[error("the openshell-loop deploy template needs [agent].sandbox_image (the agent's sandbox)")]
     MissingSandboxImage,
+    #[error(
+        "a rerun pod fetches its parent's evidence from the controller, and this profile names no \
+         [cluster].ingest_url to reach it"
+    )]
+    RerunNeedsControllerUrl,
 }
 
 /// In-pod paths fixed by the openshell-loop template (the volume mounts the renderer always emits).
@@ -131,6 +137,9 @@ pub struct RenderOpts {
     /// Playbook launch: the wrapper runs `crucible plan run` over the manifest's `[workflow]` rather
     /// than the agent loop. `None` renders the loop.
     pub playbook: Option<PlaybookLaunch>,
+    /// The platform of the cluster rendered for, over `[cluster] platform`: a render does not ask
+    /// the cluster.
+    pub platform: Option<forge::fleet::Platform>,
 }
 
 impl Default for RenderOpts {
@@ -145,6 +154,7 @@ impl Default for RenderOpts {
             harness: None,
             model: None,
             playbook: None,
+            platform: None,
         }
     }
 }
@@ -173,20 +183,22 @@ pub struct PlaybookLaunch {
     pub max_time: crate::duration::MaxTime,
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
+    /// The manifest variant the run reads; the base manifest when `None`.
+    pub variant: Option<crate::manifest::variant::VariantName>,
+    /// The finished run this launch reruns, fetched from the controller.
+    pub rerun: Option<RerunLaunch>,
+}
+
+/// A rerun launch: the parent run's controller id, and the tasks dispatched again.
+#[derive(Debug, Clone)]
+pub struct RerunLaunch {
+    pub parent: String,
+    pub from: Vec<String>,
 }
 
 /// How many times a playbook pod starts its run before leaving it unfinished: the first start
 /// and three resumes.
 const MAX_PLAYBOOK_STARTS: u32 = 4;
-
-/// The in-pod mount dir for the projected Tier 2 ingest ServiceAccount token (Tier 2 ingest). The turn
-/// reads `<dir>/token` and sends it as the bearer to the controller's ingest drop-box.
-pub(super) const INGEST_TOKEN_DIR: &str = "/var/run/secrets/crucible.io/ingest";
-/// The pod-volume name for the ingest token projection.
-pub(super) const INGEST_TOKEN_VOLUME: &str = "crucible-ingest-token";
-/// The ingest token's TTL. Short by design (a turn is minutes, not hours), the kubelet rotates it
-/// and the API server invalidates it the instant the pod dies.
-pub(super) const INGEST_TOKEN_TTL_SECS: i64 = 900;
 
 /// The in-pod init-container mount where the pack ConfigMap is projected (read-only) before it is
 /// staged into the writable domain dir.
@@ -344,7 +356,7 @@ pub fn render(
         opts,
         image,
         sandbox_image,
-        driver: profile.cluster.sandbox_driver,
+        driver: profile.cluster.sandbox_driver(),
         spoke,
     };
 
@@ -361,11 +373,32 @@ pub fn render(
     }
     // Under the kubernetes driver the gateway SA needs sandbox CRD RBAC + a ClusterRole for
     // tokenreviews and node reads.
-    if profile.cluster.sandbox_driver == ComputeDriver::Kubernetes {
+    if profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes {
         for obj in r.sandbox_rbac() {
             let yaml = serde_norway::to_string(&obj).context("serializing sandbox RBAC")?;
             out.push_str(&format!("---\n{yaml}"));
         }
+    }
+    for obj in r.buildit_rbac() {
+        let yaml = serde_norway::to_string(&obj).context("serializing buildit RBAC")?;
+        out.push_str(&format!("---\n{yaml}"));
+    }
+    if let Some(policy) = r.builder_netpol() {
+        let yaml = serde_norway::to_string(&policy)
+            .context("serializing the builder pods' NetworkPolicy")?;
+        out.push_str(&format!("---\n{yaml}"));
+    }
+    if let Some(quota) = r.builder_quota() {
+        let yaml =
+            serde_norway::to_string(&quota).context("serializing the builder pods' quota")?;
+        out.push_str(&format!("---\n{yaml}"));
+    }
+    if let Some((policy, binding)) = r.builder_admission()? {
+        let policy = serde_norway::to_string(&policy)
+            .context("serializing the builder pods' admission policy")?;
+        let binding = serde_norway::to_string(&binding)
+            .context("serializing the builder pods' admission policy binding")?;
+        out.push_str(&format!("---\n{policy}---\n{binding}"));
     }
     // Pack delivery: append the ConfigMap carrying the pack files. Last so a baked-domain render (no
     // pack) keeps its exact three-doc [pod, rbac, netpol] layout, the controller extracts by `kind`,
@@ -530,6 +563,38 @@ impl Renderer<'_> {
 
     /// A non-empty session log means an earlier start of this run already produced rows, so this
     /// start is a continuation, not a fresh run.
+    /// How a playbook pod picks up where it left off: `--resume` once a session exists, and for
+    /// a rerun, `--rerun-of` the parent's evidence on the controller until then. Returns a line
+    /// that sets the shell's arguments, and the flags to append to `crucible plan run`.
+    fn playbook_resume(&self, pb: &PlaybookLaunch) -> Result<(String, String), RenderError> {
+        let Some(rerun) = &pb.rerun else {
+            return Ok((String::new(), self.resume_flag().to_string()));
+        };
+        if self.profile.cluster.ingest_url.is_none() {
+            return Err(RenderError::RerunNeedsControllerUrl);
+        }
+        let parent = crucible_contract::artifact::path_segment(&rerun.parent);
+        let from: String = rerun
+            .from
+            .iter()
+            .map(|task| format!(" --from {}", sh_quote(task)))
+            .collect();
+        let rerun_args = format!(
+            r#"--rerun-of "${{{url}}}/api/evidence/runs/{parent}"{from}"#,
+            url = crucible_contract::ENV_CONTROLLER_URL,
+        );
+        Ok(if self.resumable() {
+            (
+                format!(
+                    "\n  if [ -s \"$D/state/session.jsonl\" ]; then set -- --resume; else set -- {rerun_args}; fi"
+                ),
+                r#" "$@""#.to_string(),
+            )
+        } else {
+            (String::new(), format!(" {rerun_args}"))
+        })
+    }
+
     fn resume_flag(&self) -> &'static str {
         if self.resumable() {
             r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
@@ -888,9 +953,8 @@ impl Renderer<'_> {
         // that literal string rather than failing.
         env.push(downward("HOST_IP", "status.hostIP"));
 
-        // The pod's own identity from the downward API. The name makes the ingest `{pod}` path
-        // segment equal the token's bound-pod claim by construction (pod-binding = run-scoping);
-        // name + uid + namespace let the broker set this pod as its GPU Jobs' owner, so orphaned
+        // The pod's own identity from the downward API: name + uid + namespace let the broker set
+        // this pod as its GPU Jobs' owner, so orphaned
         // jobs garbage-collect when the pod dies instead of holding a GPU for nobody. Same ordering
         // constraint as HOST_IP above, so a profile can interpolate these too.
         env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
@@ -928,16 +992,11 @@ impl Renderer<'_> {
             env.push(plain(k, v.clone()));
         }
 
-        // Tier 2 ingest: when the profile names the controller's drop-box URL, tell the
-        // loop where to POST its run-session (and, when the R5 collector produced one, the otel log)
-        // and where its projected `crucible-ingest`-audience token is. Absent = no drop-box; the loop
-        // falls back to the `SESSION` delimiter the wrapper still emits (old controller / local run).
-        if let Some(ingest_url) = &self.profile.cluster.ingest_url {
-            env.push(plain(crucible_contract::ENV_INGEST_URL, ingest_url.clone()));
-            env.push(plain(
-                crucible_contract::ENV_INGEST_TOKEN_PATH,
-                format!("{INGEST_TOKEN_DIR}/token"),
-            ));
+        // The controller the run uploads its evidence to, with the run token the controller's
+        // Secret projects (RFC-0004:C-RUN-EVIDENCE). Absent = no controller to reach; the wrapper
+        // dumps the session behind the `SESSION` delimiter instead.
+        if let Some(url) = &self.profile.cluster.ingest_url {
+            env.push(plain(crucible_contract::ENV_CONTROLLER_URL, url.clone()));
         }
 
         Ok(env)
@@ -948,16 +1007,16 @@ impl Renderer<'_> {
     /// the wrapper's business: `REGISTRY_AUTH_FILE` (see [`Self::env`]) points podman at the mounted
     /// authfile, which the gateway's `podman system service` inherits.
     ///
-    /// Session delivery is two-tier (Tier 2 ingest): when `CRUCIBLE_INGEST_URL` is set (a new
-    /// controller injected the drop-box env), crucible POSTs `state/session.jsonl` to the Tier 2
-    /// drop-box itself, so the wrapper stops dumping the (up to 128 MiB) session into the pod logs.
-    /// When it is absent (an old controller, or a local run) the wrapper falls back to the
+    /// Session delivery is two-tier: when `CRUCIBLE_CONTROLLER_URL` is set, crucible uploads
+    /// `state/session.jsonl` as the run's evidence itself, so the wrapper stops dumping the (up to
+    /// 128 MiB) session into the pod logs. When it is absent the wrapper falls back to the
     /// `SESSION (rc=…)` delimiter contract, the controller scrapes everything after the shared
     /// [`crucible_contract::RUN_SESSION_DELIMITER`] line as the run's session log.
     fn wrapper_script(&self) -> Result<String> {
         let domain_dir = self.domain_dir();
         let manifest_file = self.manifest_file;
         let session_delimiter = crucible_contract::RUN_SESSION_DELIMITER;
+        let session_undelivered = crucible_contract::RUN_SESSION_UNDELIVERED;
         if let Some(pb) = &self.opts.playbook {
             let max_cost = pb.max_cost;
             let max_time = pb.max_time;
@@ -972,21 +1031,26 @@ impl Renderer<'_> {
             };
             let harness_flag = harness_flag(self.opts.harness, '=');
             let model_flag = model_flag(self.opts.model.as_ref(), '=');
-            let resume_flag = self.resume_flag();
+            let variant_flag = pb
+                .variant
+                .as_ref()
+                .map(|v| format!(" --variant {v}"))
+                .unwrap_or_default();
+            let (rerun_setup, resume_flag) = self.playbook_resume(pb)?;
             let invalid_verdict = crate::plan::INVALID_VERDICT_EXIT;
             return Ok(format!(
                 r#"D={domain_dir}
 mkdir -p "$D/state"
 n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$D/state/starts"
-if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then
-  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}{resume_flag}
+if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}
+  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{variant_flag}{param_flags}{resume_flag}
   rc=$?
 else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
   rc=0
 fi
-if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
+if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ] || [ -e "$D/state/{session_undelivered}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
@@ -1025,7 +1089,7 @@ exit $rc
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
   --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}{harness_flag}{model_flag}{resume_flag}
 rc=$?
-if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
+if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ] || [ -e "$D/state/{session_undelivered}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
@@ -1077,16 +1141,6 @@ exit $rc
         // Persistent run state: mounted OVER the domain dir's state/ subdir so session.jsonl and
         // the agent-session files outlive the pod (the wrapper's `--resume` reads them back).
         mounts.extend(self.state_mount());
-        // Tier 2 ingest token (Tier 2 ingest): the projected `crucible-ingest`-audience token the loop
-        // reads to POST its run-session. Mounted read-only, only when the drop-box URL is configured.
-        if self.profile.cluster.ingest_url.is_some() {
-            mounts.push(core::VolumeMount {
-                name: INGEST_TOKEN_VOLUME.to_string(),
-                mount_path: INGEST_TOKEN_DIR.to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            });
-        }
         // Trace transport: writable, the broker deletes each trace after collecting it.
         if self
             .profile
@@ -1234,27 +1288,6 @@ exit $rc
             });
         }
 
-        // Tier 2 ingest token (Tier 2 ingest): a projected SA token audience'd to the ingest endpoint
-        // only, useless against the kube API. Added only when the drop-box URL is configured; the
-        // pod's default `automountServiceAccountToken: false` stays (this is one explicit file).
-        if self.profile.cluster.ingest_url.is_some() {
-            volumes.push(core::Volume {
-                name: INGEST_TOKEN_VOLUME.to_string(),
-                projected: Some(core::ProjectedVolumeSource {
-                    sources: Some(vec![core::VolumeProjection {
-                        service_account_token: Some(core::ServiceAccountTokenProjection {
-                            audience: Some(crucible_contract::INGEST_TOKEN_AUDIENCE.to_string()),
-                            expiration_seconds: Some(INGEST_TOKEN_TTL_SECS),
-                            path: "token".to_string(),
-                        }),
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            });
-        }
-
         // Persistent run state (see volume_mounts).
         if let Some(claim) = self.state_claim_name() {
             volumes.push(core::Volume {
@@ -1324,9 +1357,10 @@ exit $rc
     /// NetworkPolicy on the loop pod. Under `podman` the sandbox is nested inside the loop pod and
     /// reaches the broker over the pod-internal bridge (traffic a NetworkPolicy never sees), so this
     /// is a pure deny-all-ingress lockdown. Under `kubernetes` the sandbox is a sibling pod, so
-    /// gateway (:17670), broker (:8849), OTLP collector (:17671), and `[mcp]` server traffic becomes
-    /// real cluster networking. The policy then allows ingress **only** from sandbox pods, **only**
-    /// on those ports. Sandbox pods are
+    /// gateway (:17670), broker (:8849), OTLP collector (:17671), buildit (:8848, with `[buildit]`),
+    /// and `[mcp]` server traffic becomes
+    /// real cluster networking. The policy then allows ingress **only** from sandbox pods (in
+    /// `cluster.sandbox_namespace` when it is set), **only** on those ports. Sandbox pods are
     /// matched by either identity they may carry: the OpenShell managed-by label (the driver only
     /// stamps it on SPIFFE-enabled pods since the CRD path landed), or the agent-sandbox
     /// controller's name-hash label, which every Sandbox-CR pod gets. Dropping either selector
@@ -1342,6 +1376,15 @@ exit $rc
                 ..Default::default()
             }
         });
+        let cluster = &self.profile.cluster;
+        let sandbox_ns =
+            (cluster.sandbox_namespace() != cluster.loop_namespace).then(|| LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_string(),
+                    cluster.sandbox_namespace().to_string(),
+                )])),
+                ..Default::default()
+            });
         let ingress = match self.driver {
             ComputeDriver::Podman => None,
             ComputeDriver::Kubernetes => Some(vec![networking::NetworkPolicyIngressRule {
@@ -1354,6 +1397,7 @@ exit $rc
                             )])),
                             ..Default::default()
                         }),
+                        namespace_selector: sandbox_ns.clone(),
                         ..Default::default()
                     },
                     networking::NetworkPolicyPeer {
@@ -1365,37 +1409,46 @@ exit $rc
                             }]),
                             ..Default::default()
                         }),
+                        namespace_selector: sandbox_ns,
                         ..Default::default()
                     },
                 ]),
                 ports: Some(
-                    vec![
-                        networking::NetworkPolicyPort {
+                    (!crate::deploy::render::gateway::isolated(self.profile))
+                        .then_some(networking::NetworkPolicyPort {
                             port: Some(IntOrString::Int(GATEWAY_PORT.into())),
                             protocol: Some("TCP".to_string()),
                             ..Default::default()
-                        },
-                        networking::NetworkPolicyPort {
-                            // The manifest's `[agent.broker].bind` port, never a second constant: a
-                            // domain that moves the broker must not silently lose its ingress rule.
-                            port: Some(IntOrString::Int(broker_ingress_port(
-                                &self.input.agent.broker.bind,
-                            ))),
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        },
-                        networking::NetworkPolicyPort {
-                            // The turn's in-process OTLP collector; the agent's exporter posts here
-                            // from the sandbox. Rendered unconditionally: with telemetry off nothing
-                            // listens and the rule is inert.
-                            port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        },
-                    ]
-                    .into_iter()
-                    .chain(mcp_ports)
-                    .collect(),
+                        })
+                        .into_iter()
+                        .chain([
+                            networking::NetworkPolicyPort {
+                                // The manifest's `[agent.broker].bind` port, never a second constant: a
+                                // domain that moves the broker must not silently lose its ingress rule.
+                                port: Some(IntOrString::Int(broker_ingress_port(
+                                    &self.input.agent.broker.bind,
+                                ))),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            },
+                            networking::NetworkPolicyPort {
+                                // The turn's in-process OTLP collector; the agent's exporter posts here
+                                // from the sandbox. Rendered unconditionally: with telemetry off nothing
+                                // listens and the rule is inert.
+                                port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            },
+                        ])
+                        .chain(self.profile.buildit.as_ref().map(|b| {
+                            networking::NetworkPolicyPort {
+                                port: Some(IntOrString::Int(b.port().into())),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            }
+                        }))
+                        .chain(mcp_ports)
+                        .collect(),
                 ),
             }]),
         };
@@ -1436,7 +1489,7 @@ exit $rc
     /// The RBAC the kubernetes sandbox driver needs, matching OpenShell v0.1.2's helm chart for
     /// shared workspace mode with `allowDriverConfig` (`role.yaml`, `clusterrole.yaml`):
     ///
-    ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs, event reads, the
+    ///  1. A namespaced `Role` in the sandbox namespace: sandbox CRD verbs, event reads, the
     ///     supervisor pod lifecycle, the boundary Service, bootstrap Secrets, the egress
     ///     NetworkPolicy, and PVC metadata reads for resource admission. Bootstrap Secret
     ///     creation also covers the client-TLS Secret each gateway boot publishes.
@@ -1445,8 +1498,16 @@ exit $rc
     ///     `runtimeclasses`/`priorityclasses`/`namespaces` reads admission and UID resolution do.
     ///  4. A `ClusterRoleBinding` granting it to the loop SA.
     fn sandbox_rbac(&self) -> Vec<SandboxRbacObject> {
-        let sa = &self.profile.cluster.service_account;
-        let ns = &self.profile.cluster.loop_namespace;
+        let sandbox_ns = self.profile.cluster.sandbox_namespace().to_string();
+        let isolated = crate::deploy::render::gateway::isolated(self.profile);
+        let gateway_sa = crate::deploy::render::gateway::GATEWAY_SERVICE_ACCOUNT.to_string();
+        let (sa, ns) = match isolated {
+            true => (&gateway_sa, &sandbox_ns),
+            false => (
+                &self.profile.cluster.service_account,
+                &self.profile.cluster.loop_namespace,
+            ),
+        };
         let role_name = format!("{sa}-sandbox");
         let cr_name = format!("{sa}-node-reader");
 
@@ -1455,7 +1516,7 @@ exit $rc
         let role = rbac::Role {
             metadata: ObjectMeta {
                 name: Some(role_name.clone()),
-                namespace: Some(ns.clone()),
+                namespace: Some(sandbox_ns.clone()),
                 ..Default::default()
             },
             rules: Some(vec![
@@ -1529,7 +1590,7 @@ exit $rc
 
         let rb = role_binding(
             role_name.clone(),
-            ns.clone(),
+            sandbox_ns.clone(),
             "Role",
             &role_name,
             sa.clone(),
@@ -1596,18 +1657,389 @@ exit $rc
             }]),
         };
 
-        vec![
+        let mut objects = Vec::new();
+        if isolated {
+            let account = |name: &str| {
+                SandboxRbacObject::ServiceAccount(core::ServiceAccount {
+                    metadata: ObjectMeta {
+                        name: Some(name.to_string()),
+                        namespace: Some(sandbox_ns.clone()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+            };
+            objects.push(account(&gateway_sa));
+            let sandbox_sa = self.profile.cluster.sandbox_service_account();
+            if sandbox_sa != gateway_sa {
+                objects.push(account(sandbox_sa));
+            }
+        }
+        objects.extend([
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(rb),
             SandboxRbacObject::ClusterRole(cr),
             SandboxRbacObject::ClusterRoleBinding(crb),
+        ]);
+        objects.extend(self.sandbox_reader_rbac());
+        objects.extend(self.spire_reader_rbac());
+        objects
+    }
+
+    /// Under isolated gateways, what `cluster.sandbox_readers` reads the cluster's SPIRE with:
+    /// its JWT keys through the API server's Service proxy, and the resources discovery reads its
+    /// trust domain and JWT issuer from (the operator's on OpenShift, the chart's ConfigMap
+    /// elsewhere). The platform is `--platform`, else `[cluster] platform`, else `kubernetes`.
+    fn spire_reader_rbac(&self) -> Vec<SandboxRbacObject> {
+        let cluster = &self.profile.cluster;
+        if !crate::deploy::render::gateway::isolated(self.profile)
+            || cluster.sandbox_readers.is_empty()
+        {
+            return Vec::new();
+        }
+        let platform = self.opts.platform.or(cluster.platform).unwrap_or_default();
+        let at = crate::deploy::spire::discovery_location(platform);
+        let rule = |group: &str, resource: &str, names: Vec<String>| rbac::PolicyRule {
+            api_groups: Some(vec![group.to_string()]),
+            resources: Some(vec![resource.to_string()]),
+            resource_names: Some(names),
+            verbs: vec!["get".to_string()],
+            ..Default::default()
+        };
+        let mut rules = vec![rule(
+            "",
+            "services/proxy",
+            vec![at.service.to_string(), at.proxy_name()],
+        )];
+        if platform == forge::fleet::Platform::Kubernetes {
+            rules.push(rule(
+                "",
+                "configmaps",
+                vec![crate::deploy::spire::SERVER_CONFIGMAP.to_string()],
+            ));
+        }
+        let mut objects = self.reader_grant(SPIRE_READER, at.namespace, rules);
+        if platform == forge::fleet::Platform::Openshift {
+            let object = vec![crate::deploy::spire::OPERATOR_OBJECT.to_string()];
+            let role = rbac::ClusterRole {
+                metadata: ObjectMeta {
+                    name: Some(SPIRE_READER.to_string()),
+                    ..Default::default()
+                },
+                rules: Some(vec![
+                    rule(
+                        crate::deploy::spire::OPERATOR_GROUP,
+                        crate::deploy::spire::TRUST_DOMAIN_KIND.1,
+                        object.clone(),
+                    ),
+                    rule(
+                        crate::deploy::spire::OPERATOR_GROUP,
+                        crate::deploy::spire::JWT_ISSUER_KIND.1,
+                        object,
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let binding = rbac::ClusterRoleBinding {
+                metadata: ObjectMeta {
+                    name: Some(SPIRE_READER.to_string()),
+                    ..Default::default()
+                },
+                role_ref: rbac::RoleRef {
+                    api_group: "rbac.authorization.k8s.io".to_string(),
+                    kind: "ClusterRole".to_string(),
+                    name: SPIRE_READER.to_string(),
+                },
+                subjects: Some(self.reader_subjects()),
+            };
+            objects.extend([
+                SandboxRbacObject::ClusterRole(role),
+                SandboxRbacObject::ClusterRoleBinding(binding),
+            ]);
+        }
+        objects
+    }
+
+    /// get/list on `Sandbox` resources in the sandbox namespace for `cluster.sandbox_readers`,
+    /// the identity the controller resolves a bound sandbox's name with; under isolated gateways
+    /// also what it starts, adopts, and tears down each run's gateway with. Nothing when either
+    /// is unset.
+    fn sandbox_reader_rbac(&self) -> Vec<SandboxRbacObject> {
+        let cluster = &self.profile.cluster;
+        let Some(ns) = cluster.sandbox_namespace.as_ref() else {
+            return Vec::new();
+        };
+        if cluster.sandbox_readers.is_empty() {
+            return Vec::new();
+        }
+        let rule = |group: &str, resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
+            api_groups: Some(vec![group.to_string()]),
+            resources: Some(resources.iter().map(|r| r.to_string()).collect()),
+            verbs: verbs.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
+        };
+        let isolated = crate::deploy::render::gateway::isolated(self.profile);
+        let mut sandbox_rules = vec![match isolated {
+            true => rule(
+                "agents.x-k8s.io",
+                &["sandboxes"],
+                &["get", "list", "patch", "delete"],
+            ),
+            false => rule("agents.x-k8s.io", &["sandboxes"], &["get", "list"]),
+        }];
+        if isolated {
+            sandbox_rules.extend([
+                rule("", &["pods"], &["get", "list", "create", "delete"]),
+                rule("", &["pods/finalizers"], &["update"]),
+                rule("", &["services", "secrets"], &["list", "create", "delete"]),
+                rule(
+                    "networking.k8s.io",
+                    &["networkpolicies"],
+                    &["list", "create", "delete"],
+                ),
+            ]);
+        }
+        let mut objects = self.reader_grant("crucible-sandbox-reader", ns.as_str(), sandbox_rules);
+        if isolated {
+            objects.extend(self.reader_grant(
+                "crucible-gateway-loop-services",
+                &cluster.loop_namespace,
+                vec![rule("", &["services"], &["list", "create", "delete"])],
+            ));
+        }
+        objects
+    }
+
+    /// With `[buildit]`, the loop account's rights over buildit's builder pods in buildit's own
+    /// namespace: create, watch and delete them, exec into them, and read their logs. None in the
+    /// loop namespace, where they would reach every run's loop pod and Secret.
+    fn buildit_rbac(&self) -> Vec<SandboxRbacObject> {
+        let Some(buildit) = &self.profile.buildit else {
+            return Vec::new();
+        };
+        let cluster = &self.profile.cluster;
+        let name = format!("{}-buildit", cluster.service_account);
+        let rule = |resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
+            api_groups: Some(vec![String::new()]),
+            resources: Some(resources.iter().map(|r| r.to_string()).collect()),
+            verbs: verbs.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
+        };
+        let role = rbac::Role {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                namespace: Some(buildit.namespace.to_string()),
+                ..Default::default()
+            },
+            rules: Some(vec![
+                rule(&["pods"], &["create", "delete", "get", "list", "watch"]),
+                rule(&["pods/exec"], &["create", "get"]),
+                rule(&["pods/log"], &["get"]),
+            ]),
+        };
+        let binding = role_binding(
+            name.clone(),
+            buildit.namespace.to_string(),
+            "Role",
+            &name,
+            cluster.service_account.clone(),
+            cluster.loop_namespace.clone(),
+        );
+        vec![
+            SandboxRbacObject::Role(role),
+            SandboxRbacObject::RoleBinding(binding),
         ]
     }
+
+    /// With `[buildit]`, the builder pods' NetworkPolicy in buildit's namespace: no ingress, and
+    /// egress only to DNS and `[buildit] egress`.
+    fn builder_netpol(&self) -> Option<networking::NetworkPolicy> {
+        let buildit = self.profile.buildit.as_ref()?;
+        let unfenced = buildit.unfenced_egress();
+        if !unfenced.is_empty() {
+            tracing::warn!(
+                networks = ?unfenced,
+                "[buildit] egress reaches every address with no except: builds can reach the \
+                 API server and in-cluster services; except the cluster's pod and service networks"
+            );
+        }
+        let port = |port: u16, protocol: &str| networking::NetworkPolicyPort {
+            port: Some(IntOrString::Int(port.into())),
+            protocol: Some(protocol.to_string()),
+            ..Default::default()
+        };
+        let dns = networking::NetworkPolicyEgressRule {
+            ports: Some(
+                [53, 5353]
+                    .into_iter()
+                    .flat_map(|p| [port(p, "UDP"), port(p, "TCP")])
+                    .collect(),
+            ),
+            to: None,
+        };
+        let allowed = buildit
+            .egress
+            .iter()
+            .map(|e| networking::NetworkPolicyEgressRule {
+                ports: Some(e.ports.iter().map(|&p| port(p, "TCP")).collect()),
+                to: Some(vec![networking::NetworkPolicyPeer {
+                    ip_block: Some(networking::IPBlock {
+                        cidr: e.cidr.clone(),
+                        except: (!e.except.is_empty()).then(|| e.except.clone()),
+                    }),
+                    ..Default::default()
+                }]),
+            });
+        Some(networking::NetworkPolicy {
+            metadata: ObjectMeta {
+                name: Some(BUILDER_NETPOL.to_string()),
+                namespace: Some(buildit.namespace.to_string()),
+                ..Default::default()
+            },
+            spec: Some(networking::NetworkPolicySpec {
+                pod_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "buildit.dev/managed-by".to_string(),
+                        "mcp".to_string(),
+                    )])),
+                    ..Default::default()
+                }),
+                policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
+                ingress: None,
+                egress: Some(std::iter::once(dns).chain(allowed).collect()),
+            }),
+        })
+    }
+
+    /// With `[buildit]`, the builder namespace's ResourceQuota, `[buildit] quota`.
+    fn builder_quota(&self) -> Option<core::ResourceQuota> {
+        let buildit = self.profile.buildit.as_ref()?;
+        Some(core::ResourceQuota {
+            metadata: ObjectMeta {
+                name: Some(BUILDER_NETPOL.to_string()),
+                namespace: Some(buildit.namespace.to_string()),
+                ..Default::default()
+            },
+            spec: Some(core::ResourceQuotaSpec {
+                hard: Some(
+                    buildit
+                        .quota
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Quantity(v.clone())))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+
+    /// With `[buildit]`, the ValidatingAdmissionPolicy that admits only buildit-shaped builder pods
+    /// (`buildit/deploy/builder-admission.yaml`), and its binding to buildit's namespace. Both are
+    /// cluster-scoped, named after the namespace.
+    fn builder_admission(
+        &self,
+    ) -> Result<
+        Option<(
+            admission::ValidatingAdmissionPolicy,
+            admission::ValidatingAdmissionPolicyBinding,
+        )>,
+    > {
+        let Some(buildit) = &self.profile.buildit else {
+            return Ok(None);
+        };
+        let name = format!("{}-{BUILDER_ADMISSION}", buildit.namespace);
+        let mut policy: admission::ValidatingAdmissionPolicy =
+            serde_norway::from_str(BUILDER_ADMISSION_POLICY)
+                .context("parsing buildit's builder admission policy")?;
+        policy.metadata.name = Some(name.clone());
+        let binding = admission::ValidatingAdmissionPolicyBinding {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                ..Default::default()
+            },
+            spec: Some(admission::ValidatingAdmissionPolicyBindingSpec {
+                policy_name: Some(name),
+                validation_actions: Some(vec!["Deny".to_string()]),
+                match_resources: Some(admission::MatchResources {
+                    namespace_selector: Some(LabelSelector {
+                        match_labels: Some(BTreeMap::from([(
+                            "kubernetes.io/metadata.name".to_string(),
+                            buildit.namespace.to_string(),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        Ok(Some((policy, binding)))
+    }
+
+    /// A Role named `name` in `namespace` with `rules`, bound to `cluster.sandbox_readers`.
+    fn reader_grant(
+        &self,
+        name: &str,
+        namespace: &str,
+        rules: Vec<rbac::PolicyRule>,
+    ) -> Vec<SandboxRbacObject> {
+        let meta = || ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        };
+        let role = rbac::Role {
+            metadata: meta(),
+            rules: Some(rules),
+        };
+        let binding = rbac::RoleBinding {
+            metadata: meta(),
+            role_ref: rbac::RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "Role".to_string(),
+                name: name.to_string(),
+            },
+            subjects: Some(self.reader_subjects()),
+        };
+        vec![
+            SandboxRbacObject::Role(role),
+            SandboxRbacObject::RoleBinding(binding),
+        ]
+    }
+
+    /// `cluster.sandbox_readers` as RBAC subjects.
+    fn reader_subjects(&self) -> Vec<rbac::Subject> {
+        self.profile
+            .cluster
+            .sandbox_readers
+            .iter()
+            .map(|sa| rbac::Subject {
+                kind: "ServiceAccount".to_string(),
+                name: sa.name.to_string(),
+                namespace: Some(sa.namespace.to_string()),
+                ..Default::default()
+            })
+            .collect()
+    }
 }
+
+/// The Role (in SPIRE's namespace) and ClusterRole the controller reads a cluster's SPIRE with.
+pub const SPIRE_READER: &str = "crucible-spire-reader";
+
+/// The builder pods' NetworkPolicy in `[buildit] namespace`.
+pub const BUILDER_NETPOL: &str = "buildit-builders";
+
+/// The suffix of the builder pods' admission policy and binding, after `[buildit] namespace`.
+pub const BUILDER_ADMISSION: &str = "buildit-builders";
+
+const BUILDER_ADMISSION_POLICY: &str =
+    include_str!("../../../../buildit/deploy/builder-admission.yaml");
 
 /// A typed wrapper so `sandbox_rbac()` can return a mixed vec of RBAC objects and they all
 /// serialize through one `serde_norway::to_string` call.
 enum SandboxRbacObject {
+    ServiceAccount(core::ServiceAccount),
     Role(rbac::Role),
     RoleBinding(rbac::RoleBinding),
     ClusterRole(rbac::ClusterRole),
@@ -1617,6 +2049,7 @@ enum SandboxRbacObject {
 impl serde::Serialize for SandboxRbacObject {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         match self {
+            Self::ServiceAccount(a) => a.serialize(s),
             Self::Role(r) => r.serialize(s),
             Self::RoleBinding(r) => r.serialize(s),
             Self::ClusterRole(r) => r.serialize(s),
@@ -1752,11 +2185,9 @@ pub(super) fn kubernetes_sandbox_env(
             ..Default::default()
         }),
     }];
-    // Sandboxes run in the loop/turn pod's own namespace. Keeps the NetworkPolicy a simple
-    // podSelector.
     env.push(plain(
         "CRUCIBLE_SANDBOX_NAMESPACE",
-        profile.cluster.loop_namespace.clone(),
+        profile.cluster.sandbox_namespace().to_string(),
     ));
     env.push(plain(
         "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT",
@@ -1880,6 +2311,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2039,6 +2471,7 @@ mod tests {
                     harness: None,
                     model: None,
                     playbook: None,
+                    platform: None,
                 },
             )
             .expect("render")
@@ -2084,6 +2517,7 @@ mod tests {
                     harness,
                     model: model.map(str::to_string),
                     playbook: None,
+                    platform: None,
                 },
             )
             .expect("render")
@@ -2125,6 +2559,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2240,6 +2675,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2358,6 +2794,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2415,18 +2852,18 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render")
     }
 
-    /// A loop pod with `[cluster].ingest_url` set grows the Tier 2 run-session scaffolding: the
-    /// `CRUCIBLE_INGEST_URL`/`_TOKEN_PATH`/`POD_NAME` env, a projected
-    /// `crucible-ingest`-audience token volume + mount, and (the behavioral switch) the wrapper
-    /// GUARDS the `SESSION` delimiter behind the env's absence so a new-controller loop stops dumping
-    /// the (up to 128 MiB) session into the pod logs (crucible POSTs it to the drop-box instead).
+    /// A loop pod with `[cluster].ingest_url` set learns the controller's URL, and the wrapper
+    /// guards the `SESSION` delimiter behind its absence, since crucible uploads the session as
+    /// the run's evidence instead. It mounts no ServiceAccount token: the run token rides the
+    /// run's Secret, which the controller stamps at dispatch.
     #[test]
-    fn loop_pod_with_ingest_url_delivers_the_session_over_the_dropbox() {
+    fn loop_pod_with_ingest_url_uploads_the_session_to_the_controller() {
         let profile: DeployProfile = toml::from_str(
             r#"
             [cluster]
@@ -2444,26 +2881,30 @@ mod tests {
 
         let yaml = render_loop_pod(&profile);
 
-        // The env carrying the drop-box URL + the token path + the pod's own name (downward API).
-        assert!(yaml.contains("name: CRUCIBLE_INGEST_URL"));
-        assert!(yaml.contains("http://crucible-controller.autoresearch.svc:8080"));
-        assert!(yaml.contains("name: CRUCIBLE_INGEST_TOKEN_PATH"));
-        assert!(yaml.contains("name: CRUCIBLE_POD_NAME"));
-        assert!(yaml.contains("metadata.name"), "downward-API pod name");
-        // The projected, audience-locked token volume + read-only mount.
-        assert!(yaml.contains("crucible-ingest-token"));
-        assert!(yaml.contains("audience: crucible-ingest"));
-        assert!(yaml.contains("/var/run/secrets/crucible.io/ingest"));
-        // The behavioral switch: the delimiter dump is now guarded by the env's absence.
         assert!(
-            yaml.contains("if [ -z \"${CRUCIBLE_INGEST_URL:-}\" ]; then"),
-            "the SESSION delimiter dump is guarded behind the drop-box env: {yaml}"
+            yaml.contains(
+                "name: CRUCIBLE_CONTROLLER_URL\n      value: http://crucible-controller.autoresearch.svc:8080"
+            ),
+            "{yaml}"
         );
-        // `automountServiceAccountToken: false` still stands, the ingest token is one explicit file.
+        assert!(
+            yaml.contains(
+                "if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ] || [ -e \"$D/state/session.undelivered\" ]; then"
+            ),
+            "the SESSION delimiter dump runs without a controller or after a failed upload: {yaml}"
+        );
+        for gone in [
+            "CRUCIBLE_INGEST_URL",
+            "CRUCIBLE_INGEST_TOKEN_PATH",
+            "crucible-ingest-token",
+            "audience: crucible-ingest",
+        ] {
+            assert!(!yaml.contains(gone), "{gone} in a run pod: {yaml}");
+        }
         assert!(yaml.contains("automountServiceAccountToken: false"));
     }
 
-    /// Without a drop-box URL a loop pod carries NO ingest scaffolding, and the wrapper still emits the
+    /// Without a controller URL a loop pod carries no upload env, and the wrapper still emits the
     /// `SESSION` delimiter (guarded, but the guard is TRUE when the env is absent) so an old controller
     /// scrapes the session exactly as before, the fallback the migration keeps until R4.
     #[test]
@@ -2484,22 +2925,17 @@ mod tests {
 
         let yaml = render_loop_pod(&profile);
 
-        // The env DECLARATION is absent (the wrapper's guard string mentions the var name, but no
-        // `name: CRUCIBLE_INGEST_URL` env is projected and no token is mounted).
         assert!(
-            !yaml.contains("name: CRUCIBLE_INGEST_URL"),
-            "no ingest env without a drop-box: {yaml}"
+            !yaml.contains("name: CRUCIBLE_CONTROLLER_URL"),
+            "no controller env without a URL: {yaml}"
         );
-        assert!(
-            !yaml.contains("crucible-ingest-token"),
-            "no ingest token volume without a drop-box"
-        );
-        // The delimiter contract survives (behind the same guard, which is true with the env absent).
         assert!(
             yaml.contains("SESSION (rc="),
             "the SESSION delimiter is still emitted"
         );
-        assert!(yaml.contains("if [ -z \"${CRUCIBLE_INGEST_URL:-}\" ]; then"));
+        assert!(yaml.contains(
+            "if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ] || [ -e \"$D/state/session.undelivered\" ]; then"
+        ));
     }
 
     /// The manifest + a fake single-domain profile, plus a pack dir on disk with a NESTED
@@ -2609,6 +3045,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3065,6 +3502,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3160,6 +3598,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3270,6 +3709,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3385,6 +3825,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3436,6 +3877,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         ) {
             Err(e) => e,
@@ -3544,6 +3986,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render")
@@ -3730,6 +4173,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3828,6 +4272,334 @@ mod tests {
             !split.contains("name: autoresearch-sandbox\n"),
             "no RBAC object binds the sandbox SA: {split}"
         );
+    }
+
+    /// A profile `sandbox_namespace` moves the sandboxes, the gateway's sandbox Role and its
+    /// binding there, and the loop pod admits sandbox traffic only from that namespace. The
+    /// binding's subject stays the loop SA in the loop namespace.
+    /// Isolated sandboxes run as an account of their own in the sandbox namespace, which the
+    /// render creates; the loop's account does not exist there.
+    #[test]
+    fn isolated_sandboxes_get_an_account_of_their_own() {
+        let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
+        assert_eq!(
+            loop_pod_env(&moved, "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT").as_deref(),
+            Some("crucible-sandbox")
+        );
+        let accounts: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&moved)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .filter(|d| d["kind"] == "ServiceAccount")
+            .collect();
+        assert!(
+            accounts
+                .iter()
+                .any(|a| a["metadata"]["name"] == "crucible-sandbox"
+                    && a["metadata"]["namespace"] == "crucible-sandboxes"),
+            "{moved}"
+        );
+        let named = render_k8s(&k8s_profile(
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_service_account = \"team-sandbox\"",
+        ));
+        assert_eq!(
+            loop_pod_env(&named, "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT").as_deref(),
+            Some("team-sandbox")
+        );
+        assert!(named.contains("name: team-sandbox\n"), "{named}");
+    }
+
+    /// The controller discovers each cluster's SPIRE, so its identity on the cluster may read the
+    /// resources discovery reads and the keys, and nothing else of SPIRE's.
+    #[test]
+    fn the_sandbox_reader_may_read_its_clusters_spire() {
+        let readers = "sandbox_namespace = \"crucible-sandboxes\"\n\
+                       sandbox_readers = [\"crucible-control/crucible-controller\"]";
+        let docs = |extra: &str| -> Vec<serde_json::Value> {
+            render_k8s(&k8s_profile(extra))
+                .split("\n---\n")
+                .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+                .filter(|d: &serde_json::Value| d["metadata"]["name"] == SPIRE_READER)
+                .collect()
+        };
+        let k8s = docs(readers);
+        let role = k8s.iter().find(|d| d["kind"] == "Role").expect("a Role");
+        assert_eq!(role["metadata"]["namespace"], "spire-server");
+        assert_eq!(
+            role["rules"],
+            serde_json::json!([
+                {"apiGroups": [""], "resources": ["services/proxy"], "verbs": ["get"],
+                 "resourceNames": ["spire-spiffe-oidc-discovery-provider",
+                                   "http:spire-spiffe-oidc-discovery-provider:80"]},
+                {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get"],
+                 "resourceNames": ["spire-server"]},
+            ])
+        );
+        assert!(k8s.iter().all(|d| d["kind"] != "ClusterRole"));
+        let binding = k8s.iter().find(|d| d["kind"] == "RoleBinding").unwrap();
+        assert_eq!(binding["subjects"][0]["name"], "crucible-controller");
+
+        let ocp = docs(&format!("{readers}\nplatform = \"openshift\""));
+        let role = ocp.iter().find(|d| d["kind"] == "Role").unwrap();
+        assert_eq!(
+            role["metadata"]["namespace"],
+            "zero-trust-workload-identity-manager"
+        );
+        assert_eq!(role["rules"].as_array().unwrap().len(), 1, "keys only");
+        let cluster_role = ocp.iter().find(|d| d["kind"] == "ClusterRole").unwrap();
+        let resources: Vec<&str> = cluster_role["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["resources"][0].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            resources,
+            [
+                "zerotrustworkloadidentitymanagers",
+                "spireoidcdiscoveryproviders"
+            ]
+        );
+        assert!(ocp.iter().any(|d| d["kind"] == "ClusterRoleBinding"));
+
+        let profile = k8s_profile(&format!("{readers}\nplatform = \"openshift\""));
+        let manifest = k8s_manifest();
+        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let flagged = render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/alpha"),
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                platform: Some(forge::fleet::Platform::Kubernetes),
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render");
+        let role: serde_json::Value = flagged
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str::<serde_json::Value>(d).expect("yaml doc"))
+            .find(|d| d["metadata"]["name"] == SPIRE_READER && d["kind"] == "Role")
+            .expect("a Role");
+        assert_eq!(
+            role["metadata"]["namespace"], "spire-server",
+            "--platform wins over the profile's platform"
+        );
+
+        assert!(
+            docs("sandbox_namespace = \"crucible-sandboxes\"").is_empty(),
+            "no reader, no grant"
+        );
+    }
+
+    #[test]
+    fn an_isolated_gateway_leaves_the_loop_sa_no_verbs_in_the_sandbox_namespace() {
+        let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
+        let docs: Vec<serde_json::Value> = moved
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let names_loop_sa =
+            |d: &serde_json::Value| {
+                d["subjects"].as_array().into_iter().flatten().any(|s| {
+                    s["name"] == "autoresearch-publisher" && s["namespace"] == "autoresearch"
+                })
+            };
+        for d in &docs {
+            let kind = d["kind"].as_str().unwrap_or_default();
+            let grants_in_sandbox_ns = (kind == "RoleBinding"
+                && d["metadata"]["namespace"] == "crucible-sandboxes")
+                || kind == "ClusterRoleBinding";
+            assert!(
+                !(grants_in_sandbox_ns && names_loop_sa(d)),
+                "the loop SA is granted verbs that reach the sandbox namespace: {d}"
+            );
+        }
+        let netpol = docs
+            .iter()
+            .find(|d| d["kind"] == "NetworkPolicy")
+            .expect("netpol");
+        let ports: Vec<i64> = netpol["spec"]["ingress"][0]["ports"]
+            .as_array()
+            .expect("ports")
+            .iter()
+            .filter_map(|p| p["port"].as_i64())
+            .collect();
+        assert!(
+            !ports.contains(&i64::from(GATEWAY_PORT)),
+            "the gateway no longer listens in the loop pod: {ports:?}"
+        );
+
+        let shared = render_k8s(&k8s_profile(""));
+        assert!(
+            shared.contains("name: autoresearch-publisher-sandbox"),
+            "without a sandbox namespace the in-pod gateway keeps the loop SA's RBAC"
+        );
+    }
+
+    /// The controller's signing key Secret sits in the controller's own namespace, the one its
+    /// identity in `sandbox_readers` lives in. Nothing the loop render emits may let the loop SA
+    /// read Secrets there, or anywhere through a cluster-wide grant.
+    #[test]
+    fn the_loop_sa_is_never_granted_secrets_in_the_controller_namespace() {
+        for extra in [
+            "",
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_readers = [\"crucible-control/crucible-controller\"]",
+        ] {
+            let yaml = render_k8s(&k8s_profile(extra));
+            let docs: Vec<serde_json::Value> = yaml
+                .split("\n---\n")
+                .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+                .collect();
+            let names_loop_sa = |d: &serde_json::Value| {
+                d["subjects"].as_array().into_iter().flatten().any(|s| {
+                    s["name"] == "autoresearch-publisher" && s["namespace"] == "autoresearch"
+                })
+            };
+            let role_grants_secrets = |kind: &str, name: &serde_json::Value| {
+                docs.iter()
+                    .filter(|d| d["kind"] == kind && d["metadata"]["name"] == *name)
+                    .flat_map(|d| d["rules"].as_array().cloned().unwrap_or_default())
+                    .any(|rule| {
+                        rule["resources"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|r| r == "secrets" || r == "*")
+                    })
+            };
+            for d in docs.iter().filter(|d| names_loop_sa(d)) {
+                let kind = d["kind"].as_str().unwrap_or_default();
+                let role_kind = d["roleRef"]["kind"].as_str().unwrap_or_default();
+                let role = &d["roleRef"]["name"];
+                assert_ne!(
+                    d["metadata"]["namespace"], "crucible-control",
+                    "a binding for the loop SA in the controller namespace: {d}"
+                );
+                if kind == "ClusterRoleBinding" || role_kind == "ClusterRole" {
+                    assert!(
+                        !role_grants_secrets("ClusterRole", role),
+                        "a cluster role bound to the loop SA reaches Secrets: {d}"
+                    );
+                    assert!(
+                        !matches!(role.as_str(), Some("admin" | "edit" | "cluster-admin"))
+                            || d["metadata"]["namespace"] == "rig",
+                        "a built-in role bound to the loop SA outside the rig namespace: {d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_render_leaves_the_spiffe_socket_to_the_agent_delivery() {
+        let with = render_k8s(&k8s_profile(
+            r#"sandbox_spiffe_socket = "/run/spire/agent.sock""#,
+        ));
+        assert_eq!(loop_pod_env(&with, "CRUCIBLE_SANDBOX_SPIFFE_SOCKET"), None);
+    }
+
+    #[test]
+    fn a_sandbox_namespace_moves_the_sandboxes_and_their_rbac() {
+        let default = render_k8s(&k8s_profile(""));
+        assert_eq!(
+            loop_pod_env(&default, "CRUCIBLE_SANDBOX_NAMESPACE").as_deref(),
+            Some("autoresearch")
+        );
+        assert!(
+            !default.contains("kubernetes.io/metadata.name"),
+            "{default}"
+        );
+
+        let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
+        assert_eq!(
+            loop_pod_env(&moved, "CRUCIBLE_SANDBOX_NAMESPACE").as_deref(),
+            Some("crucible-sandboxes")
+        );
+        let docs: Vec<serde_json::Value> = moved
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let named = |kind: &str| {
+            docs.iter()
+                .find(|d| {
+                    d["kind"] == kind
+                        && d["metadata"]["name"] == "crucible-openshell-gateway-sandbox"
+                })
+                .unwrap_or_else(|| panic!("no {kind}: {moved}"))
+        };
+        assert_eq!(named("Role")["metadata"]["namespace"], "crucible-sandboxes");
+        let binding = named("RoleBinding");
+        assert_eq!(binding["metadata"]["namespace"], "crucible-sandboxes");
+        assert_eq!(
+            binding["subjects"][0],
+            serde_json::json!({"kind": "ServiceAccount", "name": "crucible-openshell-gateway", "namespace": "crucible-sandboxes"})
+        );
+        assert!(
+            docs.iter().any(|d| d["kind"] == "ServiceAccount"
+                && d["metadata"]["name"] == "crucible-openshell-gateway"
+                && d["metadata"]["namespace"] == "crucible-sandboxes"),
+            "{moved}"
+        );
+        let netpol = docs
+            .iter()
+            .find(|d| d["kind"] == "NetworkPolicy")
+            .expect("netpol");
+        assert!(
+            !moved.contains("crucible-sandbox-reader"),
+            "no readers named, no reader RBAC: {moved}"
+        );
+        let read = render_k8s(&k8s_profile(
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_readers = [\"crucible-control/crucible-controller\"]",
+        ));
+        let read_docs: Vec<serde_json::Value> = read
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let reader = |kind: &str| {
+            read_docs
+                .iter()
+                .find(|d| d["kind"] == kind && d["metadata"]["name"] == "crucible-sandbox-reader")
+                .unwrap_or_else(|| panic!("no reader {kind}: {read}"))
+        };
+        assert_eq!(
+            reader("Role")["metadata"]["namespace"],
+            "crucible-sandboxes"
+        );
+        assert_eq!(
+            reader("Role")["rules"],
+            serde_json::json!([
+                {"apiGroups": ["agents.x-k8s.io"], "resources": ["sandboxes"], "verbs": ["get", "list", "patch", "delete"]},
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "create", "delete"]},
+                {"apiGroups": [""], "resources": ["pods/finalizers"], "verbs": ["update"]},
+                {"apiGroups": [""], "resources": ["services", "secrets"], "verbs": ["list", "create", "delete"]},
+                {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["list", "create", "delete"]}
+            ]),
+            "the controller starts and tears down each run's gateway there"
+        );
+        let loop_services = read_docs
+            .iter()
+            .find(|d| {
+                d["kind"] == "Role" && d["metadata"]["name"] == "crucible-gateway-loop-services"
+            })
+            .unwrap_or_else(|| panic!("no loop Service Role: {read}"));
+        assert_eq!(loop_services["metadata"]["namespace"], "autoresearch");
+        assert_eq!(
+            loop_services["rules"],
+            serde_json::json!([{"apiGroups": [""], "resources": ["services"], "verbs": ["list", "create", "delete"]}])
+        );
+        assert_eq!(
+            reader("RoleBinding")["subjects"][0],
+            serde_json::json!({"kind": "ServiceAccount", "name": "crucible-controller", "namespace": "crucible-control"})
+        );
+        for peer in netpol["spec"]["ingress"][0]["from"]
+            .as_array()
+            .expect("peers")
+        {
+            assert_eq!(
+                peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+                "crucible-sandboxes",
+                "{peer}"
+            );
+        }
     }
 
     /// The sandbox driver config env vars are projected: namespace, service account, default
@@ -4345,10 +5117,163 @@ mod tests {
             netpol.contains("port: 8850"),
             "mcp port in netpol: {netpol}"
         );
+        assert!(
+            !netpol.contains("port: 8848"),
+            "no buildit port without [buildit]: {netpol}"
+        );
+        let with_buildit = k8s_profile("[buildit]\nnamespace = \"crucible-builds\"\n");
+        let yaml = render_k8s_manifest(&manifest, &with_buildit);
+        let docs: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&yaml)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .collect();
+        let named = |kind: &str| {
+            docs.iter()
+                .find(|d| {
+                    d["kind"] == kind && d["metadata"]["name"] == "autoresearch-publisher-buildit"
+                })
+                .unwrap_or_else(|| panic!("a buildit {kind}: {yaml}"))
+        };
+        let role = named("Role");
+        assert_eq!(
+            role["metadata"]["namespace"], "crucible-builds",
+            "builder pod rights never land in the loop namespace"
+        );
+        assert_eq!(
+            role["rules"],
+            serde_json::json!([
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]},
+                {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create", "get"]},
+                {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+            ])
+        );
+        let binding = named("RoleBinding");
+        assert_eq!(binding["metadata"]["namespace"], "crucible-builds");
+        assert_eq!(binding["roleRef"]["kind"], "Role");
+        assert_eq!(binding["subjects"][0]["name"], "autoresearch-publisher");
+        assert_eq!(binding["subjects"][0]["namespace"], "autoresearch");
+        assert!(
+            !render_k8s_manifest(&manifest, &k8s_profile("")).contains("-buildit"),
+            "no buildit rights without [buildit]"
+        );
+        let builders = docs
+            .iter()
+            .find(|d| d["kind"] == "NetworkPolicy" && d["metadata"]["name"] == BUILDER_NETPOL)
+            .unwrap_or_else(|| panic!("the builder pods' NetworkPolicy: {yaml}"));
+        assert_eq!(builders["metadata"]["namespace"], "crucible-builds");
+        assert_eq!(
+            builders["spec"]["podSelector"]["matchLabels"]["buildit.dev/managed-by"],
+            "mcp"
+        );
+        assert_eq!(
+            builders["spec"]["policyTypes"],
+            serde_json::json!(["Ingress", "Egress"])
+        );
+        assert!(
+            builders["spec"].get("ingress").is_none(),
+            "no ingress at all"
+        );
+        let egress = builders["spec"]["egress"].as_array().unwrap();
+        assert_eq!(egress[0].get("to"), None, "DNS anywhere");
+        assert_eq!(
+            egress[1]["to"][0]["ipBlock"]["cidr"], "0.0.0.0/0",
+            "by default, TCP 443 anywhere"
+        );
+        assert_eq!(
+            egress[1]["ports"],
+            serde_json::json!([{"port": 443, "protocol": "TCP"}])
+        );
+        let narrowed = render_k8s_manifest(
+            &manifest,
+            &k8s_profile(
+                "[buildit]\nnamespace = \"crucible-builds\"\n\
+                 egress = [{ cidr = \"203.0.113.0/24\", except = [\"203.0.113.8/29\"] }]\n",
+            ),
+        );
+        let narrowed: serde_json::Value = serde_norway::Deserializer::from_str(&narrowed)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .find(|d| d["metadata"]["name"] == BUILDER_NETPOL)
+            .unwrap();
+        assert_eq!(
+            narrowed["spec"]["egress"][1]["to"][0]["ipBlock"],
+            serde_json::json!({"cidr": "203.0.113.0/24", "except": ["203.0.113.8/29"]})
+        );
+        assert_eq!(narrowed["spec"]["egress"].as_array().unwrap().len(), 2);
+        let netpol = yaml
+            .split("\n---\n")
+            .find(|d| d.contains("kind: NetworkPolicy"))
+            .expect("netpol doc");
+        assert!(netpol.contains("port: 8848"), "buildit port: {netpol}");
         // policyTypes still declares Ingress.
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");
         // No Egress lockdown.
         assert!(!netpol.contains("- Egress"), "no egress: {netpol}");
+    }
+
+    /// With `[buildit]`, the builder namespace gets the admission policy buildit ships, bound to
+    /// that namespace alone; without it, no policy.
+    #[test]
+    fn builder_pods_are_admitted_by_buildits_policy_in_its_namespace_only() {
+        let manifest = k8s_manifest();
+        let yaml = render_k8s_manifest(
+            &manifest,
+            &k8s_profile("[buildit]\nnamespace = \"crucible-builds\"\n"),
+        );
+        let docs: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&yaml)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .collect();
+        let kind = |k: &str| {
+            docs.iter()
+                .find(|d| d["kind"] == k)
+                .unwrap_or_else(|| panic!("no {k}: {yaml}"))
+        };
+        let policy = kind("ValidatingAdmissionPolicy");
+        let shipped: serde_json::Value = serde_norway::from_str(BUILDER_ADMISSION_POLICY).unwrap();
+        assert_eq!(
+            policy["metadata"]["name"],
+            "crucible-builds-buildit-builders"
+        );
+        assert_eq!(
+            policy["spec"], shipped["spec"],
+            "buildit's policy, unchanged"
+        );
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        let binding = kind("ValidatingAdmissionPolicyBinding");
+        assert_eq!(
+            binding["metadata"]["name"],
+            "crucible-builds-buildit-builders"
+        );
+        assert_eq!(
+            binding["spec"],
+            serde_json::json!({
+                "policyName": "crucible-builds-buildit-builders",
+                "validationActions": ["Deny"],
+                "matchResources": {"namespaceSelector": {"matchLabels": {
+                    "kubernetes.io/metadata.name": "crucible-builds"}}},
+            })
+        );
+        assert!(
+            !render_k8s_manifest(&manifest, &k8s_profile("")).contains("ValidatingAdmissionPolicy"),
+            "no policy without [buildit]"
+        );
+        let quota = kind("ResourceQuota");
+        assert_eq!(quota["metadata"]["namespace"], "crucible-builds");
+        assert_eq!(
+            quota["spec"]["hard"],
+            serde_json::json!({"pods": "16", "requests.amd.com/gpu": "0", "requests.nvidia.com/gpu": "0"}),
+            "a few pods and no GPUs by default"
+        );
+        let sized = render_k8s_manifest(
+            &manifest,
+            &k8s_profile(
+                "[buildit]\nnamespace = \"crucible-builds\"\n\
+                 quota = { pods = \"4\" }\n",
+            ),
+        );
+        let sized: serde_json::Value = serde_norway::Deserializer::from_str(&sized)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .find(|d| d["kind"] == "ResourceQuota")
+            .unwrap();
+        assert_eq!(sized["spec"]["hard"], serde_json::json!({"pods": "4"}));
     }
 
     /// Under podman the render is byte-identical to before: no `--compute-driver` flag, no
@@ -4501,7 +5426,7 @@ mod tests {
         )
         .expect("podman profile");
         assert_eq!(
-            podman_profile.cluster.sandbox_driver,
+            podman_profile.cluster.sandbox_driver(),
             ComputeDriver::Podman,
             "default is podman"
         );
@@ -4521,7 +5446,7 @@ mod tests {
         )
         .expect("k8s profile");
         assert_eq!(
-            k8s_profile.cluster.sandbox_driver,
+            k8s_profile.cluster.sandbox_driver(),
             ComputeDriver::Kubernetes,
         );
     }
@@ -4628,6 +5553,8 @@ mod tests {
                 ("topic".to_string(), "attention sinks".to_string()),
                 ("depth".to_string(), "--deep".to_string()),
             ]),
+            rerun: None,
+            variant: None,
         }
     }
 
@@ -4656,6 +5583,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: Some(playbook),
+                platform: None,
             },
         )
         .expect("render")
@@ -4696,6 +5624,7 @@ mod tests {
                     harness,
                     model: model.map(str::to_string),
                     playbook: Some(playbook_launch()),
+                    platform: None,
                 },
             )
             .expect("render")
@@ -4776,7 +5705,8 @@ mod tests {
     }
 
     /// The ingest contract: a playbook pod publishes its session at the same path a loop pod does,
-    /// under the same two tiers (drop-box when the profile names one, the delimiter otherwise).
+    /// under the same two paths (an upload when the profile names a controller, the delimiter
+    /// otherwise).
     #[test]
     fn playbook_pod_keeps_the_session_path_and_delimiter() {
         let yaml = render_playbook(&k8s_profile(""), playbook_launch());
@@ -4786,24 +5716,106 @@ mod tests {
             "{yaml}"
         );
         assert!(
-            yaml.contains(r#"if [ -z "${CRUCIBLE_INGEST_URL:-}" ]; then"#),
+            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ] || [ -e "$D/state/session.undelivered" ]; then"#),
             "{yaml}"
         );
 
-        let ingesting = k8s_profile(r#"ingest_url = "https://controller.example/ingest""#);
-        let yaml = render_playbook(&ingesting, playbook_launch());
+        let uploading = k8s_profile(r#"ingest_url = "https://controller.example""#);
+        let yaml = render_playbook(&uploading, playbook_launch());
         assert!(
-            yaml.contains(r#"if [ -z "${CRUCIBLE_INGEST_URL:-}" ]; then"#),
+            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ] || [ -e "$D/state/session.undelivered" ]; then"#),
             "the delimiter stays guarded, never unconditional: {yaml}"
         );
         assert!(
-            yaml.contains(crucible_contract::ENV_INGEST_URL),
-            "the drop-box env: {yaml}"
+            yaml.contains("name: CRUCIBLE_CONTROLLER_URL\n      value: https://controller.example"),
+            "{yaml}"
+        );
+    }
+
+    fn rerun_launch() -> PlaybookLaunch {
+        PlaybookLaunch {
+            rerun: Some(RerunLaunch {
+                parent: "acme_x_7-1700000000".to_string(),
+                from: vec!["triage".to_string(), "it's".to_string()],
+            }),
+            ..playbook_launch()
+        }
+    }
+
+    /// A rerun pod fetches its parent's evidence from the controller it was given, by the parent's
+    /// run id, and dispatches the named tasks again.
+    #[test]
+    fn a_rerun_pod_names_its_parent_on_the_controller() {
+        let profile = k8s_profile(r#"ingest_url = "https://controller.example""#);
+        let yaml = render_playbook(&profile, rerun_launch());
+        assert!(
+            yaml.contains(
+                r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'"#
+            ),
+            "{yaml}"
         );
         assert!(
-            yaml.contains(INGEST_TOKEN_VOLUME),
-            "token projection: {yaml}"
+            !yaml.contains("--resume"),
+            "a one-shot pod never resumes: {yaml}"
         );
+    }
+
+    /// A run id is escaped as one URL path segment.
+    #[test]
+    fn a_rerun_parent_id_is_one_path_segment() {
+        let profile = k8s_profile(r#"ingest_url = "https://controller.example""#);
+        let launch = PlaybookLaunch {
+            rerun: Some(RerunLaunch {
+                parent: "a/b c?d".to_string(),
+                from: vec!["t".to_string()],
+            }),
+            ..playbook_launch()
+        };
+        let yaml = render_playbook(&profile, launch);
+        assert!(
+            yaml.contains("/api/evidence/runs/a%2Fb%20c%3Fd\""),
+            "{yaml}"
+        );
+    }
+
+    /// With persistent state, a restarted rerun pod resumes the rerun its claim holds rather than
+    /// seeding it from the parent again.
+    #[test]
+    fn a_restarted_rerun_pod_resumes() {
+        let profile = k8s_profile(
+            r#"ingest_url = "https://controller.example"
+            state_pvc = "deepgemm-state""#,
+        );
+        let yaml = render_playbook(&profile, rerun_launch());
+        assert!(
+            yaml.contains(
+                r#"if [ -s "$D/state/session.jsonl" ]; then set -- --resume; else set -- --rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'; fi"#
+            ),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains(r#"--param 'topic=attention sinks' "$@""#),
+            "{yaml}"
+        );
+    }
+
+    /// Without a controller to fetch from, a rerun cannot render.
+    #[test]
+    fn a_rerun_needs_a_controller_url() {
+        let manifest = playbook_manifest();
+        let input = RenderInput::from_playbook_manifest(&manifest, "alpha");
+        let err = render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/alpha"),
+            "crucible.toml",
+            &k8s_profile(""),
+            &RenderOpts {
+                playbook: Some(rerun_launch()),
+                ..RenderOpts::default()
+            },
+        )
+        .expect_err("a rerun with no controller url");
+        assert!(err.to_string().contains("[cluster].ingest_url"), "{err:#}");
     }
 
     /// With persistent state a playbook pod survives a crash the way a loop pod does: the kubelet
@@ -4903,6 +5915,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: Some(playbook_launch()),
+                platform: None,
             },
         )
         .expect("render");

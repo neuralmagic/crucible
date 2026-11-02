@@ -447,14 +447,12 @@ pub async fn whoami(c: &Client) -> Result<String> {
 /// proposal already decided. Registering is still the admin's click.
 pub async fn playbook_import(
     c: &Client,
-    repo: &str,
-    git_ref: Option<&str>,
-    path: Option<&str>,
+    source: &crate::client::PackImportSource<'_>,
     id: Option<&str>,
     description: Option<&str>,
     as_json: bool,
 ) -> Result<String> {
-    let mut raw: Value = c.import_pack(repo, git_ref, path).await?;
+    let mut raw: Value = c.import_pack(source).await?;
     let import: dto::PackImport = serde_json::from_value(raw.clone())?;
     let url = c.web_url(&import_preview_path(&import.id, id, description));
     if as_json {
@@ -494,13 +492,15 @@ pub async fn draft_create(
     let mut raw: Value = c.create_draft(draft_id, description, template).await?;
     let saved: dto::DraftCompile = serde_json::from_value(raw.clone())?;
     let url = studio_url(c, draft_id);
+    let skill = c.web_url("/api/playbooks/drafts/skill");
     if as_json {
         if let Some(obj) = raw.as_object_mut() {
             obj.insert("studio_url".to_string(), Value::String(url));
+            obj.insert("skill_url".to_string(), Value::String(skill));
         }
         return json(&raw);
     }
-    Ok(render::draft_created(draft_id, &saved, &url))
+    Ok(render::draft_created(draft_id, &saved, &url, &skill))
 }
 
 pub async fn draft_save(
@@ -561,6 +561,14 @@ pub async fn playbook_caps(c: &Client, as_json: bool) -> Result<String> {
     }
     let caps: dto::PlaybookCaps = c.playbook_caps().await?;
     Ok(render::playbook_caps(&caps))
+}
+
+pub async fn providers(c: &Client, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.providers::<Value>().await?);
+    }
+    let list: Vec<dto::Provider> = c.providers().await?;
+    Ok(render::providers(&list))
 }
 
 pub async fn secrets(c: &Client, as_json: bool) -> Result<String> {
@@ -635,6 +643,7 @@ pub struct DraftLaunch {
     /// `[agent]` harness; `model` is the model to ask it for and needs a provider.
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub rerun: Option<Rerun>,
 }
 
 /// Test-fire a draft. The values are the newest save's stored schema's, and a draft launch is held
@@ -658,6 +667,7 @@ pub async fn draft_launch(
     );
     put_trimmed(&mut body, "provider", launch.provider.as_deref());
     put_trimmed(&mut body, "model", launch.model.as_deref());
+    put_rerun(&mut body, launch.rerun.as_ref());
     if as_json {
         return json(&c.launch_draft::<Value>(draft_id, &body).await?);
     }
@@ -671,6 +681,37 @@ pub async fn draft_launch(
 pub async fn draft_delete(c: &Client, draft_id: &str) -> Result<String> {
     c.delete_draft(draft_id).await?;
     Ok(format!("deleted draft {draft_id}\n"))
+}
+
+/// Move a draft to a new id. Its saves, secret bindings, shares, standing launches and launches
+/// follow it.
+pub async fn draft_rename(c: &Client, draft_id: &str, to: &str, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.rename_draft::<Value>(draft_id, to).await?);
+    }
+    let renamed: dto::DraftRenamed = c.rename_draft(draft_id, to).await?;
+    Ok(render::draft_renamed(&renamed, &studio_url(c, &renamed.id)))
+}
+
+/// Copy a draft's newest save into a new draft. A binding comes along only when the caller could
+/// bind its secret themselves; a reference-mode secret needs a Vault token this client never
+/// sends, so its bindings are reported as left behind.
+pub async fn draft_clone(
+    c: &Client,
+    draft_id: &str,
+    to: &str,
+    description: Option<&str>,
+    as_json: bool,
+) -> Result<String> {
+    if as_json {
+        return json(&c.clone_draft::<Value>(draft_id, to, description).await?);
+    }
+    let cloned: dto::DraftCloned = c.clone_draft(draft_id, to, description).await?;
+    Ok(render::draft_cloned(
+        draft_id,
+        &cloned,
+        &studio_url(c, &cloned.id),
+    ))
 }
 
 /// Register a draft's newest compiling version as a playbook, with no review.
@@ -898,6 +939,20 @@ pub struct Launch {
     /// `[agent]` harness; `model` is the model to ask it for and needs a provider.
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub rerun: Option<Rerun>,
+}
+
+/// A launch that reruns a finished run of the same pack from some of its tasks.
+#[derive(Debug, Clone)]
+pub struct Rerun {
+    pub of: String,
+    pub from: Vec<String>,
+}
+
+fn put_rerun(body: &mut Value, rerun: Option<&Rerun>) {
+    if let Some(rerun) = rerun {
+        body["rerun"] = serde_json::json!({ "of": rerun.of, "from": rerun.from });
+    }
 }
 
 fn put_trimmed(body: &mut Value, field: &str, value: Option<&str>) {
@@ -921,6 +976,7 @@ pub async fn launch(c: &Client, id: &str, launch: Launch, as_json: bool) -> Resu
     );
     put_trimmed(&mut body, "provider", launch.provider.as_deref());
     put_trimmed(&mut body, "model", launch.model.as_deref());
+    put_rerun(&mut body, launch.rerun.as_ref());
     if as_json {
         return json(&c.launch::<Value>(id, &body).await?);
     }
@@ -1697,6 +1753,10 @@ mod tests {
                 dispatch_target: Some("  ".to_string()),
                 provider: Some("plat-openai".to_string()),
                 model: Some(" gpt-5.6-luna ".to_string()),
+                rerun: Some(Rerun {
+                    of: "run-7".to_string(),
+                    from: vec!["check".to_string()],
+                }),
             },
             false,
         )
@@ -1726,6 +1786,10 @@ mod tests {
         assert!(
             sent.get("dispatch_target").is_none(),
             "a blank target is omitted, not sent: {sent}"
+        );
+        assert_eq!(
+            sent["rerun"],
+            serde_json::json!({"of": "run-7", "from": ["check"]})
         );
 
         let bare = launch(

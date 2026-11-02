@@ -13,7 +13,7 @@
 //!     a Keycloak access token -> validated against the issuer's JWKS -> claims off the token
 //!   both
 //!     CONTROLLER_API_TOKEN    -> machine caller -> configured identity, no groups
-//!     any other bearer        -> cluster token  -> users/~ identity, no groups
+//!     any other bearer        -> cluster token  -> SelfSubjectReview identity, no groups
 //! ```
 //!
 //! In native mode the `X-Auth-Request-*` family is dropped off every request before anything else
@@ -142,7 +142,7 @@ pub enum AuthPath {
     Jwt,
     /// `CONTROLLER_API_TOKEN`: a machine caller, with at most a configured identity and no groups.
     StaticToken,
-    /// Any other bearer, resolved to a username by the cluster's `users/~`, and matching a `users`
+    /// Any other bearer, resolved to a username by the cluster's its `SelfSubjectReview`, and matching a `users`
     /// row. No groups.
     ClusterToken,
     /// A valid cluster token whose OpenShift username matches no `users` row, so it names nobody
@@ -243,7 +243,7 @@ pub(crate) fn expected_token() -> Option<SharedToken> {
 
 /// What the auth middleware checks against: the mode, the SSO edge's own token, the static machine
 /// token, the cluster-token path that resolves any OTHER bearer to an OpenShift username via
-/// `users/~`, and (native mode) the issuer the sessions and JWT bearers are proved against.
+/// its `SelfSubjectReview`, and (native mode) the issuer the sessions and JWT bearers are proved against.
 pub(crate) struct BearerGuard {
     pub(crate) mode: AuthMode,
     pub(crate) expected: Option<SharedToken>,
@@ -438,7 +438,7 @@ impl BearerGuard {
 ///
 /// On both: the static token gets the configured `CONTROLLER_API_TOKEN_IDENTITY` (no identity
 /// configured = anonymous); a cluster token gets the name the API server returned for it
-/// (`users/~`). Both drop every `X-Auth-Request-*` header the client wrote first, groups included —
+/// (its `SelfSubjectReview`). Both drop every `X-Auth-Request-*` header the client wrote first, groups included —
 /// nothing that reaches a handler is caller-asserted. A static-token request that arrives wearing
 /// edge assertions while an identity is pinned is 401: that is an edge presenting the wrong bearer,
 /// not the machine caller. Anything the API server rejects is 401; an API server that can't answer
@@ -563,7 +563,7 @@ pub(crate) async fn require_auth(
         return next.run(req).await;
     }
 
-    // A JWT is the issuer's word and never the cluster's, so it is never handed to `users/~`.
+    // A JWT is the issuer's word and never the cluster's, so it is never handed to its `SelfSubjectReview`.
     if native && looks_like_jwt(&presented) {
         let Some(oidc) = &guard.oidc else {
             return unauthorized();
@@ -639,7 +639,10 @@ pub(crate) async fn require_auth_or_api_key(
     req: Request,
     next: Next,
 ) -> Response {
-    if presented_api_key(req.headers()) {
+    if presented_bearer(req.headers()).is_some_and(crate::runs::pod_token::looks_like_token) {
+        return key_refused("a pod token authenticates only its own evidence routes");
+    }
+    if presented_bearer(req.headers()).is_some_and(crate::identity::api_key::looks_like_key) {
         let keys = KeyGuard {
             pool: both.pool,
             refresh: both.guard.refresh.clone(),
@@ -649,14 +652,13 @@ pub(crate) async fn require_auth_or_api_key(
     require_auth(State(both.guard), req, next).await
 }
 
-/// Whether the caller's bearer even claims to be an API key, which is what picks the guard. A
-/// malformed or revoked key still lands on the key guard, so it is told what is wrong with it.
-fn presented_api_key(headers: &header::HeaderMap) -> bool {
+/// The caller's bearer, whose prefix picks the guard. A malformed or revoked key still lands on
+/// the key guard, so it is told what is wrong with it.
+fn presented_bearer(headers: &header::HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(crate::identity::api_key::looks_like_key)
 }
 
 /// What [`require_api_key`] checks a key against: the pool it is stored in, and the offline
@@ -673,8 +675,8 @@ pub struct KeyGuard {
 /// holding one long-lived credential, and none of the human paths — the session cookie, the edge's
 /// header assertions, the static machine token, a cluster token — mean anything there. Keeping the
 /// two guards apart means a bug in either cannot widen the other, and it is the same shape
-/// `/metrics` and the ingest drop-box already use: merged outside the human guard,
-/// carrying its own credential check.
+/// `/metrics` and the run evidence routes already use: merged outside the human guard, carrying
+/// their own credential check.
 ///
 /// What it stamps is what every handler already reads, so nothing downstream needs to know an API
 /// key was involved: the owner's login, their subject, and the groups their `users` row holds.
@@ -1277,8 +1279,8 @@ mod tests {
         /// A stand-in API server: one good token, everything else 401.
         pub(super) async fn kube_auth() -> crate::identity::kube_user::KubeUserAuth {
             let app = axum::Router::new().route(
-                "/apis/user.openshift.io/v1/users/~",
-                get(|headers: axum::http::HeaderMap| async move {
+                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+                axum::routing::post(|headers: axum::http::HeaderMap| async move {
                     let auth = headers
                         .get("authorization")
                         .and_then(|v| v.to_str().ok())
@@ -1286,7 +1288,7 @@ mod tests {
                     if auth == "Bearer sha256~mine" {
                         (
                             StatusCode::OK,
-                            r#"{"metadata":{"name":"wynn"}}"#.to_string(),
+                            r#"{"status":{"userInfo":{"username":"wynn"}}}"#.to_string(),
                         )
                     } else {
                         (StatusCode::UNAUTHORIZED, String::new())
@@ -1499,7 +1501,10 @@ mod tests {
             };
             let (status, body) = call(app(guard), req(Some("Bearer sha256~mine"), &[])).await;
             assert_eq!(status, StatusCode::OK);
-            assert_eq!(body, "wynn|", "identity comes from users/~, not the client");
+            assert_eq!(
+                body, "wynn|",
+                "identity comes from the SelfSubjectReview, not the client"
+            );
         }
 
         /// The whole point of stripping: a valid cluster token must not carry someone ELSE's
@@ -2176,7 +2181,7 @@ mod tests {
         }
 
         /// A deployment with no issuer configured cannot validate a JWT, so it must not fall
-        /// through to handing that JWT to the cluster's `users/~` as if it were a cluster token.
+        /// through to handing that JWT to the cluster's its `SelfSubjectReview` as if it were a cluster token.
         #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
         async fn a_jwt_bearer_without_an_issuer_is_401_and_never_a_cluster_token(pool: PgPool) {
             let guard = BearerGuard {

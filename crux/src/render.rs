@@ -487,8 +487,33 @@ pub fn graph(run_id: &str, g: &dto::RunGraph) -> String {
         )
     );
     out.push_str(&outputs_block(g));
+    out.push_str(&emitted(&order, g));
     out.push_str(&full_notes(&order, g));
     out
+}
+
+/// What each task's latest attempt emitted, an evaluate's verdict among them, one compact line
+/// each. A long one is cut; `--json` has every attempt's whole output.
+fn emitted(order: &[String], g: &dto::RunGraph) -> String {
+    let lines: Vec<String> = order
+        .iter()
+        .filter_map(|name| {
+            let output = g
+                .results
+                .iter()
+                .rfind(|r| &r.task == name)?
+                .output
+                .as_ref()?;
+            Some(format!(
+                "  {name}: {}\n",
+                truncate(&output.to_string(), 500)
+            ))
+        })
+        .collect();
+    match lines.is_empty() {
+        true => String::new(),
+        false => format!("\nemitted\n{}", lines.concat()),
+    }
 }
 
 /// The notes the table had to cut, in full. A failed run's cause is usually the longest note it
@@ -767,6 +792,7 @@ pub fn pack_import(i: &dto::PackImport, preview_url: &str) -> String {
         or_dash(i.git_ref.as_deref())
     ));
     line(&mut out, "path", Some(&i.path));
+    line(&mut out, "variant", i.variant.as_deref());
     out.push_str(&format!("rev: {}\n", i.rev));
     line(&mut out, "tree", i.tree_digest.as_deref());
     out.push_str(&format!(
@@ -833,9 +859,15 @@ pub fn local_pack(digest: &crucible_contract::pack_tree::TreeDigest, ignored: &[
 }
 
 /// A save that landed: the new version, its diagnostics, and the studio page a human opens on it.
-pub fn draft_created(id: &str, saved: &dto::DraftCompile, studio_url: &str) -> String {
+pub fn draft_created(
+    id: &str,
+    saved: &dto::DraftCompile,
+    studio_url: &str,
+    skill_url: &str,
+) -> String {
     let mut out = format!("created draft {id} at version {}\n", saved.version);
     out.push_str(&compiled(saved, studio_url));
+    out.push_str(&format!("agent skill: {skill_url}\n"));
     out
 }
 
@@ -862,6 +894,37 @@ pub fn draft_graduated(id: &str, ack: &dto::GraduateAck) -> String {
          the same repo and path.\n",
         ack.pr_url
     )
+}
+
+pub fn draft_renamed(r: &dto::DraftRenamed, studio_url: &str) -> String {
+    format!(
+        "renamed draft {} to {}\nmoved: {} secret bindings, {} shares, {} standing launches, {} \
+         launches\nstudio: {studio_url}\n",
+        r.prior, r.id, r.bindings, r.shares, r.standing_launches, r.launches
+    )
+}
+
+pub fn draft_cloned(source: &str, c: &dto::DraftCloned, studio_url: &str) -> String {
+    let mut out = format!(
+        "cloned draft {source} to {} at version {}\n",
+        c.id, c.version
+    );
+    if !c.bindings.is_empty() {
+        let names: Vec<&str> = c
+            .bindings
+            .iter()
+            .map(|b| b.declared_name.as_str())
+            .collect();
+        out.push_str(&format!("bound: {}\n", names.join(", ")));
+    }
+    if !c.left_bindings.is_empty() {
+        out.push_str("not copied:\n");
+        for left in &c.left_bindings {
+            out.push_str(&format!("  {}: {}\n", left.declared_name, left.reason));
+        }
+    }
+    out.push_str(&format!("studio: {studio_url}\n"));
+    out
 }
 
 /// A publish that landed: the playbook is registered already, and the draft stays the place to
@@ -988,6 +1051,48 @@ pub fn playbook_caps(caps: &dto::PlaybookCaps) -> String {
     format!(
         "max_cost: ${:.2}\nmax_time: {}\na launch asking for more than either is refused\n",
         caps.max_cost, caps.max_time
+    )
+}
+
+/// `-` for a provider with no price, which the engine prices by the vendor's list price, or at
+/// nothing for a model no vendor sells.
+fn price(p: Option<&dto::ProviderPrice>) -> String {
+    match p {
+        Some(p) => format!(
+            "{}/{}/{}/{}",
+            p.input, p.output, p.cache_read, p.cache_write
+        ),
+        None => "-".to_string(),
+    }
+}
+
+pub fn providers(list: &[dto::Provider]) -> String {
+    if list.is_empty() {
+        return "no providers registered\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|p| {
+            vec![
+                p.id.clone(),
+                p.kind.clone(),
+                p.default_model.clone(),
+                p.harness.clone().unwrap_or_else(|| "-".to_string()),
+                price(p.price.as_ref()),
+                if p.enabled { "yes" } else { "no" }.to_string(),
+                p.owner.clone(),
+            ]
+        })
+        .collect();
+    format!(
+        "{} providers (price: USD per million tokens, input/output/cache read/cache write)\n{}",
+        list.len(),
+        table(
+            &[
+                "ID", "KIND", "MODEL", "HARNESS", "PRICE", "ENABLED", "OWNER"
+            ],
+            &rows
+        )
     )
 }
 
@@ -2233,6 +2338,34 @@ mod tests {
         );
     }
 
+    /// The latest attempt's output is printed under the table, a failing verdict included, and a
+    /// task whose latest attempt emitted nothing gets no line.
+    #[test]
+    fn graph_prints_what_each_tasks_latest_attempt_emitted() {
+        let g: dto::RunGraph = serde_json::from_str(
+            r#"{"plan_version":1,
+              "tasks":[
+                {"name":"build","kind":"command","depends_on":[],"session":"s","needs":"all","required":true},
+                {"name":"verify","kind":"evaluate","depends_on":["build"],"session":"s","needs":"all","required":true}],
+              "results":[
+                {"iter":0,"task":"build","status":"pass","note":"","output":{"image":"old"}},
+                {"iter":1,"task":"build","status":"pass","note":""},
+                {"iter":0,"task":"verify","status":"fail","note":"","output":{"pass":false,"speedup":3.2}},
+                {"iter":1,"task":"verify","status":"pass","note":"","output":{"pass":true,"speedup":7.5}}]}"#,
+        )
+        .expect("parse");
+        let out = graph("r", &g);
+        let block = out.split("\nemitted\n").nth(1).expect("an emitted block");
+        assert_eq!(
+            block, "  verify: {\"pass\":true,\"speedup\":7.5}\n",
+            "{out}"
+        );
+        assert!(
+            !graph("0192run", &run_graph()).contains("emitted"),
+            "nothing emitted, no block"
+        );
+    }
+
     /// A run whose plan never got admitted still deserves a sentence rather than an empty table.
     #[test]
     fn an_empty_graph_says_so() {
@@ -2476,6 +2609,21 @@ mod tests {
         );
         assert!(out.contains("repo: owner/packs @ main\n"), "{out}");
         assert!(out.contains("path: packs/calibrate\n"), "{out}");
+        assert!(
+            !out.contains("variant:"),
+            "the base manifest prints no variant: {out}"
+        );
+        let offline = pack_import(
+            &dto::PackImport {
+                variant: Some("offline".to_string()),
+                ..import()
+            },
+            "https://c.example.com/playbooks/import/0192f4a1",
+        );
+        assert!(
+            offline.contains("path: packs/calibrate\nvariant: offline\nrev: 9f1c2b3\n"),
+            "{offline}"
+        );
         assert!(out.contains("rev: 9f1c2b3\n"), "{out}");
         assert!(out.contains("tree: tree1:aa\n"), "{out}");
         assert!(out.contains("schema: sha256:bb\n"), "{out}");
@@ -2553,6 +2701,32 @@ mod tests {
         assert!(out.contains("schema: sha256:cc\n"), "{out}");
         assert!(
             out.ends_with("studio: https://c/playbooks/drafts/calibrate\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_create_hands_out_the_agent_skill_after_the_studio_link() {
+        let saved: dto::DraftCompile = serde_json::from_str(
+            r#"{"version":1,"saved_by":"wren","saved_at":"2026-08-23T10:00:00Z",
+               "params_schema":null,"schema_digest":"sha256:aa","graph":null,"diagnostics":[]}"#,
+        )
+        .expect("the create fixture parses");
+        let out = draft_created(
+            "haiku",
+            &saved,
+            "https://c/playbooks/drafts/haiku",
+            "https://c/api/playbooks/drafts/skill",
+        );
+        assert!(
+            out.starts_with("created draft haiku at version 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "studio: https://c/playbooks/drafts/haiku\n\
+                 agent skill: https://c/api/playbooks/drafts/skill\n"
+            ),
             "{out}"
         );
     }
@@ -2785,5 +2959,46 @@ mod tests {
             ["owner_repo_7-1720000000", "-", "finished"],
             "{out}"
         );
+    }
+
+    /// The provider table names each registration's price per million tokens, bucket by bucket,
+    /// and a dash for one the engine prices from the vendor's list.
+    #[test]
+    fn providers_show_the_price_per_million_tokens() {
+        let list: Vec<dto::Provider> = serde_json::from_str(
+            r#"[
+              {"id":"selfhosted","display_name":"Self-hosted","kind":"custom","models":[],
+               "default_model":"zai-org/glm-5","harness":"claude","roles":["agent"],
+               "price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6},
+               "enabled":true,"owner":"platform","created_by":"wren",
+               "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
+               "actions":[]},
+              {"id":"plat-openai","display_name":"OpenAI","kind":"openai","models":[],
+               "default_model":"gpt-5.6-luna","harness":"codex","roles":["agent"],
+               "price":null,"enabled":false,"owner":"platform","created_by":"wren",
+               "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
+               "actions":[]}
+            ]"#,
+        )
+        .expect("wire shape");
+        let out = providers(&list);
+        assert!(out.starts_with("2 providers"), "{out}");
+        assert!(out.contains("PRICE"), "{out}");
+        let rows: Vec<&str> = out.lines().collect();
+        let row = rows
+            .iter()
+            .find(|l| l.starts_with("selfhosted"))
+            .expect("row");
+        assert!(row.contains("0.6/2.2/0.11/0.6"), "{row}");
+        assert!(row.contains("yes"), "{row}");
+        let openai = rows
+            .iter()
+            .find(|l| l.starts_with("plat-openai"))
+            .expect("row");
+        assert!(
+            openai.contains("  -  ") && openai.contains("no"),
+            "{openai}"
+        );
+        assert_eq!(providers(&[]), "no providers registered\n");
     }
 }

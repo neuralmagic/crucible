@@ -5,7 +5,9 @@ import {
   canRegister,
   compileBody,
   graphAwaitsValues,
+  importOptions,
   matchExistingPlaybook,
+  optionKey,
   previewOf,
   proposeBody,
   withCandidates,
@@ -119,19 +121,35 @@ describe('the import source step', () => {
     const listed = withCandidates(withSource(SOURCE), {
       rev: 'a'.repeat(40),
       candidates: [
-        { path: 'packs/survey', workflow_file: 'workflow.star' },
-        { path: 'packs/audit', workflow_file: 'workflow.star' },
+        { path: 'packs/survey', workflow_file: 'workflow.star', variants: [] },
+        { path: 'packs/audit', workflow_file: 'workflow.star', variants: [] },
       ],
     });
     expect(listed.selected).toBeNull();
-    expect(withSelection(listed, 'packs/survey').selected).toBe('packs/survey');
+    const [survey] = importOptions(listed.candidates ?? []);
+    if (survey === undefined) throw new Error('an option');
+    expect(withSelection(listed, optionKey(survey)).selected).toBe(optionKey(survey));
+  });
+
+  it('offers each pack as its base manifest and as every variant it declares', () => {
+    const options = importOptions([
+      { path: 'packs/survey', workflow_file: 'workflow.star', variants: ['e2e', 'offline'] },
+      { path: '', workflow_file: 'flow.star', variants: [] },
+    ]);
+    expect(options).toEqual([
+      { path: 'packs/survey', workflowFile: 'workflow.star', variant: null },
+      { path: 'packs/survey', workflowFile: 'workflow.star', variant: 'e2e' },
+      { path: 'packs/survey', workflowFile: 'workflow.star', variant: 'offline' },
+      { path: '', workflowFile: 'flow.star', variant: null },
+    ]);
+    expect(new Set(options.map(optionKey)).size).toBe(options.length);
   });
 
   /// A listing from another repo says nothing about this one, so editing the source drops it.
   it('drops the listing when the source changes', () => {
     const listed = withCandidates(withSource(SOURCE), {
       rev: 'a'.repeat(40),
-      candidates: [{ path: 'packs/survey', workflow_file: 'workflow.star' }],
+      candidates: [{ path: 'packs/survey', workflow_file: 'workflow.star', variants: [] }],
     });
     const reSourced = withSource({ repo: 'owner/other', gitRef: 'main' });
     expect(listed.candidates).not.toBeNull();
@@ -149,13 +167,18 @@ describe('import request bodies', () => {
     expect(candidatesBody(SOURCE)).toEqual({ repo: 'owner/packs', git_ref: 'main' });
   });
 
-  it('proposes the picked pack directory under the chosen owner and nothing else', () => {
-    expect(proposeBody(SOURCE, 'packs/survey', 'team:llm-d')).toEqual({
+  it('proposes the picked pack directory and variant under the chosen owner and nothing else', () => {
+    const base = { path: 'packs/survey', workflowFile: 'workflow.star', variant: null };
+    expect(proposeBody(SOURCE, base, 'team:llm-d')).toEqual({
       repo: 'owner/packs',
       git_ref: 'main',
       path: 'packs/survey',
       owner: 'team:llm-d',
+      variant: null,
     });
+    expect(proposeBody(SOURCE, { ...base, variant: 'offline' }, 'team:llm-d').variant).toBe(
+      'offline'
+    );
   });
 
   it('drops blank values rather than compiling against empty strings', () => {

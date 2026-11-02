@@ -126,7 +126,12 @@ impl ScheduleStore {
                 }
             }
             CursorSpec::File { from, path } => {
-                let bundle = crate::runs::blob_store::get_run_files(self.db.pool(), run_id).await?;
+                let bundle = crate::runs::blob_store::get_run_bundle(
+                    self.db.pool(),
+                    run_id,
+                    crucible_contract::ArtifactKind::RunFiles,
+                )
+                .await?;
                 let found = match bundle {
                     Some(bundle) => crate::runs::run_files::read_bundle(&bundle, from.as_str())?,
                     None => None,
@@ -1048,6 +1053,49 @@ mod tests {
         Ok(())
     }
 
+    /// A schedule adopts the registration's manifest variant with its tree, so a repin onto
+    /// another variant does not change what the existing recurrence runs.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_schedule_fires_the_variant_it_adopted_before_a_repin(pool: PgPool) -> Result<()> {
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &tree(b"v1")).await;
+        sqlx::query("UPDATE playbooks SET variant = 'offline' WHERE id = 'survey'")
+            .execute(&pool)
+            .await?;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let scheduled = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
+        set_due(&pool, &scheduled.id, Some("2026-08-23T12:00:00Z")).await;
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+        sqlx::query("UPDATE playbooks SET variant = NULL WHERE id = 'survey'")
+            .execute(&pool)
+            .await?;
+
+        let keys = fire_due(
+            &Db::new(pool.clone()),
+            ts("2026-08-23T12:01:00Z"),
+            1,
+            5,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            crate::launches::store::launch_variant(&pool, &keys[0])
+                .await?
+                .map(String::from),
+            Some("offline".to_string())
+        );
+        Ok(())
+    }
+
     /// A launch reports the exposure of the pack it runs. While the registry row still holds the
     /// adopted tree, that is the row's stored exposure. Once a repin moves the row on, every launch
     /// of the old tree, including one fired after the repin, reports the exposure extracted from
@@ -1114,7 +1162,7 @@ mod tests {
         let after = fire("2026-08-23T13:00:00Z", "2026-08-23T13:01:00Z").await;
         let extracted = {
             let pack = crate::playbooks::packs::materialize_tree(&first)?;
-            crate::playbooks::exposure::extract(pack.path(), None)
+            crate::playbooks::exposure::extract(pack.path(), None, None)
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?
         };
         for key in [&before, &after] {
@@ -1316,6 +1364,7 @@ mod tests {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
         assert!(matches!(
@@ -2437,6 +2486,7 @@ mod tests {
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups: None,
+                    rerun: None,
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
@@ -3081,7 +3131,7 @@ mod tests {
         CursorSpec::parse("rollup/STATE.json", None, Some("state/cursor.json")).expect("cursor")
     }
 
-    /// A run-files bundle the way the loop's drop-box POSTs it: one gzipped tar keyed
+    /// A run-files bundle the way a run pod uploads it: one gzipped tar keyed
     /// `<task>/<declared path>`.
     fn run_files(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
@@ -3149,9 +3199,10 @@ mod tests {
         assert_eq!(store.cursor_file(&fired[0]).await?, None);
 
         let body = br#"{"seen": [{"pr": 12345, "head_sha": "ab12"}]}"#;
-        crate::runs::blob_store::put_run_files(
+        crate::runs::blob_store::put_run_bundle(
             &pool,
             "run-1",
+            crucible_contract::ArtifactKind::RunFiles,
             run_files(&[("rollup/STATE.json", body), ("rollup/REPORT.md", b"# hi")]),
         )
         .await?;
@@ -3222,7 +3273,13 @@ mod tests {
         ];
         for (run_id, bundle, expected) in cases {
             if let Some(bundle) = bundle {
-                crate::runs::blob_store::put_run_files(&pool, run_id, bundle).await?;
+                crate::runs::blob_store::put_run_bundle(
+                    &pool,
+                    run_id,
+                    crucible_contract::ArtifactKind::RunFiles,
+                    bundle,
+                )
+                .await?;
             }
             let key = fired.remove(0);
             store

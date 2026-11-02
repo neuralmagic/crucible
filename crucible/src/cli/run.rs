@@ -42,14 +42,15 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     if let Some(Cmd::Check {
         manifest,
         parse_only,
+        variant,
         profile,
         clusters,
     }) = &cli.command
     {
         let mut outcome = if *parse_only {
-            check::run_parse_only(manifest)?
+            check::run_parse_only(manifest, variant.as_ref())?
         } else {
-            check::run(manifest)?
+            check::run(manifest, variant.as_ref())?
         };
         if let Some(profile) = profile {
             // Static wiring always; the live sandbox-SA Secret probe only on a full check.
@@ -101,6 +102,10 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             poll_secs,
             once,
         );
+    }
+
+    if let Some(Cmd::OpenshellGateway) = cli.command {
+        return crate::openshell::gateway::serve();
     }
 
     if let Some(Cmd::Ps { namespace, json }) = cli.command {
@@ -189,8 +194,12 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 }
                 Ok(())
             }
-            crate::cli::PlanAction::Exposure { manifest, pr_repo } => {
-                let m = manifest::Manifest::load_frozen(manifest)?;
+            crate::cli::PlanAction::Exposure {
+                manifest,
+                pr_repo,
+                variant,
+            } => {
+                let m = manifest::Manifest::load_frozen_variant(manifest, variant.as_ref())?;
                 let exposure = crate::exposure::compute(&m, pr_repo.as_deref());
                 println!("{}", serde_json::to_string_pretty(&exposure)?);
                 Ok(())
@@ -214,6 +223,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 harness,
                 model,
                 resume,
+                variant,
+                rerun_of,
+                from,
             } => {
                 let _engine = crate::agent::engine::EngineCtx::new()?;
                 crate::plan::cli::run(
@@ -236,6 +248,15 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                             model: model.clone(),
                         },
                         resume: *resume,
+                        variant: variant.clone(),
+                        rerun: rerun_of.as_ref().map(|parent| crate::plan::cli::Rerun {
+                            parent: parent.clone(),
+                            from: from
+                                .iter()
+                                .cloned()
+                                .map(crucible::plan::ir::TaskName)
+                                .collect(),
+                        }),
                     },
                 )
             }
@@ -319,6 +340,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             harness: args.harness,
             model: args.model.clone(),
             playbook,
+            platform: args.platform.map(Into::into),
         };
         if args.controller {
             // Deprecated in favor of the `crucible-controller` Helm chart (the one packaging path).
@@ -333,9 +355,35 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 deploy::render_controller_cmd(&args.profile, &opts)
             };
         }
-        let manifest = args
-            .manifest
-            .context("--manifest is required unless --controller is set")?;
+        if let Some(cluster) = &args.cluster_link {
+            if apply {
+                return Err(deploy::cluster_link::ClusterLinkError::NoApply.into());
+            }
+            return deploy::render_cluster_link_cmd(
+                &args.profile,
+                args.clusters.as_deref(),
+                cluster,
+                args.issuer.as_deref(),
+            );
+        }
+        if args.kueue {
+            let target = deploy::kueue::KueueTarget {
+                cluster: args.kueue_cluster.as_deref(),
+                issuer: args
+                    .issuer
+                    .as_deref()
+                    .context("--kueue needs --issuer, the controller's agent issuer")?,
+                platform: args.platform.map(Into::into),
+            };
+            return if apply {
+                deploy::apply_kueue_cmd(&args.profile, &opts, &target)
+            } else {
+                deploy::render_kueue_cmd(&args.profile, &opts, &target)
+            };
+        }
+        let manifest = args.manifest.context(
+            "--manifest is required unless --controller, --kueue or --cluster-link is set",
+        )?;
         return if apply {
             deploy::apply_cmd(&manifest, &args.profile, &opts)
         } else {
@@ -408,6 +456,11 @@ fn playbook_launch(args: &crate::cli::DeployArgs) -> Result<Option<deploy::Playb
         max_time,
         max_cost: args.max_cost,
         params: crate::plan::cli::parse_params(&args.params)?,
+        variant: args.variant.clone(),
+        rerun: args.rerun_of.clone().map(|parent| deploy::RerunLaunch {
+            parent,
+            from: args.from.clone(),
+        }),
     }))
 }
 

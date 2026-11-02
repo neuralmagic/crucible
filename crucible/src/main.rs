@@ -52,6 +52,8 @@ use crucible::{deploy, duration, errors, exposure, flow, manifest, outputs, turn
 mod openshell {
     pub use crucible::openshell::{gateway, grpc, policy};
 
+    pub mod agent_servers;
+    pub mod buildit;
     pub mod provider;
     pub mod run;
     pub mod sandbox;
@@ -61,8 +63,8 @@ mod openshell {
 /// compiler, and executor.
 mod plan {
     pub use crucible::plan::{
-        STAGED_INPUTS, TASK_NAME_ENV, exec, history, ir, machine, record, resume, runner, starlark,
-        term_img, workflow, worktree,
+        STAGED_INPUTS, TASK_NAME_ENV, admission, exec, history, ir, machine, record, rerun, resume,
+        runner, starlark, term_img, workflow, worktree,
     };
 
     pub mod cli;

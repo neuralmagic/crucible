@@ -81,14 +81,16 @@ impl CallbackQuery {
 }
 
 /// The post-login destination, refused unless it is a path on this origin. Anything else — an
-/// absolute URL, a protocol-relative `//host`, a backslash the browser normalizes to one — would
-/// make the callback an open redirect.
+/// absolute URL, a protocol-relative `//host`, a backslash the browser normalizes to one, or a tab
+/// or other whitespace the URL parser strips to make one — would make the callback an open
+/// redirect.
 fn safe_redirect(raw: Option<String>) -> String {
     let candidate = raw.unwrap_or_default();
     let ok = candidate.starts_with('/')
         && !candidate.starts_with("//")
-        && !candidate.starts_with("/\\")
-        && !candidate.contains(['\r', '\n']);
+        && !candidate
+            .chars()
+            .any(|c| c == '\\' || c.is_control() || c.is_whitespace());
     if ok { candidate } else { "/".to_string() }
 }
 
@@ -317,6 +319,10 @@ mod tests {
             "issues",
             "",
             "/ok\nLocation: https://evil.example.com",
+            "/\t/evil.example.com",
+            "/\u{b}/evil.example.com",
+            "/ /evil.example.com",
+            "/a\\..\\\\evil.example.com",
         ] {
             assert_eq!(
                 safe_redirect(Some(bad.to_string())),

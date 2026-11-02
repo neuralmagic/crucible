@@ -7,7 +7,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 clap.workspace = true
 flate2 = "1.1.9"
 futures-util = "0.3.32"
@@ -21,7 +21,7 @@ hex = "0.4.3"
 # and for reading overlayfs whiteout xattrs / setting extracted-file ownership (`lgetxattr`, `lchown`).
 # std exposes none of these, and shelling out to `mount`/`chroot` would add a runtime PATH dependency.
 libc = "0.2"
-oci-client = "0.17.0"
+oci-client = "0.18.0"
 # GitHub REST client for the workflow_dispatch build backend (Declarative builds M2): dispatch, run
 # correlation/poll, and the contents-API workflow fetch for introspection. Async + rustls, matching
 # crucible-broker/-controller's feature set (already in the workspace tree).
@@ -42,11 +42,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # Typed Kubernetes client (Rendered deployments): the engine talks to the API server directly — no `kubectl`
 # shell-out. `ws` enables pod exec (the rig-invariant metric check); rustls avoids an OpenSSL build dep.
-kube = { version = "4.0", default-features = false, features = ["client", "rustls-tls", "ws", "jsonpatch", "http-proxy"] }
+kube = { workspace = true, features = ["client", "rustls-tls", "ws", "jsonpatch", "http-proxy"] }
 # `kube::Config::proxy_url` is typed `http::Uri`; the proxy-reachable spoke tier parses its
 # fleet-file `proxy_url` into it. Already transitive via kube/hyper.
 http = "1"
-k8s-openapi = { version = "0.28", features = ["v1_32"] }
+k8s-openapi.workspace = true
 # JSON Patch (RFC 6902) for a targeted array-index replace (a container's `env` list) that a JSON
 # Merge Patch can't express without re-specifying the whole container. Already in the tree via kube-core.
 json-patch = "4.2"
@@ -56,4 +56,4 @@ jiff = "0.2"
 # (aws-lc-rs is, via aws-sdk); we install the aws-lc-rs provider before the first kube client connect.
 rustls = "0.23"
 # The fleet file (`clusters.toml`) and the `[build.<name>]` spec fixtures are TOML.
-toml = "0.8"
+toml = "1.1"

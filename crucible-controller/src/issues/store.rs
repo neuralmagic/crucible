@@ -1679,6 +1679,26 @@ pub(crate) async fn funnel_counts(ex: impl PgExecutor<'_>) -> Result<FunnelCount
     })
 }
 
+/// Record that `actor` (a login) asked for `key`'s next dispatch, so the run it gets is dispatched
+/// for them; [`crate::runs::store::stamp_dispatcher`] consumes it. A name that is not
+/// login-shaped (a service account, a free-text label) clears any earlier request instead, so that
+/// dispatch acts for the run's owner rather than for whoever asked before. Returns whether a person
+/// was recorded.
+pub async fn request_dispatch(ex: impl PgExecutor<'_>, key: &str, actor: &str) -> Result<bool> {
+    let recorded: Option<bool> = sqlx::query_scalar(
+        "UPDATE issues SET dispatch_requested_by =
+             CASE WHEN trim($2) ~ '^[A-Za-z0-9._@-]+$' THEN 'user:' || lower(trim($2)) END
+          WHERE key = $1
+          RETURNING dispatch_requested_by IS NOT NULL",
+    )
+    .bind(key)
+    .bind(actor)
+    .fetch_optional(ex)
+    .await
+    .context("recording who asked for a dispatch")?;
+    Ok(recorded.unwrap_or(false))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -2051,6 +2071,7 @@ pub(crate) mod tests {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-2";
         assert!(matches!(
@@ -2178,6 +2199,7 @@ pub(crate) mod tests {
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups: None,
+                    rerun: None,
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )

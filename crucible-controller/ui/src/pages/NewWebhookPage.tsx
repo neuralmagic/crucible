@@ -138,6 +138,19 @@ function ParamRow({ spec, choice, onChange, error, diagnostics, completions }: P
           />
           <FieldNote error={error} />
         </>
+      ) : spec.multiline ? (
+        <TextAreaField
+          id={`value-${spec.name}`}
+          label="Value"
+          mono
+          rows={8}
+          value={choice.value}
+          onChange={(value) => {
+            onChange({ ...choice, value });
+          }}
+          placeholder={spec.defaultValue ?? ''}
+          error={error}
+        />
       ) : (
         <TextField
           id={`value-${spec.name}`}

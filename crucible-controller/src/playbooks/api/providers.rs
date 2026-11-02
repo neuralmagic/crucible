@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use utoipa::ToSchema;
 
+use crucible_contract::inference::{TokenPrice, UsdPerMtok};
+
 dto! {
     // --- what a launch picker reads (any authenticated caller) --------------------
 
@@ -41,6 +43,9 @@ dto! {
         pub endpoint: Option<String> = p.endpoint.as_ref().map(|e| e.url.clone()),
         /// The API a custom provider speaks; null for the other kinds, whose kind says.
         pub protocol: Option<InferenceProtocol> = p.endpoint.as_ref().map(|e| e.protocol),
+        /// What an agent run on this provider is charged per million tokens; null charges the
+        /// vendor's list price, or nothing for a model no vendor sells.
+        pub price: Option<ProviderPriceDto> = p.price.as_ref().map(ProviderPriceDto::from),
         /// `user:<login>` or `team:<slug>`.
         pub owner: String = p.owner.to_string(),
     }
@@ -63,6 +68,46 @@ dto! {
         /// Null takes the fallback provider's own default model.
         pub fallback_model: Option<String>,
     }
+}
+
+/// USD per million tokens for each billed bucket. Set, it prices every agent turn of a run on the
+/// provider and replaces the cost the harness reports.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderPriceDto {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+impl From<&TokenPrice> for ProviderPriceDto {
+    fn from(price: &TokenPrice) -> Self {
+        ProviderPriceDto {
+            input: price.input.get(),
+            output: price.output.get(),
+            cache_read: price.cache_read.get(),
+            cache_write: price.cache_write.get(),
+        }
+    }
+}
+
+/// Check a registration's price: every rate a finite, non-negative number.
+fn check_price(price: &ProviderPriceDto) -> Result<TokenPrice, String> {
+    let rate = |field: &str, usd: f64| {
+        UsdPerMtok::new(usd).map_err(|_| {
+            format!(
+                "price.{field} must be a finite, non-negative number of USD per million tokens, \
+                 not {usd}"
+            )
+        })
+    };
+    Ok(TokenPrice {
+        input: rate("input", price.input)?,
+        output: rate("output", price.output)?,
+        cache_read: rate("cache_read", price.cache_read)?,
+        cache_write: rate("cache_write", price.cache_write)?,
+    })
 }
 
 /// What the launch forms render their provider/model pickers from: the providers a launch may
@@ -198,6 +243,9 @@ dto! {
         pub endpoint: Option<String> = p.endpoint.as_ref().map(|e| e.url.clone()),
         /// The API a custom provider speaks; null for the other kinds.
         pub protocol: Option<InferenceProtocol> = p.endpoint.as_ref().map(|e| e.protocol),
+        /// What an agent run on this provider is charged per million tokens; null charges the
+        /// vendor's list price, or nothing for a model no vendor sells.
+        pub price: Option<ProviderPriceDto> = p.price.as_ref().map(ProviderPriceDto::from),
         pub enabled: bool,
         pub owner: String = p.owner.to_string(),
         pub created_by: String,
@@ -270,6 +318,10 @@ pub(crate) struct ProviderBody {
     /// opencode for chat_completions.
     #[serde(default)]
     harness: Option<String>,
+    /// What the provider's agent tokens cost. Absent charges the vendor's list price, or nothing
+    /// for a model no vendor sells. Refused on a provider that serves no agent.
+    #[serde(default)]
+    price: Option<ProviderPriceDto>,
     #[serde(default = "enabled_by_default")]
     enabled: bool,
 }
@@ -323,6 +375,7 @@ struct CheckedProvider {
     secret: Option<ProviderSecretRef>,
     endpoint: Option<Endpoint>,
     harness: Option<crucible::manifest::Harness>,
+    price: Option<TokenPrice>,
     enabled: bool,
 }
 
@@ -435,6 +488,22 @@ async fn check_provider(
         Ok(harness) => harness,
         Err(msg) => return Ok(Err(msg)),
     };
+    let price = match body.price.as_ref().map(check_price).transpose() {
+        Ok(price) => price,
+        Err(msg) => return Ok(Err(msg)),
+    };
+    if price.is_some()
+        && crate::playbooks::providers::allowed_harnesses(
+            body.kind,
+            endpoint.as_ref().map(|e| e.protocol),
+        )
+        .is_empty()
+    {
+        return Ok(Err(format!(
+            "price: a {} provider serves route decisions, not agents, so it takes no price",
+            body.kind.as_str()
+        )));
+    }
     let secret = match body.secret_name.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(raw) => {
@@ -461,6 +530,7 @@ async fn check_provider(
         secret,
         endpoint,
         harness,
+        price,
         enabled: body.enabled,
     }))
 }
@@ -527,6 +597,7 @@ async fn check_provider_secret(
         secret: None,
         endpoint: endpoint.cloned(),
         harness: None,
+        price: None,
         enabled: true,
         created_by: String::new(),
         created_at: String::new(),
@@ -571,6 +642,7 @@ fn new_provider<'a>(
         secret: checked.secret.as_ref(),
         endpoint: checked.endpoint.as_ref(),
         harness: checked.harness,
+        price: checked.price,
         enabled: checked.enabled,
         created_by: actor,
         owner,
@@ -1353,6 +1425,22 @@ pub(crate) async fn require_agent_pin(
 #[cfg(test)]
 mod tests {
     use crate::playbooks::api::providers::*;
+
+    #[test]
+    fn a_price_rate_is_finite_and_not_negative() {
+        let price = |input| ProviderPriceDto {
+            input,
+            output: 2.2,
+            cache_read: 0.11,
+            cache_write: 0.6,
+        };
+        let ok = check_price(&price(0.0)).expect("free input");
+        assert_eq!(ok.output.get(), 2.2);
+        for bad in [-0.01, f64::NAN, f64::INFINITY] {
+            let err = check_price(&price(bad)).expect_err("a bad rate");
+            assert!(err.starts_with("price.input must be"), "{bad}: {err}");
+        }
+    }
 
     #[test]
     fn a_provider_slug_stays_in_the_url_vocabulary() {

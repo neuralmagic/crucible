@@ -293,6 +293,9 @@ pub struct TaskResult {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub secs: Option<f64>,
+    /// What the attempt emitted: a passing attempt's product, or the record a failing one left.
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
 }
 
 /// `GET /api/version`: which build is answering.
@@ -546,6 +549,9 @@ pub struct PackImport {
     pub git_ref: Option<String>,
     #[serde(default)]
     pub path: String,
+    /// The manifest variant the preview read; absent for the base manifest.
+    #[serde(default)]
+    pub variant: Option<String>,
     pub rev: String,
     /// The frozen pack's `tree1:` digest. `tar_digest` is the name a controller from before tree
     /// storage sends.
@@ -686,6 +692,33 @@ pub struct PublishAck {
     pub exposure_changed: bool,
 }
 
+/// `POST /api/playbook-drafts/{id}/rename`: the new id, and how much followed it there.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftRenamed {
+    pub id: String,
+    pub prior: String,
+    pub bindings: i64,
+    pub shares: i64,
+    pub standing_launches: i64,
+    pub launches: i64,
+}
+
+/// `POST /api/playbook-drafts/{id}/clone`: the copy, the bindings it took, and the ones it left.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftCloned {
+    pub id: String,
+    pub version: i64,
+    pub bindings: Vec<SecretBinding>,
+    pub left_bindings: Vec<LeftBinding>,
+}
+
+/// A binding a clone did not copy, by the name the pack declares it under.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeftBinding {
+    pub declared_name: String,
+    pub reason: String,
+}
+
 /// `POST /api/playbook-drafts/{id}/graduate`: the export PR the draft was pushed to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraduateAck {
@@ -710,6 +743,33 @@ pub struct StaleBase {
 pub struct PlaybookCaps {
     pub max_cost: f64,
     pub max_time: String,
+}
+
+/// An inference provider registration as the admin list returns it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Provider {
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub price: Option<ProviderPrice>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub owner: String,
+}
+
+/// USD per million tokens for each billed bucket.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ProviderPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
 }
 
 /// A registry secret's metadata. The value never leaves the controller.

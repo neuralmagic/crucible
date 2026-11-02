@@ -1,0 +1,34 @@
+#:schema ../schema/work.schema.json
+
+[govctl]
+id = "WI-2026-10-28-001"
+title = "Keep playbook retries and large final reviews executable"
+status = "done"
+created = "2026-10-28"
+started = "2026-10-28"
+completed = "2026-10-28"
+
+[content]
+description = "Enforce [[RFC-0002:C-PLAYBOOK-RERUN]] before dispatching a pod-backed rerun. Refuse a missing stored Git checkpoint by name, pass large task results through a complete read-only file under [[RFC-0002:C-SETTLED-JOIN]], and apply the manifest's carried-output exclusions when preparing a playbook runner so declared captured archives do not inflate Git-memory patches."
+
+notes = ["All 392 CLI tests passed serially with 3 ignored; all seven real PostgreSQL rerun tests passed; strict all-target all-feature workspace Clippy passed. Large-input tests verify complete read-only data, symlink refusal, and a real command agent backend reading 180000 bytes with a prompt below 4 KiB."]
+
+[[content.acceptance_criteria]]
+text = "A pod rerun with absent Git memory is refused during preview and launch admission; retained parents remain admissible"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "Playbook Git snapshots exclude untracked carried artifacts while retaining code changes and the artifact files"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "Large settled task inputs remain complete in a confined read-only JSON file while the agent prompt remains bounded and history keeps its external-input boundary"
+status = "done"
+category = "fixed"
+
+[[content.acceptance_criteria]]
+text = "A terminal failed agent result is visible even without a separate error event"
+status = "done"
+category = "fixed"

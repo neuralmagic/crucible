@@ -25,6 +25,7 @@ use anyhow::{Context, Result, bail};
 use crucible::manifest::Harness;
 use crucible_contract::inference::{
     EnvName, InferenceBinding, InferenceProtocol as WireProtocol, InferenceRole, ResolvedInference,
+    TokenPrice, UsdPerMtok,
 };
 use sqlx::{PgExecutor, PgPool, Row};
 
@@ -401,6 +402,8 @@ pub struct ModelProvider {
     /// The harness the registration named, one of [`allowed_harnesses`] for its kind and protocol;
     /// `None` runs the default for them.
     pub harness: Option<Harness>,
+    /// What this provider's agent tokens cost; `None` leaves pricing to the engine's vendor table.
+    pub price: Option<TokenPrice>,
     /// A disabled provider may not be chosen at launch, but a launch that already pinned it still
     /// resolves: turning a provider off must not strand the work already committed to it.
     pub enabled: bool,
@@ -461,7 +464,8 @@ impl ModelProvider {
     }
 
     /// This provider as the engine's binding for `role`, asking `model`. A provider that spends a
-    /// secret names the role's key variable; one that does not authenticates ambiently.
+    /// secret names the role's key variable; one that does not authenticates ambiently. Only the
+    /// agent binding carries the price.
     pub fn binding(&self, role: ModelRole, model: &str) -> Result<InferenceBinding> {
         let Some(protocol) = self.protocol_for(role) else {
             bail!(
@@ -480,6 +484,10 @@ impl ModelProvider {
             url: self.endpoint.as_ref().map(|e| e.url.clone()),
             model: model.to_owned(),
             key_env,
+            price: match role {
+                ModelRole::Agent => self.price,
+                ModelRole::Decision => None,
+            },
         })
     }
 
@@ -510,6 +518,8 @@ pub struct NewProvider<'a> {
     /// The harness to run under, one of [`allowed_harnesses`] for the kind and protocol; `None`
     /// takes their default.
     pub harness: Option<Harness>,
+    /// Refused on a provider that serves no agent.
+    pub price: Option<TokenPrice>,
     pub enabled: bool,
     pub created_by: &'a str,
     pub owner: crate::authz::model::Principal,
@@ -652,8 +662,32 @@ impl From<ResolvedModel> for ResolvedDispatch {
 }
 
 const PROVIDER_COLS: &str = "id, display_name, kind, models, default_model, secret_name, \
-     secret_owner, endpoint, protocol, harness, enabled, owner, created_by, created_at, \
-     updated_at";
+     secret_owner, endpoint, protocol, harness, price_input, price_output, price_cache_read, \
+     price_cache_write, enabled, owner, created_by, created_at, updated_at";
+
+fn price_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<TokenPrice>> {
+    let cols: [Option<f64>; 4] = [
+        row.try_get("price_input")?,
+        row.try_get("price_output")?,
+        row.try_get("price_cache_read")?,
+        row.try_get("price_cache_write")?,
+    ];
+    match cols {
+        [None, None, None, None] => Ok(None),
+        [
+            Some(input),
+            Some(output),
+            Some(cache_read),
+            Some(cache_write),
+        ] => Ok(Some(TokenPrice {
+            input: UsdPerMtok::new(input)?,
+            output: UsdPerMtok::new(output)?,
+            cache_read: UsdPerMtok::new(cache_read)?,
+            cache_write: UsdPerMtok::new(cache_write)?,
+        })),
+        partial => bail!("provider row carries a partial price {partial:?}"),
+    }
+}
 
 fn provider_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelProvider> {
     let kind: String = row.try_get("kind")?;
@@ -697,6 +731,7 @@ fn provider_from_row(row: &sqlx::postgres::PgRow) -> Result<ModelProvider> {
         secret,
         endpoint,
         harness,
+        price: price_from_row(row)?,
         enabled: row.try_get("enabled")?,
         owner: crate::authz::model::Principal::parse(&row.try_get::<String, _>("owner")?)?,
         created_by: row.try_get("created_by")?,
@@ -730,6 +765,7 @@ struct ProviderBinds {
     endpoint: Option<String>,
     protocol: Option<&'static str>,
     harness: Option<&'static str>,
+    price: [Option<f64>; 4],
 }
 
 fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
@@ -776,6 +812,13 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
             harness_list(allowed_harnesses(new.kind, protocol))
         );
     }
+    if new.price.is_some() && allowed_harnesses(new.kind, protocol).is_empty() {
+        bail!(
+            "a {} provider{} serves no agent, so it takes no price",
+            new.kind.as_str(),
+            protocol.map_or(String::new(), |p| format!(" speaking {}", p.as_str())),
+        );
+    }
     Ok(ProviderBinds {
         models,
         default_model,
@@ -784,6 +827,15 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
         endpoint: new.endpoint.map(|e| e.url.clone()),
         protocol: protocol.map(|p| p.as_str()),
         harness: new.harness.map(harness_name),
+        price: match new.price {
+            None => [None; 4],
+            Some(p) => [
+                Some(p.input.get()),
+                Some(p.output.get()),
+                Some(p.cache_read.get()),
+                Some(p.cache_write.get()),
+            ],
+        },
     })
 }
 
@@ -797,8 +849,9 @@ pub fn harness_list(harnesses: &[Harness]) -> String {
 }
 
 const PROVIDER_INSERT: &str = "INSERT INTO model_providers (id, display_name, kind, models, default_model, secret_name, \
-     secret_owner, endpoint, protocol, enabled, created_by, created_at, updated_at, owner, harness) \
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14)";
+     secret_owner, endpoint, protocol, enabled, created_by, created_at, updated_at, owner, harness, \
+     price_input, price_output, price_cache_read, price_cache_write) \
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12, $13, $14, $15, $16, $17, $18)";
 
 const PROVIDER_INSERT_OR_IGNORE: &str =
     const_format::concatcp!(PROVIDER_INSERT, " ON CONFLICT (id) DO NOTHING");
@@ -810,6 +863,9 @@ const PROVIDER_UPSERT: &str = const_format::concatcp!(
          default_model = EXCLUDED.default_model, secret_name = EXCLUDED.secret_name, \
          secret_owner = EXCLUDED.secret_owner, endpoint = EXCLUDED.endpoint, \
          protocol = EXCLUDED.protocol, harness = EXCLUDED.harness, \
+         price_input = EXCLUDED.price_input, price_output = EXCLUDED.price_output, \
+         price_cache_read = EXCLUDED.price_cache_read, \
+         price_cache_write = EXCLUDED.price_cache_write, \
          enabled = EXCLUDED.enabled, updated_at = EXCLUDED.updated_at"
 );
 
@@ -835,6 +891,10 @@ async fn write_provider(
         .bind(crate::clock::now_rfc3339())
         .bind(new.owner.to_string())
         .bind(binds.harness)
+        .bind(binds.price[0])
+        .bind(binds.price[1])
+        .bind(binds.price[2])
+        .bind(binds.price[3])
         .execute(ex)
         .await
         .context(context)?;
@@ -1454,6 +1514,7 @@ mod tests {
             harness,
             enabled: true,
             created_by: "alice",
+            price: None,
         };
         assert_eq!(
             provider_binds(&new(Some(Harness::Pi))).expect("pi").harness,
@@ -1493,6 +1554,7 @@ mod tests {
                     harness,
                     enabled: true,
                     created_by: "alice",
+                    price: None,
                 },
             )
             .await?;
@@ -1508,6 +1570,7 @@ mod tests {
                 url: Some("https://inference.example.com/llm/qwen/v1".to_string()),
                 model: "qwen-3-8-27b".to_string(),
                 key_env: None,
+                price: None,
             }
         );
         let pinned = get(&pool, "bay-pi").await?.expect("the row");
@@ -1553,6 +1616,7 @@ mod tests {
                 harness: None,
                 enabled: true,
                 created_by: "alice",
+                price: None,
             },
         )
         .await?;
@@ -1568,6 +1632,7 @@ mod tests {
                 url: Some("http://vllm.internal:8000/v1".to_string()),
                 model: "gpt-oss-120b".to_string(),
                 key_env: None,
+                price: None,
             }
         );
         assert!(stored.binding(ModelRole::Decision, "gpt-oss-120b").is_err());
@@ -1599,6 +1664,7 @@ mod tests {
                 harness: None,
                 enabled: true,
                 created_by: "alice",
+                price: None,
             },
         )
         .await
@@ -1621,6 +1687,7 @@ mod tests {
                 harness: None,
                 enabled: true,
                 created_by: "alice",
+                price: None,
             },
         )
         .await
@@ -1645,6 +1712,7 @@ mod tests {
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         }
     }
 
@@ -1666,6 +1734,7 @@ mod tests {
             created_by: String::new(),
             created_at: String::new(),
             updated_at: String::new(),
+            price: None,
         }
     }
 
@@ -1734,6 +1803,7 @@ mod tests {
                 url: None,
                 model: "gpt-6-luna".to_string(),
                 key_env: Some(EnvName::new("CRUCIBLE_INFERENCE_KEY_DECISION")?),
+                price: None,
             }
         );
         let ambient = registered(ProviderKind::Vertex, None, false);
@@ -2673,5 +2743,147 @@ mod tests {
         );
         assert_eq!(DispatchOverride::from_columns(None, Some("m")), None);
         assert_eq!(DispatchOverride::from_columns(Some("  "), None), None);
+    }
+
+    fn glm_price() -> TokenPrice {
+        let usd = |v| UsdPerMtok::new(v).expect("a price");
+        TokenPrice {
+            input: usd(0.6),
+            output: usd(2.2),
+            cache_read: usd(0.11),
+            cache_write: usd(0.6),
+        }
+    }
+
+    fn selfhosted(endpoint: &Endpoint, price: Option<TokenPrice>) -> NewProvider<'_> {
+        NewProvider {
+            owner: crate::authz::model::Principal::platform(),
+            id: "selfhosted",
+            display_name: "Self-hosted",
+            kind: ProviderKind::Custom,
+            models: &[],
+            default_model: Some("zai-org/glm-5"),
+            secret: None,
+            endpoint: Some(endpoint),
+            harness: None,
+            enabled: true,
+            created_by: "alice",
+            price,
+        }
+    }
+
+    /// A price round-trips the registry, is replaced or cleared by a re-registration, and rides
+    /// the agent binding a dispatch to the provider renders.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_provider_price_is_stored_and_rendered_into_its_agent_binding(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let endpoint = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        upsert(&pool, &selfhosted(&endpoint, Some(glm_price()))).await?;
+        let stored = get(&pool, "selfhosted").await?.expect("the row");
+        assert_eq!(stored.price, Some(glm_price()));
+
+        let resolved = resolve_dispatch(
+            &pool,
+            Some(DispatchOverride {
+                provider_id: "selfhosted",
+                model: None,
+            }),
+            None,
+            WorkloadClass::Playbook,
+        )
+        .await?
+        .expect("the pinned provider");
+        let document = inference_document(&[resolved.inference()])?;
+        let agent = document
+            .binding(InferenceRole::Agent)
+            .expect("the agent binding");
+        assert_eq!(agent.model, "zai-org/glm-5");
+        assert_eq!(agent.price, Some(glm_price()));
+
+        upsert(&pool, &selfhosted(&endpoint, None)).await?;
+        let cleared = get(&pool, "selfhosted").await?.expect("the row");
+        assert_eq!(cleared.price, None);
+        assert_eq!(cleared.binding(ModelRole::Agent, "m")?.price, None);
+        Ok(())
+    }
+
+    /// The table refuses a partial or negative price even from a writer that skipped the API.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_table_refuses_a_partial_or_negative_price(pool: PgPool) -> anyhow::Result<()> {
+        let endpoint = Endpoint {
+            url: "https://selfhosted.example/v1".to_string(),
+            protocol: InferenceProtocol::Messages,
+        };
+        upsert(&pool, &selfhosted(&endpoint, None)).await?;
+        for sql in [
+            "UPDATE model_providers SET price_input = 1 WHERE id = 'selfhosted'",
+            "UPDATE model_providers SET price_input = -1, price_output = 1, \
+             price_cache_read = 1, price_cache_write = 1 WHERE id = 'selfhosted'",
+            "UPDATE model_providers SET price_input = 'NaN', price_output = 1, \
+             price_cache_read = 1, price_cache_write = 1 WHERE id = 'selfhosted'",
+            "UPDATE model_providers SET price_input = 'Infinity', price_output = 1, \
+             price_cache_read = 1, price_cache_write = 1 WHERE id = 'selfhosted'",
+        ] {
+            let refused = sqlx::query(sql).execute(&pool).await;
+            assert!(refused.is_err(), "{sql}");
+        }
+        Ok(())
+    }
+
+    /// A decision binding is never priced, and a provider that serves only decisions refuses one.
+    #[test]
+    fn only_the_agent_binding_carries_the_price() {
+        let decide = Endpoint {
+            url: "http://dgemma.internal:8011/v1/systemone".to_string(),
+            protocol: InferenceProtocol::SystemOne,
+        };
+        let err = match provider_binds(&selfhosted(&decide, Some(glm_price()))) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a decision-only provider took a price"),
+        };
+        assert!(err.contains("takes no price"), "{err}");
+
+        let mut openai = ModelProvider {
+            id: "plat-openai".to_string(),
+            display_name: "OpenAI".to_string(),
+            kind: ProviderKind::OpenAi,
+            models: Vec::new(),
+            default_model: "gpt-5.6-luna".to_string(),
+            secret: None,
+            endpoint: None,
+            harness: None,
+            price: Some(glm_price()),
+            enabled: true,
+            owner: crate::authz::model::Principal::platform(),
+            created_by: "alice".to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        };
+        assert_eq!(
+            openai
+                .binding(ModelRole::Agent, "gpt-5.6-luna")
+                .expect("agent")
+                .price,
+            Some(glm_price())
+        );
+        assert_eq!(
+            openai
+                .binding(ModelRole::Decision, "gpt-6-luna")
+                .expect("decision")
+                .price,
+            None
+        );
+        openai.price = None;
+        assert_eq!(
+            openai
+                .binding(ModelRole::Agent, "gpt-5.6-luna")
+                .expect("agent")
+                .price,
+            None
+        );
     }
 }

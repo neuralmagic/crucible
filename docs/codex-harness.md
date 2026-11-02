@@ -1,8 +1,8 @@
 # The codex harness
 
-`crucible --harness codex` (or `[agent].harness = "codex"`) runs the turn with OpenAI's Codex CLI
-instead of Claude Code. Everything downstream of the decoder is unchanged: the turn still emits
-`AgentEvent` NDJSON, and keep/discard still reads the same `Result`.
+`crucible --harness codex` (or `[agent].harness = "codex"`) runs the turn with the OpenAI Codex
+CLI instead of Claude Code. Everything after the decoder is the same. The turn emits
+`AgentEvent` NDJSON, and keep/discard reads the same `Result`.
 
 ```toml
 [agent]
@@ -17,31 +17,34 @@ auth = "api"
 api_key = "WORK"
 ```
 
-What differs from a claude turn:
+Differences from a claude turn:
 
-- **No session resume.** `codex exec resume` is not wired; a logical session's second turn errors
-  rather than silently starting fresh.
-- **No OTEL.** `codex exec` exports no metrics, so cost is the pricing-table estimate over the
-  token usage the live `--json` stream reports, not an `otel_summary`.
-- **Egress.** The codex arm adds `chatgpt.com`, `auth.openai.com`, `api.openai.com`, and
-  `ab.chatgpt.com` to the sandbox allowlist. Those hosts are per-harness: a claude turn's
-  allowlist is byte-identical to what it was before codex existed.
+- **No session resume.** Crucible does not use `codex exec resume`. The second turn of a
+  logical session fails. It does not start a new session.
+- **No OTEL.** `codex exec` exports no metrics. The cost is an estimate from the pricing table
+  and the token usage in the live `--json` stream, not an `otel_summary`.
+- **Egress.** Codex adds `chatgpt.com`, `auth.openai.com`, `api.openai.com`, and
+  `ab.chatgpt.com` to the sandbox allowlist. These hosts apply only to codex turns. The
+  allowlist of a claude turn does not change.
 
 ## Auth selection
 
-Crucible supports both Codex login methods. `[agent.codex].auth` controls selection:
+Crucible supports both Codex login methods. `[agent.codex].auth` selects the method:
 
-- `auto` (default) uses the selected non-empty API key and otherwise falls back to ChatGPT OAuth.
-- `api` requires the selected API key and never silently falls back.
-- `chatgpt` uses the OAuth flow even when API keys are present.
+- `auto` (default) uses the selected API key if it is not empty. If it is empty, it uses
+  ChatGPT OAuth.
+- `api` requires the selected API key. It does not use OAuth.
+- `chatgpt` uses the OAuth flow, also when API keys are present.
 
-`[agent.codex].api_key` names one of the deployment's OpenAI keys (uppercase letters, digits, and
-underscore); unset selects the unnamed default. The manifest names a key, never the variable
-carrying it: the host resolves `api_key = "WORK"` to `OPENAI_API_KEY_WORK` and an unset `api_key`
-to `OPENAI_API_KEY`, so a manifest cannot reach any other host credential, and an openshell
-provider that can deliver the key later replaces the resolution without a manifest change.
+`[agent.codex].api_key` names one of the OpenAI keys of the deployment (uppercase letters,
+digits, and underscore). If it is not set, the unnamed default key is used. The manifest
+names a key, not the variable that holds it. The host resolves `api_key = "WORK"` to
+`OPENAI_API_KEY_WORK`, and an unset `api_key` to `OPENAI_API_KEY`. A manifest cannot reach
+other host credentials. An openshell provider that can deliver the key can later replace this
+resolution, and the manifest does not change.
 
-A Kubernetes deploy profile injects independently rotatable keys under those names:
+A Kubernetes deploy profile supplies keys under those names. You can rotate each key
+separately:
 
 ```toml
 [[secret_env]]
@@ -55,55 +58,56 @@ secret = "crucible-openai-personal"
 key = "OPENAI_API_KEY"
 ```
 
-Switch `api_key` in the manifest (or select a deployment profile carrying that manifest) to
-choose a key for newly created turns. Use dedicated project-scoped keys and rotate their
-Kubernetes Secrets independently. The selected key is not exported into the sandbox environment,
+To select a key for new turns, change `api_key` in the manifest, or select a deployment
+profile with that manifest. Use dedicated project-scoped keys, and rotate their Kubernetes
+Secrets separately. The engine does not export the selected key into the sandbox environment,
 but Codex can read it from its seeded auth file.
 
 ## ChatGPT OAuth: `CODEX_CREDENTIALS` and the single-refresher rule
 
-Codex authenticates against the ChatGPT backend with a personal subscription, not Vertex. The
-credential is an OAuth pair produced by `codex login` on a host with a browser, stored at
-`~/.codex/auth.json`.
+Codex authenticates to the ChatGPT backend with a personal subscription, not Vertex. The
+credential is an OAuth pair that `codex login` creates on a host with a browser. It is stored
+at `~/.codex/auth.json`.
 
 Setup:
 
-1. `codex login` on your machine, then confirm `~/.codex/auth.json` exists.
-2. Ship its **verbatim contents** to the loop process as the `CODEX_CREDENTIALS` env var. In
-   cluster that is a `secretKeyRef`, exactly how `GCLOUD_CREDENTIALS` is delivered:
+1. Run `codex login` on your machine. Then make sure that `~/.codex/auth.json` exists.
+2. Give its **exact contents** to the loop process as the `CODEX_CREDENTIALS` environment
+   variable. In a cluster, use a `secretKeyRef`, as for `GCLOUD_CREDENTIALS`:
 
    ```sh
    oc create secret generic codex-auth \
      --from-file=auth.json="$HOME/.codex/auth.json"
    ```
 
-3. Reference it from the deploy profile's `[[secret_env]]`.
+3. Reference it from the `[[secret_env]]` of the deploy profile.
 
-At the top of every turn the loop process performs the OAuth `refresh_token` grant against
-`https://auth.openai.com/oauth/token` and seeds the result into the sandbox as
-`$CODEX_HOME/auth.json`: access token, account id, id token, and a placeholder refresh token.
-Provider-delivered env cannot carry it, because the sandbox sees only an `openshell:resolve:env:`
-placeholder that the L7 egress proxy would have to resolve, and codex reaches the backend over a
-WebSocket through an L4 tunnel. All four `tokens` fields have to be present, or codex drops the
-object and runs unauthenticated into a 401 loop.
+At the start of each turn, the loop process does the OAuth `refresh_token` grant against
+`https://auth.openai.com/oauth/token`. It writes the result into the sandbox as
+`$CODEX_HOME/auth.json`: the access token, the account id, the id token, and a placeholder
+refresh token. An environment variable from a provider cannot hold this value. The sandbox
+sees only an `openshell:resolve:env:` placeholder that the L7 egress proxy must resolve, and
+codex connects to the backend over a WebSocket through an L4 tunnel. All four `tokens` fields
+must be present. If one is missing, codex ignores the object, runs without authentication, and
+gets repeated 401 errors.
 
-**The single-refresher rule: the refresh token never leaves the loop process.** Exactly one thing
-performs the grant, so there is no rotation race between the host's copy and a sandbox's copy of
-`auth.json` (OpenAI rotates the refresh token on each grant, and a stale copy is dead). The
-consequence is that a sandbox holds a fixed short-lived access token: the seeded `auth.json` is
-read at exec, so a turn that outlives the access token fails loudly rather than silently
-reauthenticating. That is accepted for now.
+**Single-refresher rule: the refresh token stays in the loop process.** Only the loop process
+does the grant, so the copy of `auth.json` on the host and the copy in a sandbox cannot
+compete for a rotation. OpenAI rotates the refresh token on each grant, and an old copy is no
+longer valid. As a result, a sandbox has a fixed short-lived access token. Codex reads the
+seeded `auth.json` at exec, so if a turn lasts longer than the access token, the turn fails
+with an error. It does not authenticate again.
 
-Each grant's rotated refresh token is persisted to
-`$HOME/.config/crucible/codex-credentials.json`, and that file takes precedence over
-`CODEX_CREDENTIALS` on the next mint. The env secret is seed material for the first mint only:
-the first rotation spends it, so a fresh process with a fresh `$HOME` needs a freshly minted
-secret (re-run `codex login` and replace it as part of any pod restart). Two loop processes must
-never share one credential; each needs its own `codex login`.
+The loop process writes the rotated refresh token of each grant to
+`$HOME/.config/crucible/codex-credentials.json`. On the next grant, that file has priority
+over `CODEX_CREDENTIALS`. The environment secret is used only for the first grant. The first
+rotation makes it invalid, so a new process with a new `$HOME` needs a new secret. Run
+`codex login` again and replace the secret before each pod restart. Two loop processes must
+not share one credential. Each needs its own `codex login`.
 
-Independently, an unused refresh token goes stale after roughly a week. When mints fail the grant
-with `refresh_token_expired`, re-run `codex login` on the host, replace the secret, and delete
-the state file if the process persists a home directory.
+Also, a refresh token that is not used becomes invalid after about one week. If the grant
+fails with `refresh_token_expired`, run `codex login` again on the host, replace the secret,
+and delete the state file if the process keeps a home directory.
 
-In `auto` mode this OAuth machinery remains the fallback when the selected API key is absent or
-empty; `chatgpt` selects it explicitly.
+In `auto` mode, Crucible uses OAuth if the selected API key is absent or empty. `chatgpt`
+selects OAuth explicitly.

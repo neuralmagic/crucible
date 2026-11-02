@@ -12,7 +12,7 @@
 //! The sandbox name is derived per (process, workspace), so parallel wide-round candidates and parallel
 //! crucible processes sharing one gateway never collide on a fixed name.
 
-use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
+use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::{
     AuthProvider, HarnessRuntime, McpServer, SandboxAuth, SandboxLayout, TranscriptLocator,
     TurnArtifacts,
@@ -310,7 +310,8 @@ async fn try_turn(
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
     stage(sink, "starting the openshell gateway");
-    let version_warning = gateway::ensure_running(args.compute_driver)
+    let access = gateway::GatewayAccess::from_env()?;
+    let version_warning = gateway::ensure_running(args.compute_driver, &access)
         .await
         .context("ensuring the openshell gateway is up")?;
     // A degraded version check (rev mismatch, unparseable version) is turn telemetry, not a
@@ -324,7 +325,8 @@ async fn try_turn(
     }
     // The gateway is up, open the typed gRPC client for the rest of the turn (control plane;
     // file transfer stays on the CLI). Constructed in this runtime context (`connect_lazy`).
-    let gw = Gateway::connect().context("connecting to the openshell gateway over gRPC")?;
+    let gw = Gateway::connect(&access.dial()?)
+        .context("connecting to the openshell gateway over gRPC")?;
 
     // 2. Resolve this harness's model credential: Vertex's static credential becomes a gateway
     //    provider the metadata emulator serves to claude/hermes, and to opencode/pi when the
@@ -385,17 +387,41 @@ async fn try_turn(
     //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
     let broker_provider = match args.broker_token.as_deref() {
         Some(token) if args.broker.enabled => {
-            ensure_broker_provider(&gw, token).await?;
+            ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
             true
         }
         _ => false,
     };
 
+    // 2d. The run's MCP servers that take agent tokens: each a token-grant provider whose tokens
+    //     the sandbox's supervisor obtains from the controller and injects on traffic to that
+    //     server alone. One served in this pod is started first.
+    let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
+        .context("reading the run's agent servers")?;
+    agent_servers.check_names(
+        args.broker.enabled.then_some(args.broker.name.as_str()),
+        args.mcp.iter().map(|s| s.key.as_str()),
+    )?;
+    for s in agent_servers.iter() {
+        tokio::task::block_in_place(|| s.start_local())
+            .with_context(|| format!("starting the run's {}", s.server.name))?;
+        ensure_token_grant_provider(
+            &gw,
+            &s.provider_name(),
+            agent_servers.token_grant_profile(s),
+        )
+        .await?;
+    }
+
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
     //    turn killed mid-create, or whose cleanup delete failed, leaves the name behind, and a
     //    bare create then fails "already exists" for the rest of the run. Clearing it makes
     //    create idempotent. Labels make the sandbox discoverable via `list --selector`.
-    let name = sandbox::name_for(&p.workspace);
+    let name = if args.broker.enabled {
+        sandbox::name_for(&p.workspace)
+    } else {
+        sandbox::fresh_name_for(&p.workspace)
+    };
     tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
     let _ = gw.delete_sandbox(&name).await;
@@ -425,16 +451,44 @@ async fn try_turn(
     if broker_provider {
         providers.push(provider::BROKER_PROVIDER_NAME.to_string());
     }
-    gw.create_sandbox(
-        &name,
-        args.sandbox_image.as_deref(),
-        &providers,
-        &labels,
-        &args.openshell.read_only_paths,
-        &args.sandbox_resources,
-    )
-    .await
-    .context("creating the openshell sandbox")?;
+    providers.extend(agent_servers.iter().map(|s| s.provider_name()));
+    let sandbox_id = gw
+        .create_sandbox(
+            &name,
+            args.sandbox_image.as_deref(),
+            &providers,
+            &labels,
+            &args.openshell.read_only_paths,
+            &args.sandbox_resources,
+        )
+        .await
+        .context("creating the openshell sandbox")?;
+
+    // 3a. Bind the sandbox to this run at the controller, which issues the sandbox's agent tokens
+    //     only once it is bound. A failed bind leaves the sandbox without tokens, not the run
+    //     without its turn.
+    let agent_tokens = std::env::var(crucible_contract::sandbox::ENV_AGENT_TOKEN_ENDPOINT).ok();
+    if let Some(target) = binds_sandboxes(
+        agent_tokens.as_deref(),
+        crate::report::sandbox_bind::BindTarget::from_env(),
+    ) && let Err(e) = match sandbox_id {
+        Some(sandbox_id) => {
+            let binding = crucible_contract::sandbox::SandboxBinding {
+                sandbox_id,
+                workdir: Some(SandboxLayout::workdir(&basename)),
+            };
+            crate::report::sandbox_bind::bind_sandbox(&target, &binding).await
+        }
+        None => Err(crate::report::sandbox_bind::BindError::NoSandboxId(
+            name.clone(),
+        )),
+    } {
+        let ev = AgentEvent::Raw {
+            text: format!("sandbox bind failed (its agent token requests will be refused): {e:#}"),
+            stream: RawStream::Stderr,
+        };
+        sink("", RawStream::Stderr, Some(&ev));
+    }
 
     // 3b. Hand the broker this turn's boundary: a fresh token at `<storage>/turn-token`. The
     //     broker's per-turn candidate budget resets when the value changes. Best-effort, on a
@@ -567,6 +621,11 @@ async fn try_turn(
             })
             .into_iter()
             .collect();
+        for ep in agent_servers.iter().map(|s| s.egress_endpoint()) {
+            if !endpoints.contains(&ep) {
+                endpoints.push(ep);
+            }
+        }
         if auth == AuthProvider::Vertex {
             credential_bindings.extend(policy::VERTEX_CREDENTIAL_HOSTS.iter().map(|host| {
                 grpc::EndpointCredentialBinding {
@@ -646,10 +705,15 @@ async fn try_turn(
         //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
         //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
         //     a fresh token naming this sandbox and its workdir.
-        let seed_token = if broker_provider {
-            Some(provider::broker_token_placeholder())
-        } else {
-            args.broker_token.clone()
+        let seed_token = match (
+            broker_provider,
+            broker_placeholder(!agent_servers.is_empty()),
+        ) {
+            (true, BrokerPlaceholder::Issued) => {
+                Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
+            }
+            (true, BrokerPlaceholder::Canonical) => Some(provider::broker_token_placeholder()),
+            (false, _) => args.broker_token.clone(),
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -668,6 +732,11 @@ async fn try_turn(
             name: &s.key,
             url,
             token: Some(token),
+        }));
+        servers.extend(agent_servers.iter().map(|s| McpServer {
+            name: s.server.name.as_str(),
+            url: &s.server.url,
+            token: None,
         }));
         let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
         for seed in &seeds {
@@ -700,7 +769,7 @@ async fn try_turn(
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
-            model: args.model(),
+            pricing: args.pricing(),
             json,
             cancel: &cancel,
         };
@@ -752,17 +821,16 @@ async fn try_turn(
             replay_sandbox_log(&gw, &name, LogReplay::Tail, sink).await;
         }
         let mut cost = exec_result?;
-        spent.raise(cost);
+        spent.raise(cost.total());
 
         // 8a. Agent exited: roll the captured OTLP jsonl up into the `otel_summary` event
-        //     (authoritative cost, per-model usage, API latency). `cost_of`'s prefer-OTEL rule
-        //     lifts the turn's cost onto the authoritative number.
+        //     (authoritative cost, per-model usage, API latency).
         if let Some(c) = &collector
             && let Some(summary) = c.summary()
         {
             let ev = summary.to_event();
-            cost = cost.max(cost_of(&ev).unwrap_or(0.0));
-            spent.raise(cost);
+            cost.observe(&ev);
+            spent.raise(cost.total());
             sink("", RawStream::Stdout, Some(&ev));
         }
 
@@ -788,10 +856,10 @@ async fn try_turn(
         if harness.spec().backfill_required
             || crate::agent::engine::TurnExport::resolve().emits_anything()
         {
-            cost = graft_turn_telemetry(harness, &gw, &name, &cancel, cost, sink).await;
-            spent.raise(cost);
+            graft_turn_telemetry(harness, &gw, &name, &cancel, &mut cost, sink).await;
+            spent.raise(cost.total());
         }
-        Ok(cost)
+        Ok(cost.total())
     }
     .await;
 
@@ -869,49 +937,148 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     gw.ensure_provider_profile(provider::google_cloud_profile())
         .await
         .context("importing the google-cloud provider profile")?;
-    if gw.provider_exists(provider::PROVIDER_NAME).await {
-        gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
+    if !gw.provider_exists(provider::PROVIDER_NAME).await
+        && gw
+            .create_provider(
+                provider::PROVIDER_NAME,
+                provider::CRED_KEY,
+                token,
+                provider::PROVIDER_TYPE,
+                project,
+                region,
+            )
             .await
-            .context("updating the Vertex provider token")
-    } else {
-        gw.create_provider(
-            provider::PROVIDER_NAME,
-            provider::CRED_KEY,
-            token,
-            provider::PROVIDER_TYPE,
-            project,
-            region,
-        )
+            .context("creating the Vertex provider")?
+            == grpc::ProviderCreate::Created
+    {
+        return Ok(());
+    }
+    gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
         .await
-        .context("creating the Vertex provider")
+        .context("updating the Vertex provider token")
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum IssuedPlaceholderError {
+    #[error(
+        "the gateway issued no {key} placeholder to sandbox {sandbox}; an endpoint-bound \
+         credential resolves only through the placeholder issued to the workload"
+    )]
+    Missing { key: &'static str, sandbox: String },
+}
+
+/// The placeholder the gateway issued the sandbox for provider credential `key`. Endpoint-bound
+/// credentials resolve only through this revision-scoped value, never the canonical
+/// `openshell:resolve:env:<key>` form, so seeded configs must carry what the workload was given.
+async fn issued_placeholder(
+    gw: &Gateway,
+    sandbox: &str,
+    key: &'static str,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let command = vec!["printenv".to_string(), key.to_string()];
+    let mut issued: Option<String> = None;
+    gw.exec(sandbox, &command, cancel, |line| {
+        let value = line.trim();
+        if issued.is_none() && value.starts_with(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC)
+        {
+            issued = Some(value.to_string());
+        }
+    })
+    .await
+    .with_context(|| format!("reading the {key} placeholder issued to sandbox {sandbox}"))?;
+    issued.ok_or_else(|| {
+        IssuedPlaceholderError::Missing {
+            key,
+            sandbox: sandbox.to_string(),
+        }
+        .into()
+    })
+}
+
+/// Where to bind this turn's sandbox: the run at the controller, and only when the controller
+/// issues agent tokens (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`), since nothing reads a binding otherwise.
+fn binds_sandboxes(
+    agent_token_endpoint: Option<&str>,
+    target: Option<crate::report::sandbox_bind::BindTarget>,
+) -> Option<crate::report::sandbox_bind::BindTarget> {
+    agent_token_endpoint
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .and(target)
+}
+
+/// How the sandbox's `.mcp.json` names the broker token.
+#[derive(Debug, PartialEq, Eq)]
+enum BrokerPlaceholder {
+    /// [`provider::broker_token_placeholder`].
+    Canonical,
+    /// The placeholder the gateway issued the workload, read from the sandbox.
+    Issued,
+}
+
+/// The issued placeholder only alongside a token grant; otherwise the canonical one.
+fn broker_placeholder(token_grant: bool) -> BrokerPlaceholder {
+    match token_grant {
+        true => BrokerPlaceholder::Issued,
+        false => BrokerPlaceholder::Canonical,
     }
 }
 
-/// Import the endpointless broker profile and set this run's token on the `crucible-broker`
-/// provider, update-or-create like the Vertex provider: the token changes every run, the
-/// provider object survives across runs on a shared gateway.
-async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
-    gw.ensure_provider_profile(provider::broker_profile())
-        .await
-        .context("importing the broker provider profile")?;
-    if gw.provider_exists(provider::BROKER_PROVIDER_NAME).await {
-        gw.update_provider(
-            provider::BROKER_PROVIDER_NAME,
-            provider::BROKER_CRED_KEY,
-            token,
-        )
-        .await
-        .context("updating the broker provider token")
-    } else {
-        gw.create_static_provider(
-            provider::BROKER_PROVIDER_NAME,
-            provider::BROKER_CRED_KEY,
-            token,
-            provider::BROKER_PROFILE_ID,
-        )
-        .await
-        .context("creating the broker provider")
+/// An endpointless static-credential provider: its profile, its provider name, and the credential
+/// key its placeholder resolves through.
+struct StaticProvider {
+    profile: openshell_core::proto::ProviderProfile,
+    name: &'static str,
+    cred_key: &'static str,
+}
+
+impl StaticProvider {
+    fn broker() -> Self {
+        Self {
+            profile: provider::broker_profile(),
+            name: provider::BROKER_PROVIDER_NAME,
+            cred_key: provider::BROKER_CRED_KEY,
+        }
     }
+}
+
+/// Import the endpointless profile and set this run's token on the provider, update-or-create like
+/// the Vertex provider: the token changes every run, the provider object survives across runs on a
+/// shared gateway.
+async fn ensure_static_provider(gw: &Gateway, p: &StaticProvider, token: &str) -> Result<()> {
+    let profile_id = p.profile.id.clone();
+    gw.ensure_provider_profile(p.profile.clone())
+        .await
+        .with_context(|| format!("importing the {} provider profile", p.name))?;
+    if !gw.provider_exists(p.name).await
+        && gw
+            .create_static_provider(p.name, p.cred_key, token, &profile_id)
+            .await
+            .with_context(|| format!("creating the {} provider", p.name))?
+            == grpc::ProviderCreate::Created
+    {
+        return Ok(());
+    }
+    gw.update_provider(p.name, p.cred_key, token)
+        .await
+        .with_context(|| format!("updating the {} provider token", p.name))
+}
+
+/// Import a token-grant profile and create its provider `name`, which holds no secret: the
+/// supervisor obtains each token itself. A provider already registered under the name on this
+/// gateway is left as it is.
+async fn ensure_token_grant_provider(
+    gw: &Gateway,
+    name: &str,
+    profile: openshell_core::proto::ProviderProfile,
+) -> Result<()> {
+    let profile_id = profile.id.clone();
+    gw.ensure_provider_profile(profile)
+        .await
+        .with_context(|| format!("importing the {name} token-grant profile"))?;
+    gw.ensure_minted_provider(name, &profile_id)
+        .await
+        .with_context(|| format!("creating the {name} token-grant provider"))
 }
 
 /// Idempotent AWS provider setup: import the `aws-s3` profile, create the provider if absent,
@@ -925,11 +1092,9 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     gw.ensure_provider_profile(provider::aws_s3_profile())
         .await
         .context("importing the aws-s3 provider profile")?;
-    if !gw.provider_exists(provider::AWS_PROVIDER_NAME).await {
-        gw.create_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
-            .await
-            .context("creating the aws-s3 provider")?;
-    }
+    gw.ensure_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
+        .await
+        .context("creating the aws-s3 provider")?;
     let mut material = std::collections::HashMap::from([
         ("role_arn".to_string(), role_arn.to_string()),
         ("session_name".to_string(), "crucible-sandbox".to_string()),
@@ -952,17 +1117,16 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
         .context("pre-warming the aws-s3 credentials")
 }
 
-/// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the pricing
-/// model for the token-estimate fallback, the front-end mode, and the turn's cancellation token.
+/// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the turn's
+/// pricing, the front-end mode, and the turn's cancellation token.
 struct ExecOpts<'a> {
-    model: &'a str,
+    pricing: crate::agent::event::Pricing,
     json: bool,
     cancel: &'a CancellationToken,
 }
 
 /// Exec the agent over the gateway's `ExecSandbox` stream, driving a [`crate::agent::turn::StreamPump`] with the
-/// stdout lines the stream yields, and return the turn's cost (estimated from tokens if none was
-/// reported). The stream's stderr is replayed through the sink after the agent exits, mirroring the
+/// stdout lines the stream yields, and return the turn's running cost. The stream's stderr is replayed through the sink after the agent exits, mirroring the
 /// old CLI-child behavior. `cancel` unwinds the exec on Ctrl-C (see [`Gateway::exec`]).
 async fn exec_and_stream(
     gw: &Gateway,
@@ -972,24 +1136,18 @@ async fn exec_and_stream(
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> Result<f64> {
-    let mut pump = crate::agent::turn::StreamPump::new(decoder);
+) -> Result<crate::agent::turn::TurnCost> {
+    let mut pump = crate::agent::turn::StreamPump::new(decoder, opts.pricing);
     let exec = gw
         .exec(name, command, opts.cancel, |line| {
             pump.push(line, opts.json, sink)
         })
         .await?;
-    let (mut cost, best_tokens) = pump.finish();
+    let cost = pump.finish();
     let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
-
-    if cost == 0.0
-        && let Some(t) = &best_tokens
-    {
-        cost = estimate_cost(opts.model, t);
-    }
     // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
     // non-zero below, and a turn that spent money is never reported free.
-    spent.raise(cost);
+    spent.raise(cost.total());
 
     // Replay the agent's stderr (provisioning notes / errors) through the sink as raw lines.
     for line in exec.stderr_lines {
@@ -1233,9 +1391,9 @@ async fn graft_turn_telemetry(
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
-    cost: f64,
+    cost: &mut crate::agent::turn::TurnCost,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> f64 {
+) {
     let fetched = tokio::time::timeout(
         harness.spec().transcript_fetch_timeout,
         fetch_transcript(harness, gw, name, cancel),
@@ -1250,7 +1408,7 @@ async fn graft_turn_telemetry(
             };
             sink("", RawStream::Stderr, Some(&ev));
         }
-        return cost;
+        return;
     };
 
     let export = crate::agent::engine::TurnExport::resolve();
@@ -1278,16 +1436,15 @@ async fn graft_turn_telemetry(
         }
     }
 
-    let mut cost = cost;
     if harness.spec().backfill_required {
         for ev in &artifacts.events {
+            cost.observe(ev);
             sink("", RawStream::Stdout, Some(ev));
         }
         if let Some(c) = artifacts.cost_usd {
-            cost = cost.max(c);
+            cost.report(c);
         }
     }
-    cost
 }
 
 const PRIVATE_SESSION_DIR: &str = "agent-session-private";
@@ -1644,6 +1801,40 @@ fn relay_keys(keys: &[&str], env: &mut Vec<(String, String)>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sandbox_is_bound_only_where_the_controller_issues_agent_tokens() {
+        use crate::openshell::run::binds_sandboxes;
+        let target = || {
+            crate::report::sandbox_bind::BindTarget::new(
+                "http://crucible-controller.ns.svc:8080",
+                "run-a",
+                "crr_id_secret",
+            )
+        };
+        let endpoint = "http://crucible-controller.ns.svc:8080/oauth/token";
+        assert!(binds_sandboxes(Some(endpoint), Some(target())).is_some());
+        assert!(
+            binds_sandboxes(None, Some(target())).is_none(),
+            "a controller without the agent issuer serves no bind route"
+        );
+        assert!(binds_sandboxes(Some(" "), Some(target())).is_none());
+        assert!(binds_sandboxes(Some(endpoint), None).is_none());
+    }
+
+    #[test]
+    fn the_broker_placeholder_reads_the_sandbox_only_alongside_a_token_grant() {
+        use crate::openshell::run::{BrokerPlaceholder, broker_placeholder};
+        assert_eq!(broker_placeholder(false), BrokerPlaceholder::Canonical);
+        assert_eq!(broker_placeholder(true), BrokerPlaceholder::Issued);
+        assert_eq!(
+            crate::openshell::provider::broker_token_placeholder(),
+            format!(
+                "{}BROKER_TOKEN",
+                openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC
+            )
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1685,6 +1876,7 @@ mod tests {
             selection: Some(crate::agent::inference::AgentSelection {
                 protocol: crucible_contract::inference::InferenceProtocol::Responses,
                 model: "m".into(),
+                price: None,
             }),
             ..Default::default()
         };

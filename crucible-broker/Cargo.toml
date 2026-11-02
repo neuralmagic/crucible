@@ -10,7 +10,7 @@ edition.workspace = true
 # domain dependency: the resolver, admission, and approval are all boxed boundaries.
 [dependencies]
 crucible-contract = { path = "../crucible-contract" }
-minijinja = "2"
+minijinja = { version = "3", features = ["serde"] }
 anyhow.workspace = true
 # The bin's `spoke-smoke` subcommand (the default no-subcommand path stays the serve loop).
 clap.workspace = true
@@ -22,7 +22,7 @@ forge = { path = "../forge" }
 # MCP wire: the official Rust SDK (rmcp) over the streamable-http transport (network-reachable from the
 # sandbox, egress-allowlisted at `host.containers.internal:8849`).
 # The tool/handler code is transport-independent; only the domain binary's `main` binds the listener.
-rmcp = { version = "3.1", features = [
+rmcp = { version = "3.6", features = [
   "server",
   "macros",
   "transport-streamable-http-server",
@@ -50,7 +50,7 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 # A profile trace is a binary (gzip) artifact; it leaves the GPU pod base64'd on the job log and is
 # handed back to the agent base64'd by `fetch_trace` (the text `fetch_log` would corrupt it).
-base64 = "0.22"
+base64 = "0.23"
 # Server observability: rmcp emits `tracing` events for each MCP request; a subscriber turns
 # them into pod-log lines (set RUST_LOG to tune). Without this the broker is a black box.
 tracing = "0.1"
@@ -60,10 +60,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # MCP tool spans exported over OTLP, only when an endpoint is set — the same opentelemetry 0.32
 # stack + grpc-tonic transport the engine and controller already run, aimed at the in-cluster
 # Tempo through the loop pod's OTEL_EXPORTER_OTLP_ENDPOINT.
-tracing-opentelemetry = "0.33"
-opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+tracing-opentelemetry = "0.34"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
   "trace",
   "grpc-tonic",
   "tls-ring",
@@ -72,4 +72,4 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 [dev-dependencies]
 # tests/description_pins.rs reads the internal deploy profiles' [env] tables to keep the pinned
 # tool-description values honest against the files that actually set them.
-toml = "0.8"
+toml = "1.1"

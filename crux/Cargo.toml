@@ -18,9 +18,9 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # boxes the futures. Same version the controller already uses.
 async-trait = "0.1"
 # The MCP tool surface the controller hosts. Version tracks the controller's.
-rmcp = { version = "1.8", features = ["server", "macros"] }
+rmcp = { version = "3.6", features = ["server", "macros"] }
 # The config file. Same version the controller reads manifests with.
-toml = "0.8"
+toml = "1.1"
 
 [dev-dependencies]
 # Stands in for the controller in the client tests — same version family as the controller's own

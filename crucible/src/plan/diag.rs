@@ -2,10 +2,7 @@
 
 /// Best fuzzy match for an unknown identifier: minimum Levenshtein distance, accepted
 /// when <= 2 and < the candidate's length; ties break lexicographically.
-pub(crate) fn suggest<'a>(
-    unknown: &str,
-    known: impl IntoIterator<Item = &'a str>,
-) -> Option<&'a str> {
+pub fn suggest<'a>(unknown: &str, known: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
     let mut best: Option<(usize, &str)> = None;
     for candidate in known {
         let distance = levenshtein(unknown, candidate);

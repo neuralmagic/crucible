@@ -87,6 +87,12 @@ impl ClusterClients {
         Ok(cache.entry(cluster.to_string()).or_insert(client).clone())
     }
 
+    /// Whether the controller has a client of its own for `cluster`: the hub, a personal target, or
+    /// a clusters-directory entry carrying a kubeconfig.
+    pub fn reaches(&self, cluster: &str) -> bool {
+        personal_secret_id(cluster).is_some() || self.names().iter().any(|n| n == cluster)
+    }
+
     /// Every connected cluster: `hub`, then each clusters-directory entry that carries a
     /// kubeconfig, sorted. Directory presence is the registration — the same rule `target`
     /// resolves by.
@@ -138,6 +144,24 @@ impl ClusterClients {
         Ok(self.client(cluster).await?.default_namespace().to_string())
     }
 
+    /// `cluster`'s platform: what `profile` states for it, else what its API server serves.
+    pub async fn platform(
+        &self,
+        profile: &crucible::deploy::DeployProfile,
+        cluster: &str,
+    ) -> Result<forge::fleet::Platform> {
+        if let Some(stated) = profile.platform(cluster) {
+            return Ok(stated);
+        }
+        let groups = self
+            .client(cluster)
+            .await?
+            .list_api_groups()
+            .await
+            .with_context(|| format!("listing the API groups of `{cluster}`"))?;
+        Ok(platform_of(groups.groups.iter().map(|g| g.name.as_str())))
+    }
+
     fn target(&self, cluster: &str) -> Result<forge::kube::KubeTarget> {
         if cluster == HUB_CLUSTER {
             return Ok(forge::kube::KubeTarget::Ambient);
@@ -164,6 +188,17 @@ impl ClusterClients {
     }
 }
 
+/// The API group only OpenShift serves: its SecurityContextConstraints.
+const OPENSHIFT_GROUP: &str = "security.openshift.io";
+
+/// The distribution a cluster serving the API `groups` runs.
+pub fn platform_of<'a>(groups: impl IntoIterator<Item = &'a str>) -> forge::fleet::Platform {
+    match groups.into_iter().any(|g| g == OPENSHIFT_GROUP) {
+        true => forge::fleet::Platform::Openshift,
+        false => forge::fleet::Platform::Kubernetes,
+    }
+}
+
 /// The prefix every personal target's name carries. It is not a legal cluster directory entry, so
 /// a personal name can never collide with a mounted spoke, and a stored `issues.dispatch_target`
 /// says which resolver owns it by inspection.
@@ -183,6 +218,23 @@ pub fn personal_secret_id(target: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use crate::runs::clusters::*;
+
+    #[test]
+    fn a_cluster_with_a_kubeconfig_is_reached_directly_even_when_it_also_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ocp")).unwrap();
+        std::fs::write(dir.path().join("ocp/kubeconfig"), "apiVersion: v1\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("pushonly")).unwrap();
+        let clients = ClusterClients::new(Some(dir.path().to_path_buf()));
+        assert!(clients.reaches("hub"));
+        assert!(clients.reaches("ocp"));
+        assert!(
+            !clients.reaches("pushonly"),
+            "a directory without a kubeconfig is no client"
+        );
+        assert!(!clients.reaches("elsewhere"));
+        assert!(!ClusterClients::new(None).reaches("ocp"));
+    }
 
     #[tokio::test]
     async fn unknown_cluster_without_dir_errors() {
@@ -264,5 +316,20 @@ current-context: wharf
         let cc = ClusterClients::new(Some(dir.path().to_path_buf()));
         let ns = cc.pod_namespace("wharf", "autoresearch").await.unwrap();
         assert_eq!(ns, "crucible-loops");
+    }
+
+    /// A cluster serving OpenShift's SCC group is OpenShift; anything else is Kubernetes.
+    #[test]
+    fn the_platform_is_what_the_api_server_serves() {
+        use forge::fleet::Platform;
+        assert_eq!(
+            platform_of(["apps", "security.openshift.io", "route.openshift.io"]),
+            Platform::Openshift
+        );
+        assert_eq!(
+            platform_of(["apps", "kueue.x-k8s.io"]),
+            Platform::Kubernetes
+        );
+        assert_eq!(platform_of([]), Platform::Kubernetes);
     }
 }

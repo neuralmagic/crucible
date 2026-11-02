@@ -41,6 +41,7 @@ use std::time::Duration;
 /// Everything the blocking half of a dispatch needs: render the run's pod and pack ConfigMap, then
 /// stamp the pod with what the controller knows about the run.
 struct RunPodRender {
+    isolated: bool,
     pack: std::path::PathBuf,
     pack_digest: TreeDigest,
     inputs: RunInputs,
@@ -60,16 +61,21 @@ struct RunPodRender {
 }
 
 impl RunPodRender {
-    fn render(self) -> Result<(Pod, Option<ConfigMap>)> {
-        let (mut pod, cm) = render_run_docs(
+    fn render(self) -> Result<RunDocs> {
+        let RunDocs {
+            mut pod,
+            pack,
+            sandbox_ports,
+        } = render_run_docs(
             &self.pack,
             &self.profile,
             &self.pod_name,
             &self.opts,
             self.inputs,
             self.digests,
+            self.isolated,
         )?;
-        check_delivered_tree(cm.as_ref(), &self.pack_digest)?;
+        check_delivered_tree(pack.as_ref(), &self.pack_digest)?;
         stamp_run_pod(
             &mut pod,
             &self.pod_name,
@@ -93,7 +99,11 @@ impl RunPodRender {
             stamp_git_identity(&mut pod, who);
         }
         crate::secrets::deliver::stamp(&mut pod, &self.secret_name, &self.delivery);
-        Ok((pod, cm))
+        Ok(RunDocs {
+            pod,
+            pack,
+            sandbox_ports,
+        })
     }
 }
 
@@ -125,6 +135,10 @@ pub enum RunRenderOpts {
         max_cost: f64,
         max_time: crate::model::MaxTime,
         agent: AgentSelection,
+        /// The finished run this launch reruns.
+        rerun: Option<crate::launches::model::RerunOf>,
+        /// The manifest variant the run reads.
+        variant: Option<crucible::manifest::variant::VariantName>,
     },
 }
 
@@ -142,6 +156,14 @@ impl RunRenderOpts {
             max_cost: eff.run_max_cost,
             pr_repo: cfg.pr_repo_for(repo),
             agent,
+        }
+    }
+
+    /// The run's wall-clock ceiling in seconds, when it states one.
+    pub(crate) fn max_time_secs(&self) -> Option<u64> {
+        match self {
+            RunRenderOpts::Loop { .. } => None,
+            RunRenderOpts::Playbook { max_time, .. } => Some(max_time.secs()),
         }
     }
 
@@ -197,6 +219,8 @@ impl RunRenderOpts {
                 params,
                 max_cost,
                 max_time,
+                rerun,
+                variant,
                 ..
             } => RenderOpts {
                 max_cost: *max_cost,
@@ -206,6 +230,11 @@ impl RunRenderOpts {
                     max_time: max_time.engine()?,
                     max_cost: *max_cost,
                     params: params.iter().cloned().collect(),
+                    rerun: rerun.as_ref().map(|r| crucible::deploy::RerunLaunch {
+                        parent: r.run.clone(),
+                        from: r.from.clone(),
+                    }),
+                    variant: variant.clone(),
                 }),
                 harness: agent.harness,
                 model: agent.model.clone(),
@@ -222,7 +251,8 @@ impl RunRenderOpts {
 /// runs it under `spawn_blocking`. `pod_name` is the run's pod: the render names the run after it,
 /// so its state is its own, and names the pack ConfigMap `<pod>-pack`, so the CM and
 /// the pod volume that references it never drift. `opts` carries the per-kind run knobs
-/// ([`RunRenderOpts`]), and `inputs` the per-run files delivered beside the pack.
+/// ([`RunRenderOpts`]), and `inputs` the per-run files delivered beside the pack. `isolated` reads the
+/// sandbox ports an isolated gateway's loop Service needs.
 pub fn render_run_docs(
     pack_out: &Path,
     profile_path: &Path,
@@ -230,14 +260,15 @@ pub fn render_run_docs(
     opts: &RunRenderOpts,
     inputs: RunInputs,
     digests: Option<Arc<dyn DigestResolver>>,
-) -> Result<(Pod, Option<ConfigMap>)> {
+    isolated: bool,
+) -> Result<RunDocs> {
     let manifest = pack_out.join("crucible.toml");
     let yaml = render_yaml(
         &manifest,
         profile_path,
         &opts.render_opts(pod_name, inputs, digests)?,
     )?;
-    extract_run_docs(&yaml)
+    extract_run_docs(&yaml, isolated)
 }
 
 /// Per-run files delivered beside a pack's tree, keyed by the pack-relative path a run reads them
@@ -280,13 +311,24 @@ fn check_delivered_tree(cm: Option<&ConfigMap>, expected: &TreeDigest) -> Result
     Ok(())
 }
 
-/// Pull the `Pod` and (optional) `ConfigMap` documents out of a (possibly multi-doc) rendered
-/// manifest — the loop pod, its RBAC/NetworkPolicy, and, under pack delivery, the pack ConfigMap. A
-/// baked-domain render carries no ConfigMap, so `None` is the backward-compatible case. The Pod is
-/// required; its absence is a render bug.
-fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
+/// What the controller takes from a loop-run render.
+#[derive(Debug)]
+pub struct RunDocs {
+    pub pod: Pod,
+    /// The pack ConfigMap, under pack delivery.
+    pub pack: Option<ConfigMap>,
+    /// The ports the loop pod's NetworkPolicy admits sandbox traffic on.
+    pub sandbox_ports: Vec<u16>,
+}
+
+/// Pull the `Pod`, (optional) `ConfigMap`, and, when `isolated`, the loop NetworkPolicy's ingress
+/// ports out of a (possibly multi-doc) rendered manifest — the loop pod, its RBAC/NetworkPolicy,
+/// and, under pack delivery, the pack ConfigMap. A baked-domain render carries no ConfigMap, so
+/// `None` is the backward-compatible case. The Pod is required; its absence is a render bug.
+fn extract_run_docs(yaml: &str, isolated: bool) -> Result<RunDocs> {
     let mut pod = None;
     let mut cm = None;
+    let mut sandbox_ports = Vec::new();
     for doc in serde_norway::Deserializer::from_str(yaml) {
         let value = serde_norway::Value::deserialize(doc).context("parsing a rendered YAML doc")?;
         match value.get("kind").and_then(|k| k.as_str()) {
@@ -302,11 +344,42 @@ fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
                         .context("decoding the rendered pack ConfigMap")?,
                 );
             }
+            Some("NetworkPolicy") if isolated => {
+                let policy = serde_norway::from_value::<
+                    k8s_openapi::api::networking::v1::NetworkPolicy,
+                >(value)
+                .context("decoding the rendered loop NetworkPolicy")?;
+                sandbox_ports.extend(ingress_ports(&policy)?);
+            }
             _ => {}
         }
     }
     let pod = pod.context("the rendered manifest contained no Pod document")?;
-    Ok((pod, cm))
+    sandbox_ports.sort_unstable();
+    sandbox_ports.dedup();
+    Ok(RunDocs {
+        pod,
+        pack: cm,
+        sandbox_ports,
+    })
+}
+
+fn ingress_ports(policy: &k8s_openapi::api::networking::v1::NetworkPolicy) -> Result<Vec<u16>> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    policy
+        .spec
+        .iter()
+        .flat_map(|s| s.ingress.iter().flatten())
+        .flat_map(|rule| rule.ports.iter().flatten())
+        .filter_map(|p| p.port.as_ref())
+        .map(|port| match port {
+            IntOrString::Int(n) => u16::try_from(*n)
+                .with_context(|| format!("the loop NetworkPolicy admits port {n}, out of range")),
+            IntOrString::String(name) => {
+                bail!("the loop NetworkPolicy admits the named port {name:?}; only numbered ports are served")
+            }
+        })
+        .collect()
 }
 
 /// Stamp the controller-owned metadata onto the rendered pack ConfigMap so it is GC'd, selectable, and
@@ -317,24 +390,11 @@ fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
 /// bespoke cleanup — the CM's lifetime is glued to the pod's. The render already set the CM's name +
 /// namespace to the run-unique values, so this only adds ownership + selectors.
 fn stamp_run_configmap(cm: &mut ConfigMap, pod: &Pod, issue_key: &str) {
-    stamp_managed_meta(&mut cm.metadata, issue_key, owner_reference_to_pod(pod));
-}
-
-/// An ownerReference pointing at a just-created pod (its UID populated by the API server), for
-/// cascade-GC'ing the pack ConfigMap with the pod. `None` when the pod has no name/UID yet (a fake
-/// dispatcher that doesn't stamp a UID) — the CM is still created, just not cascade-owned, and the
-/// managed-by selector keeps it sweepable.
-fn owner_reference_to_pod(pod: &Pod) -> Option<OwnerReference> {
-    let name = pod.metadata.name.clone().filter(|s| !s.is_empty())?;
-    let uid = pod.metadata.uid.clone().filter(|s| !s.is_empty())?;
-    Some(OwnerReference {
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        name,
-        uid,
-        controller: Some(true),
-        block_owner_deletion: Some(true),
-    })
+    stamp_managed_meta(
+        &mut cm.metadata,
+        issue_key,
+        crate::runs::workpod::gateway::owner_reference_to_pod(pod),
+    );
 }
 
 /// Stamp the controller-owned metadata onto a rendered loop-run pod: override its object name with
@@ -496,6 +556,12 @@ pub enum RunAdmission {
     ContractRejected,
 }
 
+/// Whether the hub can only receive pushes from a cluster, and so cannot create a run's gateway
+/// there: it holds a push token for it and no client of its own.
+pub(crate) fn push_only(pushes: bool, reaches: bool) -> bool {
+    pushes && !reaches
+}
+
 /// What a dispatch needs to resolve the run's secrets: the scope whose bindings apply, who is
 /// launching, and what content the launch runs. `None` at a call site means the launch resolves no
 /// bindings at all — an import test-fire, which has no scope to bind against.
@@ -579,6 +645,16 @@ pub async fn dispatch_run(
         "dispatch_run needs a deploy profile: set CONTROLLER_DEPLOY_PROFILE (or --deploy-profile) \
          to the profile the loop-pod render reads",
     )?;
+    let loaded = cfg.profile().await?;
+    let agent_servers = match loaded.as_ref() {
+        Some(p) => p
+            .agent_servers()
+            .context("reading the deploy profile's agent servers")?,
+        None => Vec::new(),
+    };
+    let isolated = loaded
+        .as_deref()
+        .filter(|p| crucible::deploy::render::gateway::isolated(p));
 
     let targets: Vec<crate::runs::contract::DispatchTarget> =
         crate::runs::contract::profile_target(&profile)
@@ -610,7 +686,9 @@ pub async fn dispatch_run(
     // row, no Secret, and no pod behind.
     let mints = match secrets {
         Some(ls) => {
-            let declared = crate::secrets::manifest::declared_secrets(pack.path())?;
+            let variant = crate::launches::store::launch_variant(db.pool(), issue_key).await?;
+            let declared =
+                crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
             match crate::secrets::launch::resolve(
                 db.pool(),
                 &ls.scope,
@@ -629,6 +707,16 @@ pub async fn dispatch_run(
     };
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
+    if isolated.is_some()
+        && push_only(
+            crate::runs::cluster_push::PushTokens::from_env()?.pushes_for(&cluster),
+            crate::runs::clusters::ClusterClients::new(cfg.clusters_dir.clone()).reaches(&cluster),
+        )
+    {
+        return Err(
+            crate::runs::workpod::gateway::DispatchError::PushOnlyCluster { cluster }.into(),
+        );
+    }
     // The inference document and the models' keys, resolved and read before the row insert so a
     // refusal leaves no work-pod row behind; a variable the scope's own bindings also claim is
     // refused the same way once both are known.
@@ -715,8 +803,7 @@ pub async fn dispatch_run(
                 rows.push(row);
                 values.push(value);
             }
-            let by_the_app =
-                crate::secrets::minter::any_bound(&rows, crate::secrets::minter::Minter::GithubApp);
+            let by_the_app = crate::secrets::minter::any_github_app(&rows);
             (
                 crate::secrets::deliver::assemble(&mints, &rows, &values)?,
                 by_the_app,
@@ -728,6 +815,42 @@ pub async fn dispatch_run(
             .merge(extra)
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
     }
+    if let Some(tokens) = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?
+        && let Some(access) = crate::runs::workpod::agent_servers::access(
+            &agent_servers,
+            &cluster,
+            &tokens,
+            loaded
+                .as_deref()
+                .map_or(crucible::deploy::profile::DEFAULT_SPIFFE_SOCKET, |p| {
+                    p.cluster.spiffe_socket()
+                }),
+        )?
+    {
+        delivery.merge(access).map_err(|e| {
+            anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
+        })?;
+        crate::runs::agent_tools::grant(db, &agent_servers, run_id, &cluster, &tokens)
+            .await
+            .context("recording the run's agent tools")?;
+    }
+    let reads_run = match &opts {
+        RunRenderOpts::Playbook {
+            rerun: Some(rerun), ..
+        } => Some(rerun.run.as_str()),
+        _ => None,
+    };
+    let lifetime = crate::runs::completion::run_pod_deadline(db, cfg, issue_key).await?;
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run_id.to_string()),
+        reads_run,
+        lifetime,
+    )
+    .await?;
+    delivery
+        .merge(crate::secrets::deliver::pod_token(token))
+        .map_err(|e| anyhow::anyhow!("folding the run token into the run's delivery: {e}"))?;
     // A run pushing as the App has to have the identity, so a failed resolve fails the dispatch.
     // Everywhere else it is a default, and a failure degrades to the pack's own.
     let git_identity = match cfg.github_app.as_ref() {
@@ -753,7 +876,46 @@ pub async fn dispatch_run(
     let namespace = dispatcher
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
+    if let Some(isolated) = isolated {
+        let mut spire: Vec<crate::agent_auth::cluster_spire::ClusterSpire> =
+            crate::agent_auth::issuer::parse_list(cfg.agent_spire.as_deref().unwrap_or_default())
+                .context("reading CONTROLLER_AGENT_SPIRE")?;
+        spire.extend(cfg.spire.ready());
+        crate::agent_auth::placement::check_loop_namespace(
+            &cluster,
+            &namespace,
+            isolated,
+            &spire,
+            crate::agent_auth::placement::controller_namespace().as_deref(),
+        )?;
+    }
+    // An isolated gateway's Service address goes into its server certificate, and the loop pod's
+    // client material into the run Secret, so both precede the render.
+    let mut gateway = None;
+    let reserved: Result<()> = match isolated {
+        Some(gateway_profile) => {
+            match crate::runs::workpod::gateway::RunGateway::reserve(
+                dispatcher.as_ref(),
+                &cluster,
+                gateway_profile,
+                &pod_name,
+                opts.max_time_secs(),
+            )
+            .await
+            {
+                Ok(reserved) => delivery
+                    .merge(reserved.loop_delivery())
+                    .map(|()| gateway = Some(reserved))
+                    .map_err(|e| {
+                        anyhow::anyhow!("folding the gateway client material into the run's: {e}")
+                    }),
+                Err(e) => Err(e),
+            }
+        }
+        None => Ok(()),
+    };
     let job = RunPodRender {
+        isolated: isolated.is_some(),
         pack: pack.path().to_path_buf(),
         pack_digest: pack.digest().clone(),
         inputs,
@@ -773,16 +935,24 @@ pub async fn dispatch_run(
     };
     // The render reads the pack and pins images, so it stays on a blocking thread; the pod + CM
     // creates are plain async kube calls awaited here.
-    let rendered = tokio::task::spawn_blocking(move || job.render())
-        .await
-        .context("joining the loop-run render task")?;
+    let rendered = match reserved {
+        Ok(()) => tokio::task::spawn_blocking(move || job.render())
+            .await
+            .context("joining the loop-run render task")?,
+        Err(e) => Err(e),
+    };
+
     let issue_for_cm = issue_key.to_string();
     // Create the pod FIRST (so its UID exists to owner-ref the CM to), then the CM. A pack pod waits
     // in ContainerCreating on its init-container's ConfigMap mount until the CM lands a beat later; the
     // CM owner-ref'd to the pod means k8s cascade-GCs it whenever the pod is deleted, so no delete site
     // needs to know the CM exists.
     let created = match rendered {
-        Ok((mut pod, cm)) => {
+        Ok(RunDocs {
+            mut pod,
+            pack: cm,
+            sandbox_ports,
+        }) => {
             // Pin the run pod's image(s) to the digests the pack's builds produced, so the measurement
             // can never run on a stale or half-built image. A no-op for a build-free pack (empty map)
             // — the static manifest image stands.
@@ -790,11 +960,28 @@ pub async fn dispatch_run(
             // Inject this dispatch's W3C trace context so the loop pod's engine re-roots its `run`
             // span under it (a no-op when the controller isn't exporting spans).
             crate::runs::workpod::trace::inject_dispatch_context(&mut pod);
-            match dispatcher
-                .create(&cluster, &namespace, pod)
-                .await
-                .context("creating the loop-run pod")
-            {
+            let gateway_started = match gateway.as_ref() {
+                Some(gateway) => {
+                    gateway
+                        .start(
+                            dispatcher.as_ref(),
+                            &cluster,
+                            &namespace,
+                            &pod,
+                            &sandbox_ports,
+                        )
+                        .await
+                }
+                None => Ok(()),
+            };
+            let loop_pod_created = match gateway_started {
+                Ok(()) => dispatcher
+                    .create(&cluster, &namespace, pod)
+                    .await
+                    .context("creating the loop-run pod"),
+                Err(e) => Err(e),
+            };
+            match loop_pod_created {
                 Ok(created_pod) => {
                     if let Some(uid) = created_pod
                         .metadata
@@ -853,6 +1040,27 @@ pub async fn dispatch_run(
             })
         }
         Err(e) => {
+            if let Some(profile) = isolated
+                && let Err(cleanup) = crate::runs::workpod::gateway::teardown(
+                    dispatcher.as_ref(),
+                    &cluster,
+                    profile,
+                    &pod_name,
+                    &namespace,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = format!("{cleanup:#}"),
+                    pod_name,
+                    "a failed launch left its gateway; the gateway sweep removes it"
+                );
+            }
+            crate::runs::pod_token::revoke(
+                db.pool(),
+                &crate::runs::pod_token::Subject::Run(run_id.to_string()),
+            )
+            .await?;
             // Retain a failed-to-launch row with the real reason (swept after retention), then let the
             // reconcile see the error and retry the issue from `awaiting-approval`.
             let reason = format!("{e:#}");
@@ -908,6 +1116,7 @@ pub async fn collect_run_pod(
     db: &Db,
     dispatcher: &dyn PodDispatcher,
     hub_namespace: &str,
+    profile: Option<&crucible::deploy::DeployProfile>,
     pod_name: &str,
     disposition: RunDisposition,
 ) -> Result<()> {
@@ -925,10 +1134,21 @@ pub async fn collect_run_pod(
         None,
     )
     .await?;
-    if let Some(ns) =
-        crate::runs::workpod::row_namespace(dispatcher, &row.cluster, hub_namespace).await
+    let ns = crate::runs::workpod::row_namespace(dispatcher, &row.cluster, hub_namespace).await;
+    if let Some(ns) = ns.as_deref() {
+        let _ = dispatcher.delete(&row.cluster, ns, pod_name).await;
+    }
+    if let Some(profile) = profile.filter(|p| crucible::deploy::render::gateway::isolated(p))
+        && let Some(ns) = ns.as_deref()
+        && let Err(e) =
+            crate::runs::workpod::gateway::teardown(dispatcher, &row.cluster, profile, pod_name, ns)
+                .await
     {
-        let _ = dispatcher.delete(&row.cluster, &ns, pod_name).await;
+        tracing::warn!(
+            error = format!("{e:#}"),
+            pod_name,
+            "deleting the run's gateway failed; the gateway sweep removes it"
+        );
     }
     Ok(())
 }
@@ -1169,10 +1389,12 @@ pub(crate) async fn dispatch_grounded_rank(
         &spec,
         spec::GroundedRankSpec.pod_noun(),
         &profile,
+        &cfg.profile_cache,
         cfg.digest_resolver(),
         &cluster,
         &namespace,
         &delivery,
+        GROUNDED_RANK_TIMEOUT,
     )
     .await?
     {
@@ -1424,7 +1646,7 @@ fn scope_report_from_envelope(env: Envelope, logs: &str) -> Result<engine::Scope
 
 /// The Tier 1 artifacts manifest carried by a scope-report termination message, or empty when the
 /// message is absent/unparseable/not our envelope (the old-engine marker path — no manifest, so the
-/// drop-box preference is a no-op and the log-scraped payloads stand).
+/// uploaded artifacts are not consulted and the log-scraped payloads stand).
 #[cfg(feature = "autoresearch")]
 pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
     let Some(m) = message else {
@@ -1439,17 +1661,17 @@ pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
     env.artifacts
 }
 
-/// Prefer the drop-box artifacts over log-scraped payloads, validating each against its manifest
-/// digest. The controller trusts the kubelet-authenticated manifest, then checks the drop-box against
-/// it — so a missing, undelivered, or digest-mismatched artifact is caught without trusting the POST
-/// path at all.
+/// Prefer the turn's uploaded artifacts over log-scraped payloads, validating each against its
+/// manifest digest. The controller trusts the kubelet-authenticated manifest, then checks what the
+/// turn uploaded against it, so a missing, undelivered, or digest-mismatched artifact is caught
+/// without trusting the upload path at all.
 ///
-/// A surviving scope's PACK is required: if the manifest lists it but the drop-box can't hand back
+/// A surviving scope's PACK is required: if the manifest lists it but the store can't hand back
 /// the exact bytes, this returns `Err` with a loud reason (→ a NoReport that lands on the work_pods
 /// row). The transcript is best-effort — a problem there is logged, not fatal, matching the marker
 /// path's long-standing discipline (a garbled transcript never failed a report).
 #[cfg(feature = "autoresearch")]
-pub(crate) async fn apply_dropbox_artifacts(
+pub(crate) async fn apply_turn_artifacts(
     report: &mut engine::ScopeReport,
     manifest: &[ArtifactRef],
     pool: &sqlx::PgPool,
@@ -1458,7 +1680,7 @@ pub(crate) async fn apply_dropbox_artifacts(
     let survived = report.digest.is_some() && report.stages.iter().all(|s| s.passed);
     for art in manifest {
         match art.kind {
-            ArtifactKind::ScopePack => match resolve_dropbox_artifact(pool, pod, art).await {
+            ArtifactKind::ScopePack => match resolve_turn_artifact(pool, pod, art).await {
                 Ok(bytes) => {
                     report.pack_tgz = Some(bytes);
                     report.pack_error = None;
@@ -1467,41 +1689,44 @@ pub(crate) async fn apply_dropbox_artifacts(
                     // A dead proposal has no pack to deliver; only a survival's missing pack is fatal.
                     if survived {
                         return Err(format!(
-                            "scope pack not recovered from the drop-box: {problem}"
+                            "scope pack not recovered from the turn's upload: {problem}"
                         ));
                     }
                 }
             },
-            ArtifactKind::ScopeTranscript => match resolve_dropbox_artifact(pool, pod, art).await {
+            ArtifactKind::ScopeTranscript => match resolve_turn_artifact(pool, pod, art).await {
                 Ok(bytes) => report.transcript_gz = Some(bytes),
                 Err(problem) => {
                     tracing::warn!(
                         pod,
                         %problem,
-                        "scope transcript not recovered from the drop-box (best-effort)"
+                        "scope transcript not recovered from the turn's upload (best-effort)"
                     );
                 }
             },
             // A scope turn never uploads a loop run's evidence or (in R2) an otel-log; ignore any
             // stray entry.
-            ArtifactKind::RunSession | ArtifactKind::RunFiles | ArtifactKind::OtelLog => {}
+            ArtifactKind::RunSession
+            | ArtifactKind::RunFiles
+            | ArtifactKind::RunCommits
+            | ArtifactKind::OtelLog => {}
         }
     }
     Ok(())
 }
 
-/// Resolve one manifest entry to its drop-box bytes, validating the content digest. `Err` when the
+/// Resolve one manifest entry to the bytes the turn uploaded, validating the content digest. `Err` when the
 /// pod marked it undelivered, no artifact is stored, or the stored digest doesn't match the
 /// manifest.
 #[cfg(feature = "autoresearch")]
-async fn resolve_dropbox_artifact(
+async fn resolve_turn_artifact(
     pool: &sqlx::PgPool,
     pod: &str,
     art: &ArtifactRef,
 ) -> Result<Vec<u8>, String> {
     if !art.delivered {
         return Err(format!(
-            "the manifest marks {} delivered:false (the pod's POST failed after retries)",
+            "the manifest marks {} delivered:false (the pod's upload failed after retries)",
             art.kind
         ));
     }
@@ -1510,8 +1735,8 @@ async fn resolve_dropbox_artifact(
     };
     let payload = crate::runs::blob_store::get_artifact(pool, &owner, art.kind.as_str())
         .await
-        .map_err(|e| format!("reading drop-box {}: {e:#}", art.kind))?
-        .ok_or_else(|| format!("no {} in the drop-box store", art.kind))?;
+        .map_err(|e| format!("reading the uploaded {}: {e:#}", art.kind))?
+        .ok_or_else(|| format!("the turn uploaded no {}", art.kind))?;
     let digest = content_digest(&payload.data);
     if digest != art.digest {
         return Err(format!(

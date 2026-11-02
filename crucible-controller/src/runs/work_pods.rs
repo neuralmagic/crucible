@@ -412,6 +412,14 @@ pub async fn work_pods_in_states(
     rows.iter().map(decode_work_pod).collect()
 }
 
+/// Every cluster a work pod has been dispatched onto.
+pub async fn work_pod_clusters(ex: impl PgExecutor<'_>) -> Result<Vec<String>> {
+    sqlx::query_scalar("SELECT DISTINCT cluster FROM work_pods ORDER BY cluster")
+        .fetch_all(ex)
+        .await
+        .context("work_pod_clusters")
+}
+
 /// The `running` run pod rows of `issue_key` whose run already left `running`, as
 /// `(pod_name, run status)`.
 #[tracing::instrument(name = "db.terminal_runs_with_running_pods", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]
@@ -515,7 +523,7 @@ pub(crate) async fn clear_scope_now(ex: impl PgExecutor<'_>, key: &str) -> Resul
     Ok(())
 }
 
-/// Record (or dedup) a Tier 2 drop-box pointer (`pod_artifacts`). Content-addressed: a re-POST of
+/// Record (or dedup) a turn upload's pointer (`pod_artifacts`). Content-addressed: a re-POST of
 /// the same (pod, kind) with the same digest is idempotent (`INSERT OR REPLACE` with an identical
 /// row), so the caller can treat the pre-existing digest as the dedup signal. Runtime query (not
 /// the `query!` macro) so a fresh migration needs no `.sqlx` offline-cache entry.
@@ -545,8 +553,7 @@ pub(crate) async fn record_pod_artifact(
     Ok(())
 }
 
-/// The drop-box pointer for one (pod, kind), or `None`. The ingest approval reads it to answer "do I
-/// already hold this digest?" (idempotent dedup); the fold reads it to resolve + validate a Tier 1
+/// The upload pointer for one (pod, kind), or `None`. The fold reads it to resolve + validate a Tier 1
 /// manifest entry against the stored bytes.
 #[tracing::instrument(name = "db.pod_artifact", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod = %pod, kind = %kind), err)]
 pub(crate) async fn pod_artifact(

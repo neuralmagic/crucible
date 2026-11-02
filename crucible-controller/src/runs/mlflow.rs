@@ -1,5 +1,5 @@
 //! MLflow exporter — the MLflow exporter, a controller background task over evidence that already
-//! exists (the `otel-log` Tier 2 artifact in the drop-box + the folded `runs`/`candidates` rows).
+//! exists (a run's `otel-log` evidence + the folded `runs`/`candidates` rows).
 //!
 //! It runs POST-fold, never inline with a run or a fold. A failed export marks the bookkeeping row
 //! ([`crate::runs::model::MlflowExportRow`]) and retries on the next sweep — the agentic-ci
@@ -128,6 +128,7 @@ fn traces_to_protobuf(payload: &Value, resource_attrs: &[(&str, &str)]) -> Resul
                 value: Some(AnyValue {
                     value: Some(AnyValueEnum::StringValue((*v).to_string())),
                 }),
+                ..KeyValue::default()
             })
             .collect();
         for rs in &mut req.resource_spans {
@@ -147,13 +148,13 @@ struct OtelRecord {
     payload: Value,
 }
 
-/// Read + decompress a pod's stored `otel-log` artifact (gzipped, per the Tier 2 caps) into its
+/// Read + decompress a run's uploaded `otel-log` evidence (gzipped, per the Tier 2 caps) into its
 /// export records. A missing artifact yields an empty vec — a run without captured telemetry still
 /// exports its ledger metrics. Best-effort per line: a torn/unparseable line is skipped, never
 /// fatal.
-async fn read_otel_records(pool: &sqlx::PgPool, pod: &str) -> Result<Vec<OtelRecord>> {
-    let owner = crate::runs::blob_store::ArtifactOwner::PodEvidence {
-        pod: pod.to_string(),
+async fn read_otel_records(pool: &sqlx::PgPool, run_id: &str) -> Result<Vec<OtelRecord>> {
+    let owner = crate::runs::blob_store::ArtifactOwner::Run {
+        run_id: run_id.to_string(),
     };
     let Some(payload) = crate::runs::blob_store::get_artifact(
         pool,
@@ -161,7 +162,7 @@ async fn read_otel_records(pool: &sqlx::PgPool, pod: &str) -> Result<Vec<OtelRec
         crucible_contract::ArtifactKind::OtelLog.as_str(),
     )
     .await
-    .with_context(|| format!("reading {pod}'s otel-log"))?
+    .with_context(|| format!("reading {run_id}'s otel-log"))?
     else {
         return Ok(Vec::new());
     };
@@ -313,11 +314,7 @@ async fn assemble_run_export(
     let domain = repo.unwrap_or_else(|| "unknown".to_string());
     let experiment = cfg.experiment_for(&domain);
 
-    // The captured telemetry, if this run's pod uploaded an otel-log to the drop-box.
-    let records = match &run.pod {
-        Some(pod) => read_otel_records(db.pool(), pod).await?,
-        None => Vec::new(),
-    };
+    let records = read_otel_records(db.pool(), &run.run_id).await?;
 
     let run_attrs = [("crucible.run_id", run_id), ("crucible.domain", &domain)];
     let mut traces = Vec::new();
@@ -954,8 +951,8 @@ mod tests {
         );
         crate::runs::blob_store::put_artifact_bytes(
             &pool,
-            &crate::runs::blob_store::ArtifactOwner::PodEvidence {
-                pod: pod.to_string(),
+            &crate::runs::blob_store::ArtifactOwner::Run {
+                run_id: run_id.to_string(),
             },
             "otel-log",
             u64::MAX,
@@ -1068,8 +1065,8 @@ mod tests {
         let jsonl = "{\"ts\":1,\"path\":\"/v1/traces\",\"payload\":{\"resourceSpans\":[]}}\n";
         crate::runs::blob_store::put_artifact_bytes(
             &pool,
-            &crate::runs::blob_store::ArtifactOwner::PodEvidence {
-                pod: "pod-otel".to_string(),
+            &crate::runs::blob_store::ArtifactOwner::Run {
+                run_id: "run-otel".to_string(),
             },
             "otel-log",
             u64::MAX,
@@ -1078,12 +1075,12 @@ mod tests {
         .await
         .expect("store");
 
-        let recs = read_otel_records(&pool, "pod-otel").await.expect("read");
+        let recs = read_otel_records(&pool, "run-otel").await.expect("read");
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].path, "/v1/traces");
 
         assert!(
-            read_otel_records(&pool, "no-such-pod")
+            read_otel_records(&pool, "no-such-run")
                 .await
                 .expect("missing ok")
                 .is_empty(),

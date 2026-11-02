@@ -45,8 +45,9 @@ describe('parseParamsSchema', () => {
         defaultValue: null,
         pattern: '^[a-z ]+$',
         description: 'What the survey covers.',
+        multiline: false,
       },
-      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false },
       {
         name: 'since',
         valueType: 'string',
@@ -54,8 +55,9 @@ describe('parseParamsSchema', () => {
         defaultValue: '2026-01-01',
         pattern: '^\\d{4}-\\d{2}-\\d{2}$',
         description: null,
+        multiline: false,
       },
-      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
     ]);
   });
 
@@ -67,8 +69,26 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
     ]);
+  });
+
+  it('reads x-multiline on a string as a text area', () => {
+    const specs = specsOf({
+      type: 'object',
+      properties: {
+        log: { type: 'string', 'x-multiline': true, description: 'The failing log.' },
+        title: { type: 'string', 'x-multiline': false },
+      },
+      required: ['log'],
+    });
+    expect(specs.map((s) => [s.name, s.valueType, s.multiline])).toEqual([
+      ['log', 'string', true],
+      ['title', 'string', false],
+    ]);
+    const [log] = specs;
+    if (!log) throw new Error('log spec');
+    expect(validateParam(log, 'line one\nline two')).toBeNull();
   });
 
   it('renders an empty form for a pack that declares no params', () => {
@@ -88,6 +108,8 @@ describe('parseParamsSchema', () => {
       { type: 'object', properties: { n: { type: 'string', pattern: 7 } } },
       { type: 'object', properties: { n: 'string' } },
       { type: 'object', properties: { n: { type: 'string' } }, required: 'n' },
+      { type: 'object', properties: { n: { type: 'string', 'x-multiline': 'yes' } } },
+      { type: 'object', properties: { n: { type: 'integer', 'x-multiline': true } } },
     ]) {
       expect(parseParamsSchema(schema).kind, JSON.stringify(schema)).toBe('unrenderable');
     }
@@ -176,6 +198,7 @@ describe('validateParam', () => {
       defaultValue: null,
       pattern: '(?P<year>\\d{4})',
       description: null,
+      multiline: false,
     };
     expect(validateParam(rustOnly, 'whatever')).toBeNull();
   });

@@ -14,7 +14,7 @@ use crate::types::{Resolution, TraceParams};
 use crucible_contract::outputs::OutputKind;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, schemars, tool, tool_router};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -872,8 +872,8 @@ impl ServerHandler for McpServer {
     /// `get_info` reports `capabilities.tools = None`, so a spec-compliant client (Claude Code)
     /// completes `initialize`, sees no tools capability, and never calls `tools/list`; the server
     /// looks "connected" but exposes zero tools.
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
     }
 
     async fn call_tool(

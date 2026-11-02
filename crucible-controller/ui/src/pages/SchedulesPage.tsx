@@ -1,5 +1,5 @@
 import { $api } from '../api/client';
-import { narrow } from '../ownerContext';
+import { eyebrowFor, narrow } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
   Button,
@@ -117,7 +117,7 @@ export function SchedulesPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Queue"
+        eyebrow={eyebrowFor(owner.team, 'Queue')}
         title="Schedules"
         description="Recurring playbook launches, when each fires next, and what is stopping the ones that will not."
       />

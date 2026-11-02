@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useReducer, useState } from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { $api, apiClient } from '../api/client';
 import { formatError } from '../api/errors';
@@ -24,13 +25,16 @@ import {
   Note,
   Notice,
   NumberInputField,
+  SelectField,
   TextField,
 } from './formControls';
 import { useMediaQuery } from '../useMediaQuery';
 import { CodeSurface } from '../editor/CodeSurface';
 import { CodeDiff } from '../editor/CodeDiff';
 import { FileTreePanel } from '../editor/FileTreePanel';
+import { CloneDraftDialog } from './CloneDraftDialog';
 import { DeleteDraftDialog } from './DeleteDraftDialog';
+import { RenameDraftDialog } from './RenameDraftDialog';
 import { PlaybookParamFields } from './PlaybookParamFields';
 import { SharesSection } from './SharesSection';
 import { PackDispatchNotice } from './PackDispatchNotice';
@@ -48,7 +52,9 @@ import {
 } from './playbookLaunchForm';
 import {
   anchorOf,
+  cloneDraftBody,
   draftLaunchBody,
+  EMPTY_CLONE,
   EMPTY_STUDIO,
   flaggedFiles,
   isDirty,
@@ -59,10 +65,13 @@ import {
   originLabel,
   originMovedLabel,
   studioReducer,
+  type CloneForm,
   type StaleBase,
 } from './draftStudio';
 
 type CompileDto = components['schemas']['DraftCompileDto'];
+type LeftBinding = components['schemas']['LeftBindingDto'];
+type SecretDto = components['schemas']['SecretDto'];
 
 /// The stored tree, read outside the query cache so the buffers are not reloaded.
 async function fetchDraftFiles(id: string): Promise<Record<string, string>> {
@@ -86,7 +95,14 @@ const NO_ERRORS: ReadonlyMap<string, string> = new Map();
 /// schema renders, and the compiled graph — so the previews are never stale against the buffer.
 export function DraftStudioPage() {
   const { id = '' } = useParams<{ id: string }>();
+  return <DraftStudio key={id} id={id} />;
+}
+
+/// Keyed by the draft id, so a rename or a clone that lands on another draft starts from that
+/// draft's own state rather than this one's.
+function DraftStudio({ id }: { id: string }) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const wide = useMediaQuery(WIDE);
   const draft = $api.useQuery('get', '/api/playbook-drafts/{id}', { params: { path: { id } } });
   const files = $api.useQuery('get', '/api/playbook-drafts/{id}/files', {
@@ -96,6 +112,10 @@ export function DraftStudioPage() {
     params: { path: { id } },
   });
   const caps = $api.useQuery('get', '/api/config/playbook-caps');
+  const whoami = $api.useQuery('get', '/api/whoami');
+  const secrets = $api.useQuery('get', '/api/secrets', {
+    enabled: whoami.data?.user != null,
+  });
   const origin = draft.data?.origin ?? null;
   const moved = originMovedLabel(origin);
   const originFiles = $api.useQuery(
@@ -107,6 +127,8 @@ export function DraftStudioPage() {
 
   const save = $api.useMutation('post', '/api/playbook-drafts/{id}/versions');
   const drop = $api.useMutation('delete', '/api/playbook-drafts/{id}');
+  const rename = $api.useMutation('post', '/api/playbook-drafts/{id}/rename');
+  const clone = $api.useMutation('post', '/api/playbook-drafts/{id}/clone');
   const launch = $api.useMutation('post', '/api/playbook-drafts/{id}/launch');
   const graduate = $api.useMutation('post', '/api/playbook-drafts/{id}/graduate');
   const publish = $api.useMutation('post', '/api/playbook-drafts/{id}/publish');
@@ -119,6 +141,13 @@ export function DraftStudioPage() {
   const [overtaking, setOvertaking] = useState<Record<string, string>>({});
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [renaming, setRenaming] = useState(false);
+  const [renameTo, setRenameTo] = useState('');
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [cloning, setCloning] = useState(false);
+  const [cloneForm, setCloneForm] = useState<CloneForm>(EMPTY_CLONE);
+  const [cloneError, setCloneError] = useState<string | null>(null);
+  const [cloneLeft, setCloneLeft] = useState<readonly LeftBinding[] | null>(null);
 
   const [values, setValues] = useState<Record<string, string>>({});
   const [maxCost, setMaxCost] = useState(DEFAULT_MAX_COST);
@@ -129,6 +158,7 @@ export function DraftStudioPage() {
 
   const [gradRepo, setGradRepo] = useState('');
   const [gradPath, setGradPath] = useState('');
+  const [gradSecretId, setGradSecretId] = useState('');
   const [gradError, setGradError] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState<string | null>(null);
 
@@ -155,6 +185,26 @@ export function DraftStudioPage() {
     if (publishTarget === null) return;
     setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
   }, [publishTarget]);
+
+  const personalGithubSecrets = useMemo<SecretDto[]>(() => {
+    const login = whoami.data?.user ?? null;
+    if (login === null) return [];
+    return (secrets.data ?? []).filter(
+      secret =>
+        secret.owner === `user:${login}` &&
+        secret.kind === 'opaque' &&
+        secret.visibility === 'broker_only' &&
+        secret.mode !== 'minted',
+    );
+  }, [secrets.data, whoami.data?.user]);
+
+  const githubSecretOptions = useMemo(
+    () => [
+      { value: '', label: 'Controller identity' },
+      ...personalGithubSecrets.map(secret => ({ value: secret.id, label: secret.name })),
+    ],
+    [personalGithubSecrets],
+  );
 
   const first = stored.data;
   useEffect(() => {
@@ -272,12 +322,54 @@ export function DraftStudioPage() {
     }
   };
 
+  const handleRename = async () => {
+    setRenameError(null);
+    try {
+      const renamed = await rename.mutateAsync({
+        params: { path: { id } },
+        body: { id: renameTo.trim() },
+      });
+      await queryClient.invalidateQueries({ queryKey: ['get', '/api/playbook-drafts'] });
+      setRenaming(false);
+      void navigate(`/playbooks/drafts/${encodeURIComponent(renamed.id)}`, { replace: true });
+    } catch (err: unknown) {
+      setRenameError(formatError(err));
+    }
+  };
+
+  const openCopy = (copy: string) => {
+    setCloning(false);
+    void navigate(`/playbooks/drafts/${encodeURIComponent(copy)}`);
+  };
+
+  const handleClone = async () => {
+    setCloneError(null);
+    try {
+      const cloned = await clone.mutateAsync({
+        params: { path: { id } },
+        body: cloneDraftBody(cloneForm),
+      });
+      await queryClient.invalidateQueries({ queryKey: ['get', '/api/playbook-drafts'] });
+      if (cloned.left_bindings.length === 0) {
+        openCopy(cloned.id);
+      } else {
+        setCloneLeft(cloned.left_bindings);
+      }
+    } catch (err: unknown) {
+      setCloneError(formatError(err));
+    }
+  };
+
   const handleGraduate = async () => {
     setGradError(null);
     try {
       const ack = await graduate.mutateAsync({
         params: { path: { id } },
-        body: { repo: gradRepo.trim(), path: gradPath.trim() },
+        body: {
+          repo: gradRepo.trim(),
+          path: gradPath.trim(),
+          ...(gradSecretId === '' ? {} : { github_secret_id: gradSecretId }),
+        },
       });
       setPrUrl(ack.pr_url);
       void draft.refetch();
@@ -679,6 +771,14 @@ export function DraftStudioPage() {
                   onChange={setGradPath}
                   hint="The pack directory inside that repo. Blank is the repo root."
                 />
+                <SelectField
+                  id="studio-grad-secret"
+                  label="GitHub credential"
+                  value={gradSecretId}
+                  onChange={setGradSecretId}
+                  options={githubSecretOptions}
+                  hint="A personal opaque, broker-only secret pushes and opens the PR as you."
+                />
               </FormGrid>
             </SectionBody>
             {gradError === null ? null : (
@@ -787,6 +887,29 @@ export function DraftStudioPage() {
             </a>
             <Button
               className="uppercase"
+              disabled={!writable || isDirty(state)}
+              onClick={() => {
+                setRenameError(null);
+                setRenameTo(id);
+                setRenaming(true);
+              }}
+            >
+              Rename
+            </Button>
+            <Button
+              className="uppercase"
+              disabled={isDirty(state)}
+              onClick={() => {
+                setCloneError(null);
+                setCloneLeft(null);
+                setCloneForm(EMPTY_CLONE);
+                setCloning(true);
+              }}
+            >
+              Clone
+            </Button>
+            <Button
+              className="uppercase"
               disabled={!actions.includes('delete')}
               onClick={() => {
                 setDeleteError(null);
@@ -797,6 +920,42 @@ export function DraftStudioPage() {
             </Button>
           </div>
         }
+      />
+
+      <RenameDraftDialog
+        id={id}
+        open={renaming}
+        to={renameTo}
+        pending={rename.isPending}
+        error={renameError}
+        onToChange={setRenameTo}
+        onOpenChange={setRenaming}
+        onConfirm={() => {
+          void handleRename();
+        }}
+      />
+
+      <CloneDraftDialog
+        id={id}
+        open={cloning}
+        form={cloneForm}
+        pending={clone.isPending}
+        error={cloneError}
+        left={cloneLeft}
+        onFormChange={setCloneForm}
+        onOpenChange={(open) => {
+          if (!open && cloneLeft !== null) {
+            openCopy(cloneForm.to.trim());
+            return;
+          }
+          setCloning(open);
+        }}
+        onConfirm={() => {
+          void handleClone();
+        }}
+        onOpenCopy={() => {
+          openCopy(cloneForm.to.trim());
+        }}
       />
 
       <DeleteDraftDialog

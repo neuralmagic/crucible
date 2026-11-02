@@ -1,0 +1,17 @@
+# Namespace and LocalQueue the cluster e2e submits through. The label is what the
+# Red Hat build of Kueue's ClusterQueues select on.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: crucible-kueue-e2e
+  labels:
+    kueue.openshift.io/managed: "true"
+    crucible.dev/purpose: e2e
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: crucible-e2e
+  namespace: crucible-kueue-e2e
+spec:
+  clusterQueue: crucible
