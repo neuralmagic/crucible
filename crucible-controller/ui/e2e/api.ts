@@ -777,6 +777,25 @@ export const ROUTES: Record<string, Json> = {
       updated_at: '2026-08-21T07:00:00Z',
     },
   ],
+  '/api/playbooks/survey': {
+    id: 'survey',
+    description: 'Survey a topic across the tracked repos and file what it finds.',
+    source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/survey' },
+    rev: '9f2c1a4c0b3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f',
+    tree_digest: 'tree1:1111111111111111111111111111111111111111111111111111111111111111',
+    schema_digest: 'sha256:2222',
+    core_rev: '7c2c1a5',
+    dispatch: DISPATCHABLE,
+    owner: 'team:llm-d',
+    actions: ['read', 'create', 'update', 'delete', 'transfer', 'share', 'launch'],
+    created_by: 'wren',
+    created_at: '2026-08-20T07:00:00Z',
+    updated_at: '2026-08-20T07:00:00Z',
+    files: {
+      'crucible.toml': '[repo]\npath = "."\n\n[workflow]\ntype = "playbook"\nfile = "workflow.star"\n',
+      'workflow.star': 'params = {}\nworkflow(type = "playbook", tasks = [], result = None)\n',
+    },
+  },
   '/api/playbooks/survey/schema': {
     type: 'object',
     properties: {
