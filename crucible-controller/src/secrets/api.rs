@@ -79,8 +79,8 @@ dto! {
         pub schema_digest: Option<String>,
         pub created_by: Option<String>,
         pub created_at: String,
-        /// The blueprint this binding was carried from.
-        pub carried_from: Option<String>,
+        /// The blueprint this binding came from.
+        pub origin: Option<String>,
         /// On a binding just made on a blueprint: whether it carries to drafts started from it.
         pub carries: Option<bool> = None,
     }

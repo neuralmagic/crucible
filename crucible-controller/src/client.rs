@@ -522,7 +522,7 @@ mod tests {
             ),
             (
                 "0073_blueprints.sql",
-                "39d591a73d1b6408a32768b13aa9fe2b3034fc678c3bd85119f3a9c01062749c",
+                "64a282e389b035b4db082c9bc094797b3aeb54cf634e370e6dfa37df6c6734a8",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

@@ -77,7 +77,7 @@ pub fn render_schema() -> String {
     }
     for resource in ResourceType::ALL {
         out.push_str(&format!(
-            "entity {} {{ id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String, public?: Bool, carried_from?: String }};\n",
+            "entity {} {{ id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String, public?: Bool, origin_owner?: String }};\n",
             resource.entity_type()
         ));
     }
@@ -291,9 +291,9 @@ impl Engine {
         if resource.public {
             attrs.push(("public".to_string(), RestrictedExpression::new_bool(true)));
         }
-        if let Some(owner) = &resource.carried_from {
+        if let Some(owner) = &resource.origin_owner {
             attrs.push((
-                "carried_from".to_string(),
+                "origin_owner".to_string(),
                 RestrictedExpression::new_string(owner.to_string()),
             ));
         }
@@ -723,7 +723,7 @@ mod tests {
     }
 
     #[test]
-    fn a_member_binds_a_secret_carried_from_its_own_teams_blueprint_only() {
+    fn a_member_binds_a_secret_from_its_own_teams_blueprint_only() {
         let engine = Engine::load(DEFAULT_POLICY).expect("default");
         let llm_d = Principal::Team(slug("llm-d"));
         let member = Subject::user(
@@ -739,12 +739,12 @@ mod tests {
         };
         let mut secret = Resource::new(ResourceType::Secret, "s", llm_d.clone());
         assert!(!bind(&member, &secret), "a member does not bind outright");
-        secret.carried_from = Some(Principal::Team(slug("other")));
+        secret.origin_owner = Some(Principal::Team(slug("other")));
         assert!(
             !bind(&member, &secret),
             "carried from another team's blueprint"
         );
-        secret.carried_from = Some(llm_d.clone());
+        secret.origin_owner = Some(llm_d.clone());
         assert!(bind(&member, &secret));
         assert!(!bind(&user("zed"), &secret), "outside the team");
         assert!(
@@ -754,7 +754,7 @@ mod tests {
             "carrying confers bind alone"
         );
         let mut personal = Resource::new(ResourceType::Secret, "p", Principal::User("reed".into()));
-        personal.carried_from = Some(Principal::User("reed".into()));
+        personal.origin_owner = Some(Principal::User("reed".into()));
         assert!(!bind(&user("kim"), &personal));
     }
 

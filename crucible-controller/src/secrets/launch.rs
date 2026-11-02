@@ -972,8 +972,8 @@ mod tests {
             schema_digest: None,
             created_by: None,
             created_at: "now".to_string(),
-            carried_from: None,
-            carried_from_binding: None,
+            origin: None,
+            origin_binding: None,
         };
         let secret = SecretRow {
             id: "s".to_string(),

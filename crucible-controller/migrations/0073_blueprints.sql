@@ -6,10 +6,10 @@ ALTER TABLE playbooks
     ADD CONSTRAINT playbooks_public_is_a_blueprint CHECK (blueprint OR NOT public);
 
 ALTER TABLE secret_bindings
-    ADD COLUMN carried_from         TEXT,
-    ADD COLUMN carried_from_binding TEXT;
-CREATE INDEX secret_bindings_carried_from ON secret_bindings (carried_from)
-    WHERE carried_from IS NOT NULL;
+    ADD COLUMN origin         TEXT,
+    ADD COLUMN origin_binding TEXT;
+CREATE INDEX secret_bindings_origin ON secret_bindings (origin)
+    WHERE origin IS NOT NULL;
 
 CREATE TABLE draft_placeholders (
     draft_id        TEXT NOT NULL

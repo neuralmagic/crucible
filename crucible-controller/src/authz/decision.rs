@@ -151,8 +151,8 @@ pub struct Resource {
     pub run: Option<String>,
     /// A public blueprint (RFC-0006 C-PUBLIC).
     pub public: bool,
-    /// The owner of the blueprint a bind on this secret is carried from (RFC-0006 C-CARRY).
-    pub carried_from: Option<Principal>,
+    /// The owner of the blueprint a bind on this secret comes from (RFC-0006 C-CARRY).
+    pub origin_owner: Option<Principal>,
 }
 
 impl Resource {
@@ -164,7 +164,7 @@ impl Resource {
             share: None,
             run: None,
             public: false,
-            carried_from: None,
+            origin_owner: None,
         }
     }
 

@@ -74,7 +74,7 @@ when { resource has public && resource.public };
 permit(principal, action == Action::"secret:bind", resource)
 when {
     resource.owner_kind == "team" && resource has owner_role
-    && resource has carried_from && resource.carried_from == resource.owner
+    && resource has origin_owner && resource.origin_owner == resource.owner
 };
 
 @id("share-viewer")

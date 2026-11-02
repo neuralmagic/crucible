@@ -403,7 +403,7 @@ async fn a_teams_blueprint_carries_its_secrets_to_members_and_placeholders_to_ev
     assert_eq!(status, StatusCode::CREATED, "{used}");
     assert_eq!(used["id"], "kim-copy");
     assert_eq!(names(&used["bindings"]), vec!["gh_token"], "{used}");
-    assert_eq!(used["bindings"][0]["carried_from"], "mlr-pack");
+    assert_eq!(used["bindings"][0]["origin"], "mlr-pack");
     assert_eq!(used["bindings"][0]["scope_id"], "kim-copy");
     assert_eq!(used["bindings"][0]["projection"], "GH_TOKEN");
     assert_eq!(
@@ -421,9 +421,9 @@ async fn a_teams_blueprint_carries_its_secrets_to_members_and_placeholders_to_ev
     let carried = scope_bindings(&pool, "kim-copy").await;
     assert_eq!(carried.len(), 1);
     assert_eq!(carried[0].secret_id, gh);
-    assert_eq!(carried[0].carried_from.as_deref(), Some("mlr-pack"));
+    assert_eq!(carried[0].origin.as_deref(), Some("mlr-pack"));
     assert_eq!(
-        carried[0].carried_from_binding.as_deref(),
+        carried[0].origin_binding.as_deref(),
         Some(gh_source.as_str())
     );
     assert_eq!(carried[0].pack_rev, None);

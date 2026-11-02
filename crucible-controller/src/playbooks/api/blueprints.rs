@@ -123,7 +123,7 @@ async fn carries(
         return Ok(Err(reason));
     }
     let mut resource = Resource::new(ResourceType::Secret, &secret.id, secret.owner.clone());
-    resource.carried_from = Some(blueprint.owner.clone());
+    resource.origin_owner = Some(blueprint.owner.clone());
     let in_team = caller
         .subject()
         .is_some_and(|subject| resource.owner_role(&subject).is_some());
@@ -632,7 +632,7 @@ async fn carry(
                 schema_digest: None,
                 created_by: caller.actor_principals().login(),
             },
-            store::CarriedFrom {
+            store::Origin {
                 blueprint,
                 binding: &binding.id,
             },
