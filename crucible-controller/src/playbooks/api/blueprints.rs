@@ -5,11 +5,12 @@ use crate::api::dto::*;
 use crate::api::state::*;
 use crate::authz::action::{Action, ResourceType, Verb};
 use crate::authz::decision::Resource;
+use crate::playbooks::api::drafts::PlaceholderDto;
 use crate::playbooks::blueprints::{Placeholder, PlaceholderReason, barred};
 use crate::playbooks::registry::PlaybookRow;
 use crate::secrets::manifest::DeclaredSecret;
 use crate::secrets::store::{self, BindingRow, SecretRow};
-use crate::secrets::{AuditAction, ProjectionKind, ScopeKind, SecretMode};
+use crate::secrets::{AuditAction, ScopeKind, SecretMode};
 use anyhow::Context as _;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -23,27 +24,6 @@ pub struct BlueprintStateDto {
     pub id: String,
     pub blueprint: bool,
     pub public: bool,
-}
-
-/// A declared secret a draft started from a blueprint still has to bind.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct PlaceholderDto {
-    pub declared_name: String,
-    pub projection_kind: Option<ProjectionKind>,
-    pub projection: Option<String>,
-    pub reason: PlaceholderReason,
-}
-
-impl From<Placeholder> for PlaceholderDto {
-    fn from(p: Placeholder) -> Self {
-        let (projection_kind, projection) = p.projection.unzip();
-        PlaceholderDto {
-            declared_name: p.declared_name.to_string(),
-            projection_kind,
-            projection,
-            reason: p.reason,
-        }
-    }
 }
 
 /// One secret a blueprint declares, as it would reach the caller.

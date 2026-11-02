@@ -9,6 +9,8 @@ use crate::playbooks::api::registry::{
     PackDispatchDto, PlaybookLaunchAck, UNREADABLE_MANIFEST, check_ceilings, undispatchable,
 };
 
+use crate::playbooks::blueprints::{Placeholder, PlaceholderReason};
+
 use crate::playbooks::co_draft::CoDraft;
 
 use crate::playbooks::drafts::{
@@ -185,6 +187,27 @@ dto! {
     }
 }
 
+/// A declared secret a draft started from a blueprint still has to bind.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PlaceholderDto {
+    pub declared_name: String,
+    pub projection_kind: Option<crate::secrets::ProjectionKind>,
+    pub projection: Option<String>,
+    pub reason: PlaceholderReason,
+}
+
+impl From<Placeholder> for PlaceholderDto {
+    fn from(p: Placeholder) -> Self {
+        let (projection_kind, projection) = p.projection.unzip();
+        PlaceholderDto {
+            declared_name: p.declared_name.to_string(),
+            projection_kind,
+            projection,
+            reason: p.reason,
+        }
+    }
+}
+
 /// A draft with its save history.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlaybookDraftDetail {
@@ -192,7 +215,7 @@ pub struct PlaybookDraftDetail {
     pub draft: PlaybookDraftDto,
     pub versions: Vec<DraftVersionDto>,
     /// Secrets a blueprint left for this draft to bind.
-    pub placeholders: Vec<crate::playbooks::api::blueprints::PlaceholderDto>,
+    pub placeholders: Vec<PlaceholderDto>,
 }
 
 /// What one compile-on-save produced. Diagnostics are the payload, not an error: a save that did

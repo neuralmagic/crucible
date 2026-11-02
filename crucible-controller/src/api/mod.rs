@@ -283,7 +283,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::DraftClonedDto,
         crate::secrets::api::LeftBindingDto,
         crate::playbooks::api::blueprints::BlueprintStateDto,
-        crate::playbooks::api::blueprints::PlaceholderDto,
+        crate::playbooks::api::drafts::PlaceholderDto,
         crate::playbooks::api::blueprints::BlueprintSecretDto,
         crate::playbooks::api::blueprints::BlueprintDto,
         crate::playbooks::api::blueprints::UseBlueprintBody,
