@@ -77,7 +77,7 @@ pub fn render_schema() -> String {
     }
     for resource in ResourceType::ALL {
         out.push_str(&format!(
-            "entity {} {{ id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String }};\n",
+            "entity {} {{ id: String, owner: String, owner_kind: String, owner_role?: String, share?: String, run?: String, public?: Bool, carried_from?: String }};\n",
             resource.entity_type()
         ));
     }
@@ -288,6 +288,15 @@ impl Engine {
                 RestrictedExpression::new_string(Principal::Run(run.clone()).to_string()),
             ));
         }
+        if resource.public {
+            attrs.push(("public".to_string(), RestrictedExpression::new_bool(true)));
+        }
+        if let Some(owner) = &resource.carried_from {
+            attrs.push((
+                "carried_from".to_string(),
+                RestrictedExpression::new_string(owner.to_string()),
+            ));
+        }
         let resource_entity =
             Entity::new(resource_uid.clone(), attrs.into_iter().collect(), [].into())
                 .map_err(|e| e.to_string())?;
@@ -369,9 +378,9 @@ impl ActivePolicy {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::authz::decision::ShareRole;
     use crate::authz::model::PLATFORM_ADMINISTRATORS;
+    use crate::authz::policy::*;
 
     fn slug(s: &str) -> TeamSlug {
         TeamSlug::parse(s).expect("slug")
@@ -396,7 +405,9 @@ mod tests {
         assert!(ids.contains(&"playbook-publishers-publish".to_string()));
         assert!(ids.contains(&"everyone-launch-platform-playbooks".to_string()));
         assert!(ids.contains(&"operators-access-autoresearch".to_string()));
-        assert_eq!(ids.len(), 19);
+        assert!(ids.contains(&"everyone-read-public-blueprints".to_string()));
+        assert!(ids.contains(&"team-member-bind-carried".to_string()));
+        assert_eq!(ids.len(), 21);
     }
 
     #[test]
@@ -673,6 +684,78 @@ mod tests {
                 )
                 .allowed
         );
+    }
+
+    #[test]
+    fn a_public_blueprint_is_read_by_every_user_and_nothing_more() {
+        let engine = Engine::load(DEFAULT_POLICY).expect("default");
+        let mut playbook =
+            Resource::new(ResourceType::Playbook, "p", Principal::Team(slug("llm-d")));
+        let zed = user("zed");
+        let may = |verb: Verb, resource: &Resource| {
+            engine
+                .authorize(&zed, act(ResourceType::Playbook, verb), resource, 0)
+                .allowed
+        };
+        assert!(!may(Verb::Read, &playbook));
+        playbook.public = true;
+        assert!(may(Verb::Read, &playbook));
+        for verb in [Verb::Launch, Verb::Update, Verb::Share, Verb::Delete] {
+            assert!(!may(verb, &playbook), "{verb:?}");
+        }
+        let mut draft = Resource::new(
+            ResourceType::PlaybookDraft,
+            "d",
+            Principal::Team(slug("llm-d")),
+        );
+        draft.public = true;
+        assert!(
+            !engine
+                .authorize(
+                    &zed,
+                    act(ResourceType::PlaybookDraft, Verb::Read),
+                    &draft,
+                    0
+                )
+                .allowed,
+            "the rule reads playbooks only"
+        );
+    }
+
+    #[test]
+    fn a_member_binds_a_secret_carried_from_its_own_teams_blueprint_only() {
+        let engine = Engine::load(DEFAULT_POLICY).expect("default");
+        let llm_d = Principal::Team(slug("llm-d"));
+        let member = Subject::user(
+            "kim",
+            false,
+            true,
+            BTreeMap::from([("team:llm-d".to_string(), "member".to_string())]),
+        );
+        let bind = |subject: &Subject, resource: &Resource| {
+            engine
+                .authorize(subject, act(ResourceType::Secret, Verb::Bind), resource, 0)
+                .allowed
+        };
+        let mut secret = Resource::new(ResourceType::Secret, "s", llm_d.clone());
+        assert!(!bind(&member, &secret), "a member does not bind outright");
+        secret.carried_from = Some(Principal::Team(slug("other")));
+        assert!(
+            !bind(&member, &secret),
+            "carried from another team's blueprint"
+        );
+        secret.carried_from = Some(llm_d.clone());
+        assert!(bind(&member, &secret));
+        assert!(!bind(&user("zed"), &secret), "outside the team");
+        assert!(
+            !engine
+                .authorize(&member, act(ResourceType::Secret, Verb::Rotate), &secret, 0)
+                .allowed,
+            "carrying confers bind alone"
+        );
+        let mut personal = Resource::new(ResourceType::Secret, "p", Principal::User("reed".into()));
+        personal.carried_from = Some(Principal::User("reed".into()));
+        assert!(!bind(&user("kim"), &personal));
     }
 
     #[test]

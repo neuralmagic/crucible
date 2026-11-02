@@ -66,6 +66,17 @@ when { principal.hasTag("team:platform-operators") };
 permit(principal is UserPrincipal, action == Action::"issue:update", resource)
 when { principal.hasTag("team:platform-operators") && resource.owner == "team:platform-administrators" };
 
+@id("everyone-read-public-blueprints")
+permit(principal is UserPrincipal, action == Action::"playbook:read", resource)
+when { resource has public && resource.public };
+
+@id("team-member-bind-carried")
+permit(principal, action == Action::"secret:bind", resource)
+when {
+    resource.owner_kind == "team" && resource has owner_role
+    && resource has carried_from && resource.carried_from == resource.owner
+};
+
 @id("share-viewer")
 permit(principal, action in [Action::"read"], resource)
 when { resource has share && ["viewer", "launcher", "editor"].contains(resource.share) };

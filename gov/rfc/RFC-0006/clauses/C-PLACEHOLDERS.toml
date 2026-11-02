@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PLACEHOLDERS"
+title = "Placeholders"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Each secret the blueprint revision's pack declares that does not carry MUST become a placeholder on the new draft. A placeholder MUST give the declared name, the projection kind and projection of the blueprint's binding when one exists, and the first reason that applies of: no binding on the blueprint; a binding restricted to a reviewed revision; a secret owned by a user; a secret not owned by the blueprint's owner; a team the request's subject set does not include; a bind the active policy set denies; a check of a direct bind that did not pass. A placeholder MUST NOT reveal the bound secret's name, owner, or storage location to a subject that may not read that secret.
+
+A placeholder MUST be filled by an ordinary bind on the draft, which requires `bind` on the secret the user chooses, and that bind SHOULD default to the placeholder's projection. Reading the draft MUST list its unfilled placeholders. A placeholder MUST be dropped once the draft binds its declared name or its pack stops declaring it. A launch of a draft with an unfilled placeholder MUST be refused naming the placeholder.
+
+
+
+A personal secret never leaves its owner: the blueprint passes on what to bind, not what was bound."""

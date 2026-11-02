@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CARRY"
+title = "Carried bindings"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A binding on a blueprint carries to the new draft when all of these hold: the blueprint's owner is a team; the bound secret's owner is that team; the request's subject set includes that team; the binding is not restricted to a reviewed pack revision; and every check a direct bind of the secret by that subject makes, other than `bind` itself, passes. A carried binding MUST bind the same secret under the same declared name, projection kind, and projection, with the new draft as its scope. Creating it MUST be decided as `bind` on the secret for the request's subject, with the source blueprint in the request. In addition to the grants of [[RFC-0003:C-POLICY]], the default policy set MUST permit that decision whenever the conditions above hold. No other way of creating a draft carries a binding under this clause.
+
+Each carried binding MUST record its source blueprint and source binding, MUST be audited as a bind whose actor is the request's actor, and MUST be listable by source blueprint by any subject that may read the secret. A carried binding is independent of its source once created: unbinding or rebinding either MUST NOT change the other. A response that creates a binding on a blueprint MUST state whether that binding carries.
+
+
+
+Binding a team secret to the team's blueprint lets every member use it from a draft they can edit. Members already launch with it from the team's own playbooks; carrying extends that to code they change, so a binding restricted to reviewed code never carries and each copy names its source."""

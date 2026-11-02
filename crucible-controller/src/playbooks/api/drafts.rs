@@ -191,6 +191,8 @@ pub struct PlaybookDraftDetail {
     #[serde(flatten)]
     pub draft: PlaybookDraftDto,
     pub versions: Vec<DraftVersionDto>,
+    /// Secrets a blueprint left for this draft to bind.
+    pub placeholders: Vec<crate::playbooks::api::blueprints::PlaceholderDto>,
 }
 
 /// What one compile-on-save produced. Diagnostics are the payload, not an error: a save that did
@@ -497,9 +499,11 @@ pub(crate) async fn get_playbook_draft(
         diagnostics: latest.map_or(0, |v| v.diagnostics.len()),
         draft,
     };
+    let placeholders = crate::playbooks::blueprints::placeholders(state.db.pool(), &id).await?;
     Ok(Json(PlaybookDraftDetail {
         draft: PlaybookDraftDto::new(summary, actions),
         versions: versions.into_iter().map(DraftVersionDto::from).collect(),
+        placeholders: placeholders.into_iter().map(Into::into).collect(),
     })
     .into_response())
 }

@@ -56,6 +56,7 @@ const PlaybookDetailPage = page(() => import('./pages/PlaybookDetailPage'), 'Pla
 const PlaybookImportPage = page(() => import('./pages/PlaybookImportPage'), 'PlaybookImportPage');
 const PlaybookImportReviewPage = page(() => import('./pages/PlaybookImportReviewPage'), 'PlaybookImportReviewPage');
 const PlaybookDraftsPage = page(() => import('./pages/PlaybookDraftsPage'), 'PlaybookDraftsPage');
+const BlueprintsPage = page(() => import('./pages/BlueprintsPage'), 'BlueprintsPage');
 const DraftStudioPage = page(() => import('./pages/DraftStudioPage'), 'DraftStudioPage');
 const PlaybookLaunchPage = page(() => import('./pages/PlaybookLaunchPage'), 'PlaybookLaunchPage');
 const PlaybookRunsPage = page(() => import('./pages/PlaybookRunsPage'), 'PlaybookRunsPage');
@@ -360,6 +361,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
         },
         { to: '/playbooks', label: 'Playbooks', icon: 'PB' },
         { to: '/playbooks/drafts', label: 'Drafts', icon: 'DR' },
+        { to: '/blueprints', label: 'Blueprints', icon: 'BP' },
         { to: '/schedules', label: 'Schedules', icon: 'SC' },
         { to: '/webhooks', label: 'Webhooks', icon: 'WH' },
       ],
@@ -533,6 +535,7 @@ export function App() {
             <Route path="/playbooks/import/:id" element={<PlaybookImportReviewPage />} />
             <Route path="/playbooks/drafts" element={<PlaybookDraftsPage />} />
             <Route path="/playbooks/drafts/:id" element={<DraftStudioPage />} />
+            <Route path="/blueprints" element={<BlueprintsPage />} />
             <Route path="/playbooks/:id/launch" element={<PlaybookLaunchPage />} />
             <Route path="/playbook-runs" element={<PlaybookRunsPage />} />
             <Route path="/schedules" element={<SchedulesPage />} />
