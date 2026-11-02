@@ -895,6 +895,29 @@ pub struct Schedule {
     pub owner_signin_required: bool,
 }
 
+/// The provider a scope's unpinned dispatches of one workload class take.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DispatchDefault {
+    pub scope_kind: String,
+    #[serde(default)]
+    pub scope_ref: String,
+    pub workload_class: String,
+    pub provider: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub fallback_provider: Option<String>,
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+}
+
+/// What `GET /api/config/providers` answers: the launch pickers' providers and defaults.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DispatchProviders {
+    #[serde(default)]
+    pub defaults: Vec<DispatchDefault>,
+}
+
 /// One tracker watch, as `GET /api/watches` lists it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Watch {

@@ -1123,6 +1123,14 @@ pub fn secrets(list: &[dto::Secret]) -> String {
     )
 }
 
+pub fn secret_created(s: &dto::Secret) -> String {
+    format!(
+        "registered {} as {}\n  kind: {}  visibility: {}  mode: {}  owner: {}\n\
+         bind it: crux secret-bind {} --playbook <id> --env <VAR>\n",
+        s.name, s.id, s.kind, s.visibility, s.mode, s.owner, s.id
+    )
+}
+
 pub fn secret_bound(b: &dto::SecretBinding) -> String {
     format!(
         "bound {} to {}/{}: accepted\n  as {} -> {} {}\n  binding: {}\nactor: {}\n",
@@ -1249,6 +1257,43 @@ pub fn runs(list: &[dto::RunRow]) -> String {
         table(
             &[
                 "RUN", "NAME", "STATUS", "REPO", "ISSUE", "BEST", "COST", "CLUSTER", "CREATED"
+            ],
+            &rows
+        )
+    )
+}
+
+pub fn dispatch_defaults(list: &[dto::DispatchDefault]) -> String {
+    if list.is_empty() {
+        return "no dispatch defaults\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|d| {
+            vec![
+                match d.scope_ref.as_str() {
+                    "" => d.scope_kind.clone(),
+                    scope_ref => format!("{}:{scope_ref}", d.scope_kind),
+                },
+                d.workload_class.clone(),
+                d.provider.clone(),
+                or_dash(d.model.as_deref()),
+                or_dash(d.fallback_provider.as_deref()),
+                or_dash(d.fallback_model.as_deref()),
+            ]
+        })
+        .collect();
+    format!(
+        "{} dispatch defaults\n{}",
+        list.len(),
+        table(
+            &[
+                "SCOPE",
+                "CLASS",
+                "PROVIDER",
+                "MODEL",
+                "FALLBACK",
+                "FALLBACK MODEL"
             ],
             &rows
         )
