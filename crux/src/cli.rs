@@ -611,6 +611,59 @@ enum Command {
         json: bool,
     },
 
+    /// List the blueprints you can read, with what each would carry for you and leave to bind.
+    Blueprints {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are
+    /// in that team; every other declared secret is a placeholder to bind with `secret-bind`.
+    BlueprintUse {
+        /// The blueprint's id, as `blueprints` lists it.
+        id: String,
+        /// The new draft's id.
+        to: String,
+        /// Defaults to the blueprint's.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Offer a registered playbook as a blueprint. Refused unless you may bind every secret
+    /// whose binding would carry.
+    BlueprintMark {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Withdraw a blueprint, public or not. Drafts started from it keep what they carried.
+    BlueprintUnmark {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Let every user read and use a blueprint. Only its owning team's members get its secrets.
+    BlueprintPublic {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Make a public blueprint private again.
+    BlueprintPrivate {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Publish a draft: register its newest compiling version as a playbook, with no review.
     DraftPublish {
         draft_id: String,
@@ -968,6 +1021,25 @@ pub async fn run() -> Result<()> {
             description,
             json,
         } => ops::draft_clone(&client, &draft_id, &to, description.as_deref(), json).await?,
+        Command::Blueprints { json } => ops::blueprints(&client, json).await?,
+        Command::BlueprintUse {
+            id,
+            to,
+            description,
+            json,
+        } => ops::blueprint_use(&client, &id, &to, description.as_deref(), json).await?,
+        Command::BlueprintMark { id, json } => {
+            ops::blueprint_mark(&client, &id, true, json).await?
+        }
+        Command::BlueprintUnmark { id, json } => {
+            ops::blueprint_mark(&client, &id, false, json).await?
+        }
+        Command::BlueprintPublic { id, json } => {
+            ops::blueprint_public(&client, &id, true, json).await?
+        }
+        Command::BlueprintPrivate { id, json } => {
+            ops::blueprint_public(&client, &id, false, json).await?
+        }
         Command::DraftGraduate {
             draft_id,
             repo,
@@ -1361,6 +1433,46 @@ mod tests {
                 assert_eq!(files, "-");
             }
             _ => panic!("expected draft-save"),
+        }
+    }
+
+    #[test]
+    fn a_blueprint_use_names_the_blueprint_and_the_new_draft() {
+        assert!(Cli::try_parse_from(["crux", "blueprint-use", "mlr-pack"]).is_err());
+        let cli = Cli::try_parse_from([
+            "crux",
+            "blueprint-use",
+            "mlr-pack",
+            "kim-copy",
+            "--description",
+            "mine",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::BlueprintUse {
+                id,
+                to,
+                description,
+                json,
+            } => {
+                assert_eq!(id, "mlr-pack");
+                assert_eq!(to, "kim-copy");
+                assert_eq!(description.as_deref(), Some("mine"));
+                assert!(!json);
+            }
+            _ => panic!("expected blueprint-use"),
+        }
+        for toggle in [
+            "blueprint-mark",
+            "blueprint-unmark",
+            "blueprint-public",
+            "blueprint-private",
+        ] {
+            assert!(Cli::try_parse_from(["crux", toggle]).is_err(), "{toggle}");
+            assert!(
+                Cli::try_parse_from(["crux", toggle, "mlr-pack"]).is_ok(),
+                "{toggle}"
+            );
         }
     }
 

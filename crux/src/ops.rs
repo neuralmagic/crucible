@@ -714,6 +714,48 @@ pub async fn draft_clone(
     ))
 }
 
+pub async fn blueprints(c: &Client, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.blueprints::<Value>().await?);
+    }
+    let list: Vec<dto::Blueprint> = c.blueprints().await?;
+    Ok(render::blueprints(&list))
+}
+
+/// Mark or unmark a registered playbook as a blueprint.
+pub async fn blueprint_mark(c: &Client, id: &str, on: bool, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.set_blueprint::<Value>(id, on).await?);
+    }
+    let state: dto::BlueprintState = c.set_blueprint(id, on).await?;
+    Ok(render::blueprint_state(&state))
+}
+
+/// Make a blueprint public or private.
+pub async fn blueprint_public(c: &Client, id: &str, public: bool, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.set_blueprint_public::<Value>(id, public).await?);
+    }
+    let state: dto::BlueprintState = c.set_blueprint_public(id, public).await?;
+    Ok(render::blueprint_state(&state))
+}
+
+/// Start a draft from a blueprint. A reference-mode secret carries only with the caller's Vault
+/// token, which this client never sends, so it comes back as a placeholder.
+pub async fn blueprint_use(
+    c: &Client,
+    id: &str,
+    to: &str,
+    description: Option<&str>,
+    as_json: bool,
+) -> Result<String> {
+    if as_json {
+        return json(&c.use_blueprint::<Value>(id, to, description).await?);
+    }
+    let used: dto::BlueprintUsed = c.use_blueprint(id, to, description).await?;
+    Ok(render::blueprint_used(id, &used, &studio_url(c, &used.id)))
+}
+
 /// Register a draft's newest compiling version as a playbook, with no review.
 pub async fn draft_publish(
     c: &Client,

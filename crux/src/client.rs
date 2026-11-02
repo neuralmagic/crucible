@@ -654,6 +654,52 @@ impl Client {
         .await
     }
 
+    /// The blueprints the caller can read.
+    pub async fn blueprints<T: DeserializeOwned>(&self) -> Result<T> {
+        self.get("/api/blueprints").await
+    }
+
+    /// Mark a registered playbook as a blueprint, or unmark it.
+    pub async fn set_blueprint<T: DeserializeOwned>(&self, id: &str, on: bool) -> Result<T> {
+        self.toggle(&format!("/api/playbooks/{}/blueprint", encode(id)), on)
+            .await
+    }
+
+    /// Make a blueprint public, or private.
+    pub async fn set_blueprint_public<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        public: bool,
+    ) -> Result<T> {
+        self.toggle(
+            &format!("/api/playbooks/{}/blueprint/public", encode(id)),
+            public,
+        )
+        .await
+    }
+
+    /// `PUT` turns a flag on and `DELETE` turns it off; both answer with the resulting state.
+    async fn toggle<T: DeserializeOwned>(&self, path: &str, on: bool) -> Result<T> {
+        let method = if on {
+            reqwest::Method::PUT
+        } else {
+            reqwest::Method::DELETE
+        };
+        parse(self.send(method, path, None).await?, path)
+    }
+
+    /// Start a draft from blueprint `id`.
+    pub async fn use_blueprint<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        to: &str,
+        description: Option<&str>,
+    ) -> Result<T> {
+        let body = serde_json::json!({ "id": to, "description": description });
+        self.post(&format!("/api/blueprints/{}/use", encode(id)), Some(&body))
+            .await
+    }
+
     /// Export the newest compiling version as a PR against `repo`.
     pub async fn graduate_draft<T: DeserializeOwned>(
         &self,
