@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-CATALOG"
+title = "Catalog"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The controller MUST serve a catalog listing the blueprints the caller may read and no others, under [[RFC-0003:C-READ-SCOPING]]. Each entry MUST give the blueprint's id, description, owner, current revision, and whether it is public, and for each secret its pack declares, whether that secret would carry to the caller or become a placeholder under [[RFC-0006:C-PLACEHOLDERS]].
+
+
+
+A team's blueprints appear to its members, a `viewer` share under [[RFC-0003:C-SHARING]] lists one for another principal, and a public blueprint under [[RFC-0006:C-PUBLIC]] appears to everyone."""
