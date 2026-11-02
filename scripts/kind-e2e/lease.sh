@@ -33,10 +33,12 @@ crux draft-publish "$DRAFT-ltamper" --playbook "$DRAFT-ltpub" --json >"$WORK/pub
 LOCAL_TAMPER=$(playbook_tree "$DRAFT-ltpub")
 tamper_file "$LOCAL_TAMPER" check.sh
 if crux launch "$DRAFT-ltpub" --max-cost 1 --max-time 5m >"$WORK/launch-O-tamper.log" 2>&1; then
-    fail "[O] a registered playbook whose stored tree was tampered with launched"
+    fail "[O-tamper] a registered playbook whose stored tree was tampered with launched"
 fi
 grep -qF "$LOCAL_TAMPER no longer matches its stored files" "$WORK/launch-O-tamper.log" ||
-    fail "[O] the tampered launch refusal does not name the tree: $(cat "$WORK/launch-O-tamper.log")"
+    fail "[O-tamper] the launch refusal does not name the tree: $(cat "$WORK/launch-O-tamper.log")"
+[ "$(sql -c "SELECT count(*) FROM playbook_launches WHERE playbook = '$DRAFT-ltpub'")" = 0 ] ||
+    fail "[O-tamper] a refused launch left a launch row"
 watch_stop
 for key in "$BLOCK" "$LOCAL_KEY"; do
     [ "$(pods_seen O "$key")" = 0 ] || fail "[O] the local executor created a pod for $key"

@@ -324,7 +324,7 @@ fi
 grep -qF "$TAMPER_TREE no longer matches its stored files" "$WORK/launch-T.log" ||
     fail "[T] the registered launch refusal does not name the tree: $(cat "$WORK/launch-T.log")"
 [ "$(sql -c "SELECT count(*) FROM playbook_launches WHERE playbook = '$DRAFT-tpub'")" = 0 ] ||
-    fail "[T] the refused registered launch stored a launch"
+    fail "[T] a refused registered launch left a launch row"
 pass "[T] the registered launch is refused naming the tampered tree"
 
 # ---- scenario I ----------------------------------------------------------------------------

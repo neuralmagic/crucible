@@ -549,6 +549,9 @@ pub struct PackImport {
     pub git_ref: Option<String>,
     #[serde(default)]
     pub path: String,
+    /// The manifest variant the preview read; absent for the base manifest.
+    #[serde(default)]
+    pub variant: Option<String>,
     pub rev: String,
     /// The frozen pack's `tree1:` digest. `tar_digest` is the name a controller from before tree
     /// storage sends.

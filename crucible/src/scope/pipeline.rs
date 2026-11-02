@@ -824,7 +824,7 @@ fn compile_and_validate_round(manifest_path: &Path) -> RoundVerdict {
         Some(_) => {}
     }
 
-    let outcome = match check::run(manifest_path) {
+    let outcome = match check::run(manifest_path, None) {
         Ok(o) => o,
         Err(e) => {
             return RoundVerdict::Failed(FailureEvidence::Structure {
@@ -1000,7 +1000,7 @@ impl Stage for Validate {
         // the hand-written path there's no stored outcome, so run it now. Either way the outcome
         // stays in `ctx` for the freeze report to render.
         if ctx.check_outcome.is_none() {
-            ctx.check_outcome = Some(check::run(&ctx.manifest_path)?);
+            ctx.check_outcome = Some(check::run(&ctx.manifest_path, None)?);
         }
         let outcome = ctx
             .check_outcome

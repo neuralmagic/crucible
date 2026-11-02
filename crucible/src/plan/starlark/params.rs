@@ -127,11 +127,22 @@ pub struct ParamSpec {
     pub min: Option<f64>,
     pub max: Option<f64>,
     pub choices: Vec<String>,
+    /// A string a launch form takes in a text area. The bound value is the same string.
+    #[serde(default)]
+    pub multiline: bool,
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
 pub const FIELDS: &[&str] = &[
-    "type", "required", "default", "doc", "pattern", "min", "max", "choices",
+    "type",
+    "required",
+    "default",
+    "doc",
+    "pattern",
+    "min",
+    "max",
+    "choices",
+    "multiline",
 ];
 
 /// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
@@ -268,6 +279,9 @@ impl Params {
             if !spec.choices.is_empty() {
                 property.insert("enum".into(), serde_json::json!(spec.choices));
             }
+            if spec.multiline {
+                property.insert("x-multiline".into(), serde_json::json!(true));
+            }
             if spec.required {
                 required.push(spec.name.clone());
             }
@@ -377,6 +391,15 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             ty: ty.as_str(),
         });
     }
+    let multiline =
+        field(&declared, name, "multiline", "True or False", literal_bool)?.unwrap_or(false);
+    if multiline && ty != ParamType::String {
+        return Err(CompileError::ParamConstraintMismatch {
+            param: name.to_owned(),
+            constraint: "multiline",
+            ty: ty.as_str(),
+        });
+    }
 
     Ok(ParamSpec {
         name: name.to_owned(),
@@ -388,6 +411,7 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         min,
         max,
         choices,
+        multiline,
     })
 }
 

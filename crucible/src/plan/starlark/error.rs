@@ -563,6 +563,11 @@ pub enum CompileError {
     TaskNamesNotList { argument: String },
     #[error("{argument} entries must be tasks or task-name strings")]
     TaskNameEntryWrongType { argument: String },
+    #[error(
+        "optional(...) marks a dependency of agent, skill, command, evaluate or route; here \
+         {argument} takes plain tasks"
+    )]
+    OptionalOutsideDependsOn { argument: String },
 
     #[error("workflow source must end with workflow(...) or default_autoresearch([...])")]
     NoWorkflowResult,

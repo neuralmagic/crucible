@@ -176,6 +176,7 @@ fn deploy_render_pack_playbook_matches_render_yaml() {
                     ("depth".to_string(), "--deep".to_string()),
                 ]),
                 rerun: None,
+                variant: None,
             }),
             platform: None,
         },
@@ -183,6 +184,73 @@ fn deploy_render_pack_playbook_matches_render_yaml() {
     .expect("library render");
     assert!(from_lib.contains("kind: ConfigMap"));
     assert!(from_lib.contains("plan run"));
+    assert_eq!(from_cli, from_lib);
+}
+
+/// A variant renders the same through the command line as through the library: the pod reads
+/// the variant's `[agent]`, and its `plan run` names the variant.
+#[test]
+fn deploy_render_variant_matches_render_yaml() {
+    let tmp = scratch("variant");
+    let pack = tmp.path().join("roundup");
+    std::fs::create_dir_all(&pack).expect("mkdir pack");
+    write_playbook_pack(&pack);
+    let manifest = pack.join("crucible.toml");
+    let mut text = std::fs::read_to_string(&manifest).expect("manifest");
+    text.push_str(
+        "[variant.offline.agent]\nbackend = \"openshell\"\ngoal = \"draft the roundup\"\n\
+         sandbox_image = \"registry.example.com/offline-sandbox:latest\"\n",
+    );
+    std::fs::write(&manifest, text).expect("manifest");
+    let profile = delta_profile();
+    let from_cli = cli(&[
+        "deploy",
+        "render",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--no-pin",
+        "--pack",
+        "--pack-configmap-name",
+        "crucible-run-44-pack",
+        "--playbook",
+        "--max-cost",
+        "4.5",
+        "--max-time",
+        "30m",
+        "--variant",
+        "offline",
+        "--param",
+        "topic=t",
+    ]);
+    let from_lib = render_yaml(
+        &manifest,
+        &profile,
+        &RenderOpts {
+            max_cost: 4.5,
+            pack: Some(PackDelivery {
+                configmap_name: "crucible-run-44-pack".to_string(),
+                run_name: "roundup".to_string(),
+                inputs: Default::default(),
+            }),
+            playbook: Some(PlaybookLaunch {
+                max_time: "30m".parse().expect("30m is a duration"),
+                max_cost: 4.5,
+                params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+                rerun: None,
+                variant: Some("offline".parse().expect("variant name")),
+            }),
+            ..RenderOpts::default()
+        },
+    )
+    .expect("library render");
+    assert!(
+        from_lib.contains(" --variant offline --param"),
+        "{from_lib}"
+    );
+    assert!(from_lib.contains("offline-sandbox"), "{from_lib}");
+    assert!(!from_lib.contains("alpha-sandbox"), "{from_lib}");
     assert_eq!(from_cli, from_lib);
 }
 
@@ -247,6 +315,7 @@ fn deploy_render_rerun_matches_render_yaml() {
                     parent: "acme_x_7-1700".to_string(),
                     from: vec!["draft".to_string()],
                 }),
+                variant: None,
             }),
             ..RenderOpts::default()
         },
@@ -478,6 +547,7 @@ fn a_delivered_pack_renders_under_its_run_name_not_its_directory() {
                 max_cost: 1.0,
                 params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
                 rerun: None,
+                variant: None,
             }),
             ..RenderOpts::default()
         },
@@ -525,6 +595,7 @@ fn an_inject_resolves_through_the_run_inputs() {
                     max_cost: 1.0,
                     params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
                     rerun: None,
+                    variant: None,
                 }),
                 ..RenderOpts::default()
             },

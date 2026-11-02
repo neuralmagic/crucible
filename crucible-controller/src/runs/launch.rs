@@ -68,8 +68,14 @@ async fn plan_refusal(
     };
     let params = launch.params.iter().cloned().collect();
     let max_time = launch.max_time.clone();
+    let variant = launch.variant.clone();
     let checked = tokio::task::spawn_blocking(move || {
-        crate::playbooks::registry::check_runnable(pack.path(), &params, &max_time)
+        crate::playbooks::registry::check_runnable(
+            pack.path(),
+            &params,
+            &max_time,
+            variant.as_ref(),
+        )
     })
     .await
     .context("joining the launch plan check")?;
@@ -248,6 +254,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         max_time: launch.max_time,
         agent,
         rerun: launch.rerun,
+        variant: launch.variant,
     };
     let started = match cfg.playbook_executor {
         PlaybookExecutor::Pod => {
@@ -378,7 +385,8 @@ async fn resolve_local_secrets(
     let Some(pack) = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key).await? else {
         return Ok(None);
     };
-    let declared = crate::secrets::manifest::declared_secrets(pack.path())?;
+    let variant = crate::launches::store::launch_variant(db.pool(), &issue.key).await?;
+    let declared = crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
     match crate::secrets::launch::resolve(
         db.pool(),
         &ls.scope,

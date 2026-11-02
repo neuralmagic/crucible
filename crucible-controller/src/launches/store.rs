@@ -104,7 +104,7 @@ pub(crate) async fn get_playbook_launch(
 ) -> Result<Option<PlaybookLaunch>> {
     let row = sqlx::query!(
         "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, \
-         launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from \
+         launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from, variant \
          FROM playbook_launches WHERE key = $1",
         key,
     )
@@ -134,7 +134,31 @@ pub(crate) async fn get_playbook_launch(
             run,
             from: serde_json::from_value(row.rerun_from).unwrap_or_default(),
         }),
+        variant: row
+            .variant
+            .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+            .transpose()
+            .with_context(|| format!("stored manifest variant for {key}"))?,
     }))
+}
+
+/// The manifest variant the launch under `key` runs. `None` for the base manifest, and for a key
+/// that names no playbook launch.
+pub(crate) async fn launch_variant(
+    pool: &PgPool,
+    key: &str,
+) -> Result<Option<crucible::manifest::variant::VariantName>> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT variant FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .context("reading a launch's manifest variant")?;
+    stored
+        .flatten()
+        .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+        .transpose()
+        .with_context(|| format!("stored manifest variant for {key}"))
 }
 
 /// The stored group snapshot as plain strings. A row written before the snapshot existed, or one
@@ -522,10 +546,12 @@ pub(crate) async fn launch_exposure(
     let pack = crate::playbooks::packs::materialize_pack(pool, issue_key)
         .await?
         .with_context(|| format!("no stored pack for launch {issue_key}"))?;
-    let extracted =
-        tokio::task::spawn_blocking(move || crate::playbooks::exposure::extract(pack.path(), None))
-            .await
-            .context("joining the launch exposure worker")?;
+    let variant = launch.variant.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        crate::playbooks::exposure::extract(pack.path(), None, variant.as_ref())
+    })
+    .await
+    .context("joining the launch exposure worker")?;
     let exposure = match extracted {
         Ok(exposure) => exposure,
         Err(crate::playbooks::exposure::ExtractError::Refused(message)) => {

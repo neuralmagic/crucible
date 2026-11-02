@@ -102,12 +102,14 @@ pub fn preview_pack(
     pack_root: &Path,
     params: &BTreeMap<String, String>,
     unvalued: Unvalued,
+    variant: Option<&crucible::manifest::variant::VariantName>,
 ) -> Result<PackPreview, RegisterError> {
     preview_pack_for(
         pack_root,
         crate::playbooks::registry::PackWorkflowKind::Playbook,
         params,
         unvalued,
+        variant,
     )
 }
 
@@ -117,17 +119,18 @@ pub(crate) fn preview_pack_for(
     kind: crate::playbooks::registry::PackWorkflowKind,
     params: &BTreeMap<String, String>,
     unvalued: Unvalued,
+    variant: Option<&crucible::manifest::variant::VariantName>,
 ) -> Result<PackPreview, RegisterError> {
-    let source = crate::playbooks::registry::workflow_source_for(pack_root, kind)?;
+    let source = crate::playbooks::registry::workflow_source_for(pack_root, kind, variant)?;
     let mut preview = PackPreview {
-        agent: crate::playbooks::dispatch::pack_agent(pack_root).ok(),
+        agent: crate::playbooks::dispatch::pack_agent(pack_root, variant).ok(),
         ..PackPreview::default()
     };
-    match crate::secrets::manifest::declared_secrets(pack_root) {
+    match crate::secrets::manifest::declared_secrets(pack_root, variant) {
         Ok(declared) => preview.declared_secrets = declared,
         Err(e) => preview.diagnostics.push(format!("{e:#}")),
     }
-    match crate::playbooks::exposure::extract(pack_root, None) {
+    match crate::playbooks::exposure::extract(pack_root, None, variant) {
         Ok(exposure) => {
             preview.exposure_digest = Some(exposure.digest().map_err(RegisterError::Internal)?);
             preview.exposure = Some(exposure);
@@ -199,7 +202,8 @@ mod tests {
             format!("{text}\n[agent.sandbox.go]\nimage = \"ghcr.io/acme/go@sha256:bb\"\n"),
         )
         .expect("manifest");
-        let preview = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        let preview =
+            preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse, None).expect("previews");
         assert_eq!(
             preview.diagnostics,
             [r#"task "analyze" runs in sandbox "rust", which no [agent.sandbox.rust] declares"#],
@@ -212,7 +216,7 @@ mod tests {
         let root = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
 
         let values = BTreeMap::from([("topic".to_string(), "fences".to_string())]);
-        let preview = preview_pack(&root, &values, Unvalued::Refuse).expect("previews");
+        let preview = preview_pack(&root, &values, Unvalued::Refuse, None).expect("previews");
         assert_eq!(preview.params_schema, Some(schema_of(WORKFLOW_TOPIC)));
         assert!(preview.schema_digest.is_some_and(|d| !d.is_empty()));
         let graph = preview.graph.expect("the graph rides the preview");
@@ -242,7 +246,8 @@ mod tests {
             ),
         );
 
-        let preview = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        let preview =
+            preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse, None).expect("previews");
         assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
         let graph = preview.graph.expect("the graph rides the preview");
         let emits = |name: &str| {
@@ -262,7 +267,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = write_playbook_pack(dir.path(), WORKFLOW_BROKEN);
 
-        let preview = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        let preview =
+            preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse, None).expect("previews");
         assert!(preview.params_schema.is_some(), "the form still renders");
         assert_eq!(preview.graph, None, "no graph without a compiled plan");
         assert_eq!(preview.diagnostics.len(), 1, "{:?}", preview.diagnostics);
@@ -284,7 +290,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
 
-        let bare = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        let bare = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse, None).expect("previews");
         assert!(bare.params_schema.is_some());
         assert_eq!(bare.graph, None);
         assert!(
@@ -294,7 +300,7 @@ mod tests {
         );
 
         let filled =
-            preview_pack(&root, &BTreeMap::new(), Unvalued::Placeholder).expect("previews");
+            preview_pack(&root, &BTreeMap::new(), Unvalued::Placeholder, None).expect("previews");
         assert!(filled.diagnostics.is_empty(), "{:?}", filled.diagnostics);
         assert!(
             filled.graph.is_some(),
@@ -309,7 +315,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = write_playbook_pack(dir.path(), &format!("x = {}1\n", "lambda: ".repeat(4800)));
 
-        let preview = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        let preview =
+            preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse, None).expect("previews");
         assert_eq!(preview.params_schema, None);
         assert_eq!(preview.schema_digest, None);
         assert_eq!(preview.graph, None);
@@ -326,8 +333,8 @@ mod tests {
     #[test]
     fn a_tree_without_a_playbook_manifest_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let err =
-            preview_pack(dir.path(), &BTreeMap::new(), Unvalued::Refuse).expect_err("refused");
+        let err = preview_pack(dir.path(), &BTreeMap::new(), Unvalued::Refuse, None)
+            .expect_err("refused");
         assert!(matches!(err, RegisterError::Invalid(_)), "{err:#}");
     }
 
@@ -351,7 +358,7 @@ mod tests {
         );
 
         let values = BTreeMap::from([("repo".to_string(), "owner/pack".to_string())]);
-        let preview = preview_pack(&root, &values, Unvalued::Refuse).expect("previews");
+        let preview = preview_pack(&root, &values, Unvalued::Refuse, None).expect("previews");
         assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
         let schema = preview.params_schema.expect("schema");
         assert_eq!(schema["required"], serde_json::json!(["repo"]));
@@ -409,7 +416,8 @@ mod tests {
     fn a_pack_without_params_needs_no_values() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = write_playbook_pack(dir.path(), WORKFLOW_NO_PARAMS);
-        let preview = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        let preview =
+            preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse, None).expect("previews");
         assert!(preview.diagnostics.is_empty(), "{:?}", preview.diagnostics);
         assert_eq!(preview.params_schema, Some(schema_of(WORKFLOW_NO_PARAMS)));
         assert!(preview.graph.is_some());

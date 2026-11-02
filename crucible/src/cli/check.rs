@@ -5,6 +5,7 @@
 //! judge wall, applied here as a lint rather than a block).
 
 use crate::cli::selftest::{self, SelftestReport};
+use crate::manifest::variant::{self, VariantName};
 use crate::manifest::{self, AgentCfg, CompositeManifest, Manifest, WorldCfg};
 use crate::openshell;
 use crate::plan::history::HistoryLimit;
@@ -52,12 +53,19 @@ impl CheckOutcome {
 }
 
 /// Check `manifest_path`: composite or single, picked the same way [`crate::cli::run::dispatch`] does.
-pub fn run(manifest_path: &Path) -> Result<CheckOutcome> {
+pub fn run(manifest_path: &Path, variant: Option<&VariantName>) -> Result<CheckOutcome> {
     if manifest::is_composite(manifest_path) {
+        if let Some(variant) = variant {
+            return Ok(CheckOutcome::fail(composite_variant(variant)));
+        }
         check_composite(manifest_path)
     } else {
-        check_single(manifest_path)
+        check_single(manifest_path, variant)
     }
+}
+
+fn composite_variant(variant: &VariantName) -> String {
+    format!("--variant {variant}: a composite manifest declares no variants")
 }
 
 /// The parse-only slice of the check: parse the manifest (composite or single, the same
@@ -65,13 +73,15 @@ pub fn run(manifest_path: &Path) -> Result<CheckOutcome> {
 /// shipped packs may inject files that deliberately never land in the repo (`_controls/` answer
 /// keys), and no workspace setup, measure probe, or self-test. Needs nothing but the manifest
 /// itself, so CI sweeps it over every shipped domain manifest.
-pub fn run_parse_only(manifest_path: &Path) -> Result<CheckOutcome> {
-    let result = if manifest::is_composite(manifest_path) {
+pub fn run_parse_only(manifest_path: &Path, variant: Option<&VariantName>) -> Result<CheckOutcome> {
+    let result = if let (true, Some(variant)) = (manifest::is_composite(manifest_path), variant) {
+        Err(composite_variant(variant))
+    } else if manifest::is_composite(manifest_path) {
         CompositeManifest::load(manifest_path)
             .map(|m| crate::exposure::render(&crate::exposure::compute_composite(&m)))
             .map_err(|e| format!("composite manifest parse failed: {e:#}"))
     } else {
-        Manifest::load(manifest_path)
+        Manifest::load_variant(manifest_path, variant)
             .map_err(|e| format!("manifest parse failed: {e:#}"))
             .and_then(|m| {
                 let mut exposure = crate::exposure::render(&crate::exposure::compute(&m, None));
@@ -185,8 +195,39 @@ fn operator_history_limit() -> Option<String> {
     std::env::var(crucible_contract::history::ENV_HISTORY_MAX_BYTES).ok()
 }
 
-fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
-    let mut m = match Manifest::load_frozen(manifest_path) {
+/// The graph of every declared variant other than `selected`, and of the base when a variant
+/// is selected, compiled as the selected one is, so a broken variant fails the check of any.
+fn other_variant_findings(
+    manifest_path: &Path,
+    manifest_dir: &Path,
+    selected: Option<&VariantName>,
+) -> Vec<String> {
+    let declared = std::fs::read_to_string(manifest_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|text| variant::declared(&text));
+    let declared = match declared {
+        Ok(declared) => declared,
+        Err(e) => return vec![format!("reading the manifest's variants failed: {e:#}")],
+    };
+    std::iter::once(None)
+        .chain(declared.iter().map(Some))
+        .filter(|other| *other != selected)
+        .filter_map(|other| {
+            let label = other.map_or("the base manifest".to_owned(), |v| format!("[variant.{v}]"));
+            let finding = match Manifest::load_variant(manifest_path, other) {
+                Ok(mut m) => m
+                    .resolve_workflow(manifest_dir)
+                    .err()
+                    .and_then(|e| sandbox_finding(&e)),
+                Err(e) => Some(format!("manifest parse failed: {e:#}")),
+            };
+            finding.map(|finding| format!("{label}: {finding}"))
+        })
+        .collect()
+}
+
+fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<CheckOutcome> {
+    let mut m = match Manifest::load_frozen_variant(manifest_path, variant) {
         Ok(m) => m,
         Err(e) => return Ok(CheckOutcome::fail(format!("manifest parse failed: {e:#}"))),
     };
@@ -216,6 +257,11 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
             .extend(uninjected_script_warnings(&m, &manifest_dir)),
         Err(e) => out.findings.extend(sandbox_finding(&e)),
     }
+    out.findings.extend(other_variant_findings(
+        manifest_path,
+        &manifest_dir,
+        variant,
+    ));
 
     if !workspace.exists() {
         if let Err(e) = crate::cli::workspace::manifest_setup(&m, &manifest_dir, &workspace) {
@@ -776,7 +822,7 @@ mod tests {
             "#;
         fs::write(dir.join(MANIFEST), manifest).expect("write manifest");
 
-        let out = run(&dir.join(MANIFEST)).expect("check runs");
+        let out = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(
             out.findings.is_empty(),
             "probe must apply frozen injects first: {:?}",
@@ -794,7 +840,7 @@ mod tests {
             &dir,
             "#!/bin/sh\necho '{\"valid\": true, \"score\": 1.0}'\n",
         );
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             outcome
@@ -813,7 +859,7 @@ mod tests {
         // referenced-file resolution.
         let dir = tempdir("parse-only-good");
         scaffold_domain(&dir, "#!/bin/sh\nexit 1\n");
-        let outcome = run_parse_only(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run_parse_only(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             !dir.join("workspace").exists(),
@@ -828,7 +874,7 @@ mod tests {
         let dir = tempdir("history-limit");
         let playbook = "[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\ngoal=\"g\"\n[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"\n";
         fs::write(dir.join(MANIFEST), playbook).unwrap();
-        let outcome = run_parse_only(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run_parse_only(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             outcome
@@ -867,7 +913,7 @@ mod tests {
             "[repo]\npath = \".\"\ntypo_field = 3\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"x\"\ngoal=\"g\"\n",
         )
         .unwrap();
-        let outcome = run_parse_only(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run_parse_only(&dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(outcome.findings[0].contains("parse failed"));
 
@@ -878,7 +924,7 @@ mod tests {
             "[repo]\npath = \".\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"x\"\ngoal_file=\"missing.md\"\n",
         )
         .unwrap();
-        let outcome = run_parse_only(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run_parse_only(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -891,7 +937,7 @@ mod tests {
             "[repo]\npath = \".\"\ntypo_field = 3\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"x\"\ngoal=\"g\"\n",
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(outcome.findings[0].contains("parse failed"));
         let _ = fs::remove_dir_all(&dir);
@@ -905,7 +951,7 @@ mod tests {
             "[repo]\npath = \".\"\n[workspace]\ndir = \"workspace\"\nsetup_cmd = \"mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=t@t -c user.name=t commit -q --allow-empty -m baseline\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\ngoal=\"do the chore\"\n",
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             outcome.warnings.iter().any(|w| w.contains("task mode")),
@@ -931,7 +977,7 @@ mod tests {
             "[repo]\npath = \".\"\n[workspace]\ndir = \"workspace\"\nsetup_cmd = \"mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=t@t -c user.name=t commit -q --allow-empty -m baseline\"\n[agent]\nbackend=\"command\"\nagent_cmd=\"true\"\n",
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(
             outcome
@@ -948,7 +994,7 @@ mod tests {
     fn check_fails_when_measure_cmd_misbehaves() {
         let dir = tempdir("bad-measure");
         scaffold_domain(&dir, "#!/bin/sh\necho 'not json'\nexit 1\n");
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(
             outcome
@@ -982,7 +1028,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok());
         assert!(
             outcome
@@ -1019,7 +1065,7 @@ mod tests {
             direction = "higher"
             "#;
         fs::write(dir.join(MANIFEST), manifest).unwrap();
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             !outcome
@@ -1069,7 +1115,7 @@ mod tests {
             &dir,
             "#!/bin/sh\necho '{\"valid\": true, \"score\": 1.0}'\n",
         );
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "no selftest is a warning, not a failure");
         assert!(
             outcome
@@ -1086,7 +1132,7 @@ mod tests {
     fn check_runs_declared_selftest_and_passes_when_discriminating() {
         let dir = tempdir("selftest-discriminates");
         scaffold_value_domain(&dir, "100", "10");
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         assert!(
             outcome
@@ -1103,7 +1149,7 @@ mod tests {
     fn check_fails_when_declared_selftest_does_not_discriminate() {
         let dir = tempdir("selftest-fails");
         scaffold_value_domain(&dir, "10", "10");
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(!outcome.ok(), "equal good/bad must fail check");
         assert!(
             outcome
@@ -1154,7 +1200,7 @@ mod tests {
     fn check_fails_when_a_live_rig_has_no_toolbox_exclusions() {
         let dir = tempdir("rig-unfenced");
         scaffold_rig_domain(&dir, "");
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(
             !outcome.ok(),
             "an unfenced live-rig toolbox must fail check"
@@ -1174,7 +1220,7 @@ mod tests {
     fn check_passes_when_the_live_rig_toolbox_is_fenced() {
         let dir = tempdir("rig-fenced");
         scaffold_rig_domain(&dir, r#"toolbox_exclude = ["rig-config"]"#);
-        let outcome = run(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(
             !outcome
                 .findings
@@ -1190,7 +1236,7 @@ mod tests {
     fn parse_only_prints_the_exposure_for_a_single_and_a_composite_manifest() {
         let dir = tempdir("parse-only-exposure");
         scaffold_domain(&dir, "#!/bin/sh\nexit 1\n");
-        let outcome = run_parse_only(&dir.join(MANIFEST)).expect("check runs");
+        let outcome = run_parse_only(&dir.join(MANIFEST), None).expect("check runs");
         let text = outcome.exposure.join("\n");
         assert!(text.contains("output bounds:"), "{text}");
         assert!(text.contains("capability disclosure:"), "{text}");
@@ -1217,7 +1263,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let outcome = run_parse_only(&composite).expect("check runs");
+        let outcome = run_parse_only(&composite, None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         let text = outcome.exposure.join("\n");
         assert!(
@@ -1303,7 +1349,7 @@ workflow(type = "playbook", tasks = [r, h])
             "#,
         )
         .unwrap();
-        let out = run(&dir.join(MANIFEST)).expect("check runs");
+        let out = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(out.ok(), "findings: {:?}", out.findings);
         let hits: Vec<&String> = out
             .warnings
@@ -1347,13 +1393,87 @@ workflow(type = "playbook", tasks = [a])
             "#,
         )
         .unwrap();
-        let out = run(&dir.join(MANIFEST)).expect("check runs");
+        let out = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(
             out.findings.iter().any(|f| f.contains(
                 r#"task "analyze" runs in sandbox "rust", which no [agent.sandbox.rust] declares"#
             )),
             "findings: {:?}",
             out.findings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A variant that replaces `[agent]` without the sandbox the graph names fails the check of
+    /// the base too, and checking that variant reports it as its own failure.
+    #[test]
+    fn check_compiles_every_variants_graph() {
+        let dir = tempdir("variant-sandbox");
+        fs::write(
+            dir.join("workflow.star"),
+            r#"
+a = agent(name = "analyze", prompt = "p", sandbox = "rust")
+workflow(type = "playbook", tasks = [a])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join(MANIFEST),
+            r#"
+            [agent]
+            backend = "openshell"
+            goal = "goal"
+            [agent.sandbox.rust]
+            image = "ghcr.io/acme/rust@sha256:aa"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            [variant.offline.agent]
+            backend = "openshell"
+            goal = "goal"
+            "#,
+        )
+        .unwrap();
+        let undeclared =
+            r#"task "analyze" runs in sandbox "rust", which no [agent.sandbox.rust] declares"#;
+
+        let base = run(&dir.join(MANIFEST), None).expect("check runs");
+        assert!(
+            base.findings
+                .iter()
+                .any(|f| f.starts_with("[variant.offline]: ") && f.contains(undeclared)),
+            "findings: {:?}",
+            base.findings
+        );
+
+        let offline = VariantName::parse("offline").unwrap();
+        let selected = run(&dir.join(MANIFEST), Some(&offline)).expect("check runs");
+        assert!(
+            selected
+                .findings
+                .iter()
+                .any(|f| !f.starts_with('[') && f.contains(undeclared)),
+            "findings: {:?}",
+            selected.findings
+        );
+        assert!(
+            !selected
+                .findings
+                .iter()
+                .any(|f| f.starts_with("the base manifest")),
+            "the base compiles: {:?}",
+            selected.findings
+        );
+
+        let unknown = VariantName::parse("online").unwrap();
+        let refused = run_parse_only(&dir.join(MANIFEST), Some(&unknown)).expect("check runs");
+        assert!(
+            refused
+                .findings
+                .iter()
+                .any(|f| f.contains("no variant \"online\"")),
+            "findings: {:?}",
+            refused.findings
         );
         let _ = fs::remove_dir_all(&dir);
     }
