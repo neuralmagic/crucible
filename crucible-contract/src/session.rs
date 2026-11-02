@@ -120,6 +120,10 @@ pub struct PlanTaskWire {
     pub kind: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// The dependencies whose settling not taken satisfies the task's `all` join. Empty when it
+    /// declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<String>,
     /// Logical durable agent session; empty means a fresh turn.
     #[serde(default)]
     pub session: String,
@@ -145,6 +149,10 @@ pub struct PlanTaskWire {
     /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
     #[serde(default)]
     pub when: String,
+    /// `producer.field` references whose per-element object each instance receives narrowed to
+    /// its own entry. Empty when the task narrows nothing.
+    #[serde(default)]
+    pub keyed: Vec<String>,
     /// The tasks this task sends back when it settles failing, empty otherwise. Each round
     /// reports as `task[round-N]`, so a renderer draws the loop from this before any round runs.
     #[serde(
@@ -171,6 +179,10 @@ pub struct PlanTaskWire {
     /// How many earlier runs of its series the task reads under `history`; 0 when it reads none.
     #[serde(default)]
     pub history_depth: u32,
+    /// Digest of the compiled task with its parameters bound and of its dependencies'
+    /// definitions. A rerun refuses to reuse a task whose definition moved since its parent.
+    #[serde(default)]
+    pub definition: String,
 }
 
 fn write_revise_targets<S: serde::Serializer>(targets: &[String], s: S) -> Result<S::Ok, S::Error> {
@@ -524,7 +536,7 @@ pub enum SessionEvent {
         links: Vec<crate::link::ExternalLink>,
         /// What the attempts ran on, resolved. Present exactly when the task runs an agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent: Option<TaskAgent>,
+        agent: Option<Box<TaskAgent>>,
         /// The repair turns the attempts took, in order. Their cost is part of `cost_usd`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         repairs: Vec<TaskRepair>,
@@ -542,6 +554,9 @@ pub enum SessionEvent {
         trace_id: String,
         #[serde(default)]
         span_id: String,
+        /// The run that settled this result, when a rerun reused it rather than dispatching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reused_from: Option<String>,
     },
     /// What this run records for its launch series, emitted once before `Shutdown` by a playbook
     /// run. The orchestrator copies it into the record later runs of the series receive.
@@ -928,6 +943,7 @@ mod tests {
                 over: "discover.targets".into(),
                 max_fanout: 8,
                 when: String::new(),
+                keyed: Vec::new(),
                 revise: vec!["draft".into(), "check".into()],
                 max_rounds: 3,
                 emits: vec![
@@ -962,6 +978,8 @@ mod tests {
                 ],
                 timeout: "10m".into(),
                 history_depth: 5,
+                definition: String::new(),
+                optional: Vec::new(),
             }],
             history_record: "propose-a".into(),
         });
@@ -1025,12 +1043,15 @@ mod tests {
             over: String::new(),
             max_fanout: 0,
             when: String::new(),
+            keyed: Vec::new(),
             revise,
             max_rounds: 0,
             emits: Vec::new(),
             emits_files: Vec::new(),
             timeout: String::new(),
             history_depth: 0,
+            definition: String::new(),
+            optional: Vec::new(),
         };
         let written = |revise: Vec<String>| {
             serde_json::to_value(task(revise)).expect("encodes")["revise"].clone()
@@ -1099,6 +1120,7 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            reused_from: None,
             agent: None,
             repairs: vec![TaskRepair {
                 label: "measure-a repair 1/2".into(),
@@ -1157,6 +1179,7 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            reused_from: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1214,6 +1237,7 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            reused_from: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1259,11 +1283,12 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
-            agent: Some(TaskAgent {
+            reused_from: None,
+            agent: Some(Box::new(TaskAgent {
                 harness: "claude".into(),
                 model: "glm-5.3".into(),
                 effort: "low".into(),
-            }),
+            })),
             repairs: Vec::new(),
         };
         assert!(

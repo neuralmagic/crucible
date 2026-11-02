@@ -118,6 +118,9 @@ pub(crate) struct Args {
     /// resolved harness's own default applies (see `Args::model`).
     #[arg(long)]
     pub model: Option<String>,
+    /// The agent binding's token price, pinned with the model (see `Args::pricing`).
+    #[arg(skip)]
+    pub price: Option<crucible_contract::inference::TokenPrice>,
     /// The agent harness that runs each turn: `claude` (default), `hermes`, `codex`, `opencode`,
     /// or `pi`. Overrides
     /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
@@ -252,6 +255,12 @@ impl Args {
         self.model
             .as_deref()
             .unwrap_or_else(|| self.harness().default_model())
+    }
+
+    /// How this run's agent turns are priced: the agent binding's price, else the model's
+    /// vendor rates, else nothing.
+    pub(crate) fn pricing(&self) -> crate::agent::event::Pricing {
+        crate::agent::event::Pricing::resolve(self.model(), self.price.as_ref())
     }
 }
 

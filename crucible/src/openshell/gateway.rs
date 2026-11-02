@@ -43,6 +43,17 @@ pub enum GatewayError {
     PodIpMissing,
     #[error("{POD_IP_ENV}={raw:?} is not an IP address")]
     PodIpUnparseable { raw: String },
+    #[error(
+        "the kubernetes driver needs a dial-back address: the gateway endpoint supervisors reach \
+         and the host the run's own services listen on"
+    )]
+    NoDialBack,
+    #[error("{var} is unset; a gateway pod needs it")]
+    ServeEnvMissing { var: &'static str },
+    #[error("{var}={raw:?} is not an IP address")]
+    ServeEnvUnparseable { var: &'static str, raw: String },
+    #[error("{GATEWAY_URL_ENV} is set but {GATEWAY_CLIENT_TLS_DIR_ENV} is not")]
+    RemoteTlsMissing,
     #[error("{origin} podman API socket did not appear at {}", .socket.display())]
     PodmanSocketMissing {
         origin: &'static str,
@@ -339,6 +350,13 @@ pub struct KubernetesDriverConfig {
     /// The address `host.openshell.internal` resolves to for sandbox egress (broker, collector).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_gateway_ip: Option<IpAddr>,
+    /// The `openshell.ai/gateway-id` label the driver stamps on every supervisor pod and Sandbox
+    /// it creates, and scopes its own lookups by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gateway_id: Option<String>,
+    /// The SPIFFE Workload API socket the driver mounts into supervisor pods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_spiffe_workload_api_socket_path: Option<String>,
 }
 
 impl KubernetesDriverConfig {
@@ -348,6 +366,98 @@ impl KubernetesDriverConfig {
             supervisor_image: images.supervisor.clone(),
             sandbox_runtime_image: images.sandbox_runtime.clone(),
             ..Self::default()
+        }
+    }
+}
+
+/// Where sandbox supervisors reach their gateway, and the address `host.openshell.internal`
+/// resolves to inside a sandbox (the run's broker, collector, and MCP servers). In the loop pod
+/// both are the pod's IP; for a gateway in its own pod they are that gateway's Service and the
+/// run's loop Service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialBack {
+    pub grpc_endpoint: String,
+    pub host_gateway_ip: IpAddr,
+}
+
+impl DialBack {
+    /// The in-pod gateway's dial-back: everything at this pod's IP.
+    pub fn local(pod_ip: IpAddr, port: u16) -> Self {
+        Self {
+            grpc_endpoint: format!("https://{}", SocketAddr::new(pod_ip, port)),
+            host_gateway_ip: pod_ip,
+        }
+    }
+}
+
+/// The loop pod's view of a gateway running in its own pod: the URL, and a directory holding the
+/// client mTLS material the controller minted for this run (`ca.crt`, `tls.crt`, `tls.key`).
+pub const GATEWAY_URL_ENV: &str = "CRUCIBLE_OPENSHELL_GATEWAY_URL";
+pub const GATEWAY_CLIENT_TLS_DIR_ENV: &str = "CRUCIBLE_OPENSHELL_GATEWAY_TLS_DIR";
+
+/// The gateway pod's inputs: the endpoint supervisors dial, the loop Service's address, the
+/// Secret the driver mounts into supervisors, and the directory holding the server certificate
+/// (`tls.crt`, `tls.key`) and the CA client certificates must chain to (`ca.crt`).
+pub const SERVE_GRPC_ENDPOINT_ENV: &str = "CRUCIBLE_GATEWAY_GRPC_ENDPOINT";
+pub const SERVE_HOST_IP_ENV: &str = "CRUCIBLE_GATEWAY_HOST_IP";
+/// The run's gateway id, which supervisor SPIFFE IDs are derived from.
+pub const SERVE_GATEWAY_ID_ENV: &str = "CRUCIBLE_GATEWAY_ID";
+/// The SPIFFE Workload API socket path supervisors get, delivered with a run's agent servers
+/// (`[cluster] sandbox_spiffe_socket`).
+pub const SANDBOX_SPIFFE_SOCKET_ENV: &str = "CRUCIBLE_SANDBOX_SPIFFE_SOCKET";
+pub const SERVE_CLIENT_TLS_SECRET_ENV: &str = "CRUCIBLE_GATEWAY_CLIENT_TLS_SECRET";
+pub const SERVE_SERVER_TLS_DIR_ENV: &str = "CRUCIBLE_GATEWAY_SERVER_TLS_DIR";
+
+/// How this process reaches its gateway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GatewayAccess {
+    /// Spawned in this pod (podman, or kubernetes without a dedicated sandbox namespace), on the
+    /// fixed port, with the client material its own `generate-certs` wrote.
+    Local,
+    /// A gateway pod of its own at `endpoint`, with the controller-minted client material
+    /// (`ca.crt`, `tls.crt`, `tls.key`) in `tls_dir`.
+    Remote { endpoint: String, tls_dir: PathBuf },
+}
+
+impl GatewayAccess {
+    pub fn from_env() -> Result<Self> {
+        let endpoint = std::env::var(GATEWAY_URL_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let Some(endpoint) = endpoint else {
+            return Ok(Self::Local);
+        };
+        let tls_dir = std::env::var(GATEWAY_CLIENT_TLS_DIR_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(GatewayError::RemoteTlsMissing)?;
+        Ok(Self::Remote {
+            endpoint,
+            tls_dir: PathBuf::from(tls_dir),
+        })
+    }
+
+    /// The URL and client material the gRPC client dials with.
+    pub fn dial(&self) -> Result<crate::openshell::grpc::GatewayDial> {
+        Ok(crate::openshell::grpc::GatewayDial {
+            endpoint: self.endpoint(),
+            tls_dir: self.tls_dir()?,
+        })
+    }
+
+    /// The URL dialed over mTLS.
+    pub fn endpoint(&self) -> String {
+        match self {
+            Self::Local => format!("https://localhost:{}", crate::openshell::grpc::GATEWAY_PORT),
+            Self::Remote { endpoint, .. } => endpoint.clone(),
+        }
+    }
+
+    /// The directory holding the CA and client certificate the channel presents.
+    pub fn tls_dir(&self) -> Result<PathBuf> {
+        match self {
+            Self::Local => crate::openshell::grpc::mtls_dir(),
+            Self::Remote { tls_dir, .. } => Ok(tls_dir.clone()),
         }
     }
 }
@@ -362,7 +472,7 @@ pub fn gateway_toml(
     driver: ComputeDriver,
     images: &DriverImages,
     otlp_endpoint: Option<&str>,
-    pod_ip: Option<IpAddr>,
+    dial_back: Option<&DialBack>,
     client_tls_secret: &str,
 ) -> Result<String> {
     let mut s = format!(
@@ -396,11 +506,11 @@ pub fn gateway_toml(
             // client cert = authorized, exactly what mtls_auth grants under podman. Sandbox
             // supervisor calls keep using gateway-minted JWTs either way.
             s.push_str("\n[openshell.gateway.auth]\nallow_unauthenticated_users = true\n");
-            let pod_ip = pod_ip.ok_or(GatewayError::PodIpMissing)?;
+            let dial_back = dial_back.ok_or(GatewayError::NoDialBack)?;
             let mut cfg = KubernetesDriverConfig::new(images);
-            cfg.grpc_endpoint = format!("https://{}", SocketAddr::new(pod_ip, port));
+            cfg.grpc_endpoint = dial_back.grpc_endpoint.clone();
             cfg.client_tls_secret_name = client_tls_secret.to_string();
-            cfg.host_gateway_ip = Some(pod_ip);
+            cfg.host_gateway_ip = Some(dial_back.host_gateway_ip);
             // At runtime the render-projected env vars fill the driver config fields that
             // are unknowable at render time or vary per profile.
             if let Ok(ns) = std::env::var("CRUCIBLE_SANDBOX_NAMESPACE")
@@ -417,6 +527,16 @@ pub fn gateway_toml(
                 && !img.is_empty()
             {
                 cfg.default_image = Some(img);
+            }
+            if let Ok(id) = std::env::var(SERVE_GATEWAY_ID_ENV)
+                && !id.is_empty()
+            {
+                cfg.gateway_id = Some(id);
+            }
+            if let Ok(socket) = std::env::var(SANDBOX_SPIFFE_SOCKET_ENV)
+                && !socket.is_empty()
+            {
+                cfg.provider_spiffe_workload_api_socket_path = Some(socket);
             }
             if let Ok(secrets) = std::env::var("CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS") {
                 let v: Vec<String> = secrets
@@ -496,26 +616,30 @@ pub fn generate_certs_args(tls_dir: &str, pod_ip: Option<IpAddr>) -> Vec<String>
     args
 }
 
-/// `openshell gateway add https://localhost:<port> --local --name ci`.
-pub fn register_args(port: u16) -> Vec<String> {
+/// The in-pod gateway's endpoint.
+fn local_endpoint(port: u16) -> String {
+    format!("https://localhost:{port}")
+}
+
+/// `openshell gateway add <endpoint> --local --name ci`.
+pub fn register_args(endpoint: &str) -> Vec<String> {
     vec![
         "gateway".into(),
         "add".into(),
-        format!("https://localhost:{port}"),
+        endpoint.into(),
         "--local".into(),
         "--name".into(),
         GATEWAY_NAME.into(),
     ]
 }
 
-fn registration_matches(body: &[u8], port: u16) -> bool {
+fn registration_matches(body: &[u8], endpoint: &str) -> bool {
     let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(body) else {
         return false;
     };
-    let endpoint = format!("https://localhost:{port}");
     rows.iter().any(|row| {
         row.get("name").and_then(serde_json::Value::as_str) == Some(GATEWAY_NAME)
-            && row.get("endpoint").and_then(serde_json::Value::as_str) == Some(endpoint.as_str())
+            && row.get("endpoint").and_then(serde_json::Value::as_str) == Some(endpoint)
             && row.get("type").and_then(serde_json::Value::as_str) == Some("local")
             && row.get("auth").and_then(serde_json::Value::as_str) == Some("mtls")
     })
@@ -552,13 +676,94 @@ fn gateway_listening(port: u16) -> bool {
     .is_ok()
 }
 
-fn registration_exists(port: u16) -> bool {
+fn registration_exists(endpoint: &str) -> bool {
     Command::new("openshell")
         .args(["gateway", "list", "--output", "json"])
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .is_some_and(|output| registration_matches(&output.stdout, port))
+        .is_some_and(|output| registration_matches(&output.stdout, endpoint))
+}
+
+/// Register the CLI's gateway at `endpoint` with the client material in `tls_dir` (`ca.crt`,
+/// `client/tls.crt`, `client/tls.key`), retrying while the gateway comes up. `gateway add` copies
+/// that material and refuses an existing name, so a registration whose copy no longer matches is
+/// removed and made again. Returns the CLI's last complaint when it never registers.
+fn register_cli(endpoint: &str, tls_dir: &Path) -> Result<Result<(), String>> {
+    let current = registration_exists(endpoint)
+        && mtls_dir().is_ok_and(|dir| client_certs_match(&dir, tls_dir));
+    if current {
+        return Ok(Ok(()));
+    }
+    let listed = Command::new("openshell")
+        .args(["gateway", "list", "--output", "json"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| registered_name(&output.stdout));
+    if listed {
+        let removed = Command::new("openshell")
+            .args(["gateway", "remove", GATEWAY_NAME])
+            .output()
+            .context("exec openshell gateway remove")?;
+        if !removed.status.success() {
+            return Err(GatewayError::RemoveRegistrationFailed {
+                name: GATEWAY_NAME,
+                stderr: String::from_utf8_lossy(&removed.stderr).trim().to_owned(),
+            }
+            .into());
+        }
+    }
+    let mut last = String::new();
+    let registered = wait_for(Duration::from_secs(30), || {
+        match Command::new("openshell")
+            .args(register_args(endpoint))
+            .env("OPENSHELL_LOCAL_TLS_DIR", tls_dir)
+            .output()
+        {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                last = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                false
+            }
+            Err(e) => {
+                last = e.to_string();
+                false
+            }
+        }
+    });
+    Ok(match registered {
+        true => Ok(()),
+        false => Err(last),
+    })
+}
+
+fn registered_name(body: &[u8]) -> bool {
+    serde_json::from_slice::<Vec<serde_json::Value>>(body).is_ok_and(|rows| {
+        rows.iter()
+            .any(|row| row.get("name").and_then(serde_json::Value::as_str) == Some(GATEWAY_NAME))
+    })
+}
+
+/// Lay a gateway pod's client material (`ca.crt`, `tls.crt`, `tls.key`, as its Secret mounts it)
+/// out the way `gateway add` reads it, under `staged`.
+fn stage_client_tls(mounted: &Path, staged: &Path) -> Result<()> {
+    let client = staged.join("client");
+    std::fs::create_dir_all(&client).with_context(|| format!("creating {}", client.display()))?;
+    for (from, to) in [
+        ("ca.crt", staged.join("ca.crt")),
+        ("tls.crt", client.join("tls.crt")),
+        ("tls.key", client.join("tls.key")),
+    ] {
+        std::fs::copy(mounted.join(from), &to).with_context(|| {
+            format!(
+                "copying {} to {}",
+                mounted.join(from).display(),
+                to.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// The Podman API socket path. An explicit `OPENSHELL_PODMAN_SOCKET` names a socket managed
@@ -608,20 +813,144 @@ fn libc_getuid() -> u32 {
 static BOOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tracing::instrument(name = "gateway_boot", skip_all, fields(driver = ?driver))]
-pub async fn ensure_running(driver: ComputeDriver) -> Result<Option<String>> {
+pub async fn ensure_running(
+    driver: ComputeDriver,
+    access: &GatewayAccess,
+) -> Result<Option<String>> {
     let _boot = BOOT.lock().await;
-    if !is_running().await {
-        boot(driver, &DriverImages::from_env()).await?;
+    match access {
+        GatewayAccess::Local => {
+            if !is_running(access).await {
+                boot(driver, &DriverImages::from_env()).await?;
+            }
+        }
+        GatewayAccess::Remote { endpoint, .. } => {
+            if !is_running(access).await {
+                await_remote(access, endpoint).await?;
+            }
+            register_remote(access, endpoint)?;
+        }
     }
-    check_gateway_version().await
+    check_gateway_version(access).await
+}
+
+/// Wait for a gateway running in its own pod to answer. It may still be starting, and its
+/// client material is already mounted, so only health is polled.
+async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
+    let healthy = match access
+        .dial()
+        .ok()
+        .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
+    {
+        Some(probe) => {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                if probe.healthy().await {
+                    break true;
+                }
+                if Instant::now() >= deadline {
+                    break false;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+        None => false,
+    };
+    if !healthy {
+        return Err(GatewayError::HealthTimeout {
+            last_status: format!("no healthy answer from {endpoint}"),
+            log_tail: remote_log_hint(endpoint),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+fn remote_log_hint(endpoint: &str) -> String {
+    format!("(the gateway runs in its own pod at {endpoint}; see that pod's log)")
+}
+
+/// Register the CLI with a gateway running in its own pod, whose client material is mounted.
+fn register_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
+    let staged = state_dir()?.join("remote-tls");
+    stage_client_tls(&access.tls_dir()?, &staged)?;
+    register_cli(endpoint, &staged)?.map_err(|last| GatewayError::RegisterTimeout {
+        last,
+        log_tail: remote_log_hint(endpoint),
+    })?;
+    Ok(())
+}
+
+/// Run as a gateway pod's entrypoint: write the gateway config from the controller's env,
+/// generate the sandbox-JWT signing material locally, and exec the gateway with the
+/// controller-minted server certificate. Returns only on failure.
+pub fn serve() -> Result<()> {
+    let need = |var: &'static str| {
+        std::env::var(var)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(GatewayError::ServeEnvMissing { var })
+    };
+    let host_raw = need(SERVE_HOST_IP_ENV)?;
+    let host_gateway_ip: IpAddr =
+        host_raw
+            .parse()
+            .map_err(|_| GatewayError::ServeEnvUnparseable {
+                var: SERVE_HOST_IP_ENV,
+                raw: host_raw.clone(),
+            })?;
+    let dial_back = DialBack {
+        grpc_endpoint: need(SERVE_GRPC_ENDPOINT_ENV)?,
+        host_gateway_ip,
+    };
+    let client_tls_secret = need(SERVE_CLIENT_TLS_SECRET_ENV)?;
+    let server_tls = PathBuf::from(need(SERVE_SERVER_TLS_DIR_ENV)?);
+    need(SERVE_GATEWAY_ID_ENV)?;
+    write_config(
+        ComputeDriver::Kubernetes,
+        &DriverImages::from_env(),
+        Some(&dial_back),
+        &client_tls_secret,
+    )?;
+    let local_dir = state_dir()?.join("tls");
+    std::fs::create_dir_all(&local_dir)
+        .with_context(|| format!("creating tls dir {}", local_dir.display()))?;
+    let certs = Command::new("openshell-gateway")
+        .args(generate_certs_args(&local_dir.to_string_lossy(), None))
+        .env("OPENSHELL_LOCAL_TLS_DIR", &local_dir)
+        .output()
+        .context("exec openshell-gateway generate-certs")?;
+    if !certs.status.success() {
+        return Err(GatewayError::GenerateCertsFailed {
+            stderr: String::from_utf8_lossy(&certs.stderr).trim().to_owned(),
+        }
+        .into());
+    }
+    let mut gw = Command::new("openshell-gateway");
+    apply_gateway_aws_env(&mut gw, aws_sandbox_role().as_deref());
+    gw.args(serve_args())
+        .env("OPENSHELL_LOCAL_TLS_DIR", &local_dir)
+        .env("OPENSHELL_TLS_CERT", server_tls.join("tls.crt"))
+        .env("OPENSHELL_TLS_KEY", server_tls.join("tls.key"))
+        .env("OPENSHELL_TLS_CLIENT_CA", server_tls.join("ca.crt"));
+    use std::os::unix::process::CommandExt;
+    Err(anyhow::Error::new(gw.exec()).context("exec openshell-gateway"))
+}
+
+/// The gateway's own arguments in a gateway pod: in-memory state, like the in-pod gateway.
+pub fn serve_args() -> Vec<String> {
+    ["--db-url", "sqlite::memory:", "--log-level", "info"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Gate the healthy gateway's reported version. Hard-fail only below the minimum; every
 /// degraded probe outcome (no probe, no version, mismatched rev, unparseable string) is a
 /// returned warning, so a gateway-side format change can't brick the loop.
-async fn check_gateway_version() -> Result<Option<String>> {
+async fn check_gateway_version(access: &GatewayAccess) -> Result<Option<String>> {
     use crate::openshell::grpc::{self, VersionGate};
-    let Some(probe) = grpc::HealthProbe::new() else {
+    let Some(probe) = access.dial().ok().and_then(|d| grpc::HealthProbe::new(&d)) else {
         return Ok(Some(
             "gateway version check skipped: mTLS certs unreadable".to_string(),
         ));
@@ -693,7 +1022,14 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
 
     // 2. gateway config + 3. TLS certs.
     let tls_secret = ClientTlsSecret::for_boot(&boot_id());
-    write_config(driver, images, pod_ip, &tls_secret)?;
+    let dial_back = match driver {
+        ComputeDriver::Kubernetes => Some(DialBack::local(
+            pod_ip.ok_or(GatewayError::PodIpMissing)?,
+            GATEWAY_PORT,
+        )),
+        ComputeDriver::Podman => None,
+    };
+    write_config(driver, images, dial_back.as_ref(), tls_secret.name())?;
     let tls_dir = state_dir()?.join("tls");
     std::fs::create_dir_all(&tls_dir)
         .with_context(|| format!("creating tls dir {}", tls_dir.display()))?;
@@ -745,40 +1081,7 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
     // 5. register, retrying until the gateway is listening; 6. wait healthy. `gateway add`
     //    copies the client material out of `tls_dir` and refuses an existing name, so a
     //    registration whose copy no longer matches is removed and made again.
-    let mut last = String::new();
-    let current = registration_exists(GATEWAY_PORT)
-        && mtls_dir().is_ok_and(|dir| client_certs_match(&dir, &tls_dir));
-    if !current && registration_exists(GATEWAY_PORT) {
-        let removed = Command::new("openshell")
-            .args(["gateway", "remove", GATEWAY_NAME])
-            .output()
-            .context("exec openshell gateway remove")?;
-        if !removed.status.success() {
-            return Err(GatewayError::RemoveRegistrationFailed {
-                name: GATEWAY_NAME,
-                stderr: String::from_utf8_lossy(&removed.stderr).trim().to_owned(),
-            }
-            .into());
-        }
-    }
-    let registered = current
-        || wait_for(Duration::from_secs(30), || {
-            match Command::new("openshell")
-                .args(register_args(GATEWAY_PORT))
-                .output()
-            {
-                Ok(o) if o.status.success() => true,
-                Ok(o) => {
-                    last = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    false
-                }
-                Err(e) => {
-                    last = e.to_string();
-                    false
-                }
-            }
-        });
-    if !registered {
+    if let Err(last) = register_cli(&local_endpoint(GATEWAY_PORT), &tls_dir)? {
         return Err(GatewayError::RegisterTimeout {
             last,
             log_tail: tail_gateway_log(&log_path),
@@ -788,7 +1091,11 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
     // The certs now exist (register wrote them), so a single reusable probe covers the poll loop.
     // Its `healthy()` is async, so the health wait is an async loop (not the sync `wait_for` the
     // socket/register waits use).
-    let healthy = match crate::openshell::grpc::HealthProbe::new() {
+    let healthy = match GatewayAccess::Local
+        .dial()
+        .ok()
+        .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
+    {
         Some(probe) => {
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
@@ -819,8 +1126,12 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
 /// Whether the gateway is up and answering: a `Health` RPC over the local mTLS channel
 /// succeeds with a non-unhealthy status. Before the certs exist (pre-boot) there is nothing to
 /// probe, which reads as "not running".
-pub async fn is_running() -> bool {
-    match crate::openshell::grpc::HealthProbe::new() {
+pub async fn is_running(access: &GatewayAccess) -> bool {
+    match access
+        .dial()
+        .ok()
+        .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
+    {
         Some(p) => p.healthy().await,
         None => false,
     }
@@ -952,8 +1263,8 @@ fn state_dir() -> Result<PathBuf> {
 fn write_config(
     driver: ComputeDriver,
     images: &DriverImages,
-    pod_ip: Option<IpAddr>,
-    tls_secret: &ClientTlsSecret,
+    dial_back: Option<&DialBack>,
+    tls_secret_name: &str,
 ) -> Result<()> {
     let home = std::env::var("HOME").context("HOME unset")?;
     let dir = PathBuf::from(home).join(".config/openshell");
@@ -968,8 +1279,8 @@ fn write_config(
         driver,
         images,
         otlp_endpoint.as_deref(),
-        pod_ip,
-        tls_secret.name(),
+        dial_back,
+        tls_secret_name,
     )?;
     if std::fs::read_to_string(&path).ok().as_deref() == Some(rendered.as_str()) {
         return Ok(());
@@ -1011,13 +1322,17 @@ mod tests {
         Some(IpAddr::from([10, 1, 2, 3]))
     }
 
+    fn dial_back() -> Option<DialBack> {
+        pod_ip().map(|ip| DialBack::local(ip, 17670))
+    }
+
     fn kubernetes_toml(images: &DriverImages) -> toml::Value {
         let t = gateway_toml(
             17670,
             ComputeDriver::Kubernetes,
             images,
             None,
-            pod_ip(),
+            dial_back().as_ref(),
             CLIENT_TLS_SECRET,
         )
         .unwrap();
@@ -1147,7 +1462,7 @@ mod tests {
             ComputeDriver::Kubernetes,
             &DriverImages::default(),
             None,
-            pod_ip(),
+            dial_back().as_ref(),
             secret.name(),
         )
         .unwrap();
@@ -1358,7 +1673,7 @@ mod tests {
             ComputeDriver::Kubernetes,
             &DriverImages::default(),
             None,
-            Some(ip),
+            Some(&DialBack::local(ip, 17670)),
             CLIENT_TLS_SECRET,
         )
         .unwrap();
@@ -1382,7 +1697,7 @@ mod tests {
         assert!(
             matches!(
                 err.downcast_ref::<GatewayError>(),
-                Some(GatewayError::PodIpMissing)
+                Some(GatewayError::NoDialBack)
             ),
             "{err:#}"
         );
@@ -1468,7 +1783,7 @@ mod tests {
     #[test]
     fn register_targets_local_named_gateway() {
         assert_eq!(
-            register_args(17670),
+            register_args(&local_endpoint(17670)),
             [
                 "gateway",
                 "add",
@@ -1481,13 +1796,46 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_pods_mounted_client_material_is_staged_where_gateway_add_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounted = dir.path().join("mounted");
+        std::fs::create_dir_all(&mounted).unwrap();
+        for (name, body) in [("ca.crt", "ca"), ("tls.crt", "cert"), ("tls.key", "key")] {
+            std::fs::write(mounted.join(name), body).unwrap();
+        }
+        let staged = dir.path().join("staged");
+        stage_client_tls(&mounted, &staged).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(staged.join("ca.crt")).unwrap(),
+            "ca"
+        );
+        assert_eq!(
+            std::fs::read_to_string(staged.join("client/tls.crt")).unwrap(),
+            "cert"
+        );
+        assert_eq!(
+            std::fs::read_to_string(staged.join("client/tls.key")).unwrap(),
+            "key"
+        );
+        assert!(
+            client_certs_match(&mounted, &staged),
+            "a registration copied from the staged material is current"
+        );
+        std::fs::remove_file(mounted.join("tls.key")).unwrap();
+        assert!(stage_client_tls(&mounted, &staged).is_err());
+    }
+
+    #[test]
     fn exact_existing_registration_is_idempotent_but_wrong_endpoint_is_not() {
         let exact =
             br#"[{"name":"ci","endpoint":"https://localhost:17670","type":"local","auth":"mtls"}]"#;
-        assert!(registration_matches(exact, 17670));
+        assert!(registration_matches(exact, &local_endpoint(17670)));
         let wrong = br#"[{"name":"ci","endpoint":"https://remote.example:17670","type":"local","auth":"mtls"}]"#;
-        assert!(!registration_matches(wrong, 17670));
-        assert!(!registration_matches(b"not json", 17670));
+        assert!(!registration_matches(wrong, &local_endpoint(17670)));
+        assert!(registration_matches(wrong, "https://remote.example:17670"));
+        assert!(!registration_matches(b"not json", &local_endpoint(17670)));
+        assert!(registered_name(wrong));
+        assert!(!registered_name(br#"[{"name":"other"}]"#));
     }
 
     #[test]
@@ -1580,6 +1928,189 @@ mod tests {
         assert!(
             !client_certs_match(&mtls, &tls),
             "a missing registered file"
+        );
+    }
+
+    fn clear_remote_env() {
+        for var in [
+            GATEWAY_URL_ENV,
+            GATEWAY_CLIENT_TLS_DIR_ENV,
+            SERVE_GRPC_ENDPOINT_ENV,
+            SERVE_HOST_IP_ENV,
+            SERVE_CLIENT_TLS_SECRET_ENV,
+            SERVE_SERVER_TLS_DIR_ENV,
+            SERVE_GATEWAY_ID_ENV,
+        ] {
+            unsafe {
+                std::env::remove_var(var);
+            }
+        }
+    }
+
+    #[test]
+    fn a_gateway_url_with_client_material_makes_the_gateway_remote() {
+        let _guard = crate::test_support::env_lock();
+        clear_remote_env();
+        assert_eq!(GatewayAccess::from_env().unwrap(), GatewayAccess::Local);
+        assert_eq!(GatewayAccess::Local.endpoint(), "https://localhost:17670");
+        unsafe {
+            std::env::set_var(GATEWAY_URL_ENV, "https://172.30.0.9:17670");
+        }
+        let err = GatewayAccess::from_env().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<GatewayError>(),
+                Some(GatewayError::RemoteTlsMissing)
+            ),
+            "{err:#}"
+        );
+        unsafe {
+            std::env::set_var(GATEWAY_CLIENT_TLS_DIR_ENV, "/etc/crucible/gateway-tls");
+        }
+        let access = GatewayAccess::from_env().unwrap();
+        assert_eq!(
+            access,
+            GatewayAccess::Remote {
+                endpoint: "https://172.30.0.9:17670".into(),
+                tls_dir: PathBuf::from("/etc/crucible/gateway-tls"),
+            }
+        );
+        assert_eq!(access.endpoint(), "https://172.30.0.9:17670");
+        assert_eq!(
+            access.tls_dir().unwrap(),
+            PathBuf::from("/etc/crucible/gateway-tls")
+        );
+        clear_remote_env();
+    }
+
+    #[test]
+    fn a_gateway_pod_refuses_to_start_without_its_controller_env() {
+        let _guard = crate::test_support::env_lock();
+        clear_remote_env();
+        let err = serve().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<GatewayError>(),
+                Some(GatewayError::ServeEnvMissing { var }) if *var == SERVE_HOST_IP_ENV
+            ),
+            "{err:#}"
+        );
+        unsafe {
+            std::env::set_var(SERVE_HOST_IP_ENV, "not-an-ip");
+        }
+        let err = serve().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<GatewayError>(),
+                Some(GatewayError::ServeEnvUnparseable { .. })
+            ),
+            "{err:#}"
+        );
+        unsafe {
+            std::env::set_var(SERVE_HOST_IP_ENV, "172.30.0.10");
+        }
+        let err = serve().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<GatewayError>(),
+                Some(GatewayError::ServeEnvMissing { var }) if *var == SERVE_GRPC_ENDPOINT_ENV
+            ),
+            "{err:#}"
+        );
+        unsafe {
+            std::env::set_var(SERVE_GRPC_ENDPOINT_ENV, "https://172.30.0.9:17670");
+            std::env::set_var(SERVE_CLIENT_TLS_SECRET_ENV, "crucible-run-a-gw-client");
+            std::env::set_var(SERVE_SERVER_TLS_DIR_ENV, "/etc/crucible/gateway-server-tls");
+        }
+        let err = serve().unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<GatewayError>(),
+                Some(GatewayError::ServeEnvMissing { var }) if *var == SERVE_GATEWAY_ID_ENV
+            ),
+            "a gateway without its run's id would label supervisors with the shared default: \
+             {err:#}"
+        );
+        clear_remote_env();
+    }
+
+    #[test]
+    fn a_remote_dial_back_names_the_gateway_service_and_the_loop_service() {
+        let _guard = crate::test_support::env_lock();
+        clear_remote_env();
+        unsafe {
+            std::env::set_var(SERVE_GATEWAY_ID_ENV, "crucible-run-a");
+        }
+        let dial_back = DialBack {
+            grpc_endpoint: "https://172.30.0.9:17670".into(),
+            host_gateway_ip: IpAddr::from([172, 30, 0, 10]),
+        };
+        let t = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            &DriverImages::default(),
+            None,
+            Some(&dial_back),
+            "crucible-run-a-gw-client",
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&t).unwrap();
+        let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
+        assert_eq!(
+            k8s["grpc_endpoint"].as_str(),
+            Some("https://172.30.0.9:17670")
+        );
+        assert_eq!(k8s["host_gateway_ip"].as_str(), Some("172.30.0.10"));
+        assert_eq!(
+            k8s["client_tls_secret_name"].as_str(),
+            Some("crucible-run-a-gw-client")
+        );
+        assert_eq!(k8s["gateway_id"].as_str(), Some("crucible-run-a"));
+        assert!(
+            k8s.get("provider_spiffe_workload_api_socket_path")
+                .is_none(),
+            "no socket configured, none mounted"
+        );
+        unsafe {
+            std::env::set_var(
+                SANDBOX_SPIFFE_SOCKET_ENV,
+                "/spiffe-workload-api/spire-agent.sock",
+            );
+        }
+        let with_socket = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            &DriverImages::default(),
+            None,
+            Some(&dial_back),
+            "crucible-run-a-gw-client",
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var(SANDBOX_SPIFFE_SOCKET_ENV);
+        }
+        let parsed: toml::Value = toml::from_str(&with_socket).unwrap();
+        assert_eq!(
+            parsed["openshell"]["drivers"]["kubernetes"]["provider_spiffe_workload_api_socket_path"]
+                .as_str(),
+            Some("/spiffe-workload-api/spire-agent.sock")
+        );
+        clear_remote_env();
+        let local = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            &DriverImages::default(),
+            None,
+            Some(&dial_back),
+            "crucible-run-a-gw-client",
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&local).unwrap();
+        assert!(
+            parsed["openshell"]["drivers"]["kubernetes"]
+                .get("gateway_id")
+                .is_none(),
+            "an in-pod gateway keeps the driver's default id"
         );
     }
 }

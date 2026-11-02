@@ -48,11 +48,13 @@ pub(crate) fn iteration_template(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                keyed: Vec::new(),
                 when: None,
                 revise: None,
                 timeout: None,
                 history: None,
                 repair: 0,
+                optional: Vec::new(),
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];

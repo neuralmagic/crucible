@@ -12,16 +12,22 @@ read ──> gate ─┬─ bucket = outage ──> oncall ──┐
 
 ## Run
 
-Point the run at any server speaking the System One decision API, then pick a ticket:
+Bind a decision model, then pick a ticket. OpenAI's Decisions API:
+
+```sh
+export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"decisions",
+  "model":"gpt-6-luna","key_env":"OPENAI_API_KEY"}]}'
+TICKET=billing crucible plan run --manifest examples/route/crucible.toml --max-cost 1 --max-time 5m
+```
+
+Or any server speaking the System One decision API:
 
 ```sh
 export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"system_one",
   "url":"http://127.0.0.1:8011/v1/systemone","model":"dgemma"}]}'
-TICKET=billing crucible plan run --manifest examples/route/crucible.toml --max-cost 1 --max-time 5m
 ```
 
-Add `"key_env":"SOME_VAR"` to the binding for an endpoint that needs a bearer key held in
-`SOME_VAR`. With no decision binding the run truncates at `gate` before spending anything.
+`key_env` names the variable holding the endpoint's bearer key. With no decision binding the run truncates at `gate` before spending anything.
 
 ## Tickets
 

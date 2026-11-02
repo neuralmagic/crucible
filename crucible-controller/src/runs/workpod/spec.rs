@@ -71,7 +71,7 @@ impl std::fmt::Display for LaunchFailure {
 /// The per-kind deltas of one agent-turn kind. Static-dispatch only (concrete ZST specs; no
 /// `async_trait`, no `dyn TurnSpec` — `Self::Result` isn't dyn-compatible, and two ZST kinds make
 /// static dispatch free). The async methods await the already-`Send`-boxed `dyn PodDispatcher`
-/// (and, for `parse`, the drop-box store); everything else is sync.
+/// (and, for `parse`, the artifact store); everything else is sync.
 pub(crate) trait TurnSpec: Send + Sync {
     type Result: Send;
 
@@ -233,6 +233,11 @@ async fn collect<S: TurnSpec>(
     created_at: &str,
 ) -> Result<TurnCollected<S::Result>> {
     let kind = spec.kind();
+    crate::runs::pod_token::revoke(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Turn(name.to_string()),
+    )
+    .await?;
     match outcome {
         Ok(TurnRunOutcome::Result(result)) => {
             match book_turn_success(
@@ -385,7 +390,10 @@ async fn fail_turn(
     Ok(CasResult::Won)
 }
 
-/// `spawn_blocking(render + stamp)` then `dispatcher.create`. The OUTER `Result` is the
+/// `spawn_blocking(render + stamp)` then `dispatcher.create`. Under isolated gateways the turn gets
+/// its own gateway pod first, exactly as a run does, with certificates valid for `deadline`; it is
+/// torn down here when the launch fails, and by the gateway sweep once the turn's row closes. The
+/// OUTER `Result` is the
 /// `spawn_blocking` `JoinError` ALONE — the caller `?`-propagates it out (row stays `Running` for
 /// the startup sweep, never CAS-failed). The INNER `Result<(), LaunchFailure>` is render-or-create:
 /// a render error carries no added context (`LaunchFailure::RenderFailed`); a create error carries
@@ -403,11 +411,62 @@ pub(crate) async fn spawn_turn_pod(
     spec: &WorkPodSpec,
     pod_noun: &'static str,
     profile: &Path,
+    loaded: &crate::config::ProfileCache,
     digests: Option<Arc<dyn DigestResolver>>,
     cluster: &str,
     ns: &str,
     delivery: &crate::secrets::deliver::Delivery,
+    deadline: Duration,
 ) -> Result<Result<(), LaunchFailure>> {
+    let isolated = match loaded.get(Some(profile)).await {
+        Ok(loaded) => loaded.filter(|p| crucible::deploy::render::gateway::isolated(p)),
+        Err(e) => return Ok(Err(LaunchFailure::RenderFailed(format!("{e:#}")))),
+    };
+    let gateway_failed = async |detail: String| {
+        if let Some(gateway_profile) = isolated.as_ref()
+            && let Err(e) = crate::runs::workpod::gateway::teardown(
+                d,
+                cluster,
+                gateway_profile,
+                &spec.pod_name,
+                ns,
+            )
+            .await
+        {
+            tracing::warn!(pod_name = %spec.pod_name, error = format!("{e:#}"), "a failed turn launch left its gateway; the gateway sweep removes it");
+        }
+        Err(LaunchFailure::PodCreateFailed { pod_noun, detail })
+    };
+    let mut delivery = delivery.clone();
+    let gateway = match isolated.as_ref() {
+        None => None,
+        Some(gateway_profile) => {
+            match crate::runs::workpod::gateway::RunGateway::reserve(
+                d,
+                cluster,
+                gateway_profile,
+                &spec.pod_name,
+                Some(deadline.as_secs()),
+            )
+            .await
+            {
+                Ok(gateway) => match delivery.merge(gateway.loop_delivery()) {
+                    Ok(()) => Some(gateway),
+                    Err(e) => {
+                        return Ok(gateway_failed(format!(
+                            "folding the gateway client material into the turn's: {e}"
+                        ))
+                        .await);
+                    }
+                },
+                Err(e) => {
+                    return Ok(
+                        gateway_failed(format!("reserving the turn's gateway: {e:#}")).await,
+                    );
+                }
+            }
+        }
+    };
     let owner = owner_reference_from_env();
     let spec_cl = spec.clone();
     let profile = profile.to_path_buf();
@@ -429,15 +488,34 @@ pub(crate) async fn spawn_turn_pod(
             // Inject the dispatching span's W3C trace context so the turn pod's engine re-roots its
             // scope/rank span under it (a no-op when the controller isn't exporting spans).
             crate::runs::workpod::trace::inject_dispatch_context(&mut pod);
-            match d.create(cluster, ns, pod).await {
+            if let Some(gateway) = gateway.as_ref()
+                && let Err(e) = gateway
+                    .start(
+                        d,
+                        cluster,
+                        ns,
+                        &pod,
+                        &[crucible::openshell::gateway::OTEL_COLLECTOR_PORT],
+                    )
+                    .await
+            {
+                return Ok(gateway_failed(format!("starting the turn's gateway: {e:#}")).await);
+            }
+            let created = match d.create(cluster, ns, pod).await {
                 Ok(created) => {
-                    create_turn_secret(d, cluster, ns, &secret_name, delivery, &created, pod_noun)
+                    create_turn_secret(d, cluster, ns, &secret_name, &delivery, &created, pod_noun)
                         .await
                 }
                 Err(e) => Err(LaunchFailure::PodCreateFailed {
                     pod_noun,
                     detail: format!("{e:#}"),
                 }),
+            };
+            match created {
+                Err(LaunchFailure::PodCreateFailed { detail, .. }) if gateway.is_some() => {
+                    gateway_failed(detail).await
+                }
+                created => created,
             }
         }
         Err(e) => Err(LaunchFailure::RenderFailed(format!("{e:#}"))),
@@ -491,6 +569,14 @@ pub(crate) async fn fail_launch(
     issue_key: &str,
 ) {
     let rendered = reason.to_string();
+    if let Err(e) = crate::runs::pod_token::revoke(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Turn(name.to_string()),
+    )
+    .await
+    {
+        tracing::warn!(pod = %name, error = format!("{e:#}"), "revoking a failed turn's token");
+    }
     let _ = crate::runs::work_pods::try_finish_running_work_pod(
         db.pool(),
         name,
@@ -583,25 +669,20 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         });
     }
 
-    // The provider's key, read before anything is written: a turn that cannot pay for the service
+    // The models' keys, read before anything is written: a turn that cannot pay for the service
     // it was pointed at must leave no work-pod row and no pod behind.
-    let delivery = match inputs.inference_provider.as_ref() {
-        None => crate::secrets::deliver::Delivery::default(),
-        Some(provider) => {
-            match crate::secrets::deliver::provider_delivery(
-                db.pool(),
-                cfg.secret_provider.as_ref(),
-                provider,
-            )
-            .await?
-            {
-                Ok(delivery) => delivery,
-                Err(refusal) => {
-                    return Ok(TurnDispatch::Failed {
-                        reason: refusal.to_string(),
-                    });
-                }
-            }
+    let mut delivery = match crate::secrets::deliver::inference_delivery(
+        db.pool(),
+        cfg.secret_provider.as_ref(),
+        &inputs.inference,
+    )
+    .await?
+    {
+        Ok(delivery) => delivery,
+        Err(refusal) => {
+            return Ok(TurnDispatch::Failed {
+                reason: refusal.to_string(),
+            });
         }
     };
 
@@ -612,6 +693,16 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
     let wp_spec =
         spec.build_work_pod_spec(cfg, issue_key, repo_url, max_cost, sandbox_image, inputs);
     let pod_name = wp_spec.pod_name.clone();
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Turn(pod_name.clone()),
+        None,
+        std::time::Duration::from_secs(cfg.loop_run_max_age.secs()),
+    )
+    .await?;
+    delivery
+        .merge(crate::secrets::deliver::pod_token(token))
+        .map_err(|e| anyhow::anyhow!("folding the turn's token into its delivery: {e}"))?;
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
     crate::runs::work_pods::insert_work_pod(
         db.pool(),
@@ -625,10 +716,12 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         &wp_spec,
         spec.pod_noun(),
         &profile,
+        &cfg.profile_cache,
         cfg.digest_resolver(),
         &cluster,
         &ns,
         &delivery,
+        spec.deadline(cfg),
     )
     .await?
     {
@@ -797,9 +890,7 @@ impl TurnSpec for ScopeSpec {
         match collect_scope_report(terminal.termination_message(), logs) {
             Ok(mut report) => {
                 let manifest = manifest_from_message(terminal.termination_message());
-                if let Err(reason) =
-                    apply_dropbox_artifacts(&mut report, &manifest, pool, pod).await
-                {
+                if let Err(reason) = apply_turn_artifacts(&mut report, &manifest, pool, pod).await {
                     return Ok(TurnRunOutcome::NoResult {
                         reason: format!("scope turn pod {pod}: {reason}"),
                     });
@@ -818,8 +909,8 @@ impl TurnSpec for ScopeSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::metrics::Metrics;
+    use crate::runs::workpod::spec::*;
     use crucible_contract::{ArtifactKind, ArtifactRef, Envelope, EnvelopeKind};
     use k8s_openapi::api::core::v1::Pod;
     use std::sync::Mutex;
@@ -1092,7 +1183,7 @@ mod tests {
     }
 
     /// A ScopeReport termination-envelope JSON, with an optional manifest entry so a fixture can
-    /// exercise `apply_dropbox_artifacts` on the envelope path (the marker-only fallback carries no
+    /// exercise `apply_turn_artifacts` on the envelope path (the marker-only fallback carries no
     /// manifest at all).
     fn scope_envelope(
         digest: Option<&str>,
@@ -1150,7 +1241,7 @@ mod tests {
         assert_eq!(db.metrics().unwrap().turns_total("scope", "failed"), 1);
     }
 
-    /// A surviving scope report whose manifest names a pack the drop-box never received (the
+    /// A surviving scope report whose manifest names a pack the turn never uploaded (the
     /// artifact store is empty) — a loud `NoResult`, never a silently missing deliverable.
     #[tokio::test]
     async fn fixture_pack_missing() {
@@ -1179,6 +1270,109 @@ mod tests {
             panic!("expected a loud NoResult, got {out:?}");
         };
         assert!(reason.contains("scope pack not recovered"), "{reason}");
+    }
+
+    /// A turn's pod token rides the turn's Secret, never its spec, names the turn's pod, and is
+    /// revoked when the turn is collected (RFC-0004:C-RUN-EVIDENCE).
+    #[tokio::test]
+    async fn a_turn_holds_a_token_for_its_pod_until_it_is_collected() {
+        let _g = crate::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let db = new_db().await;
+        let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+        let cfg = pod_cfg(&profile, "img");
+        let d = Arc::new(ScriptedDispatcher::succeeded(""));
+
+        let out = dispatch_turn(
+            &ScopeSpec,
+            &db,
+            &cfg,
+            d.clone(),
+            "o/r#40",
+            "o/r",
+            5.0,
+            TurnInputs::default(),
+        )
+        .await
+        .expect("dispatch");
+        assert!(matches!(out, TurnDispatch::Launched));
+        let pod = d.created.lock().expect("lock")[0].clone();
+        let name = pod.metadata.name.clone().expect("pod name");
+        let token_env = pod.spec.as_ref().expect("spec").containers[0]
+            .env
+            .as_ref()
+            .and_then(|env| {
+                env.iter()
+                    .find(|e| e.name == crucible_contract::ENV_POD_TOKEN)
+            })
+            .cloned()
+            .expect("the token env");
+        assert!(token_env.value.is_none(), "the token never rides the spec");
+        assert!(
+            token_env
+                .value_from
+                .and_then(|v| v.secret_key_ref)
+                .is_some(),
+            "it is read from the turn's Secret"
+        );
+        let revoked = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT revoked_at FROM pod_tokens WHERE turn_pod = $1",
+            )
+            .bind(&name)
+            .fetch_all(db.pool())
+            .await
+            .expect("tokens")
+        };
+        assert_eq!(
+            revoked().await,
+            vec![None],
+            "one live token for the turn's pod"
+        );
+
+        let mut done = ScriptedDispatcher::succeeded("");
+        done.message = Some(scope_envelope(Some("v1:beef"), true, 0.1, None));
+        adopt_scope_turn(&db, &cfg, Arc::new(done), "o/r#40")
+            .await
+            .expect("adopt")
+            .expect("a running row");
+        let after = revoked().await;
+        assert_eq!(after.len(), 1);
+        assert!(after[0].is_some(), "collection revoked the turn's token");
+    }
+
+    /// A turn whose pod could not be created has its token revoked with the failed launch.
+    #[tokio::test]
+    async fn a_failed_turn_launch_revokes_its_token() {
+        let _g = crate::ENV_LOCK.lock().await;
+        let tmp = tempfile::tempdir().expect("tmp");
+        let db = new_db().await;
+        let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+        let cfg = pod_cfg(&profile, "img");
+        let mut d = ScriptedDispatcher::succeeded("");
+        d.create_err = true;
+        let out = dispatch_turn(
+            &ScopeSpec,
+            &db,
+            &cfg,
+            Arc::new(d),
+            "o/r#41",
+            "o/r",
+            5.0,
+            TurnInputs::default(),
+        )
+        .await
+        .expect("dispatch");
+        assert!(matches!(out, TurnDispatch::Failed { .. }));
+        let pod = failed_row_for_issue(&db, "o/r#41").await.pod_name;
+        let revoked: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT revoked_at FROM pod_tokens WHERE turn_pod = $1")
+                .bind(&pod)
+                .fetch_all(db.pool())
+                .await
+                .expect("tokens");
+        assert_eq!(revoked.len(), 1);
+        assert!(revoked[0].is_some(), "{revoked:?}");
     }
 
     // --- CAS-loss fixtures, split per arm (R2) ------------------------------------------------

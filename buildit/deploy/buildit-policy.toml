@@ -1,0 +1,13 @@
+# buildit MCP tool policy (--tool-policy, optional). Rules see `claims` (the access token's, or
+# the equivalent built for a tokens-file token) and `args` (the call's arguments). The tools and
+# methods buildit serves, and the scope each needs, are the server's own (BuilditRules).
+
+[[tools.build.validate]]
+name = "build-timeout-cap"
+rule = "!has(args.timeout_s) || args.timeout_s <= 3600"
+message = "a build may run at most 3600 seconds"
+
+[[tools.run.validate]]
+name = "run-timeout-cap"
+rule = "!has(args.timeout_s) || args.timeout_s <= 1800"
+message = "a run may take at most 1800 seconds"

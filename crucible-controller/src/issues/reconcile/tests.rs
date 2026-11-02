@@ -1,17 +1,17 @@
 #![allow(clippy::disallowed_macros)]
 
-#[cfg(feature = "autoresearch")]
-use super::grounded::TierGate;
-#[cfg(feature = "autoresearch")]
-use super::grounded::*;
-#[cfg(feature = "autoresearch")]
-use super::scope::*;
-use super::*;
 use crate::Db;
 use crate::config::Profile;
 use crate::issues::model::{NewIssue, NewScope};
 #[cfg(feature = "autoresearch")]
+use crate::issues::reconcile::grounded::TierGate;
+#[cfg(feature = "autoresearch")]
+use crate::issues::reconcile::grounded::*;
+#[cfg(feature = "autoresearch")]
 use crate::issues::reconcile::lifecycle::*;
+#[cfg(feature = "autoresearch")]
+use crate::issues::reconcile::scope::*;
+use crate::issues::reconcile::*;
 use crate::model::{ParkReason, ParkedBy};
 use crate::runs::completion::*;
 use crate::runs::model::NewRun;
@@ -2149,6 +2149,96 @@ async fn complete_run_parks_an_errored_outcome(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn complete_run_parks_a_playbook_run_that_reached_its_wall_clock_ceiling(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-26";
+    seed_registered_playbook(&db, "survey").await;
+    adopt_launch(&db, key, 3.5).await;
+    assert!(crate::issues::store::claim_issue(db.pool(), key, Status::New, Status::Running).await?);
+    let log = [
+        r#"{"v":1,"kind":"budget","spent":0.4,"elapsed_secs":1800}"#,
+        r#"{"v":1,"kind":"shutdown","outcome":"budget","reason":"wall-clock ceiling reached"}"#,
+    ]
+    .join("\n");
+
+    let disposition = complete_run(&db, key, None, "run-ceiling", None, &log, None).await?;
+
+    assert_eq!(disposition, crate::runs::workpod::RunDisposition::Errored);
+    let iss = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("row");
+    assert_eq!(
+        iss.status,
+        Status::Parked,
+        "a playbook that hit its ceiling parks, never done"
+    );
+    assert!(
+        iss.parked_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("wall-clock ceiling reached")),
+        "the engine's shutdown reason rides the park: {:?}",
+        iss.parked_reason
+    );
+    Ok(())
+}
+
+/// An autoresearch loop's `budget` outcome is its exhausted end: a loop that kept a candidate and
+/// opened a draft PR before its cost cap still lands `pr-open`.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn complete_run_lands_pr_open_when_a_loop_hit_its_budget_after_a_pr(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#8")).await?;
+    assert!(
+        crate::issues::store::claim_issue(db.pool(), "owner/repo#8", Status::New, Status::Running)
+            .await?
+    );
+    let scope_id = crate::issues::store::insert_scope(
+        db.pool(),
+        &NewScope {
+            issue: "owner/repo#8".into(),
+            pack_digest: None,
+            check_outcome: None,
+        },
+    )
+    .await?;
+    let log = [
+        r#"{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","score":230.0}}"#,
+        r#"{"v":1,"kind":"pr_links","links":[{"url":"https://github.com/owner/repo/pull/9","repo":"owner/repo","name":""}]}"#,
+        r#"{"v":1,"kind":"shutdown","outcome":"budget","reason":"a cost or time cap was reached"}"#,
+    ]
+    .join("\n");
+
+    let disposition = complete_run(
+        &db,
+        "owner/repo#8",
+        Some(scope_id),
+        "run-8",
+        None,
+        &log,
+        None,
+    )
+    .await?;
+
+    assert_eq!(disposition, crate::runs::workpod::RunDisposition::Finished);
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), "owner/repo#8")
+            .await?
+            .expect("row")
+            .status,
+        Status::PrOpen
+    );
+    let ev = db.events().read_for_key("owner/repo#8").await?;
+    let last = ev.last().expect("a transition event");
+    assert_eq!(last.to, "pr-open");
+    Ok(())
+}
+
 /// The live failure: the park read `run errored: short-circuited at scan`, which names where the
 /// run stopped and not why, and the pod carrying the real chain was deleted on collection. The
 /// failing task's note has to ride the park too.
@@ -2578,48 +2668,52 @@ async fn ingest_completion_scrapes_the_session_from_the_finished_pods_logs(
     Ok(())
 }
 
-/// Store a gzipped run-session artifact exactly where the Tier 2 approval would (the pod-evidence
-/// owner in the artifact store), so the completion edge finds it and prefers it.
-async fn seed_dropbox_run_session(pool: &sqlx::PgPool, pod: &str, ndjson: &str) {
-    use std::io::Write as _;
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(ndjson.as_bytes()).expect("gzip");
+/// Store a gzipped run-session exactly where a pod's upload lands it: the run's own artifact.
+async fn seed_uploaded_run_session(pool: &sqlx::PgPool, run_id: &str, ndjson: &str) {
     crate::runs::blob_store::put_artifact_bytes(
         pool,
-        &crate::runs::blob_store::ArtifactOwner::PodEvidence {
-            pod: pod.to_string(),
+        &crate::runs::blob_store::ArtifactOwner::Run {
+            run_id: run_id.to_string(),
         },
         crucible_contract::ArtifactKind::RunSession.as_str(),
         u64::MAX,
-        enc.finish().expect("gzip finish"),
+        crucible_contract::artifact::gzip(ndjson.as_bytes()).expect("gzip"),
     )
     .await
     .expect("store artifact");
 }
 
-/// The Tier 2 drop-box run-session is PREFERRED over the log scrape: with the artifact present
-/// the completion edge decompresses it into the run's stored session and folds it — proven by feeding
-/// the dispatcher logs that carry NO session at all (which would otherwise park loud), so only
-/// the drop-box could have produced the ingested run.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn ingest_completion_prefers_the_dropbox_run_session(pool: PgPool) -> Result<()> {
-    let _g = crate::ENV_LOCK.lock().await;
-    let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
-    seed_running_pod_run(&db, "owner/repo#43", "run-43", "crucible-run-43").await?;
-
-    let session = [
+fn finished_loop_session() -> String {
+    [
         r#"{"v":1,"kind":"row","row":{"iter":0,"decision":"baseline","score":200.0}}"#,
         r#"{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","score":245.0}}"#,
         r#"{"v":1,"kind":"budget","spent":1.4,"elapsed_secs":90}"#,
         r#"{"v":1,"kind":"summary","rows":[],"gate":"bench","best_score":245.0}"#,
         r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":"done"}"#,
     ]
-    .join("\n");
-    seed_dropbox_run_session(db.pool(), "crucible-run-43", &session).await;
+    .join("\n")
+}
 
-    // Logs carry NO session (the new wrapper skips the delimiter when ingest is on): if the scrape
-    // ran it would NoDelimiter-park. Only the drop-box can advance this run.
+/// A pod run completes from the session it uploaded to its run once its pod is terminal, with
+/// logs that carry no session at all (which would otherwise park loud), so only the upload could
+/// have produced the ingested run. Completion keeps the pod's own output and revokes the run's
+/// token.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    seed_running_pod_run(&db, "owner/repo#43", "run-43", "crucible-run-43").await?;
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run("run-43".to_string()),
+        None,
+        std::time::Duration::from_secs(3600),
+    )
+    .await?;
+    let session = finished_loop_session();
+    seed_uploaded_run_session(db.pool(), "run-43", &session).await;
+
     crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: "podman login noise\n".into(),
@@ -2628,20 +2722,16 @@ async fn ingest_completion_prefers_the_dropbox_run_session(pool: PgPool) -> Resu
     let outcome = ingest_completion(&db, &cfg, "owner/repo#43").await;
     crate::runs::workpod::reset_dispatcher();
 
-    assert!(outcome?, "the completion edge ingested from the drop-box");
+    assert!(
+        outcome?,
+        "the completion edge ingested the uploaded session"
+    );
     assert_eq!(
         crate::runs::blob_store::get_run_engine_log(db.pool(), "run-43")
             .await?
             .as_deref(),
         Some("podman login noise\n"),
-        "the pod's own output is kept even when the session came from the drop-box"
-    );
-    let written = crate::runs::blob_store::get_run_session(db.pool(), "run-43")
-        .await?
-        .expect("the drop-box session was persisted for the run");
-    assert_eq!(
-        written, session,
-        "the plain NDJSON round-trips out of the drop-box gzip"
+        "the pod's own output is kept beside the uploaded session"
     );
     assert_eq!(
         crate::issues::store::get_issue(db.pool(), "owner/repo#43")
@@ -2649,13 +2739,73 @@ async fn ingest_completion_prefers_the_dropbox_run_session(pool: PgPool) -> Resu
             .unwrap()
             .status,
         Status::Done,
-        "the issue advanced off running via the drop-box, not the (empty) scrape"
     );
     let run = sqlx::query!(r#"SELECT status, best_score FROM runs WHERE run_id='run-43'"#)
         .fetch_one(db.pool())
         .await?;
     assert_eq!(run.status, "finished");
     assert_eq!(run.best_score, Some(245.0));
+    assert!(
+        matches!(
+            crate::runs::pod_token::verify(db.pool(), &token).await,
+            Err(crate::runs::pod_token::TokenRefusal::Revoked { .. })
+        ),
+        "completion revokes the run's token"
+    );
+    Ok(())
+}
+
+/// A pod that uploaded its session is not settled until it is terminal: its pod is still
+/// finishing, and its log is kept only once it has stopped writing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_uploaded_session_waits_for_its_pod(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    seed_running_pod_run(&db, "owner/repo#44", "run-44", "crucible-run-44").await?;
+    seed_uploaded_run_session(db.pool(), "run-44", &finished_loop_session()).await;
+
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::TimedOut,
+        logs: String::new(),
+        created: Default::default(),
+    }));
+    let outcome = ingest_completion(&db, &cfg, "owner/repo#44").await;
+    crate::runs::workpod::reset_dispatcher();
+
+    assert!(!outcome?, "a running pod's run is still in flight");
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), "owner/repo#44")
+            .await?
+            .unwrap()
+            .status,
+        Status::Running,
+    );
+    Ok(())
+}
+
+/// A pod already gone once its session was stored completes from the store, rather than failing
+/// as lost: a restarted controller finds the pod collected and the session uploaded.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_gone_pod_with_an_uploaded_session_completes(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    seed_running_pod_run(&db, "owner/repo#45", "run-45", "crucible-run-45").await?;
+    seed_uploaded_run_session(db.pool(), "run-45", &finished_loop_session()).await;
+
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(GoneRunPodDispatcher));
+    let outcome = ingest_completion(&db, &cfg, "owner/repo#45").await;
+    crate::runs::workpod::reset_dispatcher();
+
+    assert!(outcome?, "the stored session settles the run");
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), "owner/repo#45")
+            .await?
+            .unwrap()
+            .status,
+        Status::Done,
+    );
     Ok(())
 }
 
@@ -4003,9 +4153,10 @@ impl crate::runs::workpod::PodDispatcher for PodArmDispatcher {
         &self,
         _cluster: &str,
         _ns: &str,
-        pod: k8s_openapi::api::core::v1::Pod,
+        mut pod: k8s_openapi::api::core::v1::Pod,
     ) -> Result<k8s_openapi::api::core::v1::Pod> {
         self.created.lock().expect("lock").push(pod.clone());
+        pod.metadata.uid = Some("fake-pod-uid".to_string());
         Ok(pod)
     }
     async fn await_terminal(
@@ -4316,6 +4467,7 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -4491,6 +4643,7 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -4517,20 +4670,36 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
     let argv = crate::testing::fixtures::wrapper_of(pod);
     assert!(argv.contains("--harness codex"), "{argv}");
     assert!(argv.contains("--model gpt-5.6-sol"), "{argv}");
-    let key = pod
+    let env = pod
         .spec
         .as_ref()
         .and_then(|s| s.containers.first())
         .and_then(|c| c.env.as_ref())
-        .expect("env")
+        .expect("env");
+    let key = env
         .iter()
-        .find(|v| v.name == "OPENAI_API_KEY")
-        .expect("the provider's key on the turn container")
-        .clone();
+        .find(|v| v.name == "CRUCIBLE_INFERENCE_KEY_AGENT")
+        .expect("the provider's key on the turn container");
     assert!(
         key.value.is_none() && key.value_from.is_some(),
         "the key rides a secretKeyRef, never a plain value"
     );
+    let document = env
+        .iter()
+        .find(|v| v.name == crucible_contract::inference::ENV_INFERENCE)
+        .and_then(|v| v.value.as_deref())
+        .map(crucible_contract::inference::ResolvedInference::parse)
+        .expect("the inference document")
+        .expect("a valid document");
+    let agent = document
+        .binding(crucible_contract::inference::InferenceRole::Agent)
+        .expect("the agent binding");
+    assert_eq!(agent.model, "gpt-5.6-sol");
+    assert_eq!(
+        agent.key_env.as_ref().map(|k| k.as_str()),
+        Some("CRUCIBLE_INFERENCE_KEY_AGENT")
+    );
+    assert!(env.iter().all(|v| v.name != "OPENAI_API_KEY"));
     let secret = created_secrets.lock().expect("lock");
     assert_eq!(
         secret
@@ -4538,7 +4707,7 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
             .expect("the turn's Secret")
             .string_data
             .as_ref()
-            .and_then(|d| d.get("openai_key.OPENAI_API_KEY")),
+            .and_then(|d| d.get("openai_key.CRUCIBLE_INFERENCE_KEY_AGENT")),
         Some(&"value-of-openai_key".to_string())
     );
     Ok(())
@@ -5261,8 +5430,9 @@ impl crate::runs::workpod::PodDispatcher for StillRunningDispatcher {
         &self,
         _cluster: &str,
         _ns: &str,
-        pod: k8s_openapi::api::core::v1::Pod,
+        mut pod: k8s_openapi::api::core::v1::Pod,
     ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        pod.metadata.uid = Some("still-running-uid".to_string());
         Ok(pod)
     }
     async fn await_terminal(
@@ -6605,17 +6775,17 @@ async fn burst_backlog_respects_the_tight_rank_cap_no_bypass(pool: PgPool) -> Re
 /// Seed a registered playbook whose stored tarball is a minimal build-free pack. Registration
 /// itself is covered in `playbooks.rs`; this is the row a launch is adopted against.
 async fn seed_registered_playbook(db: &Db, id: &str) {
+    seed_registered_playbook_with(db, id, crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH).await;
+}
+
+async fn seed_registered_playbook_with(db: &Db, id: &str, source: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("crucible.toml"),
         crate::testing::fixtures::PLAYBOOK_PACK_MANIFEST,
     )
     .expect("manifest");
-    std::fs::write(
-        dir.path().join("workflow.star"),
-        crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
-    )
-    .expect("source");
+    std::fs::write(dir.path().join("workflow.star"), source).expect("source");
     let tar_gz = crate::playbooks::packs::tar_pack_tree(dir.path()).expect("tar");
     let bytes = tar_gz.len() as i64;
     let digest = crucible_contract::content_digest(&tar_gz);
@@ -6671,6 +6841,7 @@ async fn adopt_launch_with_groups(
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups,
+                    rerun: None,
                 },
                 registered.revision()
             )
@@ -6740,6 +6911,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         },
         registered.revision(),
     )
@@ -7186,6 +7358,126 @@ async fn a_playbook_launch_with_a_binding_dispatches(pool: PgPool) -> Result<()>
             "the value itself must not reach a dispatched document: {doc}"
         );
     }
+    Ok(())
+}
+
+/// A playbook launch hands its run both models the defaults resolve: the agent it thinks with and
+/// the decision model its route tasks ask, in one inference document, each key under its role's
+/// variable and neither under a name a harness reads.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool) -> Result<()> {
+    use crate::playbooks::providers::{
+        DefaultScope, DispatchDefault, ModelRole, NewProvider, ProviderKind, ProviderSecretRef,
+        WorkloadClass,
+    };
+    use crucible_contract::inference::{InferenceProtocol, InferenceRole, ResolvedInference};
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        secret_provider: Some(std::sync::Arc::new(
+            crate::secrets::provider::MapProvider::new([(
+                "openai_key".to_string(),
+                SECRET_VALUE.to_string(),
+            )]),
+        )),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    crate::testing::register_inference_key(db.pool(), "user:platform-admin", "openai_key").await?;
+    crate::playbooks::providers::upsert(
+        db.pool(),
+        &NewProvider {
+            owner: crate::authz::model::Principal::platform(),
+            id: "openai",
+            display_name: "OpenAI",
+            kind: ProviderKind::OpenAi,
+            models: &[],
+            default_model: None,
+            secret: Some(&ProviderSecretRef {
+                name: "openai_key".to_string(),
+                owner: crate::authz::model::Principal::parse("user:platform-admin")
+                    .expect("a principal"),
+            }),
+            endpoint: None,
+            harness: None,
+            enabled: true,
+            created_by: "wren",
+            price: None,
+        },
+    )
+    .await?;
+    for role in [ModelRole::Agent, ModelRole::Decision] {
+        crate::playbooks::providers::set_default(
+            db.pool(),
+            &DispatchDefault {
+                scope_kind: DefaultScope::Platform,
+                scope_ref: String::new(),
+                workload_class: WorkloadClass::Playbook,
+                role,
+                provider_id: "openai".to_string(),
+                model: None,
+                fallback_provider_id: None,
+                fallback_model: None,
+            },
+        )
+        .await?;
+    }
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-d";
+    seed_registered_playbook(&db, "survey").await;
+    adopt_launch(&db, key, 3.5).await;
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::Succeeded,
+        logs: String::new(),
+        created: created.clone(),
+    }));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    res?;
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Running, "{:?}", issue.parked_reason);
+
+    let pods = created.lock().expect("lock");
+    let pod = pods.first().expect("the run pod");
+    assert!(
+        !serde_json::to_string(pod)?.contains(SECRET_VALUE),
+        "the key never reaches the pod spec"
+    );
+    let env = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .expect("env");
+    let document = env
+        .iter()
+        .find(|v| v.name == crucible_contract::inference::ENV_INFERENCE)
+        .and_then(|v| v.value.as_deref())
+        .map(ResolvedInference::parse)
+        .expect("the inference document")
+        .expect("a valid document");
+    let agent = document.binding(InferenceRole::Agent).expect("agent");
+    let decision = document.binding(InferenceRole::Decision).expect("decision");
+    assert_eq!(
+        (agent.protocol, agent.model.as_str()),
+        (InferenceProtocol::Responses, "gpt-5.6-luna")
+    );
+    assert_eq!(
+        (decision.protocol, decision.model.as_str()),
+        (InferenceProtocol::Decisions, "gpt-6-luna")
+    );
+    for binding in [agent, decision] {
+        let var = binding.key_env.as_ref().expect("a keyed binding").as_str();
+        assert!(
+            env.iter().any(|v| v.name == var && v.value_from.is_some()),
+            "{var} rides a secretKeyRef"
+        );
+    }
+    assert!(env.iter().all(|v| v.name != "OPENAI_API_KEY"));
     Ok(())
 }
 
@@ -7734,6 +8026,15 @@ async fn a_restart_adopts_the_local_runs_it_orphaned(pool: PgPool) -> Result<()>
         .fetch_all(db.pool())
         .await?;
     assert_eq!(statuses, vec!["finished", "no-session"]);
+    let run_id: String = sqlx::query_scalar("SELECT run_id FROM runs WHERE issue = $1")
+        .bind(published)
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(
+        crate::runs::blob_store::get_run_session(db.pool(), &run_id).await?,
+        Some(playbook_log("finished")),
+        "a folded local session is stored like a pod's, so a rerun can read it"
+    );
     Ok(())
 }
 
@@ -7763,6 +8064,56 @@ async fn a_playbook_launch_without_its_row_parks(pool: PgPool) -> Result<()> {
         issue.parked_reason.as_deref().map(ParkReason::parse),
         Some(ParkReason::PlaybookLaunchMissing)
     );
+    Ok(())
+}
+
+/// A launch that reached the queue with a `max_time` shorter than a task's declared timeout (a
+/// schedule firing, a draft head that moved) parks at dispatch with the engine's own refusal,
+/// rather than dispatching a pod the engine exits from at startup.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_shorter_than_a_task_timeout_parks_at_dispatch(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
+    seed_registered_playbook_with(
+        &db,
+        "survey",
+        concat!(
+            "params = {\n",
+            "    \"topic\": {\"type\": \"string\", \"required\": True},\n",
+            "    \"depth\": {\"type\": \"string\", \"default\": \"shallow\"},\n",
+            "}\n",
+            "\n",
+            "prepare = command(name = \"prepare\", run = \"true\", timeout = \"110m\")\n",
+            "\n",
+            "workflow(type = \"playbook\", tasks = [prepare], result = prepare)\n",
+        ),
+    )
+    .await;
+    adopt_launch(&db, key, 3.0).await;
+
+    reconcile(&db, &cfg, key).await?;
+
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    assert_eq!(issue.parked_by, Some(crate::model::ParkedBy::Machine));
+    assert_eq!(
+        issue.parked_reason.as_deref().map(ParkReason::parse),
+        Some(ParkReason::PlanRefused {
+            detail: "task \"prepare\" declares timeout 110m, longer than this run's --max-time \
+                     30m. The run's ceiling is the longest any task may declare; shorten the \
+                     timeout or raise --max-time"
+                .to_string()
+        })
+    );
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs WHERE issue = $1")
+        .bind(key)
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(runs, 0, "nothing was dispatched");
     Ok(())
 }
 

@@ -2,7 +2,8 @@
 // kept out of the renderer so the mapping is testable without a flow.
 
 import { formatCost } from './runReport';
-import type { FanOutState, TaskRuntime } from './taskGraph';
+import type { ExternalLinkRef } from '../ui';
+import type { FanOutState, NodeLinks, RouteDecision, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
 
 /// A field the wire may carry as absent, null, or a string.
@@ -11,13 +12,37 @@ export function said(value: string | null | undefined): value is string {
 }
 
 /// A mapped task is a fan-out over a producer's field, not the work itself: the agent or command
-/// is what each of its instances runs, and the instances carry that badge.
+/// is what each of its instances runs, and the instances carry that badge. A route decides however
+/// many times it runs, and says so either way.
 export function badgeFor(node: WorkflowGraphNode): string {
+  if (node.kind === 'route') return 'DECIDE';
   if ((node.fanout ?? null) !== null) return 'MAP';
   if (node.kind === 'agent') return 'AGENT';
   if (node.kind === 'command') return 'CMD';
   if (node.kind === 'engine') return 'ENGINE';
   return 'TASK';
+}
+
+/// The glyph a card shows for what runs the task; `badgeFor` is its name.
+export function kindGlyph(node: WorkflowGraphNode): string {
+  if (node.kind === 'route') return '◇';
+  if ((node.fanout ?? null) !== null) return '≡';
+  if (node.kind === 'agent') return '✦';
+  if (node.kind === 'command') return '›';
+  if (node.kind === 'engine') return '⚙';
+  return '·';
+}
+
+/// How a node's status dot reads: passed, failed, never dispatched because something upstream
+/// stopped it, not reached yet in a run still going, or ended some other way (skipped, not taken,
+/// never ran).
+export type StatusMark = 'pass' | 'fail' | 'blocked' | 'active' | 'idle';
+
+export function statusMark(runtime: TaskRuntime): StatusMark {
+  if (runtime.tone === 'pass') return 'pass';
+  if (runtime.tone === 'fail') return 'fail';
+  if (runtime.status === 'blocked') return 'blocked';
+  return runtime.status === 'pending' ? 'active' : 'idle';
 }
 
 /// One line of secondary text, or none. A mapped task says what it maps over, since that is what
@@ -33,8 +58,12 @@ export function metaFor(node: WorkflowGraphNode): string | null {
   return null;
 }
 
-/// What a task runs, in one line: an agent's knobs, or the command line itself.
+/// What a task runs, in one line: an agent's knobs, the command line itself, or the questions a
+/// route asks.
 export function runsLine(node: WorkflowGraphNode): string | null {
+  if (node.kind === 'route') {
+    return node.questions.length === 0 ? null : node.questions.map((q) => `${q}?`).join(' ');
+  }
   if (node.kind === 'agent') {
     const knobs = [node.model, node.effort].filter(said);
     return knobs.length === 0 ? 'pack defaults' : knobs.join(' · ');
@@ -45,6 +74,26 @@ export function runsLine(node: WorkflowGraphNode): string | null {
 export interface DetailRow {
   label: string;
   value: string;
+}
+
+/// The labels one question resolved to, most frequent first. A single decision reads as its label
+/// alone; a tally of a mapped route's instances carries each label's count.
+export function decisionText(decision: RouteDecision): string {
+  const labels = [...decision.labels].sort(
+    (a, b) => b.count - a.count || a.label.localeCompare(b.label)
+  );
+  const [only, ...rest] = labels;
+  if (only !== undefined && rest.length === 0 && only.count === 1) return only.label;
+  return labels.map((l) => `${l.label} ${l.count}`).join(' · ');
+}
+
+/// One line per question a route resolved: `tier: high`, or `tier: high 80 · low 38`.
+export function decisionLines(decisions: RouteDecision[]): string[] {
+  return decisions.map((d) => `${d.question}: ${decisionText(d)}`);
+}
+
+export function decisionRows(decisions: RouteDecision[]): DetailRow[] {
+  return decisions.map((d) => ({ label: d.question, value: decisionText(d) }));
 }
 
 /// Everything the graph document holds about one task, as the panel lists it.
@@ -68,6 +117,15 @@ export function detailRows(node: WorkflowGraphNode): DetailRow[] {
       value: typeof fanout.max_fanout === 'number' ? String(fanout.max_fanout) : 'uncapped',
     });
   }
+  if (node.questions.length > 0) rows.push({ label: 'questions', value: node.questions.join(' ') });
+  const when = node.when ?? null;
+  if (when !== null) {
+    rows.push({
+      label: 'when',
+      value: `${when.route}.${when.question} in ${when.labels.join('|')}`,
+    });
+  }
+  if (node.keyed.length > 0) rows.push({ label: 'narrows', value: node.keyed.join(' ') });
   if (node.emits.length > 0) rows.push({ label: 'emits', value: node.emits.join(' ') });
   if (node.emits_files.length > 0) {
     rows.push({ label: 'emits files', value: node.emits_files.join(' ') });
@@ -82,15 +140,17 @@ export function sourceFor(node: WorkflowGraphNode): { label: string; body: strin
   return null;
 }
 
-/// A run's node state, as the card's status line reads it: where the task ended, how many attempts
-/// it took, and what those attempts cost.
+/// A run's node state, as the card's status line reads it: the iteration it ended in when that was
+/// a retry, how many attempts it took, and what those attempts cost and took. A zero says nothing,
+/// so it is left out, and a task with nothing to say has no line.
 export function runtimeLine(runtime: TaskRuntime): string | null {
   if (!runtime.reported) return null;
-  const parts = [`iter ${runtime.latestIter}`];
+  const parts: string[] = [];
+  if (runtime.latestIter > 0) parts.push(`iter ${runtime.latestIter}`);
   if (runtime.attempts > 1) parts.push(`${runtime.attempts} attempts`);
-  if (runtime.costUsd !== null) parts.push(formatCost(runtime.costUsd));
-  if (runtime.secs !== null) parts.push(formatSecs(runtime.secs));
-  return parts.join(' · ');
+  if (runtime.costUsd !== null && runtime.costUsd > 0) parts.push(formatCost(runtime.costUsd));
+  if (runtime.secs !== null && runtime.secs > 0) parts.push(formatSecs(runtime.secs));
+  return parts.length === 0 ? null : parts.join(' · ');
 }
 
 /// The width to read a fan-out against, or null when there is none to read it against. A run
@@ -101,22 +161,32 @@ function widthOf(state: FanOutState): number | null {
   return state.items;
 }
 
+/// How an instance status reads in a tally.
+function statusWord(status: string): string {
+  if (status === 'fail') return 'failed';
+  return status.replaceAll('_', ' ');
+}
+
 /// What a run made of a mapped task: how wide it was spread against how the instances that
-/// started ended. A fan-out over nothing says so — zero work asked for is a result, not an
-/// absence.
+/// started ended, not-taken instances apart from failed ones. A fan-out over nothing says so —
+/// zero work asked for is a result, not an absence.
 export function fanoutLine(state: FanOutState): string {
   if (state.items === 0 && state.started === 0) return '0 items';
   const width = widthOf(state);
-  const parts = [
-    width === null
-      ? `${state.started} started · ${state.passed} passed`
-      : `${state.passed} of ${width} passed`,
-  ];
-  for (const other of state.other) parts.push(`${other.count} ${other.status}`);
+  const parts = [width === null ? `${state.started} started` : String(width)];
+  parts.push(`${state.passed} passed`);
+  if (state.notTaken > 0) parts.push(`${state.notTaken} not taken`);
+  for (const other of state.other) parts.push(`${other.count} ${statusWord(other.status)}`);
   if (width !== null && state.started < width) {
     parts.push(`${width - state.started} ${state.running ? 'pending' : 'never started'}`);
   }
   return parts.join(' · ');
+}
+
+/// How many instances a mapped task came to: the items it was spread over, or the instances that
+/// started when the run cannot say how many items there were.
+export function fanoutCount(state: FanOutState): number {
+  return state.items ?? state.started;
 }
 
 /// The fan-out's own rows in the task panel, listed above the run's.
@@ -125,6 +195,7 @@ export function fanoutRows(state: FanOutState): DetailRow[] {
     { label: 'items', value: state.items === null ? '—' : String(state.items) },
     { label: 'started', value: String(state.started) },
     { label: 'passed', value: String(state.passed) },
+    ...(state.notTaken > 0 ? [{ label: 'not taken', value: String(state.notTaken) }] : []),
     ...state.other.map((other) => ({ label: other.status, value: String(other.count) })),
   ];
 }
@@ -145,4 +216,25 @@ export function runtimeRows(runtime: TaskRuntime): DetailRow[] {
     { label: 'cost', value: formatCost(runtime.costUsd) },
     { label: 'took', value: runtime.secs === null ? '—' : formatSecs(runtime.secs) },
   ];
+}
+
+/// The chip drawn over a pill's end: its one link as it is, several as a count under one mark (the
+/// provider's, when they share one). The links themselves are on the run's header.
+export type PillChip =
+  | { kind: 'link'; link: ExternalLinkRef }
+  | { kind: 'count'; provider: string; count: number };
+
+export function pillChip(drawn: NodeLinks | null): PillChip | null {
+  if (drawn === null || drawn.kind !== 'links') return null;
+  const [first, second] = drawn.links;
+  if (first === undefined) return null;
+  if (second === undefined) return { kind: 'link', link: first };
+  const shared = drawn.links.every((link) => link.provider === first.provider);
+  return { kind: 'count', provider: shared ? first.provider : '', count: drawn.links.length };
+}
+
+/// The room a pill chip takes, in characters of the pill's note: its text plus the mark and gaps.
+export function pillChipChars(chip: PillChip | null): number {
+  if (chip === null) return 0;
+  return (chip.kind === 'link' ? chip.link.label.length : String(chip.count).length) + 3;
 }

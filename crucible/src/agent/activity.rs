@@ -2,7 +2,7 @@
 //! looking like a hung pod. Shared by `scope`'s propose/adversary rounds and the grounded ranking
 //! turn; each names its own marker prefix so a log consumer can tell the two apart.
 
-use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
+use crate::agent::event::{AgentEvent, Pricing, RawStream};
 use serde::Serialize;
 
 /// One activity line's payload: a live-view hint, never a result.
@@ -72,8 +72,8 @@ impl ActivityFeed {
     }
 
     /// Observe one streamed event; print its activity line if it earns one.
-    pub(crate) fn observe(&mut self, model: &str, ev: &AgentEvent) {
-        if let Some(line) = self.line_for(model, ev, std::time::Instant::now()) {
+    pub(crate) fn observe(&mut self, pricing: &Pricing, ev: &AgentEvent) {
+        if let Some(line) = self.line_for(pricing, ev, std::time::Instant::now()) {
             println!("{line}");
         }
     }
@@ -82,7 +82,7 @@ impl ActivityFeed {
     /// the rate limit and budget with controlled instants instead of capturing stdout.
     pub(crate) fn line_for(
         &mut self,
-        model: &str,
+        pricing: &Pricing,
         ev: &AgentEvent,
         now: std::time::Instant,
     ) -> Option<String> {
@@ -92,13 +92,8 @@ impl ActivityFeed {
         // Cost first: every sample updates the running number, whether or not a line is emitted.
         // max() keeps the readout monotonic within a turn if an estimate lands after an
         // authoritative sample.
-        match cost_of(ev) {
-            Some(c) => self.turn_cost = self.turn_cost.max(c),
-            None => {
-                if let AgentEvent::Tokens(t) = ev {
-                    self.turn_cost = self.turn_cost.max(estimate_cost(model, t));
-                }
-            }
+        if let Some(c) = pricing.sample(ev) {
+            self.turn_cost = self.turn_cost.max(c);
         }
         let activity = match ev {
             AgentEvent::Tool { name, summary, .. } => ActivityLine {
@@ -239,6 +234,41 @@ mod tests {
         serde_json::from_str(json).expect("activity json")
     }
 
+    fn m() -> Pricing {
+        Pricing::resolve("m", None)
+    }
+
+    fn tool() -> AgentEvent {
+        AgentEvent::Tool {
+            name: "Bash".to_string(),
+            summary: "ls".to_string(),
+            subagent: false,
+            input: None,
+            result: None,
+        }
+    }
+
+    /// The live readout follows the turn's pricing: a self-hosted model's reported dollars are
+    /// not spend, and a vendor model's are.
+    #[test]
+    fn the_live_cost_follows_the_turns_pricing() {
+        let result = AgentEvent::Result {
+            subtype: "success".into(),
+            is_error: false,
+            turns: 2,
+            cost_usd: 25.0,
+            error: None,
+        };
+        let now = std::time::Instant::now();
+        for (model, want) in [("zai-org/glm-5", 0.0), ("claude-opus-4-6", 25.0)] {
+            let pricing = Pricing::resolve(model, None);
+            let mut feed = ActivityFeed::new(RANK_ACTIVITY_MARKER, true);
+            assert!(feed.line_for(&pricing, &result, now).is_none());
+            let line = feed.line_for(&pricing, &tool(), now).expect("tool emits");
+            assert_eq!(detail(&line)["cost_so_far"], want, "{model}");
+        }
+    }
+
     /// An agent that starts, prints a diagnostic and dies leaves that diagnostic in the log.
     /// The outage shape: an agent that never gets a usable credential retries until its budget
     /// is gone, then exits having printed nothing on either stream. The retry's error is the only
@@ -252,11 +282,11 @@ mod tests {
             max: 20,
             error: "  could not refresh access token  ".to_string(),
         };
-        let line = feed.line_for("m", &ev, now).expect("retry emits");
+        let line = feed.line_for(&m(), &ev, now).expect("retry emits");
         let v = detail(&line);
         assert_eq!(v["kind"], "retry");
         assert_eq!(v["detail"], "attempt 3/20: could not refresh access token");
-        assert!(feed.line_for("m", &ev, now).is_some());
+        assert!(feed.line_for(&m(), &ev, now).is_some());
     }
 
     #[test]
@@ -267,7 +297,7 @@ mod tests {
             error_type: "openshell".to_string(),
             message: "the agent exited 1".to_string(),
         };
-        let line = feed.line_for("m", &ev, now).expect("error emits");
+        let line = feed.line_for(&m(), &ev, now).expect("error emits");
         let v = detail(&line);
         assert_eq!(v["kind"], "error");
         assert_eq!(v["name"], "openshell");
@@ -282,12 +312,12 @@ mod tests {
             text: "credential file not found".to_string(),
             stream: RawStream::Stderr,
         };
-        let line = feed.line_for("m", &ev, now).expect("stderr emits");
+        let line = feed.line_for(&m(), &ev, now).expect("stderr emits");
         let v = detail(&line);
         assert_eq!(v["kind"], "stderr");
         assert_eq!(v["detail"], "credential file not found");
         // Not rate limited: a dying agent's last words must not lose a race with a text delta.
-        assert!(feed.line_for("m", &ev, now).is_some());
+        assert!(feed.line_for(&m(), &ev, now).is_some());
     }
 
     #[test]
@@ -298,13 +328,13 @@ mod tests {
             text: "   ".to_string(),
             stream: RawStream::Stderr,
         };
-        assert!(feed.line_for("m", &blank, now).is_none());
+        assert!(feed.line_for(&m(), &blank, now).is_none());
         let stdout = AgentEvent::Raw {
             text: "the whole transcript".to_string(),
             stream: RawStream::Stdout,
         };
         assert!(
-            feed.line_for("m", &stdout, now).is_none(),
+            feed.line_for(&m(), &stdout, now).is_none(),
             "stdout is the verdict channel, never echoed back into the feed"
         );
     }
@@ -317,6 +347,9 @@ mod tests {
             label: "openshell".to_string(),
             value: Some("creating sandbox".to_string()),
         };
-        assert!(feed.line_for("m", &ev, std::time::Instant::now()).is_none());
+        assert!(
+            feed.line_for(&m(), &ev, std::time::Instant::now())
+                .is_none()
+        );
     }
 }

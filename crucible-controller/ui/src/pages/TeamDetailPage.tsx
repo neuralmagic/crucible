@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
+import type { components } from '../api/schema';
 import {
   Breadcrumb,
   Button,
@@ -33,7 +34,7 @@ import {
   type MemberBody,
 } from './membersView';
 import { HELD, sortedMembers, viewAsOffer, type MemberDto } from './teamsView';
-import { TeamResources } from './TeamResources';
+import { Workspace } from './HomePage';
 import { useOwnerContext } from '../useOwnerContext';
 import { useViewAs } from '../api/viewAs';
 
@@ -257,15 +258,22 @@ function Members({ slug, members, editable, viewer }: MembersProps) {
   );
 }
 
-/// One team: who is in it, at what role, and how each membership is held.
-export function TeamDetailPage() {
-  const { slug = '' } = useParams();
-  const whoami = $api.useQuery('get', '/api/whoami');
+type TeamDto = components['schemas']['TeamDto'];
+
+/// A team page's frame: the team, its act-as toggle, and what the caller holds in it.
+function TeamFrame({
+  slug,
+  crumbs,
+  render,
+}: {
+  slug: string;
+  crumbs: { label: string; to?: string }[];
+  render: (header: ReactNode, team: TeamDto) => ReactNode;
+}) {
   const team = $api.useQuery('get', '/api/teams/{slug}', { params: { path: { slug } } });
   const owner = useOwnerContext();
   const principal = `team:${slug}`;
-  const acting = owner.context === principal;
-  const crumbs = [{ label: 'Teams', to: '/teams' }, { label: slug }];
+  const acting = owner.stored === principal;
 
   if (team.isError) {
     return (
@@ -284,7 +292,7 @@ export function TeamDetailPage() {
     );
   }
   const row = team.data;
-  return (
+  const header = (
     <>
       <Breadcrumb items={crumbs} />
       <DetailHeader
@@ -316,29 +324,60 @@ export function TeamDetailPage() {
           <Spec
             items={[
               { label: 'Your role', value: row.my_role ?? '—' },
-              { label: 'Members', value: row.members.length },
+              {
+                label: 'Members',
+                value: <Link to={`/teams/${encodeURIComponent(row.slug)}/members`}>{row.members.length}</Link>,
+              },
               { label: 'Reachable', value: row.reachable ? 'yes' : 'no' },
             ]}
           />
         }
       />
-      <Section>
-        <SectionHeader
-          title="Members"
-          actions={
-            <Link to="/teams" className="font-mono text-data text-ink-3 hover:text-ink">
-              all teams
-            </Link>
-          }
-        />
-        <Members
-          slug={row.slug}
-          members={row.members}
-          editable={row.my_role === 'owner'}
-          viewer={whoami.data?.role === 'admin' && !whoami.data.impersonation ? (whoami.data.user ?? null) : null}
-        />
-      </Section>
-      <TeamResources owner={principal} />
     </>
+  );
+  return <>{render(header, row)}</>;
+}
+
+/// One team's home: what waits on it, what it ran lately, and what it can launch.
+export function TeamDetailPage() {
+  const { slug = '' } = useParams();
+  return (
+    <TeamFrame
+      slug={slug}
+      crumbs={[{ label: 'Teams', to: '/teams' }, { label: slug }]}
+      render={(header) => <Workspace header={header} />}
+    />
+  );
+}
+
+/// Who is in one team, at what role, and how each membership is held.
+export function TeamMembersPage() {
+  const { slug = '' } = useParams();
+  const whoami = $api.useQuery('get', '/api/whoami');
+  return (
+    <TeamFrame
+      slug={slug}
+      crumbs={[
+        { label: 'Teams', to: '/teams' },
+        { label: slug, to: `/teams/${encodeURIComponent(slug)}` },
+        { label: 'Members' },
+      ]}
+      render={(header, row) => (
+        <>
+          {header}
+          <Section>
+            <SectionHeader title="Members" />
+            <Members
+              slug={row.slug}
+              members={row.members}
+              editable={row.my_role === 'owner'}
+              viewer={
+                whoami.data?.role === 'admin' && !whoami.data.impersonation ? (whoami.data.user ?? null) : null
+              }
+            />
+          </Section>
+        </>
+      )}
+    />
   );
 }

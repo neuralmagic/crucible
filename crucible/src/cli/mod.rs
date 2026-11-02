@@ -41,6 +41,10 @@ pub(crate) struct Cli {
 /// Subcommands that aren't the default loop run.
 #[derive(clap::Subcommand)]
 pub(crate) enum Cmd {
+    /// Run as a per-run OpenShell gateway pod's entrypoint: the controller creates that pod and
+    /// supplies its config through the environment.
+    #[command(hide = true)]
+    OpenshellGateway,
     /// Scaffold a minimal `crucible.toml` + measure stub in the current directory (or `--dir`):
     /// the bring-your-own-repo on-ramp, dropping crucible onto a repo like a justfile. Refuses
     /// to overwrite existing files.
@@ -60,6 +64,10 @@ pub(crate) enum Cmd {
         /// resolution, workspace setup, measure probe, or gate self-test. Runs anywhere (CI).
         #[arg(long)]
         parse_only: bool,
+        /// The `[variant.<name>]` the full check runs against; the base manifest without it.
+        /// Every declared variant is parsed and validated, and its graph compiled, either way.
+        #[arg(long, value_name = "NAME")]
+        variant: Option<crate::manifest::variant::VariantName>,
         /// Also validate a deploy profile's cluster wiring: the named [measure].cluster resolves
         /// against the fleet file, its secret name is non-empty, no bastion (not implemented yet),
         /// and, live, the sandbox SA cannot read the spoke kubeconfig Secret in the loop namespace.
@@ -272,6 +280,9 @@ pub(crate) enum PlanAction {
         /// manifest's own `[publish].pr_repo` wins over it, exactly as at run time.
         #[arg(long)]
         pr_repo: Option<String>,
+        /// The `[variant.<name>]` of the manifest to read; the base manifest without it.
+        #[arg(long, value_name = "NAME", requires = "manifest")]
+        variant: Option<crate::manifest::variant::VariantName>,
     },
     /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
@@ -325,6 +336,19 @@ pub(crate) enum PlanAction {
         /// ceilings. The graph compiled now must be the one the run started with.
         #[arg(long, requires = "manifest")]
         resume: bool,
+        /// The `[variant.<name>]` of the manifest to read; the base manifest without it.
+        #[arg(long, value_name = "NAME", requires = "manifest")]
+        variant: Option<crate::manifest::variant::VariantName>,
+        /// Rerun a finished playbook run: the tasks `--from` names, everything downstream of
+        /// them, and every task the run did not pass run again; every other task is reused with
+        /// its output, files, and commits. PARENT is that run's state directory, or its evidence
+        /// on the controller (`https://controller/api/evidence/runs/<id>`), fetched with the run token in
+        /// CRUCIBLE_POD_TOKEN or a person's CONTROLLER_API_TOKEN.
+        #[arg(long, value_name = "PARENT", requires = "manifest")]
+        rerun_of: Option<crucible::plan::rerun::ParentRef>,
+        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+        #[arg(long, value_name = "TASK", requires = "rerun_of")]
+        from: Vec<String>,
     },
 }
 
@@ -346,6 +370,22 @@ pub(crate) enum StatesFormat {
 pub(crate) enum StatesGraph {
     Task,
     Plan,
+}
+
+/// `crucible deploy render --kueue --platform`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum KueuePlatform {
+    Kubernetes,
+    Openshift,
+}
+
+impl From<KueuePlatform> for forge::fleet::Platform {
+    fn from(p: KueuePlatform) -> Self {
+        match p {
+            KueuePlatform::Kubernetes => Self::Kubernetes,
+            KueuePlatform::Openshift => Self::Openshift,
+        }
+    }
 }
 
 /// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.
@@ -435,8 +475,9 @@ pub(crate) struct RenderTurnArgs {
 #[derive(clap::Args)]
 pub(crate) struct DeployArgs {
     /// The domain manifest (composite or single-domain), the run: components, broker, judge, world,
-    /// `[deploy]` targets. Required unless `--controller` is set (the controller has no per-run
-    /// manifest; it renders from the profile's `[controller]` table alone).
+    /// `[deploy]` targets. Required unless `--controller`, `--kueue` or `--cluster-link` is set (those have no
+    /// per-run manifest; they render from the profile's `[controller]`, `[kueue]` or
+    /// `[cluster_link]` table alone).
     #[arg(long)]
     pub manifest: Option<PathBuf>,
     /// The per-cluster deploy profile (the environment: namespaces, secrets, resources, loop image).
@@ -459,6 +500,33 @@ pub(crate) struct DeployArgs {
     /// projected from the profile's `[controller]` table, no `--manifest` needed.
     #[arg(long)]
     pub controller: bool,
+    /// Render the crucible-kueue MCP server (Deployment, Service, ServiceAccount, RBAC, tenants
+    /// namespace) from the profile's `[kueue]` table, no `--manifest` needed.
+    #[arg(long, conflicts_with = "controller", group = "issuer_user")]
+    pub kueue: bool,
+    /// With `--kueue`, the `[kueue] clusters` entry to render the server for: it is started with
+    /// `--cluster` and accepts only tokens for that cluster. Required when the table names several.
+    #[arg(long, value_name = "CLUSTER", requires = "kueue")]
+    pub kueue_cluster: Option<String>,
+    /// With `--kueue` or `--cluster-link`, the controller's agent issuer (its
+    /// `CONTROLLER_AGENT_ISSUER`): the issuer whose tokens the server takes, or the browser URL
+    /// when `[cluster_link]` sets no `external_url`.
+    #[arg(long, value_name = "URL", requires = "issuer_user")]
+    pub issuer: Option<String>,
+    /// The platform (`kubernetes` or `openshift`) of the cluster rendered for, over the profile's
+    /// `platform` key; a render does not ask the cluster.
+    #[arg(long, value_enum, conflicts_with_all = ["controller", "cluster_link"])]
+    pub platform: Option<KueuePlatform>,
+    /// Render the controller's OpenShift `OAuthClient` for this cluster from the profile's
+    /// `[cluster_link]` table, no `--manifest` needed. Render only: it is cluster-scoped on that
+    /// cluster, so apply it there yourself.
+    #[arg(
+        long,
+        value_name = "CLUSTER",
+        conflicts_with_all = ["controller", "kueue"],
+        group = "issuer_user"
+    )]
+    pub cluster_link: Option<String>,
     /// Pack delivery: the manifest is a controller-drafted PACK on the state PVC, not a domain baked
     /// into the loop image. Emit a ConfigMap carrying the pack files and stage it (init-container →
     /// emptyDir) at the in-pod domain path, so `crucible run` finds the manifest. Set by the
@@ -481,6 +549,18 @@ pub(crate) struct DeployArgs {
     /// is what it accepts.
     #[arg(long = "param", value_name = "NAME=VALUE", requires = "playbook")]
     pub params: Vec<String>,
+    /// The `[variant.<name>]` of the manifest the launched playbook runs, emitted as the in-pod
+    /// `plan run --variant`.
+    #[arg(long, value_name = "NAME", requires = "playbook")]
+    pub variant: Option<crate::manifest::variant::VariantName>,
+    /// Rerun a finished run: the rendered pod fetches that run's evidence from the controller at
+    /// `[cluster].ingest_url` and dispatches the tasks `--from` names, and every task the run did
+    /// not pass, again. RUN is the controller's run id.
+    #[arg(long, value_name = "RUN", requires = "playbook")]
+    pub rerun_of: Option<String>,
+    /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+    #[arg(long, value_name = "TASK", requires = "rerun_of")]
+    pub from: Vec<String>,
     /// Publish-on-keep: the `owner/repo` fork the rendered loop opens its kept-commits draft PR against
     /// (emitted as the loop's `--pr-repo`). The controller passes its per-repo default so a dispatched
     /// run publishes; omit for a manual render (the manifest's `[publish] pr_repo` still applies). The

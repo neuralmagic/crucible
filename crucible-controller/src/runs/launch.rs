@@ -41,6 +41,47 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
     Ok(())
 }
 
+/// Record `e` on `key`'s event log as a failed dispatch, and hand it back.
+async fn dispatch_failed(db: &Db, key: &str, e: anyhow::Error) -> anyhow::Error {
+    let _ = db
+        .events()
+        .append(&Event::now(
+            key,
+            "new",
+            "new",
+            Some(PLAYBOOK_DISPATCH_FAILED),
+            Some(&crate::model::truncate_chain(&format!("{e:#}"))),
+        ))
+        .await;
+    e
+}
+
+/// Why the engine would refuse `launch` at startup, judged against the pack it froze. `None` when
+/// it would start, or when no pack is stored for the dispatch to fail on.
+async fn plan_refusal(
+    db: &Db,
+    key: &str,
+    launch: &crate::launches::model::PlaybookLaunch,
+) -> Result<Option<String>> {
+    let Some(pack) = crate::playbooks::packs::materialize_pack(db.pool(), key).await? else {
+        return Ok(None);
+    };
+    let params = launch.params.iter().cloned().collect();
+    let max_time = launch.max_time.clone();
+    let variant = launch.variant.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        crate::playbooks::registry::check_runnable(
+            pack.path(),
+            &params,
+            &max_time,
+            variant.as_ref(),
+        )
+    })
+    .await
+    .context("joining the launch plan check")?;
+    Ok(checked.err().map(|field| field.message))
+}
+
 async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let day = crate::clock::today_utc();
     if db
@@ -63,6 +104,22 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         .await?;
         return Ok(());
     };
+    let refusal = match plan_refusal(db, &issue.key, &launch).await {
+        Ok(refusal) => refusal,
+        Err(e) => return Err(dispatch_failed(db, &issue.key, e).await),
+    };
+    if let Some(detail) = refusal {
+        crate::issues::transitions::park(
+            db.pool(),
+            db.events(),
+            &issue.key,
+            Status::New,
+            &ParkReason::PlanRefused { detail },
+            ParkedBy::Machine,
+        )
+        .await?;
+        return Ok(());
+    }
 
     let run_id = new_run_id(&issue.key);
     // Both a draft test-fire and a registered launch resolve the playbook scope's bindings, against
@@ -147,6 +204,17 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         None => crate::runs::model::RunImage::default(),
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
+    let decision = crate::playbooks::providers::resolve_decision(
+        db.pool(),
+        Some(&issue.repo),
+        WorkloadClass::Playbook,
+    )
+    .await?;
+    let inference = dispatch
+        .iter()
+        .map(|d| d.inference())
+        .chain(decision)
+        .collect();
     let exposure =
         crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await??;
     let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
@@ -177,7 +245,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         launcher,
         revision,
         provider: cfg.secret_provider.clone(),
-        inference_provider: dispatch.map(|d| d.provider),
+        inference,
         exposure,
     });
     let opts = crate::runs::workpod::RunRenderOpts::Playbook {
@@ -185,6 +253,8 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         max_cost: launch.max_cost,
         max_time: launch.max_time,
         agent,
+        rerun: launch.rerun,
+        variant: launch.variant,
     };
     let started = match cfg.playbook_executor {
         PlaybookExecutor::Pod => {
@@ -220,19 +290,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
             db.ledger_append(None, "capped", 0.0).await?;
             return Ok(());
         }
-        Err(e) => {
-            let _ = db
-                .events()
-                .append(&Event::now(
-                    &issue.key,
-                    "new",
-                    "new",
-                    Some(PLAYBOOK_DISPATCH_FAILED),
-                    Some(&crate::model::truncate_chain(&format!("{e:#}"))),
-                ))
-                .await;
-            return Err(e);
-        }
+        Err(e) => return Err(dispatch_failed(db, &issue.key, e).await),
     };
 
     if let Started::SecretsRefused(detail) = &started {
@@ -292,6 +350,9 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         )
         .await?;
         crate::runs::store::attribute_run(&mut *tx, &run_id).await?;
+        if cfg.issues_agent_tokens() {
+            crate::runs::store::stamp_dispatcher(&mut *tx, &run_id).await?;
+        }
         crate::runs::store::set_run_dispatch(&mut *tx, &run_id, dispatch).await?;
         crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
         crate::runs::store::set_run_image(&mut *tx, &run_id, &image).await?;
@@ -300,6 +361,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         crate::event_log::insert(&mut *tx, &ev).await?;
         tx.commit().await?;
         db.events().publish(&ev);
+        crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
     }
     // The subprocess is supervised out of band, exactly as the pod watch drives a pod's
     // completion — and only once the run row it will fold into is committed.
@@ -323,7 +385,8 @@ async fn resolve_local_secrets(
     let Some(pack) = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key).await? else {
         return Ok(None);
     };
-    let declared = crate::secrets::manifest::declared_secrets(pack.path())?;
+    let variant = crate::launches::store::launch_variant(db.pool(), &issue.key).await?;
+    let declared = crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
     match crate::secrets::launch::resolve(
         db.pool(),
         &ls.scope,

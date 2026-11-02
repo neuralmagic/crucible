@@ -11,6 +11,7 @@ export type ProviderDto = components['schemas']['ProviderDto'];
 export type DispatchDefaultBody = components['schemas']['DispatchDefaultBody'];
 export type DefaultScope = components['schemas']['DefaultScope'];
 export type WorkloadClass = components['schemas']['WorkloadClass'];
+export type ModelRole = components['schemas']['ModelRole'];
 
 export const KIND_OPTIONS: readonly { value: ProviderKind; label: string }[] = [
   { value: 'openai', label: 'openai (api.openai.com, runs Codex by default)' },
@@ -23,6 +24,8 @@ export const PROTOCOL_OPTIONS: readonly { value: InferenceProtocol; label: strin
   { value: 'chat_completions', label: 'chat_completions (OpenAI Chat Completions, runs OpenCode by default)' },
   { value: 'responses', label: 'responses (OpenAI Responses / harmony, runs Codex by default)' },
   { value: 'messages', label: 'messages (Anthropic Messages, runs Claude Code by default)' },
+  { value: 'decisions', label: 'decisions (OpenAI Decisions, answers route tasks)' },
+  { value: 'system_one', label: 'system_one (System One, answers route tasks)' },
 ];
 
 /// The agent CLIs a registration may run its models under, default first: the server's own table
@@ -37,13 +40,16 @@ const PROTOCOL_HARNESSES: Record<InferenceProtocol, readonly string[]> = {
   messages: ['claude', 'opencode', 'pi'],
   chat_completions: ['opencode', 'pi'],
   responses: ['codex', 'pi'],
+  decisions: [],
+  system_one: [],
 };
 
 export function allowedHarnesses(kind: ProviderKind, protocol: InferenceProtocol): readonly string[] {
   return kind === 'custom' ? PROTOCOL_HARNESSES[protocol] : KIND_HARNESSES[kind];
 }
 
-export function defaultHarness(kind: ProviderKind, protocol: InferenceProtocol): string {
+/// `undefined` for a decision protocol, which runs no harness.
+export function defaultHarness(kind: ProviderKind, protocol: InferenceProtocol): string | undefined {
   return allowedHarnesses(kind, protocol)[0];
 }
 
@@ -59,6 +65,7 @@ const HARNESS_LABELS: Record<string, string> = {
 /// harness that can speak to the service.
 export function harnessOptions(kind: ProviderKind, protocol: InferenceProtocol): readonly PickOption[] {
   const fallback = defaultHarness(kind, protocol);
+  if (fallback === undefined) return [];
   return [
     { value: '', label: `default (${HARNESS_LABELS[fallback] ?? fallback})` },
     ...allowedHarnesses(kind, protocol).map((h) => ({ value: h, label: `${h} (${HARNESS_LABELS[h] ?? h})` })),
@@ -71,7 +78,8 @@ export function harnessFor(kind: ProviderKind, protocol: InferenceProtocol, chos
   return allowedHarnesses(kind, protocol).includes(chosen) ? chosen : '';
 }
 
-/// The variable a provider's harness reads its key from, which its secret has to carry.
+/// The entry a credentials map keeps the provider's key under, or null where the secret is one bare
+/// key (System One) or there is none (Vertex).
 export function keyVariable(kind: ProviderKind, protocol: InferenceProtocol): string | null {
   switch (kind) {
     case 'anthropic':
@@ -81,7 +89,16 @@ export function keyVariable(kind: ProviderKind, protocol: InferenceProtocol): st
     case 'vertex':
       return null;
     case 'custom':
-      return protocol === 'messages' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
+      switch (protocol) {
+        case 'messages':
+          return 'ANTHROPIC_API_KEY';
+        case 'system_one':
+          return null;
+        case 'chat_completions':
+        case 'responses':
+        case 'decisions':
+          return 'OPENAI_API_KEY';
+      }
   }
 }
 
@@ -231,12 +248,22 @@ export const CLASS_OPTIONS: readonly { value: WorkloadClass; label: string }[] =
   { value: 'playbook', label: 'playbook' },
 ];
 
+export const ROLE_OPTIONS: readonly { value: ModelRole; label: string }[] = [
+  { value: 'agent', label: 'agent' },
+  { value: 'decision', label: 'decision' },
+];
+
+export function servesRole(provider: ProviderDto, role: ModelRole): boolean {
+  return provider.roles.includes(role);
+}
+
 /// One dispatch default as the form edits it. A blank model takes the provider's own default; a
 /// blank fallback provider means none.
 export interface DefaultForm {
   scopeKind: DefaultScope;
   scopeRef: string;
   workloadClass: WorkloadClass;
+  role: ModelRole;
   provider: string;
   model: string;
   fallbackProvider: string;
@@ -248,6 +275,7 @@ export function emptyDefaultForm(): DefaultForm {
     scopeKind: 'platform',
     scopeRef: '',
     workloadClass: 'autoresearch',
+    role: 'agent',
     provider: '',
     model: '',
     fallbackProvider: '',
@@ -260,6 +288,7 @@ export function defaultFormOf(row: DispatchDefaultDto): DefaultForm {
     scopeKind: row.scope_kind,
     scopeRef: row.scope_ref,
     workloadClass: row.workload_class,
+    role: row.role,
     provider: row.provider,
     model: row.model ?? '',
     fallbackProvider: row.fallback_provider ?? '',
@@ -274,6 +303,9 @@ export function defaultErrors(form: DefaultForm): Map<string, string> {
   const errors = new Map<string, string>();
   if (form.scopeKind === 'domain' && !DOMAIN.test(form.scopeRef.trim())) {
     errors.set('scopeRef', 'a domain is spelled owner/repo');
+  }
+  if (form.role === 'decision' && form.workloadClass === 'autoresearch') {
+    errors.set('role', 'an autoresearch loop runs no route task');
   }
   if (form.provider.length === 0) errors.set('provider', 'pick a provider');
   const model = form.model.trim();
@@ -299,6 +331,7 @@ export function defaultBody(form: DefaultForm): DispatchDefaultBody {
     scope_kind: form.scopeKind,
     ...(form.scopeKind === 'domain' ? { scope_ref: form.scopeRef.trim() } : {}),
     workload_class: form.workloadClass,
+    role: form.role,
     provider: form.provider,
     ...(model.length > 0 ? { model } : {}),
     ...(form.fallbackProvider.length > 0 ? { fallback_provider: form.fallbackProvider } : {}),

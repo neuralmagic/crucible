@@ -1,8 +1,7 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::kube::{
-    FORGE_STORAGE_ROOT, INGEST_TOKEN_DIR, INGEST_TOKEN_TTL_SECS, INGEST_TOKEN_VOLUME,
-    PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env, node_avoid_affinity, resources,
-    secret_env_vars,
+    FORGE_STORAGE_ROOT, PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env,
+    node_avoid_affinity, resources, secret_env_vars,
 };
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
@@ -294,6 +293,28 @@ fn checked_git_ref(r: &str) -> Result<&str, BadRepoRef> {
     Ok(r)
 }
 
+/// The turn pod's labels. Under isolated gateways it also names its run, which its gateway's
+/// NetworkPolicy admits it by.
+fn turn_labels(profile: &DeployProfile, opts: &TurnOpts) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::from([
+        (
+            crucible_contract::MANAGED_BY_KEY.to_string(),
+            crucible_contract::MANAGED_BY_VALUE.to_string(),
+        ),
+        (
+            "crucible.io/work-kind".to_string(),
+            opts.kind.label_value().to_string(),
+        ),
+    ]);
+    if crate::deploy::render::gateway::isolated(profile) {
+        labels.insert(
+            crate::deploy::render::gateway::RUN_LABEL.to_string(),
+            opts.name.clone(),
+        );
+    }
+    labels
+}
+
 #[tracing::instrument(skip_all, fields(turn_kind = ?opts.kind, issue = %opts.issue, pinned = opts.digests.is_some()), err)]
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     let image = pin_image(
@@ -325,7 +346,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // with the podman driver's default (see the `--compute-driver` flag below), nests a pull of
     // `sandbox_image` through the authfile path instead of the kubelet's `imagePullSecrets`, and
     // never creates a `Sandbox` CR.
-    if profile.cluster.sandbox_driver == ComputeDriver::Kubernetes {
+    if profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes {
         env.extend(kubernetes_sandbox_env(profile, &sandbox_image)?);
     }
     // The GitHub / gate / Vertex-project env the profile carries (rank-grounded fetches the issue
@@ -337,23 +358,19 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         env.push(plain(k, v.clone()));
     }
 
-    // Tier 2 ingest: when the profile names the controller's drop-box URL, tell the turn
-    // where to POST its large artifacts and where its projected `crucible-ingest`-audience token is.
-    // Absent = no drop-box; the engine falls back to marker emission. The token volume itself is
-    // added below, it's a separate, audience-locked file, independent of the API-server automount
-    // above.
-    if let Some(ingest_url) = &profile.cluster.ingest_url {
-        env.push(plain(crucible_contract::ENV_INGEST_URL, ingest_url.clone()));
+    // When the profile names the controller, the turn uploads its pack and transcript there under
+    // its own name, with the pod token the controller puts in its Secret. Absent = the engine falls
+    // back to marker emission.
+    if let Some(controller) = &profile.cluster.ingest_url {
         env.push(plain(
-            crucible_contract::ENV_INGEST_TOKEN_PATH,
-            format!("{INGEST_TOKEN_DIR}/token"),
+            crucible_contract::ENV_CONTROLLER_URL,
+            controller.clone(),
         ));
     }
 
-    // The pod learns its own name from the downward API, so the ingest `{pod}` path segment it
-    // POSTs to equals the token's bound-pod claim by construction (pod-binding = turn-scoping).
-    // Name + uid also let the in-pod gateway create a client-TLS Secret unique to this pod and
-    // owned by it, which is what gets it garbage-collected with the turn.
+    // The pod learns its own name from the downward API: the `{pod}` segment its uploads go to,
+    // and, with its uid, what lets the in-pod gateway create a client-TLS Secret unique to this
+    // pod and owned by it, which is what gets it garbage-collected with the turn.
     let downward = |name: &str, field_path: &str| core::EnvVar {
         name: name.to_string(),
         value: None,
@@ -388,7 +405,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // subcommand synthesizes a fresh `Args` (`Cli::parse_from(["crucible"])`) that always defaults
     // to the podman compute driver, so the gateway resolves `sandbox_image` through the nested
     // podman/authfile path instead of the kubelet's `imagePullSecrets` and never creates a Sandbox.
-    let sandboxed = match profile.cluster.sandbox_driver {
+    let sandboxed = match profile.cluster.sandbox_driver() {
         ComputeDriver::Kubernetes => vec!["--compute-driver=kubernetes".to_string()],
         ComputeDriver::Podman => Vec::new(),
     };
@@ -503,33 +520,6 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         ..Default::default()
     });
 
-    // Tier 2 ingest token (Tier 2 ingest): a projected SA token audience'd to the ingest endpoint only,
-    // useless against the kube API or any other service. Mounted read-only; the engine reads
-    // `<dir>/token` and sends it as the bearer. Added only when the drop-box URL is configured.
-    if profile.cluster.ingest_url.is_some() {
-        mounts.push(core::VolumeMount {
-            name: INGEST_TOKEN_VOLUME.to_string(),
-            mount_path: INGEST_TOKEN_DIR.to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        });
-        volumes.push(core::Volume {
-            name: INGEST_TOKEN_VOLUME.to_string(),
-            projected: Some(core::ProjectedVolumeSource {
-                sources: Some(vec![core::VolumeProjection {
-                    service_account_token: Some(core::ServiceAccountTokenProjection {
-                        audience: Some(crucible_contract::INGEST_TOKEN_AUDIENCE.to_string()),
-                        expiration_seconds: Some(INGEST_TOKEN_TTL_SECS),
-                        path: "token".to_string(),
-                    }),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-    }
-
     mounts.push(core::VolumeMount {
         name: CHECKOUT_VOLUME.to_string(),
         mount_path: CHECKOUT_DIR.to_string(),
@@ -593,7 +583,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         command: Some(vec!["crucible".to_string()]),
         args: Some(argv),
         security_context: crate::deploy::render::kube::agent_security_context(
-            profile.cluster.sandbox_driver,
+            profile.cluster.sandbox_driver(),
         ),
         env: Some(env),
         volume_mounts: Some(mounts),
@@ -609,16 +599,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
                 "sidecar.istio.io/inject".to_string(),
                 "false".to_string(),
             )])),
-            labels: Some(BTreeMap::from([
-                (
-                    crucible_contract::MANAGED_BY_KEY.to_string(),
-                    crucible_contract::MANAGED_BY_VALUE.to_string(),
-                ),
-                (
-                    "crucible.io/work-kind".to_string(),
-                    opts.kind.label_value().to_string(),
-                ),
-            ])),
+            labels: Some(turn_labels(profile, opts)),
             ..Default::default()
         },
         spec: Some(core::PodSpec {
@@ -630,7 +611,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
             // no mounted kubeconfig like the loop pod does, so it needs the automounted token; podman
             // never touches the API and stays tokenless.
             automount_service_account_token: Some(
-                profile.cluster.sandbox_driver == ComputeDriver::Kubernetes,
+                profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes,
             ),
             restart_policy: Some("Never".to_string()),
             affinity: node_avoid_affinity(profile),
@@ -796,14 +777,10 @@ mod tests {
         assert!(!yaml.contains("kind: RoleBinding"));
         // No avoid-list in the profile, no affinity stanza.
         assert!(!yaml.contains("affinity"), "no affinity key: {yaml}");
-        // No drop-box configured → no Tier 2 ingest env/volume leaks in (Tier 2 ingest).
+        // No controller configured, so the turn uploads nowhere.
         assert!(
-            !yaml.contains("CRUCIBLE_INGEST_URL"),
-            "no ingest env without a drop-box"
-        );
-        assert!(
-            !yaml.contains("crucible-ingest-token"),
-            "no ingest token volume"
+            !yaml.contains("CRUCIBLE_CONTROLLER_URL"),
+            "no controller env without a controller"
         );
     }
 
@@ -860,6 +837,50 @@ mod tests {
             .find(|e| e.name == "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT")
             .and_then(|e| e.value.as_deref());
         assert_eq!(sandbox_sa, Some("autoresearch-sandbox"));
+    }
+
+    #[test]
+    fn an_isolated_turn_pod_names_its_run_for_its_gateways_network_policy() {
+        let render = |extra: &str| {
+            let profile: DeployProfile = toml::from_str(&format!(
+                r#"
+                [cluster]
+                loop_namespace = "autoresearch"
+                rig_namespace = "rig"
+                service_account = "autoresearch-publisher"
+                supervisor_image = "registry.example.com/openshell-supervisor:latest"
+                sandbox_driver = "kubernetes"
+                {extra}
+                [image]
+                loop = "ghcr.io/neuralmagic/crucible:latest"
+                pull_secret = "example-pull-secret"
+            "#
+            ))
+            .expect("profile parses");
+            let yaml = render_turn(
+                &profile,
+                &TurnOpts::new(
+                    TurnKind::Rank,
+                    "crucible-turn-owner-repo-42-abcd",
+                    "owner/repo#42",
+                    "https://github.com/owner/repo.git",
+                    "registry.example.com/epp-sandbox:latest",
+                ),
+            )
+            .expect("render turn");
+            pod_of(&yaml).metadata.labels.expect("labels")
+        };
+        let isolated = render(r#"sandbox_namespace = "sandboxes""#);
+        assert_eq!(
+            isolated
+                .get(crate::deploy::render::gateway::RUN_LABEL)
+                .map(String::as_str),
+            Some("crucible-turn-owner-repo-42-abcd")
+        );
+        assert!(
+            !render("").contains_key(crate::deploy::render::gateway::RUN_LABEL),
+            "an in-pod gateway needs no run label"
+        );
     }
 
     /// Under `sandbox_driver = "kubernetes"` a turn pod must thread the same `--compute-driver`
@@ -950,12 +971,10 @@ mod tests {
         );
     }
 
-    /// With `[cluster].ingest_url` set, a turn pod grows the Tier 2 ingest scaffolding (Tier 2 ingest):
-    /// the `CRUCIBLE_INGEST_URL`/`_TOKEN_PATH`/`POD_NAME` env, a projected `crucible-ingest`-audience
-    /// SA token volume mounted read-only, while `automountServiceAccountToken: false` still stands
-    /// (this is one explicit audience-locked file, not the kube-API passport).
+    /// With `[cluster].ingest_url` set, a turn pod learns the controller's URL and its own name, and
+    /// nothing token-shaped is in its spec: the pod token rides the Secret dispatch creates.
     #[test]
-    fn turn_pod_with_ingest_url_projects_the_drop_box_token_and_env() {
+    fn turn_pod_with_a_controller_uploads_under_its_own_name_and_projects_no_token() {
         let profile: DeployProfile = toml::from_str(
             r#"
             [cluster]
@@ -994,20 +1013,17 @@ mod tests {
         )
         .expect("render turn");
 
-        // The env carrying the drop-box URL + the token path + the pod's own name (downward API).
-        assert!(yaml.contains("CRUCIBLE_INGEST_URL"));
+        assert!(yaml.contains("CRUCIBLE_CONTROLLER_URL"));
         assert!(yaml.contains("http://crucible-controller.autoresearch.svc:8080"));
-        assert!(yaml.contains("CRUCIBLE_INGEST_TOKEN_PATH"));
         assert!(yaml.contains("CRUCIBLE_POD_NAME"));
         assert!(yaml.contains("metadata.name"), "downward-API pod name");
         // The uid is what lets the in-pod gateway own what it publishes, so that material is
         // collected with the turn instead of outliving it.
         assert!(yaml.contains("CRUCIBLE_POD_UID"));
         assert!(yaml.contains("metadata.uid"), "downward-API pod uid");
-        // The projected, audience-locked token volume + its read-only mount.
-        assert!(yaml.contains("crucible-ingest-token"));
-        assert!(yaml.contains("audience: crucible-ingest"));
-        assert!(yaml.contains("/var/run/secrets/crucible.io/ingest"));
+        // The token rides the Secret the controller creates at dispatch, never the pod spec.
+        assert!(!yaml.contains("serviceAccountToken"), "{yaml}");
+        assert!(!yaml.contains("CRUCIBLE_POD_TOKEN"), "{yaml}");
         // The default stays: the kube-API automount is still off.
         assert!(yaml.contains("automountServiceAccountToken: false"));
     }

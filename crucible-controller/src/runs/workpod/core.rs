@@ -241,10 +241,11 @@ pub struct TurnInputs {
     /// the turn pod carries no flag and the pack manifest's `[agent]` table decides. Scope turns
     /// only — a rank turn runs the triage harness the profile configures, not the domain's.
     pub agent: crate::playbooks::providers::AgentSelection,
-    /// The provider [`Self::agent`] came from, whose registered key is projected onto the turn pod
-    /// as the harness's `*_API_KEY`. A turn rendered against a provider has to be able to pay for
-    /// it; `None` (every rank turn, and every dispatch under an empty registry) delivers nothing.
-    pub inference_provider: Option<crate::playbooks::providers::ModelProvider>,
+    /// The models [`Self::agent`] resolved, rendered onto the turn pod as its inference document
+    /// with each role's registered key beside it. A turn rendered against a provider has to be able
+    /// to pay for it; empty (every rank turn, and every dispatch under an empty registry) delivers
+    /// nothing.
+    pub inference: Vec<crate::playbooks::providers::ResolvedModel>,
 }
 
 /// A turn input the linked engine's [`TurnOpts`] has no field for. Refused at dispatch as a

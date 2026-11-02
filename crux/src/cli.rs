@@ -70,6 +70,13 @@ enum Command {
         /// The model to ask that provider for. Needs --provider; omit for its default.
         #[arg(long, requires = "provider")]
         model: Option<String>,
+        /// Rerun this finished run of the same pack instead of starting afresh: every task it
+        /// passed is reused, and the tasks --from names run again with everything after them.
+        #[arg(long, value_name = "RUN")]
+        rerun_of: Option<String>,
+        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+        #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
+        from: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -454,6 +461,10 @@ enum Command {
         /// The pack directory inside the repo. Omit for the repo root.
         #[arg(long)]
         path: Option<String>,
+        /// The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the
+        /// base manifest.
+        #[arg(long)]
+        variant: Option<String>,
         /// The registry id to propose registering under; prefills the review page.
         #[arg(long)]
         id: Option<String>,
@@ -519,6 +530,13 @@ enum Command {
         /// The version these edits were made against (what `draft-pull` printed).
         #[arg(long = "base-version")]
         base_version: i64,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// List the inference providers you may read: id, kind, default model, harness, the price per
+    /// million tokens a run on it is charged, and whether launches may pick it.
+    Providers {
         #[arg(long)]
         json: bool,
     },
@@ -609,13 +627,42 @@ enum Command {
         /// The model to ask that provider for. Needs --provider; omit for its default.
         #[arg(long, requires = "provider")]
         model: Option<String>,
+        /// Rerun this finished run of the same pack instead of starting afresh: every task it
+        /// passed is reused, and the tasks --from names run again with everything after them.
+        #[arg(long, value_name = "RUN")]
+        rerun_of: Option<String>,
+        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+        #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
+        from: Vec<String>,
         #[arg(long)]
         json: bool,
     },
 
-    /// Delete a draft and every version of it. Admin only; the id is free to create again.
+    /// Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin
+    /// only; the id is free to create again.
     DraftDelete {
         draft_id: String,
+    },
+
+    /// Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow.
+    DraftRename {
+        draft_id: String,
+        /// The new id.
+        to: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Copy a draft's newest save into a new draft, with the bindings you could make yourself.
+    DraftClone {
+        draft_id: String,
+        /// The copy's id.
+        to: String,
+        /// Defaults to the source draft's.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Publish a draft: register its newest compiling version as a playbook, with no review.
@@ -661,6 +708,8 @@ pub async fn run() -> Result<()> {
             dispatch_target,
             provider,
             model,
+            rerun_of,
+            from,
             json,
         } => {
             let params: serde_json::Value =
@@ -675,6 +724,7 @@ pub async fn run() -> Result<()> {
                     dispatch_target,
                     provider,
                     model,
+                    rerun: rerun_of.map(|of| ops::Rerun { of, from }),
                 },
                 json,
             )
@@ -843,15 +893,19 @@ pub async fn run() -> Result<()> {
             repo,
             git_ref,
             path,
+            variant,
             id,
             description,
             json,
         } => {
             ops::playbook_import(
                 &client,
-                &repo,
-                git_ref.as_deref(),
-                path.as_deref(),
+                &crate::client::PackImportSource {
+                    repo: &repo,
+                    git_ref: git_ref.as_deref(),
+                    path: path.as_deref(),
+                    variant: variant.as_deref(),
+                },
                 id.as_deref(),
                 description.as_deref(),
                 json,
@@ -887,6 +941,7 @@ pub async fn run() -> Result<()> {
             base_version,
             json,
         } => ops::draft_push(&client, &draft_id, &dir, base_version, json).await?,
+        Command::Providers { json } => ops::providers(&client, json).await?,
         Command::Secrets { json } => ops::secrets(&client, json).await?,
         Command::SecretCreate {
             name,
@@ -959,6 +1014,8 @@ pub async fn run() -> Result<()> {
             dispatch_target,
             provider,
             model,
+            rerun_of,
+            from,
             json,
         } => {
             let params: std::collections::BTreeMap<String, String> = serde_json::from_str(&params)
@@ -977,12 +1034,22 @@ pub async fn run() -> Result<()> {
                     dispatch_target,
                     provider,
                     model,
+                    rerun: rerun_of.map(|of| ops::Rerun { of, from }),
                 },
                 json,
             )
             .await?
         }
         Command::DraftDelete { draft_id } => ops::draft_delete(&client, &draft_id).await?,
+        Command::DraftRename { draft_id, to, json } => {
+            ops::draft_rename(&client, &draft_id, &to, json).await?
+        }
+        Command::DraftClone {
+            draft_id,
+            to,
+            description,
+            json,
+        } => ops::draft_clone(&client, &draft_id, &to, description.as_deref(), json).await?,
         Command::DraftGraduate {
             draft_id,
             repo,
@@ -1582,6 +1649,46 @@ mod tests {
             }
             _ => panic!("expected draft-launch"),
         }
+
+        match Cli::try_parse_from([
+            "crux",
+            "draft-launch",
+            "calibrate",
+            "--max-cost",
+            "1",
+            "--max-time",
+            "5m",
+            "--rerun-of",
+            "run-7",
+            "--from",
+            "check",
+            "--from",
+            "report",
+        ])
+        .expect("parses")
+        .command
+        {
+            Command::DraftLaunch { rerun_of, from, .. } => {
+                assert_eq!(rerun_of.as_deref(), Some("run-7"));
+                assert_eq!(from, ["check", "report"]);
+            }
+            _ => panic!("expected draft-launch"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "crux",
+                "launch",
+                "survey",
+                "--max-cost",
+                "1",
+                "--max-time",
+                "5m",
+                "--from",
+                "check",
+            ])
+            .is_err(),
+            "--from without --rerun-of parsed"
+        );
 
         assert!(
             Cli::try_parse_from(["crux", "draft-graduate", "calibrate"]).is_err(),

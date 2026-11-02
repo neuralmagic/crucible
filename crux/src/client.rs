@@ -96,6 +96,15 @@ pub struct HttpTransport {
     auth: Auth,
 }
 
+/// Where an import fetches a pack, and the manifest variant it reads.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PackImportSource<'a> {
+    pub repo: &'a str,
+    pub git_ref: Option<&'a str>,
+    pub path: Option<&'a str>,
+    pub variant: Option<&'a str>,
+}
+
 pub struct Client {
     transport: std::sync::Arc<dyn Transport>,
 }
@@ -379,6 +388,11 @@ impl Client {
         self.get("/api/config/playbook-caps").await
     }
 
+    /// Every provider registration the caller may read, disabled ones included.
+    pub async fn providers<T: DeserializeOwned>(&self) -> Result<T> {
+        self.get("/api/providers").await
+    }
+
     /// The secrets the caller owns or is an owner-group member of. Metadata only.
     pub async fn secrets<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/secrets").await
@@ -547,12 +561,9 @@ impl Client {
 
     pub async fn import_pack<T: DeserializeOwned>(
         &self,
-        repo: &str,
-        git_ref: Option<&str>,
-        path: Option<&str>,
+        source: &PackImportSource<'_>,
     ) -> Result<T> {
-        let body = serde_json::json!({ "repo": repo, "git_ref": git_ref, "path": path });
-        self.post("/api/playbooks/imports", Some(&body)).await
+        self.post("/api/playbooks/imports", Some(source)).await
     }
 
     pub async fn create_draft<T: DeserializeOwned>(
@@ -620,6 +631,31 @@ impl Client {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Move a draft to `to`, with everything keyed on its id.
+    pub async fn rename_draft<T: DeserializeOwned>(&self, id: &str, to: &str) -> Result<T> {
+        let body = serde_json::json!({ "id": to });
+        self.post(
+            &format!("/api/playbook-drafts/{}/rename", encode(id)),
+            Some(&body),
+        )
+        .await
+    }
+
+    /// Copy a draft's newest save into a new draft `to`.
+    pub async fn clone_draft<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        to: &str,
+        description: Option<&str>,
+    ) -> Result<T> {
+        let body = serde_json::json!({ "id": to, "description": description });
+        self.post(
+            &format!("/api/playbook-drafts/{}/clone", encode(id)),
+            Some(&body),
+        )
+        .await
     }
 
     /// Export the newest compiling version as a PR against `repo`.

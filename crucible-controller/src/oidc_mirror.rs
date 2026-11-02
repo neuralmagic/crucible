@@ -75,8 +75,7 @@ impl DiscoveryUpstream for KubeUpstream {
 }
 
 /// The upstream used when no kube client could be built at startup: every fetch fails, so the
-/// mirror serves 503 until the controller restarts with a reachable API (mirrors the ingest
-/// drop-box's fail-closed posture).
+/// mirror serves 503 until the controller restarts with a reachable API.
 pub(crate) struct UnavailableUpstream;
 
 impl DiscoveryUpstream for UnavailableUpstream {

@@ -2,8 +2,8 @@
 //! exactly the bytes the `crucible` command line prints. Each test drives both paths.
 
 use crucible::deploy::{
-    DeployProfile, PackDelivery, PackPath, PlaybookLaunch, ProposeTier, RenderOpts, TurnKind,
-    TurnOpts, render_turn, render_yaml,
+    DeployProfile, PackDelivery, PackPath, PlaybookLaunch, ProposeTier, RenderOpts, RerunLaunch,
+    TurnKind, TurnOpts, render_turn, render_yaml,
 };
 use crucible::flow::{FlowFormat, FlowInput, render};
 use crucible::manifest::Harness;
@@ -82,6 +82,7 @@ fn deploy_render_matches_render_yaml() {
             harness: Some(Harness::Hermes),
             model: Some("hermes-4-70b".to_string()),
             playbook: None,
+            platform: None,
         },
     )
     .expect("library render");
@@ -174,12 +175,158 @@ fn deploy_render_pack_playbook_matches_render_yaml() {
                     ("topic".to_string(), "attention sinks".to_string()),
                     ("depth".to_string(), "--deep".to_string()),
                 ]),
+                rerun: None,
+                variant: None,
             }),
+            platform: None,
         },
     )
     .expect("library render");
     assert!(from_lib.contains("kind: ConfigMap"));
     assert!(from_lib.contains("plan run"));
+    assert_eq!(from_cli, from_lib);
+}
+
+/// A variant renders the same through the command line as through the library: the pod reads
+/// the variant's `[agent]`, and its `plan run` names the variant.
+#[test]
+fn deploy_render_variant_matches_render_yaml() {
+    let tmp = scratch("variant");
+    let pack = tmp.path().join("roundup");
+    std::fs::create_dir_all(&pack).expect("mkdir pack");
+    write_playbook_pack(&pack);
+    let manifest = pack.join("crucible.toml");
+    let mut text = std::fs::read_to_string(&manifest).expect("manifest");
+    text.push_str(
+        "[variant.offline.agent]\nbackend = \"openshell\"\ngoal = \"draft the roundup\"\n\
+         sandbox_image = \"registry.example.com/offline-sandbox:latest\"\n",
+    );
+    std::fs::write(&manifest, text).expect("manifest");
+    let profile = delta_profile();
+    let from_cli = cli(&[
+        "deploy",
+        "render",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--no-pin",
+        "--pack",
+        "--pack-configmap-name",
+        "crucible-run-44-pack",
+        "--playbook",
+        "--max-cost",
+        "4.5",
+        "--max-time",
+        "30m",
+        "--variant",
+        "offline",
+        "--param",
+        "topic=t",
+    ]);
+    let from_lib = render_yaml(
+        &manifest,
+        &profile,
+        &RenderOpts {
+            max_cost: 4.5,
+            pack: Some(PackDelivery {
+                configmap_name: "crucible-run-44-pack".to_string(),
+                run_name: "roundup".to_string(),
+                inputs: Default::default(),
+            }),
+            playbook: Some(PlaybookLaunch {
+                max_time: "30m".parse().expect("30m is a duration"),
+                max_cost: 4.5,
+                params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+                rerun: None,
+                variant: Some("offline".parse().expect("variant name")),
+            }),
+            ..RenderOpts::default()
+        },
+    )
+    .expect("library render");
+    assert!(
+        from_lib.contains(" --variant offline --param"),
+        "{from_lib}"
+    );
+    assert!(from_lib.contains("offline-sandbox"), "{from_lib}");
+    assert!(!from_lib.contains("alpha-sandbox"), "{from_lib}");
+    assert_eq!(from_cli, from_lib);
+}
+
+/// A rerun renders the same through the command line as through the library: the parent's
+/// evidence URL on the controller and the tasks dispatched again.
+#[test]
+fn deploy_render_rerun_matches_render_yaml() {
+    let tmp = scratch("rerun");
+    let pack = tmp.path().join("roundup");
+    std::fs::create_dir_all(&pack).expect("mkdir pack");
+    write_playbook_pack(&pack);
+    let manifest = pack.join("crucible.toml");
+    let profile = tmp.path().join("profile.toml");
+    let delta = std::fs::read_to_string(delta_profile()).expect("delta profile");
+    std::fs::write(
+        &profile,
+        delta.replacen(
+            "[cluster]\n",
+            "[cluster]\ningest_url = \"http://crucible-controller.ns.svc:8080\"\n",
+            1,
+        ),
+    )
+    .expect("profile");
+    let from_cli = cli(&[
+        "deploy",
+        "render",
+        "--manifest",
+        manifest.to_str().unwrap(),
+        "--profile",
+        profile.to_str().unwrap(),
+        "--no-pin",
+        "--pack",
+        "--pack-configmap-name",
+        "crucible-run-43-pack",
+        "--playbook",
+        "--max-cost",
+        "4.5",
+        "--max-time",
+        "30m",
+        "--param",
+        "topic=t",
+        "--rerun-of",
+        "acme_x_7-1700",
+        "--from",
+        "draft",
+    ]);
+    let from_lib = render_yaml(
+        &manifest,
+        &profile,
+        &RenderOpts {
+            max_cost: 4.5,
+            pack: Some(PackDelivery {
+                configmap_name: "crucible-run-43-pack".to_string(),
+                run_name: "roundup".to_string(),
+                inputs: Default::default(),
+            }),
+            playbook: Some(PlaybookLaunch {
+                max_time: "30m".parse().expect("30m is a duration"),
+                max_cost: 4.5,
+                params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+                rerun: Some(RerunLaunch {
+                    parent: "acme_x_7-1700".to_string(),
+                    from: vec!["draft".to_string()],
+                }),
+                variant: None,
+            }),
+            ..RenderOpts::default()
+        },
+    )
+    .expect("library render");
+    assert!(
+        from_lib.contains(
+            r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/acme_x_7-1700" --from 'draft'"#
+        ),
+        "{from_lib}"
+    );
     assert_eq!(from_cli, from_lib);
 }
 
@@ -399,6 +546,8 @@ fn a_delivered_pack_renders_under_its_run_name_not_its_directory() {
                 max_time: "30m".parse().expect("30m is a duration"),
                 max_cost: 1.0,
                 params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+                rerun: None,
+                variant: None,
             }),
             ..RenderOpts::default()
         },
@@ -445,6 +594,8 @@ fn an_inject_resolves_through_the_run_inputs() {
                     max_time: "30m".parse().expect("30m is a duration"),
                     max_cost: 1.0,
                     params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+                    rerun: None,
+                    variant: None,
                 }),
                 ..RenderOpts::default()
             },

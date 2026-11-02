@@ -175,7 +175,7 @@ async fn launch_approved_run(
             launcher: crate::authz::model::Principals::default(),
             revision: crate::secrets::launch::OwnedRevision::UNPINNED,
             provider: cfg.secret_provider.clone(),
-            inference_provider: dispatch.map(|d| d.provider),
+            inference: dispatch.iter().map(|d| d.inference()).collect(),
             exposure: scope.exposure.clone(),
         }),
     )
@@ -246,6 +246,9 @@ async fn launch_approved_run(
         )
         .await?;
         crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
+        if cfg.issues_agent_tokens() {
+            crate::runs::store::stamp_dispatcher(&mut *tx, &run_id).await?;
+        }
         crate::runs::names::set(&mut *tx, &run_id, &name).await?;
         let ev = Event::now(
             &issue.key,
@@ -261,6 +264,7 @@ async fn launch_approved_run(
         crate::runs::work_pods::clear_redispatch(&mut *tx, &issue.key).await?;
         tx.commit().await?;
         db.events().publish(&ev);
+        crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
     }
     Ok(())
 }

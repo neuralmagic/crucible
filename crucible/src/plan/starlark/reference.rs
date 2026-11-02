@@ -9,7 +9,6 @@ use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
-#[cfg(test)]
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
 use crucible_contract::history::MAX_HISTORY_DEPTH;
@@ -26,8 +25,7 @@ pub enum Lane {
 }
 
 impl Lane {
-    #[cfg(test)]
-    fn includes(self, workflow: WorkflowType) -> bool {
+    pub fn includes(self, workflow: WorkflowType) -> bool {
         match self {
             Lane::Common => true,
             Lane::Scored => workflow != WorkflowType::Playbook,
@@ -66,13 +64,13 @@ fn task_knobs() -> Vec<Kwarg> {
     vec![
         Kwarg::new(
             "depends_on",
-            "list[task]",
+            "list[task | optional(task)]",
             "Dependencies. Readiness decides execution order; declaration order does not.",
         ),
         Kwarg::new(
             "needs",
             "str",
-            "The substrate capability the task needs, such as `\"systemone\"`. The default \
+            "The substrate capability the task needs, such as `\"decision\"`. The default \
              `\"any\"` runs everywhere. A required task whose capability is unavailable truncates \
              the plan before dispatch; an advisory one is skipped with its dependents.",
         ),
@@ -115,10 +113,12 @@ fn task_knobs() -> Vec<Kwarg> {
         Kwarg::new(
             "emits_files",
             "list[str] | dict[str, schema | None]",
-            "Workspace files the task produces. A dependent is staged with the declared files of \
-             every dependency that passed. The dict form maps a path to `schema_file(...)` or \
-             `None`; a file with a schema must hold JSON the schema admits when the task passes, \
-             or the task fails.",
+            "Workspace files the task produces. A task is staged with the declared files of \
+             every ancestor that passed, not only its direct dependencies, under \
+             `inputs/<producer>/`; a `join = \"settled\"` task also gets those of a direct \
+             dependency that failed. JSON outputs, unlike files, come from direct dependencies \
+             only. The dict form maps a path to `schema_file(...)` or `None`; a file with a \
+             schema must hold JSON the schema admits when the task passes, or the task fails.",
         ),
         Kwarg::new(
             "over",
@@ -132,6 +132,7 @@ fn task_knobs() -> Vec<Kwarg> {
                 "Instance cap for `over`, within the engine's ceiling of {MAX_FANOUT_CEILING}."
             ),
         ),
+        keyed_kwarg(),
         Kwarg::new(
             "revise",
             "task | list[task]",
@@ -176,14 +177,24 @@ fn task_knobs() -> Vec<Kwarg> {
     ]
 }
 
+fn keyed_kwarg() -> Kwarg {
+    Kwarg::new(
+        "keyed",
+        "list[producer.field]",
+        "Object fields of unmapped dependencies, keyed by item. Each instance receives only its \
+         own item's entry in place of the whole field. Needs `over`.",
+    )
+}
+
 fn when_kwarg() -> Kwarg {
     Kwarg::new(
         "when",
         "route.question",
         "Run only on a listed answer to one question of a `route()` this task depends on. \
          Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, \
-         and every `all`-join dependent is not taken with it. Rejoin branches with \
-         `join = \"passed\"` or `join = \"settled\"`. Playbook and custom workflows only.",
+         and every `all`-join dependent is not taken with it unless it lists the task as \
+         `optional(...)`. Rejoin branches with `join = \"passed\"` or `join = \"settled\"`. \
+         Playbook and custom workflows only.",
     )
 }
 
@@ -205,7 +216,7 @@ fn answers_kwarg() -> Kwarg {
         "str | list[str]",
         format!(
             "The answers `when` accepts: labels the question declares, or `\"{UNCERTAIN}\"`. \
-             Defaults to `\"yes\"` for a noul and is required for a choice."
+             Defaults to `\"yes\"` for a noul and is required for a choice or a score."
         ),
     )
 }
@@ -337,7 +348,12 @@ pub fn functions() -> Vec<Function> {
             positional: None,
             kwargs: vec![
                 name_kwarg(),
-                Kwarg::new("destination", "str", "The configured sink to publish to."),
+                Kwarg::new(
+                    "destination",
+                    "dict",
+                    "The sink to publish to, as `{\"kind\": \"slack\"}`. The controller holds \
+                     its endpoint and credential.",
+                ),
                 Kwarg::new(
                     "template",
                     "str",
@@ -546,12 +562,13 @@ pub fn functions() -> Vec<Function> {
                 Kwarg::new(
                     "questions",
                     "dict[str, question]",
-                    "Question id to `noul()` or `choice()`. `gate.<id>` names one for `when`.",
+                    "Question id to `noul()`, `choice()`, or `score()`. `gate.<id>` names one \
+                     for `when`.",
                 ),
                 Kwarg::new(
                     "min_confidence",
                     "number",
-                    "A decision model answers, through the broker's `systemone` capability. An \
+                    "A decision model answers, through the broker's `decision` capability. An \
                      answer whose probability is below this, in (0, 1], is recorded as \
                      `\"uncertain\"`. Exactly one of `min_confidence` and `source`.",
                 ),
@@ -564,6 +581,28 @@ pub fn functions() -> Vec<Function> {
                      types its emits, each question's field must be typed with labels the \
                      question answers, or `\"boolean\"` for a noul.",
                 ),
+                Kwarg::new(
+                    "files",
+                    "list[str]",
+                    "Declared JSON files of dependencies the model reads, under `files` in its \
+                     state, by dependency and path. Each must be declared by a dependency with a \
+                     `schema_file(...)`. Not with `source`.",
+                ),
+                Kwarg::new(
+                    "over",
+                    "producer.field",
+                    "Decide once per item. A task mapped over the same list reads each item's \
+                     answer with `when`; one mapped over another list, or not mapped, cannot.",
+                ),
+                Kwarg::new(
+                    "max_fanout",
+                    "int",
+                    format!(
+                        "Instance cap for `over`, within the engine's ceiling of \
+                         {MAX_FANOUT_CEILING}."
+                    ),
+                ),
+                keyed_kwarg(),
                 Kwarg::new(
                     "depends_on",
                     "list[task]",
@@ -616,6 +655,42 @@ pub fn functions() -> Vec<Function> {
             ],
         },
         Function {
+            name: "score",
+            lane: Lane::Routed,
+            purpose: "An ordinal question for `route()`. It answers its most probable level, the \
+                      lowest on a tie, and records a score in [0, 1]: the expected level \
+                      position over the normalized distribution, 0 for the lowest level and 1 \
+                      for the highest. A `source` answers one level label, scored by its \
+                      position, and `\"uncertain\"` records no score.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new("ask", "str", "What to decide."),
+                Kwarg::new(
+                    "levels",
+                    "list[str] | dict[str, str | None]",
+                    "At least two distinct identifier labels, lowest first in the order written, \
+                     optionally each with a description the model sees. `\"uncertain\"` is \
+                     reserved.",
+                ),
+                Kwarg::new(
+                    "drop",
+                    "str | list[str]",
+                    "Answers that deliberately lead nowhere, so no `when` has to list them.",
+                ),
+            ],
+        },
+        Function {
+            name: "optional",
+            lane: Lane::Routed,
+            purpose: "Mark an entry of `depends_on` that may settle `not_taken`. Under \
+                      `join = \"all\"` the task dispatches past it as though it passed, and its \
+                      inputs carry no entry for it; one that failed or was blocked still blocks. \
+                      Refused under another join, on a dependency that can never settle \
+                      `not_taken`, and on a task the reviewer revises.",
+            positional: Some("task"),
+            kwargs: vec![],
+        },
+        Function {
             name: "default_autoresearch",
             lane: Lane::Scored,
             purpose: "Expand the built-in propose/apply/measure/decide loop into visible nodes, \
@@ -659,6 +734,14 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
             "status",
             declared_status_type(),
             "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+        ),
+        Reserved::new(
+            crate::plan::ir::NOTE_FIELD,
+            "str",
+            "Why the task failed or was skipped, recorded as its note: in place of the default \
+             note when `status` is `\"fail\"` or `\"skipped\"`, and after the exit status in \
+             place of the stderr tail when a command exits nonzero. The control plane shows it as \
+             a parked run's reason. Read only from a result that fails or skips.",
         ),
         Reserved::new(
             crate::plan::ir::COMPLETE_FIELD,
@@ -970,7 +1053,7 @@ mod tests {
         let results = super::reserved_result_fields();
         assert_eq!(
             results.iter().map(|row| row.name).collect::<Vec<_>>(),
-            ["status"]
+            ["status", crate::plan::ir::NOTE_FIELD]
                 .into_iter()
                 .chain(crate::plan::ir::RESERVED_OUTPUTS)
                 .collect::<Vec<_>>(),

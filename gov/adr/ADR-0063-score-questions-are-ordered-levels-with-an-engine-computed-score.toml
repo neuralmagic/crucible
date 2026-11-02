@@ -1,0 +1,88 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0063"
+title = "Score questions are ordered levels with an engine-computed score"
+status = "proposed"
+date = "2026-10-07"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0001:C-ROUTE-SCORE",
+    "RFC-0001:C-INFERENCE",
+    "RFC-0001:C-WORKFLOW",
+    "ADR-0062",
+]
+
+[content]
+context = """
+A route answers noul and choice questions ([[RFC-0001:C-ROUTE]]). Some decisions are ordinal: how risky a change is, how much effort a ticket needs, how strongly evidence supports a verdict. Asked as a choice, the levels are unordered labels, so the run records which level won but not where the rest of the mass sits; "high 0.45, medium 0.40" and "high 0.45, low 0.40" record the same label.
+
+OpenAI's Decisions API, as published in October 2026, has a native score question over ordered levels and answers it with a per-level distribution, a score, and a confidence; support for it as a decision protocol is being added beside System One. The System One API has no score question. A route's binding picks the API at launch ([[RFC-0001:C-INFERENCE]]), not the playbook, so the same playbook should run against either, and the decision is recorded once and folded on resume.
+
+The engine already derives a choice's label from the distribution alone and ignores any choice or confidence the API reports, so the record does not depend on how a provider summarises its own answer."""
+decision = """
+Add score as a third question type: ordered levels, labelled as a choice's options are, plus a recorded score in [0, 1] that the engine computes as the expected level position over the normalized distribution ([[RFC-0001:C-ROUTE-SCORE]]). The label is the most probable level, so when, drop, otherwise, and coverage work exactly as for a choice. The engine asks it natively where the binding's API has an ordered question and as a choice where it has none, and records which under asked_as.
+
+The engine computes the score for the same reason it derives the label: the record must mean the same thing whatever the provider reports, and the formula has to be stated for a reader to use the number. Emulating on System One rather than refusing keeps a playbook portable across bindings; a choice over the levels returns the same shape of evidence, and asked_as tells a reader comparing runs that the model was not told the levels were ordered.
+
+Ordering work by score, such as dispatching the riskiest element's turn first so a budget halt falls on the least important, is not part of this decision. The score is in the record for a reducer or report to sort on."""
+consequences = """
+- Ordinal judgments carry their spread, and a reducer can rank elements without a second model call.
+- A playbook runs on either binding. On system_one the model sees unordered options, so its distribution may be less calibrated across neighbouring levels than a native score; asked_as makes that visible but does not fix it.
+- The engine's score can differ from the score OpenAI reports, which may weight levels differently. Readers use the recorded score, not the provider's.
+- The score treats levels as evenly spaced, so low, medium, and high become 0, 0.5, and 1. An author whose levels are not evenly spaced should sort on the distribution, not the score.
+- Label coverage over a score question with many levels is verbose; otherwise covers the tail.
+- "score" now names both a route question type in the playbook lanes and the measured number in the scored lanes. The lanes do not share constructors, so the DSL namespace does not collide, but documentation has to keep them apart."""
+
+[[content.alternatives]]
+text = "Native over decisions, asked as a choice over system_one, score computed by the engine"
+status = "accepted"
+pros = [
+    "One record shape for both bindings.",
+    "The score is defined by a stated formula, independent of provider summaries.",
+    "No capability split; a playbook does not need to know the binding.",
+]
+cons = ["System One answers without knowing the levels are ordered."]
+
+[[content.alternatives]]
+text = "Refuse a score question unless the binding speaks decisions, through a capability verified before dispatch"
+status = "rejected"
+pros = [
+    "Never asks a model a weaker question than the author wrote.",
+    "The plan truncates before spend, so the failure is cheap and clear.",
+]
+cons = [
+    "The same playbook fails on one deployment and runs on another.",
+    "Adds a capability tier to C-PLAYBOOK-CAPS for one question type.",
+]
+rejection_reason = "Portability across bindings matters more than the calibration difference, and asked_as records which form was used."
+
+[[content.alternatives]]
+text = "Record the score the API reports"
+status = "rejected"
+pros = ["No engine formula to maintain."]
+cons = [
+    "System One reports none, so the field would be absent on one binding.",
+    "Contradicts the existing rule that the label is derived from probabilities alone.",
+]
+rejection_reason = "The record must not depend on how a provider summarises its own answer."
+
+[[content.alternatives]]
+text = "No new type; authors write a choice and compute a score in a downstream command"
+status = "rejected"
+pros = ["No contract change."]
+cons = [
+    "Every playbook reimplements the same formula over an unordered distribution.",
+    "OpenAI's native ordinal question is never used.",
+]
+rejection_reason = "Common enough to be a type, and the native question is the better ask where it exists."
+
+[[content.alternatives]]
+text = "A scalar answer in [0, 1] asked directly"
+status = "rejected"
+pros = ["One number, no levels to author."]
+cons = [
+    "No distribution to record, so the spread this decision exists for is lost.",
+    "Neither API answers a free scalar with a probability, so min_confidence has nothing to compare.",
+]
+rejection_reason = "Loses the distribution and the confidence rule."

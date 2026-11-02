@@ -1,11 +1,12 @@
 # Tasks: the no-judge lane
 
-The autoresearch loop assumes an objective, but not every job has one. The **task lane** runs
-the same loop — sandbox, broker mediation, session log, publish, resume — for work that just
-needs doing: consolidate the open dependabot PRs, fix flaky tests nightly, regenerate docs,
-triage an issue backlog. One manifest, no Rust, no gate script.
+The autoresearch loop needs an objective, but some jobs have no objective. The **task lane**
+runs the same loop (sandbox, broker, session log, publish, resume) for work without a score:
+consolidate the open dependabot PRs, fix flaky tests every night, regenerate docs, triage an
+issue backlog. You need one manifest. You do not need Rust or a gate script.
 
-Opt in by omitting `[judge]`. That's the whole switch ([ADR-0026](./adr/0026-no-judge-task-lane.md)).
+To use the task lane, omit `[judge]`. No other setting is necessary
+([ADR-0026](./adr/0026-no-judge-task-lane.md)).
 
 ## The minimal manifest
 
@@ -32,42 +33,45 @@ crucible check --manifest task.toml     # validates; prints the task-mode notice
 crucible --manifest task.toml --iterations 3
 ```
 
-Each iteration is one agent turn. Every completed turn is kept and committed to git memory;
-there is no baseline, no score, no discard. The run exits 0 when the iterations are spent.
+Each iteration is one agent turn. The engine keeps every completed turn and commits it to
+Git. There is no baseline, no score, and no discard. The run exits with status 0 when no
+iterations remain.
 
-## What you get for free
+## What the engine supplies
 
-- **Reversible memory**: each turn is a commit; an interrupted run resumes with `--resume`
-  from the session log, rolling back any half-finished turn to the last kept state.
-- **The deliverable**: kept commits pushed as a draft PR (`[publish].pr_repo`), with the run
-  log and per-turn diffs recorded to S3 when a results bucket is configured.
-- **The trust model**: with `backend = "openshell"` the agent runs under Landlock with a
-  deny-by-default egress allowlist, and holds no credentials. Anything privileged goes
-  through the broker's tools, never the agent's environment. Merging the PR stays with you.
-- **Forensics**: `state/session.jsonl` is the source of truth; `crucible flow --session
-  state/session.jsonl --out flow.html` renders a self-contained explainer of what the agent
-  did each turn.
-- **Steering**: `STEER.md`, the control bridge, distress paging, and budget caps
-  (`--max-cost`, `--max-time`) all work exactly as in scored runs.
+- **History**: each turn is a commit. An interrupted run continues from the session log with
+  `--resume`. The engine rolls back an incomplete turn to the last kept state.
+- **The deliverable**: the engine pushes kept commits as a draft PR (`[publish].pr_repo`). If
+  a results bucket is configured, it also records the run log and the diff of each turn to
+  S3.
+- **The trust model**: with `backend = "openshell"`, the agent runs under Landlock with a
+  deny-by-default egress allowlist, and it has no credentials. All privileged operations go
+  through the broker tools, not the agent environment. You merge the PR.
+- **Forensics**: `state/session.jsonl` is the source of truth.
+  `crucible flow --session state/session.jsonl --out flow.html` renders a self-contained page
+  that shows what the agent did in each turn.
+- **Steering**: `STEER.md`, the control bridge, distress paging, and the limits
+  (`--max-cost`, `--max-time`) work as in scored runs.
 
 ## Semantics to know
 
 | Question | Answer |
 | --- | --- |
-| How does it end? | The iteration budget (or `--max-cost`/`--max-time`/stop). `solved` never fires; `--no-early-stop` is a no-op. |
-| What does exit 0 mean? | The run completed. It does not certify the chore succeeded — read the rows or the PR. |
-| What's on the wire? | `Start.gate == "task"` is the discriminator; an iter-0 `baseline-skipped` row, then `keep` rows with `score: null`. |
-| Can a composite be a task? | No. Composites exist to combine scored components; `[judge]` stays required there. |
-| What else is off the table? | `[search]`, `[workflow]`, and `[preflight]` — all three need scores, so a task manifest rejects them at load. `objective = "task"` is reserved on scored judges. |
-| Scheduled runs? | Render the pod with `crucible deploy render` (a playbook launch adds `--playbook --max-time <dur>`) and drive it from any scheduler (a Kubernetes CronJob works today); native controller scheduling is planned. |
+| How does the run end? | At the iteration limit, or at `--max-cost`, `--max-time`, or stop. `solved` does not occur. `--no-early-stop` has no effect. |
+| What does exit status 0 mean? | The run completed. It does not mean that the task succeeded. Read the rows or the PR. |
+| What is on the wire? | `Start.gate == "task"` is the discriminator. There is an iteration-0 `baseline-skipped` row, then `keep` rows with `score: null`. |
+| Can a composite be a task? | No. A composite combines scored components, so it needs `[judge]`. |
+| Which sections are not allowed? | `[search]`, `[workflow]`, and `[preflight]`. All three need scores, so a task manifest rejects them at load. `objective = "task"` is reserved for scored judges. |
+| Scheduled runs? | The controller schedules only playbooks. For a task run, render the pod with `crucible deploy render` and start it from a scheduler, for example a Kubernetes CronJob. |
 
 ## The runnable reference
 
-`examples/task/` is the litmus domain: the deterministic `command` backend stands in for an
-LLM, so the full path (manifest → turns → keeps → session log → resume) runs in milliseconds:
+`examples/task/` is the reference domain. The deterministic `command` backend replaces the
+LLM, so the full path (manifest → turns → keeps → session log → resume) runs in
+milliseconds:
 
 ```sh
 crucible --manifest examples/task/crucible.toml --iterations 3
 ```
 
-Use its manifest as the template for anything that authors task manifests programmatically.
+Use its manifest as the template for tools that generate task manifests.
