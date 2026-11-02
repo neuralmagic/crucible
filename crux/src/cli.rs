@@ -159,12 +159,6 @@ enum Command {
         json: bool,
     },
 
-    /// Registered inference providers: kind, harness, default model, secret, owner, endpoint.
-    Providers {
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Register a provider from a JSON body (`POST /api/providers`).
     ProviderCreate {
         #[arg(long)]
@@ -765,7 +759,6 @@ pub async fn run() -> Result<()> {
             limit,
             json,
         } => ops::webhook_deliveries(&client, &id, before.as_deref(), limit, json).await?,
-        Command::Providers { json } => ops::providers(&client, json).await?,
         Command::ProviderCreate { file } => ops::provider_create(&client, &file).await?,
         Command::ProviderUpdate { id, file } => ops::provider_update(&client, &id, &file).await?,
         Command::ProviderDelete { id } => ops::provider_delete(&client, &id).await?,

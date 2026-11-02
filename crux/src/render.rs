@@ -1263,42 +1263,6 @@ pub fn runs(list: &[dto::RunRow]) -> String {
     )
 }
 
-/// The recurrences. A schedule whose owner has to sign in again is listed as blocked rather than
-/// enabled: it is enabled and still will not fire, which is the confusing case worth naming.
-pub fn providers(list: &[dto::Provider]) -> String {
-    if list.is_empty() {
-        return "no providers\n".to_string();
-    }
-    let rows: Vec<Vec<String>> = list
-        .iter()
-        .map(|p| {
-            vec![
-                p.id.clone(),
-                match &p.protocol {
-                    Some(protocol) => format!("{}/{protocol}", p.kind),
-                    None => p.kind.clone(),
-                },
-                p.harness.clone(),
-                p.default_model.clone(),
-                if p.enabled { "enabled" } else { "disabled" }.to_string(),
-                or_dash(p.secret_name.as_deref()),
-                p.owner.clone(),
-                or_dash(p.endpoint.as_deref()),
-            ]
-        })
-        .collect();
-    format!(
-        "{} providers\n{}",
-        list.len(),
-        table(
-            &[
-                "ID", "KIND", "HARNESS", "MODEL", "STATE", "SECRET", "OWNER", "ENDPOINT"
-            ],
-            &rows
-        )
-    )
-}
-
 pub fn dispatch_defaults(list: &[dto::DispatchDefault]) -> String {
     if list.is_empty() {
         return "no dispatch defaults\n".to_string();
@@ -1336,6 +1300,8 @@ pub fn dispatch_defaults(list: &[dto::DispatchDefault]) -> String {
     )
 }
 
+/// The recurrences. A schedule whose owner has to sign in again is listed as blocked rather than
+/// enabled: it is enabled and still will not fire, which is the confusing case worth naming.
 pub fn schedules(list: &[dto::Schedule]) -> String {
     if list.is_empty() {
         return "no schedules\n".to_string();

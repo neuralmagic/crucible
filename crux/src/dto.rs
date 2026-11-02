@@ -895,28 +895,6 @@ pub struct Schedule {
     pub owner_signin_required: bool,
 }
 
-/// A registered inference provider, as `GET /api/providers` lists it.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Provider {
-    pub id: String,
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub harness: String,
-    #[serde(default)]
-    pub default_model: String,
-    #[serde(default)]
-    pub protocol: Option<String>,
-    #[serde(default)]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub secret_name: Option<String>,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub owner: String,
-}
-
 /// The provider a scope's unpinned dispatches of one workload class take.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DispatchDefault {

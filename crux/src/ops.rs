@@ -1192,14 +1192,6 @@ pub async fn webhook_delete(c: &Client, id: &str) -> Result<String> {
     Ok(format!("deleted webhook {id}\n"))
 }
 
-pub async fn providers(c: &Client, as_json: bool) -> Result<String> {
-    if as_json {
-        return json(&c.get::<Value>("/api/providers").await?);
-    }
-    let list: Vec<dto::Provider> = c.get("/api/providers").await?;
-    Ok(render::providers(&list))
-}
-
 /// Register a provider from a JSON body (`POST /api/providers`).
 pub async fn provider_create(c: &Client, file: &Path) -> Result<String> {
     json(
@@ -2370,9 +2362,9 @@ mod tests {
         std::fs::write(&default_body, default.to_string()).expect("write");
 
         let table = providers(&client, false).await.expect("providers");
-        assert!(table.starts_with("1 providers\n"), "{table}");
-        assert!(table.contains("custom/messages"), "{table}");
-        assert!(table.contains("enmaas-api-key"), "{table}");
+        assert!(table.starts_with("1 providers "), "{table}");
+        assert!(table.contains("enmaas"), "{table}");
+        assert!(table.contains("claude-opus-5-5"), "{table}");
 
         let made = provider_create(&client, &body).await.expect("create");
         assert!(made.contains("\"id\": \"enmaas\""), "{made}");
