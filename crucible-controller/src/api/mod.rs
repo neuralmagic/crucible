@@ -99,6 +99,12 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::delete_playbook_draft,
         crate::playbooks::api::drafts::rename_playbook_draft,
         crate::playbooks::api::drafts::clone_playbook_draft,
+        crate::playbooks::api::blueprints::mark_blueprint,
+        crate::playbooks::api::blueprints::unmark_blueprint,
+        crate::playbooks::api::blueprints::publish_blueprint,
+        crate::playbooks::api::blueprints::unpublish_blueprint,
+        crate::playbooks::api::blueprints::list_blueprints,
+        crate::playbooks::api::blueprints::use_blueprint,
         crate::playbooks::api::drafts::launch_playbook_draft,
         crate::playbooks::api::drafts::graduate_playbook_draft,
         crate::playbooks::api::drafts::publish_playbook_draft,
@@ -279,6 +285,13 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::CloneDraftBody,
         crate::playbooks::api::drafts::DraftClonedDto,
         crate::secrets::api::LeftBindingDto,
+        crate::playbooks::api::blueprints::BlueprintStateDto,
+        crate::playbooks::api::drafts::PlaceholderDto,
+        crate::playbooks::api::blueprints::BlueprintSecretDto,
+        crate::playbooks::api::blueprints::BlueprintDto,
+        crate::playbooks::api::blueprints::UseBlueprintBody,
+        crate::playbooks::api::blueprints::BlueprintUsedDto,
+        crate::playbooks::blueprints::PlaceholderReason,
         crate::playbooks::api::drafts::PlaybookDraftDto,
         crate::playbooks::api::drafts::PlaybookDraftDetail,
         crate::playbooks::api::drafts::PlaybookLimits,
@@ -520,6 +533,16 @@ pub fn router(state: ApiState) -> Router {
             crate::playbooks::api::drafts::rename_playbook_draft
         ))
         .routes(routes!(crate::playbooks::api::drafts::clone_playbook_draft))
+        .routes(routes!(
+            crate::playbooks::api::blueprints::mark_blueprint,
+            crate::playbooks::api::blueprints::unmark_blueprint
+        ))
+        .routes(routes!(
+            crate::playbooks::api::blueprints::publish_blueprint,
+            crate::playbooks::api::blueprints::unpublish_blueprint
+        ))
+        .routes(routes!(crate::playbooks::api::blueprints::list_blueprints))
+        .routes(routes!(crate::playbooks::api::blueprints::use_blueprint))
         .routes(routes!(
             crate::playbooks::api::drafts::launch_playbook_draft
         ))
