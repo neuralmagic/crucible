@@ -341,6 +341,23 @@ pub enum CompileError {
     )]
     OverNotOutputField,
     #[error(
+        "\"keyed\" must name declared output fields of tasks this one depends on, as \
+         `keyed = [producer.field]`"
+    )]
+    KeyedNotOutputField,
+    #[error("keyed {reference} is declared {declared}; keyed needs an object keyed by element")]
+    KeyedNotObject {
+        reference: String,
+        declared: crucible_contract::emits::FieldType,
+    },
+    #[error("\"files\" must be a list of workspace-relative paths, like [\"RESULT.json\"]")]
+    RouteFilesNotList,
+    #[error(
+        "route {task:?} reads files but is decided by source; only a model reads files, so drop \
+         files or use min_confidence"
+    )]
+    RouteFilesWithSource { task: String },
+    #[error(
         "argument {argument:?} carries a value supplied from outside the pack. A prompt marks \
          such a span so an agent can tell it from an instruction; nothing else can, so do not \
          build it into {argument:?}. A command or evaluate task reads it as data from the \
@@ -546,25 +563,53 @@ pub enum CompileError {
     TaskNamesNotList { argument: String },
     #[error("{argument} entries must be tasks or task-name strings")]
     TaskNameEntryWrongType { argument: String },
+    #[error(
+        "optional(...) marks a dependency of agent, skill, command, evaluate or route; here \
+         {argument} takes plain tasks"
+    )]
+    OptionalOutsideDependsOn { argument: String },
 
     #[error("workflow source must end with workflow(...) or default_autoresearch([...])")]
     NoWorkflowResult,
     #[error(
         "task(s) constructed but not included in the workflow: {}; add them to \
          workflow(tasks = ...) or delete them",
-        .sites.join(", ")
+        Site::list(.sites)
     )]
-    DroppedTasks { sites: Vec<String> },
+    DroppedTasks { sites: Vec<Site> },
     #[error(
         "session string reference(s) {} appear before any session() declaration; declare sessions \
          before binding them",
-        .sites.join(", ")
+        Site::list(.sites)
     )]
-    LateSessionDeclaration { sites: Vec<String> },
+    LateSessionDeclaration { sites: Vec<Site> },
     #[error(
         "session(s) declared but never bound to a task: {}; bind with session = <declaration> or \
          delete them",
-        .sites.join(", ")
+        Site::list(.sites)
     )]
-    UnboundSessions { sites: Vec<String> },
+    UnboundSessions { sites: Vec<Site> },
+}
+
+/// A named site an error points at.
+#[derive(Debug, Clone)]
+pub struct Site {
+    pub name: String,
+    pub at: FileSpan,
+}
+
+impl Site {
+    fn list(sites: &[Site]) -> String {
+        sites
+            .iter()
+            .map(Site::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} ({})", self.name, self.at)
+    }
 }

@@ -14,8 +14,8 @@ set -euo pipefail
 # dep-name:space-separated-list-of-crate-dirs-allowed-to-depend-on-it-directly. Plain array (not
 # an associative array) so this runs under both GNU bash on CI and macOS's ancient system bash.
 ALLOW=(
-  "k8s-openapi:crucible crucible-controller forge"
-  "kube:crucible-controller forge"
+  "k8s-openapi:buildit crucible crucible-controller crucible-kueue crucible-mcp-auth forge"
+  "kube:buildit crucible-controller crucible-kueue crucible-mcp-auth forge"
   "sqlx:crucible-controller"
   "git2:crucible crucible-vcs forge epp-tools"
   "aws-sdk-s3:crucible"

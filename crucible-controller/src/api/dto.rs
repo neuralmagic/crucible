@@ -384,6 +384,9 @@ dto! {
 pub struct RunDetail {
     pub run: RunDto,
     pub candidates: Vec<CandidateDto>,
+    /// The MCP servers the run's agent was granted at dispatch; absent when it was granted none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agent_tools: Vec<crate::runs::agent_tools::AgentTool>,
 }
 
 dto! {
@@ -405,6 +408,10 @@ dto! {
         pub over: String,
         /// The most instances `over` may produce; 0 when the task is not mapped.
         pub max_fanout: u32,
+        /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
+        pub when: String,
+        /// `producer.field` references each instance receives narrowed to its own entry.
+        pub keyed: Vec<String>,
     }
 }
 
@@ -426,6 +433,9 @@ dto! {
         pub agent: Option<TaskAgentDto> = r.agent.map(TaskAgentDto::from),
         /// The repair turns the attempt took, in order; their cost is part of `cost_usd`.
         pub repairs: Vec<TaskRepairDto> = r.repairs.into_iter().map(TaskRepairDto::from).collect(),
+        /// What the attempt emitted: a passing attempt's product, or the record a failing one left
+        /// (an evaluate's verdict). Null when it emitted nothing.
+        pub output: Option<serde_json::Value>,
     }
 }
 
@@ -498,6 +508,9 @@ pub struct RunGraphDto {
     /// the run stored no session or its producer emitted no list: how many instances started is
     /// in `results`, but how many were asked for is only knowable from the producer's payload.
     pub fanout: Vec<FanOutCountDto>,
+    /// What each route decided, read from the session: one row per question per route node and
+    /// per route instance, a mapped route's node tallying its instances.
+    pub decisions: Vec<RouteDecisionDto>,
 }
 
 /// One mapped task against the number of items its producer emitted.
@@ -505,6 +518,23 @@ pub struct RunGraphDto {
 pub struct FanOutCountDto {
     pub task: String,
     pub items: i64,
+    /// Instances the settled node's fold counts as not taken; 0 before it settles.
+    pub not_taken: i64,
+}
+
+/// How a route node or instance resolved one question.
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
+pub struct RouteDecisionDto {
+    pub task: String,
+    pub question: String,
+    /// Each resolved label and how many decisions gave it, in label order.
+    pub labels: Vec<LabelCountDto>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
+pub struct LabelCountDto {
+    pub label: String,
+    pub count: i64,
 }
 
 /// Where an output bound came from.
@@ -872,19 +902,38 @@ dto! {
 }
 
 /// Assemble the full provenance graph for one issue: issue row → scopes → runs → candidates,
-/// plus the event-log history. `None` if the issue is untracked.
+/// plus the event-log history. `None` if the issue is untracked. With `agent_tools`, each run
+/// carries what its agent was granted.
 #[cfg(feature = "autoresearch")]
-pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDetail>> {
+pub async fn issue_detail(
+    db: &Db,
+    key: &str,
+    agent_tools: bool,
+) -> anyhow::Result<Option<IssueDetail>> {
     let Some(issue) = crate::issues::store::get_issue(db.pool(), key).await? else {
         return Ok(None);
     };
     let scopes = crate::issues::store::list_scopes_for_issue(db.pool(), key).await?;
-    let mut scope_details = Vec::with_capacity(scopes.len());
+    let mut scope_runs = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let runs = crate::runs::store::list_runs_for_scope(db.pool(), scope.id).await?;
+        scope_runs.push((scope, runs));
+    }
+    let mut tools = match agent_tools {
+        true => {
+            let run_ids: Vec<String> = scope_runs
+                .iter()
+                .flat_map(|(_, runs)| runs.iter().map(|r| r.run_id.clone()))
+                .collect();
+            crate::runs::agent_tools::for_runs(db.pool(), &run_ids).await?
+        }
+        false => std::collections::BTreeMap::new(),
+    };
+    let mut scope_details = Vec::with_capacity(scope_runs.len());
     // The issue's kept PR for the header chip: the kept candidate from the newest run (run-id
     // lexical order is chronological), tracked while the provenance graph is assembled anyway.
     let mut kept_pr: Option<(String, String)> = None;
-    for scope in scopes {
-        let runs = crate::runs::store::list_runs_for_scope(db.pool(), scope.id).await?;
+    for (scope, runs) in scope_runs {
         let mut run_details = Vec::with_capacity(runs.len());
         for run in runs {
             let candidates =
@@ -899,6 +948,7 @@ pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDeta
             }
             let transport_losses =
                 crate::runs::task_results::count_transport_losses(db.pool(), &run.run_id).await?;
+            let agent_tools = tools.remove(&run.run_id).unwrap_or_default();
             run_details.push(RunDetail {
                 run: RunDto::from_parts(
                     run,
@@ -908,6 +958,7 @@ pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDeta
                     transport_losses,
                 ),
                 candidates: candidates.into_iter().map(CandidateDto::from).collect(),
+                agent_tools,
             });
         }
         scope_details.push(ScopeDetail {
@@ -1216,6 +1267,7 @@ mod tests {
             created_by: Some("wren".to_string()),
             created_at: "2026-08-22T00:00:00Z".to_string(),
             updated_at: "2026-08-22T00:00:00Z".to_string(),
+            variant: None,
         };
         let v = serde_json::to_value(&dto).expect("serialize");
         assert_eq!(v["id"], "survey");

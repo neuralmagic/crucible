@@ -1,0 +1,82 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0064"
+title = "Only a route asks the decision model"
+status = "proposed"
+date = "2026-10-07"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0001:C-INFERENCE",
+    "RFC-0001:C-ROUTE-EACH",
+    "RFC-0001:C-ROUTE-FILES",
+    "RFC-0002:C-PLAYBOOK-CAPS",
+    "RFC-0002:C-REVISE-LOOP",
+    "ADR-0062",
+]
+
+[content]
+context = """
+The decision binding is used by the engine's own process, and its credential must not leave the engine ([[RFC-0001:C-INFERENCE]]). A route is its only consumer today. Two pressures push against that:
+
+- A command task in a triage playbook already holds the per-element facts and could ask the decision model itself, through a broker tool that keeps the credential engine-side, instead of the playbook declaring a route for each question.
+- A route that judges an agent's output ("does this result file's evidence support its claim?") wants to feed its verdict back to the agent, as a reviewer in a revise loop does ([[RFC-0002:C-REVISE-LOOP]]), not only gate a later lane.
+
+A route's guarantees come from being a graph node: its questions and labels are compile-time and in the generated TOML, every label must lead somewhere, its answer and full distribution are the task's recorded output, and a resumed run never asks again. A tool call from inside a task has none of those."""
+decision = """
+Keep every model decision a route. The engine does not relay the decision binding into any sandbox or task process and offers no tool that asks it ([[RFC-0001:C-INFERENCE]]). Per-element decisions are mapped routes ([[RFC-0001:C-ROUTE-EACH]]), and a route judges an agent's output by reading its declared JSON files ([[RFC-0001:C-ROUTE-FILES]]) and gating a review lane with when.
+
+A judgment is not yet a send-back, and C-REVISE-LOOP does not cover it: a reviewer must be an agent, command, or evaluate task, and a body must not map over a list. Admitting a route reviewer needs a stated mapping from labels to a failing verdict, and admitting mapped bodies needs per-element rounds. Both are separate decisions, deferred until a playbook needs the judged conversation resumed rather than a second agent reviewing."""
+consequences = """
+- Every model decision in a run is visible in the plan, covered by the label rule, recorded with its distribution, and folded on resume.
+- A command that would like a quick model opinion must be split around a route, which costs a node and an edge per question set.
+- Questions cannot be composed at run time. A playbook that needs a question per discovered category has to declare the categories up front, which is the constraint C-ROUTE already imposes.
+- The credential boundary stays simple: no sandbox egress rule, no broker tool, and no per-task decision budget to police.
+- A judged agent result that fails review goes to a separate review turn, which starts a new conversation and pays to re-read the work. Resuming the original agent's session with the judgment is the follow-up if that cost matters."""
+
+[[content.alternatives]]
+text = "Only route tasks ask the decision model"
+status = "accepted"
+pros = [
+    "Compile-time questions, label coverage, recorded distributions, and resume folding hold for every decision.",
+    "No credential, endpoint, or tool reaches a task process.",
+]
+cons = ["A task cannot ask an ad hoc question mid-work."]
+
+[[content.alternatives]]
+text = "A broker tool that lets a command task ask the decision model, credential kept in the engine"
+status = "rejected"
+pros = [
+    "The task asks exactly when it has the facts, with no extra node.",
+    "The credential still never leaves the engine.",
+]
+cons = [
+    "Questions and labels are authored at run time by the task, outside the plan and the coverage rule.",
+    "The answer is whatever the task writes into its own output, not a recorded decision; a resume re-runs the task and asks again.",
+    "Calls are unbounded per task; max_fanout and the run's ceilings do not see them.",
+    "A sandboxed task would need egress or a broker channel for decision traffic.",
+]
+rejection_reason = "Gives up every guarantee that makes a route auditable, for flexibility the per-element route already provides."
+
+[[content.alternatives]]
+text = "Declared question sets a command task may ask by name through the broker"
+status = "rejected"
+pros = [
+    "Questions stay compile-time.",
+    "A task chooses when to ask.",
+]
+cons = [
+    "The answer still lands in the task's own output rather than a decision record.",
+    "Gating on it needs the task to emit it and an output-decided route to read it, which is a route again.",
+]
+rejection_reason = "Ends up as a route with extra plumbing."
+
+[[content.alternatives]]
+text = "Admit a route as a revise reviewer, failing on listed labels"
+status = "rejected"
+pros = ["A judgment can resume the judged agent's conversation."]
+cons = [
+    "Needs a label-to-verdict mapping and its own coverage rule.",
+    "Useless for the per-element case until revise bodies may map over a list.",
+]
+rejection_reason = "Deferred: needs a label-to-verdict mapping and per-element revise rounds, each a separate decision."

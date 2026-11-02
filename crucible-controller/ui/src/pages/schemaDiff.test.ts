@@ -39,6 +39,14 @@ describe('diffParamsSchemas', () => {
     expect(diffIsEmpty(diff)).toBe(false);
   });
 
+  it('reports a param that became multiline', () => {
+    const diff = diffParamsSchemas(
+      schema({ log: { type: 'string' } }),
+      schema({ log: { type: 'string', 'x-multiline': true } })
+    );
+    expect(diff.changed).toEqual([{ name: 'log', field: 'multiline', from: 'single line', to: 'multiline' }]);
+  });
+
   it('reports a flipped requirement on its own', () => {
     const diff = diffParamsSchemas(
       schema({ topic: { type: 'string' } }, ['topic']),

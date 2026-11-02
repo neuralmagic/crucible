@@ -9,7 +9,7 @@ use crate::client::{AdoptBody, Client};
 use crate::ops;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{ServerCapabilities, ServerInfo};
+use rmcp::model::{ServerCapabilities, ServerConfig};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use std::sync::Arc;
@@ -268,6 +268,10 @@ pub struct ImportArgs {
     /// The pack directory inside the repo. Omit for the repo root.
     #[serde(default)]
     pub path: Option<String>,
+    /// The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the base
+    /// manifest.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// The registry id you propose registering this pack under. Prefills the review page.
     #[serde(default)]
     pub id: Option<String>,
@@ -612,9 +616,12 @@ impl CrucibleMcp {
         flatten(
             ops::playbook_import(
                 &self.client,
-                &a.repo,
-                a.git_ref.as_deref(),
-                a.path.as_deref(),
+                &crate::client::PackImportSource {
+                    repo: &a.repo,
+                    git_ref: a.git_ref.as_deref(),
+                    path: a.path.as_deref(),
+                    variant: a.variant.as_deref(),
+                },
                 a.id.as_deref(),
                 a.description.as_deref(),
                 a.json,
@@ -765,6 +772,7 @@ impl CrucibleMcp {
                     dispatch_target: a.dispatch_target,
                     provider: a.provider,
                     model: a.model,
+                    rerun: None,
                 },
                 a.json,
             )
@@ -773,8 +781,8 @@ impl CrucibleMcp {
     }
 
     #[tool(
-        description = "Delete a draft and every version of it. Admin only. Gone is gone; the id \
-        is free for crucible_draft_create again."
+        description = "Delete a draft, every version of it, and its secret bindings, shares and \
+        schedules. Admin only. Gone is gone; the id is free for crucible_draft_create again."
     )]
     async fn crucible_draft_delete(&self, Parameters(a): Parameters<DraftIdArgs>) -> String {
         flatten(ops::draft_delete(&self.client, &a.draft_id).await)
@@ -854,6 +862,7 @@ impl CrucibleMcp {
                     dispatch_target: a.dispatch_target,
                     provider: a.provider,
                     model: a.model,
+                    rerun: None,
                 },
                 a.json,
             )
@@ -975,10 +984,10 @@ fn flatten(r: anyhow::Result<String>) -> String {
 impl ServerHandler for CrucibleMcp {
     /// Advertise the `tools` capability during `initialize`. Without it a spec-compliant client
     /// connects, never calls `tools/list`, and the server looks connected while exposing nothing.
-    fn get_info(&self) -> ServerInfo {
-        // ServerInfo is #[non_exhaustive], so it has to be built by mutation rather than a struct
+    fn get_info(&self) -> ServerConfig {
+        // ServerConfig is #[non_exhaustive], so it has to be built by mutation rather than a struct
         // literal.
-        let mut info = ServerInfo::default();
+        let mut info = ServerConfig::default();
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
         info.instructions = Some(
             "The crucible controller. Read tools return compact text; pass json=true for raw \

@@ -247,7 +247,7 @@ pub(crate) async fn get_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
 ) -> Result<Response, AppError> {
-    match issue_detail(&state.db, &key).await? {
+    match issue_detail(&state.db, &key, state.agent_tools).await? {
         Some(detail) => Ok(Json(detail).into_response()),
         None => Ok(not_found(format!("issue not found: {key}"))),
     }

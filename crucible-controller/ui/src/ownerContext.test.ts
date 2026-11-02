@@ -7,7 +7,9 @@ import {
   effectiveContext,
   narrow,
   ownerOptions,
+  scopedPath,
   switchable,
+  teamScope,
   viaLabel,
   withOwner,
 } from './ownerContext';
@@ -24,6 +26,7 @@ function whoami(overrides: Partial<Whoami> = {}): Whoami {
     downgraded: false,
     proves_groups: true,
     entitlements: [],
+    features: { agent_tools: false, identities: false },
     teams: [
       { team: 'zeta', role: 'member', via: [{ kind: 'direct', role: 'member' }] },
       { team: 'llm-d', role: 'maintainer', via: [{ kind: 'group', group: '/groups/x', role: 'maintainer' }] },
@@ -102,5 +105,30 @@ describe('viaLabel', () => {
     expect(viaLabel({ kind: 'group', group: '/groups/x', role: 'member' })).toBe('group /groups/x · member');
     expect(viaLabel({ kind: 'rule', rule: 'configured-admins', role: 'owner' })).toBe('rule configured-admins · owner');
     expect(viaLabel({ kind: 'team', team: 'parent', role: 'maintainer' })).toBe('team parent · maintainer');
+  });
+});
+
+describe('team scope', () => {
+  it('scopes /teams/<slug> and every path under it to that team', () => {
+    expect(teamScope('/teams/llm-d')).toBe('team:llm-d');
+    expect(teamScope('/teams/llm-d/')).toBe('team:llm-d');
+    expect(teamScope('/teams/llm-d/playbooks/drafts')).toBe('team:llm-d');
+    expect(teamScope('/teams/a%20b/secrets')).toBe('team:a b');
+  });
+
+  it('leaves every other path unscoped', () => {
+    expect(teamScope('/teams')).toBeNull();
+    expect(teamScope('/teams/')).toBeNull();
+    expect(teamScope('/playbooks')).toBeNull();
+    expect(teamScope('/teamsx/llm-d')).toBeNull();
+    expect(teamScope('/teams/%E0%A4%A')).toBeNull();
+  });
+
+  it('mirrors a global path under the team, and round-trips through teamScope', () => {
+    expect(scopedPath('team:llm-d', '/')).toBe('/teams/llm-d');
+    expect(scopedPath('team:llm-d', '/playbook-runs')).toBe('/teams/llm-d/playbook-runs');
+    expect(scopedPath('team:a b', '/secrets')).toBe('/teams/a%20b/secrets');
+    expect(teamScope(scopedPath('team:a b', '/secrets'))).toBe('team:a b');
+    expect(scopedPath(null, '/secrets')).toBe('/secrets');
   });
 });

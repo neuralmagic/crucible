@@ -1,6 +1,6 @@
 //! What one agent turn hands back, and the stream pump that folds its events into that.
 
-use crate::agent::event::{AgentEvent, RawStream, Tokens, cost_of};
+use crate::agent::event::{AgentEvent, Pricing, RawStream, Tokens, cost_of};
 use crate::agent::harness::StreamDecoder;
 use crate::agent::tool_chain::{StopReason, ToolChain};
 use crate::args::Args;
@@ -123,16 +123,15 @@ pub(crate) fn tool_io_full(args: &Args) -> bool {
         .unwrap_or(false)
 }
 
-/// What a drained agent stream amounted to: its cost signals, and the tool chain stop that cut it
+/// What a drained agent stream amounted to: its running cost, and the tool chain stop that cut it
 /// short.
 pub(crate) struct PumpEnd {
-    pub(crate) cost: f64,
-    pub(crate) best_tokens: Option<Tokens>,
+    pub(crate) cost: TurnCost,
     pub(crate) stopped: Option<StopReason>,
 }
 
 /// The decoder-driving core of an agent stdout pump: one [`StreamDecoder`] plus the
-/// turn's running (max authoritative cost, largest token sample). Pure and sync, no I/O. Each
+/// turn's running [`TurnCost`]. Pure and sync, no I/O. Each
 /// complete stdout line is [`push`](StreamPump::push)ed in; the local-child path feeds it off a
 /// `BufReader` ([`pump_stream`]), the openshell exec path feeds it lines straight off the
 /// gRPC stream. Splitting the loop from the byte source is what lets the async exec path reuse the
@@ -140,25 +139,25 @@ pub(crate) struct PumpEnd {
 pub(crate) struct StreamPump {
     decoder: Box<dyn StreamDecoder>,
     chain_decoder: Option<Box<dyn StreamDecoder>>,
-    cost: f64,
-    best_tokens: Option<Tokens>,
+    cost: TurnCost,
     chain: ToolChain,
 }
 
 impl StreamPump {
     /// A fresh pump over the harness's `decoder` (see `Backend::decoder`), its events run through
-    /// `chain`. `chain_decoder` decodes the same lines with full tool IO for the chain when
-    /// `decoder` is compact; `None` hands the chain `decoder`'s own events.
+    /// `chain` and its cost settled under `pricing`. `chain_decoder` decodes the same lines with
+    /// full tool IO for the chain when `decoder` is compact; `None` hands the chain `decoder`'s own
+    /// events.
     pub(crate) fn new(
         decoder: Box<dyn StreamDecoder>,
         chain_decoder: Option<Box<dyn StreamDecoder>>,
         chain: ToolChain,
+        pricing: Pricing,
     ) -> Self {
         Self {
             decoder,
             chain_decoder,
-            cost: 0.0,
-            best_tokens: None,
+            cost: TurnCost::new(pricing),
             chain,
         }
     }
@@ -174,7 +173,7 @@ impl StreamPump {
     ) {
         let events = self.decoder.push(line);
         for ev in &events {
-            account(ev, &mut self.cost, &mut self.best_tokens);
+            self.cost.observe(ev);
             if json {
                 sink(line, RawStream::Stdout, Some(ev));
             } else if let Some(human) = human_line(ev) {
@@ -197,8 +196,8 @@ impl StreamPump {
         self.chain.stopped()
     }
 
-    /// The turn's max authoritative cost, largest token sample, and chain stop once the stream
-    /// ends, after the chain's end-of-turn reports reach `sink`.
+    /// The turn's running cost and chain stop once the stream ends, after the chain's end-of-turn
+    /// reports reach `sink`.
     pub(crate) fn finish(
         self,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
@@ -206,7 +205,6 @@ impl StreamPump {
         report_chain(&self.chain, sink);
         PumpEnd {
             cost: self.cost,
-            best_tokens: self.best_tokens,
             stopped: self.chain.into_stopped(),
         }
     }
@@ -251,21 +249,46 @@ pub(crate) fn ended_turn(cost: f64, stopped: Option<StopReason>) -> TurnOutcome 
     }
 }
 
-/// Fold one event into the turn's running totals: the highest authoritative cost seen,
-/// and the largest token sample (the estimate fallback when no cost is reported).
-pub(crate) fn account(ev: &AgentEvent, cost: &mut f64, best_tokens: &mut Option<Tokens>) {
-    if let Some(c) = cost_of(ev) {
-        *cost = cost.max(c);
+/// One turn's running cost: the highest cost its harness reported and its largest token sample,
+/// settled under the turn's [`Pricing`].
+#[derive(Debug, Clone)]
+pub(crate) struct TurnCost {
+    pricing: Pricing,
+    reported: f64,
+    tokens: Option<Tokens>,
+}
+
+impl TurnCost {
+    pub(crate) fn new(pricing: Pricing) -> Self {
+        Self {
+            pricing,
+            reported: 0.0,
+            tokens: None,
+        }
     }
-    if let AgentEvent::Tokens(t) = ev
-        && best_tokens.as_ref().is_none_or(|b| t.total >= b.total)
-    {
-        *best_tokens = Some(t.clone());
+
+    pub(crate) fn observe(&mut self, ev: &AgentEvent) {
+        if let Some(c) = cost_of(ev) {
+            self.report(c);
+        }
+        if let AgentEvent::Tokens(t) = ev
+            && self.tokens.as_ref().is_none_or(|b| t.total >= b.total)
+        {
+            self.tokens = Some(t.clone());
+        }
+    }
+
+    /// A cost the harness reported outside its event stream.
+    pub(crate) fn report(&mut self, usd: f64) {
+        self.reported = self.reported.max(usd);
+    }
+
+    pub(crate) fn total(&self) -> f64 {
+        self.pricing.settle(self.reported, self.tokens.as_ref())
     }
 }
 
-/// Render an event as a human-readable line for the headless console. `None` for events that stay quiet
-/// in a log (init/result/lifecycle); token/tool/text/thinking/retry/error show.
+/// Render observable activity and failed results for the headless console.
 pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
     match ev {
         AgentEvent::Text { delta } => Some(delta.clone()),
@@ -302,16 +325,27 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
             value: Some(value),
             ..
         } if label.starts_with("tool_") => Some(format!("\u{1f9e9} {label}: {value}")),
+        AgentEvent::Result {
+            is_error: true,
+            subtype,
+            error,
+            ..
+        } => Some(format!(
+            "\u{274c} Error: {subtype}: {}",
+            error.as_deref().unwrap_or("agent reported a failed turn"),
+        )),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::event::{Pricing, Tokens};
     use crate::agent::tool_chain::{StopReason, ToolChain, Wedged};
-    use crate::agent::turn::{PumpEnd, StreamPump};
+    use crate::agent::turn::{PumpEnd, StreamPump, TurnCost};
     use crate::manifest::ToolPluginSpec;
     use crucible_contract::event::{AgentEvent, RawStream};
+    use crucible_contract::inference::{TokenPrice, UsdPerMtok};
     use crucible_harness::StreamJsonParser;
     use std::num::NonZeroUsize;
 
@@ -333,10 +367,14 @@ mod tests {
         NonZeroUsize::new(n).unwrap()
     }
 
+    fn pricing() -> Pricing {
+        Pricing::resolve("claude-opus-4-6", None)
+    }
+
     /// Drives `lines` through the real Claude decoder and a pump, stopping at the first wedge.
     fn pump(lines: &[String], tool_io: bool, n: usize) -> (PumpEnd, usize, Vec<AgentEvent>) {
         let decoder = Box::new(StreamJsonParser::default().with_tool_io(tool_io));
-        let mut pump = StreamPump::new(decoder, None, guard(n));
+        let mut pump = StreamPump::new(decoder, None, guard(n), pricing());
         let mut events = Vec::new();
         let mut read = 0;
         for line in lines {
@@ -377,6 +415,7 @@ mod tests {
                 Box::new(StreamJsonParser::default()),
                 Some(Box::new(StreamJsonParser::default().with_tool_io(true))),
                 ToolChain::new(&crate::manifest::default_chain()),
+                pricing(),
             );
             let mut logged = Vec::new();
             let mut sink =
@@ -480,7 +519,7 @@ mod tests {
     fn a_wedge_is_reported_once() {
         let lines: Vec<String> = (0..80).flat_map(|i| claude_call(i, "ls", None)).collect();
         let decoder = Box::new(StreamJsonParser::default());
-        let mut pump = StreamPump::new(decoder, None, guard(3));
+        let mut pump = StreamPump::new(decoder, None, guard(3), pricing());
         let mut errors = 0;
         for line in &lines {
             pump.push(
@@ -492,6 +531,99 @@ mod tests {
             );
         }
         assert_eq!(errors, 1);
+    }
+
+    #[test]
+    fn a_failed_result_is_visible_without_a_separate_error_event() {
+        let event = AgentEvent::Result {
+            subtype: "error_during_execution".into(),
+            is_error: true,
+            turns: 0,
+            cost_usd: 0.0,
+            error: Some("Prompt too long".into()),
+        };
+
+        assert!(
+            crate::agent::turn::human_line(&event)
+                .unwrap()
+                .contains("Prompt too long")
+        );
+        assert!(crate::agent::turn::human_line(&result(0.0)).is_none());
+    }
+
+    fn result(cost_usd: f64) -> AgentEvent {
+        AgentEvent::Result {
+            subtype: "success".into(),
+            is_error: false,
+            turns: 4,
+            cost_usd,
+            error: None,
+        }
+    }
+
+    fn tokens(input: u64, output: u64, cache_read: u64, cache_write: u64) -> AgentEvent {
+        AgentEvent::Tokens(Tokens {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            total: input + output + cache_read + cache_write,
+            rate: None,
+            cost_usd: None,
+        })
+    }
+
+    fn settle(pricing: Pricing, events: &[AgentEvent]) -> f64 {
+        let mut cost = TurnCost::new(pricing);
+        for ev in events {
+            cost.observe(ev);
+        }
+        cost.total()
+    }
+
+    #[test]
+    fn a_self_hosted_turn_reporting_25_dollars_settles_at_zero() {
+        let events = [tokens(3_000_000, 400_000, 9_000_000, 200_000), result(25.0)];
+        let pricing = Pricing::resolve("zai-org/glm-5", None);
+        assert_eq!(settle(pricing, &events), 0.0);
+        let mut backfilled = TurnCost::new(pricing);
+        backfilled.report(25.0);
+        assert_eq!(backfilled.total(), 0.0);
+    }
+
+    #[test]
+    fn a_vendor_turn_keeps_the_cost_its_harness_reported() {
+        let events = [tokens(3_000_000, 400_000, 9_000_000, 200_000), result(25.0)];
+        assert_eq!(
+            settle(Pricing::resolve("claude-opus-4-6", None), &events),
+            25.0
+        );
+        let estimated = settle(
+            Pricing::resolve("claude-opus-4-6", None),
+            &[tokens(1_000_000, 0, 0, 0)],
+        );
+        assert!((estimated - 5.0).abs() < 1e-9, "{estimated}");
+    }
+
+    #[test]
+    fn a_priced_binding_settles_at_its_largest_token_sample_times_its_price() {
+        let usd = |v| UsdPerMtok::new(v).unwrap();
+        let price = TokenPrice {
+            input: usd(1.0),
+            output: usd(4.0),
+            cache_read: usd(0.1),
+            cache_write: usd(2.0),
+        };
+        let events = [
+            tokens(1_000_000, 100_000, 0, 0),
+            tokens(3_000_000, 400_000, 9_000_000, 200_000),
+            result(25.0),
+        ];
+        let want = 3.0 * 1.0 + 0.4 * 4.0 + 9.0 * 0.1 + 0.2 * 2.0;
+        for model in ["zai-org/glm-5", "claude-opus-4-6"] {
+            let got = settle(Pricing::resolve(model, Some(&price)), &events);
+            assert!((got - want).abs() < 1e-9, "{model}: got {got}, want {want}");
+        }
     }
 
     #[test]

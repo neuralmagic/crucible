@@ -88,19 +88,29 @@ pub fn contains_key(value: &str) -> bool {
     value.contains(PREFIX)
 }
 
-/// Split `crk_<id>_<secret>` into its halves. Neither may be empty: `crk__` is malformed, not a
-/// lookup for the empty id.
-fn split(presented: &str) -> Option<(&str, &str)> {
-    let rest = presented.strip_prefix(PREFIX)?;
+/// Split `<prefix><id>_<secret>` into its halves. Neither may be empty: `crk__` is malformed, not
+/// a lookup for the empty id.
+pub(crate) fn split<'a>(prefix: &str, presented: &'a str) -> Option<(&'a str, &'a str)> {
+    let rest = presented.strip_prefix(prefix)?;
     let (id, secret) = rest.split_once('_')?;
     (!id.is_empty() && !secret.is_empty()).then_some((id, secret))
 }
 
 /// SHA-256 of the secret half, base64url like the secret itself, which is what the row stores.
-fn digest(secret: &str) -> String {
+pub(crate) fn digest(secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(secret.as_bytes());
     URL_SAFE_NO_PAD.encode(hasher.finalize())
+}
+
+/// A new row id and secret half: a UUID, and [`SECRET_BYTES`] of CSPRNG output as base64url.
+pub(crate) fn fresh() -> (String, String) {
+    let mut bytes = [0u8; SECRET_BYTES];
+    rand::fill(&mut bytes);
+    (
+        uuid::Uuid::new_v4().simple().to_string(),
+        URL_SAFE_NO_PAD.encode(bytes),
+    )
 }
 
 /// Mint a key for `sub`. `expires_at` is RFC3339, or `None` for a key that outlives everything.
@@ -113,10 +123,7 @@ pub async fn mint(
     name: &str,
     expires_at: Option<&str>,
 ) -> Result<Minted> {
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let mut bytes = [0u8; SECRET_BYTES];
-    rand::fill(&mut bytes);
-    let secret = URL_SAFE_NO_PAD.encode(bytes);
+    let (id, secret) = fresh();
     let hash = digest(&secret);
     let now = now_rfc3339();
 
@@ -157,7 +164,7 @@ pub async fn verify(
     refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
     presented: &str,
 ) -> Result<Authenticated, KeyRefusal> {
-    let Some((id, secret)) = split(presented) else {
+    let Some((id, secret)) = split(PREFIX, presented) else {
         return Err(KeyRefusal::Malformed);
     };
     let row = sqlx::query!(
@@ -215,7 +222,7 @@ pub async fn verify(
 
 /// Whether an RFC3339 expiry has passed. An unparseable stamp is expired: a key whose lifetime
 /// cannot be read is not one to keep honoring.
-fn expired(at: &str) -> bool {
+pub(crate) fn expired(at: &str) -> bool {
     match at.parse::<jiff::Timestamp>() {
         Ok(at) => at <= jiff::Timestamp::now(),
         Err(_) => true,

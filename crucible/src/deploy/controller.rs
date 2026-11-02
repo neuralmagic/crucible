@@ -352,6 +352,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -432,6 +433,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -475,6 +477,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         ) {
             Ok(_) => panic!("expected an error: no [controller] table"),

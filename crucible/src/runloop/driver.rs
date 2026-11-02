@@ -3014,6 +3014,7 @@ mod tests {
             sandboxes: Default::default(),
             relayed_secrets: Default::default(),
             model: Some("test-model".into()),
+            price: None,
             harness: None,
             hermes: Default::default(),
             codex: Default::default(),

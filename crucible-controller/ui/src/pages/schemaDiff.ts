@@ -2,7 +2,7 @@ import { parseParamsSchema, type ParamFieldSpec } from './playbookLaunchForm';
 
 /// Which property of a param moved under a pin bump. The closed subset the form renders is the
 /// whole vocabulary, so it is the whole diff.
-export type ParamFieldKey = 'required' | 'pattern' | 'default' | 'description';
+export type ParamFieldKey = 'required' | 'pattern' | 'default' | 'description' | 'multiline';
 
 export interface ParamFieldChange {
   name: string;
@@ -41,10 +41,12 @@ function flagOf(spec: ParamFieldSpec, field: ParamFieldKey): string | null {
       return spec.defaultValue;
     case 'description':
       return spec.description;
+    case 'multiline':
+      return spec.multiline ? 'multiline' : 'single line';
   }
 }
 
-const FIELDS: readonly ParamFieldKey[] = ['required', 'pattern', 'default', 'description'];
+const FIELDS: readonly ParamFieldKey[] = ['required', 'pattern', 'default', 'description', 'multiline'];
 
 /// What a pin bump does to the launch form: params gained, params lost, and every property that
 /// moved on the ones that stayed. The registry's stored schema is `before`, the import preview's

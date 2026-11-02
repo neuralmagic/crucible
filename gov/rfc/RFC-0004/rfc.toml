@@ -23,6 +23,7 @@ clauses = [
     "clauses/C-TYPED-INVOCATION.toml",
     "clauses/C-CONTRACT-VERSION.toml",
     "clauses/C-BOUNDARY-FAILURE.toml",
+    "clauses/C-RUN-EVIDENCE.toml",
 ]
 
 [[sections]]

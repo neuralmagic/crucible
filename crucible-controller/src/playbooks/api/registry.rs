@@ -34,6 +34,22 @@ pub(crate) struct RegisterPlaybookBody {
     /// changed is refused (409, naming both digests) unless this quotes the new one back.
     #[serde(default)]
     accept_exposure_digest: Option<String>,
+    /// The `[variant.<name>]` of the pack's manifest every launch runs. Omitted ⇒ the base
+    /// manifest.
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+/// A request's manifest variant: blank is none, and `Err` names why the engine would refuse it.
+pub(crate) fn requested_variant(
+    raw: Option<&str>,
+) -> Result<Option<crucible::manifest::variant::VariantName>, String> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(name) => crucible::manifest::variant::VariantName::parse(name)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -278,6 +294,8 @@ pub struct PlaybookDto {
     pub core_rev: String,
     /// The digest of this revision's declared exposure; null for an absent-legacy revision.
     pub exposure_digest: Option<String>,
+    /// The `[variant.<name>]` of the manifest every launch runs; null is the base manifest.
+    pub variant: Option<String>,
     /// What the pack's agent needs, against what this deployment can dispatch.
     pub dispatch: PackDispatchDto,
     /// `user:<login>` or `team:<slug>`.
@@ -336,6 +354,7 @@ impl PlaybookDto {
             rev: r.rev,
             tree_digest: r.tree_digest.map(|t| t.to_string()),
             exposure_digest: r.exposure_digest,
+            variant: r.variant.map(String::from),
             schema_digest: r.schema_digest,
             core_rev: r.core_rev,
             dispatch,
@@ -393,6 +412,10 @@ pub(crate) async fn register_playbook(
             return unprocessable(msg);
         }
     };
+    let variant = match requested_variant(body.variant.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => return unprocessable(msg),
+    };
     let actor = identity.as_deref();
     let owner = match crate::authz::owner::owner_for_create(
         &state,
@@ -420,6 +443,7 @@ pub(crate) async fn register_playbook(
             .accept_exposure_digest
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
+        variant,
     };
 
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
@@ -613,6 +637,9 @@ pub(crate) struct LaunchPlaybookBody {
     /// The model to ask that provider for. Free text; absent takes the provider's own default.
     #[serde(default)]
     model: Option<String>,
+    /// Rerun a finished run of this playbook from some of its tasks.
+    #[serde(default)]
+    rerun: Option<crate::runs::api::rerun::RerunBody>,
 }
 
 /// What a launch landed: the issue key the run is tracked under, and the values it was authorized
@@ -778,6 +805,13 @@ pub(crate) async fn launch_playbook(
         Ok(v) => v,
         Err(refusal) => return refusal,
     };
+    let rerun =
+        match crate::runs::api::rerun::admit_launch(&state, &pack.id, false, body.rerun.as_ref())
+            .await
+        {
+            Ok(rerun) => rerun,
+            Err(refusal) => return *refusal,
+        };
     let actor = saver.actor.as_deref();
     let dispatch_target = saver.dispatch_target.clone();
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
@@ -795,6 +829,7 @@ pub(crate) async fn launch_playbook(
         draft_version: None,
         created_by: actor,
         launcher_groups: Some(&saver.groups),
+        rerun: rerun.as_ref(),
     };
     use crate::launches::store::AdoptPlaybookOutcome;
     match crate::launches::store::adopt_playbook_launch(
@@ -968,7 +1003,46 @@ pub(crate) async fn authorize_pack(
     Ok((pack, schema, max_time))
 }
 
-/// Validate one launch request against the registry: [`authorize_pack`], then the values.
+/// Refuse a launch of `tree` the engine would refuse at startup: compiled with the launch's
+/// validated values, its graph does not compile or declares a task timeout past `max_time`.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn check_plan(
+    tree: crucible_contract::pack_tree::PackTree,
+    params: &serde_json::Value,
+    max_time: &crate::model::MaxTime,
+    variant: Option<&crucible::manifest::variant::VariantName>,
+) -> Result<(), Response> {
+    let params = crate::launches::store::stored_params(params);
+    match crate::playbooks::registry::check_tree_runnable(
+        tree,
+        params,
+        max_time.clone(),
+        variant.cloned(),
+    )
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(field)) => Err(invalid_fields(vec![field])),
+        Err(e) => Err(AppError::from(e).into_response()),
+    }
+}
+
+/// The response for a pack tree a launch could not read: a 422 naming why when the stored bytes
+/// cannot be a tree, a 500 otherwise.
+pub(crate) fn unreadable_tree(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
+        .is_some()
+    {
+        return invalid_fields(vec![crate::playbooks::registry::FieldError {
+            field: String::new(),
+            message: format!("{e:#}"),
+        }]);
+    }
+    AppError::from(e).into_response()
+}
+
+/// Validate one launch request against the registry: [`authorize_pack`], then the values, then
+/// the graph those values compile.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn authorize_launch(
     state: &ApiState,
@@ -985,10 +1059,36 @@ pub(crate) async fn authorize_launch(
         Ok(v) => v,
         Err(fields) => return Err(invalid_fields(fields)),
     };
+    let tree = match crate::playbooks::registry::pack(state.db.pool(), id).await {
+        Ok(Some(tree)) => tree,
+        Ok(None) => return Err(not_found(format!("no playbook {id:?}"))),
+        Err(e) => return Err(unreadable_tree(e)),
+    };
+    check_plan(tree, &params, &max_time, pack.variant.as_ref()).await?;
     Ok(AuthorizedLaunch {
         pack,
         params,
         max_cost,
         max_time,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::playbooks::api::registry::requested_variant;
+
+    #[test]
+    fn a_requested_variant_is_a_checked_name_or_none() {
+        assert_eq!(requested_variant(None).ok(), Some(None));
+        assert_eq!(requested_variant(Some("  ")).ok(), Some(None));
+        assert_eq!(
+            requested_variant(Some(" offline "))
+                .ok()
+                .flatten()
+                .map(String::from),
+            Some("offline".to_string())
+        );
+        let refused = requested_variant(Some("off line")).expect_err("refused");
+        assert!(refused.contains("\"off line\""), "{refused}");
+    }
 }

@@ -7,8 +7,8 @@
   </span>
   <div>
     <p class="eyebrow">Deterministic agent orchestration</p>
-    <p class="headline">Agents do the work. The engine decides what runs.</p>
-    <p class="lead">Crucible is a deterministic orchestrator for agent workflows, with sandboxing built in. Declare the graph; the engine schedules it, contains it, and accounts for it.</p>
+    <p class="headline">Agents do the work. The engine selects the next task.</p>
+    <p class="lead">Crucible is a deterministic orchestrator for agent workflows. It runs agent turns in sandboxes. You declare the graph, and the engine schedules the tasks, isolates them, and records their cost.</p>
     <div class="cru-actions">
       <a class="cru-button primary" href="./playbooks.html">Write a playbook →</a>
       <a class="cru-button" href="./controller-local.html">Run the control plane</a>
@@ -17,28 +17,29 @@
   </div>
 </div>
 
-A workflow is a graph of agent turns, commands and checks. An agent never picks what runs
-next: the executor does, by rules you can read before the run starts.
+A workflow is a graph of agent turns, commands, and checks. The executor selects the next
+task, not the agent. The selection rules are fixed, and you can read them before the run
+starts.
 
 <div class="cru-lanes">
   <div class="cru-lane">
     <h3>Deterministic</h3>
-    <p class="tag">The plan you review is the plan that runs</p>
+    <p class="tag">The engine runs the plan that you review</p>
     <ul>
       <li>Workflows compile to a static plan. Loops and functions unroll at compile time.</li>
-      <li>The executor owns advancement. Dispatch order is stable and the event stream is reproducible.</li>
-      <li>Outcomes follow fixed rules: transport failures retry, measured failures never do, and a plan that cannot run in full dispatches nothing.</li>
-      <li>Cost and time ceilings are inputs to every run.</li>
+      <li>The executor advances the plan. The dispatch order is stable, and the event stream is reproducible.</li>
+      <li>Outcomes follow fixed rules. Transport failures retry. Measured failures do not retry. If a plan cannot run in full, the engine dispatches nothing.</li>
+      <li>Every run has a cost limit and a time limit.</li>
     </ul>
   </div>
   <div class="cru-lane scored">
     <h3>Sandboxed</h3>
-    <p class="tag">The host holds the keys</p>
+    <p class="tag">The host keeps the credentials</p>
     <ul>
       <li>Agent turns run in OpenShell sandboxes with deny-by-default egress.</li>
-      <li>Privileged operations go through a mediated broker: the agent asks over MCP, the host acts.</li>
-      <li>A pack declares its egress and credentials, and <code>crucible check</code> lists them before anything runs.</li>
-      <li>Launch parameters reach prompts, never a command line.</li>
+      <li>Privileged operations go through a broker. The agent sends a request over MCP, and the host does the operation.</li>
+      <li>A pack declares its egress and credentials. <code>crucible check</code> lists them before the run starts.</li>
+      <li>Launch parameters go into prompts. They do not go into a command line.</li>
     </ul>
   </div>
 </div>
@@ -50,18 +51,18 @@ The same engine runs two kinds of workflow.
 <div class="cru-grid">
   <a class="cru-card" href="./playbooks.html">
     <p class="cru-card-title">Playbooks <span class="arrow">→</span></p>
-    <p>Run the graph once and ship what it produced, with a verdict on whether every required task held. Branches, review rounds and fan-out are decided at runtime, each bounded.</p>
+    <p>Run the graph once and ship the result, with a verdict that tells if every required task passed. The engine decides branches, review rounds, and fan-out at run time, and each has a limit.</p>
   </a>
   <a class="cru-card" href="./how-it-works.html">
     <p class="cru-card-title">Autoresearch <span class="arrow">→</span></p>
-    <p>Run the graph inside a keep-or-discard loop against a frozen judge. A change is kept only if it scores better than the best so far, and Git is the memory.</p>
+    <p>Run the graph in a keep-or-discard loop against a frozen judge. The engine keeps a change only if it scores better than the best result so far. Git stores the accepted states.</p>
   </a>
 </div>
 
 ## A playbook, end to end
 
-A pack is a directory: a `crucible.toml`, a `workflow.star`, and whatever scripts the tasks
-run. This one reads a ticket, routes it to one queue, and files it:
+A pack is a directory that holds a `crucible.toml`, a `workflow.star`, and the scripts that
+the tasks run. This pack reads a ticket, routes it to one queue, and files it:
 
 ```python
 read = command(name = "read", run = "./classify.sh", emits = ["bucket"])
@@ -103,9 +104,10 @@ plan v1: completed — spent $0.0000 of $1
 verdict: valid
 ```
 
-The branches nobody chose settle `not_taken`: they never dispatch and spend nothing. Swap
-`source = read` for `min_confidence = 0.8` and a decision model answers the question instead,
-with low-confidence answers recorded as `uncertain`, which `otherwise` catches.
+The branches that no answer selects settle `not_taken`. They do not dispatch and do not
+spend. If you replace `source = read` with `min_confidence = 0.8`, a decision model answers
+the question. The engine records a low-confidence answer as `uncertain`, and the `otherwise`
+task takes it.
 
 <figure class="cru-figure">
   <img src="./img/controller-run.png" alt="A playbook run in the crucible control plane: the admitted task graph with a fanned-out build and measure, one failed instance, and the judge that kept the winner.">
@@ -121,7 +123,7 @@ with low-confidence answers recorded as `uncertain`, which `otherwise` catches.
   </a>
   <a class="cru-card" href="./playbook-patterns.html">
     <p class="cru-card-title">Branching and review <span class="arrow">→</span></p>
-    <p>Routes, revise loops, fan-out, sessions, joins and advisory tasks.</p>
+    <p>Routes, revise loops, fan-out, sessions, joins, and advisory tasks.</p>
   </a>
   <a class="cru-card" href="./dsl-reference.html">
     <p class="cru-card-title">DSL reference <span class="arrow">→</span></p>
@@ -133,7 +135,7 @@ with low-confidence answers recorded as `uncertain`, which `otherwise` catches.
   </a>
   <a class="cru-card" href="./controller-local.html">
     <p class="cru-card-title">The control plane <span class="arrow">→</span></p>
-    <p>A UI, API and CLI for launching and watching runs. Starts on a laptop with one command.</p>
+    <p>A UI, an API, and a CLI to launch and monitor runs. One command starts it on a laptop.</p>
   </a>
   <a class="cru-card" href="./crucible-contract.html">
     <p class="cru-card-title">The contract <span class="arrow">→</span></p>
@@ -146,7 +148,7 @@ with low-confidence answers recorded as `uncertain`, which `otherwise` catches.
 | Crate | What it is |
 | --- | --- |
 | `crucible/` | The engine: the Starlark compiler, the plan executor, the autoresearch loop, agent backends, and `crucible deploy`. |
-| `crucible-controller/` | The control plane: a Postgres ledger, the reconciling daemon, the HTTP API and the embedded UI. |
+| `crucible-controller/` | The control plane: a Postgres ledger, the reconciling daemon, the HTTP API, and the embedded UI. |
 | `crux/` | The CLI and MCP tools over the controller API. |
-| `crucible-broker/` | The mediated broker: the host holds the keys, the sandboxed agent asks over MCP. |
-| `forge/` | Image builds, registry and deployment support. |
+| `crucible-broker/` | The broker. The host keeps the credentials, and the sandboxed agent sends requests over MCP. |
+| `forge/` | Image builds, registry, and deployment support. |

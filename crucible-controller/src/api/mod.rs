@@ -17,6 +17,7 @@ use utoipa_axum::routes;
 pub mod state;
 use state::*;
 
+mod agent_auth;
 #[cfg(feature = "autoresearch")]
 mod autoresearch;
 
@@ -61,6 +62,7 @@ pub(crate) mod tests;
         crate::runs::api::evidence::get_task_evidence,
         crate::runs::api::evidence::get_run_log,
         crate::runs::api::evidence::get_run_files,
+        crate::runs::api::rerun::preview_rerun,
         crate::runs::api::evidence::get_run_file,
         crate::runs::api::runs::list_run_artifacts,
         crate::runs::api::runs::get_artifact,
@@ -95,6 +97,8 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::get_playbook_draft_tarball,
         crate::playbooks::api::drafts::save_playbook_draft,
         crate::playbooks::api::drafts::delete_playbook_draft,
+        crate::playbooks::api::drafts::rename_playbook_draft,
+        crate::playbooks::api::drafts::clone_playbook_draft,
         crate::playbooks::api::drafts::launch_playbook_draft,
         crate::playbooks::api::drafts::graduate_playbook_draft,
         crate::playbooks::api::drafts::publish_playbook_draft,
@@ -195,11 +199,13 @@ pub(crate) mod tests;
     components(schemas(
         system::Health,
         system::Whoami,
+        system::Features,
         crate::identity::auth::Role,
         system::AccessDto,
         crate::identity::api::prefs::PrefsDto,
         crate::identity::api::prefs::EditorPrefsDto,
         crate::identity::api::prefs::PickerPrefsDto,
+        crate::runs::agent_tools::AgentTool,
         dto::Overview,
         dto::StatusCount,
         dto::TierCount,
@@ -228,6 +234,8 @@ pub(crate) mod tests;
         dto::TaskResultDto,
         dto::RunGraphDto,
         dto::FanOutCountDto,
+        dto::RouteDecisionDto,
+        dto::LabelCountDto,
         dto::GraphOutputDto,
         dto::OutputSourceDto,
         dto::OutputTargetDto,
@@ -263,6 +271,11 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::GraduateDraftBody,
         crate::playbooks::api::drafts::GraduateAck,
         crate::playbooks::api::drafts::PublishDraftBody,
+        crate::playbooks::api::drafts::RenameDraftBody,
+        crate::playbooks::api::drafts::DraftRenamedDto,
+        crate::playbooks::api::drafts::CloneDraftBody,
+        crate::playbooks::api::drafts::DraftClonedDto,
+        crate::secrets::api::LeftBindingDto,
         crate::playbooks::api::drafts::PlaybookDraftDto,
         crate::playbooks::api::drafts::PlaybookDraftDetail,
         crate::playbooks::api::drafts::PlaybookLimits,
@@ -278,6 +291,7 @@ pub(crate) mod tests;
         crate::playbooks::plan_graph::GraphNodeDto,
         crate::playbooks::plan_graph::GraphEdgeDto,
         crate::playbooks::plan_graph::FanOutDto,
+        crate::playbooks::plan_graph::WhenDto,
         crate::playbooks::plan_graph::TaskKind,
         crate::playbooks::plan_graph::Needs,
         crate::playbooks::plan_graph::Join,
@@ -395,8 +409,9 @@ struct ApiDoc;
 
 /// Return the OpenAPI spec as JSON. Can be called without a running server for typegen workflows.
 pub(crate) fn openapi_spec() -> anyhow::Result<String> {
-    #[allow(unused_mut)]
     let mut doc = ApiDoc::openapi();
+    doc.merge(agent_auth::IdentityDoc::openapi());
+    doc.merge(agent_auth::AgentToolsDoc::openapi());
     #[cfg(feature = "autoresearch")]
     doc.merge(autoresearch::AutoresearchDoc::openapi());
     Ok(doc.to_json()?)
@@ -441,6 +456,7 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(crate::runs::api::evidence::get_task_evidence))
         .routes(routes!(crate::runs::api::evidence::get_run_log))
         .routes(routes!(crate::runs::api::evidence::get_run_files))
+        .routes(routes!(crate::runs::api::rerun::preview_rerun))
         .routes(routes!(crate::runs::api::runs::list_run_artifacts))
         .routes(routes!(crate::runs::api::flow::get_run_flow_enriched))
         .routes(routes!(crate::runs::api::runs::export_runs))
@@ -497,6 +513,10 @@ pub fn router(state: ApiState) -> Router {
                 ),
             ),
         )
+        .routes(routes!(
+            crate::playbooks::api::drafts::rename_playbook_draft
+        ))
+        .routes(routes!(crate::playbooks::api::drafts::clone_playbook_draft))
         .routes(routes!(
             crate::playbooks::api::drafts::launch_playbook_draft
         ))
@@ -660,7 +680,18 @@ pub fn router(state: ApiState) -> Router {
     } else {
         router
     };
-    let (router, api) = router.split_for_parts();
+    let router = match state.identities {
+        true => agent_auth::identity_routes(router),
+        false => router,
+    };
+    let (router, mut api) = router.split_for_parts();
+    let router = match state.agent_tools {
+        true => {
+            api.merge(agent_auth::AgentToolsDoc::openapi());
+            agent_auth::agent_tool_routes(router)
+        }
+        false => router,
+    };
 
     router
         // The artifact proxy is a catch-all (`{*path}` captures `diffs/<file>`, which carries a

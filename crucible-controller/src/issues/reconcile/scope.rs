@@ -283,7 +283,7 @@ pub(super) async fn run_scope_and_transition(
                 agent: crate::playbooks::providers::AgentSelection::from_resolved(
                     dispatch.as_ref(),
                 ),
-                inference_provider: dispatch.map(|d| d.provider),
+                inference: dispatch.iter().map(|d| d.inference()).collect(),
             },
         )
         .await?;
@@ -409,7 +409,7 @@ async fn extract_scope_exposure(
         anyhow::bail!("no stored pack for {key}");
     };
     let extraction = tokio::task::spawn_blocking(move || {
-        crate::playbooks::exposure::extract(pack.path(), pr_repo.as_deref())
+        crate::playbooks::exposure::extract(pack.path(), pr_repo.as_deref(), None)
     })
     .await
     .context("joining the scope exposure worker")?;

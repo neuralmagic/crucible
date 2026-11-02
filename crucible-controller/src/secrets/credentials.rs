@@ -27,8 +27,10 @@ pub enum CredentialsError {
     NotAString { name: String },
     #[error("credentials name no variable at all")]
     NoEntries,
-    #[error("credentials name no {expected}, which the provider's harness reads its key from")]
+    #[error("credentials name no {expected}, the entry the provider's key is read from")]
     MissingKey { expected: &'static str },
+    #[error("a {protocol} provider's secret is one bare key, not a map")]
+    MapForBareKey { protocol: &'static str },
 }
 
 /// What an inference secret holds.
@@ -72,20 +74,22 @@ impl Credentials {
         Ok(Credentials::Map(map))
     }
 
-    /// The variables this secret lands in when a provider whose harness reads `key_env` spends it.
-    /// A single key takes that name; a map has to carry it, or the harness would start without a
-    /// key while other variables were set.
-    pub fn for_env(
+    /// The key a provider spends, and the map's other entries. A single key is the key; a map
+    /// keeps it under `entry`, the variable a client of the provider's protocol reads it from, or
+    /// is refused when the protocol takes one bare key (`entry` is `None`).
+    pub fn split(
         self,
-        key_env: &'static str,
-    ) -> Result<BTreeMap<String, String>, CredentialsError> {
-        match self {
-            Credentials::Single(value) => Ok(BTreeMap::from([(key_env.to_string(), value)])),
-            Credentials::Map(map) => {
-                if !map.contains_key(key_env) {
-                    return Err(CredentialsError::MissingKey { expected: key_env });
-                }
-                Ok(map)
+        protocol: &'static str,
+        entry: Option<&'static str>,
+    ) -> Result<(String, BTreeMap<String, String>), CredentialsError> {
+        match (self, entry) {
+            (Credentials::Single(value), _) => Ok((value, BTreeMap::new())),
+            (Credentials::Map(_), None) => Err(CredentialsError::MapForBareKey { protocol }),
+            (Credentials::Map(mut map), Some(entry)) => {
+                let key = map
+                    .remove(entry)
+                    .ok_or(CredentialsError::MissingKey { expected: entry })?;
+                Ok((key, map))
             }
         }
     }
@@ -93,38 +97,48 @@ impl Credentials {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::secrets::credentials::*;
 
     #[test]
-    fn a_bare_key_is_a_single_credential_under_the_providers_variable() {
+    fn a_bare_key_is_the_key_whatever_the_protocol() {
         let creds = Credentials::parse("  sk-test\n").expect("parses");
         assert_eq!(creds, Credentials::Single("sk-test".to_string()));
-        assert_eq!(
-            creds.for_env("OPENAI_API_KEY").expect("named"),
-            BTreeMap::from([("OPENAI_API_KEY".to_string(), "sk-test".to_string())])
-        );
+        for entry in [Some("OPENAI_API_KEY"), None] {
+            assert_eq!(
+                creds.clone().split("decisions", entry).expect("a bare key"),
+                ("sk-test".to_string(), BTreeMap::new())
+            );
+        }
     }
 
     #[test]
-    fn a_map_keeps_every_variable_and_must_carry_the_harness_key() {
+    fn a_map_gives_up_its_protocol_entry_as_the_key_and_keeps_the_rest() {
         let creds =
             Credentials::parse(r#"{"OPENAI_API_KEY": "sk-test", "OPENAI_ORG_ID": "org-1"}"#)
                 .expect("parses");
-        let env = creds
+        let (key, rest) = creds
             .clone()
-            .for_env("OPENAI_API_KEY")
+            .split("responses", Some("OPENAI_API_KEY"))
             .expect("carries the key");
-        assert_eq!(env.len(), 2);
-        assert_eq!(env["OPENAI_ORG_ID"], "org-1");
+        assert_eq!(key, "sk-test");
+        assert_eq!(
+            rest,
+            BTreeMap::from([("OPENAI_ORG_ID".to_string(), "org-1".to_string())])
+        );
         let err = creds
-            .for_env("ANTHROPIC_API_KEY")
-            .expect_err("the wrong harness's key is missing");
+            .clone()
+            .split("messages", Some("ANTHROPIC_API_KEY"))
+            .expect_err("the wrong protocol's key is missing");
         assert!(matches!(
             err,
             CredentialsError::MissingKey {
                 expected: "ANTHROPIC_API_KEY"
             }
         ));
+        let err = creds
+            .split("system_one", None)
+            .expect_err("a bare-key protocol refuses a map");
+        assert!(err.to_string().contains("system_one"), "{err}");
     }
 
     #[test]

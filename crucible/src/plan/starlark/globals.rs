@@ -16,10 +16,11 @@ use starlark::values::tuple::{TupleRef, UnpackTuple};
 use starlark::values::{Heap, Value, ValueLike};
 use starlark_syntax::codemap::FileSpan;
 
+use crate::plan::ir::TaskName;
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    AnswerRefValue, CONVERTED, ExternalText, OutputRefValue, QuestionValue, SchemaValue,
-    SessionValue, TaskValue, WorkflowValue,
+    AnswerRefValue, CONVERTED, ExternalText, OptionalValue, OutputRefValue, QuestionValue,
+    SchemaValue, SessionValue, TaskValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -28,6 +29,7 @@ const POSITIONAL: &[&str] = &[
     "prompt_file",
     "schema_file",
     "param",
+    "optional",
     "workflow",
     "default_autoresearch",
 ];
@@ -135,12 +137,28 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
         dispatch("noul", args, kwargs, eval)
     }
 
+    fn optional<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("optional", args, kwargs, eval)
+    }
+
     fn route<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("route", args, kwargs, eval)
+    }
+
+    fn score<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("score", args, kwargs, eval)
     }
 }
 
@@ -256,43 +274,43 @@ fn call<'v>(
             return Err(one_positional());
         };
         let argument = convert(*argument).map_err(|error| located(at, error))?;
-        return match (function, argument) {
+        let value = match (function, argument) {
             ("prompt_file", dsl::Value::String(path)) => state
                 .context_mut()
                 .prompt_file(&path)
-                .map(dsl::Value::String)
-                .map_err(|error| located(at, error)),
+                .map(dsl::Value::String),
             ("schema_file", dsl::Value::String(path)) => state
                 .context_mut()
                 .schema_file(&path)
-                .map(dsl::Value::Schema)
-                .map_err(|error| located(at, error)),
+                .map(dsl::Value::Schema),
             ("param", dsl::Value::String(name)) => state.context_mut().param(&name),
+            ("optional", dsl::Value::Task(task)) => Ok(dsl::Value::Optional(task.name)),
+            ("optional", dsl::Value::String(name)) => Ok(dsl::Value::Optional(TaskName(name))),
             ("workflow", dsl::Value::List(tasks)) => {
-                let tasks = dsl::task_list("workflow", tasks)?;
-                let workflow = WorkflowCfg {
-                    workflow_type: WorkflowType::Autoresearch,
-                    result: None,
-                    tasks,
-                    file: None,
-                    resolved_from: None,
-                    params: BTreeMap::new(),
-                    history_record: None,
-                };
-                workflow.validate()?;
-                Ok(dsl::Value::Workflow(workflow))
+                dsl::task_list("workflow", tasks).and_then(|tasks| {
+                    let workflow = WorkflowCfg {
+                        workflow_type: WorkflowType::Autoresearch,
+                        result: None,
+                        tasks,
+                        file: None,
+                        resolved_from: None,
+                        params: BTreeMap::new(),
+                        history_record: None,
+                    };
+                    workflow.validate()?;
+                    Ok(dsl::Value::Workflow(workflow))
+                })
             }
             ("default_autoresearch", dsl::Value::List(tasks)) => {
-                dsl::default_autoresearch(dsl::task_list("default_autoresearch", tasks)?)
+                dsl::task_list("default_autoresearch", tasks)
+                    .and_then(dsl::default_autoresearch)
                     .map(dsl::Value::Workflow)
             }
-            _ => Err(located(
-                at,
-                dsl::CompileError::WrongPositionalType {
-                    function: function.to_owned(),
-                },
-            )),
+            _ => Err(dsl::CompileError::WrongPositionalType {
+                function: function.to_owned(),
+            }),
         };
+        return value.map_err(|error| located(at, error));
     }
     if !args.items.is_empty() {
         return Err(located(
@@ -304,7 +322,14 @@ fn call<'v>(
     }
     let named = kwargs
         .into_iter()
-        .map(|(name, value)| Ok((name, convert(value)?)))
+        .map(|(name, value)| {
+            let value = if SOURCE_ORDERED.contains(&(function, name.as_str())) {
+                convert_ordered(value)?
+            } else {
+                convert(value)?
+            };
+            Ok((name, value))
+        })
         .collect::<dsl::Result<BTreeMap<String, dsl::Value>>>()
         .map_err(|error| located(at, error))?;
     dsl::constructor(function, named, state, at).map_err(|error| located(at, error))
@@ -325,6 +350,22 @@ fn located(at: &FileSpan, error: dsl::CompileError) -> dsl::CompileError {
 /// space becomes [`dsl::Value::Opaque`], which every `take_*` helper reports as a wrong type.
 fn convert(value: Value<'_>) -> dsl::Result<dsl::Value> {
     convert_at(value, 0)
+}
+
+/// Arguments whose dict keeps the order the source wrote it in.
+const SOURCE_ORDERED: &[(&str, &str)] = &[("score", "levels")];
+
+fn convert_ordered(value: Value<'_>) -> dsl::Result<dsl::Value> {
+    let Some(dict) = DictRef::from_value(value) else {
+        return convert(value);
+    };
+    dict.iter()
+        .map(|(key, value)| match key.unpack_str() {
+            Some(key) => Ok((plain(key)?, convert_at(value, 1)?)),
+            None => Err(dsl::CompileError::DictKeyNotString),
+        })
+        .collect::<dsl::Result<Vec<_>>>()
+        .map(dsl::Value::Ordered)
 }
 
 /// Marshal one argument, refusing a value nested deeper than a source is allowed to nest.
@@ -409,6 +450,9 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(schema) = SchemaValue::from_value(value) {
         return Ok(dsl::Value::Schema(schema.0.clone()));
     }
+    if let Some(optional) = OptionalValue::from_value(value) {
+        return Ok(dsl::Value::Optional(optional.0.clone()));
+    }
     Ok(dsl::Value::Opaque)
 }
 
@@ -447,7 +491,7 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         }
         dsl::Value::External(segments) => heap.alloc(ExternalText(segments)),
         // A dictionary never travels back out: the constructors consume it.
-        dsl::Value::Map(_) => Value::new_none(),
+        dsl::Value::Map(_) | dsl::Value::Ordered(_) => Value::new_none(),
         dsl::Value::Task(task) => heap.alloc(TaskValue(*task)),
         dsl::Value::Output(output) => heap.alloc(OutputRefValue {
             declared: match output.ty {
@@ -464,5 +508,6 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Answer(answer) => heap.alloc(AnswerRefValue(answer)),
         dsl::Value::Workflow(workflow) => heap.alloc(WorkflowValue(workflow)),
         dsl::Value::Schema(schema) => heap.alloc(SchemaValue(schema)),
+        dsl::Value::Optional(name) => heap.alloc(OptionalValue(name)),
     }
 }

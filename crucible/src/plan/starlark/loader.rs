@@ -140,7 +140,7 @@ impl Resolver<'_, '_> {
         if self.total_bytes > dsl::MAX_TOTAL_SOURCE_BYTES {
             return Err(located(dsl::CompileError::LoadSourceBudgetSpent));
         }
-        dsl::reject_deep_nesting(&source, &canonical).map_err(&located)?;
+        dsl::reject_deep_nesting(&source, &canonical).map_err(located)?;
         let ast = AstModule::parse(&canonical.display().to_string(), source, &dsl::dialect())
             .map_err(|error| located(dsl::parse_error(error)))?;
         self.active.push(canonical.clone());

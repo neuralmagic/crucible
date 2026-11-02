@@ -1,12 +1,18 @@
 import { useCallback, useMemo, useSyncExternalStore } from 'react';
+import { useLocation } from 'react-router-dom';
 import { $api } from './api/client';
 import { OWNER_CONTEXT_KEY, clearActAsRefusal } from './actAs';
 import { readValue, subscribeFlags, writeValue } from './deviceStore';
-import { ALL, actedAs, effectiveContext, ownerOptions, switchable, type ActedAs } from './ownerContext';
+import { ALL, actedAs, effectiveContext, ownerOptions, switchable, teamScope, type ActedAs } from './ownerContext';
 
 export interface OwnerContext {
-  /// `all` or the principal whose resources the lists show.
+  /// `all` or the principal whose resources the lists show: the team a `/teams/<slug>` page is
+  /// scoped to, else the device's choice.
   context: string;
+  /// The device's choice, which the masthead switcher shows and requests act as.
+  stored: string;
+  /// The team the current page is scoped to by its path.
+  team: string | null;
   setContext: (next: string) => void;
   /// Every principal the caller acts as.
   principals: ActedAs[];
@@ -23,13 +29,17 @@ export function useOwnerContext(): OwnerContext {
   const whoami = $api.useQuery('get', '/api/whoami');
   const stored = useSyncExternalStore(subscribeFlags, () => readValue(OWNER_CONTEXT_KEY), () => null);
   const principals = useMemo(() => actedAs(whoami.data), [whoami.data]);
-  const context = whoami.isSuccess ? effectiveContext(stored, principals) : ALL;
+  const { pathname } = useLocation();
+  const team = teamScope(pathname);
+  const device = whoami.isSuccess ? effectiveContext(stored, principals) : ALL;
   const setContext = useCallback((next: string) => {
     clearActAsRefusal();
     writeValue(OWNER_CONTEXT_KEY, next);
   }, []);
   return {
-    context,
+    context: team ?? device,
+    stored: device,
+    team,
     setContext,
     principals,
     switchable: useMemo(() => switchable(principals), [principals]),

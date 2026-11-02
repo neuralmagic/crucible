@@ -123,9 +123,9 @@ struct TaskResultWire {
     cost_usd: f64,
     #[serde(default)]
     secs: f64,
-    /// What the task emitted, verbatim. Folded into [`ParsedRun::result`] rather than into the
-    /// `task_results` row: it is the run's product, and a schedule's cursor reads a field of it
-    /// after a successful run.
+    /// What the task emitted, verbatim. Kept on the attempt's `task_results` row, and a passing
+    /// attempt's is folded into [`ParsedRun::result`]: it is the run's product, and a schedule's
+    /// cursor reads a field of it after a successful run.
     #[serde(default)]
     output: Option<serde_json::Value>,
     /// The external results the engine parsed off the attempt's declared `link`/`links` fields,
@@ -271,13 +271,37 @@ impl ParsedRun {
         Ok(())
     }
 
-    /// The note of the first task attempt that failed outright — what an errored run's park reason
-    /// carries as its diagnosis. `skipped`/`blocked` attempts are downstream of that failure rather
-    /// than the cause of it, so they are passed over; a status the engine does not know reads as a
-    /// failure, matching [`crate::runs::task_evidence`]. `None` when no failing attempt left a note.
+    /// The note of the first unresolved task failure, else of the first task it blocked.
     pub(crate) fn failure_cause(&self) -> Option<String> {
-        let failed = self
+        let mut last = BTreeMap::new();
+        for (index, result) in self.task_results.iter().enumerate() {
+            last.insert((result.iter, result.task.as_str()), index);
+        }
+
+        let current: Vec<_> = self
             .task_results
+            .iter()
+            .enumerate()
+            .filter(|(index, result)| {
+                if last.get(&(result.iter, result.task.as_str())) != Some(index) {
+                    return false;
+                }
+
+                let Some((node, instance)) = result.task.split_once('[') else {
+                    return true;
+                };
+
+                let Some(parent) = last.get(&(result.iter, node)) else {
+                    return true;
+                };
+
+                !instance.starts_with("round-")
+                    && self.task_results[*parent].status.parse() != Ok(TaskStatus::Pass)
+            })
+            .map(|(_, result)| result)
+            .collect();
+
+        let failed = current
             .iter()
             .filter(|r| {
                 matches!(
@@ -285,11 +309,10 @@ impl ParsedRun {
                     TaskStatus::Fail | TaskStatus::Transport | TaskStatus::Truncated
                 )
             })
-            .map(|r| r.note.trim())
-            .find(|note| !note.is_empty())
-            .map(str::to_owned);
+            .find_map(|r| (!r.note.trim().is_empty()).then(|| r.note.trim().to_owned()));
+
         failed.or_else(|| {
-            self.task_results.iter().find_map(|r| {
+            current.iter().find_map(|r| {
                 r.blocked
                     .as_ref()
                     .map(|b| format!("{} {}", r.task, blocked_cause(b, &r.note)))
@@ -454,10 +477,11 @@ fn parse_session(content: &str) -> ParsedRun {
                 if task.is_empty() {
                     continue;
                 }
-                if let Some(output) = output.filter(|o| !o.is_null())
+                let output = output.filter(|o| !o.is_null());
+                if let Some(output) = &output
                     && status == "pass"
                 {
-                    run.result.insert(task.clone(), output);
+                    run.result.insert(task.clone(), output.clone());
                 }
                 run.task_results.push(TaskResult {
                     iter: iter.into(),
@@ -473,6 +497,7 @@ fn parse_session(content: &str) -> ParsedRun {
                     links: crucible_contract::decode_links(&links),
                     agent: serde_json::from_value(agent).ok(),
                     repairs: crucible_contract::session::TaskRepair::decode_all(&repairs),
+                    output,
                 });
             }
             Ev::Shutdown { outcome, reason } => {
@@ -916,6 +941,7 @@ mod tests {
     /// A playbook run's product is what its tasks emitted: each passing task's `output`, keyed by
     /// task name, which is the document a schedule's cursor addresses. A retried task's last
     /// attempt wins, a failed one contributes nothing, and a log without outputs leaves it empty.
+    /// Every attempt's row keeps the output it emitted, failing or not.
     #[test]
     fn parse_folds_passing_task_outputs_into_the_run_result() {
         let log = [
@@ -941,6 +967,22 @@ mod tests {
             parsed.task_results.len(),
             5,
             "every attempt is still ledgered"
+        );
+        let outputs: Vec<Option<serde_json::Value>> = parsed
+            .task_results
+            .iter()
+            .map(|r| r.output.clone())
+            .collect();
+        assert_eq!(
+            outputs,
+            [
+                Some(serde_json::json!({"newest_created_at": "2026-08-01T00:00:00Z"})),
+                Some(serde_json::json!({"newest_created_at": "2026-08-23T00:00:00Z", "seen": 4})),
+                Some(serde_json::json!("done")),
+                None,
+                None,
+            ],
+            "each attempt keeps its own output, the failed one's included, and null is none"
         );
 
         assert!(
@@ -1338,6 +1380,50 @@ mod tests {
             );
             assert_eq!(parse_session(&log).failure_cause().as_deref(), Some(want));
         }
+    }
+
+    #[test]
+    fn a_recovered_review_timeout_cannot_hide_the_current_build_problem() {
+        let log = [
+            r#"{"v":1,"kind":"task_result","task":"impact_assessment[round-1]","status":"fail","iter":0,"note":"timed out: the task ran past its 10m limit"}"#,
+            r#"{"v":1,"kind":"task_result","task":"planning_check[round-1]","status":"fail","iter":0,"note":"exit 1: "}"#,
+            r#"{"v":1,"kind":"task_result","task":"impact_assessment","status":"pass","iter":0}"#,
+            r#"{"v":1,"kind":"task_result","task":"planning_check","status":"pass","iter":0}"#,
+            r#"{"v":1,"kind":"task_result","task":"pick_review[candidate]","status":"fail","iter":0,"note":"old review failure"}"#,
+            r#"{"v":1,"kind":"task_result","task":"pick_review","status":"pass","iter":0}"#,
+            r#"{"v":1,"kind":"task_result","task":"build","status":"fail","iter":0,"note":"exit 1: source layer cannot package changed test paths","output":{"pass":false,"note":"source layer cannot package changed test paths"}}"#,
+            r#"{"v":1,"kind":"task_result","task":"failure_investigation","status":"transport","iter":0,"note":"agent exited without a verdict"}"#,
+        ].join("\n");
+
+        assert_eq!(
+            parse_session(&log).failure_cause().as_deref(),
+            Some("exit 1: source layer cannot package changed test paths")
+        );
+    }
+
+    /// The cause is the engine's note. An output field a pack uses for its own purposes is not
+    /// read as one, whatever it is called.
+    #[test]
+    fn a_failure_cause_reads_the_note_not_an_output_field() {
+        let log = r#"{"v":1,"kind":"task_result","task":"build","status":"fail","iter":0,"note":"exit 1: the image did not build","output":{"problem":"a field the pack reports for itself"}}"#;
+        assert_eq!(
+            parse_session(log).failure_cause().as_deref(),
+            Some("exit 1: the image did not build")
+        );
+    }
+
+    #[test]
+    fn a_failed_mapped_review_keeps_its_specific_final_attempt_reason() {
+        let log = [
+            r#"{"v":1,"kind":"task_result","task":"review[candidate]","status":"transport","iter":0,"note":"old gateway failure"}"#,
+            r#"{"v":1,"kind":"task_result","task":"review[candidate]","status":"fail","iter":0,"note":"timed out at 30m"}"#,
+            r#"{"v":1,"kind":"task_result","task":"review","status":"fail","iter":0,"note":"1 of 1 instances failed"}"#,
+        ].join("\n");
+
+        assert_eq!(
+            parse_session(&log).failure_cause().as_deref(),
+            Some("timed out at 30m")
+        );
     }
 
     #[test]

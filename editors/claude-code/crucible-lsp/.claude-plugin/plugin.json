@@ -1,0 +1,8 @@
+{
+  "name": "crucible-lsp",
+  "description": "Runs crucible-lsp on crucible workflow files (*.star): errors after each edit, definitions, references, hover, and symbols.",
+  "version": "0.5.1",
+  "author": {
+    "name": "crucible"
+  }
+}

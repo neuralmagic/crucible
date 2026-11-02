@@ -101,12 +101,23 @@ pub(crate) fn select_agent(
     (harness, selection.model.clone())
 }
 
-/// Resolve [`select_agent`] against the process environment and pin the result on `args`.
+/// Resolve [`select_agent`] against the process environment and pin the result, with the agent
+/// binding's price, on `args`.
 pub(crate) fn pin_agent(args: &mut Args, agent: &manifest::AgentCfg) -> Result<manifest::Harness> {
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
     let (harness, model) = select_agent(args.harness, args.model.as_deref(), agent, &inference);
     args.harness = Some(harness);
     args.model = Some(model);
+    args.price = inference.selection.and_then(|s| s.price);
+    if let Some(price) = &args.price {
+        tracing::info!(
+            input = price.input.get(),
+            output = price.output.get(),
+            cache_read = price.cache_read.get(),
+            cache_write = price.cache_write.get(),
+            "the injected agent binding's price replaces the cost the harness reports"
+        );
+    }
     Ok(harness)
 }
 
@@ -270,7 +281,7 @@ fn end_run_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Err
 
 /// Deliver a run whose session log already records the setup failure it ended on.
 pub(crate) fn ended_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Error {
-    crate::report::ingest_client::deliver_run_evidence(p);
+    crate::report::evidence_client::deliver_run_evidence(p);
     error.context(EndedAtSetup)
 }
 
@@ -288,6 +299,7 @@ pub(crate) fn prep_plan_runner(
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     prep_plan_runner_with_params(
         manifest_path,
+        None,
         &std::collections::BTreeMap::new(),
         crate::openshell::gateway::ComputeDriver::Podman,
         crate::args::AgentOverride::default(),
@@ -313,6 +325,53 @@ pub(crate) fn restore_pristine(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the parent run started from {base}, which this workspace neither has nor matches; a rerun \
+     starts where its parent did"
+)]
+struct RerunBaseUnavailable {
+    base: String,
+}
+
+/// Rebuild a rerun's workspace: the commit its parent started from, or this checkout's `HEAD`
+/// when that holds the same tree or the workspace has no repository of its own, then the reused
+/// tasks' commits, then the manifest's injects. Returns the commit the rerun starts from.
+pub(crate) fn restore_for_rerun(
+    manifest_path: &Path,
+    m: &manifest::Manifest,
+    parent: &crate::plan::resume::RunStart,
+    commits: &[crucible_vcs::git_memory::TaskCommit],
+) -> Result<String> {
+    use crucible_vcs::git_memory;
+    let manifest_dir = manifest::manifest_dir(manifest_path);
+    let workspace = manifest_dir.join(&m.workspace.dir);
+    let base = if git_memory::tree_of(&workspace, &parent.base)?.is_some() {
+        parent.base.clone()
+    } else {
+        let head = vcs::head_sha(&workspace)?;
+        let own_baseline = m.workspace.setup_cmd.is_none() && m.repo.source().is_none();
+        match git_memory::tree_of(&workspace, &head)? {
+            _ if own_baseline => head,
+            Some(tree) if !parent.base_tree.is_empty() && tree == parent.base_tree => head,
+            _ => {
+                return Err(RerunBaseUnavailable {
+                    base: parent.base.clone(),
+                }
+                .into());
+            }
+        }
+    };
+    git_memory::restore(&workspace, &base, &[])
+        .with_context(|| format!("restoring the workspace to the parent's base ({base})"))?;
+    git_memory::replay(&workspace, commits)?;
+    for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
+        manifest::apply_inject(&src, &dst)
+            .context("applying [workspace].inject to the rerun's workspace")?;
+    }
+    Ok(base)
+}
+
 /// Where a manifest run keeps its state: the session log, captured files, and run records.
 pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
     manifest::manifest_dir(manifest_path).join("state")
@@ -320,11 +379,12 @@ pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
 
 pub(crate) fn prep_plan_runner_with_params(
     manifest_path: &Path,
+    variant: Option<&manifest::variant::VariantName>,
     params: &std::collections::BTreeMap<String, String>,
     compute_driver: crate::openshell::gateway::ComputeDriver,
     agent: crate::args::AgentOverride,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
-    let mut m = manifest::Manifest::load_frozen(manifest_path)?;
+    let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
@@ -342,10 +402,13 @@ pub(crate) fn prep_plan_runner_with_params(
     // The harness's own files, plus where a task's staged inputs land. Without this a playbook's
     // per-task commit sweeps in the toolbox, the results log, and every artifact an ancestor
     // handed this task, and each task's commit reads as though it produced all of them.
-    crucible_vcs::git_memory::install_harness_excludes(
-        &workspace,
-        &[format!("{}/", crate::plan::STAGED_INPUTS)],
-    );
+    let excludes: Vec<String> = m
+        .workspace
+        .carried_paths()
+        .into_iter()
+        .chain(std::iter::once(format!("{}/", crate::plan::STAGED_INPUTS)))
+        .collect();
+    crucible_vcs::git_memory::install_harness_excludes(&workspace, &excludes);
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
     // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
@@ -403,9 +466,55 @@ mod tests {
             selection: Some(crate::agent::inference::AgentSelection {
                 protocol,
                 model: "bound-model".into(),
+                price: None,
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_playbook_keeps_carried_artifacts_out_of_git_memory() {
+        let dir = tempdir("playbook-carried-evidence");
+        fs::write(dir.join("tool.py"), "print('ok')\n").unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            "t = command(name = \"t\", run = \"python3 tool.py\")\nworkflow(type = \"playbook\", tasks = [t])\n",
+        ).unwrap();
+        fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [workspace]
+            inject = ["tool.py"]
+            carry_forward = ["evidence/"]
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+        "#,
+        )
+        .unwrap();
+
+        prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+
+        let ws = dir.join("workspace");
+        fs::create_dir(ws.join("evidence")).unwrap();
+        fs::write(ws.join("evidence/probe.zip"), b"retained separately").unwrap();
+        fs::write(ws.join("change.py"), "print('changed')\n").unwrap();
+
+        crucible_vcs::git_memory::snapshot(&ws, "task probe").unwrap();
+
+        let repo = git2::Repository::open(&ws).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+
+        assert!(tree.get_path(Path::new("evidence/probe.zip")).is_err());
+        assert!(tree.get_path(Path::new("change.py")).is_ok());
+        assert_eq!(
+            fs::read(ws.join("evidence/probe.zip")).unwrap(),
+            b"retained separately"
+        );
     }
 
     #[test]
@@ -455,6 +564,41 @@ mod tests {
             ),
             (Harness::Claude, "bound-model".to_string())
         );
+    }
+
+    /// The agent binding's price is pinned with its model, so every agent turn of the run settles
+    /// at tokens times that price; a binding without one leaves the vendor table in charge.
+    #[test]
+    fn pin_agent_pins_the_binding_price_beside_its_model() {
+        use crate::agent::event::Pricing;
+        use crucible_contract::inference::ENV_INFERENCE;
+        let _guard = crucible::test_support::env_lock();
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
+
+        unsafe {
+            std::env::set_var(
+                ENV_INFERENCE,
+                r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","url":"https://selfhosted.example/v1","model":"zai-org/glm-5","price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6}}]}"#,
+            )
+        };
+        let mut priced = args_from(&["crucible"]);
+        pin_agent(&mut priced, &m.agent).unwrap();
+        assert_eq!(priced.model(), "zai-org/glm-5");
+        let price = priced.price.expect("the binding's price");
+        assert_eq!(price.output.get(), 2.2);
+        assert!(matches!(priced.pricing(), Pricing::Fixed(_)));
+
+        unsafe {
+            std::env::set_var(
+                ENV_INFERENCE,
+                r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","model":"zai-org/glm-5"}]}"#,
+            )
+        };
+        let mut unpriced = args_from(&["crucible"]);
+        pin_agent(&mut unpriced, &m.agent).unwrap();
+        assert_eq!(unpriced.price, None);
+        assert_eq!(unpriced.pricing(), Pricing::resolve("zai-org/glm-5", None));
+        unsafe { std::env::remove_var(ENV_INFERENCE) };
     }
 
     /// Resources schedule a sandbox, so only the backend that runs one takes them; any other

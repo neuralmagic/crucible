@@ -39,10 +39,15 @@ pub const RESERVED_INPUTS: [&str; 6] = [
     REVISION_INPUT,
 ];
 
+/// The reserved key a route's decision state carries its declared files under.
+pub const FILES_INPUT: &str = "files";
+
 /// The output field a task declares early completion with.
 pub const COMPLETE_FIELD: &str = "complete";
 /// The output field carrying an early completion's reason.
 pub const REASON_FIELD: &str = "reason";
+/// The output field a failing or skipped task states its own reason in.
+pub const NOTE_FIELD: &str = "note";
 /// Output fields a task may not declare in `emits`.
 pub const RESERVED_OUTPUTS: [&str; 2] = [COMPLETE_FIELD, REASON_FIELD];
 
@@ -379,6 +384,38 @@ impl TaskKind {
             },
         }
     }
+
+    /// Whether an attempt of this kind asks a model, and so draws on the run's cost ceiling.
+    pub fn spends(&self) -> bool {
+        match self {
+            TaskKind::Agent { .. }
+            | TaskKind::Route {
+                decider: Decider::Model { .. },
+                ..
+            }
+            | TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => true,
+            TaskKind::Command { .. }
+            | TaskKind::Evaluate { .. }
+            | TaskKind::Report { .. }
+            | TaskKind::TopK { .. }
+            | TaskKind::Route {
+                decider: Decider::Output { .. },
+                ..
+            }
+            | TaskKind::Engine {
+                op:
+                    EngineOp::Apply
+                    | EngineOp::Measure
+                    | EngineOp::Grade
+                    | EngineOp::Decide
+                    | EngineOp::MeasureDiff,
+                ..
+            } => false,
+        }
+    }
 }
 
 /// `f64` fields deserialized through [`serde_json::Number`].
@@ -405,10 +442,13 @@ mod number {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Decider {
-    /// A System One decision model, reached through the broker.
+    /// A decision model, reached through the broker.
     Model {
         #[serde(deserialize_with = "number::required")]
         min_confidence: f64,
+        /// Declared JSON files of dependencies the model reads under the reserved `files` key.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<String>,
     },
     /// A dependency's output, which carries one declared label per question id.
     Output { task: TaskName },
@@ -429,8 +469,26 @@ impl fmt::Display for When {
     }
 }
 
+/// Whether two tasks map over the same producer field, so their instances pair by item key.
+pub fn aligned(a: &Task, b: &Task) -> bool {
+    matches!((&a.over, &b.over), (Some(x), Some(y)) if x == y)
+}
+
+/// Whether `route` is a mapped output-decided route whose source is not aligned with it, so each
+/// element's answer is read out of an object keyed by element rather than a label field.
+fn reads_keyed_source<'a>(route: &Task, lookup: impl Fn(&TaskName) -> Option<&'a Task>) -> bool {
+    let TaskKind::Route {
+        decider: Decider::Output { task: source },
+        ..
+    } = &route.task
+    else {
+        return false;
+    };
+    route.over.is_some() && lookup(source).is_some_and(|source| !aligned(route, source))
+}
+
 /// The capability a model-decided route task needs.
-pub const NEEDS_SYSTEMONE: &str = "systemone";
+pub const NEEDS_DECISION: &str = "decision";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -488,8 +546,15 @@ pub struct Task {
     /// whatever a global default happened to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fanout: Option<u32>,
+    /// Object fields of unmapped dependencies each instance receives narrowed to its own entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyed: Vec<OutputRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<When>,
+    /// Dependencies that satisfy an `all` join by settling not taken. Such a dependency gives the
+    /// task no input entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<TaskName>,
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
@@ -507,6 +572,33 @@ pub struct Task {
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+/// Tasks that carry a `when`, or reach one through `all` joins on dependencies not declared
+/// optional.
+pub(crate) fn may_settle_not_taken(tasks: &[Task]) -> BTreeSet<&TaskName> {
+    let mut conditional: BTreeSet<&TaskName> = tasks
+        .iter()
+        .filter(|t| t.when.is_some())
+        .map(|t| &t.name)
+        .collect();
+    loop {
+        let grown: Vec<&TaskName> = tasks
+            .iter()
+            .filter(|t| {
+                t.join == Join::All
+                    && !conditional.contains(&t.name)
+                    && t.depends_on
+                        .iter()
+                        .any(|d| !t.optional.contains(d) && conditional.contains(d))
+            })
+            .map(|t| &t.name)
+            .collect();
+        if grown.is_empty() {
+            return conditional;
+        }
+        conditional.extend(grown);
+    }
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `tasks` run again with the
@@ -628,6 +720,35 @@ impl ValidPlan {
             })
             .collect()
     }
+
+    /// Refuse a plan whose task declares a timeout the run's wall-clock ceiling does not allow.
+    pub fn check_timeouts(&self, ceiling: std::time::Duration) -> Result<(), TimeoutPastCeiling> {
+        match self
+            .tasks_topo()
+            .find_map(|t| Some((t, t.timeout?)).filter(|(_, limit)| limit.get() > ceiling))
+        {
+            Some((task, timeout)) => Err(TimeoutPastCeiling {
+                task: task.name.clone(),
+                timeout,
+                ceiling,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A task whose declared timeout is longer than the run's `--max-time`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "task {:?} declares timeout {timeout}, longer than this run's --max-time {}. The run's \
+     ceiling is the longest any task may declare; shorten the timeout or raise --max-time",
+    task.0,
+    crate::duration::Shown(*ceiling)
+)]
+pub struct TimeoutPastCeiling {
+    pub task: TaskName,
+    pub timeout: TaskTimeout,
+    pub ceiling: std::time::Duration,
 }
 
 pub struct ReviseLoop<'a> {
@@ -639,6 +760,11 @@ pub struct ReviseLoop<'a> {
 impl ReviseLoop<'_> {
     pub fn contains(&self, name: &TaskName) -> bool {
         self.body.iter().any(|t| &t.name == name)
+    }
+
+    /// Whether a round can spend: the loop dispatches as one unit, so one task that can makes it.
+    pub fn spends(&self) -> bool {
+        self.body.iter().any(|t| t.task.spends())
     }
 }
 
@@ -683,6 +809,25 @@ pub enum PlanError {
     },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
+    #[error("task {task:?}: optional names {dependency:?}, which is not one of its dependencies")]
+    OptionalNotADependency { task: String, dependency: String },
+    #[error("task {task:?} lists optional dependency {dependency:?} twice")]
+    RepeatedOptional { task: String, dependency: String },
+    #[error(
+        "task {task:?}: an optional dependency needs join = \"all\"; a {join:?} join already \
+         dispatches past a dependency that was not taken"
+    )]
+    OptionalOutsideAllJoin { task: String, join: &'static str },
+    #[error(
+        "task {task:?}: optional dependency {dependency:?} can never settle not taken: it has \
+         no when and joins no conditional task with join = \"all\""
+    )]
+    OptionalNeverNotTaken { task: String, dependency: String },
+    #[error(
+        "task {task:?}: optional names {target:?}, which it revises; a reviewer reviews what its \
+         targets produced"
+    )]
+    OptionalReviseTarget { task: String, target: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
     JoinPassedWithoutDependencies { task: String },
     #[error("task {task:?}: join = \"settled\" needs at least one dependency")]
@@ -824,7 +969,7 @@ pub enum PlanError {
     #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
     MinConfidenceOutOfRange { task: String, got: f64 },
     #[error(
-        "model-decided route task {task:?} must declare needs = \"{NEEDS_SYSTEMONE}\", got {got:?}"
+        "model-decided route task {task:?} must declare needs = \"{NEEDS_DECISION}\", got {got:?}"
     )]
     RouteNeeds { task: String, got: String },
     #[error(
@@ -882,8 +1027,79 @@ pub enum PlanError {
     },
     #[error("{0}")]
     WhenNeverAnswered(Box<NeverAnswered>),
-    #[error("route task {task:?} declares `over`; routing each element of a list is not supported")]
-    RouteWithOver { task: String },
+    #[error(
+        "task {task:?}: when names {route:?}, which maps over {route_over}, so only a task mapped \
+         over {route_over} can read its answer for each element; {task:?} {task_over}"
+    )]
+    WhenOnUnalignedRoute {
+        task: String,
+        route: String,
+        route_over: String,
+        task_over: String,
+    },
+    #[error("task {task:?} declares keyed without `over`; there is no element to narrow to")]
+    KeyedWithoutOver { task: String },
+    #[error("task {task:?}: keyed {reference} is not read from one of its dependencies")]
+    KeyedNotADependency { task: String, reference: String },
+    #[error(
+        "task {task:?}: keyed {reference} reads a mapped task; only an unmapped dependency's field \
+         is narrowed to the element"
+    )]
+    KeyedFromMapped { task: String, reference: String },
+    #[error(
+        "task {task:?}: keyed {reference}, but {producer:?} does not declare {field:?} in emits"
+    )]
+    KeyedUndeclared {
+        task: String,
+        reference: String,
+        producer: String,
+        field: String,
+    },
+    #[error(
+        "task {task:?}: keyed {reference} is declared {declared}; keyed needs an object keyed by \
+         element"
+    )]
+    KeyedNotObject {
+        task: String,
+        reference: String,
+        declared: Box<FieldType>,
+    },
+    #[error(
+        "route task {task:?} reads its answers from {source_task:?}, which maps over a different \
+         list; a mapped route's source is either aligned with it or not mapped"
+    )]
+    RouteSourceMappedUnaligned { task: String, source_task: String },
+    #[error(
+        "route task {task:?} depends on a task named {FILES_INPUT:?}, the key its declared files arrive under"
+    )]
+    RouteDependsOnFiles { task: String },
+    #[error(
+        "route task {task:?} reads file {path:?}, which none of its dependencies declares in \
+         emits_files"
+    )]
+    RouteFileUndeclared { task: String, path: String },
+    #[error(
+        "route task {task:?} reads file {path:?}, which its dependencies declare without a schema; \
+         the model reads files as JSON"
+    )]
+    RouteFileWithoutSchema { task: String, path: String },
+    #[error(
+        "route task {task:?} reads file {path:?}, declared only by a mapped task the route is not \
+         aligned with; it would not know which element's file to read"
+    )]
+    RouteFileFromUnaligned { task: String, path: String },
+    #[error(
+        "route task {task:?} maps over {route_over} and reads question {question:?} from \
+         {source_task:?}, which declares it {declared}; an unaligned source answers each element \
+         from an object keyed by element"
+    )]
+    RouteSourceNotKeyed {
+        task: String,
+        route_over: String,
+        source_task: String,
+        question: String,
+        declared: Box<FieldType>,
+    },
     #[error("task {task:?}: when names {route:?}, which is not one of its dependencies")]
     WhenNotADependency { task: String, route: String },
     #[error("task {task:?}: when names {route:?}, which is a {kind} task, not a route")]
@@ -1045,10 +1261,11 @@ pub struct NeverAnswered {
 }
 
 /// Whether every value of `declared` is an answer an output-decided route accepts for
-/// `question`: one of its labels or `uncertain`, where a boolean answers `yes` or `no`.
+/// `question`: one of its labels or `uncertain`, where a boolean answers `yes` or `no` for
+/// anything but a score.
 fn answers(question: &Question, declared: &FieldType) -> bool {
     declared
-        .route_answers()
+        .answers_to(&question.kind)
         .is_some_and(|labels| labels.iter().all(|l| question.resolves_to(l)))
 }
 
@@ -1074,7 +1291,7 @@ pub(crate) fn typed_answers<'a>(
     let Declared::Typed(declared) = source.emits.field(question.as_str()) else {
         return None;
     };
-    let possible = declared.route_answers()?;
+    let possible = declared.answers_to(&asked.kind)?;
     possible
         .iter()
         .all(|label| asked.resolves_to(label))
@@ -1091,7 +1308,7 @@ fn answerable_types(question: &Question) -> String {
     let labels = format!("labels from {}", labels.join("|"));
     match question.kind {
         QuestionKind::Noul => format!("\"boolean\" or {labels}"),
-        QuestionKind::Choice { .. } => labels,
+        QuestionKind::Choice { .. } | QuestionKind::Score { .. } => labels,
     }
 }
 
@@ -1195,6 +1412,35 @@ impl Plan {
                         dependency_stage,
                     });
                 }
+            }
+            let mut optional = BTreeSet::new();
+            for d in &t.optional {
+                if !t.depends_on.contains(d) {
+                    return Err(PlanError::OptionalNotADependency {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                if !optional.insert(d) {
+                    return Err(PlanError::RepeatedOptional {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                if let Some(revise) = &t.revise
+                    && revise.tasks.contains(d)
+                {
+                    return Err(PlanError::OptionalReviseTarget {
+                        task: task(),
+                        target: d.0.clone(),
+                    });
+                }
+            }
+            if !t.optional.is_empty() && t.join != Join::All {
+                return Err(PlanError::OptionalOutsideAllJoin {
+                    task: task(),
+                    join: t.join.as_str(),
+                });
             }
             if let Some(depth) = t.history {
                 if !(1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) {
@@ -1338,14 +1584,14 @@ impl Plan {
                         })?;
                 }
                 match decider {
-                    Decider::Model { min_confidence } => {
+                    Decider::Model { min_confidence, .. } => {
                         if !(*min_confidence > 0.0 && *min_confidence <= 1.0) {
                             return Err(PlanError::MinConfidenceOutOfRange {
                                 task: task(),
                                 got: *min_confidence,
                             });
                         }
-                        if t.needs != NEEDS_SYSTEMONE {
+                        if t.needs != NEEDS_DECISION {
                             return Err(PlanError::RouteNeeds {
                                 task: task(),
                                 got: t.needs.clone(),
@@ -1359,8 +1605,36 @@ impl Plan {
                                 source_task: source.0.clone(),
                             });
                         }
-                        let emits = &self.tasks[index[source]].emits;
+                        let source_task = &self.tasks[index[source]];
+                        let emits = &source_task.emits;
+                        let keyed_source = t.over.is_some() && !aligned(t, source_task);
+                        if keyed_source && source_task.over.is_some() {
+                            return Err(PlanError::RouteSourceMappedUnaligned {
+                                task: task(),
+                                source_task: source.0.clone(),
+                            });
+                        }
                         for (id, question) in questions {
+                            if keyed_source {
+                                if let Declared::Typed(declared) = emits.field(id.as_str())
+                                    && !declared.is_object()
+                                {
+                                    return Err(PlanError::RouteSourceNotKeyed {
+                                        task: task(),
+                                        route_over: t
+                                            .over
+                                            .as_ref()
+                                            .map(ToString::to_string)
+                                            .unwrap_or_default(),
+                                        source_task: source.0.clone(),
+                                        question: id.to_string(),
+                                        declared: Box::new(declared.clone()),
+                                    });
+                                }
+                                if emits.field(id.as_str()) != Declared::Omitted {
+                                    continue;
+                                }
+                            }
                             match emits.field(id.as_str()) {
                                 Declared::Unchecked | Declared::Untyped => {}
                                 Declared::Omitted => {
@@ -1384,8 +1658,41 @@ impl Plan {
                         }
                     }
                 }
-                if t.over.is_some() {
-                    return Err(PlanError::RouteWithOver { task: task() });
+                if t.depends_on.iter().any(|d| d.0 == FILES_INPUT) {
+                    return Err(PlanError::RouteDependsOnFiles { task: task() });
+                }
+                if let Decider::Model { files, .. } = decider {
+                    for path in files {
+                        let declaring: Vec<(&Task, &DeclaredFile)> = t
+                            .depends_on
+                            .iter()
+                            .map(|d| &self.tasks[index[d]])
+                            .filter_map(|d| {
+                                Some((d, d.emits_files.iter().find(|f| &f.path == path)?))
+                            })
+                            .collect();
+                        if declaring.is_empty() {
+                            return Err(PlanError::RouteFileUndeclared {
+                                task: task(),
+                                path: path.clone(),
+                            });
+                        }
+                        if declaring.iter().all(|(_, f)| f.schema.is_none()) {
+                            return Err(PlanError::RouteFileWithoutSchema {
+                                task: task(),
+                                path: path.clone(),
+                            });
+                        }
+                        if declaring
+                            .iter()
+                            .all(|(d, _)| d.over.is_some() && !aligned(t, d))
+                        {
+                            return Err(PlanError::RouteFileFromUnaligned {
+                                task: task(),
+                                path: path.clone(),
+                            });
+                        }
+                    }
                 }
             }
             if let Some(when) = &t.when {
@@ -1405,6 +1712,19 @@ impl Plan {
                         kind: target.task.label(),
                     });
                 };
+                if let Some(route_over) = &target.over
+                    && !aligned(t, target)
+                {
+                    return Err(PlanError::WhenOnUnalignedRoute {
+                        task: task(),
+                        route: route(),
+                        route_over: route_over.to_string(),
+                        task_over: match &t.over {
+                            Some(over) => format!("maps over {over}"),
+                            None => "is not mapped".to_string(),
+                        },
+                    });
+                }
                 let Some(asked) = questions.get(&when.question) else {
                     return Err(PlanError::WhenUnknownQuestion {
                         task: task(),
@@ -1420,9 +1740,9 @@ impl Plan {
                         question: question(),
                     });
                 }
-                let typed = typed_answers(target, &when.question, |name| {
-                    index.get(name).map(|&i| &self.tasks[i])
-                });
+                let lookup = |name: &TaskName| index.get(name).map(|&i| &self.tasks[i]);
+                let typed = typed_answers(target, &when.question, lookup)
+                    .filter(|_| !reads_keyed_source(target, lookup));
                 let mut listed = BTreeSet::new();
                 for label in &when.is {
                     if let Some((source, declared, possible)) = &typed
@@ -1658,6 +1978,44 @@ impl Plan {
                     }
                 }
             }
+            if !t.keyed.is_empty() && t.over.is_none() {
+                return Err(PlanError::KeyedWithoutOver { task: task() });
+            }
+            for reference in &t.keyed {
+                let keyed = || reference.to_string();
+                if !t.depends_on.contains(&reference.task) {
+                    return Err(PlanError::KeyedNotADependency {
+                        task: task(),
+                        reference: keyed(),
+                    });
+                }
+                let producer = &self.tasks[index[&reference.task]];
+                if producer.over.is_some() {
+                    return Err(PlanError::KeyedFromMapped {
+                        task: task(),
+                        reference: keyed(),
+                    });
+                }
+                match producer.emits.field(&reference.field.0) {
+                    Declared::Untyped => {}
+                    Declared::Typed(declared) if declared.is_object() => {}
+                    Declared::Typed(declared) => {
+                        return Err(PlanError::KeyedNotObject {
+                            task: task(),
+                            reference: keyed(),
+                            declared: Box::new(declared.clone()),
+                        });
+                    }
+                    Declared::Unchecked | Declared::Omitted => {
+                        return Err(PlanError::KeyedUndeclared {
+                            task: task(),
+                            reference: keyed(),
+                            producer: reference.task.0.clone(),
+                            field: reference.field.0.clone(),
+                        });
+                    }
+                }
+            }
             if t.repair > MAX_REPAIR_CEILING {
                 return Err(PlanError::RepairOutOfRange {
                     task: task(),
@@ -1699,6 +2057,15 @@ impl Plan {
                 }
             }
         }
+        let conditional = may_settle_not_taken(&self.tasks);
+        for t in &self.tasks {
+            if let Some(d) = t.optional.iter().find(|d| !conditional.contains(d)) {
+                return Err(PlanError::OptionalNeverNotTaken {
+                    task: t.name.0.clone(),
+                    dependency: d.0.clone(),
+                });
+            }
+        }
         let mut handled: BTreeMap<(&TaskName, &QuestionId), BTreeSet<&Label>> = BTreeMap::new();
         for t in &self.tasks {
             if let Some(when) = &t.when {
@@ -1716,10 +2083,10 @@ impl Plan {
             let Some(asked) = questions.get(question) else {
                 continue;
             };
-            let possible = typed_answers(route_task, question, |name| {
-                index.get(name).map(|&i| &self.tasks[i])
-            })
-            .map(|(_, _, possible)| possible);
+            let lookup = |name: &TaskName| index.get(name).map(|&i| &self.tasks[i]);
+            let possible = typed_answers(route_task, question, lookup)
+                .filter(|_| !reads_keyed_source(route_task, lookup))
+                .map(|(_, _, possible)| possible);
             let unrouted: Vec<String> = asked
                 .labels()
                 .into_iter()
@@ -1900,11 +2267,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -1949,9 +2318,10 @@ mod tests {
                 questions: BTreeMap::from([(qid("area"), area_question(drop))]),
                 decider: Decider::Model {
                     min_confidence: 0.8,
+                    files: Vec::new(),
                 },
             },
-            needs: NEEDS_SYSTEMONE.into(),
+            needs: NEEDS_DECISION.into(),
             ..agent(name, deps)
         }
     }
@@ -2006,6 +2376,95 @@ mod tests {
         plan(routed()).validate().unwrap();
     }
 
+    fn optional_on(mut task: Task, optional: &[&str]) -> Task {
+        task.optional = optional.iter().map(|d| (*d).into()).collect();
+        task
+    }
+
+    #[test]
+    fn an_optional_dependency_on_a_conditional_task_validates_and_round_trips() {
+        let mut tasks = routed();
+        tasks.push(optional_on(agent("report", &["scan", "fix"]), &["fix"]));
+        tasks.push(agent("verify", &["fix"]));
+        tasks.push(optional_on(agent("summary", &["verify"]), &["verify"]));
+        let original = plan(tasks);
+        let text = toml::to_string(&original).unwrap();
+        assert!(text.contains(r#"optional = ["fix"]"#), "{text}");
+        let json = serde_json::to_value(&original).unwrap();
+        assert!(json["task"][0].get("optional").is_none(), "{json}");
+        for back in [
+            Plan::from_toml_str(&text).unwrap(),
+            Plan::from_json_str(&json.to_string()).unwrap(),
+        ] {
+            assert_eq!(back.tasks[4].optional, vec![TaskName::from("fix")]);
+            assert_eq!(back.tasks[6].optional, vec![TaskName::from("verify")]);
+            back.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_optional_dependency_is_refused_where_it_cannot_apply() {
+        let with = |task: Task| {
+            let mut tasks = routed();
+            tasks.push(task);
+            plan(tasks).validate().unwrap_err()
+        };
+        assert_eq!(
+            with(optional_on(agent("report", &["scan"]), &["fix"])),
+            PlanError::OptionalNotADependency {
+                task: "report".into(),
+                dependency: "fix".into(),
+            }
+        );
+        assert_eq!(
+            with(optional_on(agent("report", &["fix"]), &["fix", "fix"])),
+            PlanError::RepeatedOptional {
+                task: "report".into(),
+                dependency: "fix".into(),
+            }
+        );
+        for join in [Join::Passed, Join::Settled] {
+            let mut report = optional_on(agent("report", &["fix"]), &["fix"]);
+            report.join = join;
+            assert_eq!(
+                with(report),
+                PlanError::OptionalOutsideAllJoin {
+                    task: "report".into(),
+                    join: join.as_str(),
+                }
+            );
+        }
+        assert_eq!(
+            with(optional_on(agent("report", &["scan", "fix"]), &["scan"])),
+            PlanError::OptionalNeverNotTaken {
+                task: "report".into(),
+                dependency: "scan".into(),
+            }
+        );
+
+        let mut tasks = routed();
+        tasks.push(optional_on(agent("report", &["fix"]), &["fix"]));
+        tasks.push(optional_on(agent("tail", &["report"]), &["report"]));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::OptionalNeverNotTaken {
+                task: "tail".into(),
+                dependency: "report".into(),
+            },
+            "a task that dispatches past every untaken dependency is not conditional"
+        );
+
+        let mut tasks = routed();
+        tasks.push(optional_on(reviewer("check", &["fix"], "fix", 3), &["fix"]));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::OptionalReviseTarget {
+                task: "check".into(),
+                target: "fix".into(),
+            }
+        );
+    }
+
     #[test]
     fn a_route_and_its_when_round_trip_through_toml_and_json() {
         let original = plan(routed());
@@ -2021,7 +2480,8 @@ mod tests {
             assert_eq!(
                 *decider,
                 Decider::Model {
-                    min_confidence: 0.8
+                    min_confidence: 0.8,
+                    files: Vec::new(),
                 }
             );
             back.validate().unwrap();
@@ -2078,6 +2538,7 @@ mod tests {
             questions: BTreeMap::new(),
             decider: Decider::Model {
                 min_confidence: 0.8,
+                files: Vec::new(),
             },
         };
         assert_eq!(
@@ -2129,6 +2590,7 @@ mod tests {
             if let TaskKind::Route { decider, .. } = &mut gate.task {
                 *decider = Decider::Model {
                     min_confidence: value,
+                    files: Vec::new(),
                 };
             }
             let got = plan(vec![gate]).validate();
@@ -2143,7 +2605,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_route_must_need_systemone_and_an_output_route_need_not() {
+    fn a_model_route_must_need_decision_and_an_output_route_need_not() {
         let mut gate = model_route("gate", &[], &[]);
         gate.needs = "any".into();
         assert_eq!(
@@ -2162,19 +2624,14 @@ mod tests {
     }
 
     #[test]
-    fn a_route_rejects_over_and_emits() {
+    fn a_route_may_map_over_a_list_but_not_declare_emits() {
         let mut gate = model_route("gate", &["scan"], &[]);
         gate.over = Some(OutputRef {
             task: "scan".into(),
             field: OutputField("issues".into()),
         });
         gate.max_fanout = Some(4);
-        assert_eq!(
-            plan(vec![agent("scan", &[]), gate]).validate().unwrap_err(),
-            PlanError::RouteWithOver {
-                task: "gate".into()
-            }
-        );
+        plan(vec![agent("scan", &[]), gate]).validate().unwrap();
         let mut gate = model_route("gate", &[], &[]);
         gate.emits = fields(&["area"]);
         assert_eq!(
@@ -2540,11 +2997,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -2691,11 +3150,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -4264,6 +4725,57 @@ emits = ["lines"]
     }
 
     #[test]
+    fn a_timeout_past_the_wall_clock_ceiling_is_refused_naming_the_task() {
+        let timed = |name: &str, deps: &[&str], timeout: &str| {
+            let mut t = agent(name, deps);
+            t.timeout = Some(timeout.parse().unwrap());
+            t
+        };
+        let graph = plan(vec![
+            agent("scan", &[]),
+            timed("prepare", &["scan"], "110m"),
+            timed("report", &["prepare"], "3h"),
+        ])
+        .validate()
+        .unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+
+        let refused = graph.check_timeouts(hour).unwrap_err();
+        assert_eq!(
+            refused,
+            TimeoutPastCeiling {
+                task: "prepare".into(),
+                timeout: "110m".parse().unwrap(),
+                ceiling: hour,
+            },
+            "the first task in dependency order past the ceiling is the one named"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "task \"prepare\" declares timeout 110m, longer than this run's --max-time 1h. The \
+             run's ceiling is the longest any task may declare; shorten the timeout or raise \
+             --max-time"
+        );
+        assert_eq!(
+            graph.check_timeouts(2 * hour).unwrap_err().task,
+            TaskName::from("report")
+        );
+        assert_eq!(
+            graph.check_timeouts(3 * hour),
+            Ok(()),
+            "a timeout equal to the ceiling fits"
+        );
+        assert_eq!(
+            plan(vec![agent("a", &[])])
+                .validate()
+                .unwrap()
+                .check_timeouts(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "a task without a timeout is bounded by the ceiling alone"
+        );
+    }
+
+    #[test]
     fn revision_is_a_reserved_input_name() {
         assert_eq!(
             refused(vec![agent("revision", &[]), agent("author", &["revision"])]),
@@ -4287,5 +4799,466 @@ emits = ["lines"]
                 }
             );
         }
+    }
+
+    fn mapped(mut task: Task, producer: &str, field: &str) -> Task {
+        task.over = Some(OutputRef {
+            task: producer.into(),
+            field: OutputField(field.into()),
+        });
+        task.max_fanout = Some(8);
+        task
+    }
+
+    fn keyed(mut task: Task, refs: &[(&str, &str)]) -> Task {
+        task.keyed = refs
+            .iter()
+            .map(|(task, field)| OutputRef {
+                task: (*task).into(),
+                field: OutputField((*field).into()),
+            })
+            .collect();
+        task
+    }
+
+    fn producer() -> Task {
+        Task {
+            emits: fields(&["members", "others", "facts"]),
+            ..agent("prepare", &[])
+        }
+    }
+
+    /// prepare -> gate[k] -> fix[k] (scheduler) | punt[k] (frontend, uncertain)
+    fn mapped_routing() -> Vec<Task> {
+        vec![
+            producer(),
+            mapped(model_route("gate", &["prepare"], &[]), "prepare", "members"),
+            on(
+                mapped(agent("fix", &["prepare", "gate"]), "prepare", "members"),
+                "gate",
+                "area",
+                &["scheduler"],
+            ),
+            on(
+                mapped(agent("punt", &["prepare", "gate"]), "prepare", "members"),
+                "gate",
+                "area",
+                &["frontend", "uncertain"],
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_task_mapped_over_the_same_list_may_gate_on_a_mapped_route() {
+        plan(mapped_routing()).validate().unwrap();
+    }
+
+    #[test]
+    fn a_when_on_a_mapped_route_needs_a_task_mapped_over_the_same_list() {
+        let mut tasks = mapped_routing();
+        tasks[2] = on(
+            agent("fix", &["prepare", "gate"]),
+            "gate",
+            "area",
+            &["scheduler"],
+        );
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenOnUnalignedRoute {
+                task: "fix".into(),
+                route: "gate".into(),
+                route_over: "prepare.members".into(),
+                task_over: "is not mapped".into(),
+            }
+        );
+        let mut tasks = mapped_routing();
+        tasks[2] = on(
+            mapped(agent("fix", &["prepare", "gate"]), "prepare", "others"),
+            "gate",
+            "area",
+            &["scheduler"],
+        );
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenOnUnalignedRoute {
+                task: "fix".into(),
+                route: "gate".into(),
+                route_over: "prepare.members".into(),
+                task_over: "maps over prepare.others".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_mapped_route_still_has_to_route_every_label() {
+        let mut tasks = mapped_routing();
+        tasks.pop();
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::UnroutedLabels {
+                route: "gate".into(),
+                question: "area".into(),
+                labels: vec!["frontend".into(), "uncertain".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn keyed_narrows_an_object_field_of_an_unmapped_dependency() {
+        let tasks = vec![
+            producer(),
+            keyed(
+                mapped(agent("analyze", &["prepare"]), "prepare", "members"),
+                &[("prepare", "facts")],
+            ),
+        ];
+        plan(tasks).validate().unwrap();
+        let tasks = vec![
+            Task {
+                emits: typed(&[("members", FieldType::List), ("facts", FieldType::Object)]),
+                ..agent("prepare", &[])
+            },
+            keyed(
+                mapped(
+                    model_route(
+                        "gate",
+                        &["prepare"],
+                        &["scheduler", "frontend", "uncertain"],
+                    ),
+                    "prepare",
+                    "members",
+                ),
+                &[("prepare", "facts")],
+            ),
+        ];
+        plan(tasks).validate().unwrap();
+    }
+
+    #[test]
+    fn keyed_is_refused_where_it_cannot_narrow() {
+        let analyze = || mapped(agent("analyze", &["prepare"]), "prepare", "members");
+        let cases: Vec<(Vec<Task>, PlanError)> = vec![
+            (
+                vec![
+                    producer(),
+                    keyed(agent("analyze", &["prepare"]), &[("prepare", "facts")]),
+                ],
+                PlanError::KeyedWithoutOver {
+                    task: "analyze".into(),
+                },
+            ),
+            (
+                vec![
+                    producer(),
+                    agent("other", &[]),
+                    keyed(analyze(), &[("other", "facts")]),
+                ],
+                PlanError::KeyedNotADependency {
+                    task: "analyze".into(),
+                    reference: "other.facts".into(),
+                },
+            ),
+            (
+                vec![
+                    producer(),
+                    Task {
+                        emits: fields(&["facts"]),
+                        ..mapped(agent("probe", &["prepare"]), "prepare", "members")
+                    },
+                    keyed(
+                        mapped(
+                            agent("analyze", &["prepare", "probe"]),
+                            "prepare",
+                            "members",
+                        ),
+                        &[("probe", "facts")],
+                    ),
+                ],
+                PlanError::KeyedFromMapped {
+                    task: "analyze".into(),
+                    reference: "probe.facts".into(),
+                },
+            ),
+            (
+                vec![producer(), keyed(analyze(), &[("prepare", "nope")])],
+                PlanError::KeyedUndeclared {
+                    task: "analyze".into(),
+                    reference: "prepare.nope".into(),
+                    producer: "prepare".into(),
+                    field: "nope".into(),
+                },
+            ),
+            (
+                vec![
+                    agent("prepare", &[]),
+                    keyed(analyze(), &[("prepare", "facts")]),
+                ],
+                PlanError::KeyedUndeclared {
+                    task: "analyze".into(),
+                    reference: "prepare.facts".into(),
+                    producer: "prepare".into(),
+                    field: "facts".into(),
+                },
+            ),
+            (
+                vec![
+                    Task {
+                        emits: typed(&[("members", FieldType::List), ("facts", FieldType::List)]),
+                        ..agent("prepare", &[])
+                    },
+                    keyed(analyze(), &[("prepare", "facts")]),
+                ],
+                PlanError::KeyedNotObject {
+                    task: "analyze".into(),
+                    reference: "prepare.facts".into(),
+                    declared: Box::new(FieldType::List),
+                },
+            ),
+        ];
+        for (tasks, expected) in cases {
+            assert_eq!(plan(tasks).validate().unwrap_err(), expected);
+        }
+    }
+
+    #[test]
+    fn a_route_may_not_depend_on_a_task_named_files() {
+        let tasks = vec![
+            agent("files", &[]),
+            model_route("gate", &["files"], &["scheduler", "frontend", "uncertain"]),
+        ];
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::RouteDependsOnFiles {
+                task: "gate".into()
+            }
+        );
+    }
+
+    fn reading(mut route: Task, files: &[&str]) -> Task {
+        if let TaskKind::Route { decider, .. } = &mut route.task {
+            *decider = Decider::Model {
+                min_confidence: 0.8,
+                files: files.iter().map(|f| (*f).to_string()).collect(),
+            };
+        }
+        route
+    }
+
+    fn with_file(mut task: Task, path: &str, schema: bool) -> Task {
+        task.emits_files.push(DeclaredFile {
+            path: path.into(),
+            schema: schema.then(|| {
+                crucible_contract::emits::JsonSchema::parse(r#"{"type": "object"}"#).unwrap()
+            }),
+        });
+        task
+    }
+
+    #[test]
+    fn a_route_reads_only_files_its_dependencies_declare_with_a_schema() {
+        let all = &["scheduler", "frontend", "uncertain"];
+        plan(vec![
+            with_file(agent("analyze", &[]), "RESULT.json", true),
+            reading(model_route("judge", &["analyze"], all), &["RESULT.json"]),
+        ])
+        .validate()
+        .unwrap();
+        assert_eq!(
+            plan(vec![
+                agent("analyze", &[]),
+                reading(model_route("judge", &["analyze"], all), &["RESULT.json"]),
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::RouteFileUndeclared {
+                task: "judge".into(),
+                path: "RESULT.json".into(),
+            }
+        );
+        assert_eq!(
+            plan(vec![
+                with_file(agent("analyze", &[]), "RESULT.json", false),
+                reading(model_route("judge", &["analyze"], all), &["RESULT.json"]),
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::RouteFileWithoutSchema {
+                task: "judge".into(),
+                path: "RESULT.json".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_route_reads_a_mapped_dependencys_file_only_when_aligned_with_it() {
+        let all = &["scheduler", "frontend", "uncertain"];
+        let analyze = || {
+            with_file(
+                mapped(agent("analyze", &["prepare"]), "prepare", "members"),
+                "RESULT.json",
+                true,
+            )
+        };
+        plan(vec![
+            producer(),
+            analyze(),
+            reading(
+                mapped(
+                    model_route("judge", &["prepare", "analyze"], all),
+                    "prepare",
+                    "members",
+                ),
+                &["RESULT.json"],
+            ),
+        ])
+        .validate()
+        .unwrap();
+        assert_eq!(
+            plan(vec![
+                producer(),
+                analyze(),
+                reading(model_route("judge", &["analyze"], all), &["RESULT.json"]),
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::RouteFileFromUnaligned {
+                task: "judge".into(),
+                path: "RESULT.json".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_mapped_output_route_reads_an_unaligned_source_as_objects_keyed_by_element() {
+        let gate = || {
+            let mut gate = mapped(output_route("gate", "facts", &[]), "prepare", "members");
+            gate.depends_on.push("prepare".into());
+            gate
+        };
+        let routed = |source: Task| {
+            vec![
+                producer(),
+                source,
+                gate(),
+                on(
+                    mapped(agent("act", &["prepare", "gate"]), "prepare", "members"),
+                    "gate",
+                    "area",
+                    &["scheduler", "frontend", "uncertain"],
+                ),
+            ]
+        };
+        plan(routed(Task {
+            emits: typed(&[("area", FieldType::Object)]),
+            ..agent("facts", &[])
+        }))
+        .validate()
+        .unwrap();
+        assert_eq!(
+            plan(routed(Task {
+                emits: typed(&[("area", one_of(&["scheduler", "frontend"]))]),
+                ..agent("facts", &[])
+            }))
+            .validate()
+            .unwrap_err(),
+            PlanError::RouteSourceNotKeyed {
+                task: "gate".into(),
+                route_over: "prepare.members".into(),
+                source_task: "facts".into(),
+                question: "area".into(),
+                declared: Box::new(one_of(&["scheduler", "frontend"])),
+            }
+        );
+    }
+
+    fn score_route(levels: &[&str]) -> Task {
+        use crucible_contract::decision::ChoiceOption;
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(
+                    qid("risk"),
+                    Question {
+                        instructions: "How risky?".into(),
+                        kind: QuestionKind::Score {
+                            levels: levels
+                                .iter()
+                                .map(|l| ChoiceOption {
+                                    label: Label::new(*l).unwrap(),
+                                    description: None,
+                                })
+                                .collect(),
+                        },
+                        drop: Vec::new(),
+                    },
+                )]),
+                decider: Decider::Output {
+                    task: "classify".into(),
+                },
+            },
+            ..agent("gate", &["classify"])
+        }
+    }
+
+    #[test]
+    fn an_output_score_is_answerable_only_by_level_labels() {
+        let check = |levels: &[&str], ty: FieldType| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[("risk", ty)]);
+            plan(vec![classify, score_route(levels)]).validate()
+        };
+        for ok in [
+            one_of(&["low", "high"]),
+            one_of(&["high", "uncertain"]),
+            schema(serde_json::json!({"enum": ["low", "medium"]})),
+        ] {
+            check(&["low", "medium", "high"], ok).unwrap();
+        }
+        for (levels, bad) in [
+            (&["low", "high"][..], FieldType::Boolean),
+            (&["no", "yes"][..], FieldType::Boolean),
+            (
+                &["no", "yes"][..],
+                schema(serde_json::json!({"type": "boolean"})),
+            ),
+            (
+                &["no", "yes"][..],
+                schema(serde_json::json!({"enum": ["no", true]})),
+            ),
+            (&["low", "high"][..], FieldType::String),
+            (&["low", "high"][..], one_of(&["low", "extreme"])),
+        ] {
+            let expected = format!("labels from {}|uncertain", levels.join("|"));
+            assert_eq!(
+                check(levels, bad.clone()).unwrap_err(),
+                PlanError::RouteSourceUnanswerable {
+                    task: "gate".into(),
+                    source_task: "classify".into(),
+                    question: "risk".into(),
+                    declared: Box::new(bad),
+                    expected,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_mapped_output_route_refuses_a_source_mapped_over_another_list() {
+        let mut gate = mapped(
+            output_route("gate", "facts", &["scheduler", "frontend", "uncertain"]),
+            "prepare",
+            "members",
+        );
+        gate.depends_on.push("prepare".into());
+        let facts = Task {
+            emits: typed(&[("area", FieldType::Object)]),
+            ..mapped(agent("facts", &["prepare"]), "prepare", "others")
+        };
+        assert_eq!(
+            plan(vec![producer(), facts, gate]).validate().unwrap_err(),
+            PlanError::RouteSourceMappedUnaligned {
+                task: "gate".into(),
+                source_task: "facts".into(),
+            }
+        );
     }
 }

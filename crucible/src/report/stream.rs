@@ -197,8 +197,7 @@ impl Reporter for SessionReporter {
                     if let AgentEvent::Tokens(t) = ev {
                         // Provisional mid-turn budget line; the loop's turn-end
                         // budget call reconciles it with the authoritative cost.
-                        let spent = budget.spent_before
-                            + crate::agent::event::provisional_cost(args.model(), t);
+                        let spent = budget.spent_before + args.pricing().provisional(t);
                         budget.record_provisional(it, spent);
                         sink.write_event(&SessionEvent::Budget {
                             spent,

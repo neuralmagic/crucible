@@ -85,6 +85,7 @@ impl ShellRunner {
     ) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
+        crate::inference::withhold_from_task(&mut cmd);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -192,7 +193,7 @@ impl ShellRunner {
             }
             TaskKind::Route {
                 questions,
-                decider: Decider::Model { min_confidence },
+                decider: Decider::Model { min_confidence, .. },
             } => {
                 let inference = match crate::inference::from_process_env() {
                     Ok(inference) => inference,
@@ -205,7 +206,7 @@ impl ShellRunner {
                     );
                 };
                 let endpoint =
-                    match crucible_broker::systemone::Endpoint::from_binding(binding, |name| {
+                    match crucible_broker::decide::Endpoint::from_binding(binding, |name| {
                         std::env::var(name).ok()
                     }) {
                         Ok(endpoint) => endpoint,
@@ -243,15 +244,19 @@ impl ShellRunner {
         };
         let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let output = last_json_line(&stdout).filter(Value::is_object);
+            let reason = output
+                .as_ref()
+                .and_then(|o| o.get(crate::plan::ir::NOTE_FIELD))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|note| !note.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| stderr_tail(&String::from_utf8_lossy(&out.stderr)));
             return Attempt {
                 outcome: AttemptOutcome::Fail {
-                    note: format!(
-                        "exit {}: {}",
-                        out.status.code().unwrap_or(-1),
-                        stderr_tail(&stderr)
-                    ),
-                    output: last_json_line(&stdout).filter(Value::is_object),
+                    note: format!("exit {}: {reason}", out.status.code().unwrap_or(-1)),
+                    output,
                 },
                 cost_usd: 0.0,
                 repairs: Vec::new(),
@@ -505,11 +510,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -530,11 +537,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -662,6 +671,43 @@ mod tests {
         assert!(r.note.as_ref().unwrap().contains("doomed"));
     }
 
+    /// A command that exits nonzero and says why in its result's `note` is recorded with that
+    /// reason, not its stderr; a blank note falls back to the stderr tail.
+    #[test]
+    fn a_nonzero_exit_records_the_note_its_result_states() {
+        let out = run_plan(
+            vec![command(
+                "boom",
+                r#"echo '{"pass": false, "note": "  the layer cannot package test paths "}'; echo doomed >&2; exit 2"#,
+                &[],
+            )],
+            None,
+        );
+        let r = &out.results[&"boom".into()];
+        assert_eq!(r.status, TaskStatus::Fail);
+        assert_eq!(
+            r.note.as_deref(),
+            Some("exit 2: the layer cannot package test paths")
+        );
+        assert_eq!(r.output.as_ref().unwrap()["pass"], false);
+
+        for printed in [r#"{"note": "  "}"#, r#"{"note": 7}"#] {
+            let out = run_plan(
+                vec![command(
+                    "boom",
+                    &format!("echo '{printed}'; echo doomed >&2; exit 2"),
+                    &[],
+                )],
+                None,
+            );
+            assert_eq!(
+                out.results[&"boom".into()].note.as_deref(),
+                Some("exit 2: doomed"),
+                "{printed}"
+            );
+        }
+    }
+
     /// A payload is a bonus, never a second failure mode: unparsable or non-object output leaves
     /// the failure exactly as it was.
     #[test]
@@ -751,11 +797,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -787,11 +835,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -830,11 +880,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -862,11 +914,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -903,11 +957,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut r = ShellRunner {
             workdir: std::env::temp_dir(),
@@ -944,11 +1000,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -977,11 +1035,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(
             vec![t],
@@ -1020,11 +1080,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             history: Some(4),
             timeout: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut r = ShellRunner {
             agent_cmd: Some(
@@ -1098,11 +1160,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -1131,11 +1195,13 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(
             vec![

@@ -11,6 +11,8 @@ use sqlx::PgPool;
 pub const EDITOR_KIND: &str = "editor";
 /// The `kind` the pickers' stars and filters live under.
 pub const PICKERS_KIND: &str = "pickers";
+/// Which notices a user has seen, by notice: `{"agent_tools": "<revision>"}`.
+pub const NOTICES_KIND: &str = "notices";
 
 /// One user's document of that kind, or `None` when they never saved one.
 pub async fn get(pool: &PgPool, user: &str, kind: &str) -> Result<Option<serde_json::Value>> {

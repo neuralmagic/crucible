@@ -1,7 +1,7 @@
 //! `PUT /api/runs/{run_id}/session` — ingest (or re-ingest) the session log of an external run:
-//! one the controller did NOT dispatch (a harness-launched loop pod). The pod-bound drop-box
-//! can't serve these — the pod and its projected token are gone by the time a human decides the
-//! run is worth keeping — so this is the operator approval: admin-gated, ledgered, and a re-upload
+//! one the controller did NOT dispatch (a harness-launched loop pod). The pod's own token
+//! can't serve these — the controller never minted one, and the pod is gone by the time a human
+//! decides the run is worth keeping — so this is the operator approval: admin-gated, ledgered, and a re-upload
 //! REPLACES the run in place (same patch-not-skip contract as `POST /api/emissions/run`).
 //!
 //! The body is the raw session NDJSON (the wrapper's SESSION dump / `state/session.jsonl`).

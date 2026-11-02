@@ -1,0 +1,16 @@
+# The build-and-run smoke pack: one sandboxed agent turn that writes a program, builds and pushes
+# it through the run's `buildit`, runs it as a Kueue Job through `kueue`, and reads its log.
+[agent]
+backend       = "openshell"
+harness       = "claude"
+model         = "claude-sonnet-5"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-go-cgo-cc@sha256:33cc058e97a0f9fded61d6c2a4584cc189854a0c6e0576215e8f6c0ba2a44628"
+goal          = "Build a program with buildit, run it as a Kueue Job through kueue, and report its log."
+
+# The images are linux/amd64.
+[agent.resources]
+node_selector = { "kubernetes.io/arch" = "amd64" }
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

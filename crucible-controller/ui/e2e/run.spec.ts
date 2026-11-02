@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { RETRY_RUN, stubApi, TRIAGE_RUN } from './api';
+import { RETRY_RUN, ROUTE_RUN, stubApi, TRIAGE_RUN } from './api';
 
 const RUN = '/runs/RUN-0412';
 
@@ -21,9 +21,10 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph).toBeVisible();
-    // Instances hang off their mapped task and become the producers for its downstream edge; the
-    // seventh edge reaches the marker for a revision that stored no exposure.
-    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(7);
+    // Instances are rows under their mapped task, which places them with no edge of their own, and
+    // become the producers for its downstream edge; the fifth edge reaches the marker for a
+    // revision that stored no exposure.
+    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(5);
 
     const read = graph.locator('[data-task="read"]');
     await expect(read).toContainText('pass');
@@ -34,8 +35,46 @@ test.describe('the run task graph', () => {
 
     const failed = graph.locator('[data-task="summarize[flashinfer]"]');
     await expect(failed).toContainText('fail');
+    await expect(failed).toHaveAttribute('data-status', 'fail');
+    await expect(failed.locator('[data-mark="fail"]')).toBeVisible();
     await expect(graph.locator('[data-task="summarize[paged-attention]"]')).toContainText('pass');
-    await expect(page.getByText('red = failed')).toBeVisible();
+    await expect(read.locator('[data-mark="pass"]')).toBeVisible();
+    // The status is the colour and the dot, not a word; the glyph says what runs the task.
+    await expect(read.getByText('pass', { exact: true })).toBeHidden();
+    await expect(page.getByText('red = failed')).toHaveCount(0);
+  });
+
+  /// A mapped route reads as a decision, tallies what its instances answered, and the fix aligned
+  /// with it counts the elements its when left out apart from the one that failed.
+  test('draws a mapped route, its answers, and the per-element edges it feeds', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${ROUTE_RUN}`);
+
+    const graph = page.getByTestId('workflow-graph');
+    const route = graph.locator('[data-task="triage"]');
+    await expect(route).toContainText('DECIDE');
+    await expect(route).toContainText('over scan.items ≤120');
+    await expect(route).toContainText('tier: skip 2 · high 1 · low 1');
+    await expect(graph.locator('[data-task="triage[a]"]')).toContainText('high');
+    await expect(graph.locator('[data-task="fix"]')).toContainText(
+      '4 · 1 passed · 2 not taken · 1 failed'
+    );
+    // Each paired edge carries the answer that let its instance through; the deck-to-deck edge,
+    // which would say it again, is not drawn.
+    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'tier: high' }).first()).toBeVisible();
+    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'tier: high|low' })).toHaveCount(0);
+    // What an edge carries shows only while it is traced.
+    await expect(graph.locator('[data-plumbing]')).toHaveCount(0);
+    await graph.locator('[data-task="fix"]').hover();
+    await expect(graph.locator('[data-plumbing]').filter({ hasText: 'notes[item]' }).first()).toBeVisible();
+    await page.mouse.move(0, 0);
+    await expect(graph.locator('[data-plumbing]')).toHaveCount(0);
+    await expect(page.getByText('double line = per element')).toHaveCount(0);
+
+    await route.click();
+    const panel = page.getByRole('complementary', { name: 'Task triage' });
+    await expect(panel).toContainText('narrows');
+    await expect(panel).toContainText('scan.notes');
   });
 
   /// A mapped task is the fan-out, not the work: it says MAP, and the instances under it say what
@@ -50,7 +89,7 @@ test.describe('the run task graph', () => {
     await expect(deck).toContainText('over read.papers ≤8');
     await expect(graph.locator('[data-task="summarize[flashinfer]"]')).toContainText('CMD');
     await expect(graph.locator('[data-task="read"]')).toContainText('AGENT');
-    await expect(page.getByText('MAP = mapped over a producer field')).toBeVisible();
+    await expect(page.getByText('MAP = mapped over a producer field')).toHaveCount(0);
   });
 
   /// The case the badge exists for: a mapped agent task whose deck runs nothing itself.
@@ -72,7 +111,7 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph.locator('[data-fanout="summarize"]')).toHaveText(
-      '1 of 3 passed · 1 fail · 1 pending',
+      '3 · 1 passed · 1 failed · 1 pending',
     );
     await expect(graph.locator('[data-task="file"]')).toContainText('pending');
 
@@ -94,7 +133,7 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph.locator('[data-fanout="triage"]')).toHaveText(
-      '2 of 20 passed · 18 never started',
+      '20 · 2 passed · 18 never started',
     );
   });
 
@@ -175,12 +214,15 @@ test.describe('the run task graph', () => {
   });
 });
 
+const openGrid = (page: Page) => page.locator('summary', { hasText: 'Grid' }).click();
+
 test.describe('the run task grid', () => {
   /// The grid holds what the graph drops: every attempt, in the column of the iteration it came
   /// from. `read` failed on iter 0 and passed on iter 1, and both squares are there to see.
   test('draws every attempt as tasks down and iterations across', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     const grid = page.getByTestId('run-grid');
     await expect(grid).toBeVisible();
@@ -216,14 +258,16 @@ test.describe('the run task grid', () => {
   test('totals duration and cost across a retried task', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     const grid = page.getByTestId('run-grid');
     const row = grid.locator('[data-task-row="read"]');
     // 31s on iter 0 plus 240s on iter 1.
     await expect(row.locator('xpath=following-sibling::*[1]')).toHaveAttribute('title', '4m 31s');
 
-    await expect(page.getByText('pass 3', { exact: true })).toBeVisible();
-    await expect(page.getByText('fail 2', { exact: true })).toBeVisible();
+    const summary = page.locator('summary', { hasText: 'Grid' });
+    await expect(summary).toContainText('5 attempts · 2 failed · 3 passed');
+    await expect(summary.getByText('· 2 failed')).toHaveClass(/text-red/);
   });
 
   /// What an agent instance actually ran with, beside the attempt it ran. The mapped parent runs
@@ -232,6 +276,7 @@ test.describe('the run task grid', () => {
   test('names the provider, model and effort each agent task ran with', async ({ page }) => {
     await stubApi(page);
     await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+    await openGrid(page);
 
     const grid = page.getByTestId('run-grid');
     const cell = (task: string, col: string) =>
@@ -257,6 +302,7 @@ test.describe('the run task grid', () => {
   test('melds a run of attempts that ended the same way', async ({ page }) => {
     await stubApi(page);
     await ready(page, `/runs/${RETRY_RUN}`);
+    await openGrid(page);
 
     const row = page.getByTestId('run-grid').locator('[data-task="probe"]');
     await expect(row).toHaveCount(3);
@@ -273,6 +319,7 @@ test.describe('the run task grid', () => {
   test('opens the first attempt of a melded block', async ({ page }) => {
     await stubApi(page);
     await ready(page, `/runs/${RETRY_RUN}`);
+    await openGrid(page);
 
     await page.getByTestId('run-grid').locator('[data-task="probe"]').nth(2).click();
     await expect(page.getByText('iter 6', { exact: true })).toBeVisible();
@@ -282,6 +329,7 @@ test.describe('the run task grid', () => {
   test('opens a picked attempt and its evidence', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     await page
       .getByTestId('run-grid')
@@ -291,6 +339,21 @@ test.describe('the run task grid', () => {
     // The picked cell says what the attempt reported, and its evidence opens beneath.
     await expect(page.getByRole('paragraph').filter({ hasText: 'no citations parsed' })).toBeVisible();
     await expect(page.getByTestId('task-result')).toContainText('at summarize.sh:14');
+  });
+});
+
+test.describe('the run header', () => {
+  /// The run id is cut to fit the header line and copies whole.
+  test('copies the whole run id from its cut chip', async ({ page, context }) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const chip = page.getByRole('button', { name: 'Copy RUN-0412' });
+    await expect(chip).toHaveAttribute('title', 'RUN-0412');
+    await chip.click();
+    await expect(chip).toHaveText(/copied/);
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('RUN-0412');
   });
 });
 
@@ -306,7 +369,7 @@ test.describe('external results', () => {
     await stubApi(page);
     await ready(page, RUN);
 
-    const section = sectionOf(page, 'Links');
+    const section = page.getByTestId('run-links');
     await expect(section.getByRole('link')).toHaveCount(6);
 
     const pr = section.getByRole('link', { name: /#412/ });
@@ -323,6 +386,7 @@ test.describe('external results', () => {
   test('shows a picked attempt its own links', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     const attempts = sectionOf(page, 'Grid');
     await page.getByTestId('run-grid').locator('[data-task="rank"][data-iter="1"]').click();

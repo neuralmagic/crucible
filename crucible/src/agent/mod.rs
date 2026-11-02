@@ -29,7 +29,7 @@ pub(crate) mod relay;
 pub(crate) mod tool_chain;
 pub(crate) mod turn;
 
-use crate::agent::event::{AgentEvent, RawStream, Tokens, estimate_cost};
+use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
 use crate::args::{Args, Paths};
 #[cfg(feature = "autoresearch")]
@@ -42,8 +42,8 @@ use std::thread;
 
 use crate::agent::tool_chain::ToolChain;
 use crate::agent::turn::{
-    PumpEnd, StreamPump, TurnFailure, TurnOutcome, account, ended_turn, otel_enabled, otel_forward,
-    report_chain, stop_event, tool_io_full,
+    PumpEnd, StreamPump, TurnCost, TurnFailure, TurnOutcome, ended_turn, otel_enabled,
+    otel_forward, report_chain, stop_event, tool_io_full,
 };
 
 /// Where a turn's events come from. Resolved once from [`Args`] (see
@@ -140,6 +140,7 @@ fn command_backend(
     session: Option<&crate::agent::agent_session::SessionTurn>,
 ) -> Command {
     let mut c = Command::new("sh");
+    crucible::inference::withhold_from_task(&mut c);
     c.arg("-c")
         .arg(cmd)
         .current_dir(&p.workspace)
@@ -194,6 +195,7 @@ fn local_command(
         return Err(std::io::Error::other("harness produced an empty argv"));
     };
     let mut cmd = Command::new(program);
+    crucible::inference::withhold_from_task(&mut cmd);
     cmd.args(rest)
         .current_dir(&p.workspace)
         .stdin(Stdio::null())
@@ -333,9 +335,7 @@ fn run_turn_with(
         lines
     });
 
-    let mut cost = 0.0_f64;
-    // Highest cumulative token sample seen, for the estimate fallback below.
-    let mut best_tokens: Option<Tokens> = None;
+    let mut cost = TurnCost::new(args.pricing());
     let mut stopped = None;
     if let Some(out) = stdout {
         if matches!(source, AgentSource::LocalClaude) {
@@ -347,10 +347,10 @@ fn run_turn_with(
                 backend.decoder(args, meters.as_ref(), full),
                 (!full).then(|| backend.decoder(args, None, true)),
                 ToolChain::for_args(args),
+                args.pricing(),
             );
             let end = pump_stream(out, json, pump, &mut sink);
             cost = end.cost;
-            best_tokens = end.best_tokens;
             stopped = end.stopped;
             if stopped.is_some() {
                 child.kill();
@@ -360,7 +360,7 @@ fn run_turn_with(
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let ev = line_event(&line, RawStream::Stdout);
                 if let Some(e) = ev.as_ref() {
-                    account(e, &mut cost, &mut best_tokens);
+                    cost.observe(e);
                 }
                 sink(&line, RawStream::Stdout, ev.as_ref());
                 if let Some(reason) = ev.as_ref().and_then(|e| chain.observe(e)) {
@@ -381,7 +381,7 @@ fn run_turn_with(
         for line in errlines {
             let ev = line_event(&line, RawStream::Stderr);
             if let Some(e) = ev.as_ref() {
-                account(e, &mut cost, &mut best_tokens);
+                cost.observe(e);
             }
             sink(&line, RawStream::Stderr, ev.as_ref());
         }
@@ -394,35 +394,26 @@ fn run_turn_with(
         && let Some(artifacts) = args.harness().backend().local_backfill(p)
     {
         for ev in &artifacts.events {
-            account(ev, &mut cost, &mut best_tokens);
+            cost.observe(ev);
             sink("", RawStream::Stdout, Some(ev));
         }
         if let Some(c) = artifacts.cost_usd {
-            cost = cost.max(c);
+            cost.report(c);
         }
     }
 
     // The agent has fully exited, so its last OTLP export has landed: roll the capture up into the
-    // `otel_summary` event (authoritative cost, per-model usage, API latency, active time). The
-    // event finally has a producer again. Routed through `account` so `cost_of`'s prefer-OTEL rule
-    // puts the authoritative number on the turn's cost.
+    // `otel_summary` event (authoritative cost, per-model usage, API latency, active time).
     if let Some(collector) = collector {
         if let Some(summary) = collector.summary() {
             let ev = summary.to_event();
-            account(&ev, &mut cost, &mut best_tokens);
+            cost.observe(&ev);
             sink("", RawStream::Stdout, Some(&ev));
         }
         collector.stop();
     }
 
-    // No authoritative cost (telemetry off, or the OpenShell sandbox runs without the local
-    // collector) but tokens flowed, estimate from model pricing so `--max-cost` budgeting still
-    // has a signal. The agent's real number wins whenever `result`/OTEL reported one above.
-    if cost == 0.0
-        && let Some(t) = &best_tokens
-    {
-        cost = estimate_cost(args.model(), t);
-    }
+    let cost = cost.total();
     match killed_at {
         Some(deadline) => TurnOutcome::failed(cost, TurnFailure::DeadlineExceeded(deadline)),
         None => ended_turn(cost, stopped),
@@ -445,10 +436,9 @@ fn line_event(line: &str, stream: RawStream) -> Option<AgentEvent> {
 }
 
 /// Stream agent stdout from `reader` through `pump`, driving `sink`, until the stream ends or the
-/// pump's tool chain ends the turn. The
-/// local-child wrapper around [`StreamPump`]: it loops `BufReader` lines into the pump. Used by
-/// the local path ([`run_turn_with`]); the openshell `sandbox exec` path drives a
-/// [`StreamPump`] directly off its gRPC stream.
+/// pump's tool chain ends the turn. The local-child wrapper around [`StreamPump`]: it loops
+/// `BufReader` lines into the pump. Used by the local path ([`run_turn_with`]); the openshell
+/// `sandbox exec` path drives a [`StreamPump`] directly off its gRPC stream.
 pub(crate) fn pump_stream(
     reader: impl Read,
     json: bool,

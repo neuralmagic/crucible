@@ -1,8 +1,8 @@
-//! The model-decided half of a route task: one System One call, recorded as the task's output.
+//! The model-decided half of a route task: one decision API call, recorded as the task's output.
 
 use std::collections::BTreeMap;
 
-use crucible_broker::systemone::{DecideError, Endpoint, decide};
+use crucible_broker::decide::{DecideError, Endpoint, decide};
 use crucible_contract::TransportCause;
 use crucible_contract::decision::{Question, QuestionId};
 use serde_json::Value;

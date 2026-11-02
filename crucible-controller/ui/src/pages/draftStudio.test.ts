@@ -3,6 +3,7 @@ import { NO_AGENT_PICK } from './agentPick';
 import type { ParamFieldSpec } from './playbookLaunchForm';
 import {
   anchorOf,
+  cloneDraftBody,
   draftLaunchBody,
   EMPTY_STUDIO,
   flaggedFiles,
@@ -312,10 +313,24 @@ describe('a draft names what it is based on', () => {
   });
 });
 
+describe('cloneDraftBody', () => {
+  it('sends only the id when description and token are blank', () => {
+    expect(cloneDraftBody({ to: ' survey-v2 ', description: '  ', vaultToken: ' ' })).toEqual({
+      id: 'survey-v2',
+    });
+  });
+
+  it('trims a description and a token it sends', () => {
+    expect(
+      cloneDraftBody({ to: 'copy', description: ' a variant ', vaultToken: ' hvs.aaa ' })
+    ).toEqual({ id: 'copy', description: 'a variant', vault_token: 'hvs.aaa' });
+  });
+});
+
 describe('draftLaunchBody', () => {
   const specs: ParamFieldSpec[] = [
-    { name: 'topic', valueType: 'string', required: true, defaultValue: null, pattern: null, description: null },
-    { name: 'depth', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null },
+    { name: 'topic', valueType: 'string', required: true, defaultValue: null, pattern: null, description: null, multiline: false },
+    { name: 'depth', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
   ];
   const ceilings = { maxCost: 2.5, maxTime: ' 30m ', schemaDigest: 'sha256:bb' };
 

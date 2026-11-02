@@ -6,6 +6,7 @@
 //! logic: the authoritative-vs-estimated cost extraction and the pricing-table fallback estimate.
 
 pub use crucible_contract::event::{AgentEvent, RawStream, Tokens};
+use crucible_contract::inference::TokenPrice;
 
 /// The cumulative run cost this event reports, if any. Prefers authoritative
 /// numbers (OTEL summary, result, OTEL-on-tokens) and falls back to the pretty
@@ -26,18 +27,120 @@ pub fn cost_of(ev: &AgentEvent) -> Option<f64> {
     }
 }
 
-/// Per-token USD prices: (input, output, cache_read, cache_write).
+/// USD per token for each billed bucket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
+impl Rates {
+    const FREE: Rates = Rates {
+        input: 0.0,
+        output: 0.0,
+        cache_read: 0.0,
+        cache_write: 0.0,
+    };
+
+    fn per_mtok(input: f64, output: f64, cache_read: f64, cache_write: f64) -> Rates {
+        let per = 1e-6;
+        Rates {
+            input: input * per,
+            output: output * per,
+            cache_read: cache_read * per,
+            cache_write: cache_write * per,
+        }
+    }
+
+    pub fn cost(&self, t: &Tokens) -> f64 {
+        t.input as f64 * self.input
+            + t.output as f64 * self.output
+            + t.cache_read as f64 * self.cache_read
+            + t.cache_write as f64 * self.cache_write
+    }
+}
+
+impl From<&TokenPrice> for Rates {
+    fn from(price: &TokenPrice) -> Rates {
+        Rates::per_mtok(
+            price.input.get(),
+            price.output.get(),
+            price.cache_read.get(),
+            price.cache_write.get(),
+        )
+    }
+}
+
+/// How a turn's tokens become dollars (RFC-0001 C-INFERENCE).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Pricing {
+    /// A vendor-billed model: the cost the harness reports is authoritative, and these rates
+    /// estimate a turn that reported none.
+    Vendor(Rates),
+    /// Tokens times these rates whatever the harness reports: the agent binding's price, or
+    /// nothing for a model no vendor bills.
+    Fixed(Rates),
+}
+
+impl Pricing {
+    pub fn resolve(model: &str, price: Option<&TokenPrice>) -> Pricing {
+        match price {
+            Some(price) => Pricing::Fixed(price.into()),
+            None => vendor_rates(model).map_or(Pricing::Fixed(Rates::FREE), Pricing::Vendor),
+        }
+    }
+
+    fn rates(&self) -> &Rates {
+        match self {
+            Pricing::Vendor(rates) | Pricing::Fixed(rates) => rates,
+        }
+    }
+
+    /// The turn's cumulative cost one mid-turn token sample implies.
+    #[cfg(feature = "autoresearch")]
+    pub fn provisional(&self, t: &Tokens) -> f64 {
+        match self {
+            Pricing::Vendor(rates) => t.cost_usd.unwrap_or_else(|| rates.cost(t)),
+            Pricing::Fixed(rates) => rates.cost(t),
+        }
+    }
+
+    /// The turn's cumulative cost `ev` implies, if it implies one.
+    #[cfg(feature = "autoresearch")]
+    pub fn sample(&self, ev: &AgentEvent) -> Option<f64> {
+        let reported = match self {
+            Pricing::Vendor(_) => cost_of(ev),
+            Pricing::Fixed(_) => None,
+        };
+        reported.or(match ev {
+            AgentEvent::Tokens(t) => Some(self.provisional(t)),
+            _ => None,
+        })
+    }
+
+    /// What a finished turn cost, from the highest cost its harness reported and its largest
+    /// token sample.
+    pub fn settle(&self, reported: f64, tokens: Option<&Tokens>) -> f64 {
+        match self {
+            Pricing::Vendor(_) if reported > 0.0 => reported,
+            Pricing::Vendor(_) | Pricing::Fixed(_) => tokens.map_or(0.0, |t| self.rates().cost(t)),
+        }
+    }
+}
+
+/// Per-token USD prices for a vendor-billed model, `None` for any other.
 /// Anthropic: cache_read ≈ 0.1× input, cache_write ≈ 1.25× input (default 5-min ephemeral).
 /// OpenAI: cached input is 0.1× input and there is no cache-write premium (1.0× input).
 /// Sources: claude-api pricing (Opus 4.x $5/$25, Sonnet 4.6 $3/$15, Haiku 4.5 $1/$5 per MTok) and
 /// OpenAI's published per-MTok rates (see [`openai_prices`]). A name from neither family is a
 /// self-hosted model reached through a custom endpoint (qwen on an in-house MaaS, say): its
 /// tokens are counted but priced at nothing, since no vendor bills for them.
-fn model_prices(model: &str) -> (f64, f64, f64, f64) {
+fn vendor_rates(model: &str) -> Option<Rates> {
     let m = model.to_ascii_lowercase();
-    let per = 1e-6;
     if let Some((input, output)) = openai_prices(&m) {
-        return (input * per, output * per, input * 0.1 * per, input * per);
+        return Some(Rates::per_mtok(input, output, input * 0.1, input));
     }
     let (input, output) = if m.contains("haiku") {
         (1.0, 5.0)
@@ -48,14 +151,9 @@ fn model_prices(model: &str) -> (f64, f64, f64, f64) {
         // unrecognized Anthropic name never under-charges the budget line.
         (5.0, 25.0)
     } else {
-        return (0.0, 0.0, 0.0, 0.0);
+        return None;
     };
-    (
-        input * per,
-        output * per,
-        input * 0.1 * per,
-        input * 1.25 * per,
-    )
+    Some(Rates::per_mtok(input, output, input * 0.1, input * 1.25))
 }
 
 /// The (input, output) per-MTok rate for an OpenAI model the codex harness can run, or `None` when
@@ -77,23 +175,9 @@ fn openai_prices(m: &str) -> Option<(f64, f64)> {
     }
 }
 
-#[cfg(feature = "autoresearch")]
-/// The turn's provisional cost from one mid-turn token sample: the OTEL number when
-/// telemetry stamped one, otherwise the pricing-table estimate. Reconciled by the
-/// authoritative turn-end cost, so streaming this keeps the budget line moving
-/// inside a turn without changing what the run ultimately charges.
-pub fn provisional_cost(model: &str, t: &Tokens) -> f64 {
-    t.cost_usd.unwrap_or_else(|| estimate_cost(model, t))
-}
-
-/// Estimate the run cost so far from the live token counts × model pricing.
-/// Replaced by the agent's authoritative number once `result`/OTEL reports it.
+/// Estimate the run cost so far from the live token counts × the vendor table.
 pub fn estimate_cost(model: &str, t: &Tokens) -> f64 {
-    let (pin, pout, pcr, pcw) = model_prices(model);
-    t.input as f64 * pin
-        + t.output as f64 * pout
-        + t.cache_read as f64 * pcr
-        + t.cache_write as f64 * pcw
+    vendor_rates(model).map_or(0.0, |rates| rates.cost(t))
 }
 
 #[cfg(test)]
@@ -174,14 +258,145 @@ mod tests {
         assert_eq!(openai_prices("gpt-5.2-codex"), Some((1.75, 14.0)));
     }
 
+    fn price(input: f64, output: f64, cache_read: f64, cache_write: f64) -> TokenPrice {
+        let usd = |v| crucible_contract::inference::UsdPerMtok::new(v).unwrap();
+        TokenPrice {
+            input: usd(input),
+            output: usd(output),
+            cache_read: usd(cache_read),
+            cache_write: usd(cache_write),
+        }
+    }
+
+    fn turn_tokens() -> Tokens {
+        Tokens {
+            input: 2_000_000,
+            output: 500_000,
+            cache_read: 10_000_000,
+            cache_write: 1_000_000,
+            total: 13_500_000,
+            rate: None,
+            cost_usd: Some(25.0),
+        }
+    }
+
     #[cfg(feature = "autoresearch")]
     #[test]
-    fn provisional_prefers_the_authoritative_sample_cost() {
+    fn provisional_prefers_the_authoritative_sample_cost_for_a_vendor_model() {
+        let pricing = Pricing::resolve("claude-opus-4-6", None);
         let mut t = sample();
         t.cost_usd = Some(0.42);
-        assert!((provisional_cost("claude-opus-4-6", &t) - 0.42).abs() < 1e-9);
+        assert!((pricing.provisional(&t) - 0.42).abs() < 1e-9);
         t.cost_usd = None;
         let est = estimate_cost("claude-opus-4-6", &t);
-        assert!((provisional_cost("claude-opus-4-6", &t) - est).abs() < 1e-9);
+        assert!((pricing.provisional(&t) - est).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_self_hosted_model_settles_at_zero_whatever_the_harness_reports() {
+        for model in ["zai-org/glm-5", "deepseek-ai/DeepSeek-V4"] {
+            let pricing = Pricing::resolve(model, None);
+            assert_eq!(pricing, Pricing::Fixed(Rates::FREE), "{model}");
+            assert_eq!(pricing.settle(25.0, Some(&turn_tokens())), 0.0, "{model}");
+        }
+    }
+
+    #[cfg(feature = "autoresearch")]
+    #[test]
+    fn a_live_sample_follows_the_turns_pricing() {
+        let result = AgentEvent::Result {
+            subtype: "success".into(),
+            is_error: false,
+            turns: 3,
+            cost_usd: 25.0,
+            error: None,
+        };
+        let glm = Pricing::resolve("zai-org/glm-5", None);
+        assert_eq!(glm.provisional(&turn_tokens()), 0.0);
+        assert_eq!(glm.sample(&result), None);
+        assert_eq!(glm.sample(&AgentEvent::Tokens(turn_tokens())), Some(0.0));
+        let sonnet = Pricing::resolve("claude-sonnet-4-6", None);
+        assert_eq!(sonnet.sample(&result), Some(25.0));
+        assert_eq!(sonnet.provisional(&turn_tokens()), 25.0);
+        let priced = Pricing::resolve("zai-org/glm-5", Some(&price(1.0, 1.0, 1.0, 1.0)));
+        assert_eq!(priced.sample(&result), None);
+        assert!((priced.provisional(&turn_tokens()) - 13.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_vendor_model_keeps_the_harness_cost_and_estimates_only_without_one() {
+        let pricing = Pricing::resolve("claude-sonnet-4-6", None);
+        assert!(matches!(pricing, Pricing::Vendor(_)));
+        assert_eq!(pricing.settle(25.0, Some(&turn_tokens())), 25.0);
+        let est = estimate_cost("claude-sonnet-4-6", &turn_tokens());
+        assert!(est > 0.0);
+        assert!((pricing.settle(0.0, Some(&turn_tokens())) - est).abs() < 1e-9);
+        assert_eq!(pricing.settle(0.0, None), 0.0);
+    }
+
+    #[test]
+    fn a_binding_price_settles_at_tokens_times_price_for_any_model() {
+        let glm = price(0.6, 2.2, 0.11, 0.75);
+        let want = 2.0 * 0.6 + 0.5 * 2.2 + 10.0 * 0.11 + 1.0 * 0.75;
+        for model in ["zai-org/glm-5", "claude-opus-4-6", "gpt-5.6-sol"] {
+            let pricing = Pricing::resolve(model, Some(&glm));
+            assert!(matches!(pricing, Pricing::Fixed(_)), "{model}");
+            let got = pricing.settle(25.0, Some(&turn_tokens()));
+            assert!((got - want).abs() < 1e-9, "{model}: got {got}, want {want}");
+            assert_eq!(pricing.settle(25.0, None), 0.0, "{model}");
+        }
+    }
+
+    #[test]
+    fn a_binding_price_bills_each_cache_bucket_at_its_own_rate() {
+        let only = |t: Tokens| {
+            Pricing::resolve("glm", Some(&price(1.0, 2.0, 3.0, 4.0))).settle(0.0, Some(&t))
+        };
+        let zero = Tokens {
+            input: 0,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            total: 0,
+            rate: None,
+            cost_usd: None,
+        };
+        let mtok = 1_000_000;
+        for (tokens, want) in [
+            (
+                Tokens {
+                    input: mtok,
+                    ..zero.clone()
+                },
+                1.0,
+            ),
+            (
+                Tokens {
+                    output: mtok,
+                    ..zero.clone()
+                },
+                2.0,
+            ),
+            (
+                Tokens {
+                    cache_read: mtok,
+                    ..zero.clone()
+                },
+                3.0,
+            ),
+            (
+                Tokens {
+                    cache_write: mtok,
+                    ..zero.clone()
+                },
+                4.0,
+            ),
+        ] {
+            let got = only(tokens.clone());
+            assert!(
+                (got - want).abs() < 1e-9,
+                "{tokens:?}: got {got}, want {want}"
+            );
+        }
     }
 }

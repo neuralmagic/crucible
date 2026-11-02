@@ -326,23 +326,52 @@ const TRUSTED_ASSOCIATIONS: &[&str] = &["OWNER", "MEMBER", "COLLABORATOR"];
 #[derive(Debug, Clone, Default)]
 pub struct Authz {
     allow_users: Vec<String>,
+    /// GitHub login (lowercased) to crucible login, for the people an operator has paired.
+    logins: std::collections::BTreeMap<String, String>,
 }
 
 impl Authz {
-    /// Read the allowlist from `CONTROLLER_APPROVERS` (comma-separated logins); empty falls back to
-    /// the trusted-association gate.
+    /// Read the allowlist from `CONTROLLER_APPROVERS` (comma-separated logins; empty falls back to
+    /// the trusted-association gate) and the GitHub-to-crucible login pairs from
+    /// `CONTROLLER_GITHUB_LOGINS` (`<github login>=<crucible login>`, comma-separated).
     pub(crate) fn from_env() -> Self {
-        let allow_users = std::env::var("CONTROLLER_APPROVERS")
-            .ok()
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default();
-        Authz { allow_users }
+        Self::from_lookup(|var| std::env::var(var).ok())
+    }
+
+    pub(crate) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let list = |var: &str| -> Vec<String> {
+            get(var)
+                .map(|s| {
+                    s.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut logins = std::collections::BTreeMap::new();
+        for pair in list("CONTROLLER_GITHUB_LOGINS") {
+            match pair.split_once('=') {
+                Some((github, login)) if !github.trim().is_empty() && !login.trim().is_empty() => {
+                    logins.insert(github.trim().to_lowercase(), login.trim().to_string());
+                }
+                _ => tracing::warn!(
+                    entry = pair,
+                    "CONTROLLER_GITHUB_LOGINS entry is not <github login>=<crucible login>; ignored"
+                ),
+            }
+        }
+        Authz {
+            allow_users: list("CONTROLLER_APPROVERS"),
+            logins,
+        }
+    }
+
+    /// The crucible login an operator paired with GitHub login `github`, matched
+    /// case-insensitively.
+    pub(crate) fn crucible_login(&self, github: &str) -> Option<&str> {
+        self.logins.get(&github.to_lowercase()).map(String::as_str)
     }
 
     /// Is `login` (carrying repo `assoc`) allowed? Allowlist wins when present; else the association
@@ -362,7 +391,24 @@ impl Authz {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::issues::github::*;
+
+    #[test]
+    fn github_logins_pair_only_what_the_operator_listed() {
+        let authz = Authz::from_lookup(|var| {
+            (var == "CONTROLLER_GITHUB_LOGINS")
+                .then(|| " Maint=alice, broken , =nobody, other=bob ".to_string())
+        });
+        assert_eq!(authz.crucible_login("maint"), Some("alice"));
+        assert_eq!(authz.crucible_login("MAINT"), Some("alice"));
+        assert_eq!(authz.crucible_login("other"), Some("bob"));
+        assert_eq!(
+            authz.crucible_login("alice"),
+            None,
+            "no pairing by matching names"
+        );
+        assert_eq!(authz.crucible_login("broken"), None);
+    }
 
     #[test]
     fn parse_pr_url_handles_pull_and_issue_with_trailing_path() {
@@ -402,6 +448,7 @@ mod tests {
 
         let allow = Authz {
             allow_users: vec!["ext".into()],
+            ..Authz::default()
         };
         assert!(
             allow.authorized("ext", "CONTRIBUTOR"),

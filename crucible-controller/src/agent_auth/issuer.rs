@@ -1,0 +1,1782 @@
+//! Agent access tokens. The controller verifies a sandbox supervisor's SPIRE JWT-SVID, and for a
+//! sandbox bound to a live run mints a short-lived ES256 token naming the run's launcher as `sub`
+//! and the sandbox as `act.sub`. Nothing in the request beyond the verified SVID, the audience
+//! (checked against an allowlist), and the scope (narrowed to what the audience lists) reaches the
+//! claims.
+
+use crate::agent_auth::bindings::BoundRun;
+use crate::agent_auth::cluster_spire::{ClusterSpire, SpireDirectory, SpireError};
+use crate::agent_auth::sandbox::{SandboxId, SandboxIdError};
+use crucible::deploy::servers::ServerSpec;
+use crucible_mcp_auth::jwks::Jwks;
+use crucible_mcp_auth::verify::{TokenError, Verifier, unverified_issuer};
+use jsonwebtoken::jwk::{Jwk, JwkSet, PublicKeyUse, ThumbprintHash};
+use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use serde::Serialize;
+use serde_json::{Value, json};
+use std::fmt;
+use std::sync::Arc;
+use url::Url;
+
+/// The bounds of a minted access token's lifetime: long enough that a sandbox fetches one per
+/// task rather than per call, short enough that a leaked one expires within the task.
+pub const MIN_TOKEN_TTL_SECS: u64 = 15 * 60;
+pub const MAX_TOKEN_TTL_SECS: u64 = 30 * 60;
+
+pub const TOKEN_PATH: &str = "/oauth/token";
+
+/// People's authorization endpoint.
+pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
+/// RFC 7591 registration, for loopback public clients only.
+pub const REGISTER_PATH: &str = "/oauth/register";
+pub const JWKS_PATH: &str = "/.well-known/jwks.json";
+pub const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
+
+/// RFC 7523 §2.2: the only `client_assertion_type` accepted.
+pub const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
+
+const JTI_BYTES: usize = 16;
+
+/// The longest a JWT-SVID may live, `exp` minus `iat`. SPIRE issues them for five minutes by
+/// default; a longer-lived assertion is a replayable credential.
+pub const MAX_SVID_LIFETIME_SECS: i64 = 900;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("{var} is required when CONTROLLER_AGENT_ISSUER is set")]
+    Missing { var: &'static str },
+    #[error("{var} {value:?} is not a URL: {source}")]
+    Url {
+        var: &'static str,
+        value: String,
+        source: url::ParseError,
+    },
+    #[error(
+        "CONTROLLER_AGENT_ISSUER {0:?} must be an http(s) origin with no path, query, or fragment, \
+         so its metadata sits at /.well-known/oauth-authorization-server"
+    )]
+    IssuerShape(String),
+    #[error(transparent)]
+    Spire(#[from] SpireError),
+    #[error("CONTROLLER_AGENT_SPIRE names no cluster's SPIRE")]
+    NoSpire,
+    #[error(
+        "CONTROLLER_AGENT_ISSUER is set but neither CONTROLLER_AGENT_SPIRE (agent tokens) nor \
+         a deploy profile server with `people = true` (people's tokens) says whom it issues to"
+    )]
+    NoRecipients,
+    #[error("CONTROLLER_AGENT_SPIRE names {0:?} twice; each cluster and each SVID issuer once")]
+    SpireTwice(String),
+    #[error(
+        "CONTROLLER_AGENT_TOKEN_TTL_SECS {0:?} is not a number of seconds from \
+         {MIN_TOKEN_TTL_SECS} to {MAX_TOKEN_TTL_SECS}"
+    )]
+    Ttl(String),
+    #[error("reading {path}: {source}")]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("loading the agent signing key {path}: {source}")]
+    Key {
+        path: String,
+        source: jsonwebtoken::errors::Error,
+    },
+    #[error("{var} is set, but CONTROLLER_AGENT_ISSUER is not; it does nothing without the issuer")]
+    NoIssuer { var: &'static str },
+}
+
+/// The controller's issuer identifier: an http(s) origin, compared to `iss` and `aud` as an exact
+/// string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssuerUrl(String);
+
+impl IssuerUrl {
+    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
+        let url = Url::parse(raw).map_err(|source| ConfigError::Url {
+            var: "CONTROLLER_AGENT_ISSUER",
+            value: raw.to_string(),
+            source,
+        })?;
+        let origin_only = matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.path() == "/"
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && url.username().is_empty();
+        match origin_only {
+            true => Ok(Self(raw.trim_end_matches('/').to_string())),
+            false => Err(ConfigError::IssuerShape(raw.to_string())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn endpoint(&self, path: &str) -> String {
+        format!("{}{path}", self.0)
+    }
+}
+
+/// The ES256 key minted tokens are signed with, and its public half as published.
+pub struct SigningKey {
+    kid: String,
+    key: EncodingKey,
+    public: Jwk,
+}
+
+impl SigningKey {
+    /// A PKCS#8 P-256 private key. Its `kid` is the RFC 7638 thumbprint of the public key, so a
+    /// rotated key gets a new `kid` without configuration.
+    pub fn from_pem(pem: &[u8]) -> Result<Self, jsonwebtoken::errors::Error> {
+        let _ = jsonwebtoken::crypto::aws_lc::DEFAULT_PROVIDER.install_default();
+        let key = EncodingKey::from_ec_pem(pem)?;
+        let mut public = Jwk::from_encoding_key(&key, Algorithm::ES256)?;
+        let kid = public.thumbprint(ThumbprintHash::SHA256)?;
+        public.common.key_id = Some(kid.clone());
+        public.common.public_key_use = Some(PublicKeyUse::Signature);
+        Ok(Self { kid, key, public })
+    }
+
+    pub fn kid(&self) -> &str {
+        &self.kid
+    }
+}
+
+impl fmt::Debug for SigningKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SigningKey")
+            .field("kid", &self.kid)
+            .finish_non_exhaustive()
+    }
+}
+
+/// An MCP resource a token may be minted for, and the scopes a token for it may carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Audience {
+    /// The resource URL, compared to the requested `audience` as an exact string.
+    pub resource: String,
+    /// The cluster whose runs get tokens for it. The same URL on another cluster is another
+    /// audience.
+    pub cluster: String,
+    pub scopes: Vec<String>,
+    /// Whether the server authorizes as the token's `kube_user`, so no token is minted without
+    /// one.
+    pub requires_kube_user: bool,
+    /// The namespaces a token names, the first as the default.
+    pub namespaces: Vec<String>,
+}
+
+impl Audience {
+    /// The audience each of `server`'s clusters' runs get tokens for: its URL, scopes and token
+    /// needs, as the deploy profile describes it.
+    pub fn of(server: &ServerSpec) -> impl Iterator<Item = Audience> + '_ {
+        server.clusters.iter().map(|cluster| Audience {
+            resource: server.url.clone(),
+            cluster: cluster.clone(),
+            scopes: server.scopes.clone(),
+            requires_kube_user: server.requires_kube_user,
+            namespaces: server.namespaces.clone(),
+        })
+    }
+
+    /// Whether a run on `cluster` may get tokens for this audience.
+    pub fn serves(&self, cluster: &str) -> bool {
+        self.cluster == cluster
+    }
+}
+
+/// A minted token's lifetime, within [`MIN_TOKEN_TTL_SECS`]..=[`MAX_TOKEN_TTL_SECS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenTtl(u64);
+
+impl TokenTtl {
+    pub fn secs(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for TokenTtl {
+    fn default() -> Self {
+        Self(MIN_TOKEN_TTL_SECS)
+    }
+}
+
+impl std::str::FromStr for TokenTtl {
+    type Err = ConfigError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if (MIN_TOKEN_TTL_SECS..=MAX_TOKEN_TTL_SECS).contains(&secs) => Ok(Self(secs)),
+            _ => Err(ConfigError::Ttl(raw.to_string())),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct AgentIssuerConfig {
+    pub issuer: IssuerUrl,
+    /// The key tokens are signed with.
+    pub signing_key: SigningKey,
+    /// The key tokens were signed with before a rotation, still published in the JWKS so tokens
+    /// it signed verify until they expire.
+    pub previous_key: Option<SigningKey>,
+    pub token_ttl: TokenTtl,
+    /// Each cluster's SPIRE, by cluster and by SVID issuer unique.
+    pub spire: Vec<ClusterSpire>,
+    /// The MCP resources a token may be minted for: every server the deploy profile describes, on
+    /// each of its clusters ([`AgentIssuerConfig::serving`]).
+    pub audiences: Vec<Audience>,
+}
+
+impl AgentIssuerConfig {
+    /// The same settings, minting for every server `servers` describe, each on its clusters.
+    pub fn serving(self, servers: &[ServerSpec]) -> Self {
+        Self {
+            audiences: servers.iter().flat_map(Audience::of).collect(),
+            ..self
+        }
+    }
+}
+
+/// The settings that mean nothing without `CONTROLLER_AGENT_ISSUER`; one set without it is a
+/// configuration error rather than a silently disabled feature.
+const DEPENDENT_VARS: &[&str] = &[
+    "CONTROLLER_AGENT_SIGNING_KEY",
+    "CONTROLLER_AGENT_SIGNING_KEY_FILE",
+    "CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE",
+    "CONTROLLER_AGENT_TOKEN_TTL_SECS",
+    "CONTROLLER_AGENT_SPIRE",
+    "CONTROLLER_AGENT_TOKEN_ENDPOINT",
+    "CONTROLLER_PEOPLE_ACCESS_TTL_SECS",
+    "CONTROLLER_PEOPLE_CLIENTS_FILE",
+    "CONTROLLER_PEOPLE_CIMD_HOSTS",
+    "CONTROLLER_PEOPLE_DCR",
+    "CONTROLLER_PEOPLE_TRUSTED_PROXIES",
+];
+
+impl AgentIssuerConfig {
+    /// The issuer's configuration from `CONTROLLER_AGENT_*`, `None` when
+    /// `CONTROLLER_AGENT_ISSUER` and every setting that needs it are unset. A partial configuration is an error. Without
+    /// `CONTROLLER_AGENT_SPIRE` the issuer mints no agent tokens and serves people only. The
+    /// signing key is `CONTROLLER_AGENT_SIGNING_KEY` (PEM) or the file
+    /// `CONTROLLER_AGENT_SIGNING_KEY_FILE` names.
+    pub fn from_env() -> Result<Option<Self>, ConfigError> {
+        Self::from_lookup(|var| std::env::var(var).ok())
+    }
+
+    pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
+        let get = |var: &str| get(var).filter(|v| !v.trim().is_empty());
+        let Some(issuer) = get("CONTROLLER_AGENT_ISSUER") else {
+            return match DEPENDENT_VARS.iter().find(|var| get(var).is_some()) {
+                Some(var) => Err(ConfigError::NoIssuer { var }),
+                None => Ok(None),
+            };
+        };
+        let need = |var: &'static str| get(var).ok_or(ConfigError::Missing { var });
+        let read = |path: String| {
+            std::fs::read(&path).map_err(|source| ConfigError::Read { path, source })
+        };
+        let load_key = |path: String| {
+            SigningKey::from_pem(&read(path.clone())?)
+                .map_err(|source| ConfigError::Key { path, source })
+        };
+        let signing_key = match get("CONTROLLER_AGENT_SIGNING_KEY") {
+            Some(pem) => {
+                SigningKey::from_pem(pem.as_bytes()).map_err(|source| ConfigError::Key {
+                    path: "CONTROLLER_AGENT_SIGNING_KEY".into(),
+                    source,
+                })?
+            }
+            None => load_key(need("CONTROLLER_AGENT_SIGNING_KEY_FILE")?)?,
+        };
+        let previous_key = get("CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE")
+            .map(load_key)
+            .transpose()?;
+        let token_ttl = get("CONTROLLER_AGENT_TOKEN_TTL_SECS")
+            .map(|raw| raw.parse())
+            .transpose()?
+            .unwrap_or_default();
+        let spire: Vec<ClusterSpire> = match get("CONTROLLER_AGENT_SPIRE") {
+            None => Vec::new(),
+            Some(raw) => {
+                let spire: Vec<ClusterSpire> = parse_list(&raw)?;
+                if spire.is_empty() {
+                    return Err(ConfigError::NoSpire);
+                }
+                spire
+            }
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &spire {
+            for key in [&entry.cluster, &entry.svid_issuer] {
+                if !seen.insert(key.as_str()) {
+                    return Err(ConfigError::SpireTwice(key.clone()));
+                }
+            }
+        }
+        Ok(Some(Self {
+            issuer: IssuerUrl::parse(&issuer)?,
+            signing_key,
+            previous_key,
+            token_ttl,
+            spire,
+            audiences: Vec::new(),
+        }))
+    }
+}
+
+/// The comma-separated entries of a `CONTROLLER_AGENT_*` list.
+pub fn parse_list<T>(raw: &str) -> Result<Vec<T>, ConfigError>
+where
+    T: std::str::FromStr,
+    T::Err: Into<ConfigError>,
+{
+    raw.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| e.parse().map_err(Into::into))
+        .collect()
+}
+
+/// A verified sandbox supervisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sandbox {
+    pub spiffe_id: String,
+    /// The cluster whose SPIRE issued the SVID.
+    pub cluster: String,
+    /// The tenant segment of its SPIFFE ID, under a prefix with `{tenant}`.
+    pub tenant: Option<String>,
+    /// The gateway that created the supervisor's pod.
+    pub gateway: GatewayId,
+    pub id: SandboxId,
+}
+
+/// An OpenShell gateway id: a DNS-1123 label, the `openshell.ai/gateway-id` label value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayId(String);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("gateway id {0:?} is not a DNS-1123 label")]
+pub struct GatewayIdError(pub String);
+
+impl GatewayId {
+    pub fn parse(raw: &str) -> Result<Self, GatewayIdError> {
+        let bytes = raw.as_bytes();
+        let valid = !raw.is_empty()
+            && raw.len() <= 63
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric);
+        match valid {
+            true => Ok(Self(raw.to_string())),
+            false => Err(GatewayIdError(raw.to_string())),
+        }
+    }
+
+    /// The gateway the controller starts for the run whose pod is `run_pod`.
+    pub fn of_run_pod(run_pod: &str) -> Self {
+        Self(crucible::deploy::render::gateway::GatewayNames::for_run_pod(run_pod).gateway_id)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GatewayId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AssertionError {
+    #[error(transparent)]
+    Token(#[from] TokenError),
+    #[error("assertion iss {0:?} is no trusted cluster's SPIRE")]
+    UnknownSpire(String),
+    #[error("assertion aud must be exactly [{expected:?}], got {got}")]
+    Audience { expected: String, got: Value },
+    #[error("assertion sub {sub:?} is not <gateway>/sandbox/<id> under {prefix}")]
+    NotASandbox { sub: String, prefix: String },
+    #[error(transparent)]
+    GatewayId(#[from] GatewayIdError),
+    #[error("assertion has no numeric iat")]
+    NoIssuedAt,
+    #[error("assertion iat {iat} is in the future")]
+    IssuedInFuture { iat: i64 },
+    #[error("assertion lives {lifetime}s, past the {MAX_SVID_LIFETIME_SECS}s maximum")]
+    Lifetime { lifetime: i64 },
+    #[error(transparent)]
+    SandboxId(#[from] SandboxIdError),
+}
+
+/// Why a verified sandbox gets no token, each mapped to an RFC 6749 §5.2 error code.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum GrantError {
+    #[error("no audience requested; ask for one of {allowed:?}")]
+    NoAudience { allowed: Vec<String> },
+    #[error("audience {requested:?} is not one of {allowed:?} for runs on cluster {cluster}")]
+    Audience {
+        requested: String,
+        cluster: String,
+        allowed: Vec<String>,
+    },
+    #[error(
+        "scope {requested:?} is not grantable for this audience; the run may hold {grantable:?}"
+    )]
+    Scope {
+        requested: String,
+        grantable: Vec<String>,
+    },
+    #[error(
+        "launcher {launcher} has no known kubernetes username on cluster {cluster}, which {audience} \
+         requires ({why}); link it under Settings > Cluster identities"
+    )]
+    NoKubeUser {
+        launcher: String,
+        cluster: String,
+        audience: String,
+        why: String,
+    },
+    #[error(
+        "the SVID comes from cluster {spire}'s SPIRE, but sandbox {sandbox} is bound to a run on \
+         {run}"
+    )]
+    WrongCluster {
+        sandbox: String,
+        spire: String,
+        run: String,
+    },
+    #[error(
+        "run {run_id} was dispatched for {dispatched_by:?}, not a person, so it has no launcher"
+    )]
+    NoLauncher {
+        run_id: String,
+        dispatched_by: Option<String>,
+    },
+    #[error("{0}")]
+    NoUsername(String),
+}
+
+/// The launcher a run's token acts for: the login of the person the run was dispatched for.
+pub fn launcher(run: &BoundRun) -> Result<String, GrantError> {
+    run.dispatched_by
+        .as_deref()
+        .and_then(|p| p.strip_prefix("user:"))
+        .filter(|login| !login.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| GrantError::NoLauncher {
+            run_id: run.run_id.clone(),
+            dispatched_by: run.dispatched_by.clone(),
+        })
+}
+
+/// The scopes to grant for `audience`: all it lists when none is requested, else exactly the
+/// requested ones, each of which it must list. What a scope lets the caller do is the resource
+/// server's to decide, from the token's identity.
+pub fn granted_scopes(
+    requested: Option<&str>,
+    audience: &Audience,
+) -> Result<Vec<String>, GrantError> {
+    let grantable = audience.scopes.clone();
+    let Some(requested) = requested.filter(|r| !r.trim().is_empty()) else {
+        return Ok(grantable);
+    };
+    let mut granted: Vec<String> = Vec::new();
+    for scope in requested.split_whitespace() {
+        if !grantable.iter().any(|g| g == scope) {
+            return Err(GrantError::Scope {
+                requested: scope.to_string(),
+                grantable,
+            });
+        }
+        if !granted.iter().any(|g| g == scope) {
+            granted.push(scope.to_string());
+        }
+    }
+    Ok(granted)
+}
+
+/// Everything a minted token says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentGrant {
+    pub sandbox: Sandbox,
+    pub launcher: String,
+    /// The launcher's Kubernetes username, for the `kube_user` claim.
+    pub kube_user: Option<String>,
+    pub run: BoundRun,
+    pub audience: String,
+    pub scopes: Vec<String>,
+    /// The `namespaces` claim, the audience's namespaces; the first is also the `namespace`
+    /// claim, the default.
+    pub namespaces: Vec<String>,
+}
+
+/// A minted token. Never printed.
+pub struct Minted {
+    pub access_token: String,
+    pub expires_in: u64,
+    pub scope: String,
+}
+
+impl fmt::Debug for Minted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Minted")
+            .field("expires_in", &self.expires_in)
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum MintError {
+    #[error("drawing random bytes for the token id failed")]
+    Random,
+    #[error("signing the access token: {0}")]
+    Sign(#[from] jsonwebtoken::errors::Error),
+}
+
+/// RFC 8414 authorization server metadata.
+#[derive(Debug, Serialize, PartialEq)]
+pub struct AuthorizationServerMetadata {
+    pub issuer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<String>,
+    pub token_endpoint: String,
+    pub jwks_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
+    pub grant_types_supported: Vec<&'static str>,
+    pub response_types_supported: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub code_challenge_methods_supported: Vec<&'static str>,
+    pub token_endpoint_auth_methods_supported: Vec<&'static str>,
+    pub token_endpoint_auth_signing_alg_values_supported: Vec<Algorithm>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub authorization_response_iss_parameter_supported: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub client_id_metadata_document_supported: bool,
+    pub scopes_supported: Vec<String>,
+}
+
+/// What the people grant adds to the metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeopleMetadata {
+    /// Every scope a person's token may carry.
+    pub scopes: Vec<String>,
+    /// Whether an https `client_id` is resolved as a Client ID Metadata Document.
+    pub client_id_metadata_documents: bool,
+    /// Whether loopback public clients may register themselves.
+    pub registration: bool,
+}
+
+/// A fresh random `jti`.
+pub fn token_id() -> Result<String, MintError> {
+    let mut jti = [0u8; JTI_BYTES];
+    aws_lc_rs::rand::fill(&mut jti).map_err(|_| MintError::Random)?;
+    Ok(crucible_contract::artifact::lower_hex(&jti))
+}
+
+pub struct AgentIssuer {
+    issuer: IssuerUrl,
+    key: SigningKey,
+    previous_key: Option<SigningKey>,
+    ttl: TokenTtl,
+    /// The SPIRE `CONTROLLER_AGENT_SPIRE` names.
+    stated: Vec<Arc<TrustedSpire>>,
+    /// The SPIRE discovery has read, a verifier for each made on first use from `keys`.
+    directory: SpireDirectory,
+    discovered: std::sync::Mutex<Vec<Arc<TrustedSpire>>>,
+    keys: Option<KeySource>,
+    audiences: Vec<Audience>,
+}
+
+/// Each cluster's SPIRE key set.
+type KeySource = Box<dyn Fn(&ClusterSpire) -> Jwks + Send + Sync>;
+
+struct TrustedSpire {
+    spire: ClusterSpire,
+    svids: Verifier,
+}
+
+fn trusted(entry: &ClusterSpire, keys: &dyn Fn(&ClusterSpire) -> Jwks) -> Arc<TrustedSpire> {
+    Arc::new(TrustedSpire {
+        spire: entry.clone(),
+        svids: Verifier::new(entry.svid_issuer.clone(), keys(entry)),
+    })
+}
+
+impl AgentIssuer {
+    /// `keys` gives each cluster's SPIRE key set.
+    pub fn new(cfg: AgentIssuerConfig, keys: impl Fn(&ClusterSpire) -> Jwks) -> Self {
+        let stated = cfg
+            .spire
+            .iter()
+            .map(|entry| trusted(entry, &keys))
+            .collect();
+        Self {
+            stated,
+            directory: SpireDirectory::default(),
+            discovered: Default::default(),
+            keys: None,
+            issuer: cfg.issuer,
+            key: cfg.signing_key,
+            previous_key: cfg.previous_key,
+            ttl: cfg.token_ttl,
+            audiences: cfg.audiences,
+        }
+    }
+
+    /// This issuer, also trusting the SPIRE `directory` discovers, its keys from `keys`.
+    pub fn discovering(
+        self,
+        directory: SpireDirectory,
+        keys: impl Fn(&ClusterSpire) -> Jwks + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            directory,
+            keys: Some(Box::new(keys)),
+            ..self
+        }
+    }
+
+    pub fn issuer(&self) -> &IssuerUrl {
+        &self.issuer
+    }
+
+    /// Whether agent tokens are minted at all: some cluster's SPIRE is named, or discovery looks
+    /// for some.
+    pub fn serves_agents(&self) -> bool {
+        !self.stated.is_empty() || self.directory.enabled()
+    }
+
+    /// The trusted SPIRE whose JWT-SVIDs `svid_issuer` signs.
+    fn spire_of(&self, svid_issuer: &str) -> Option<Arc<TrustedSpire>> {
+        if let Some(stated) = self
+            .stated
+            .iter()
+            .find(|s| s.spire.svid_issuer == svid_issuer)
+        {
+            return Some(stated.clone());
+        }
+        let found = self
+            .directory
+            .ready()
+            .into_iter()
+            .find(|s| s.svid_issuer == svid_issuer)?;
+        let mut cache = self
+            .discovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.iter().find(|t| t.spire == found) {
+            return Some(cached.clone());
+        }
+        let fresh = trusted(&found, self.keys.as_deref()?);
+        cache.retain(|t| t.spire.cluster != found.cluster);
+        cache.push(fresh.clone());
+        Some(fresh)
+    }
+
+    /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against the keys
+    /// of the cluster SPIRE its `iss` names, carry exactly one `aud` equal to this issuer, and
+    /// name a SPIFFE ID `<that cluster's gateway prefix><gateway id>/sandbox/<sandbox id>`.
+    pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
+        let issuer = self.issuer.as_str();
+        let claimed = unverified_issuer(assertion)?;
+        let trusted = self
+            .spire_of(&claimed)
+            .ok_or(AssertionError::UnknownSpire(claimed))?;
+        let spire = &trusted.spire;
+        let claims = trusted.svids.verify(assertion, &[issuer]).await?;
+        let aud = claims.get("aud").cloned().unwrap_or(Value::Null);
+        let single = match &aud {
+            Value::String(a) => a == issuer,
+            Value::Array(items) => matches!(items.as_slice(), [Value::String(a)] if a == issuer),
+            _ => false,
+        };
+        if !single {
+            return Err(AssertionError::Audience {
+                expected: issuer.to_string(),
+                got: aud,
+            });
+        }
+        let iat = claims
+            .get("iat")
+            .and_then(Value::as_i64)
+            .ok_or(AssertionError::NoIssuedAt)?;
+        let exp = claims
+            .get("exp")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX);
+        let now = i64::try_from(jsonwebtoken::get_current_timestamp()).unwrap_or(i64::MAX);
+        let leeway = i64::try_from(crucible_mcp_auth::verify::LEEWAY_SECS).unwrap_or(0);
+        if iat > now.saturating_add(leeway) {
+            return Err(AssertionError::IssuedInFuture { iat });
+        }
+        let lifetime = exp.saturating_sub(iat);
+        if lifetime > MAX_SVID_LIFETIME_SECS {
+            return Err(AssertionError::Lifetime { lifetime });
+        }
+        let sub = claims
+            .get("sub")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let not_a_sandbox = || AssertionError::NotASandbox {
+            sub: sub.to_string(),
+            prefix: spire.gateway_prefix.as_str().to_string(),
+        };
+        let (tenant, rest) = spire.gateway_prefix.split(sub).ok_or_else(not_a_sandbox)?;
+        let (gateway, id) = rest.split_once("/sandbox/").ok_or_else(not_a_sandbox)?;
+        Ok(Sandbox {
+            spiffe_id: sub.to_string(),
+            cluster: spire.cluster.clone(),
+            tenant: tenant.map(str::to_string),
+            gateway: GatewayId::parse(gateway)?,
+            id: SandboxId::parse(id)?,
+        })
+    }
+
+    /// The requested audience, when it is an MCP resource allowlisted for runs on `cluster`.
+    pub fn audience(
+        &self,
+        requested: Option<&str>,
+        cluster: &str,
+    ) -> Result<&Audience, GrantError> {
+        let serving = || self.audiences.iter().filter(|a| a.serves(cluster));
+        let allowed = || serving().map(|a| a.resource.clone()).collect();
+        let requested = requested
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| GrantError::NoAudience { allowed: allowed() })?;
+        serving()
+            .find(|a| a.resource == requested)
+            .ok_or_else(|| GrantError::Audience {
+                requested: requested.to_string(),
+                cluster: cluster.to_string(),
+                allowed: allowed(),
+            })
+    }
+
+    /// Sign `claims` with the issuer's key, as a JWT access token (`typ: at+jwt`).
+    pub fn sign(&self, claims: &Value) -> Result<String, MintError> {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(self.key.kid.clone());
+        header.typ = Some(crucible_mcp_auth::verify::ACCESS_TOKEN_TYP.to_string());
+        Ok(jsonwebtoken::encode(&header, claims, &self.key.key)?)
+    }
+
+    /// Sign `grant` as an access token issued at `now` (Unix seconds).
+    pub fn mint(&self, grant: &AgentGrant, now: u64) -> Result<Minted, MintError> {
+        let jti = token_id()?;
+        let scope = grant.scopes.join(" ");
+        let mut claims = json!({
+            "iss": self.issuer.as_str(),
+            "sub": grant.launcher,
+            "aud": grant.audience,
+            "iat": now,
+            "nbf": now,
+            "exp": now.saturating_add(self.ttl.secs()),
+            "jti": jti,
+            "act": {"sub": grant.sandbox.spiffe_id},
+            "run_id": grant.run.pod_name,
+            "kube_cluster": grant.run.cluster,
+            "scope": scope,
+        });
+        if let Some(map) = claims.as_object_mut() {
+            if let Some(name) = &grant.run.sandbox_name {
+                map.insert("sandbox".into(), json!(name));
+            }
+            if let Some(kube_user) = &grant.kube_user {
+                map.insert("kube_user".into(), json!(kube_user));
+            }
+            if let Some(workdir) = &grant.run.workdir {
+                map.insert("workdir".into(), json!(workdir));
+            }
+            if let Some(default) = grant.namespaces.first() {
+                map.insert("namespace".into(), json!(default));
+                map.insert("namespaces".into(), json!(grant.namespaces));
+            }
+        }
+        let access_token = self.sign(&claims)?;
+        Ok(Minted {
+            access_token,
+            expires_in: self.ttl.secs(),
+            scope,
+        })
+    }
+
+    /// The current key, then the previous one while it is configured.
+    pub fn jwks(&self) -> JwkSet {
+        JwkSet {
+            keys: std::iter::once(&self.key)
+                .chain(self.previous_key.iter().filter(|k| k.kid != self.key.kid))
+                .map(|k| k.public.clone())
+                .collect(),
+        }
+    }
+
+    /// The metadata document; `people` adds the authorization code grant for people's clients and,
+    /// when they may register themselves, the registration endpoint.
+    pub fn metadata(&self, people: Option<&PeopleMetadata>) -> AuthorizationServerMetadata {
+        let mut scopes_supported = Vec::new();
+        let people_scopes = people.into_iter().flat_map(|p| p.scopes.iter());
+        for scope in self
+            .audiences
+            .iter()
+            .flat_map(|a| a.scopes.iter())
+            .chain(people_scopes)
+        {
+            if !scopes_supported.contains(scope) {
+                scopes_supported.push(scope.clone());
+            }
+        }
+        let mut metadata = AuthorizationServerMetadata {
+            issuer: self.issuer.as_str().to_string(),
+            authorization_endpoint: None,
+            token_endpoint: self.issuer.endpoint(TOKEN_PATH),
+            jwks_uri: self.issuer.endpoint(JWKS_PATH),
+            registration_endpoint: None,
+            grant_types_supported: Vec::new(),
+            response_types_supported: Vec::new(),
+            code_challenge_methods_supported: Vec::new(),
+            token_endpoint_auth_methods_supported: Vec::new(),
+            token_endpoint_auth_signing_alg_values_supported: Vec::new(),
+            authorization_response_iss_parameter_supported: false,
+            client_id_metadata_document_supported: false,
+            scopes_supported,
+        };
+        if self.serves_agents() {
+            metadata.grant_types_supported.push("client_credentials");
+            metadata
+                .token_endpoint_auth_methods_supported
+                .push("private_key_jwt");
+            metadata.token_endpoint_auth_signing_alg_values_supported =
+                crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec();
+        }
+        if let Some(people) = people {
+            metadata.client_id_metadata_document_supported = people.client_id_metadata_documents;
+            metadata.registration_endpoint = people
+                .registration
+                .then(|| self.issuer.endpoint(REGISTER_PATH));
+            metadata.authorization_endpoint = Some(self.issuer.endpoint(AUTHORIZE_PATH));
+            metadata
+                .grant_types_supported
+                .extend(["authorization_code", "refresh_token"]);
+            metadata.response_types_supported.push("code");
+            metadata.code_challenge_methods_supported.push("S256");
+            metadata.token_endpoint_auth_methods_supported.push("none");
+            metadata.authorization_response_iss_parameter_supported = true;
+        }
+        metadata
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::agent_auth::cluster_spire::{DiscoveryService, GatewayPrefix};
+    use crate::agent_auth::issuer::*;
+    use crate::agent_auth::testing::{
+        self, BUILDIT, CLUSTER, EcKey, ISSUER, KUEUE, POD, PREFIX, PROFILE, Spire, now, serve_jwks,
+    };
+    use crucible::deploy::profile::KubeName;
+    use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
+    use std::collections::HashMap;
+
+    fn with(claims: Value, edit: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Value {
+        let mut claims = claims;
+        edit(claims.as_object_mut().unwrap());
+        claims
+    }
+
+    #[tokio::test]
+    async fn an_svid_for_the_controller_names_its_sandbox() {
+        let spire = Spire::start().await;
+        let issuer = testing::issuer(&spire, &EcKey::generate());
+        for aud in [json!([ISSUER]), json!(ISSUER)] {
+            let svid = spire.svid(&with(Spire::claims("sbx-1"), |c| {
+                c.insert("aud".into(), aud.clone());
+            }));
+            let sandbox = issuer.sandbox(&svid).await.unwrap();
+            assert_eq!(sandbox.id.as_str(), "sbx-1", "aud {aud}");
+            assert_eq!(sandbox.gateway.as_str(), POD);
+            assert_eq!(sandbox.spiffe_id, format!("{PREFIX}{POD}/sandbox/sbx-1"));
+            assert_eq!(sandbox.cluster, CLUSTER);
+            assert_eq!(sandbox.tenant, None);
+        }
+    }
+
+    /// A cluster's SPIRE that discovery has read is trusted like a stated one, from the moment it
+    /// is read; one still pending or found wanting signs nothing the issuer accepts.
+    #[tokio::test]
+    async fn a_discovered_spire_is_trusted_once_read() {
+        use crate::agent_auth::cluster_spire::SpireState;
+        let spire = Spire::start().await;
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.spire.clear();
+        let directory = SpireDirectory::default();
+        let uri = spire.jwks_uri.clone();
+        let issuer = AgentIssuer::new(cfg, |_| -> Jwks { panic!("nothing is stated") })
+            .discovering(directory.clone(), move |_| {
+                Jwks::new(reqwest::Client::new(), uri.clone())
+            });
+        assert!(!issuer.serves_agents());
+        directory.enable([CLUSTER.to_string()]);
+        assert!(issuer.serves_agents(), "discovery is looking");
+        let svid = spire.svid(&Spire::claims("sbx-1"));
+        assert!(matches!(
+            issuer.sandbox(&svid).await,
+            Err(AssertionError::UnknownSpire(_))
+        ));
+        directory.set(CLUSTER, SpireState::Unavailable("not read".into()));
+        assert!(matches!(
+            issuer.sandbox(&svid).await,
+            Err(AssertionError::UnknownSpire(_))
+        ));
+        directory.set(CLUSTER, SpireState::Ready(testing::cluster_spire()));
+        let sandbox = issuer.sandbox(&svid).await.unwrap();
+        assert_eq!(sandbox.cluster, CLUSTER);
+        assert_eq!(sandbox.id.as_str(), "sbx-1");
+    }
+
+    #[tokio::test]
+    async fn an_svid_under_a_tenant_prefix_names_its_tenant_and_sandbox() {
+        let spire = Spire::start().await;
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.spire[0].gateway_prefix =
+            GatewayPrefix::parse("spiffe://example.crucible/openshell/{tenant}/gateway/").unwrap();
+        let issuer = AgentIssuer::new(cfg, |_| {
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
+        let svid = |sub: String| {
+            spire.svid(&with(Spire::claims("sbx-1"), |c| {
+                c.insert("sub".into(), json!(sub));
+            }))
+        };
+        let sandbox = issuer
+            .sandbox(&svid(format!(
+                "spiffe://example.crucible/openshell/team-a/gateway/{POD}/sandbox/sbx-1"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(sandbox.tenant.as_deref(), Some("team-a"));
+        assert_eq!(sandbox.gateway.as_str(), POD);
+        assert_eq!(sandbox.id.as_str(), "sbx-1");
+        assert!(matches!(
+            issuer
+                .sandbox(&svid(format!("{PREFIX}{POD}/sandbox/sbx-1")))
+                .await,
+            Err(AssertionError::NotASandbox { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn each_svid_verifies_only_against_the_spire_its_issuer_names() {
+        let hub = Spire::start().await;
+        let spoke = Spire::start().await;
+        let spoke_issuer = "https://oidc-discovery.spoke.example";
+        let spoke_prefix = "spiffe://spoke.example/openshell/gateway/";
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.spire.push(
+            format!("spoke={spoke_issuer} {spoke_prefix} spire/oidc-discovery:443")
+                .parse()
+                .unwrap(),
+        );
+        let issuer = AgentIssuer::new(cfg, |entry| {
+            let uri = match entry.cluster.as_str() {
+                "spoke" => spoke.jwks_uri.clone(),
+                _ => hub.jwks_uri.clone(),
+            };
+            Jwks::new(reqwest::Client::new(), uri)
+        });
+        let from_spoke = |sub: String| {
+            with(Spire::claims("sbx-1"), |c| {
+                c.insert("iss".into(), json!(spoke_issuer));
+                c.insert("sub".into(), json!(sub));
+            })
+        };
+        let own = from_spoke(format!("{spoke_prefix}{POD}/sandbox/sbx-1"));
+        let sandbox = issuer.sandbox(&spoke.svid(&own)).await.unwrap();
+        assert_eq!(sandbox.cluster, "spoke");
+        assert!(
+            matches!(
+                issuer.sandbox(&hub.svid(&own)).await,
+                Err(AssertionError::Token(_))
+            ),
+            "the hub's key does not verify an SVID claiming the spoke's issuer"
+        );
+        let hub_domain = from_spoke(format!("{PREFIX}{POD}/sandbox/sbx-1"));
+        assert!(
+            matches!(
+                issuer.sandbox(&spoke.svid(&hub_domain)).await,
+                Err(AssertionError::NotASandbox { .. })
+            ),
+            "the spoke's SPIRE speaks only for its own trust domain"
+        );
+        let unknown = with(Spire::claims("sbx-1"), |c| {
+            c.insert("iss".into(), json!("https://oidc-discovery.evil.example"));
+        });
+        assert!(matches!(
+            issuer.sandbox(&hub.svid(&unknown)).await,
+            Err(AssertionError::UnknownSpire(iss)) if iss == "https://oidc-discovery.evil.example"
+        ));
+    }
+
+    #[tokio::test]
+    async fn svids_failing_any_check_are_refused() {
+        let spire = Spire::start().await;
+        let issuer = testing::issuer(&spire, &EcKey::generate());
+        let base = || Spire::claims("sbx-1");
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "another audience",
+                spire.svid(&with(base(), |c| {
+                    c.insert(
+                        "aud".into(),
+                        json!(["https://keycloak.example/realms/crucible"]),
+                    );
+                })),
+            ),
+            (
+                "a second audience beside the controller",
+                spire.svid(&with(base(), |c| {
+                    c.insert("aud".into(), json!([ISSUER, KUEUE]));
+                })),
+            ),
+            (
+                "the issuer with a trailing slash",
+                spire.svid(&with(base(), |c| {
+                    c.insert("aud".into(), json!([format!("{ISSUER}/")]));
+                })),
+            ),
+            (
+                "no audience",
+                spire.svid(&with(base(), |c| {
+                    c.remove("aud");
+                })),
+            ),
+            (
+                "another trust domain",
+                spire.svid(&with(base(), |c| {
+                    c.insert(
+                        "sub".into(),
+                        json!("spiffe://evil.example/openshell/sandbox/sbx-1"),
+                    );
+                })),
+            ),
+            (
+                "another workload in the trust domain",
+                spire.svid(&with(base(), |c| {
+                    c.insert(
+                        "sub".into(),
+                        json!("spiffe://example.crucible/ns/team-e2e/sa/default"),
+                    );
+                })),
+            ),
+            (
+                "a nested path under the sandbox",
+                spire.svid(&with(base(), |c| {
+                    c.insert(
+                        "sub".into(),
+                        json!(format!("{PREFIX}{POD}/sandbox/sbx-1/extra")),
+                    );
+                })),
+            ),
+            (
+                "no gateway segment",
+                spire.svid(&with(base(), |c| {
+                    c.insert("sub".into(), json!(format!("{PREFIX}sbx-1")));
+                })),
+            ),
+            (
+                "a gateway id that is not a label",
+                spire.svid(&with(base(), |c| {
+                    c.insert(
+                        "sub".into(),
+                        json!(format!("{PREFIX}Gateway_A/sandbox/sbx-1")),
+                    );
+                })),
+            ),
+            (
+                "an empty gateway id",
+                spire.svid(&with(base(), |c| {
+                    c.insert("sub".into(), json!(format!("{PREFIX}/sandbox/sbx-1")));
+                })),
+            ),
+            (
+                "the bare prefix",
+                spire.svid(&with(base(), |c| {
+                    c.insert("sub".into(), json!(PREFIX));
+                })),
+            ),
+            (
+                "expired",
+                spire.svid(&with(base(), |c| {
+                    c.insert("exp".into(), json!(now() - 120));
+                })),
+            ),
+            (
+                "no iat",
+                spire.svid(&with(base(), |c| {
+                    c.remove("iat");
+                })),
+            ),
+            (
+                "an iat in the future",
+                spire.svid(&with(base(), |c| {
+                    c.insert("iat".into(), json!(now() + 600));
+                    c.insert("exp".into(), json!(now() + 900));
+                })),
+            ),
+            (
+                "a lifetime past the maximum",
+                spire.svid(&with(base(), |c| {
+                    c.insert("iat".into(), json!(now()));
+                    c.insert("exp".into(), json!(now() + 3600));
+                })),
+            ),
+            (
+                "another issuer",
+                spire.svid(&with(base(), |c| {
+                    c.insert("iss".into(), json!("https://oidc-discovery.evil.example"));
+                })),
+            ),
+            (
+                "signed by a key SPIRE never published",
+                testing::sign(&EcKey::generate(), "spire", &base()),
+            ),
+        ];
+        for (what, svid) in cases {
+            if let Ok(sandbox) = issuer.sandbox(&svid).await {
+                panic!("{what}: accepted as {sandbox:?}");
+            }
+        }
+        let expired = spire.svid(&with(base(), |c| {
+            c.insert("exp".into(), json!(now() - 120));
+        }));
+        assert!(matches!(
+            issuer.sandbox(&expired).await,
+            Err(AssertionError::Token(_))
+        ));
+        let foreign = spire.svid(&with(base(), |c| {
+            c.insert(
+                "sub".into(),
+                json!("spiffe://evil.example/openshell/sandbox/sbx-1"),
+            );
+        }));
+        assert!(matches!(
+            issuer.sandbox(&foreign).await,
+            Err(AssertionError::NotASandbox { .. })
+        ));
+        let doubled = spire.svid(&with(base(), |c| {
+            c.insert("aud".into(), json!([ISSUER, KUEUE]));
+        }));
+        assert!(matches!(
+            issuer.sandbox(&doubled).await,
+            Err(AssertionError::Audience { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn only_an_allowlisted_audience_is_granted() {
+        let spire = Spire::start().await;
+        let issuer = testing::issuer(&spire, &EcKey::generate());
+        assert_eq!(
+            issuer.audience(Some(KUEUE), CLUSTER).unwrap().resource,
+            KUEUE
+        );
+        assert_eq!(
+            issuer.audience(Some(BUILDIT), CLUSTER).unwrap().scopes,
+            ["buildit.read", "buildit.build"]
+        );
+        assert!(matches!(
+            issuer.audience(None, CLUSTER),
+            Err(GrantError::NoAudience { .. })
+        ));
+        assert!(matches!(
+            issuer.audience(Some(""), CLUSTER),
+            Err(GrantError::NoAudience { .. })
+        ));
+        assert!(matches!(
+            issuer.audience(Some(&format!("{KUEUE}/")), CLUSTER),
+            Err(GrantError::Audience { .. })
+        ));
+    }
+
+    /// The issuer grants a cluster-bound audience only to runs on its cluster.
+    #[tokio::test]
+    async fn a_cluster_bound_audience_is_granted_on_its_cluster_only() {
+        let spire = Spire::start().await;
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.audiences = vec![
+            testing::audience("spoke-a", KUEUE, "kueue.read"),
+            testing::audience("spoke-b", BUILDIT, "buildit.read"),
+        ];
+        let issuer = AgentIssuer::new(cfg, |_| {
+            crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
+        assert_eq!(
+            issuer.audience(Some(KUEUE), "spoke-a").unwrap().scopes,
+            ["kueue.read"]
+        );
+        match issuer.audience(Some(KUEUE), "spoke-b") {
+            Err(GrantError::Audience {
+                cluster, allowed, ..
+            }) => {
+                assert_eq!(cluster, "spoke-b");
+                assert_eq!(allowed, [BUILDIT], "only what spoke-b's runs may get");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(issuer.audience(Some(BUILDIT), "spoke-b").is_ok());
+    }
+
+    /// Every server the profile describes is an audience on each of its clusters, with its scopes
+    /// and token needs; the same URL on two clusters is two audiences.
+    #[test]
+    fn every_server_is_an_audience_on_each_of_its_clusters() {
+        let servers = toml::from_str::<crucible::deploy::DeployProfile>(&PROFILE.replace(
+            "cluster = \"dev\"\nnamespace = \"crucible-system\"",
+            "clusters = [\"spoke-a\", \"spoke-b\"]\nnamespace = \"crucible-system\"",
+        ))
+        .unwrap()
+        .agent_servers()
+        .unwrap();
+        let cfg = testing::config(&EcKey::generate()).serving(&servers);
+        let on = |cluster: &str| {
+            cfg.audiences
+                .iter()
+                .find(|a| a.resource == KUEUE && a.serves(cluster))
+        };
+        for cluster in ["spoke-a", "spoke-b"] {
+            let kueue = on(cluster).unwrap_or_else(|| panic!("no kueue audience on {cluster}"));
+            assert_eq!(kueue.scopes, [SCOPE_READ, SCOPE_SUBMIT]);
+            assert!(kueue.requires_kube_user);
+            assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);
+        }
+        assert!(on("spoke-c").is_none());
+        let buildit = cfg
+            .audiences
+            .iter()
+            .find(|a| a.resource == BUILDIT)
+            .unwrap();
+        assert_eq!(buildit.scopes, ["buildit.read", "buildit.build"]);
+        assert!(!buildit.requires_kube_user && buildit.namespaces.is_empty());
+    }
+
+    /// SPIRE entries and the deploy profile accept the same cluster names.
+    #[test]
+    fn every_cluster_setting_accepts_the_names_the_profile_accepts() {
+        for name in [
+            "hub", "ocp", "spoke-a", "a1", "", "Ocp", "spoke_a", "-a", "a-", "a.b",
+        ] {
+            let profile = crucible::deploy::profile::check_cluster_name(name).is_ok();
+            let spire = format!(
+                "{name}=https://oidc.example spiffe://td/openshell/gateway/ spire/oidc:443"
+            )
+            .parse::<ClusterSpire>()
+            .is_ok();
+            assert_eq!(spire, profile, "{name:?}");
+        }
+    }
+
+    fn kueue() -> Audience {
+        testing::audience(CLUSTER, KUEUE, "kueue.read kueue.submit")
+    }
+
+    fn buildit() -> Audience {
+        testing::audience(CLUSTER, BUILDIT, "buildit.read buildit.build")
+    }
+
+    #[test]
+    fn scopes_narrow_to_what_the_audience_lists() {
+        assert_eq!(
+            granted_scopes(None, &kueue()).unwrap(),
+            [SCOPE_READ, SCOPE_SUBMIT]
+        );
+        assert_eq!(
+            granted_scopes(Some(""), &kueue()).unwrap(),
+            [SCOPE_READ, SCOPE_SUBMIT]
+        );
+        assert_eq!(
+            granted_scopes(Some("kueue.read kueue.read"), &kueue()).unwrap(),
+            [SCOPE_READ]
+        );
+        assert_eq!(
+            granted_scopes(Some("kueue.admin"), &kueue()),
+            Err(GrantError::Scope {
+                requested: "kueue.admin".into(),
+                grantable: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()]
+            })
+        );
+        assert_eq!(
+            granted_scopes(None, &buildit()).unwrap(),
+            ["buildit.read", "buildit.build"]
+        );
+        assert!(
+            granted_scopes(Some("kueue.read"), &buildit()).is_err(),
+            "a scope another audience lists is not grantable here"
+        );
+        let bare = testing::audience(CLUSTER, KUEUE, "");
+        assert!(granted_scopes(None, &bare).unwrap().is_empty());
+    }
+
+    fn run(dispatched_by: Option<&str>) -> BoundRun {
+        BoundRun {
+            run_id: "playbook_kueue-e2e_01a1-1791474738".into(),
+            pod_name: "crucible-run-brave-otter".into(),
+            cluster: CLUSTER.into(),
+            dispatched_by: dispatched_by.map(str::to_string),
+            sandbox_name: Some("ci-0123abcd".into()),
+            workdir: Some("/sandbox/repo".into()),
+        }
+    }
+
+    #[test]
+    fn the_launcher_is_the_person_the_run_was_dispatched_for() {
+        assert_eq!(launcher(&run(Some("user:alice"))).unwrap(), "alice");
+        for unattributed in [
+            None,
+            Some("team:platform-administrators"),
+            Some("user:"),
+            Some("alice"),
+        ] {
+            assert!(
+                matches!(
+                    launcher(&run(unattributed)),
+                    Err(GrantError::NoLauncher { .. })
+                ),
+                "{unattributed:?}"
+            );
+        }
+    }
+
+    fn grant(namespaces: &[&str]) -> AgentGrant {
+        AgentGrant {
+            sandbox: Sandbox {
+                spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
+                cluster: CLUSTER.into(),
+                tenant: None,
+                gateway: GatewayId::of_run_pod(POD),
+                id: crate::agent_auth::sandbox::SandboxId::parse("sbx-1").unwrap(),
+            },
+            launcher: "alice".into(),
+            kube_user: Some("alice-k8s".into()),
+            run: run(Some("user:alice")),
+            audience: KUEUE.into(),
+            scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
+            namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
+        }
+    }
+
+    /// Verify `token` the way a resource server does: against the published JWKS.
+    async fn verified(issuer: &AgentIssuer, token: &str) -> serde_json::Map<String, Value> {
+        let jwks = serve_jwks(issuer.jwks()).await;
+        crucible_mcp_auth::verify::Verifier::new(
+            ISSUER,
+            crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), jwks),
+        )
+        .typed_access_tokens()
+        .verify(token, &[KUEUE])
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_minted_token_carries_identity_claims_only_and_verifies() {
+        let spire = Spire::start().await;
+        let issuer = testing::issuer(&spire, &EcKey::generate());
+        let at = now();
+        let minted = issuer
+            .mint(&grant(&["crucible-kueue-e2e", "team-b"]), at)
+            .unwrap();
+        assert_eq!(minted.expires_in, MIN_TOKEN_TTL_SECS);
+        assert_eq!(minted.scope, "kueue.read kueue.submit");
+        let header = jsonwebtoken::decode_header(&minted.access_token).unwrap();
+        assert_eq!(header.alg, Algorithm::ES256);
+        assert_eq!(header.kid.as_deref(), Some(issuer.key.kid()));
+        assert_eq!(header.typ.as_deref(), Some("at+jwt"), "RFC 9068 §2.1");
+        let mut claims = verified(&issuer, &minted.access_token).await;
+        let jti = claims.remove("jti").unwrap();
+        assert_eq!(jti.as_str().unwrap().len(), 2 * JTI_BYTES);
+        assert_eq!(
+            Value::Object(claims),
+            json!({
+                "iss": ISSUER,
+                "sub": "alice",
+                "kube_user": "alice-k8s",
+                "aud": KUEUE,
+                "iat": at,
+                "nbf": at,
+                "exp": at + MIN_TOKEN_TTL_SECS,
+                "act": {"sub": format!("{PREFIX}{POD}/sandbox/sbx-1")},
+                "run_id": "crucible-run-brave-otter",
+                "kube_cluster": "dev",
+                "sandbox": "ci-0123abcd",
+                "workdir": "/sandbox/repo",
+                "scope": "kueue.read kueue.submit",
+                "namespace": "crucible-kueue-e2e",
+                "namespaces": ["crucible-kueue-e2e", "team-b"],
+            })
+        );
+        let principal = crucible_mcp_auth::principal::Principal::from_claims(
+            verified(&issuer, &minted.access_token).await,
+            crucible_mcp_auth::principal::Callers::Runs,
+        )
+        .unwrap();
+        assert_eq!(
+            principal.presenter(),
+            format!("{PREFIX}{POD}/sandbox/sbx-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn every_token_gets_its_own_id_and_omits_the_namespace_and_kube_user_it_lacks() {
+        let spire = Spire::start().await;
+        let issuer = testing::issuer(&spire, &EcKey::generate());
+        let unlinked = AgentGrant {
+            kube_user: None,
+            ..grant(&[])
+        };
+        let a = verified(
+            &issuer,
+            &issuer.mint(&unlinked, now()).unwrap().access_token,
+        )
+        .await;
+        let b = verified(
+            &issuer,
+            &issuer.mint(&grant(&[]), now()).unwrap().access_token,
+        )
+        .await;
+        assert_ne!(a["jti"], b["jti"]);
+        for key in ["namespace", "namespaces", "queues", "role", "kube_user"] {
+            assert!(!a.contains_key(key), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_keeps_tokens_from_the_previous_key_verifying_until_they_expire() {
+        let spire = Spire::start().await;
+        let old = EcKey::generate();
+        let new = EcKey::generate();
+        let before = testing::issuer(&spire, &old);
+        let token = before.mint(&grant(&[]), now()).unwrap().access_token;
+        let mut cfg = testing::config(&new);
+        cfg.previous_key = Some(SigningKey::from_pem(old.pem().as_bytes()).unwrap());
+        let after = AgentIssuer::new(cfg, |_| {
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
+        let kids: Vec<_> = after
+            .jwks()
+            .keys
+            .iter()
+            .filter_map(|k| k.common.key_id.clone())
+            .collect();
+        assert_eq!(
+            kids,
+            [after.key.kid().to_string(), before.key.kid().to_string()]
+        );
+        let issued = verified(&after, &token).await;
+        assert_eq!(
+            issued["sub"], "alice",
+            "signed by the previous key, published still"
+        );
+        let fresh = after.mint(&grant(&[]), now()).unwrap().access_token;
+        assert_eq!(
+            jsonwebtoken::decode_header(&fresh).unwrap().kid.as_deref(),
+            Some(after.key.kid()),
+            "new tokens are signed with the current key"
+        );
+        assert_eq!(after.jwks().keys.len(), 2);
+        let mut same = testing::config(&new);
+        same.previous_key = Some(SigningKey::from_pem(new.pem().as_bytes()).unwrap());
+        let unrotated = AgentIssuer::new(same, |_| {
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
+        assert_eq!(unrotated.jwks().keys.len(), 1, "one key is published once");
+    }
+
+    #[test]
+    fn the_token_lifetime_is_fifteen_to_thirty_minutes() {
+        assert_eq!(TokenTtl::default().secs(), 900);
+        assert_eq!("1800".parse::<TokenTtl>().unwrap().secs(), 1800);
+        for bad in ["899", "1801", "300", "soon", ""] {
+            assert!(
+                matches!(bad.parse::<TokenTtl>(), Err(ConfigError::Ttl(_))),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_kid_is_the_public_key_thumbprint_and_debug_hides_the_key() {
+        let key = EcKey::generate();
+        let a = SigningKey::from_pem(key.pem().as_bytes()).unwrap();
+        let b = SigningKey::from_pem(key.pem().as_bytes()).unwrap();
+        let other = SigningKey::from_pem(EcKey::generate().pem().as_bytes()).unwrap();
+        assert_eq!(a.kid(), b.kid());
+        assert_ne!(a.kid(), other.kid());
+        assert_eq!(a.public.common.key_id.as_deref(), Some(a.kid()));
+        assert_eq!(
+            format!("{a:?}"),
+            format!("SigningKey {{ kid: {:?}, .. }}", a.kid())
+        );
+        assert!(
+            SigningKey::from_pem(b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n")
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_metadata_points_at_the_issuers_own_endpoints() {
+        let spire = Spire::start().await;
+        let issuer = testing::issuer(&spire, &EcKey::generate());
+        let doc = serde_json::to_value(issuer.metadata(None)).unwrap();
+        assert_eq!(doc["issuer"], ISSUER);
+        assert_eq!(doc["token_endpoint"], format!("{ISSUER}/oauth/token"));
+        assert_eq!(doc["jwks_uri"], format!("{ISSUER}/.well-known/jwks.json"));
+        assert_eq!(doc["grant_types_supported"], json!(["client_credentials"]));
+        assert_eq!(
+            doc["scopes_supported"],
+            json!([
+                "kueue.read",
+                "kueue.submit",
+                "buildit.read",
+                "buildit.build"
+            ])
+        );
+        assert_eq!(
+            doc["token_endpoint_auth_methods_supported"],
+            json!(["private_key_jwt"])
+        );
+        assert!(
+            doc["token_endpoint_auth_signing_alg_values_supported"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("ES256"))
+        );
+        let jwks = serde_json::to_value(issuer.jwks()).unwrap();
+        assert_eq!(jwks["keys"][0]["kid"], issuer.key.kid());
+        assert_eq!(jwks["keys"][0]["use"], "sig");
+        assert_eq!(jwks["keys"][0]["alg"], "ES256");
+        assert!(
+            jwks["keys"][0].get("d").is_none(),
+            "no private key material"
+        );
+    }
+
+    fn lookup<'a>(vars: &'a HashMap<&'static str, String>) -> impl Fn(&str) -> Option<String> + 'a {
+        |var| vars.get(var).cloned()
+    }
+
+    fn env(key_file: &std::path::Path) -> HashMap<&'static str, String> {
+        HashMap::from([
+            ("CONTROLLER_AGENT_ISSUER", format!("{ISSUER}/")),
+            (
+                "CONTROLLER_AGENT_SIGNING_KEY_FILE",
+                key_file.display().to_string(),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                format!(
+                    "{CLUSTER}={} {PREFIX} spire/oidc-discovery:443, \
+                     spoke=https://oidc.spoke.example spiffe://spoke.example/openshell/gateway/ \
+                     spire-system/spire-oidc:8443,",
+                    testing::SVID_ISSUER
+                ),
+            ),
+        ])
+    }
+
+    #[test]
+    fn config_loads_from_env_and_refuses_a_partial_or_malformed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("signing.pem");
+        std::fs::write(&key_file, EcKey::generate().pem()).unwrap();
+        let vars = env(&key_file);
+
+        let cfg = AgentIssuerConfig::from_lookup(lookup(&vars))
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.issuer.as_str(), ISSUER, "the trailing slash is dropped");
+        assert!(
+            cfg.audiences.is_empty(),
+            "audiences come from the deploy profile's servers, not the environment"
+        );
+        assert_eq!(
+            cfg.spire,
+            [
+                testing::cluster_spire(),
+                ClusterSpire {
+                    cluster: "spoke".into(),
+                    svid_issuer: "https://oidc.spoke.example".into(),
+                    gateway_prefix: GatewayPrefix::parse(
+                        "spiffe://spoke.example/openshell/gateway/"
+                    )
+                    .unwrap(),
+                    discovery: DiscoveryService {
+                        tls: true,
+                        namespace: KubeName::try_from("spire-system".to_string()).unwrap(),
+                        name: KubeName::try_from("spire-oidc".to_string()).unwrap(),
+                        port: 8443,
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            cfg.spire[1].discovery.keys_path(),
+            "/api/v1/namespaces/spire-system/services/https:spire-oidc:8443/proxy/keys"
+        );
+        let plain: ClusterSpire = "k8s=https://oidc-discovery.k8s.crucible \
+             spiffe://k8s.crucible/openshell/gateway/ \
+             http://spire-server/spire-spiffe-oidc-discovery-provider:80"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            plain.discovery.keys_path(),
+            "/api/v1/namespaces/spire-server/services/http:spire-spiffe-oidc-discovery-provider:80/proxy/keys",
+            "a discovery provider without TLS is read over http"
+        );
+
+        assert!(
+            AgentIssuerConfig::from_lookup(|_| None).unwrap().is_none(),
+            "no issuer, no endpoint"
+        );
+        for var in DEPENDENT_VARS {
+            let mut orphaned = vars.clone();
+            orphaned.remove("CONTROLLER_AGENT_ISSUER");
+            orphaned.insert(*var, "x".to_string());
+            assert!(
+                matches!(
+                    AgentIssuerConfig::from_lookup(lookup(&orphaned)),
+                    Err(ConfigError::NoIssuer { .. })
+                ),
+                "{var} without the issuer starts nothing silently"
+            );
+        }
+
+        let mut keyless = vars.clone();
+        keyless.remove("CONTROLLER_AGENT_SIGNING_KEY_FILE");
+        assert!(matches!(
+            AgentIssuerConfig::from_lookup(lookup(&keyless)),
+            Err(ConfigError::Missing { var }) if var == "CONTROLLER_AGENT_SIGNING_KEY_FILE"
+        ));
+
+        let spire = |entry: &str| format!("{CLUSTER}={entry}");
+        let twice = format!(
+            "{},{}",
+            spire(&format!("{} {PREFIX} spire/oidc:443", testing::SVID_ISSUER)),
+            spire(&format!("https://other.example {PREFIX} spire/oidc:443"))
+        );
+        let same_issuer = format!(
+            "{},other={} {PREFIX} spire/oidc:443",
+            spire(&format!("{} {PREFIX} spire/oidc:443", testing::SVID_ISSUER)),
+            testing::SVID_ISSUER
+        );
+        let bad: Vec<(&'static str, String)> = vec![
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(
+                    "https://oidc.example spiffe://example.crucible/openshell/gateway spire/oidc:443",
+                ),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(
+                    "https://oidc.example https://example.crucible/openshell/gateway/ spire/oidc:443",
+                ),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX}")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX} spire/oidc")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX} spire/oidc:https")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX} Spire_NS/oidc:443")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                format!("https://oidc.example {PREFIX} spire/oidc:443"),
+            ),
+            ("CONTROLLER_AGENT_SPIRE", " , ".to_string()),
+            ("CONTROLLER_AGENT_SPIRE", twice),
+            ("CONTROLLER_AGENT_SPIRE", same_issuer),
+        ];
+        let bad = bad.iter().map(|(v, s)| (*v, s.as_str())).chain([
+            (
+                "CONTROLLER_AGENT_ISSUER",
+                "http://controller.svc:8080/oauth",
+            ),
+            ("CONTROLLER_AGENT_ISSUER", "http://controller.svc:8080/?x=1"),
+            ("CONTROLLER_AGENT_ISSUER", "spiffe://example.crucible"),
+            (
+                "CONTROLLER_AGENT_SIGNING_KEY_FILE",
+                "/nonexistent/signing.pem",
+            ),
+        ]);
+        for (var, value) in bad {
+            let mut broken = vars.clone();
+            broken.insert(var, value.to_string());
+            assert!(
+                AgentIssuerConfig::from_lookup(lookup(&broken)).is_err(),
+                "{var}={value}"
+            );
+        }
+    }
+
+    /// Without SPIRE the issuer serves people only: no agent audiences are needed, the key may come
+    /// inline, and the metadata advertises no client_credentials grant.
+    #[test]
+    fn an_issuer_without_spire_serves_people_only() {
+        let key = EcKey::generate();
+        let vars = HashMap::from([
+            ("CONTROLLER_AGENT_ISSUER", ISSUER.to_string()),
+            ("CONTROLLER_AGENT_SIGNING_KEY", key.pem()),
+        ]);
+        let cfg = AgentIssuerConfig::from_lookup(lookup(&vars))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.spire.is_empty() && cfg.audiences.is_empty());
+        let issuer = AgentIssuer::new(cfg, |_: &ClusterSpire| -> crucible_mcp_auth::jwks::Jwks {
+            panic!("no SPIRE to read keys from")
+        });
+        assert!(!issuer.serves_agents());
+        let people = crate::agent_auth::people::PeopleConfig::new(vec![
+            crate::agent_auth::people::PersonAudience {
+                resource: KUEUE.into(),
+                cluster: "ocp".into(),
+                scopes: vec!["kueue.read".into()],
+            },
+        ])
+        .unwrap();
+        let doc = issuer.metadata(Some(&PeopleMetadata {
+            scopes: people.scopes(),
+            client_id_metadata_documents: false,
+            registration: false,
+        }));
+        assert_eq!(
+            doc.grant_types_supported,
+            ["authorization_code", "refresh_token"]
+        );
+        assert_eq!(doc.token_endpoint_auth_methods_supported, ["none"]);
+        assert!(issuer.metadata(None).grant_types_supported.is_empty());
+
+        let mut bad = vars.clone();
+        bad.insert("CONTROLLER_AGENT_SIGNING_KEY", "not a key".into());
+        assert!(matches!(
+            AgentIssuerConfig::from_lookup(lookup(&bad)),
+            Err(ConfigError::Key { .. })
+        ));
+    }
+}

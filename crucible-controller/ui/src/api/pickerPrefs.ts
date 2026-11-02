@@ -8,7 +8,8 @@ import { $api } from './client';
  * the blob opaque and the shape is validated here on the way in.
  */
 export interface PickerPrefs {
-  /** Principals starred in the secret owner picker, in the order they were starred. */
+  /** Principals starred in the owner pickers and on the teams page, in the order they were
+   * starred. A starred `team:<slug>` is named in the rail and the masthead switcher. */
   ownerFavorites: string[];
   /** The filter text the secret owner picker was last left with. */
   ownerFilter: string;

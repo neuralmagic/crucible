@@ -11,8 +11,7 @@ import {
 import type { KeyboardEvent, ReactNode } from 'react';
 import {
   BaseEdge,
-  Background,
-  BackgroundVariant,
+  ControlButton,
   Controls,
   EdgeLabelRenderer,
   Handle,
@@ -24,7 +23,6 @@ import {
   type Edge,
   type EdgeProps,
   type EdgeTypes,
-  type FitViewOptions,
   type Node,
   type NodeProps,
   type NodeTypes,
@@ -32,33 +30,48 @@ import {
 import { cn, ExternalLinkChip, ExternalLinkMark, Split, SplitHandle, SplitPane } from '../ui';
 import { useDeviceFlag } from '../useDeviceFlag';
 import {
+  fitViewport,
+  frameHeight,
+  INSTANCE_GAP,
+  INSTANCE_H,
+  INSTANCE_INDENT,
+  isPill,
   layoutWorkflow,
   LINK_STRIP,
-  STACK_CARDS,
-  STACK_STEP,
+  PILL_NOTE_CHAR,
   type LaidOutEdge,
   type LaidOutNode,
   type LayoutDirection,
+  type PillOptions,
   type WorkflowGraphDoc,
+  type WorkflowGraphNode,
 } from './workflowGraphLayout';
 import {
   badgeFor,
+  decisionLines,
+  decisionRows,
   detailRows,
+  fanoutCount,
   fanoutLine,
   fanoutRows,
+  kindGlyph,
   metaFor,
+  pillChip,
+  pillChipChars,
   runsLine,
   runtimeLine,
   runtimeRows,
   sourceFor,
+  statusMark,
+  type StatusMark,
 } from './workflowGraphCard';
 import {
   targetLabel,
   type FanOutState,
   type NodeLinks,
   type OutputNode,
+  type RouteDecision,
   type TaskRuntime,
-  type TaskTone,
 } from './taskGraph';
 import { TaskEvidence } from './TaskEvidence';
 
@@ -75,22 +88,49 @@ export interface WorkflowGraphProps {
   fanoutState?: ReadonlyMap<string, FanOutState>;
   /// The external results each node links out to, keyed by node name.
   links?: ReadonlyMap<string, NodeLinks>;
+  /// What each route node or route instance decided, keyed by its name.
+  decisions?: ReadonlyMap<string, RouteDecision[]>;
   className?: string;
 }
 
-/// A finished task borrows its border and its status from how it ended; one with nothing terminal
-/// to say keeps the card's own rule.
-const TONE_BORDER: Record<TaskTone, string> = {
+/// A task borrows its border and its dot from how it ended, or from the run still being on its way
+/// to it; one with nothing of either to say keeps the card's own rule and a hollow dot.
+const MARK_BORDER: Record<StatusMark, string> = {
   pass: 'border-green',
   fail: 'border-red',
-  none: '',
+  blocked: 'border-amber',
+  active: 'border-blue',
+  idle: '',
 };
 
-const TONE_TEXT: Record<TaskTone, string> = {
-  pass: 'text-green',
-  fail: 'text-red',
-  none: 'text-ink-3',
+const MARK_DOT: Record<StatusMark, string> = {
+  pass: 'bg-green',
+  fail: 'bg-red',
+  blocked: 'bg-amber',
+  active: 'animate-pulse bg-blue',
+  idle: 'border border-ink-3',
 };
+
+function StatusDot({ runtime }: { runtime: TaskRuntime }) {
+  return (
+    <span
+      aria-hidden
+      title={runtime.status}
+      data-mark={statusMark(runtime)}
+      className={cn('inline-block size-2 shrink-0 rounded-full', MARK_DOT[statusMark(runtime)])}
+    />
+  );
+}
+
+/// What the glyph and the dot say, for whoever cannot see them.
+function Spoken({ node, runtime }: { node: WorkflowGraphNode; runtime: TaskRuntime | null }) {
+  return (
+    <span className="sr-only">
+      {badgeFor(node)}
+      {runtime === null ? '' : ` ${runtime.status}`}{' '}
+    </span>
+  );
+}
 
 /// A full-screen graph too big to hold at once gets an overview to navigate by; fitted into the
 /// page it is already the overview.
@@ -102,16 +142,15 @@ const KIND_RULE: Record<string, string> = {
   agent: 'bg-blue',
   command: 'bg-ink-2',
   engine: 'bg-amber',
+  route: 'bg-ink',
 };
+
+/// The frame's border, top and bottom: its height is set border to border, the graph's inside it.
+const FRAME_BORDER = 2;
 
 /// Which way the graph runs is a per-device choice: a wide screen reads left to right, a narrow
 /// pane top down.
 const VERTICAL_KEY = 'crucible.graph.vertical';
-
-const FIT: FitViewOptions = {
-  padding: { top: '34px', right: '8px', bottom: '8px', left: '8px' },
-  maxZoom: 1.35,
-};
 
 /// Where an edge enters and leaves a card, by direction.
 const PORTS: Record<LayoutDirection, { in: Position; out: Position }> = {
@@ -131,7 +170,12 @@ interface GraphView {
   outputs: ReadonlyMap<string, OutputNode>;
   fanoutState: ReadonlyMap<string, FanOutState>;
   links: ReadonlyMap<string, NodeLinks>;
+  decisions: ReadonlyMap<string, RouteDecision[]>;
   edges: ReadonlyMap<string, LaidOutEdge>;
+  /// Plain command tasks drawn as pills, null when they are cards.
+  pills: PillOptions | null;
+  /// The hovered edge, whose plumbing label shows.
+  hoveredEdge: string | null;
   /// The hovered or focused task and everything it depends on; null when nothing is traced. A
   /// picked task is not traced: reading its metadata should not dim the graph it sits in.
   lit: ReadonlySet<string> | null;
@@ -207,13 +251,17 @@ function TaskCard({ id }: NodeProps) {
 
   const output = view.outputs.get(id);
   if (output !== undefined) return <OutputCard id={id} output={output} />;
+  if (laid.instance !== null) return <InstanceRow laid={laid} />;
+  if (isPill(laid.node, view.pills)) return <TaskPill laid={laid} />;
 
   const { node } = laid;
   const advisory = !node.required;
   const dim = view.lit !== null && !view.lit.has(id);
   const fanout = node.fanout ?? null;
+  const route = node.kind === 'route';
   const emitted = [...node.emits, ...node.emits_files];
-  const runs = runsLine(node);
+  const decided = decisionLines(view.decisions.get(node.name) ?? []);
+  const runs = decided.length === 0 ? runsLine(node) : null;
   const meta = metaFor(node);
   const runtime = view.runtime.get(node.name) ?? null;
   const spread = view.fanoutState.get(node.name) ?? null;
@@ -224,25 +272,10 @@ function TaskCard({ id }: NodeProps) {
   return (
     <>
       <Handle type="target" position={ports.in} isConnectable={false} className="opacity-0" />
-      {/* A mapped task is drawn as the deck of instances it becomes at run time. */}
-      {fanout !== null &&
-        Array.from({ length: STACK_CARDS }, (_, i) => (
-          <span
-            key={i}
-            aria-hidden
-            className="absolute inset-0 border border-rule-hard bg-raised"
-            style={{
-              transform: `translate(${(STACK_CARDS - i) * STACK_STEP}px, ${
-                (STACK_CARDS - i) * STACK_STEP
-              }px)`,
-              opacity: dim ? 0.2 : 1,
-            }}
-          />
-        ))}
       <button
         type="button"
         data-task={node.name}
-        aria-label={`${badgeFor(node)} ${node.name}`}
+        data-status={runtime?.status}
         aria-pressed={view.picked === node.name}
         onClick={() => view.onPick(node.name)}
         onFocus={(event) => {
@@ -257,63 +290,82 @@ function TaskCard({ id }: NodeProps) {
           paddingBottom: links === null ? undefined : LINK_STRIP,
         }}
         className={cn(
-          'relative flex h-full w-full flex-col overflow-hidden bg-raised py-0.5 pr-1.5 pl-2 text-left leading-tight',
+          'relative flex h-full w-full flex-col overflow-hidden py-0.5 pr-1.5 pl-2 text-left leading-tight',
+          route ? 'bg-sunk pl-3' : 'bg-raised',
           advisory ? 'border border-dashed border-rule-hard' : 'border border-ink-3',
+          route && !advisory && 'border-double border-[3px]',
           laid.isResult && 'border-2 border-ink',
-          runtime !== null && TONE_BORDER[runtime.tone],
+          runtime !== null && MARK_BORDER[statusMark(runtime)],
           view.picked === node.name && 'outline-2 outline-offset-2 outline-blue'
         )}
       >
         <span
           aria-hidden
           className={cn(
-            'absolute top-1 bottom-1 left-0 w-[2px]',
+            route ? 'absolute top-3 bottom-3 left-1 w-[2px]' : 'absolute top-1 bottom-1 left-0 w-[2px]',
             fanout !== null ? 'bg-ink' : (KIND_RULE[node.kind] ?? 'bg-ink-3')
           )}
         />
         {/* The result task ends the graph: a solid end bar, the way a column ends. */}
         {laid.isResult && <span aria-hidden className="absolute inset-y-0 right-0 w-[3px] bg-ink" />}
 
-        <span className="flex items-baseline justify-between gap-2 font-mono text-micro tracking-label text-ink-2 uppercase">
-          <span>{badgeFor(node)}</span>
-          {runtime === null ? (
-            <span>{laid.isResult ? 'result' : advisory ? 'advisory' : ''}</span>
-          ) : (
-            <span className={TONE_TEXT[runtime.tone]}>{runtime.status}</span>
+        <Spoken node={node} runtime={runtime} />
+        <span className="flex items-center gap-1.5">
+          <span
+            aria-hidden
+            title={badgeFor(node)}
+            className="w-3 shrink-0 text-center font-mono text-data text-ink-3"
+          >
+            {kindGlyph(node)}
+          </span>
+          <span
+            title={node.name}
+            className={cn(
+              'min-w-0 flex-1 truncate font-mono text-body',
+              laid.isResult ? 'font-semibold text-ink' : advisory ? 'text-ink-2' : 'text-ink'
+            )}
+          >
+            {node.name}
+          </span>
+          {spread !== null && (
+            <span data-count={node.name} className="shrink-0 font-mono text-label text-ink-2">
+              ×{fanoutCount(spread)}
+            </span>
           )}
-        </span>
-
-        <span
-          title={node.name}
-          className={cn(
-            'block truncate font-mono text-data-lg',
-            laid.isResult ? 'font-semibold text-ink' : advisory ? 'text-ink-2' : 'text-ink'
-          )}
-        >
-          {node.name}
+          {runtime !== null && <StatusDot runtime={runtime} />}
         </span>
 
         {runs !== null && (
-          <span title={runs} className="block truncate font-mono text-micro text-ink-2">
+          <span title={runs} className="block truncate font-mono text-label text-ink-2">
             {runs}
           </span>
         )}
         {meta !== null && (
-          <span title={meta} className="block truncate font-mono text-micro text-ink-2">
+          <span title={meta} className="block truncate font-mono text-label text-ink-2">
             {meta}
           </span>
         )}
+        {decided.map((line) => (
+          <span
+            key={line}
+            data-decision={node.name}
+            title={line}
+            className="block truncate font-mono text-label text-ink"
+          >
+            {line}
+          </span>
+        ))}
         {spread !== null && (
           <span
             data-fanout={node.name}
             title={fanoutLine(spread)}
-            className="block truncate font-mono text-micro text-ink-2"
+            className="block truncate font-mono text-label text-ink-2"
           >
             {fanoutLine(spread)}
           </span>
         )}
         {ran !== null && (
-          <span className="block truncate font-mono text-micro text-ink-2">{ran}</span>
+          <span className="block truncate font-mono text-label text-ink-2">{ran}</span>
         )}
         {emitted.length > 0 && (
           <span className="flex min-w-0 gap-1 overflow-hidden">
@@ -325,6 +377,159 @@ function TaskCard({ id }: NodeProps) {
         )}
       </button>
       {links !== null && <NodeLinkRow name={node.name} drawn={links} dim={dim} />}
+      <Handle type="source" position={ports.out} isConnectable={false} className="opacity-0" />
+    </>
+  );
+}
+
+/// One runtime instance of a mapped task, drawn as a row under its deck: the item it ran for, and
+/// what it answered or how it ended. A button like the card, so it opens the instance's evidence.
+function InstanceRow({ laid }: { laid: LaidOutNode }) {
+  const view = useGraphView();
+  const { node, instance } = laid;
+  if (instance === null) return null;
+  const dim = view.lit !== null && !view.lit.has(node.name);
+  const runtime = view.runtime.get(node.name) ?? null;
+  const item = node.name.slice(instance.deck.length + 1, -1);
+  const answer = view.decisions.get(node.name)?.[0]?.labels[0]?.label ?? null;
+  const links = view.links.get(node.name) ?? null;
+  const link = links?.kind === 'links' ? (links.links[0] ?? null) : null;
+  const ports = PORTS[view.direction];
+
+  return (
+    <>
+      <Handle type="target" position={ports.in} isConnectable={false} className="opacity-0" />
+      {view.direction === 'LR' && (
+        <span
+          aria-hidden
+          className="absolute border-b border-l border-rule-hard"
+          style={{
+            left: -INSTANCE_INDENT / 2,
+            width: INSTANCE_INDENT / 2,
+            top: -(INSTANCE_GAP + (instance.index === 0 ? 0 : INSTANCE_H / 2)),
+            bottom: INSTANCE_H / 2,
+            opacity: dim ? 0.2 : 1,
+          }}
+        />
+      )}
+      <button
+        type="button"
+        data-task={node.name}
+        data-status={runtime?.status}
+        aria-pressed={view.picked === node.name}
+        onClick={() => view.onPick(node.name)}
+        onFocus={(event) => {
+          if (event.currentTarget.matches(':focus-visible')) view.onTrace(node.name);
+        }}
+        onBlur={() => view.onTrace(null)}
+        style={{ opacity: dim ? 0.2 : 1, transition: 'opacity 120ms linear' }}
+        className={cn(
+          'flex h-full w-full items-center gap-1.5 overflow-hidden border bg-raised px-1.5 text-left font-mono text-label leading-none',
+          (runtime === null ? '' : MARK_BORDER[statusMark(runtime)]) || 'border-rule-hard',
+          link !== null && 'pr-12',
+          view.picked === node.name && 'outline-2 outline-offset-2 outline-blue'
+        )}
+      >
+        <Spoken node={node} runtime={runtime} />
+        {runtime !== null && <StatusDot runtime={runtime} />}
+        <span title={item} className="min-w-0 flex-1 truncate text-ink-2">
+          {item}
+        </span>
+        {answer !== null && <span className="shrink-0 text-ink">{answer}</span>}
+      </button>
+      {link !== null && (
+        <span
+          data-node-links={node.name}
+          style={{ opacity: dim ? 0.2 : 1 }}
+          className="pointer-events-none absolute inset-y-0 right-1 flex items-center"
+        >
+          <ExternalLinkChip link={link} className="pointer-events-auto border-b-0 text-micro" />
+        </span>
+      )}
+      <Handle type="source" position={ports.out} isConnectable={false} className="opacity-0" />
+    </>
+  );
+}
+
+/// Pixels between a pill's name and the chip drawn over its end, plus the chip's inset.
+const PILL_CHIP_GAP = 14;
+
+/// A plain command task in a run, drawn as one line: how it ended, its name, and what its attempts
+/// cost when that is anything worth saying.
+function TaskPill({ laid }: { laid: LaidOutNode }) {
+  const view = useGraphView();
+  const { node } = laid;
+  const advisory = !node.required;
+  const dim = view.lit !== null && !view.lit.has(node.name);
+  const runtime = view.runtime.get(node.name) ?? null;
+  const ran = runtime === null ? null : runtimeLine(runtime);
+  const chip = pillChip(view.links.get(node.name) ?? null);
+  const ports = PORTS[view.direction];
+
+  return (
+    <>
+      <Handle type="target" position={ports.in} isConnectable={false} className="opacity-0" />
+      <button
+        type="button"
+        data-task={node.name}
+        data-status={runtime?.status}
+        aria-pressed={view.picked === node.name}
+        onClick={() => view.onPick(node.name)}
+        onFocus={(event) => {
+          if (event.currentTarget.matches(':focus-visible')) view.onTrace(node.name);
+        }}
+        onBlur={() => view.onTrace(null)}
+        style={{
+          opacity: dim ? 0.2 : 1,
+          transition: 'opacity 120ms linear',
+          paddingRight:
+            chip === null ? undefined : Math.ceil(pillChipChars(chip) * PILL_NOTE_CHAR) + PILL_CHIP_GAP,
+        }}
+        className={cn(
+          'flex h-full w-full items-center gap-1.5 overflow-hidden bg-raised px-2.5 text-left font-mono leading-none',
+          advisory ? 'border border-dashed border-rule-hard' : 'border border-ink-3',
+          laid.isResult && 'border-2 border-ink',
+          runtime !== null && MARK_BORDER[statusMark(runtime)],
+          view.picked === node.name && 'outline-2 outline-offset-2 outline-blue'
+        )}
+      >
+        <Spoken node={node} runtime={runtime} />
+        {runtime !== null && <StatusDot runtime={runtime} />}
+        <span
+          title={node.name}
+          className={cn(
+            'min-w-0 flex-1 truncate text-data-lg',
+            laid.isResult ? 'font-semibold text-ink' : advisory ? 'text-ink-2' : 'text-ink'
+          )}
+        >
+          {node.name}
+        </span>
+        {ran !== null && (
+          <span title={ran} className="max-w-[45%] shrink-0 truncate text-label text-ink-2">
+            {ran}
+          </span>
+        )}
+      </button>
+      {chip !== null && (
+        <span
+          data-node-links={node.name}
+          style={{ opacity: dim ? 0.2 : 1 }}
+          className="pointer-events-none absolute inset-y-0 right-2 flex items-center"
+        >
+          {chip.kind === 'link' ? (
+            <ExternalLinkChip link={chip.link} className="pointer-events-auto border-b-0 text-micro" />
+          ) : (
+            <span
+              data-link-count={chip.count}
+              aria-label={`${chip.count} links`}
+              className="inline-flex items-center gap-1 font-mono text-micro text-ink-2"
+            >
+              <ExternalLinkMark provider={chip.provider} />
+              {chip.count}
+            </span>
+          )}
+        </span>
+      )}
       <Handle type="source" position={ports.out} isConnectable={false} className="opacity-0" />
     </>
   );
@@ -377,10 +582,11 @@ function OutputCard({ id, output }: { id: string; output: OutputNode }) {
 
 interface EdgeMarkers {
   arrow: string;
+  arrowSpine: string;
   arrowLit: string;
 }
 
-const EdgeMarkersContext = createContext<EdgeMarkers>({ arrow: '', arrowLit: '' });
+const EdgeMarkersContext = createContext<EdgeMarkers>({ arrow: '', arrowSpine: '', arrowLit: '' });
 
 /// One dependency, drawn on the path the layout routed through the gutters. An edge into an
 /// advisory task is dashed, and one its consumer joins on carries the join.
@@ -392,30 +598,58 @@ function PlanEdge({ id }: EdgeProps) {
 
   const lit = view.lit !== null && view.lit.has(laid.from) && view.lit.has(laid.to);
   const dim = view.lit !== null && !lit;
+  const tone = lit ? 'var(--ink)' : laid.spine ? 'var(--ink-2)' : 'var(--ink-3)';
+  const width = lit ? 1.6 : laid.spine ? 1.4 : 1;
+  // The spine is drawn whole, advisory or not: it is the line a reader follows first.
+  const dashed = !laid.required && !laid.spine;
+  const untaken = view.runtime.get(laid.to)?.status === 'not_taken';
+  const fade = dim ? 0.15 : untaken ? 0.45 : 1;
+  const double = laid.aligned && !untaken;
+  const plumbing = lit || view.hoveredEdge === id ? laid.plumbing : null;
+  if (laid.implied && !lit) return null;
 
   return (
     <>
+      {double && (
+        <path
+          d={laid.path}
+          data-aligned-edge={id}
+          fill="none"
+          style={{
+            stroke: tone,
+            strokeWidth: width * 2 + 2.5,
+            strokeDasharray: dashed ? '3 3' : undefined,
+            opacity: fade,
+          }}
+        />
+      )}
       <BaseEdge
         id={id}
         path={laid.path}
-        markerEnd={`url(#${lit ? markers.arrowLit : markers.arrow})`}
+        markerEnd={`url(#${lit ? markers.arrowLit : laid.spine ? markers.arrowSpine : markers.arrow})`}
         style={{
-          stroke: lit ? 'var(--ink)' : 'var(--ink-3)',
-          strokeWidth: lit ? 1.6 : 1,
-          strokeDasharray: laid.required ? undefined : '3 3',
-          opacity: dim ? 0.15 : 1,
+          stroke: double ? 'var(--paper)' : tone,
+          strokeWidth: double ? 2.5 : width,
+          strokeDasharray: untaken ? '2 4' : dashed && !double ? '3 3' : undefined,
+          opacity: fade,
         }}
       />
-      {laid.label !== null && (
+      {(laid.label !== null || laid.reads !== null || plumbing !== null) && (
         <EdgeLabelRenderer>
           <span
-            className="absolute bg-paper px-1 font-mono text-micro tracking-label text-ink-2 uppercase"
+            data-edge-label={id}
+            className={cn(
+              'absolute flex gap-1 bg-paper px-1 font-mono text-label text-ink-2',
+              plumbing !== null && 'z-10'
+            )}
             style={{
               transform: `translate(-50%, -50%) translate(${laid.labelX}px, ${laid.labelY}px)`,
-              opacity: dim ? 0.15 : 1,
+              opacity: fade,
             }}
           >
-            {laid.label}
+            {laid.label !== null && <span className="tracking-label uppercase">{laid.label}</span>}
+            {laid.reads !== null && <span className="text-ink">{laid.reads}</span>}
+            {plumbing !== null && <span data-plumbing>{plumbing}</span>}
           </span>
         </EdgeLabelRenderer>
       )}
@@ -424,24 +658,27 @@ function PlanEdge({ id }: EdgeProps) {
 }
 
 const NODE_TYPES: NodeTypes = { task: TaskCard };
+const PRO_OPTIONS = { hideAttribution: true };
 const EDGE_TYPES: EdgeTypes = { plan: PlanEdge };
 
 interface TaskPanelProps {
   laid: LaidOutNode;
   runtime: TaskRuntime | null;
   spread: FanOutState | null;
+  decisions: RouteDecision[];
   runId: string | undefined;
   onClose: () => void;
 }
 
 /// Everything the graph document holds about one task, the source it runs included: too long for a
 /// card, and the thing an importer most wants to read before registering a pack.
-function TaskPanel({ laid, runtime, spread, runId, onClose }: TaskPanelProps) {
+function TaskPanel({ laid, runtime, spread, decisions, runId, onClose }: TaskPanelProps) {
   const { node } = laid;
   const source = sourceFor(node);
   const rows = [
     ...(runtime === null ? [] : runtimeRows(runtime)),
     ...(spread === null ? [] : fanoutRows(spread)),
+    ...decisionRows(decisions),
     ...detailRows(node),
   ];
 
@@ -499,6 +736,7 @@ const NO_RUNTIME: ReadonlyMap<string, TaskRuntime> = new Map();
 const NO_OUTPUTS: ReadonlyMap<string, OutputNode> = new Map();
 const NO_FANOUT: ReadonlyMap<string, FanOutState> = new Map();
 const NO_LINKS: ReadonlyMap<string, NodeLinks> = new Map();
+const NO_DECISIONS: ReadonlyMap<string, RouteDecision[]> = new Map();
 
 const CANVAS_ONLY = ['canvas'];
 const CANVAS_AND_PANEL = ['canvas', 'panel'];
@@ -510,20 +748,52 @@ function GraphCanvas({
   outputs,
   fanoutState,
   links,
+  decisions,
   className,
 }: WorkflowGraphProps) {
   const marker = useId().replace(/:/g, '');
   const markers = useMemo(
-    () => ({ arrow: `arrow-${marker}`, arrowLit: `arrow-lit-${marker}` }),
+    () => ({
+      arrow: `arrow-${marker}`,
+      arrowSpine: `arrow-spine-${marker}`,
+      arrowLit: `arrow-lit-${marker}`,
+    }),
     [marker]
   );
   const [vertical, setVertical] = useDeviceFlag(VERTICAL_KEY, false);
   const direction: LayoutDirection = vertical ? 'TD' : 'LR';
-  const layout = useMemo(() => layoutWorkflow(graph, direction), [graph, direction]);
+  // A pill is as wide as what it says, so the layout is told how much trails each name.
+  const pills = useMemo<PillOptions | null>(() => {
+    if (runtime === undefined) return null;
+    const trailing = new Map<string, number>();
+    for (const node of graph.nodes) {
+      const state = runtime.get(node.name);
+      const note = state === undefined ? null : runtimeLine(state);
+      const linked = pillChipChars(pillChip(links?.get(node.name) ?? null));
+      const chars = (note?.length ?? 0) + linked;
+      if (chars > 0) trailing.set(node.name, chars);
+    }
+    return { trailing };
+  }, [graph, runtime, links]);
+  const layout = useMemo(
+    () => layoutWorkflow(graph, direction, { pills }),
+    [graph, direction, pills]
+  );
   const [traced, setTraced] = useState<string | null>(null);
+  const [hoveredEdge, setHoveredEdge] = useState<string | null>(null);
   const [picked, setPicked] = useState<string | null>(null);
   const [full, setFull] = useState(false);
-  const { fitView } = useReactFlow();
+  const { setViewport } = useReactFlow();
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+  const frameRef = useRef<HTMLDivElement | null>(null);
+  const [frameWidth, setFrameWidth] = useState(0);
+  const fit = useCallback(() => {
+    const element = canvasRef.current;
+    if (element === null) return;
+    void setViewport(
+      fitViewport(layout, { width: element.clientWidth, height: element.clientHeight })
+    );
+  }, [layout, setViewport]);
 
   const nodes = useMemo<Node[]>(
     () =>
@@ -569,8 +839,8 @@ function GraphCanvas({
 
   // A new arrangement, whether from a recompile or from turning the graph, is refit.
   useEffect(() => {
-    void fitView(FIT);
-  }, [layout, fitView]);
+    fit();
+  }, [fit]);
 
   const view = useMemo<GraphView>(() => {
     return {
@@ -580,15 +850,29 @@ function GraphCanvas({
       outputs: outputs ?? NO_OUTPUTS,
       fanoutState: fanoutState ?? NO_FANOUT,
       links: links ?? NO_LINKS,
+      decisions: decisions ?? NO_DECISIONS,
       edges: new Map(layout.edges.map((laid) => [edgeId(laid.from, laid.to), laid])),
+      pills,
+      hoveredEdge,
       lit: traced === null ? null : (layout.ancestry.get(traced) ?? new Set([traced])),
       picked,
       onTrace: setTraced,
       onPick: setPicked,
     };
-  }, [direction, layout, runtime, outputs, fanoutState, links, traced, picked]);
+  }, [
+    direction,
+    layout,
+    runtime,
+    outputs,
+    fanoutState,
+    links,
+    decisions,
+    pills,
+    hoveredEdge,
+    traced,
+    picked,
+  ]);
 
-  const canvasRef = useRef<HTMLDivElement | null>(null);
   // The canvas changes size when a divider is dragged, the rail collapses, or the window resizes;
   // the plan is refit to whatever it is now.
   useEffect(() => {
@@ -597,16 +881,26 @@ function GraphCanvas({
     let frame = 0;
     const observer = new ResizeObserver(() => {
       cancelAnimationFrame(frame);
-      frame = requestAnimationFrame(() => {
-        void fitView(FIT);
-      });
+      frame = requestAnimationFrame(fit);
     });
     observer.observe(element);
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [fitView]);
+  }, [fit]);
+
+  // The frame is as tall as its graph needs at the width it is given.
+  useEffect(() => {
+    const element = frameRef.current;
+    if (element === null) return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width;
+      if (width !== undefined) setFrameWidth(width);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
 
   const close = useCallback(() => setPicked(null), []);
   // Escape closes the innermost thing first: the task panel, then the full-screen view.
@@ -628,19 +922,8 @@ function GraphCanvas({
     [picked, close, full]
   );
 
-  const tones = new Set([...view.runtime.values()].map((state) => state.tone));
-  const marks = [
-    tones.has('pass') ? 'green = passed' : null,
-    tones.has('fail') ? 'red = failed' : null,
-    layout.nodes.some((laid) => (laid.node.fanout ?? null) !== null)
-      ? 'MAP = mapped over a producer field'
-      : null,
-    layout.nodes.some((laid) => !laid.node.required) ? 'dashed = advisory' : null,
-    layout.edges.some((laid) => laid.label !== null) ? 'passed = joins only on what passed' : null,
-    layout.nodes.some((laid) => laid.isResult) ? 'end bar = result' : null,
-  ].filter((mark): mark is string => mark !== null);
-
   const pickedNode = picked === null ? undefined : view.nodes.get(picked);
+  const height = frameHeight(layout, frameWidth, pickedNode !== undefined);
   const panelIds = pickedNode === undefined ? CANVAS_ONLY : CANVAS_AND_PANEL;
 
   if (layout.nodes.length === 0) return null;
@@ -652,14 +935,13 @@ function GraphCanvas({
           role="region"
           aria-label="Compiled workflow graph"
           data-testid="workflow-graph"
+          ref={frameRef}
           onKeyDown={onKeyDown}
           data-fullscreen={full ? 'true' : undefined}
-          style={full ? undefined : { aspectRatio: `${layout.width} / ${layout.height}` }}
+          style={full ? undefined : { height: `min(${height + FRAME_BORDER}px, 780px, 64vh)` }}
           className={cn(
             'border border-rule-hard bg-paper',
-            full
-              ? 'fixed inset-0 z-40 h-screen w-screen'
-              : 'relative max-h-[min(780px,64vh)] min-h-[240px] w-full'
+            full ? 'fixed inset-0 z-40 h-screen w-screen' : 'relative w-full'
           )}
         >
           <div
@@ -669,15 +951,15 @@ function GraphCanvas({
           >
             {(
               [
-                { vertical: false, label: '\u2192 LR', title: 'Lay the graph out left to right' },
-                { vertical: true, label: '\u2193 TD', title: 'Lay the graph out top down' },
+                { vertical: false, label: 'LR', title: 'Lay the graph out left to right' },
+                { vertical: true, label: 'TD', title: 'Lay the graph out top down' },
               ] as const
             ).map((option) => (
               <button
                 key={option.label}
                 type="button"
                 title={option.title}
-                aria-label={option.title}
+                aria-label={`${option.label}: ${option.title}`}
                 aria-pressed={vertical === option.vertical}
                 onClick={() => setVertical(option.vertical)}
                 className={cn(
@@ -685,6 +967,7 @@ function GraphCanvas({
                   vertical === option.vertical && 'bg-ink text-surface hover:bg-ink hover:text-surface'
                 )}
               >
+                <span aria-hidden>{option.vertical ? '\u2193' : '\u2192'} </span>
                 {option.label}
               </button>
             ))}
@@ -701,6 +984,7 @@ function GraphCanvas({
             <defs>
               {[
                 { id: markers.arrow, tone: 'var(--ink-3)' },
+                { id: markers.arrowSpine, tone: 'var(--ink-2)' },
                 { id: markers.arrowLit, tone: 'var(--ink)' },
               ].map(({ id, tone }) => (
                 <marker
@@ -711,6 +995,7 @@ function GraphCanvas({
                   refY={4}
                   markerWidth={7}
                   markerHeight={7}
+                  markerUnits="userSpaceOnUse"
                   orient="auto-start-reverse"
                 >
                   <path d="M 0 1 L 7 4 L 0 7 z" fill={tone} />
@@ -728,8 +1013,7 @@ function GraphCanvas({
                     edges={edges}
                     nodeTypes={NODE_TYPES}
                     edgeTypes={EDGE_TYPES}
-                    fitView
-                    fitViewOptions={FIT}
+                    proOptions={PRO_OPTIONS}
                     minZoom={0.2}
                     maxZoom={2}
                     nodesDraggable={false}
@@ -742,10 +1026,17 @@ function GraphCanvas({
                     preventScrolling={false}
                     onNodeMouseEnter={(_, node) => setTraced(node.id)}
                     onNodeMouseLeave={() => setTraced(null)}
+                    onEdgeMouseEnter={(_, edge) => setHoveredEdge(edge.id)}
+                    onEdgeMouseLeave={() => setHoveredEdge(null)}
                     onPaneClick={close}
                   >
-                    <Background variant={BackgroundVariant.Dots} gap={12} size={1} />
-                    <Controls showInteractive={false} />
+                    <Controls showInteractive={false} showFitView={false}>
+                      <ControlButton onClick={fit} title="Fit view" aria-label="Fit view">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 30" aria-hidden>
+                          <path d="M3.692 4.63c0-.53.4-.938.939-.938h5.215V0H4.708C2.13 0 0 2.054 0 4.63v5.216h3.692V4.631zM27.354 0h-5.2v3.692h5.17c.53 0 .984.4.984.939v5.215H32V4.631A4.624 4.624 0 0027.354 0zm.954 24.83c0 .532-.4.94-.939.94h-5.215v3.768h5.215c2.577 0 4.631-2.13 4.631-4.707v-5.139h-3.692v5.139zm-23.677.94c-.531 0-.939-.4-.939-.94v-5.138H0v5.139c0 2.577 2.13 4.707 4.708 4.707h5.138V25.77H4.631z" />
+                        </svg>
+                      </ControlButton>
+                    </Controls>
                     {full && layout.nodes.length >= MINIMAP_FROM && <MiniMap pannable zoomable />}
                   </ReactFlow>
                 </GraphViewContext.Provider>
@@ -760,6 +1051,7 @@ function GraphCanvas({
                     laid={pickedNode}
                     runtime={view.runtime.get(pickedNode.node.name) ?? null}
                     spread={view.fanoutState.get(pickedNode.node.name) ?? null}
+                    decisions={view.decisions.get(pickedNode.node.name) ?? []}
                     runId={runId}
                     onClose={close}
                   />
@@ -768,11 +1060,6 @@ function GraphCanvas({
             )}
           </Split>
         </div>
-        {marks.length > 0 && (
-          <p className="m-0 pt-3 font-mono text-micro tracking-label text-ink-3 uppercase">
-            {marks.join('   ·   ')}
-          </p>
-        )}
       </div>
     </EdgeMarkersContext.Provider>
   );

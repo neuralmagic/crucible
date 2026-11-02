@@ -2,15 +2,19 @@
 //! URI in `vault_path`, the same column a reference spells a `vault://` URL in.
 
 use crate::secrets::SecretMode;
+use crate::secrets::github_app::{GithubOwner, InvalidOwner};
 
 /// The URI scheme a minted secret's source is spelled with.
 const SCHEME: &str = "mint://";
 
+const GITHUB_APP: &str = "github-app";
+
 /// A source that issues a fresh credential per dispatch instead of storing one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Minter {
-    /// An installation token for the controller's GitHub App: `ghs_…`, one hour.
-    GithubApp,
+    /// An installation token for the controller's GitHub App: `ghs_…`, one hour. `None` is the
+    /// home installation; an owner is the App's installation on that account.
+    GithubApp(Option<GithubOwner>),
 }
 
 /// Why a stored or requested minter could not be resolved.
@@ -20,26 +24,36 @@ pub enum MinterError {
     NotAMinterUri(String),
     #[error("no minter named {0}")]
     Unknown(String),
+    #[error(transparent)]
+    Owner(#[from] InvalidOwner),
 }
 
 impl Minter {
-    /// The name a registration asks for.
-    pub fn as_str(self) -> &'static str {
+    /// The name a registration asks for: `github-app`, or `github-app/<owner>`.
+    pub fn name(&self) -> String {
         match self {
-            Minter::GithubApp => "github-app",
+            Minter::GithubApp(None) => GITHUB_APP.to_string(),
+            Minter::GithubApp(Some(owner)) => format!("{GITHUB_APP}/{owner}"),
         }
     }
 
     /// What the row stores.
-    pub fn uri(self) -> String {
-        format!("{SCHEME}{}", self.as_str())
+    pub fn uri(&self) -> String {
+        format!("{SCHEME}{}", self.name())
     }
 
     /// Resolve the name a registration named.
     pub fn parse_name(raw: &str) -> Result<Self, MinterError> {
-        match raw.trim() {
-            "github-app" => Ok(Minter::GithubApp),
-            other => Err(MinterError::Unknown(other.to_string())),
+        let raw = raw.trim();
+        let (minter, owner) = match raw.split_once('/') {
+            Some((minter, owner)) => (minter, Some(owner)),
+            None => (raw, None),
+        };
+        match minter {
+            GITHUB_APP => Ok(Minter::GithubApp(
+                owner.map(GithubOwner::parse).transpose()?,
+            )),
+            _ => Err(MinterError::Unknown(raw.to_string())),
         }
     }
 
@@ -61,17 +75,21 @@ impl Minter {
     }
 }
 
-/// Whether any of a run's bound secrets is issued by `minter`. An unparseable source is nobody's;
-/// the provider has already refused it by the time this runs.
-pub fn any_bound(rows: &[crate::secrets::store::SecretRow], minter: Minter) -> bool {
-    rows.iter()
-        .any(|row| Minter::of(row.mode, &row.vault_path) == Ok(Some(minter)))
+/// Whether any of a run's bound secrets is a GitHub App token, for any installation. An
+/// unparseable source is nobody's; the provider has already refused it by the time this runs.
+pub fn any_github_app(rows: &[crate::secrets::store::SecretRow]) -> bool {
+    rows.iter().any(|row| {
+        matches!(
+            Minter::of(row.mode, &row.vault_path),
+            Ok(Some(Minter::GithubApp(_)))
+        )
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::authz::model::Principal;
+    use crate::secrets::minter::*;
     use crate::secrets::store::SecretRow;
     use crate::secrets::{ConsumerClass, SecretKind, SecretName, Visibility};
 
@@ -92,31 +110,69 @@ mod tests {
         }
     }
 
+    fn owner(login: &str) -> GithubOwner {
+        GithubOwner::parse(login).unwrap()
+    }
+
     #[test]
-    fn a_run_pushes_as_the_app_only_when_one_of_its_secrets_is_minted_by_it() {
+    fn a_run_pushes_as_the_app_when_any_of_its_secrets_is_an_app_token() {
         let stored = row(SecretMode::Managed, "crucible/registry/user:wynn/pr-token");
-        let minted = row(SecretMode::Minted, "mint://github-app");
-        assert!(!any_bound(&[], Minter::GithubApp));
-        assert!(!any_bound(std::slice::from_ref(&stored), Minter::GithubApp));
-        assert!(any_bound(&[stored, minted], Minter::GithubApp));
+        let home = row(SecretMode::Minted, "mint://github-app");
+        let other = row(
+            SecretMode::Minted,
+            "mint://github-app/red-hat-data-services",
+        );
+        assert!(!any_github_app(&[]));
+        assert!(!any_github_app(std::slice::from_ref(&stored)));
+        assert!(any_github_app(&[stored.clone(), home]));
+        assert!(any_github_app(&[stored, other]));
     }
 
     /// A row whose source does not parse belongs to no minter.
     #[test]
     fn an_unreadable_source_is_not_credited_to_a_minter() {
-        assert!(!any_bound(
-            &[row(SecretMode::Minted, "mint://nonesuch")],
-            Minter::GithubApp
-        ));
+        assert!(!any_github_app(&[row(
+            SecretMode::Minted,
+            "mint://nonesuch"
+        )]));
+        assert!(!any_github_app(&[row(
+            SecretMode::Minted,
+            "mint://github-app/not a login"
+        )]));
     }
 
     #[test]
     fn a_minter_round_trips_through_the_uri_a_row_stores() {
-        assert_eq!(Minter::GithubApp.uri(), "mint://github-app");
+        let home = Minter::GithubApp(None);
+        assert_eq!(home.uri(), "mint://github-app");
+        assert_eq!(Minter::parse_uri("mint://github-app").unwrap(), home);
+
+        let other = Minter::GithubApp(Some(owner("red-hat-data-services")));
+        assert_eq!(other.uri(), "mint://github-app/red-hat-data-services");
         assert_eq!(
-            Minter::parse_uri("mint://github-app").unwrap(),
-            Minter::GithubApp
+            Minter::parse_uri("mint://github-app/red-hat-data-services").unwrap(),
+            other
         );
+    }
+
+    /// GitHub logins are case-insensitive, so the stored form is lowercase.
+    #[test]
+    fn an_owner_is_stored_lowercase() {
+        assert_eq!(
+            Minter::parse_name("github-app/Red-Hat-Data-Services")
+                .unwrap()
+                .uri(),
+            "mint://github-app/red-hat-data-services"
+        );
+    }
+
+    #[test]
+    fn a_malformed_owner_is_refused() {
+        for bad in ["", "-lead", "trail-", "a/b", "has space", &"x".repeat(40)] {
+            let err = Minter::parse_name(&format!("github-app/{bad}")).unwrap_err();
+            assert!(matches!(err, MinterError::Owner(_)), "{bad:?}: {err:?}");
+        }
+        assert!(Minter::parse_name(&format!("github-app/{}", "x".repeat(39))).is_ok());
     }
 
     #[test]
@@ -131,6 +187,10 @@ mod tests {
             Minter::parse_name("gitlab-app").unwrap_err(),
             MinterError::Unknown("gitlab-app".to_string())
         );
+        assert_eq!(
+            Minter::parse_name("gitlab-app/acme").unwrap_err(),
+            MinterError::Unknown("gitlab-app/acme".to_string())
+        );
     }
 
     /// A stored secret has no minter, so a reader can ask without branching on the mode first.
@@ -142,7 +202,7 @@ mod tests {
         );
         assert_eq!(
             Minter::of(SecretMode::Minted, "mint://github-app").unwrap(),
-            Some(Minter::GithubApp)
+            Some(Minter::GithubApp(None))
         );
     }
 }
