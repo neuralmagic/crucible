@@ -50,13 +50,6 @@ impl<'a> LaunchTarget<'a> {
         }
     }
 
-    pub(crate) fn owner(self) -> &'a crate::authz::model::Principal {
-        match self {
-            Self::Registered(pack) => &pack.owner,
-            Self::Draft(head) => &head.draft.owner,
-        }
-    }
-
     pub(crate) fn schema_digest(self) -> &'a str {
         match self {
             Self::Registered(pack) => &pack.schema_digest,
@@ -109,6 +102,18 @@ impl<'a> LaunchTarget<'a> {
         match self {
             Self::Registered(_) => None,
             Self::Draft(head) => Some(head.version),
+        }
+    }
+
+    /// The resource a launch decision on this target is about.
+    fn resource(self) -> crate::authz::decision::Resource {
+        match self {
+            Self::Registered(pack) => pack.resource(),
+            Self::Draft(head) => crate::authz::decision::Resource::new(
+                crate::authz::action::ResourceType::Playbook,
+                &head.draft.id,
+                head.draft.owner.clone(),
+            ),
         }
     }
 
@@ -375,11 +380,7 @@ pub(crate) async fn decide_launch(
     crate::authz::owner::decide_on(
         state,
         caller,
-        &crate::authz::decision::Resource::new(
-            crate::authz::action::ResourceType::Playbook,
-            target.id(),
-            target.owner().clone(),
-        ),
+        &target.resource(),
         crate::authz::action::Verb::Launch,
     )
     .await

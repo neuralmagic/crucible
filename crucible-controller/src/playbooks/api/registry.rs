@@ -282,6 +282,8 @@ pub struct PlaybookDto {
     pub owner: String,
     /// What the caller may do with this playbook under the policy set in force.
     pub actions: Vec<crate::authz::action::Verb>,
+    pub blueprint: bool,
+    pub public: bool,
     pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -340,6 +342,8 @@ impl PlaybookDto {
             dispatch,
             owner: r.owner.to_string(),
             actions,
+            blueprint: r.blueprint,
+            public: r.public,
             created_by: r.created_by,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -465,20 +469,16 @@ pub(crate) async fn readable_playbook(
     id: &str,
     verb: crate::authz::action::Verb,
 ) -> Result<crate::playbooks::registry::PlaybookRow, Response> {
-    let row = crate::playbooks::registry::get(state.db.pool(), id)
+    let Some(row) = crate::playbooks::registry::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
-    crate::authz::owner::decide_row(
-        state,
-        caller,
-        crate::authz::action::ResourceType::Playbook,
-        id,
-        verb,
-        row,
-        |r| r.owner.clone(),
-    )
-    .await
-    .map_err(IntoResponse::into_response)
+        .map_err(|e| AppError::from(e).into_response())?
+    else {
+        return Err(not_found(format!("no playbook {id:?}")));
+    };
+    crate::authz::owner::decide_on(state, caller, &row.resource(), verb)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    Ok(row)
 }
 
 /// `GET /api/playbooks` — the registry: what can be launched, pinned where, with which form.
@@ -497,13 +497,7 @@ pub(crate) async fn list_playbooks(
         &caller,
         crate::authz::action::ResourceType::Playbook,
         rows,
-        |r| {
-            crate::authz::decision::Resource::new(
-                crate::authz::action::ResourceType::Playbook,
-                &r.id,
-                r.owner.clone(),
-            )
-        },
+        crate::playbooks::registry::PlaybookRow::resource,
     )
     .await?;
     let catalog = crate::images::store::list_images(state.db.pool()).await?;
@@ -537,16 +531,7 @@ pub(crate) async fn get_playbook(
     let Some(files) = crate::playbooks::registry::files(state.db.pool(), &id).await? else {
         return Ok(not_found(format!("no playbook {id:?}")));
     };
-    let actions = crate::authz::owner::actions_on(
-        &state,
-        &caller,
-        crate::authz::decision::Resource::new(
-            crate::authz::action::ResourceType::Playbook,
-            &id,
-            row.owner.clone(),
-        ),
-    )
-    .await?;
+    let actions = crate::authz::owner::actions_on(&state, &caller, row.resource()).await?;
     let catalog = crate::images::store::list_images(state.db.pool()).await?;
     Ok(Json(PlaybookDetailDto {
         playbook: PlaybookDto::from_row(row, actions, &state.dispatch, &catalog),
