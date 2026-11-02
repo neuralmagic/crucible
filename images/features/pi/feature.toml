@@ -2,7 +2,7 @@ summary = "Pi coding agent CLI"
 layer = 90
 
 [pins]
-pi = "0.85.1"
+pi = "1.1.0"
 
 [capabilities]
 "agent.pi" = { pin = "pi" }
