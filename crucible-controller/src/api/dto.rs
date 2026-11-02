@@ -1267,6 +1267,7 @@ mod tests {
             created_by: Some("wren".to_string()),
             created_at: "2026-08-22T00:00:00Z".to_string(),
             updated_at: "2026-08-22T00:00:00Z".to_string(),
+            variant: None,
         };
         let v = serde_json::to_value(&dto).expect("serialize");
         assert_eq!(v["id"], "survey");

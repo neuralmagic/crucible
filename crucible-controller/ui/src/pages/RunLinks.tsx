@@ -1,5 +1,5 @@
 import { $api } from '../api/client';
-import { ExternalLinks, Section, SectionBody, SectionHeader } from '../ui';
+import { ExternalLinks } from '../ui';
 import type { RunGraph } from './RunTaskGraph';
 
 /// Every external result the run's tasks reported. Shares the graph endpoint's cache key with
@@ -15,11 +15,8 @@ export function RunLinks({ runId }: { runId: string }) {
   const links = (graph?.results ?? []).flatMap((result) => result.links);
   if (links.length === 0) return null;
   return (
-    <Section>
-      <SectionHeader title="Links" />
-      <SectionBody>
-        <ExternalLinks links={links} />
-      </SectionBody>
-    </Section>
+    <div data-testid="run-links">
+      <ExternalLinks links={links} />
+    </div>
   );
 }

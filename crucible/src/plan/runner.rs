@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use crate::crucible::Direction;
 use crate::deadline::{Deadline, Supervised};
-use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner};
+use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner, own_note};
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
@@ -244,16 +244,17 @@ impl ShellRunner {
         };
         let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            let output = last_json_line(&stdout).filter(Value::is_object);
+            let reason = output
+                .as_ref()
+                .and_then(own_note)
+                .map(str::to_owned)
+                .unwrap_or_else(|| stderr_tail(&String::from_utf8_lossy(&out.stderr)));
             return Attempt {
-                outcome: AttemptOutcome::Fail {
-                    note: format!(
-                        "exit {}: {}",
-                        out.status.code().unwrap_or(-1),
-                        stderr_tail(&stderr)
-                    ),
-                    output: last_json_line(&stdout).filter(Value::is_object),
-                },
+                outcome: AttemptOutcome::failed_as_declared(
+                    format!("exit {}: {reason}", out.status.code().unwrap_or(-1)),
+                    output,
+                ),
                 cost_usd: 0.0,
                 repairs: Vec::new(),
             };
@@ -438,26 +439,37 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
             repairs: Vec::new(),
         }
     } else {
-        let note = format!(
-            "evaluation {} did not pass{}{}",
-            task.name,
-            threshold
-                .map(|threshold| format!(" threshold {threshold}"))
-                .unwrap_or_default(),
-            if handles.is_empty() {
-                String::new()
-            } else {
-                format!(" logs: {}", handles.join(","))
-            }
-        );
+        let note = evaluation_note(&task.name, threshold, &handles, own_note(&value));
         Attempt {
-            outcome: AttemptOutcome::Fail {
-                note,
-                output: Some(value),
-            },
+            outcome: AttemptOutcome::failed_as_declared(note, Some(value)),
             cost_usd: 0.0,
             repairs: Vec::new(),
         }
+    }
+}
+
+/// A failed grade's note: the result's own reason followed by the threshold and log handles it
+/// was graded with, or the engine's stand-in naming them.
+fn evaluation_note(
+    task: &TaskName,
+    threshold: Option<f64>,
+    handles: &[String],
+    own: Option<&str>,
+) -> String {
+    let context: Vec<String> = [
+        threshold.map(|threshold| format!("threshold {threshold}")),
+        (!handles.is_empty()).then(|| format!("logs: {}", handles.join(","))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    match own {
+        None => std::iter::once(format!("evaluation {task} did not pass"))
+            .chain(context)
+            .collect::<Vec<_>>()
+            .join(" "),
+        Some(own) if context.is_empty() => own.to_owned(),
+        Some(own) => format!("{own} ({})", context.join("; ")),
     }
 }
 
@@ -512,6 +524,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -538,6 +551,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -665,6 +679,43 @@ mod tests {
         assert!(r.note.as_ref().unwrap().contains("doomed"));
     }
 
+    /// A command that exits nonzero and says why in its result's `note` is recorded with that
+    /// reason, not its stderr; a blank note falls back to the stderr tail.
+    #[test]
+    fn a_nonzero_exit_records_the_note_its_result_states() {
+        let out = run_plan(
+            vec![command(
+                "boom",
+                r#"echo '{"pass": false, "note": "  the layer cannot package test paths "}'; echo doomed >&2; exit 2"#,
+                &[],
+            )],
+            None,
+        );
+        let r = &out.results[&"boom".into()];
+        assert_eq!(r.status, TaskStatus::Fail);
+        assert_eq!(
+            r.note.as_deref(),
+            Some("exit 2: the layer cannot package test paths")
+        );
+        assert_eq!(r.output.as_ref().unwrap()["pass"], false);
+
+        for printed in [r#"{"note": "  "}"#, r#"{"note": 7}"#] {
+            let out = run_plan(
+                vec![command(
+                    "boom",
+                    &format!("echo '{printed}'; echo doomed >&2; exit 2"),
+                    &[],
+                )],
+                None,
+            );
+            assert_eq!(
+                out.results[&"boom".into()].note.as_deref(),
+                Some("exit 2: doomed"),
+                "{printed}"
+            );
+        }
+    }
+
     /// A payload is a bonus, never a second failure mode: unparsable or non-object output leaves
     /// the failure exactly as it was.
     #[test]
@@ -726,6 +777,272 @@ mod tests {
         assert_eq!(r.output.as_ref().unwrap()["bug_present"], false);
     }
 
+    fn settled(task: Task) -> crate::plan::exec::TaskResult {
+        let name = task.name.clone();
+        let mut out = run_plan(vec![task], None);
+        out.results.remove(&name).unwrap()
+    }
+
+    fn printing(object: &str) -> String {
+        format!("echo '{object}'")
+    }
+
+    #[test]
+    fn a_failing_evaluation_records_the_note_its_result_states() {
+        let r = settled(evaluate(
+            "a",
+            &printing(r#"{"pass": false, "note": "  own reason a "}"#),
+            None,
+        ));
+        assert_eq!(r.status, TaskStatus::Fail);
+        assert_eq!(r.note.as_deref(), Some("own reason a"));
+        assert_eq!(r.output.unwrap()["note"], "  own reason a ");
+    }
+
+    #[test]
+    fn a_missed_threshold_records_the_note_with_its_threshold_and_logs() {
+        for (printed, note) in [
+            (
+                r#"{"score": 42, "note": "p99 regressed"}"#,
+                "p99 regressed (threshold 10)",
+            ),
+            (
+                r#"{"score": 42, "note": "p99 regressed", "logs": ["job-a.log", "job-b.log"]}"#,
+                "p99 regressed (threshold 10; logs: job-a.log,job-b.log)",
+            ),
+            (
+                r#"{"score": 5, "pass": false, "note": "flaky run"}"#,
+                "flaky run (threshold 10)",
+            ),
+        ] {
+            let r = settled(evaluate("latency", &printing(printed), Some(10.0)));
+            assert_eq!(r.status, TaskStatus::Fail, "{printed}");
+            assert_eq!(r.note.as_deref(), Some(note), "{printed}");
+        }
+        let r = settled(evaluate(
+            "latency",
+            &printing(r#"{"pass": false, "note": "no bound", "logs": ["job-a.log"]}"#),
+            None,
+        ));
+        assert_eq!(r.note.as_deref(), Some("no bound (logs: job-a.log)"));
+    }
+
+    #[test]
+    fn a_blank_or_non_string_note_falls_back_to_the_evaluations_own() {
+        for note in [r#""""#, r#""   ""#, "7", "null", r#"["why"]"#] {
+            let r = settled(evaluate(
+                "b",
+                &printing(&format!(r#"{{"pass": false, "note": {note}}}"#)),
+                None,
+            ));
+            assert_eq!(r.status, TaskStatus::Fail, "{note}");
+            assert_eq!(
+                r.note.as_deref(),
+                Some("evaluation b did not pass"),
+                "{note}"
+            );
+
+            let r = settled(evaluate(
+                "b",
+                &printing(&format!(
+                    r#"{{"score": 42, "logs": ["job-a.log"], "note": {note}}}"#
+                )),
+                Some(10.0),
+            ));
+            assert_eq!(
+                r.note.as_deref(),
+                Some("evaluation b did not pass threshold 10 logs: job-a.log"),
+                "{note}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failing_evaluation_settles_as_its_declared_fail_or_skip() {
+        for (printed, threshold, status, note) in [
+            (
+                r#"{"pass": false, "status": "fail", "note": "own reason b"}"#,
+                None,
+                TaskStatus::Fail,
+                "own reason b",
+            ),
+            (
+                r#"{"pass": false, "status": "fail"}"#,
+                None,
+                TaskStatus::Fail,
+                "evaluation e did not pass",
+            ),
+            (
+                r#"{"score": 42, "status": "fail", "note": "regressed"}"#,
+                Some(10.0),
+                TaskStatus::Fail,
+                "regressed (threshold 10)",
+            ),
+            (
+                r#"{"pass": false, "status": "skipped", "note": "no gpu on this node"}"#,
+                None,
+                TaskStatus::Skipped,
+                "no gpu on this node",
+            ),
+            (
+                r#"{"pass": false, "status": "skipped"}"#,
+                None,
+                TaskStatus::Skipped,
+                "evaluation e did not pass",
+            ),
+            (
+                r#"{"score": 42, "status": "skipped", "note": "trace too short"}"#,
+                Some(10.0),
+                TaskStatus::Skipped,
+                "trace too short (threshold 10)",
+            ),
+            (
+                r#"{"score": 42, "status": "skipped"}"#,
+                Some(10.0),
+                TaskStatus::Skipped,
+                "evaluation e did not pass threshold 10",
+            ),
+        ] {
+            let r = settled(evaluate("e", &printing(printed), threshold));
+            assert_eq!(r.status, status, "{printed}");
+            assert_eq!(r.note.as_deref(), Some(note), "{printed}");
+            assert_eq!(r.attempts, 1, "{printed}");
+            let output = r.output.unwrap();
+            assert_eq!(output["pass"], false, "{printed}");
+            assert_eq!(output["status"], status.as_str(), "{printed}");
+        }
+    }
+
+    #[test]
+    fn a_passing_evaluation_settles_as_its_declared_fail_or_skip() {
+        for (printed, status, note) in [
+            (
+                r#"{"score": 5, "status": "fail", "note": "vetoed"}"#,
+                TaskStatus::Fail,
+                "vetoed",
+            ),
+            (
+                r#"{"score": 5, "status": "fail", "note": " "}"#,
+                TaskStatus::Fail,
+                "task declared status=fail",
+            ),
+            (
+                r#"{"score": 5, "status": "skipped", "note": "inapplicable"}"#,
+                TaskStatus::Skipped,
+                "inapplicable",
+            ),
+            (
+                r#"{"score": 5, "status": "skipped"}"#,
+                TaskStatus::Skipped,
+                "task declared status=skipped",
+            ),
+        ] {
+            let r = settled(evaluate("e", &printing(printed), Some(10.0)));
+            assert_eq!(r.status, status, "{printed}");
+            assert_eq!(r.note.as_deref(), Some(note), "{printed}");
+            assert_eq!(r.output.unwrap()["pass"], true, "{printed}");
+        }
+    }
+
+    #[test]
+    fn a_declared_pass_cannot_pass_a_failing_grade() {
+        for (printed, threshold, note) in [
+            (
+                r#"{"pass": false, "status": "pass"}"#,
+                None,
+                "evaluation w did not pass",
+            ),
+            (
+                r#"{"pass": false, "status": "pass", "note": "close enough"}"#,
+                None,
+                "close enough",
+            ),
+            (
+                r#"{"score": 42, "status": "pass"}"#,
+                Some(10.0),
+                "evaluation w did not pass threshold 10",
+            ),
+            (
+                r#"{"score": 42, "pass": true, "status": "pass"}"#,
+                Some(10.0),
+                "evaluation w did not pass threshold 10",
+            ),
+        ] {
+            let r = settled(evaluate("w", &printing(printed), threshold));
+            assert_eq!(r.status, TaskStatus::Fail, "{printed}");
+            assert_eq!(r.note.as_deref(), Some(note), "{printed}");
+            assert_eq!(r.output.unwrap()["pass"], false, "{printed}");
+        }
+    }
+
+    #[test]
+    fn a_nonzero_exit_settles_as_its_declared_fail_or_skip_and_never_passes() {
+        for (printed, status, note) in [
+            (
+                r#"{"status": "pass", "note": "fine really"}"#,
+                TaskStatus::Fail,
+                "exit 3: fine really",
+            ),
+            (r#"{"status": "pass"}"#, TaskStatus::Fail, "exit 3: doomed"),
+            (
+                r#"{"status": "fail", "note": "own reason d"}"#,
+                TaskStatus::Fail,
+                "exit 3: own reason d",
+            ),
+            (
+                r#"{"status": "skipped", "note": "no gpu"}"#,
+                TaskStatus::Skipped,
+                "exit 3: no gpu",
+            ),
+            (
+                r#"{"status": "skipped"}"#,
+                TaskStatus::Skipped,
+                "exit 3: doomed",
+            ),
+        ] {
+            for task in [
+                command(
+                    "c",
+                    &format!("echo '{printed}'; echo doomed >&2; exit 3"),
+                    &[],
+                ),
+                evaluate(
+                    "c",
+                    &format!("echo '{printed}'; echo doomed >&2; exit 3"),
+                    None,
+                ),
+            ] {
+                let r = settled(task);
+                assert_eq!(r.status, status, "{printed}");
+                assert_eq!(r.note.as_deref(), Some(note), "{printed}");
+                assert_eq!(r.attempts, 1, "{printed}");
+                assert_eq!(
+                    r.output,
+                    Some(serde_json::from_str::<Value>(printed).unwrap()),
+                    "{printed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_skipped_failing_evaluation_blocks_its_dependents() {
+        let out = run_plan(
+            vec![
+                evaluate(
+                    "probe",
+                    &printing(r#"{"pass": false, "status": "skipped", "note": "no gpu"}"#),
+                    None,
+                ),
+                command("after", "echo '{}'", &["probe"]),
+            ],
+            None,
+        );
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::Skipped);
+        assert_eq!(out.results[&"after".into()].status, TaskStatus::Blocked);
+        assert!(!out.valid);
+    }
+
     #[test]
     fn non_json_output_is_a_measured_failure() {
         let out = run_plan(vec![command("chatty", "echo not json at all", &[])], None);
@@ -760,6 +1077,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -797,6 +1115,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -841,6 +1160,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -874,6 +1194,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -916,6 +1237,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut r = ShellRunner {
             workdir: std::env::temp_dir(),
@@ -958,6 +1280,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -992,6 +1315,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(
             vec![t],
@@ -1036,6 +1360,7 @@ mod tests {
             history: Some(4),
             timeout: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut r = ShellRunner {
             agent_cmd: Some(
@@ -1115,6 +1440,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -1149,6 +1475,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let out = run_plan(
             vec![

@@ -2149,6 +2149,96 @@ async fn complete_run_parks_an_errored_outcome(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn complete_run_parks_a_playbook_run_that_reached_its_wall_clock_ceiling(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-26";
+    seed_registered_playbook(&db, "survey").await;
+    adopt_launch(&db, key, 3.5).await;
+    assert!(crate::issues::store::claim_issue(db.pool(), key, Status::New, Status::Running).await?);
+    let log = [
+        r#"{"v":1,"kind":"budget","spent":0.4,"elapsed_secs":1800}"#,
+        r#"{"v":1,"kind":"shutdown","outcome":"budget","reason":"wall-clock ceiling reached"}"#,
+    ]
+    .join("\n");
+
+    let disposition = complete_run(&db, key, None, "run-ceiling", None, &log, None).await?;
+
+    assert_eq!(disposition, crate::runs::workpod::RunDisposition::Errored);
+    let iss = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("row");
+    assert_eq!(
+        iss.status,
+        Status::Parked,
+        "a playbook that hit its ceiling parks, never done"
+    );
+    assert!(
+        iss.parked_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("wall-clock ceiling reached")),
+        "the engine's shutdown reason rides the park: {:?}",
+        iss.parked_reason
+    );
+    Ok(())
+}
+
+/// An autoresearch loop's `budget` outcome is its exhausted end: a loop that kept a candidate and
+/// opened a draft PR before its cost cap still lands `pr-open`.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn complete_run_lands_pr_open_when_a_loop_hit_its_budget_after_a_pr(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#8")).await?;
+    assert!(
+        crate::issues::store::claim_issue(db.pool(), "owner/repo#8", Status::New, Status::Running)
+            .await?
+    );
+    let scope_id = crate::issues::store::insert_scope(
+        db.pool(),
+        &NewScope {
+            issue: "owner/repo#8".into(),
+            pack_digest: None,
+            check_outcome: None,
+        },
+    )
+    .await?;
+    let log = [
+        r#"{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","score":230.0}}"#,
+        r#"{"v":1,"kind":"pr_links","links":[{"url":"https://github.com/owner/repo/pull/9","repo":"owner/repo","name":""}]}"#,
+        r#"{"v":1,"kind":"shutdown","outcome":"budget","reason":"a cost or time cap was reached"}"#,
+    ]
+    .join("\n");
+
+    let disposition = complete_run(
+        &db,
+        "owner/repo#8",
+        Some(scope_id),
+        "run-8",
+        None,
+        &log,
+        None,
+    )
+    .await?;
+
+    assert_eq!(disposition, crate::runs::workpod::RunDisposition::Finished);
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), "owner/repo#8")
+            .await?
+            .expect("row")
+            .status,
+        Status::PrOpen
+    );
+    let ev = db.events().read_for_key("owner/repo#8").await?;
+    let last = ev.last().expect("a transition event");
+    assert_eq!(last.to, "pr-open");
+    Ok(())
+}
+
 /// The live failure: the park read `run errored: short-circuited at scan`, which names where the
 /// run stopped and not why, and the pod carrying the real chain was deleted on collection. The
 /// failing task's note has to ride the park too.

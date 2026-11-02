@@ -31,8 +31,8 @@
 #   L  a version whose bytes change on a live controller loses its tree; it is read, downloaded,
 #      and delivered from its legacy bytes, and converts to the downloaded tree at the next boot; a
 #      registry row whose bytes change is inspected, templated, and launched from them alike
-#   T  a stored tree whose files were tampered with refuses its draft launch and parks its
-#      registered launch without a pod; the startup agent backfill skips it and fills the rest
+#   T  a stored tree whose files were tampered with refuses its draft and registered launches;
+#      the startup agent backfill skips it and fills the rest
 #   E  a restart re-derives a stale registry row from its tree, not its bytes
 #   I  a git pack is proposed, compiled, registered, opened as a draft, and registered directly,
 #      each holding the same tree with state/ ignored, named tree_digest through the API and crux;
@@ -50,7 +50,7 @@
 #   Q  an approved direct autoresearch pack plans and delivers the tree its scope froze, not one
 #      written to its pack row afterwards, and its approval evidence reads SCOPE.md from the
 #      stored tree (needs the controller built with the autoresearch lane)
-#   O  the local executor runs a stored tree with its steering beside it, and parks a tampered tree
+#   O  the local executor runs a stored tree with its steering beside it, and refuses a tampered tree
 #   V  conversion makes a draft-sourced rev its tree and pins a secret binding and a fork to it, so
 #      neither is stale or moved across restarts and an identical republish, while new content
 #      stales and moves them; a launch is checked against the tree it froze; a pre-tree digest is

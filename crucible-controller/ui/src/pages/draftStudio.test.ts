@@ -329,8 +329,8 @@ describe('cloneDraftBody', () => {
 
 describe('draftLaunchBody', () => {
   const specs: ParamFieldSpec[] = [
-    { name: 'topic', valueType: 'string', required: true, defaultValue: null, pattern: null, description: null },
-    { name: 'depth', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null },
+    { name: 'topic', valueType: 'string', required: true, defaultValue: null, pattern: null, description: null, multiline: false },
+    { name: 'depth', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
   ];
   const ceilings = { maxCost: 2.5, maxTime: ' 30m ', schemaDigest: 'sha256:bb' };
 

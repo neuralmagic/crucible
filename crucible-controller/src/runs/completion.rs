@@ -2,7 +2,7 @@
 
 use crate::client::Db;
 use crate::config::ControllerCfg;
-use crate::issues::model::split_issue_key;
+use crate::issues::model::{InputKind, split_issue_key};
 use crate::model::{ParkReason, ParkedBy, Status};
 use crate::runs::ingest;
 use crate::runs::workpod::RunDisposition;
@@ -78,8 +78,16 @@ pub async fn complete_run(
     // A run that ERRORED parks (retryable — `done` means solved-or-exhausted, and completing on an
     // error buried the first live loop failure as terminal; Will's call 2026-07-07). The engine's
     // own shutdown reason and the failing task's note ride the park so the next person needs no
-    // session forensics.
-    if parsed.outcome.as_deref() == Some("error") {
+    // session forensics. A playbook that hit its cost or time ceiling parks the same way; a loop's
+    // `budget` is its exhausted end and completes.
+    let parks = match parsed.outcome.as_deref() {
+        Some("error") => true,
+        Some("budget") => crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .is_some_and(|issue| matches!(issue.kind, InputKind::Playbook { .. })),
+        _ => false,
+    };
+    if parks {
         let park_reason = ParkReason::RunErrored {
             engine_reason: parsed.outcome_reason.clone(),
             cause: parsed

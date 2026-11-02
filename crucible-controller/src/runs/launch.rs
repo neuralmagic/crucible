@@ -71,6 +71,7 @@ async fn plan_refusal(
         tree,
         launch.params.iter().cloned().collect(),
         launch.max_time.clone(),
+        launch.variant.clone(),
     )
     .await?;
     Ok(checked.err().map(|field| field.message))
@@ -253,6 +254,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         max_time: launch.max_time,
         agent,
         rerun: launch.rerun,
+        variant: launch.variant,
     };
     let started = match cfg.playbook_executor {
         PlaybookExecutor::Pod => {
@@ -383,7 +385,8 @@ async fn resolve_local_secrets(
     let Some(pack) = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key).await? else {
         return Ok(None);
     };
-    let declared = crate::secrets::manifest::declared_secrets(pack.path())?;
+    let variant = crate::launches::store::launch_variant(db.pool(), &issue.key).await?;
+    let declared = crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
     match crate::secrets::launch::resolve(
         db.pool(),
         &ls.scope,

@@ -20,6 +20,7 @@ pub(crate) fn plan_admitted_event(
                 name: t.name.0.clone(),
                 kind: t.task.label().to_string(),
                 depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+                optional: t.optional.iter().map(|d| d.0.clone()).collect(),
                 session: t.session.clone().unwrap_or_default(),
                 needs: t.needs.clone(),
                 required: t.required,

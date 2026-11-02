@@ -31,6 +31,89 @@ async function finished(page: Page): Promise<void> {
   );
 }
 
+const ISSUE = /\/api\/issues\/playbook(%3A|:)survey(%3A|:)0199$/;
+
+test.describe('the launch header', () => {
+  /// The header names the playbook and links its run; the key is there to copy, not to read.
+  test('leads with the playbook, its run and how long it ran', async ({ page }) => {
+    await stubApi(page);
+    await page.route(ISSUE, (route: Route) =>
+      route.fulfill({
+        json: {
+          issue: {},
+          events: [
+            { key: 'playbook:survey:0199', from: 'new', to: 'running', ts: '2026-10-27T01:53:04Z' },
+            { key: 'playbook:survey:0199', from: 'running', to: 'done', ts: '2026-10-27T02:03:19Z' },
+          ],
+        },
+      }),
+    );
+    await ready(page, LAUNCH);
+
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('survey');
+    await expect(page.getByRole('link', { name: 'RUN-0412' })).toHaveAttribute(
+      'href',
+      '/playbook-runs/playbook%3Asurvey%3A0199/runs/RUN-0412',
+    );
+    await expect(page.getByTestId('wall-time')).toHaveText('ran 10m 15s');
+    await expect(page.getByRole('button', { name: 'Copy playbook:survey:0199' })).toBeVisible();
+  });
+
+  /// A run that is still going has no wall time to show yet.
+  test('shows no wall time while the launch runs', async ({ page }) => {
+    await stubApi(page);
+    await page.route(ISSUE, (route: Route) =>
+      route.fulfill({
+        json: {
+          issue: {},
+          events: [{ key: 'playbook:survey:0199', from: 'new', to: 'running', ts: '2026-10-27T01:53:04Z' }],
+        },
+      }),
+    );
+    await ready(page, LAUNCH);
+    await expect(page.getByRole('heading', { level: 1 })).toHaveText('survey');
+    await expect(page.getByTestId('wall-time')).toHaveCount(0);
+  });
+
+  /// Two tracker issues and a pull request sit on the header line as three marked links.
+  test('carries every issue and pull request the run reported', async ({ page }) => {
+    await stubApi(page);
+    const graph = ROUTES['/api/runs/RUN-0412/graph'];
+    if (typeof graph !== 'object' || graph === null || Array.isArray(graph) || !Array.isArray(graph.results)) {
+      throw new Error('RUN-0412 graph fixture has no results');
+    }
+    const links = [
+      { url: 'https://tracker.example.com/browse/ITEM-1306', provider: 'jira', kind: 'issue', label: 'ITEM-1306' },
+      { url: 'https://tracker.example.com/browse/ITEM-1307', provider: 'jira', kind: 'issue', label: 'ITEM-1307' },
+      { url: 'https://github.com/example/repo-a/pull/9', provider: 'github', kind: 'pull_request', label: '#9' },
+    ];
+    const results = graph.results.map((r, i) =>
+      typeof r === 'object' && r !== null && !Array.isArray(r) ? { ...r, links: i === 0 ? links : [] } : r,
+    );
+    await page.route('**/api/runs/RUN-0412/graph', (route: Route) => route.fulfill({ json: { ...graph, results } }));
+    await ready(page, LAUNCH);
+
+    const header = page.getByTestId('run-links');
+    const marked = header.getByRole('link');
+    await expect(marked).toHaveCount(3);
+    for (const [name, mark] of [['ITEM-1306', 'Jira'], ['ITEM-1307', 'Jira'], ['#9', 'GitHub']] as const) {
+      await expect(header.getByRole('link', { name }).locator(`svg[aria-label="${mark}"]`)).toBeVisible();
+    }
+    const boxes = await marked.evaluateAll((els) =>
+      els.map((e) => {
+        const r = e.getBoundingClientRect();
+        return { left: r.left, right: r.right, top: r.top };
+      }),
+    );
+    for (let i = 1; i < boxes.length; i++) {
+      const prev = boxes[i - 1];
+      const box = boxes[i];
+      expect(prev && box && prev.right <= box.left).toBe(true);
+      expect(prev && box && Math.abs(prev.top - box.top) < 2).toBe(true);
+    }
+  });
+});
+
 test.describe('the launch view', () => {
   /// A launch is authorized, then dispatched: the values and ceilings it froze, where it came
   /// from, and what its run did — none of which the issue journey has a place for.
@@ -195,6 +278,7 @@ test.describe('the launch view', () => {
     });
     await ready(page, LAUNCH);
 
+    await page.locator('summary', { hasText: 'Rerun' }).click();
     const tasks = page.getByTestId('rerun-tasks');
     await expect(tasks.locator('li[data-state="reused"]')).toHaveCount(2);
     await expect(tasks.locator('li[data-state="reruns"]')).toContainText('rank');
@@ -240,6 +324,7 @@ test.describe('the launch view', () => {
     });
     await ready(page, LAUNCH);
 
+    await page.locator('summary', { hasText: 'Rerun' }).click();
     const tasks = page.getByTestId('rerun-tasks');
     await expect(tasks.locator('li[data-state="changed"]')).toContainText('discover');
     await expect(page.getByRole('button', { name: /^Rerun \d/ })).toBeDisabled();

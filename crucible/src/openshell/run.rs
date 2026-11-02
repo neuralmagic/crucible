@@ -417,7 +417,11 @@ async fn try_turn(
     //    turn killed mid-create, or whose cleanup delete failed, leaves the name behind, and a
     //    bare create then fails "already exists" for the rest of the run. Clearing it makes
     //    create idempotent. Labels make the sandbox discoverable via `list --selector`.
-    let name = sandbox::name_for(&p.workspace);
+    let name = if args.broker.enabled {
+        sandbox::name_for(&p.workspace)
+    } else {
+        sandbox::fresh_name_for(&p.workspace)
+    };
     tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
     let _ = gw.delete_sandbox(&name).await;

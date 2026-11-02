@@ -95,6 +95,15 @@ impl<'a> LaunchTarget<'a> {
         }
     }
 
+    /// The manifest variant a launch of this target runs under: the registration's, never a
+    /// draft's.
+    pub(crate) fn variant(self) -> Option<&'a crucible::manifest::variant::VariantName> {
+        match self {
+            Self::Registered(pack) => pack.variant.as_ref(),
+            Self::Draft(_) => None,
+        }
+    }
+
     /// The draft version a launch of this target is authorized against.
     pub(crate) fn draft_version(self) -> Option<i64> {
         match self {
@@ -244,7 +253,13 @@ pub(crate) async fn admit<P: Admissible>(
     let (schema, max_time) = admit_pack(state, target, request).await?;
     let params = crate::playbooks::registry::validate_params(&schema, request.params)
         .map_err(invalid_fields)?;
-    check_plan(target.tree(state.db.pool()).await?, &params, &max_time).await?;
+    check_plan(
+        target.tree(state.db.pool()).await?,
+        &params,
+        &max_time,
+        target.variant(),
+    )
+    .await?;
     Ok(AuthorizedLaunch {
         pack,
         params,
@@ -320,9 +335,17 @@ async fn check_plan(
     tree: crucible_contract::pack_tree::PackTree,
     params: &serde_json::Value,
     max_time: &crate::model::MaxTime,
+    variant: Option<&crucible::manifest::variant::VariantName>,
 ) -> Result<(), Response> {
     let params = crate::launches::store::stored_params(params);
-    match crate::playbooks::registry::check_tree_runnable(tree, params, max_time.clone()).await {
+    match crate::playbooks::registry::check_tree_runnable(
+        tree,
+        params,
+        max_time.clone(),
+        variant.cloned(),
+    )
+    .await
+    {
         Ok(Ok(())) => Ok(()),
         Ok(Err(field)) => Err(invalid_fields(vec![field])),
         Err(e) => Err(AppError::from(e).into_response()),

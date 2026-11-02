@@ -37,6 +37,22 @@ pub(crate) struct RegisterPlaybookBody {
     /// changed is refused (409, naming both digests) unless this quotes the new one back.
     #[serde(default)]
     accept_exposure_digest: Option<String>,
+    /// The `[variant.<name>]` of the pack's manifest every launch runs. Omitted ⇒ the base
+    /// manifest.
+    #[serde(default)]
+    variant: Option<String>,
+}
+
+/// A request's manifest variant: blank is none, and `Err` names why the engine would refuse it.
+pub(crate) fn requested_variant(
+    raw: Option<&str>,
+) -> Result<Option<crucible::manifest::variant::VariantName>, String> {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        None => Ok(None),
+        Some(name) => crucible::manifest::variant::VariantName::parse(name)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -258,6 +274,8 @@ pub struct PlaybookDto {
     pub core_rev: String,
     /// The digest of this revision's declared exposure; null for an absent-legacy revision.
     pub exposure_digest: Option<String>,
+    /// The `[variant.<name>]` of the manifest every launch runs; null is the base manifest.
+    pub variant: Option<String>,
     /// What the pack's agent needs, against what this deployment can dispatch.
     pub dispatch: PackDispatchDto,
     /// `user:<login>` or `team:<slug>`.
@@ -316,6 +334,7 @@ impl PlaybookDto {
             rev: r.rev,
             tree_digest: r.tree_digest.map(|t| t.to_string()),
             exposure_digest: r.exposure_digest,
+            variant: r.variant.map(String::from),
             schema_digest: r.schema_digest,
             core_rev: r.core_rev,
             dispatch,
@@ -373,6 +392,10 @@ pub(crate) async fn register_playbook(
             return unprocessable(msg);
         }
     };
+    let variant = match requested_variant(body.variant.as_deref()) {
+        Ok(v) => v,
+        Err(msg) => return unprocessable(msg),
+    };
     let actor = identity.as_deref();
     let owner = match crate::authz::owner::owner_for_create(
         &state,
@@ -400,6 +423,7 @@ pub(crate) async fn register_playbook(
             .accept_exposure_digest
             .map(|d| d.trim().to_string())
             .filter(|d| !d.is_empty()),
+        variant,
     };
 
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
@@ -850,5 +874,25 @@ pub(crate) async fn dedupe_target(
         ))),
         Ok(None) => Err(refuse(format!("no schedule {id:?}"))),
         Err(e) => Err(AppError::from(e).into_response()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::playbooks::api::registry::requested_variant;
+
+    #[test]
+    fn a_requested_variant_is_a_checked_name_or_none() {
+        assert_eq!(requested_variant(None).ok(), Some(None));
+        assert_eq!(requested_variant(Some("  ")).ok(), Some(None));
+        assert_eq!(
+            requested_variant(Some(" offline "))
+                .ok()
+                .flatten()
+                .map(String::from),
+            Some("offline".to_string())
+        );
+        let refused = requested_variant(Some("off line")).expect_err("refused");
+        assert!(refused.contains("\"off line\""), "{refused}");
     }
 }
