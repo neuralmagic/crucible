@@ -3046,7 +3046,7 @@ struct Parked {
     /// The questions as the request asked them, each dynamic choice over its resolved options.
     questions: BTreeMap<QuestionId, Question>,
     choices: BTreeMap<QuestionId, Vec<String>>,
-    resolved: crate::plan::route::Resolved,
+    resolved: crate::plan::options::Resolved,
 }
 
 enum Opened {
@@ -3102,7 +3102,7 @@ fn open_decision(
     };
     let producers = file_producers(plan, t, results, runner);
     let inputs = inputs_for(plan, t, results, &producers);
-    let (questions, resolved) = match crate::plan::route::asked_questions(t, questions, &inputs) {
+    let (questions, resolved) = match crate::plan::options::asked_questions(t, questions, &inputs) {
         Ok(asked) => asked,
         Err(note) => return Opened::Settled(decision_failed(note)),
     };

@@ -9,6 +9,7 @@ pub mod exec;
 pub mod history;
 pub mod ir;
 pub mod machine;
+pub mod options;
 pub mod param;
 pub mod record;
 pub mod rerun;
