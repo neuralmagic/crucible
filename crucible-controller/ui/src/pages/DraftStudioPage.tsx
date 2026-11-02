@@ -186,9 +186,9 @@ function DraftStudio({ id }: { id: string }) {
     setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
   }, [publishTarget]);
 
-  const personalGithubSecrets = useMemo(() => {
+  const personalGithubSecrets = useMemo<SecretDto[]>(() => {
     const login = whoami.data?.user ?? null;
-    if (login === null) return [] as SecretDto[];
+    if (login === null) return [];
     return (secrets.data ?? []).filter(
       secret =>
         secret.owner === `user:${login}` &&
