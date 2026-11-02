@@ -3,9 +3,7 @@
 #[cfg(feature = "autoresearch")]
 use crate::issues::model::KeptPr;
 use crate::model::SortDir;
-use crate::runs::model::{
-    Candidate, NewCandidate, NewRun, Run, RunKindFilter, RunQuery, RunRow, run_id_created,
-};
+use crate::runs::model::{Candidate, NewCandidate, NewRun, Run, RunKindFilter, RunQuery, RunRow};
 use anyhow::{Context, Result};
 use sqlx::{PgExecutor, Row};
 use std::collections::HashMap;
@@ -27,7 +25,7 @@ pub async fn contract_parked(ex: impl PgExecutor<'_>) -> Result<Vec<(String, Str
 
 /// The `runs` column list, in decode order. Every `runs` read that yields a [`Run`] builds its
 /// SELECT from this so a new column is a one-line edit here.
-pub(crate) const RUN_COLS: &str = "run_id, name, scope, issue, identity_digest, status, pod, session_uri, best_score, cost_usd, dispatch, cluster, namespace, image_ref, image_digest, capability_digest, image_override";
+pub(crate) const RUN_COLS: &str = "run_id, name, scope, issue, identity_digest, status, pod, session_uri, best_score, cost_usd, created_at, dispatch, cluster, namespace, image_ref, image_digest, capability_digest, image_override";
 
 /// Record the image provenance the preflight resolved for a run. Written once, at dispatch.
 #[tracing::instrument(name = "db.set_run_image", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
@@ -53,8 +51,9 @@ pub(crate) async fn set_run_image(
 /// Every run launched from one scope, oldest first.
 #[tracing::instrument(name = "db.list_runs_for_scope", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", scope = scope), err)]
 pub async fn list_runs_for_scope(ex: impl PgExecutor<'_>, scope: i64) -> Result<Vec<Run>> {
-    let sql =
-        const_format::formatcp!("SELECT {RUN_COLS} FROM runs WHERE scope = $1 ORDER BY run_id");
+    let sql = const_format::formatcp!(
+        "SELECT {RUN_COLS} FROM runs WHERE scope = $1 ORDER BY created_at, seq"
+    );
     sqlx::query_as::<_, Run>(sql)
         .bind(scope)
         .fetch_all(ex)
@@ -99,21 +98,21 @@ pub(crate) const CANDIDATE_COLS: &str =
 /// `status=`/`repo=`/`dispatch_target=` filter + sorting and paging. A plain `sqlx::query`
 /// (not the macro) because the ORDER BY column is only known at runtime — the column comes from a
 /// [`RunSort`](crate::runs::model::RunSort) match, never string-interpolated, so this stays injection-safe;
-/// every filter/paging value is a bound `?`. `run_id DESC` is the deterministic tiebreak (and, since
-/// the id is time-first, a sensible newest-first secondary order).
+/// every filter/paging value is a bound `?`. `seq` breaks ties in the requested direction.
 #[tracing::instrument(name = "db.list_runs_page", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_runs_page(ex: impl PgExecutor<'_>, q: &RunQuery) -> Result<Vec<RunRow>> {
     let order_col = q.sort.order_col();
     // NULLS placement pinned to the SQLite-era behavior the UI expects (NULLs sort as
     // smallest: first ASC, last DESC); Postgres's default is the opposite on DESC.
-    let order_dir = match q.dir {
-        SortDir::Asc => "ASC NULLS FIRST",
-        SortDir::Desc => "DESC NULLS LAST",
+    let (order_dir, seq_dir) = match q.dir {
+        SortDir::Asc => ("ASC NULLS FIRST", "ASC"),
+        SortDir::Desc => ("DESC NULLS LAST", "DESC"),
     };
     let sql = format!(
         r#"
         SELECT r.run_id AS run_id, r.name AS name, r.issue AS issue_key, i.repo AS repo,
                r.status AS status, r.best_score AS best_score, r.cost_usd AS cost_usd,
+               r.created_at AS created_at,
                (SELECT c.pr_url FROM candidates c
                  WHERE c.run_id = r.run_id AND c.pr_url IS NOT NULL AND c.decision = 'keep'
                  ORDER BY c.seq DESC LIMIT 1) AS pr_url,
@@ -131,7 +130,7 @@ pub(crate) async fn list_runs_page(ex: impl PgExecutor<'_>, q: &RunQuery) -> Res
           AND ($7::text IS NULL
                OR ($7 = 'autoresearch' AND pl.key IS NULL)
                OR ($7 = 'playbook' AND pl.key IS NOT NULL))
-        ORDER BY {order_col} {order_dir}, r.run_id DESC
+        ORDER BY {order_col} {order_dir}, r.seq {seq_dir}
         LIMIT $5 OFFSET $6
         "#
     );
@@ -150,11 +149,8 @@ pub(crate) async fn list_runs_page(ex: impl PgExecutor<'_>, q: &RunQuery) -> Res
         .context("list_runs_page")?;
     rows.into_iter()
         .map(|row| {
-            let run_id: String = row.try_get("run_id")?;
-            let created = run_id_created(&run_id);
             Ok(RunRow {
-                created,
-                run_id,
+                run_id: row.try_get("run_id")?,
                 name: row.try_get("name")?,
                 issue_key: row.try_get("issue_key")?,
                 repo: row.try_get("repo")?,
@@ -163,6 +159,7 @@ pub(crate) async fn list_runs_page(ex: impl PgExecutor<'_>, q: &RunQuery) -> Res
                 cost_usd: row.try_get("cost_usd")?,
                 pr_url: row.try_get("pr_url")?,
                 transport_losses: row.try_get("transport_losses")?,
+                created_at: row.try_get("created_at")?,
             })
         })
         .collect()
@@ -425,6 +422,23 @@ pub(crate) async fn set_run_dispatch(
     Ok(())
 }
 
+/// Restamp when a run was recorded. Rebuild only: a re-ingested row otherwise reads as recorded at
+/// rebuild time.
+#[tracing::instrument(name = "db.set_run_created_at", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", %run_id), err)]
+pub(crate) async fn set_run_created_at(
+    ex: impl PgExecutor<'_>,
+    run_id: &str,
+    created_at: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE runs SET created_at = $2 WHERE run_id = $1")
+        .bind(run_id)
+        .bind(created_at)
+        .execute(ex)
+        .await
+        .context("set_run_created_at")?;
+    Ok(())
+}
+
 /// Drop a run and its folded candidates so an external re-upload can re-ingest in place.
 /// External-run replace only: a dispatched run's row is the pod-watch's to own.
 pub async fn delete_run_cascade(pool: &sqlx::PgPool, run_id: &str) -> Result<()> {
@@ -600,7 +614,7 @@ pub(crate) async fn count_running(ex: impl PgExecutor<'_>) -> Result<i64> {
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::store::*;
 
     #[cfg(feature = "autoresearch")]
     use crate::issues::model::NewScope;
@@ -930,6 +944,226 @@ mod tests {
         assert!(
             running_run_for_issue(&pool, key).await?.is_none(),
             "a finished run is no longer live"
+        );
+        Ok(())
+    }
+
+    fn bare_run(run_id: &str, status: &str) -> NewRun {
+        NewRun {
+            run_id: run_id.to_string(),
+            scope: None,
+            issue: None,
+            identity_digest: None,
+            status: status.to_string(),
+            pod: None,
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        }
+    }
+
+    fn created_query(dir: crate::model::SortDir) -> RunQuery {
+        RunQuery {
+            status: None,
+            repo: None,
+            dispatch_target: None,
+            kind: None,
+            sort: crate::runs::model::RunSort::Created,
+            dir,
+            limit: 50,
+            offset: 0,
+        }
+    }
+
+    /// The leaderboard's newest-first is the order runs were recorded in. Every id shape the
+    /// controller and the engine mint is here, inserted in an order that matches neither the
+    /// recorded times nor the ids' lexical order, so a sort on either of those fails.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_leaderboard_sorts_by_when_a_run_was_recorded_not_by_its_id(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let rows = [
+            (
+                "20260817T000000Z-goal-generalize-the-fused-gemm",
+                "2026-08-17T00:00:00Z",
+            ),
+            (
+                "scenario_01a0d53c-ffc3-7652-be92-9c77252a2352-1790283939",
+                "2026-09-24T21:05:39Z",
+            ),
+            (
+                "playbook_survey_0199c0de-7c2c-71a5-8000-9-1793620800",
+                "2026-11-02T12:00:00Z",
+            ),
+            ("adopted-1786754192", "2026-08-15T00:36:32Z"),
+            ("owner_repo_1-1790812800", "2026-10-01T00:00:00Z"),
+            (
+                "playbook_triage_019a4b1c-0000-7000-8000-1-1793620800",
+                "2026-11-02T12:00:00Z",
+            ),
+        ];
+        for (run_id, at) in rows {
+            insert_run(&pool, &bare_run(run_id, "finished")).await?;
+            set_run_created_at(&pool, run_id, at).await?;
+        }
+
+        let desc = list_runs_page(&pool, &created_query(crate::model::SortDir::Desc)).await?;
+        let ids = |page: &[RunRow]| page.iter().map(|r| r.run_id.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&desc),
+            [
+                "playbook_triage_019a4b1c-0000-7000-8000-1-1793620800",
+                "playbook_survey_0199c0de-7c2c-71a5-8000-9-1793620800",
+                "owner_repo_1-1790812800",
+                "scenario_01a0d53c-ffc3-7652-be92-9c77252a2352-1790283939",
+                "20260817T000000Z-goal-generalize-the-fused-gemm",
+                "adopted-1786754192",
+            ],
+            "newest first; a tie goes to the row recorded later"
+        );
+        assert_eq!(desc[0].created_at, "2026-11-02T12:00:00Z");
+        assert_eq!(desc[5].created_at, "2026-08-15T00:36:32Z");
+
+        let asc = list_runs_page(&pool, &created_query(crate::model::SortDir::Asc)).await?;
+        let mut reversed = ids(&desc);
+        reversed.reverse();
+        assert_eq!(ids(&asc), reversed, "ascending is the exact reverse");
+
+        let second_page = list_runs_page(
+            &pool,
+            &RunQuery {
+                limit: 2,
+                offset: 2,
+                ..created_query(crate::model::SortDir::Desc)
+            },
+        )
+        .await?;
+        assert_eq!(ids(&second_page), ids(&desc[2..4]));
+        Ok(())
+    }
+
+    /// A run is stamped when its row is first written; the completion edge re-runs the same upsert
+    /// and must not move the stamp.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_run_is_stamped_on_insert_and_completion_keeps_the_stamp(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let before = jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1);
+        insert_run(&pool, &bare_run("run-1", "running")).await?;
+        let stamped = get_run(&pool, "run-1").await?.expect("row").created_at;
+        let at: jiff::Timestamp = stamped.parse()?;
+        assert!(
+            at >= before && at <= jiff::Timestamp::now(),
+            "{stamped} is the insert time"
+        );
+        assert_eq!(
+            stamped,
+            crate::clock::stamp(at),
+            "the schema's stamp format"
+        );
+
+        set_run_created_at(&pool, "run-1", "2026-07-04T10:00:00Z").await?;
+        insert_run(&pool, &bare_run("run-1", "finished")).await?;
+        let run = get_run(&pool, "run-1").await?.expect("row");
+        assert_eq!(run.status, "finished");
+        assert_eq!(run.created_at, "2026-07-04T10:00:00Z");
+        Ok(())
+    }
+
+    /// A launch's runs and a scope's runs read in recorded order too, whatever their ids say.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn per_launch_reads_follow_the_recorded_order(pool: PgPool) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) \
+             VALUES ('playbook:survey:k', 'owner/repo', 'T1', 'running', 0, 'playbook', 's', \
+             '2026-08-23T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await?;
+        for (run_id, at) in [
+            ("playbook_survey_k-1790000000", "2026-09-21T13:46:40Z"),
+            ("playbook_survey_k-999999999", "2001-09-09T01:46:39Z"),
+            ("playbook_survey_k-rerun", "2026-10-01T00:00:00Z"),
+        ] {
+            insert_run(
+                &pool,
+                &NewRun {
+                    issue: Some("playbook:survey:k".to_string()),
+                    ..bare_run(run_id, "finished")
+                },
+            )
+            .await?;
+            set_run_created_at(&pool, run_id, at).await?;
+        }
+        let runs = crate::launches::store::list_runs_for_launch(&pool, "playbook:survey:k").await?;
+        assert_eq!(
+            runs.iter().map(|r| r.run_id.as_str()).collect::<Vec<_>>(),
+            [
+                "playbook_survey_k-rerun",
+                "playbook_survey_k-1790000000",
+                "playbook_survey_k-999999999",
+            ]
+        );
+        Ok(())
+    }
+
+    /// The migration that adds `created_at` dates every existing row: an engine id from its
+    /// leading stamp, a controller id from its trailing epoch, and an id that carries no real
+    /// instant from its neighbours in insertion order (the newest dated row before it, else the
+    /// oldest one after it).
+    #[sqlx::test(migrations = false)]
+    async fn the_migration_dates_existing_runs_from_their_ids(pool: PgPool) -> anyhow::Result<()> {
+        crate::MIGRATOR.run_to(72, &pool).await?;
+        for run_id in [
+            "first-undated",
+            "20260817T093000Z-goal-generalize-the-fused-gemm",
+            "playbook_survey_01a0d53c-ffc3-7652-be92-9c77252a2352-1790283939",
+            "between-undated",
+            "adopted-1786754192",
+            "20261340T999999Z-not-a-real-instant",
+        ] {
+            sqlx::query("INSERT INTO runs (run_id, status) VALUES ($1, 'finished')")
+                .bind(run_id)
+                .execute(&pool)
+                .await?;
+        }
+
+        crate::MIGRATOR.run(&pool).await?;
+
+        let dated: Vec<(String, String)> =
+            sqlx::query_as("SELECT run_id, created_at FROM runs ORDER BY seq")
+                .fetch_all(&pool)
+                .await?;
+        assert_eq!(
+            dated,
+            [
+                ("first-undated", "2026-08-15T00:36:32Z"),
+                (
+                    "20260817T093000Z-goal-generalize-the-fused-gemm",
+                    "2026-08-17T09:30:00Z"
+                ),
+                (
+                    "playbook_survey_01a0d53c-ffc3-7652-be92-9c77252a2352-1790283939",
+                    "2026-09-24T21:05:39Z"
+                ),
+                ("between-undated", "2026-09-24T21:05:39Z"),
+                ("adopted-1786754192", "2026-08-15T00:36:32Z"),
+                (
+                    "20261340T999999Z-not-a-real-instant",
+                    "2026-09-24T21:05:39Z"
+                ),
+            ]
+            .map(|(id, at)| (id.to_string(), at.to_string()))
+        );
+
+        insert_run(&pool, &bare_run("after-migration", "running")).await?;
+        let at: String =
+            sqlx::query_scalar("SELECT created_at FROM runs WHERE run_id = 'after-migration'")
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            at.parse::<jiff::Timestamp>().is_ok(),
+            "a new row is stamped by the column default: {at}"
         );
         Ok(())
     }

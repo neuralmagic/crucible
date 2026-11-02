@@ -27,7 +27,7 @@ import {
 import type { AppliedFilter, FacetRow } from '../ui';
 import { issueStatusColor } from './issueStatus';
 import { relativeTime } from './journeyView';
-import { launchPath, relaunchPath } from './launchView';
+import { launchPath, originLabel, relaunchPath } from './launchView';
 import { formatCost, transportLossLabel } from './runReport';
 import {
   DEFAULT_FILTERS,
@@ -95,6 +95,12 @@ const runColumns = runHelper.columns([
       );
     },
   }),
+  runHelper.accessor('origin', {
+    header: 'Origin',
+    enableSorting: false,
+    meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
+    cell: ({ getValue }) => originLabel(getValue()),
+  }),
   runHelper.accessor('created_by', {
     header: 'Launched by',
     enableSorting: false,
@@ -129,15 +135,17 @@ const runColumns = runHelper.columns([
 ]);
 
 export function PlaybookRunsPage() {
-  const runs = $api.useQuery('get', '/api/playbook-runs');
+  const [searchParams, setSearchParams] = useSearchParams();
+  const filters = parseRunFilters(searchParams);
+  const runs = $api.useQuery('get', '/api/playbook-runs', {
+    params: { query: filters.schedule ? { schedule: filters.schedule } : {} },
+  });
   const oneShots = $api.useQuery('get', '/api/one-shots');
   const playbooks = $api.useQuery('get', '/api/playbooks');
   const drafts = $api.useQuery('get', '/api/playbook-drafts');
   const owner = useOwnerContext();
   const oneShotRows = narrow(oneShots.data ?? EMPTY_ONE_SHOTS, owner.context, (row) => row.owner_principal);
 
-  const [searchParams, setSearchParams] = useSearchParams();
-  const filters = parseRunFilters(searchParams);
   const patch = (next: Partial<RunFilters>) => {
     setSearchParams(runFilterParams({ ...filters, ...next }), { replace: true });
   };
@@ -181,7 +189,7 @@ export function PlaybookRunsPage() {
   ];
 
   const applied: AppliedFilter[] = [];
-  for (const axis of ['status', 'playbook', 'origin'] as const) {
+  for (const axis of ['status', 'playbook', 'origin', 'schedule'] as const) {
     if (filters[axis]) {
       applied.push({
         label: `${axis}: ${filters[axis]}`,
@@ -212,7 +220,7 @@ export function PlaybookRunsPage() {
       <PageHeader
         eyebrow={eyebrowFor(owner.team, 'Execution')}
         title="Playbook runs"
-        description="Ad-hoc playbook launches with the values they froze, what they cost, and the deferred ones still waiting."
+        description="Playbook launches with the values they froze, what they cost, and the deferred ones still waiting."
       />
 
       <Facets rows={facetRows} />

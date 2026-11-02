@@ -454,8 +454,7 @@ impl ParkReason {
 }
 
 /// Where a launch came from. Downstream a launch is a launch — same row, same dispatch — so this
-/// exists to keep the one-shot surface from listing a schedule's firings, and to say in the audit
-/// trail which surface authorized a run.
+/// exists to say which surface authorized a run, in the audit trail and on the runs surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, strum::EnumIter)]
 pub(crate) enum LaunchOrigin {
     /// A form POST.
@@ -600,7 +599,7 @@ pub(crate) fn sorted_json(value: serde_json::Value) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::model::*;
 
     #[test]
     fn max_time_takes_the_engine_grammar_and_refuses_everything_else() {

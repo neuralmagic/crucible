@@ -581,8 +581,8 @@ pub(crate) async fn pod_artifact(
 
 /// The terminal runs the MLflow exporter still owes a push: a run whose bookkeeping row is absent
 /// or not yet `exported`. `running` runs are skipped — the export is post-fold, over a finished
-/// run's evidence. Ordered oldest-first (by `run_id`, which carries a time prefix) so a backlog
-/// drains in creation order; `limit` bounds one sweep's batch.
+/// run's evidence. Ordered oldest-first so a backlog drains in creation order; `limit` bounds one
+/// sweep's batch.
 #[tracing::instrument(name = "db.runs_awaiting_mlflow_export", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn runs_awaiting_mlflow_export(
     ex: impl PgExecutor<'_>,
@@ -595,7 +595,7 @@ pub(crate) async fn runs_awaiting_mlflow_export(
         LEFT JOIN mlflow_exports m ON m.run_id = r.run_id
         WHERE r.status != 'running'
           AND (m.state IS NULL OR m.state != 'exported')
-        ORDER BY r.run_id ASC
+        ORDER BY r.created_at, r.seq
         LIMIT $1
         "#,
     )
@@ -746,7 +746,7 @@ pub(crate) async fn clear_redispatch(ex: impl PgExecutor<'_>, key: &str) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::work_pods::*;
     use sqlx::PgPool;
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

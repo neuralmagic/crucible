@@ -650,7 +650,8 @@ async fn get_json_object(app: &Router, uri: &str) -> (StatusCode, serde_json::Va
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_runs_page_sorts_filters_and_pages(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    // Time-first run ids so `created` (== run_id) order is meaningful; two repos for the filter.
+    // Two repos for the filter; each run's `created_at` an hour apart so the default order means
+    // something.
     seed_scoped_run(
         &db,
         "o/a",
@@ -695,9 +696,20 @@ async fn list_runs_page_sorts_filters_and_pages(pool: PgPool) -> Result<()> {
         },
     )
     .await?;
+    for (run_id, at) in [
+        ("20260704T100000Z-a", "2026-07-04T10:00:00Z"),
+        ("20260704T110000Z-b", "2026-07-04T11:00:00Z"),
+        ("20260704T120000Z-c", "2026-07-04T12:00:00Z"),
+    ] {
+        sqlx::query("UPDATE runs SET created_at = $2 WHERE run_id = $1")
+            .bind(run_id)
+            .bind(at)
+            .execute(db.pool())
+            .await?;
+    }
     let app = app(db.clone(), Arc::new(Recorder::default()));
 
-    // Default: sort=created desc → newest run_id first, and the join carries issue_key + repo.
+    // Default: sort=created desc → newest run first, and the join carries issue_key + repo.
     let (st, v) = get_json(&app, "/api/runs").await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(v.len(), 3);
@@ -7642,10 +7654,10 @@ fn one_shot_body(fire_at: &str) -> serde_json::Value {
     })
 }
 
-/// The runs section is the relaunch source: every ad-hoc launch with the values and ceilings it
-/// froze, its outcome, and its cost — and a schedule's firing is not one of them.
+/// The runs section is the relaunch source: every launch, a schedule's firings included, with the
+/// values and ceilings it froze, its outcome, and its cost.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn the_runs_list_carries_the_snapshot_and_leaves_schedules_out(pool: PgPool) -> Result<()> {
+async fn the_runs_list_carries_the_snapshot_and_every_origin(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
     let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
     register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
@@ -7663,35 +7675,67 @@ async fn the_runs_list_carries_the_snapshot_and_leaves_schedules_out(pool: PgPoo
     assert_eq!(status, StatusCode::CREATED, "{ack}");
     let key = ack["key"].as_str().expect("key").to_string();
 
-    // A schedule's firing lands the same row with a different origin (WI-005 writes these); the
-    // one-shot surface must not claim it.
-    let scheduled = "playbook:survey:scheduled-1";
-    sqlx::query(
-        "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) \
-         VALUES ($1, 'owner/repo', 'T1', 'new', 0, 'playbook', 'sched', '2026-08-23T00:00:00Z')",
+    // A schedule's firing lands the same row with a different origin and the schedule that
+    // minted it.
+    let (status, schedule) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules"),
+        schedule_body("0 * * * *", "UTC"),
     )
-    .bind(scheduled)
-    .execute(db.pool())
-    .await?;
-    sqlx::query(
-        "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, \
-         advance_dedupe, origin, created_at) \
-         VALUES ($1, 'survey', '{}'::jsonb, 'sha256:x', 1.0, '5m', TRUE, 'schedule', \
-         '2026-08-23T00:00:00Z')",
-    )
-    .bind(scheduled)
-    .execute(db.pool())
-    .await?;
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{schedule}");
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+    let due: jiff::Timestamp = schedule["next_due_at"].as_str().expect("due").parse()?;
+    let fired =
+        crate::launches::schedules::fire_due(&db, due, 8, 5, std::time::Duration::from_secs(3600))
+            .await?;
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    let firing = fired[0].as_str();
 
+    let keys = |rows: &serde_json::Value| -> Vec<String> {
+        rows.as_array()
+            .expect("array")
+            .iter()
+            .map(|r| r["key"].as_str().expect("key").to_string())
+            .collect()
+    };
     let (status, rows) = get_json_value(&app, "/api/playbook-runs").await;
     assert_eq!(status, StatusCode::OK);
-    let rows = rows.as_array().expect("array");
     assert_eq!(
-        rows.len(),
-        1,
-        "the scheduled firing stays off this list: {rows:?}"
+        keys(&rows),
+        [firing, key.as_str()],
+        "the firing is listed beside the form launch, newest first"
     );
-    let row = &rows[0];
+    assert_eq!(rows[0]["origin"], "schedule");
+    assert_eq!(rows[0]["schedule"], schedule_id.as_str());
+
+    let by_schedule = format!("schedule={schedule_id}");
+    let both_schedule = format!("origin=schedule&schedule={schedule_id}");
+    for (query, want) in [
+        ("origin=schedule", vec![firing]),
+        ("origin=manual", vec![key.as_str()]),
+        ("origin=webhook", vec![]),
+        (by_schedule.as_str(), vec![firing]),
+        ("schedule=nope", vec![]),
+        (both_schedule.as_str(), vec![firing]),
+        ("status=new&playbook=survey", vec![firing, key.as_str()]),
+        ("status=done", vec![]),
+        ("playbook=triage", vec![]),
+        (
+            "origin=&schedule=&status=&playbook=",
+            vec![firing, key.as_str()],
+        ),
+    ] {
+        let (status, rows) = get_json_value(&app, &format!("/api/playbook-runs?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {rows}");
+        assert_eq!(keys(&rows), want, "{query}");
+    }
+    for query in ["origin=cron", "status=finished"] {
+        let (status, body) = get_json_value(&app, &format!("/api/playbook-runs?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+
+    let row = &rows[1];
     assert_eq!(row["key"], key.as_str());
     assert_eq!(row["origin"], "manual");
     assert_eq!(row["status"], "new");
@@ -7725,7 +7769,7 @@ async fn the_runs_list_carries_the_snapshot_and_leaves_schedules_out(pool: PgPoo
 
     let (status, scheduled_row) = get_json_value(
         &app,
-        &format!("/api/playbook-runs/{}", urlencoding_encode(scheduled)),
+        &format!("/api/playbook-runs/{}", urlencoding_encode(firing)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{scheduled_row}");
