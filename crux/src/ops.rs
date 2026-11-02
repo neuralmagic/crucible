@@ -447,14 +447,12 @@ pub async fn whoami(c: &Client) -> Result<String> {
 /// proposal already decided. Registering is still the admin's click.
 pub async fn playbook_import(
     c: &Client,
-    repo: &str,
-    git_ref: Option<&str>,
-    path: Option<&str>,
+    source: &crate::client::PackImportSource<'_>,
     id: Option<&str>,
     description: Option<&str>,
     as_json: bool,
 ) -> Result<String> {
-    let mut raw: Value = c.import_pack(repo, git_ref, path).await?;
+    let mut raw: Value = c.import_pack(source).await?;
     let import: dto::PackImport = serde_json::from_value(raw.clone())?;
     let url = c.web_url(&import_preview_path(&import.id, id, description));
     if as_json {

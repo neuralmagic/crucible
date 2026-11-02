@@ -64,6 +64,10 @@ pub(crate) enum Cmd {
         /// resolution, workspace setup, measure probe, or gate self-test. Runs anywhere (CI).
         #[arg(long)]
         parse_only: bool,
+        /// The `[variant.<name>]` the full check runs against; the base manifest without it.
+        /// Every declared variant is parsed and validated, and its graph compiled, either way.
+        #[arg(long, value_name = "NAME")]
+        variant: Option<crate::manifest::variant::VariantName>,
         /// Also validate a deploy profile's cluster wiring: the named [measure].cluster resolves
         /// against the fleet file, its secret name is non-empty, no bastion (not implemented yet),
         /// and, live, the sandbox SA cannot read the spoke kubeconfig Secret in the loop namespace.
@@ -276,6 +280,9 @@ pub(crate) enum PlanAction {
         /// manifest's own `[publish].pr_repo` wins over it, exactly as at run time.
         #[arg(long)]
         pr_repo: Option<String>,
+        /// The `[variant.<name>]` of the manifest to read; the base manifest without it.
+        #[arg(long, value_name = "NAME", requires = "manifest")]
+        variant: Option<crate::manifest::variant::VariantName>,
     },
     /// Execute a plan with the shell runner: `command` tasks run as real subprocesses,
     /// `agent` tasks run `--agent-cmd` (the command-backend stand-in). Exits nonzero when
@@ -329,6 +336,9 @@ pub(crate) enum PlanAction {
         /// ceilings. The graph compiled now must be the one the run started with.
         #[arg(long, requires = "manifest")]
         resume: bool,
+        /// The `[variant.<name>]` of the manifest to read; the base manifest without it.
+        #[arg(long, value_name = "NAME", requires = "manifest")]
+        variant: Option<crate::manifest::variant::VariantName>,
         /// Rerun a finished playbook run: the tasks `--from` names, everything downstream of
         /// them, and every task the run did not pass run again; every other task is reused with
         /// its output, files, and commits. PARENT is that run's state directory, or its evidence
@@ -539,6 +549,10 @@ pub(crate) struct DeployArgs {
     /// is what it accepts.
     #[arg(long = "param", value_name = "NAME=VALUE", requires = "playbook")]
     pub params: Vec<String>,
+    /// The `[variant.<name>]` of the manifest the launched playbook runs, emitted as the in-pod
+    /// `plan run --variant`.
+    #[arg(long, value_name = "NAME", requires = "playbook")]
+    pub variant: Option<crate::manifest::variant::VariantName>,
     /// Rerun a finished run: the rendered pod fetches that run's evidence from the controller at
     /// `[cluster].ingest_url` and dispatches the tasks `--from` names, and every task the run did
     /// not pass, again. RUN is the controller's run id.

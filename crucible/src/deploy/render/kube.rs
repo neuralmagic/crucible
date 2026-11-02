@@ -183,6 +183,8 @@ pub struct PlaybookLaunch {
     pub max_time: crate::duration::MaxTime,
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
+    /// The manifest variant the run reads; the base manifest when `None`.
+    pub variant: Option<crate::manifest::variant::VariantName>,
     /// The finished run this launch reruns, fetched from the controller.
     pub rerun: Option<RerunLaunch>,
 }
@@ -1029,6 +1031,11 @@ impl Renderer<'_> {
             };
             let harness_flag = harness_flag(self.opts.harness, '=');
             let model_flag = model_flag(self.opts.model.as_ref(), '=');
+            let variant_flag = pb
+                .variant
+                .as_ref()
+                .map(|v| format!(" --variant {v}"))
+                .unwrap_or_default();
             let (rerun_setup, resume_flag) = self.playbook_resume(pb)?;
             let invalid_verdict = crate::plan::INVALID_VERDICT_EXIT;
             return Ok(format!(
@@ -1037,7 +1044,7 @@ mkdir -p "$D/state"
 n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$D/state/starts"
 if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}
-  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}{resume_flag}
+  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{variant_flag}{param_flags}{resume_flag}
   rc=$?
 else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
@@ -5547,6 +5554,7 @@ mod tests {
                 ("depth".to_string(), "--deep".to_string()),
             ]),
             rerun: None,
+            variant: None,
         }
     }
 

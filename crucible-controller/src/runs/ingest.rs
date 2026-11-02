@@ -271,7 +271,7 @@ impl ParsedRun {
         Ok(())
     }
 
-    /// The first unresolved task failure, preferring a captured problem over its exit status.
+    /// The note of the first unresolved task failure, else of the first task it blocked.
     pub(crate) fn failure_cause(&self) -> Option<String> {
         let mut last = BTreeMap::new();
         for (index, result) in self.task_results.iter().enumerate() {
@@ -309,16 +309,7 @@ impl ParsedRun {
                     TaskStatus::Fail | TaskStatus::Transport | TaskStatus::Truncated
                 )
             })
-            .find_map(|r| {
-                r.output
-                    .as_ref()
-                    .and_then(|output| output.get("problem"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|problem| !problem.is_empty())
-                    .map(|problem| format!("{}: {problem}", r.task))
-                    .or_else(|| (!r.note.trim().is_empty()).then(|| r.note.trim().to_owned()))
-            });
+            .find_map(|r| (!r.note.trim().is_empty()).then(|| r.note.trim().to_owned()));
 
         failed.or_else(|| {
             current.iter().find_map(|r| {
@@ -1400,13 +1391,24 @@ mod tests {
             r#"{"v":1,"kind":"task_result","task":"planning_check","status":"pass","iter":0}"#,
             r#"{"v":1,"kind":"task_result","task":"pick_review[candidate]","status":"fail","iter":0,"note":"old review failure"}"#,
             r#"{"v":1,"kind":"task_result","task":"pick_review","status":"pass","iter":0}"#,
-            r#"{"v":1,"kind":"task_result","task":"build","status":"fail","iter":0,"note":"exit 1: ","output":{"pass":false,"problem":"source layer cannot package changed test paths"}}"#,
+            r#"{"v":1,"kind":"task_result","task":"build","status":"fail","iter":0,"note":"exit 1: source layer cannot package changed test paths","output":{"pass":false,"note":"source layer cannot package changed test paths"}}"#,
             r#"{"v":1,"kind":"task_result","task":"failure_investigation","status":"transport","iter":0,"note":"agent exited without a verdict"}"#,
         ].join("\n");
 
         assert_eq!(
             parse_session(&log).failure_cause().as_deref(),
-            Some("build: source layer cannot package changed test paths")
+            Some("exit 1: source layer cannot package changed test paths")
+        );
+    }
+
+    /// The cause is the engine's note. An output field a pack uses for its own purposes is not
+    /// read as one, whatever it is called.
+    #[test]
+    fn a_failure_cause_reads_the_note_not_an_output_field() {
+        let log = r#"{"v":1,"kind":"task_result","task":"build","status":"fail","iter":0,"note":"exit 1: the image did not build","output":{"problem":"a field the pack reports for itself"}}"#;
+        assert_eq!(
+            parse_session(log).failure_cause().as_deref(),
+            Some("exit 1: the image did not build")
         );
     }
 

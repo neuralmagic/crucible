@@ -517,6 +517,8 @@ pub struct RunOpts {
     pub agent: AgentOverride,
     /// Continue the playbook run the manifest's state dir holds instead of starting one.
     pub resume: bool,
+    /// The manifest variant the run reads.
+    pub variant: Option<crate::manifest::variant::VariantName>,
     /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
     pub rerun: Option<Rerun>,
 }
@@ -630,7 +632,7 @@ fn start_rerun(
         .restore_captured(&parent, &paths.state)
         .context("restoring the parent's captured files")?;
     let tree = crucible_vcs::git_memory::tree_of(&paths.workspace, &base)?.unwrap_or_default();
-    RunStart::begin(run, base, tree, plan).write(&paths.state)?;
+    RunStart::begin(run, base, tree, plan, loaded.variant.clone()).write(&paths.state)?;
     Ok(seeded.prior)
 }
 
@@ -649,6 +651,7 @@ pub fn run(
         compute_driver,
         agent,
         resume,
+        variant,
         rerun,
     } = opts;
 
@@ -676,6 +679,7 @@ pub fn run(
                 let resumed = resume.then(|| RunStart::read(&state)).transpose()?;
                 let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
                     m,
+                    variant.as_ref(),
                     params,
                     compute_driver,
                     agent,
@@ -736,7 +740,7 @@ pub fn run(
                 }
                 match (resumed, &rerun) {
                     (Some(resumed), _) => {
-                        resumed.continues(run, &plan)?;
+                        resumed.continues(run, &plan, variant.as_ref())?;
                         crate::cli::setup::restore_pristine(m, &loaded, &resumed.base)?;
                         prior = Some(crate::plan::resume::fold_log(
                             &session_log,
@@ -756,7 +760,7 @@ pub fn run(
                             .context("reading the workspace's starting commit")?;
                         let tree = crucible_vcs::git_memory::tree_of(workspace, &base)?
                             .unwrap_or_default();
-                        RunStart::begin(run, base, tree, &plan).write(&state)?;
+                        RunStart::begin(run, base, tree, &plan, variant.clone()).write(&state)?;
                     }
                     (None, None) => {}
                 }
@@ -1038,6 +1042,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::variant::VariantName;
 
     const SRC: &str = r#"
         version = 1
@@ -1118,6 +1123,82 @@ mod tests {
         assert!(inline_error.contains("nope"), "{inline_error}");
         assert!(backed_error.contains("nope"), "{backed_error}");
         assert!(!sentinel.exists(), "neither run may dispatch a task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A variant's tables replace the base's whole for the run that selects it, and a resume
+    /// of that run must select it again.
+    #[test]
+    fn a_variant_run_reads_its_own_graph_and_resumes_only_as_itself() {
+        let dir = crate::testing::tempdir("plan-run-variant");
+        let base_ran = dir.join("base-ran");
+        let offline_ran = dir.join("offline-ran");
+        for (file, sentinel) in [("base.star", &base_ran), ("offline.star", &offline_ran)] {
+            std::fs::write(
+                dir.join(file),
+                format!(
+                    "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"touch {} && echo '{{}}'\")])\n",
+                    sentinel.display()
+                ),
+            )
+            .expect("workflow");
+        }
+        let manifest = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest,
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [workflow]
+            type = "playbook"
+            file = "base.star"
+            [variant.offline.workflow]
+            type = "playbook"
+            file = "offline.star"
+            "#,
+        )
+        .expect("manifest");
+        let launch = |variant: Option<&str>, resume: bool| {
+            run(
+                None,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                Some(&manifest),
+                RunOpts {
+                    ceilings: Ceilings {
+                        usd: Some(1.0),
+                        wall_clock: Some(std::time::Duration::from_secs(60)),
+                        wall_clock_raw: Some("60s".to_string()),
+                    },
+                    variant: variant.map(|v| VariantName::parse(v).expect("variant name")),
+                    resume,
+                    ..Default::default()
+                },
+            )
+        };
+
+        launch(Some("offline"), false).expect("the offline variant runs");
+        assert!(offline_ran.exists(), "the variant's graph ran");
+        assert!(!base_ran.exists(), "the base [workflow] was replaced whole");
+
+        let error = launch(None, true).expect_err("a resume under the base is another run");
+        assert!(
+            format!("{error:#}").contains(
+                "reads the base manifest, but the interrupted run read [variant.offline]"
+            ),
+            "{error:#}"
+        );
+        launch(Some("missing"), false).expect_err("an undeclared variant is refused");
+        launch(Some("offline"), true).expect("a resume under the same variant continues");
+        assert!(!base_ran.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
