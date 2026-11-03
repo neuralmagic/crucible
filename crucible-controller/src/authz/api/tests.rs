@@ -1302,6 +1302,90 @@ async fn draft_reads_and_writes_are_scoped_to_what_the_caller_may_read(pool: PgP
     );
 }
 
+/// Migrating a draft is saving a version of it, so it is decided as `playbook_draft:update` on the
+/// draft's owner: a member who may only read is refused with the structured denial, a caller who
+/// may not read is told it does not exist, and a platform administrator migrates another owner's
+/// draft as they could save it.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn migrating_a_draft_is_decided_as_saving_it(pool: PgPool) {
+    let app = app_with_roles(pool.clone(), &["root"], &["alice", "bob", "carol"]);
+    team_with(
+        &app,
+        "alice",
+        "llm-d",
+        vec![
+            member("user", "alice", "owner"),
+            member("user", "bob", "member"),
+        ],
+    )
+    .await;
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/playbook-drafts",
+            Some("alice"),
+            &[],
+            Some(json!({"id": "ours", "description": "d", "owner": "team:llm-d"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let migrate = |user: &str, dry_run: bool| {
+        as_user(
+            "POST",
+            "/api/playbook-drafts/ours/migrate",
+            Some(user),
+            &[],
+            Some(json!({"base_version": 1, "dry_run": dry_run})),
+        )
+    };
+
+    for dry_run in [true, false] {
+        let (status, body) = call(&app, migrate("bob", dry_run)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["rule"], "no-rule");
+        assert!(
+            body["error"]
+                .as_str()
+                .expect("error")
+                .contains("playbook_draft:update"),
+            "{body}"
+        );
+        let (status, body) = call(&app, migrate("carol", dry_run)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    let (status, body) = call(&app, migrate("root", false)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["saved"]["version"], 2);
+    assert_eq!(body["saved"]["saved_by"], "root");
+
+    let denials: Vec<(String, String)> = sqlx::query_as(
+        "SELECT actor, action FROM authz_audit
+          WHERE decision = 'deny' AND resource_type = 'playbook_draft' AND resource_id = 'ours'
+          ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("audit");
+    assert_eq!(
+        denials,
+        [
+            ("user:bob".to_string(), "playbook_draft:update".to_string()),
+            (
+                "user:carol".to_string(),
+                "playbook_draft:update".to_string()
+            ),
+            ("user:bob".to_string(), "playbook_draft:update".to_string()),
+            (
+                "user:carol".to_string(),
+                "playbook_draft:update".to_string()
+            ),
+        ]
+    );
+}
+
 /// C-SHARING on drafts: a share puts the resource in the grantee's lists and reads at its role and
 /// nothing more, an expired share allows nothing while still listing, a transfer keeps the shares,
 /// revocation takes `share` or platform administration, and every change is audited.

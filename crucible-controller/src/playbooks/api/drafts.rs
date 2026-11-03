@@ -271,6 +271,13 @@ dto! {
         pub saved_by: Option<String>,
         pub saved_at: String,
         pub diagnostics: Vec<crate::playbooks::drafts::Diagnostic>,
+        /// The pack contract edition the manifest declares; null when it does not say one this
+        /// controller's engine reads.
+        pub edition: Option<i64> = f
+            .files
+            .get(crate::playbooks::packs::MANIFEST)
+            .and_then(|text| crucible::manifest::edition::declared(text).ok())
+            .map(crucible::manifest::edition::Edition::number),
         /// `{path: content}`, every file the pack holds.
         pub files: std::collections::BTreeMap<String, String>,
     }
@@ -787,6 +794,236 @@ pub(crate) async fn save_playbook_draft(
         .into_response(),
         Err(e) => draft_refusal(e),
     }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct MigrateDraftBody {
+    /// The edition to move to; omitted ⇒ the newest the controller's engine runs.
+    #[serde(default)]
+    to: Option<u32>,
+    /// The version the migration reads and saves over. A newer save refuses it with the version
+    /// that overtook it.
+    base_version: i64,
+    /// Answer with the diff, the changes, and the findings, and store nothing.
+    dry_run: bool,
+}
+
+/// One file's unified diff.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftFileDiffDto {
+    pub path: String,
+    pub unified: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationChangeKind {
+    /// The manifest's top-level edition.
+    Edition,
+    /// A variable a table's host commands read, declared optional in its `env`.
+    Declared,
+}
+
+/// One edit a migration made.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MigrationChangeDto {
+    pub kind: MigrationChangeKind,
+    /// The table a declaration went into, as the manifest spells it; null for the edition.
+    pub table: Option<String>,
+    /// The `env` entry declared; null for the edition.
+    pub entry: Option<String>,
+    /// Where the declared variable is read: `path:line`, or the command that reads it.
+    pub read_at: Vec<String>,
+    pub message: String,
+}
+
+impl From<crucible::manifest::migrate::Change> for MigrationChangeDto {
+    fn from(change: crucible::manifest::migrate::Change) -> Self {
+        use crucible::manifest::migrate::Change;
+        let message = change.to_string();
+        match change {
+            Change::Edition { .. } => MigrationChangeDto {
+                kind: MigrationChangeKind::Edition,
+                table: None,
+                entry: None,
+                read_at: Vec::new(),
+                message,
+            },
+            Change::Declared {
+                table,
+                decl,
+                read_at,
+            } => MigrationChangeDto {
+                kind: MigrationChangeKind::Declared,
+                table: Some(table.to_string()),
+                entry: Some(decl.to_string()),
+                read_at: read_at.iter().map(ToString::to_string).collect(),
+                message,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationFindingKind {
+    /// A host command whose code was not fully read.
+    UnresolvedCommand,
+    /// A pack file reads variables, and no host command was found to run it.
+    UnattributedReads,
+    /// A pack file reads variables, and only code the edition does not govern runs it.
+    NotAffected,
+    /// A read whose variable name is computed at run time.
+    ComputedRead,
+}
+
+/// Something a migration could not settle from the pack's text, for a reviewer to check.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MigrationFindingDto {
+    pub kind: MigrationFindingKind,
+    /// The pack file the finding is about; null when it is about a command.
+    pub path: Option<String>,
+    pub message: String,
+}
+
+impl From<crucible::manifest::migrate::Finding> for MigrationFindingDto {
+    fn from(finding: crucible::manifest::migrate::Finding) -> Self {
+        use crucible::manifest::migrate::{Finding, ReadSite};
+        let message = finding.to_string();
+        let (kind, path) = match finding {
+            Finding::UnresolvedCommand { .. } => (MigrationFindingKind::UnresolvedCommand, None),
+            Finding::UnattributedReads { path, .. } => {
+                (MigrationFindingKind::UnattributedReads, Some(path))
+            }
+            Finding::NotAffected { path, .. } => (MigrationFindingKind::NotAffected, Some(path)),
+            Finding::ComputedRead { site } => (
+                MigrationFindingKind::ComputedRead,
+                match site {
+                    ReadSite::File { path, .. } => Some(path),
+                    ReadSite::Command(_) => None,
+                },
+            ),
+        };
+        MigrationFindingDto {
+            kind,
+            path,
+            message,
+        }
+    }
+}
+
+/// A draft version moved to a newer edition.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftMigrationDto {
+    /// The edition the base version is written against.
+    pub from: i64,
+    pub to: i64,
+    pub base_version: i64,
+    pub dry_run: bool,
+    /// One unified diff per file the migration changes; empty when the draft is already at `to`.
+    pub diffs: Vec<DraftFileDiffDto>,
+    pub changes: Vec<MigrationChangeDto>,
+    pub findings: Vec<MigrationFindingDto>,
+    /// The version the migration stored; null on a dry run and when nothing changed.
+    pub saved: Option<DraftCompileDto>,
+}
+
+/// `POST /api/playbook-drafts/{id}/migrate` — move a draft to a newer pack edition with the
+/// controller's engine (ADR-0071). A dry run answers with the diff, the changes, and what needs
+/// review; otherwise the migrated files are saved as the next version exactly as
+/// `POST .../versions` saves them, against `base_version`.
+#[utoipa::path(
+    post,
+    path = "/api/playbook-drafts/{id}/migrate",
+    params(("id" = String, Path, description = "Draft id")),
+    request_body = MigrateDraftBody,
+    responses(
+        (status = 200, description = "The migration, and the version it stored unless this was a dry run or nothing changed", body = DraftMigrationDto),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No draft with that id", body = ErrorBody),
+        (status = 409, description = "A newer save overtook `base_version`, or the draft retired when its graduated pack was imported", body = StaleBaseBody),
+        (status = 422, description = "An edition the engine does not run, a manifest that does not parse, or a workflow that does not compile", body = ErrorBody)
+    )
+)]
+pub(crate) async fn migrate_playbook_draft(
+    State(state): State<ApiState>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+    Json(body): Json<MigrateDraftBody>,
+) -> ApiResult<Response> {
+    if let Err(refused) =
+        readable_draft(&state, &caller, &id, crate::authz::action::Verb::Update).await
+    {
+        return Ok(refused);
+    }
+    let to = match body.to {
+        Some(edition) => crucible::manifest::edition::Edition::try_from(i64::from(edition))
+            .map_err(|e| ApiError::Unprocessable(e.to_string()))?,
+        None => crucible::manifest::edition::Edition::LATEST,
+    };
+    let migrated = match crate::playbooks::drafts::migrate(
+        state.db.pool(),
+        &id,
+        to,
+        body.base_version,
+        body.dry_run,
+        identity.as_deref(),
+    )
+    .await
+    {
+        Ok(migrated) => migrated,
+        Err(e) => return Ok(draft_refusal(e)),
+    };
+    let saved = match migrated.saved {
+        Some(saved) => {
+            state
+                .audit(
+                    crate::event_log::Event::now(
+                        &format!("draft:{id}"),
+                        "migrated",
+                        "migrated",
+                        Some(&format!(
+                            "migrated to edition {to} as version {}",
+                            saved.version
+                        )),
+                        None,
+                    )
+                    .by(identity.as_deref()),
+                    "migrate_playbook_draft",
+                )
+                .await;
+            let catalog = match crate::playbooks::api::registry::catalog(&state).await {
+                Ok(c) => c,
+                Err(refusal) => return Ok(refusal),
+            };
+            Some(DraftCompileDto::from_saved(
+                saved,
+                &state.dispatch,
+                &catalog,
+            ))
+        }
+        None => None,
+    };
+    let migration = migrated.migration;
+    Ok(Json(DraftMigrationDto {
+        from: migration.from.number(),
+        to: migration.to.number(),
+        base_version: body.base_version,
+        dry_run: body.dry_run,
+        diffs: migration
+            .diffs(&migrated.base)
+            .into_iter()
+            .map(|d| DraftFileDiffDto {
+                path: d.path,
+                unified: d.unified,
+            })
+            .collect(),
+        changes: migration.changes.into_iter().map(Into::into).collect(),
+        findings: migration.needs_review.into_iter().map(Into::into).collect(),
+        saved,
+    })
+    .into_response())
 }
 
 /// `DELETE /api/playbook-drafts/{id}` — drop a draft, every version it holds, and its secret
