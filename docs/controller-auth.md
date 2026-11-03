@@ -222,6 +222,7 @@ The controller refuses to start when one of these is set, and the error names th
 | `CONTROLLER_KUBE_USER_AUTH` | An API key. Cluster tokens are not bearers. |
 | `CONTROLLER_OIDC_DEVICE_CLIENT_ID` | An API key. Device-flow access tokens are not bearers. |
 | `CONTROLLER_TLS_ADDR` | TLS at the Route. The controller serves plain HTTP. |
+| `CONTROLLER_MLFLOW_TRACKING_URI`, `CONTROLLER_MLFLOW_EXPERIMENT`, `CONTROLLER_MLFLOW_EXPERIMENT_MAP`, `CONTROLLER_MLFLOW_TOKEN`, `CONTROLLER_MLFLOW_SWEEP_SECS` | `GET /api/export/runs.parquet` and the run evidence routes. The MLflow run exporter was removed. |
 
 ## API keys
 

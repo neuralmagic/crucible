@@ -125,8 +125,7 @@ sha2 = "0.10"
 rand = "0.10"
 # A run's display name (`benevolent-monkey`), from the crate's built-in English word lists.
 petname = { version = "3", default-features = false, features = ["default-rng", "default-words"] }
-# Percent-encodes the MLflow experiment name into a query string (mlflow.rs), and the form bodies
-# the OIDC logout and revoke requests carry.
+# Percent-encodes the form bodies the OIDC logout and revoke requests carry, and URL path segments.
 percent-encoding = "2"
 # AES-256-GCM for the offline credential at rest, under the chart-mounted key. Already the crypto
 # provider under rustls and jsonwebtoken in this tree, so it adds no new build.
@@ -186,18 +185,6 @@ flate2 = "1"
 # A surviving scope pack arrives from the turn pod as a gzip'd tar on its own marker line and is
 # unpacked (traversal-guarded) into the controller's pack_out dir.
 tar = "0.4"
-# MLflow export (R6). `with-serde` deserializes captured OTLP/JSON trace records — hex
-# traceId/spanId/parentSpanId fields decode to bytes exactly like agentic-ci's `_fixup_ids`
-# did — straight into the proto types; `prost` re-encodes them to the wire protobuf MLflow's
-# `/v1/traces` ingests. `gen-tonic-messages` brings the collector's ExportTraceServiceRequest
-# message (no gRPC stack). Already in the tree via opentelemetry-otlp, so no new transitive
-# build.
-opentelemetry-proto = { version = "0.33", default-features = false, features = [
-    "gen-tonic-messages",
-    "trace",
-    "with-serde",
-] }
-prost = "0.14"
 cedar-policy = "4.12.0"
 
 # A Postgres the controller runs itself, for `DATABASE_URL=embedded`.

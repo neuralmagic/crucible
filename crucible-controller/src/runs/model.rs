@@ -71,43 +71,6 @@ pub struct PodArtifactRow {
     pub(crate) created_at: String,
 }
 
-/// The lifecycle of one run's MLflow export (`mlflow_exports`). A closed enum, not a raw string,
-/// so the sweep can't drift a state literal past the bookkeeping layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MlflowExportState {
-    /// A sweep has claimed the run and is attempting the export (or a prior attempt died mid-flight).
-    Pending,
-    /// The run + its traces landed on the tracking server; the idempotency stop — never re-exported.
-    Exported,
-    /// The last attempt failed; retried on the next sweep with the error preserved.
-    Failed,
-}
-
-impl std::str::FromStr for MlflowExportState {
-    type Err = String;
-    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
-        match s {
-            "pending" => Ok(MlflowExportState::Pending),
-            "exported" => Ok(MlflowExportState::Exported),
-            "failed" => Ok(MlflowExportState::Failed),
-            other => Err(format!("unknown mlflow export state: {other}")),
-        }
-    }
-}
-
-/// One `mlflow_exports` row read back — the export bookkeeping for one run.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MlflowExportRow {
-    pub(crate) run_id: String,
-    pub(crate) state: MlflowExportState,
-    pub(crate) mlflow_run_id: Option<String>,
-    pub(crate) experiment_id: Option<String>,
-    pub(crate) attempts: i64,
-    pub(crate) error: Option<String>,
-    pub(crate) created_at: String,
-    pub(crate) updated_at: String,
-}
-
 /// Where a run's engine ran: a controller-owned work pod, or a supervised subprocess on the
 /// controller's own machine (the config-gated local mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

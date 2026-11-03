@@ -1134,7 +1134,40 @@ const RETIRED: &[Retired] = &[
         removed: "the controller's own TLS listener was removed",
         instead: "terminate TLS at the Route in front of CONTROLLER_API_ADDR",
     },
+    Retired {
+        var: "CONTROLLER_MLFLOW_TRACKING_URI",
+        live: |_| true,
+        removed: MLFLOW_REMOVED,
+        instead: MLFLOW_INSTEAD,
+    },
+    Retired {
+        var: "CONTROLLER_MLFLOW_EXPERIMENT",
+        live: |_| true,
+        removed: MLFLOW_REMOVED,
+        instead: MLFLOW_INSTEAD,
+    },
+    Retired {
+        var: "CONTROLLER_MLFLOW_EXPERIMENT_MAP",
+        live: |_| true,
+        removed: MLFLOW_REMOVED,
+        instead: MLFLOW_INSTEAD,
+    },
+    Retired {
+        var: "CONTROLLER_MLFLOW_TOKEN",
+        live: |_| true,
+        removed: MLFLOW_REMOVED,
+        instead: MLFLOW_INSTEAD,
+    },
+    Retired {
+        var: "CONTROLLER_MLFLOW_SWEEP_SECS",
+        live: |_| true,
+        removed: MLFLOW_REMOVED,
+        instead: MLFLOW_INSTEAD,
+    },
 ];
+
+const MLFLOW_REMOVED: &str = "the MLflow run exporter was removed";
+const MLFLOW_INSTEAD: &str = "read runs through the controller API: GET /api/export/runs.parquet and the run evidence routes";
 
 /// Refuse every retired setting `env` still carries. An empty value is unset.
 pub fn refuse_retired_settings(env: impl Fn(&str) -> Option<String>) -> Result<(), RetiredSetting> {
@@ -1560,6 +1593,13 @@ mod tests {
                 "api key",
             ),
             ("CONTROLLER_TLS_ADDR", "0.0.0.0:8443", "Route"),
+            (
+                "CONTROLLER_MLFLOW_TRACKING_URI",
+                "https://mlflow.example.com",
+                "/api/export",
+            ),
+            ("CONTROLLER_MLFLOW_EXPERIMENT", "crucible", "/api/export"),
+            ("CONTROLLER_MLFLOW_TOKEN", "mlflow-secret", "/api/export"),
         ] {
             let refusal =
                 crate::config::refuse_retired_settings(env_of(&[(var, value)])).expect_err(var);

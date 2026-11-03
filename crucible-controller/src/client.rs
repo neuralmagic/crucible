@@ -504,6 +504,10 @@ mod tests {
                 "0073_github_token_secret_kind.sql",
                 "6f3e8fef73c64ce84ac99360bfb00dfe52c1c073065204526256c1e5eba2884b",
             ),
+            (
+                "0074_drop_mlflow_exports_and_secret_grants.sql",
+                "fd1398bba4a22a81191df88ad25654570f869629e3e8f1a51f71067a34e30d73",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

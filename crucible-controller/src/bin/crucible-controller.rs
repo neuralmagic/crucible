@@ -1039,16 +1039,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
                 }
             });
         }
-        // The MLflow exporter: a controller-only background task that pushes each folded run's
-        // traces and metrics to a per-deployment MLflow, off unless CONTROLLER_MLFLOW_TRACKING_URI
-        // is set. Post-fold, allow-failure — a failed export marks its bookkeeping row and retries.
-        if let Some(mlflow_cfg) = crucible_controller::runs::mlflow::MlflowConfig::from_env() {
-            tokio::spawn(crucible_controller::runs::mlflow::export_loop(
-                db.clone(),
-                mlflow_cfg,
-                shutdown.clone(),
-            ));
-        }
         // The image catalog watcher: sweeps the configured repositories on an interval and on
         // `POST /api/images/refresh`; off when no repository is configured.
         if !cfg.image_catalog_repos.is_empty() {
