@@ -6,6 +6,7 @@ import type { components } from '../api/schema';
 import {
   Breadcrumb,
   Button,
+  cn,
   CopyText,
   DetailHeader,
   Empty,
@@ -23,6 +24,7 @@ import type { SpecItem } from '../ui';
 import { issueStatusColor } from './issueStatus';
 import { absoluteTime, relativeTime } from './journeyView';
 import {
+  dispatchFailure,
   dispatchTone,
   graphRunId,
   launchLabel,
@@ -189,6 +191,7 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
 /// land.
 function DispatchSection({ detail }: { detail: LaunchDetail }) {
   const { dispatch } = detail;
+  const failure = dispatchFailure(dispatch);
   return (
     <Section>
       <SectionHeader
@@ -199,20 +202,23 @@ function DispatchSection({ detail }: { detail: LaunchDetail }) {
         <div data-testid="dispatch-state">
           <Status status={dispatch.state} tone={dispatchTone(dispatch.state)} />
         </div>
-        {dispatch.failure && (
+        {failure && (
           <div>
             <Mono size="micro" tone="ink-3" uppercase className="tracking-section">
-              why it did not start
+              {failure.label}
             </Mono>
             <p
               data-testid="dispatch-failure"
-              className="mt-1 mb-0 whitespace-pre-wrap font-mono text-data text-red"
+              className={cn(
+                'mt-1 mb-0 whitespace-pre-wrap font-mono text-data',
+                failure.blocking ? 'text-red' : 'text-ink-2',
+              )}
             >
-              {dispatch.failure}
+              {failure.error}
             </p>
-            {dispatch.failed_at && (
-              <Mono size="micro" tone="ink-3" title={absoluteTime(dispatch.failed_at) ?? undefined}>
-                {relativeTime(dispatch.failed_at) ?? dispatch.failed_at}
+            {failure.at && (
+              <Mono size="micro" tone="ink-3" title={absoluteTime(failure.at) ?? undefined}>
+                {relativeTime(failure.at) ?? failure.at}
               </Mono>
             )}
           </div>
