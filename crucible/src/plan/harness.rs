@@ -980,13 +980,13 @@ fn agent_turn(
     let result_path = cx.paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
     let _ = std::fs::remove_file(&result_path);
-    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_| {});
+    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_, _, _| {});
     let transport_error = match stop {
         TurnStop::TimedOut(deadline) => {
             let _ = std::fs::remove_file(&result_path);
             return (cost, TurnEnd::TimedOut(deadline));
         }
-        TurnStop::Transport(failure) => Some(failure),
+        TurnStop::Transport(failure) | TurnStop::Reported(failure) => Some(failure),
         TurnStop::Clean => None,
     };
     let end = match std::fs::read_to_string(&result_path) {
@@ -1010,20 +1010,23 @@ enum TurnStop {
     Clean,
     TimedOut(Deadline),
     Transport(TransportFailure),
+    /// The agent's own result said the turn failed, and nothing under it did.
+    Reported(TransportFailure),
 }
 
-/// Stream one agent turn to its end under `cx.deadline`, showing every event to `on_event`, and
-/// advance a ledgered session only when the turn's transport held.
+/// Stream one agent turn to its end under `cx.deadline`, showing every output line to `on_line`,
+/// and advance a ledgered session only when the turn neither failed nor reported failing.
 fn stream_turn(
     cx: &TurnCx<'_>,
     prompt: &str,
     session: Option<&crate::agent::agent_session::SessionTurn>,
     banked: f64,
-    on_event: &mut dyn FnMut(&AgentEvent),
+    on_line: &mut dyn FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> (f64, TurnStop) {
     let paths = cx.paths;
     let name = cx.name.to_string();
     let mut transport_error: Option<TransportFailure> = None;
+    let mut reported = false;
     let log = Arc::new(Mutex::new(TurnLog::new(Instant::now())));
     let heartbeat = {
         let name = name.clone();
@@ -1051,11 +1054,10 @@ fn stream_turn(
                 lane.spent_so_far(banked + cost);
             }
             if let Some(failure) = ev.and_then(agent_transport_error) {
+                reported = matches!(ev, Some(AgentEvent::Result { .. }));
                 transport_error = Some(failure);
             }
-            if let Some(ev) = ev {
-                on_event(ev);
-            }
+            on_line(line, stream, ev);
         },
     );
     drop(heartbeat);
@@ -1064,6 +1066,7 @@ fn stream_turn(
         return (cost, TurnStop::TimedOut(*deadline));
     }
     if let Some(failure) = turn.failure() {
+        reported = false;
         transport_error = Some(TransportFailure::new(
             failure.transport_cause(),
             failure.to_string(),
@@ -1074,9 +1077,11 @@ fn stream_turn(
         session.filter(|_| cx.ledgered),
         transport_error.is_none(),
     ) {
+        reported = false;
         transport_error = Some(TransportFailure::new(TransportCause::Workspace, note));
     }
     match transport_error {
+        Some(failure) if reported => (cost, TurnStop::Reported(failure)),
         Some(failure) => (cost, TurnStop::Transport(failure)),
         None => (cost, TurnStop::Clean),
     }
@@ -1087,14 +1092,16 @@ fn stream_turn(
 pub(crate) enum CandidateEvent<'a> {
     /// The turn is about to start, resuming or starting this session if it has one.
     Starting(Option<&'a crate::agent::agent_session::SessionTurn>),
-    Agent(&'a AgentEvent),
+    /// One line of the agent's output, with the event it decoded to, if any.
+    Line(&'a str, RawStream, Option<&'a AgentEvent>),
 }
 
 #[cfg(feature = "autoresearch")]
 impl HarnessRunner {
     /// The scored loop's candidate turn for `task`: `prompt`, or `resume_prompt` when the task's
     /// session resumes, run in the shared workspace under `deadline`. The turn edits the
-    /// workspace and writes no result file, so a turn whose transport held passes.
+    /// workspace and writes no result file, so a turn whose transport held passes, and one whose
+    /// own result says it failed is a measured failure of the candidate.
     pub(crate) fn candidate_turn(
         &self,
         task: &Task,
@@ -1124,13 +1131,18 @@ impl HarnessRunner {
             prompt,
             Some(resume_prompt),
         );
-        let (cost, stop) = stream_turn(&cx, prompt, session.as_ref(), 0.0, &mut |ev| {
-            on_event(CandidateEvent::Agent(ev))
-        });
+        let (cost, stop) = stream_turn(
+            &cx,
+            prompt,
+            session.as_ref(),
+            0.0,
+            &mut |line, stream, ev| on_event(CandidateEvent::Line(line, stream, ev)),
+        );
         let outcome = match stop {
             TurnStop::Clean => AttemptOutcome::Pass(serde_json::json!({ "cost_usd": cost })),
             TurnStop::TimedOut(deadline) => AttemptOutcome::TimedOut(deadline),
             TurnStop::Transport(failure) => AttemptOutcome::Transport(failure),
+            TurnStop::Reported(failure) => AttemptOutcome::fail(failure.note),
         };
         Attempt {
             outcome,

@@ -483,6 +483,8 @@ fn run_loop_body<R: Reporter>(
             world,
             judge,
             run.segment.baseline_score,
+            args.max_time()
+                .map(|cap| cap.saturating_sub(started.elapsed().saturating_sub(run.parked_total))),
         )?;
         let winner = result.winners.first().copied();
         let winner_diff = winner.and_then(|id| result.diffs.get(&id).cloned());
@@ -2933,6 +2935,23 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             .to_string()
         }
 
+        /// The provider error a turn dies on before it reports: a transport death.
+        fn died(message: &str) -> String {
+            serde_json::json!({
+                "v": 1,
+                "kind": "error",
+                "error_type": "provider",
+                "message": message,
+            })
+            .to_string()
+        }
+
+        /// Turn `n` dies in transport, or every turn without a script of its own when `None`.
+        fn dies(&self, n: Option<u32>, message: &str) {
+            let name = n.map_or("default.json".to_string(), |n| format!("turn-{n}.json"));
+            std::fs::write(self.dir.join(name), Self::died(message)).expect("dying turn");
+        }
+
         /// What every turn without a script of its own prints.
         fn every_turn(&self, cost: f64, error: Option<&str>) {
             std::fs::write(self.dir.join("default.json"), Self::result(cost, error))
@@ -3493,18 +3512,18 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
         assert_eq!(r.shutdowns[0].0, "escalated");
     }
 
-    /// A turn whose result reports an error is a transport failure, as it is for a playbook
-    /// agent: the turn is retried in place and never measured, so a turn that fails every time
-    /// stalls the run instead of handing the judge an unchanged workspace.
+    /// A turn whose own result says it failed left nothing worth measuring, but its transport
+    /// held: the candidate is discarded with the CLI's reason and the run moves on to the next
+    /// iteration instead of retrying the turn.
     #[test]
-    fn an_is_error_turn_is_retried_and_never_measured() {
-        let f = fixture(1, 0.0, false);
+    fn an_is_error_turn_is_discarded_and_the_next_iteration_runs() {
+        let f = fixture(2, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
             fail_baseline: false,
         });
-        f.agent.every_turn(0.0, Some("Not logged in"));
+        f.agent.turn(1, 0.0, Some("Not logged in"));
         let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
@@ -3515,17 +3534,28 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             &judge,
             LoopRuntime::default(),
         );
-        let outcome = outcome.expect("a failing turn stalls the run, it is not a run error");
-        assert!(!outcome.solved, "an is_error turn must never be measured");
-        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
-        assert_eq!(r.shutdowns[0].0, "stalled");
+        let outcome = outcome.expect("a failed turn is a discarded iteration, not a run error");
+        assert_eq!(f.agent.calls(), 2, "the failed turn was not retried");
         assert!(
             r.notes
                 .iter()
-                .any(|n| n.contains("transport error (retrying)") && n.contains("Not logged in")),
-            "the retry note carries the CLI's reason: {:?}",
+                .any(|n| n.contains("agent turn failed (discarding iter 1)")
+                    && n.contains("Not logged in")),
+            "the discard note carries the CLI's reason: {:?}",
             r.notes
         );
+        let decided: Vec<(u32, &str)> = r
+            .rows
+            .iter()
+            .filter(|row| row.iter > 0)
+            .map(|row| (row.iter, row.decision.as_str()))
+            .collect();
+        assert_eq!(decided.first().map(|(it, _)| *it), Some(1), "{decided:?}");
+        assert!(
+            decided.iter().any(|(it, d)| *it == 2 && *d == "keep"),
+            "iteration 2 ran and was measured: {decided:?}"
+        );
+        assert!(outcome.solved, "the next iteration's candidate was kept");
     }
 
     /// `--max-time` bounds the turn itself, not only the gap between iterations: a turn that
@@ -3584,7 +3614,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             solved: false,
             fail_baseline: false,
         });
-        f.agent.turn(1, 0.0, Some(DEAD_TURN));
+        f.agent.dies(Some(1), DEAD_TURN);
         let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
@@ -3631,7 +3661,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             fail_baseline: false,
         });
         for n in [1, 2, 4, 5] {
-            f.agent.turn(n, 0.0, Some(DEAD_TURN));
+            f.agent.dies(Some(n), DEAD_TURN);
         }
         let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
@@ -3773,7 +3803,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             solved: false,
             fail_baseline: false,
         });
-        f.agent.every_turn(0.0, Some("request timed out"));
+        f.agent.dies(None, "request timed out");
         let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
@@ -4047,7 +4077,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
         });
         let r = RecordingReporter::default();
         // The first turn dies in transport (never started); the second runs.
-        f.agent.turn(1, 0.0, Some("Connection reset by peer"));
+        f.agent.dies(Some(1), "Connection reset by peer");
         let (_, outcome) = run_loop(
             &f.args,
             &f.paths,

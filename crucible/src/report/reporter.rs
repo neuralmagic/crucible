@@ -78,6 +78,16 @@ pub trait Reporter {
     fn note(&mut self, msg: &str);
     /// A decided row (baseline / keep / discard); `solved` flags a winning fix.
     fn row(&mut self, row: &Row, solved: bool);
+    /// The candidate turn of `iter` is starting on `model`, in `session` when it has one.
+    fn agent_starting(
+        &mut self,
+        _iter: u32,
+        _model: &str,
+        _session: Option<&crate::agent::agent_session::SessionTurn>,
+    ) {
+    }
+    /// One line of the running agent's output.
+    fn agent_line(&mut self, _line: &str, _stream: crate::agent::event::RawStream) {}
     /// Cumulative budget after a turn; lets the front-end draw a gauge / warn.
     fn budget(&mut self, _spent: f64, _elapsed: Duration) {}
     /// Interrupt checkpoint: decide whether to stop.

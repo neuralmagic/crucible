@@ -53,6 +53,30 @@ impl Reporter for ConsoleReporter {
         }
     }
 
+    fn agent_starting(
+        &mut self,
+        iter: u32,
+        model: &str,
+        session: Option<&crate::agent::agent_session::SessionTurn>,
+    ) {
+        println!("  -> running agent (iteration {iter}, {model}) …");
+        if let Some(turn) = session {
+            println!(
+                "  -> agent session {} {} (turn {})",
+                turn.logical_name,
+                turn.action(),
+                turn.completed_turns + 1
+            );
+        }
+    }
+
+    /// The harness already prints the agent's stderr, prefixed with the task name.
+    fn agent_line(&mut self, line: &str, stream: crate::agent::event::RawStream) {
+        if stream == crate::agent::event::RawStream::Stdout {
+            println!("{}", line.trim_end());
+        }
+    }
+
     fn budget(&mut self, spent: f64, elapsed: std::time::Duration) {
         println!(
             "  budget: spent ${spent:.4} · elapsed {}m{:02}s",

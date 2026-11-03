@@ -548,6 +548,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
             workflow_runner.candidate_turn(task, prompt, resume_prompt, deadline, &mut |event| {
                 match event {
                     CandidateEvent::Starting(session) => {
+                        r.agent_starting(*it, args.model(), session);
                         if let Some(turn) = session {
                             r.plan_event(&SessionEvent::AgentSession {
                                 session: turn.logical_name.clone(),
@@ -557,7 +558,11 @@ impl<R: Reporter> LoopTaskRunner<R> {
                         }
                         r.plan_event(&SessionEvent::AgentStart { iter: *it });
                     }
-                    CandidateEvent::Agent(ev) => {
+                    CandidateEvent::Line(line, stream, ev) => {
+                        r.agent_line(line, stream);
+                        let Some(ev) = ev else {
+                            return;
+                        };
                         if let crate::agent::event::AgentEvent::Tokens(t) = ev {
                             let spent = *spent_before + pricing.provisional(t);
                             if let Some(heartbeat) = heartbeat {
@@ -601,6 +606,14 @@ impl<R: Reporter> LoopTaskRunner<R> {
                     failure.note
                 ));
                 return attempt;
+            }
+            AttemptOutcome::Fail { note, .. } => {
+                self.r.note(&format!(
+                    "agent turn failed (discarding iter {}): {note}",
+                    self.it
+                ));
+                self.signal = Some(Signal::Discard("turn failed".to_string()));
+                return Attempt::failed(cost, "turn failed; iteration discarded".to_string());
             }
             _ => return attempt,
         }
@@ -948,6 +961,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
     world: &Arc<dyn World>,
     judge: &Arc<dyn Judge>,
     baseline_score: f64,
+    time_left: Option<std::time::Duration>,
 ) -> Result<WideOutcome> {
     r.note(&format!(
         "wide round: fanning out {} candidates (top-{} advance)",
@@ -988,7 +1002,10 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            wall_clock: time_left,
+            ..ExecCfg::default()
+        },
         &mut runner,
         |task, result| {
             task_events.push(crate::plan::events::task_result_event(
@@ -1321,7 +1338,7 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
         task: &Task,
         _attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        _deadline: Option<Deadline>,
+        deadline: Option<Deadline>,
     ) -> Attempt {
         match &task.task {
             TaskKind::Agent { prompt, .. } => {
@@ -1343,8 +1360,11 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     &self.p.workspace,
                     &self.wide_dir,
                     self.p.skills.clone(),
-                    id,
-                    prompt,
+                    WideCandidate {
+                        id,
+                        prompt,
+                        deadline,
+                    },
                     &pending,
                 )
             }
@@ -1381,15 +1401,18 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
         };
         let (args, workspace, wide_dir, skills) =
             (self.args, &self.p.workspace, &self.wide_dir, &self.p.skills);
-        admission.run_all(batch, |b, _lane| {
+        admission.run_all(batch, |b, lane| {
             match (&b.task.task, candidate_id(&b.task.name)) {
                 (TaskKind::Agent { prompt, .. }, Some(id)) => wide_propose(
                     args,
                     workspace,
                     wide_dir,
                     skills.clone(),
-                    id,
-                    prompt,
+                    WideCandidate {
+                        id,
+                        prompt,
+                        deadline: lane.deadline(),
+                    },
                     &pending,
                 ),
                 _ => Attempt::failed(0.0, "non-agent task in a propose batch".to_string()),
@@ -1402,15 +1425,26 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
 /// staged diff as the task output, clean up. The diff text is the only thing that leaves
 /// the worktree. Wide turns are not streamed and their cost is not booked against the run
 /// budget.
+/// One wide candidate: its id, the prompt that biases it, and when its turn must be over by.
+struct WideCandidate<'a> {
+    id: u32,
+    prompt: &'a str,
+    deadline: Option<Deadline>,
+}
+
 fn wide_propose(
     args: &Args,
     workspace: &Path,
     wide_dir: &Path,
     skills: Option<PathBuf>,
-    id: u32,
-    prompt: &str,
+    candidate: WideCandidate<'_>,
     pending: &str,
 ) -> Attempt {
+    let WideCandidate {
+        id,
+        prompt,
+        deadline,
+    } = candidate;
     if STOP.load(Ordering::SeqCst) {
         return pass(serde_json::json!({ "diff": "" }));
     }
@@ -1420,7 +1454,19 @@ fn wide_propose(
     }
     let cand_paths = Paths::for_worktree(worktree.clone(), skills);
     let _ = std::fs::create_dir_all(&cand_paths.state);
-    let turn = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
+    let turn = agent::run_turn_with_session(
+        args,
+        &cand_paths,
+        prompt,
+        false,
+        None,
+        deadline,
+        |_line, _stream, _ev| {},
+    );
+    if let Some(crate::agent::turn::TurnFailure::DeadlineExceeded(deadline)) = turn.failure() {
+        let _ = std::fs::remove_dir_all(&worktree);
+        return Attempt::timed_out(turn.cost_usd, *deadline);
+    }
     if let Some(failure) = turn.failure() {
         let _ = std::fs::remove_dir_all(&worktree);
         return Attempt::failed(turn.cost_usd, failure.to_string());
@@ -1902,6 +1948,16 @@ mod tests {
         wide: bool,
         workflow: Option<&str>,
     ) -> RunTrace {
+        run_counter_within(iterations, bump, wide, workflow, "")
+    }
+
+    fn run_counter_within(
+        iterations: u32,
+        bump: &str,
+        wide: bool,
+        workflow: Option<&str>,
+        max_time: &str,
+    ) -> RunTrace {
         // A counter, not a timestamp: two tests starting in the same microsecond would get
         // the same name, and the first thing this does is remove_dir_all.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1974,6 +2030,7 @@ mod tests {
         args.agent_backend = manifest::AgentBackend::Command;
         args.agent_cmd = m.agent.agent_cmd.clone();
         args.iterations = iterations;
+        args.max_time = max_time.into();
         args.search = m.search.clone();
         args.workflow = m.workflow.clone();
 
@@ -2003,7 +2060,7 @@ mod tests {
             .unwrap();
         let (_r, outcome) = run_loop(&args, &p, &prep, r, &world, &judge, LoopRuntime::default());
         let outcome = outcome.unwrap();
-        if workflow.is_none() {
+        if workflow.is_none() && max_time.is_empty() {
             assert!(outcome.improved, "the counter bump must be kept");
         }
 
@@ -2170,6 +2227,29 @@ mod tests {
             7 + 4,
             "3 proposes + 3 measures + pick, then the 4 deep-round tasks"
         );
+    }
+
+    /// The wide round's candidate turns run under what is left of the run's wall clock, like
+    /// the deep loop's: a candidate that hangs is killed when it runs out, and the run stops on
+    /// its time cap instead of waiting on the turn.
+    #[test]
+    fn a_hung_wide_candidate_is_killed_when_the_runs_wall_clock_runs_out() {
+        let started = std::time::Instant::now();
+        let t = run_counter_within(
+            1,
+            "#!/bin/sh
+sleep 60
+",
+            true,
+            None,
+            "3s",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(40),
+            "the hung candidates held the run for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(t.shutdown, "budget", "{}", describe(&t));
     }
 
     #[test]
