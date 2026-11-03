@@ -15,7 +15,7 @@ use crucible_contract::outputs::OutputKind;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{ServerCapabilities, ServerConfig};
-use rmcp::{ServerHandler, schemars, tool, tool_router};
+use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::Deserialize;
 use std::sync::Arc;
 use ujira::{JiraClient, render};
@@ -857,16 +857,10 @@ fn json_err(msg: &str) -> String {
     serde_json::json!({ "status": "error", "error": msg }).to_string()
 }
 
-/// Hand-written (not `#[tool_handler]`) so EVERY tool invocation funnels through one instrumented
-/// `call_tool`: the codegen four, fetch_log/fetch_trace, and the generic build/deploy/measure/
-/// profile/JIRA tools all get a span with zero per-tool boilerplate. `call_tool`/`list_tools`/
-/// `get_tool` mirror the macro's expansion exactly, plus the span.
-///
-/// DO NOT "simplify" this back to `#[tool_handler]`. The macro dispatches through the STATIC
-/// `Self::tool_router()`, while these route through the INSTANCE `self.tool_router` that
-/// [`McpServer::new`] has already run [`crate::describe::apply`] over. Swapping them compiles
-/// clean and silently serves the unflavored descriptions, dropping every `BROKER_DESC_*` override
-/// from the agent's tool list.
+/// Routes through the instance router, the one [`McpServer::new`] ran [`crate::describe::apply`]
+/// over, so the agent sees the flavored descriptions. `call_tool` is hand-written so every tool
+/// invocation funnels through one instrumented span; `list_tools` so the list is sorted.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for McpServer {
     /// Advertise the `tools` capability in the initialize handshake. Without this the default
     /// `get_info` reports `capabilities.tools = None`, so a spec-compliant client (Claude Code)
@@ -907,10 +901,6 @@ impl ServerHandler for McpServer {
         let mut tools = self.tool_router.list_all();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(rmcp::model::ListToolsResult::with_all_items(tools))
-    }
-
-    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
-        self.tool_router.get(name).cloned()
     }
 }
 
