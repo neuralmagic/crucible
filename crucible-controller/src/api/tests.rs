@@ -9374,6 +9374,87 @@ async fn a_registered_launch_shorter_than_a_task_timeout_is_refused(pool: PgPool
     Ok(())
 }
 
+/// Overwrite the stored `workflow.star` of `tree` so its files no longer hash to its digest.
+async fn tamper_tree(pool: &PgPool, tree: &str) {
+    sqlx::query(
+        "UPDATE pack_blobs SET content = 'print(\"evil\")' WHERE sha256 = \
+         (SELECT sha256 FROM pack_tree_files WHERE digest = $1 AND path = 'workflow.star')",
+    )
+    .bind(tree)
+    .execute(pool)
+    .await
+    .expect("tamper the tree");
+}
+
+/// A launch of a tree whose stored files were tampered with is refused naming the tree, on the
+/// draft, registered and one-shot paths alike, and adopts nothing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_of_a_tampered_tree_is_refused_naming_the_tree(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), TIMED_WORKFLOW).await;
+    crate::playbooks::pack_migration::convert_pack_trees(db.pool()).await?;
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(TIMED_WORKFLOW);
+    let saved = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    let registered: String =
+        sqlx::query_scalar("SELECT tree_digest FROM playbooks WHERE id = 'survey'")
+            .fetch_one(&pool)
+            .await?;
+    let drafted: String = sqlx::query_scalar(
+        "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = 'studio' \
+         ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    tamper_tree(&pool, &registered).await;
+    tamper_tree(&pool, &drafted).await;
+    let launch = serde_json::json!({
+        "params": {"topic": "attention", "depth": "deep"},
+        "max_cost": 1.0,
+        "max_time": "2h",
+    });
+    let names = |tree: &str| format!("pack tree {tree} no longer matches its stored files");
+
+    let (status, body) = post_launch(&app, "survey", launch.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&names(&registered)), "{body}");
+
+    let mut deferred = launch.clone();
+    deferred["playbook"] = serde_json::json!("survey");
+    deferred["fire_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    let (status, body) = post_admin(&app, "/api/one-shots", deferred).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&names(&registered)), "{body}");
+
+    let (status, body) = post_admin(&app, "/api/playbook-drafts/studio/launch", launch).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&names(&drafted)), "{body}");
+
+    assert_eq!(
+        launch_count(&pool).await,
+        0,
+        "a refused launch adopts nothing"
+    );
+    Ok(())
+}
+
 /// Put a recording `git` and `gh` on PATH for the duration of a body: graduation's push and PR
 /// open are the two shells, and this is what proves which refs it pushed. The `git` stub delegates
 /// everything but `push` to the real binary, so a test running beside this one still gets git.

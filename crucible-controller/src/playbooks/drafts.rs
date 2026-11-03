@@ -65,13 +65,11 @@ pub enum DraftError {
     Internal(anyhow::Error),
 }
 
-/// An [`Unconvertible`](crate::playbooks::pack_trees::Unconvertible) pack is refused as invalid,
+/// An [unreadable](crate::playbooks::pack_trees::is_unreadable) pack is refused as invalid,
 /// naming its reason; anything else is internal.
 impl From<anyhow::Error> for DraftError {
     fn from(e: anyhow::Error) -> Self {
-        if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
-            .is_some()
-        {
+        if crate::playbooks::pack_trees::is_unreadable(&e) {
             DraftError::Invalid(format!("{e:#}"))
         } else {
             DraftError::Internal(e)
