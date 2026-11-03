@@ -1376,9 +1376,10 @@ fn park_for_approval(
 /// so RESULTS.md carries them next to the outcome they happened during. Consumed on read, hence
 /// one call per row-emitting path.
 fn fold_distress_notes(r: &mut dyn Reporter, note: &mut String) {
-    for (severity, reason) in crate::control::distress::drain_notes() {
-        r.note(&format!("distress[{severity}]: {reason}"));
-        note.push_str(&format!("; distress[{severity}]: {reason}"));
+    for pending in crate::control::distress::drain_notes() {
+        let line = format!("distress[{}]: {}", pending.severity, pending.reason);
+        r.note(&line);
+        note.push_str(&format!("; {line}"));
     }
 }
 
@@ -1428,8 +1429,12 @@ fn write_turn_meta(iter: u32, spent_usd: f64) {
     if !dir.is_dir() {
         return;
     }
-    let body = serde_json::json!({ "iter": iter, "spent_usd": spent_usd }).to_string();
-    let _ = std::fs::write(dir.join("turn-meta.json"), body);
+    let Ok(body) =
+        serde_json::to_string(&crucible_contract::distress::TurnMeta { iter, spent_usd })
+    else {
+        return;
+    };
+    let _ = std::fs::write(dir.join(crucible_contract::distress::TURN_META_FILE), body);
 }
 
 /// Fill the contract's prompt slots: `{{GOAL}}`, `{{STATUS}}` (the objective status line, aliased by
@@ -3091,6 +3096,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             watch_feedback: false,
             sandbox_run_id: None,
             gateway_boot: Default::default(),
+            engine: None,
         };
         let paths = Paths {
             workspace,
