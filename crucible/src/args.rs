@@ -275,6 +275,7 @@ impl Args {
 
     /// The engine runtime, which every async call site runs on; an error, never a panic, when
     /// the arm that built this run never built one.
+    #[cfg(feature = "autoresearch")]
     pub(crate) fn engine_handle(&self) -> Result<&tokio::runtime::Handle, EngineUninitialized> {
         self.engine.as_ref().ok_or(EngineUninitialized)
     }
@@ -314,6 +315,7 @@ impl Args {
 }
 
 /// An async call site reached before the arm that owns the run built the engine runtime.
+#[cfg(feature = "autoresearch")]
 #[derive(Debug, thiserror::Error)]
 #[error(
     "the engine runtime is not initialized (EngineCtx::new was not called before an async call \
