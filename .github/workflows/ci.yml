@@ -256,7 +256,7 @@ jobs:
             git diff -- docs/rfc docs/adr
             exit 1
           fi
-          for f in docs/adr/ADR-*.md; do
+          for f in docs/rfc/RFC-*.md docs/adr/ADR-*.md; do
             grep -qF "(./${f#docs/})" docs/SUMMARY.md || { echo "$f is not listed in docs/SUMMARY.md"; exit 1; }
           done
 

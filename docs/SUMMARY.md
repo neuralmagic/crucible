@@ -27,10 +27,13 @@
 - [Deploying the controller](./controller-deploy.md)
 - [Authentication](./controller-auth.md)
 - [Vault and the secrets registry](./controller-vault.md)
+- [Agent and people MCP architecture](./agent-mcp-architecture.md)
 
 # Reference
 
 - [Implementation contract](./crucible-contract.md)
+- [Bounded outputs](./outputs.md)
+- [Conversation content logs](./conversation-content-logs.md)
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
 - [The codex harness](./codex-harness.md)
 - [The opencode and pi harnesses](./opencode-pi-harnesses.md)
@@ -43,6 +46,7 @@
 - [RFC-0002: Playbook workflows](./rfc/RFC-0002.md)
 - [RFC-0003: Teams, ownership, and policy-based authorization](./rfc/RFC-0003.md)
 - [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
+- [RFC-0005: Run supervisor services](./rfc/RFC-0005.md)
 
 # Architecture decisions
 
