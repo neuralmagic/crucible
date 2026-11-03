@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use crucible_contract::decision::{
-    ChoiceOption, Label, PickSource, Question, QuestionId, QuestionKind,
+    ChoiceOption, Label, OptionSource, Question, QuestionId, QuestionKind,
 };
 use crucible_contract::decision_request::{
     Evidence, InputEvidence, OpenRequest, RequestState, RequestStatus, RunEvidence,
@@ -88,7 +88,7 @@ fn multi_request() -> OpenRequest {
         Question {
             instructions: "which nodes?".into(),
             kind: QuestionKind::Pick {
-                source: PickSource {
+                source: OptionSource {
                     task: "plan".into(),
                     field: "nodes".into(),
                 },

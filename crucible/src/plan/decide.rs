@@ -9,6 +9,7 @@ use base64::Engine as _;
 use serde_json::Value;
 
 use crate::plan::ir::{Task, TaskName, ValidPlan};
+use crate::plan::options::Resolved;
 use crucible_contract::decision::{Answer, Decision, Label, Question, QuestionId, QuestionKind};
 use crucible_contract::decision_request::{
     AnswerRecord, DECISION_KEY, Evidence, FileEvidence, GatedTask, InputEvidence, OpenRequest,
@@ -230,15 +231,17 @@ pub enum Settled {
 }
 
 /// The route's settled result for a terminal request state; `None` while it is open. `choices`
-/// are the pick options the request's evidence offered.
+/// are the pick options the request's evidence offered, and `resolved` the options each dynamic
+/// choice was asked over, recorded with its answer.
 pub fn settle(
     questions: &BTreeMap<QuestionId, Question>,
     choices: &BTreeMap<QuestionId, Vec<String>>,
+    resolved: &Resolved,
     state: &RequestState,
 ) -> Option<Settled> {
     match &state.status {
         RequestStatus::Open => None,
-        RequestStatus::Answered { answer } => Some(answered(questions, choices, answer)),
+        RequestStatus::Answered { answer } => Some(answered(questions, choices, resolved, answer)),
         RequestStatus::Expired => {
             let mut decision = BTreeMap::new();
             let mut picks = BTreeMap::new();
@@ -254,6 +257,7 @@ pub fn settle(
                             probabilities: BTreeMap::new(),
                             score: None,
                             asked_as: None,
+                            options: resolved.get(id).cloned().unwrap_or_default(),
                             labels: Vec::new(),
                         },
                     );
@@ -276,6 +280,7 @@ pub fn settle(
 fn answered(
     questions: &BTreeMap<QuestionId, Question>,
     choices: &BTreeMap<QuestionId, Vec<String>>,
+    resolved: &Resolved,
     answer: &AnswerRecord,
 ) -> Settled {
     if let Some(extra) = answer.labels.keys().find(|id| !questions.contains_key(*id)) {
@@ -334,6 +339,7 @@ fn answered(
                 probabilities: labels.iter().map(|l| (l.clone(), 1.0)).collect(),
                 score,
                 asked_as: None,
+                options: resolved.get(id).cloned().unwrap_or_default(),
                 labels: if question.multiple() {
                     labels
                 } else {
@@ -369,7 +375,7 @@ fn failing(note: String) -> Settled {
 #[cfg(test)]
 mod tests {
     use crate::plan::decide::*;
-    use crucible_contract::decision::{ChoiceOption, PickSource};
+    use crucible_contract::decision::{ChoiceOption, OptionSource};
 
     fn choice(labels: &[&str], multiple: bool) -> Question {
         Question {
@@ -392,7 +398,7 @@ mod tests {
         Question {
             instructions: "which nodes?".into(),
             kind: QuestionKind::Pick {
-                source: PickSource {
+                source: OptionSource {
                     task: "plan".into(),
                     field: "nodes".into(),
                 },
@@ -454,7 +460,15 @@ mod tests {
 
     #[test]
     fn an_open_request_settles_nothing() {
-        assert!(settle(&questions(), &none(), &state(RequestStatus::Open)).is_none());
+        assert!(
+            settle(
+                &questions(),
+                &none(),
+                &Resolved::new(),
+                &state(RequestStatus::Open)
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -462,6 +476,7 @@ mod tests {
         let r = settle(
             &questions(),
             &none(),
+            &Resolved::new(),
             &state(answer(&[("go", &["approve"])])),
         )
         .unwrap();
@@ -491,7 +506,13 @@ mod tests {
             &[("go", &["approve"]), ("other", &["approve"])],
         ];
         for labels in cases {
-            let r = settle(&questions(), &none(), &state(answer(labels))).unwrap();
+            let r = settle(
+                &questions(),
+                &none(),
+                &Resolved::new(),
+                &state(answer(labels)),
+            )
+            .unwrap();
             assert!(matches!(r, Settled::Fail(_)), "{labels:?}");
         }
     }
@@ -501,6 +522,7 @@ mod tests {
         let r = settle(
             &mixed(),
             &offered(),
+            &Resolved::new(),
             &state(answer(&[
                 ("go", &["approve"]),
                 ("checks", &["unit", "lint"]),
@@ -527,6 +549,7 @@ mod tests {
         let r = settle(
             &mixed(),
             &offered(),
+            &Resolved::new(),
             &state(answer(&[
                 ("go", &["deny"]),
                 ("checks", &["e2e"]),
@@ -569,10 +592,16 @@ mod tests {
                     }
                 })
                 .collect();
-            let r = settle(&mixed(), &offered(), &state(answer(&labels))).unwrap();
+            let r = settle(
+                &mixed(),
+                &offered(),
+                &Resolved::new(),
+                &state(answer(&labels)),
+            )
+            .unwrap();
             assert!(matches!(r, Settled::Fail(_)), "{question} {values:?}");
         }
-        let r = settle(&mixed(), &none(), &state(answer(&base))).unwrap();
+        let r = settle(&mixed(), &none(), &Resolved::new(), &state(answer(&base))).unwrap();
         assert!(
             matches!(r, Settled::Fail(_)),
             "a pick the request did not offer"
@@ -581,7 +610,13 @@ mod tests {
 
     #[test]
     fn expiry_answers_every_question_uncertain_and_passes() {
-        let r = settle(&mixed(), &offered(), &state(RequestStatus::Expired)).unwrap();
+        let r = settle(
+            &mixed(),
+            &offered(),
+            &Resolved::new(),
+            &state(RequestStatus::Expired),
+        )
+        .unwrap();
         let Settled::Pass(out) = r else {
             panic!("{r:?}");
         };
@@ -597,7 +632,13 @@ mod tests {
 
     #[test]
     fn withdrawal_fails_the_route() {
-        let r = settle(&questions(), &none(), &state(RequestStatus::Withdrawn)).unwrap();
+        let r = settle(
+            &questions(),
+            &none(),
+            &Resolved::new(),
+            &state(RequestStatus::Withdrawn),
+        )
+        .unwrap();
         assert!(matches!(r, Settled::Fail(_)));
     }
 

@@ -181,6 +181,22 @@ fn status_of<'a>(stdout: &'a str, task: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no row for {task} in:\n{stdout}"))
 }
 
+/// The JSON a task's row printed after `out=`.
+fn out_of(stdout: &str, task: &str) -> serde_json::Value {
+    let row = stdout
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(task))
+        .unwrap_or_else(|| panic!("no row for {task} in:\n{stdout}"));
+    let (_, out) = row
+        .split_once("out=")
+        .unwrap_or_else(|| panic!("no out= on {task}'s row: {row}"));
+    serde_json::Deserializer::from_str(out)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| panic!("{task}'s out= is not JSON: {row}"))
+}
+
 fn ran(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -498,5 +514,201 @@ fn an_output_decided_route_branches_on_a_commands_answer_with_no_endpoint() {
     assert_eq!(ran(&dir), ["page", "punt", "wrap"]);
     assert_eq!(status_of(&run.stdout, "fix"), "not_taken");
     assert!(run.stdout.contains("verdict: valid"), "{}", run.stdout);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+const DYNAMIC_PLAN: &str = r#"
+version = 1
+[budget]
+usd = 5.0
+
+[[task]]
+name = "scan"
+kind = "command"
+command = "echo '{\"items\": [\"a\", \"b\", \"c\"], \"packages\": {\"a\": [{\"value\": \"p1\", \"description\": \"golang.org/x/net 0.17.0\"}, {\"value\": \"none\", \"description\": \"No shipped package matches\"}], \"b\": [\"p1\", \"none\", \"p1\"], \"c\": [\"none\"]}}'"
+emits = ["items", "packages"]
+
+[[task]]
+name = "match"
+kind = "route"
+needs = "decision"
+required = false
+depends_on = ["scan"]
+over = { task = "scan", field = "items" }
+max_fanout = 4
+decider = { kind = "model", min_confidence = 0.5 }
+[task.questions.package]
+instructions = "Which shipped package does the flaw affect?"
+type = "dynamic_choice"
+options_from = { task = "scan", field = "packages" }
+
+[[task]]
+name = "analyze"
+kind = "command"
+depends_on = ["scan", "match"]
+join = "settled"
+over = { task = "scan", field = "items" }
+max_fanout = 4
+when = { task = "match", question = "package", is = ["uncertain"], any_option = true }
+command = "echo '{}'"
+"#;
+
+/// Each element of a mapped route is asked over its own option list, read from the producer's
+/// object keyed by element; a repeated option collapses, the answer records what was offered, and
+/// an element whose list is too short fails without a request while the others decide.
+#[test]
+fn a_dynamic_choice_asks_each_item_over_its_own_options() {
+    let (url, seen) = serve_at(
+        "/v1/decisions",
+        "200 OK",
+        r#"{"answers":[{"type":"choice","name":"package","probabilities":[{"value":"p1","probability":0.9},{"value":"none","probability":0.1}]}]}"#.to_string(),
+    );
+    let dir = workdir("dynamic", DYNAMIC_PLAN);
+    let document = serde_json::json!({"version": 1, "bindings": [{
+        "role": "decision", "protocol": "decisions", "url": url, "model": "gpt-6-luna",
+    }]})
+    .to_string();
+    let run = run_with(&dir, Some(&document), None);
+    assert!(run.ok, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(status_of(&run.stdout, "match"), "fail");
+    assert!(
+        run.stdout.contains("(1 of 3 instances failed: c)"),
+        "only the element whose list is too short fails: {}",
+        run.stdout
+    );
+    let decided = out_of(&run.stdout, "match");
+    let a = &decided["outputs"]["a"]["package"];
+    assert_eq!(
+        (&a["label"], &a["confidence"]),
+        (&serde_json::json!("p1"), &serde_json::json!(0.9))
+    );
+    assert_eq!(
+        a["options"],
+        serde_json::json!([
+            {"label": "p1", "description": "golang.org/x/net 0.17.0"},
+            {"label": "none", "description": "No shipped package matches"},
+        ]),
+        "the answer records the options it chose among: {}",
+        run.stdout
+    );
+    assert_eq!(
+        decided["outputs"]["b"]["package"]["options"],
+        serde_json::json!([{"label": "p1"}, {"label": "none"}]),
+        "a repeated option collapses to its first entry: {}",
+        run.stdout
+    );
+    assert_eq!(status_of(&run.stdout, "analyze"), "pass");
+    assert_eq!(
+        out_of(&run.stdout, "analyze"),
+        serde_json::json!({"failed": 0, "instances": 3, "not_taken": 1, "outputs": {"a": {}, "b": {}}, "passed": 2}),
+        "any option runs the analysis, the failed element's is not taken: {}",
+        run.stdout
+    );
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2, "no request for the element that failed");
+    let mut asked: Vec<(String, serde_json::Value)> = requests
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_str(request.rsplit('\n').next().unwrap()).unwrap();
+            let input: serde_json::Value =
+                serde_json::from_str(body["input"].as_str().unwrap()).unwrap();
+            let item = input["item"].as_str().unwrap().to_owned();
+            (item, body["questions"].clone())
+        })
+        .collect();
+    asked.sort_by(|x, y| x.0.cmp(&y.0));
+    assert_eq!(
+        asked,
+        [
+            (
+                "a".to_owned(),
+                serde_json::json!([{
+                    "type": "choice", "name": "package",
+                    "instructions": "Which shipped package does the flaw affect?",
+                    "choices": [
+                        {"value": "p1", "description": "golang.org/x/net 0.17.0"},
+                        {"value": "none", "description": "No shipped package matches"},
+                    ],
+                }])
+            ),
+            (
+                "b".to_owned(),
+                serde_json::json!([{
+                    "type": "choice", "name": "package",
+                    "instructions": "Which shipped package does the flaw affect?",
+                    "choices": [{"value": "p1"}, {"value": "none"}],
+                }])
+            ),
+        ]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An unmapped route reads its options as the dependency's list, and System One is sent them as
+/// the choice's criteria.
+#[test]
+fn a_dynamic_choice_on_an_unmapped_route_asks_system_one_over_the_list() {
+    let plan = r#"
+version = 1
+[budget]
+usd = 5.0
+
+[[task]]
+name = "scan"
+kind = "command"
+command = "echo '{\"packages\": [{\"value\": \"openssl\", \"description\": \"openssl-libs 3.0.7\"}, \"none\"]}'"
+emits = { packages = "list" }
+
+[[task]]
+name = "match"
+kind = "route"
+needs = "decision"
+depends_on = ["scan"]
+decider = { kind = "model", min_confidence = 0.8 }
+[task.questions.package]
+instructions = "Which shipped package does the flaw affect?"
+type = "dynamic_choice"
+options_from = { task = "scan", field = "packages" }
+
+[[task]]
+name = "review"
+kind = "command"
+depends_on = ["match"]
+when = { task = "match", question = "package", is = ["uncertain"] }
+command = "touch review.ran && echo '{}'"
+
+[[task]]
+name = "analyze"
+kind = "command"
+depends_on = ["match"]
+when = { task = "match", question = "package", is = [], any_option = true }
+command = "touch analyze.ran && echo '{}'"
+"#;
+    let (url, seen) = serve(
+        "200 OK",
+        r#"{"model":"dgemma","answers":{"package":{"type":"choice","probabilities":{"openssl":0.6,"none":0.4}}}}"#.to_string(),
+    );
+    let dir = workdir("dynamic-unmapped", plan);
+    let run = run(&dir, Some(&url), None);
+    assert!(run.ok, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(ran(&dir), ["review"], "0.6 is below min_confidence");
+    assert_eq!(status_of(&run.stdout, "analyze"), "not_taken");
+    assert!(
+        run.stdout.contains(r#""label":"uncertain""#),
+        "{}",
+        run.stdout
+    );
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value =
+        serde_json::from_str(requests[0].rsplit('\n').next().unwrap()).unwrap();
+    assert_eq!(body["questions"]["package"]["type"], "choice");
+    assert_eq!(
+        body["questions"]["package"]["criteria"],
+        serde_json::json!({"openssl": "openssl-libs 3.0.7", "none": null})
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
