@@ -60,13 +60,16 @@ pub(crate) fn files_root(scratch_root: &Path, run_id: &str) -> PathBuf {
 }
 
 /// Resolve one task's captured-files directory, or `None` when it does not exist or resolves
-/// outside the run's own files root.
+/// outside the run's own files root. `task` is the name the session log carries; an instance's
+/// directory escapes its key the way the engine does.
 fn task_files_dir(scratch_root: &Path, run_id: &str, task: &str) -> Option<PathBuf> {
-    if !safe_segment(run_id) || !safe_segment(task) {
+    let task = crucible::plan::ir::TaskName(task.to_owned());
+    let dir_name = task.dir_name();
+    if !safe_segment(run_id) || !safe_segment(&dir_name) {
         return None;
     }
     let root = files_root(scratch_root, run_id).canonicalize().ok()?;
-    let dir = root.join(task).canonicalize().ok()?;
+    let dir = root.join(dir_name.as_ref()).canonicalize().ok()?;
     dir.starts_with(&root).then_some(dir)
 }
 
@@ -361,6 +364,27 @@ mod tests {
             captured_files(scratch, "run-1", "../../../../etc")
                 .await
                 .is_empty()
+        );
+    }
+
+    /// An instance named after a key holding a separator captured into the engine's escaped
+    /// directory, and its evidence is read from there by the name the session log carries.
+    #[tokio::test]
+    async fn an_instance_whose_key_holds_a_separator_reads_its_escaped_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scratch = root.path();
+        let task_dir = files_root(scratch, "run-1").join("audit[llm-d%2Fllm-d-router]");
+        std::fs::create_dir_all(&task_dir).expect("mkdir");
+        std::fs::write(task_dir.join("out.txt"), "router\n").expect("write");
+
+        let files = captured_files(scratch, "run-1", "audit[llm-d/llm-d-router]").await;
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].content.as_deref(), Some("router\n"));
+        assert!(
+            captured_files(scratch, "run-1", "audit[llm-d%2Fllm-d-router]")
+                .await
+                .is_empty(),
+            "the escaped text is not itself the raw key"
         );
     }
 

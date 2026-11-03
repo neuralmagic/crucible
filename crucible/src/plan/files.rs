@@ -1,6 +1,7 @@
-//! The declared files a run's tasks captured, under `state/files/<task>/<declared>`. A task's
-//! set is published whole or not at all: a directory exists only for a task that delivered
-//! every file it declared, so a partial capture never reaches a descendant.
+//! The declared files a run's tasks captured, under `state/files/<task>/<declared>`, where
+//! `<task>` is [`TaskName::dir_name`]. A task's set is published whole or not at all: a
+//! directory exists only for a task that delivered every file it declared, so a partial capture
+//! never reaches a descendant.
 
 use std::path::{Path, PathBuf};
 
@@ -23,7 +24,7 @@ impl CapturedFiles {
     }
 
     pub fn dir(&self, task: &TaskName) -> PathBuf {
-        self.root.join(task.as_str())
+        self.root.join(task.dir_name().as_ref())
     }
 
     pub fn path(&self, task: &TaskName, declared: &str) -> PathBuf {
@@ -117,5 +118,31 @@ mod tests {
         assert!(!files.has(&audit.name), "the node's own set is dropped");
         assert!(!files.has(&alpha), "an instance's set goes with its node");
         assert!(files.has(&other), "another task's set stays");
+    }
+
+    /// A key that holds a separator or climbs still names one directory directly under the
+    /// root, and dropping the node drops it.
+    #[test]
+    fn an_instance_whose_key_holds_a_separator_publishes_under_one_escaped_directory() {
+        let state = tempfile::tempdir().unwrap();
+        let files = CapturedFiles::new(state.path());
+        let audit = mapped("audit");
+        for (key, dir) in [
+            ("llm-d/llm-d-router", "audit[llm-d%2Fllm-d-router]"),
+            ("../../escape", "audit[%2E.%2F..%2Fescape]"),
+        ] {
+            let instance = TaskName::instance(&audit.name, &ItemKey::new(key).unwrap());
+            assert_eq!(files.dir(&instance), files.root().join(dir));
+            assert_eq!(files.dir(&instance).parent(), Some(files.root()));
+            std::fs::create_dir_all(files.dir(&instance)).unwrap();
+            std::fs::write(files.path(&instance, "out.txt"), key).unwrap();
+            assert_eq!(
+                files.read(&instance, "out.txt"),
+                Some(key.as_bytes().to_vec())
+            );
+        }
+        assert!(!state.path().join("escape]").exists());
+        files.drop(&audit);
+        assert_eq!(std::fs::read_dir(files.root()).unwrap().count(), 0);
     }
 }

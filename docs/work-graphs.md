@@ -544,7 +544,9 @@ In a playbook, the epilogue runs after the main graph completes or fails. It rea
 reserved `outcome` input: `{"exit", "tasks": {name: {"status", "note", "output", "files"}}}`.
 Each entry is the same as the value that a `join = "settled"` consumer gets, with
 `per_instance`. The engine stages the declared files of each main-graph task under
-`inputs/<name>/` (for a mapped node, under `inputs/<node>[<key>]/`). It stages files from
+`inputs/<name>/` (for a mapped node, under `inputs/<node>[<key>]/`, where `%`, `/`, `\`, NUL,
+and a leading `.` in the key are written `%25`, `%2F`, `%5C`, `%00`, and `%2E`, so
+`llm-d/router` stages under `inputs/<node>[llm-d%2Frouter]/`). It stages files from
 failed tasks and from passing tasks. `files` tells if the files of that task are present. A
 skipped, blocked, or transport-failed task stages no files.
 

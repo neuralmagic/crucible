@@ -489,7 +489,10 @@ fn capture_declared(
     if task.emits_files.is_empty() {
         return attempt;
     }
-    let staging = paths.state.join("files.tmp").join(&task.name.0);
+    let staging = paths
+        .state
+        .join("files.tmp")
+        .join(task.name.dir_name().as_ref());
     let _ = std::fs::remove_dir_all(&staging);
     let mut charged = 0u64;
     let taken = (|| -> Result<(), String> {
@@ -653,7 +656,9 @@ fn materialize_inputs(
         if !from.exists() {
             continue;
         }
-        let to = inputs.join(file.producer.as_str()).join(&file.declared);
+        let to = inputs
+            .join(file.producer.dir_name().as_ref())
+            .join(&file.declared);
         if let Some(parent) = to.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {

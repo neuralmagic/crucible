@@ -12,6 +12,7 @@ use crucible_contract::session::SessionEvent;
 use crucible_vcs::git_memory::TaskCommit;
 
 use crate::plan::exec::Prior;
+use crate::plan::files::CapturedFiles;
 use crate::plan::ir::{Stage, TaskName, ValidPlan};
 use crate::plan::resume::{ResumeError, RunStart, settled_row};
 use crucible_contract::session::TaskStatus;
@@ -183,7 +184,7 @@ impl ParentDir {
 
     /// The parent's captured set for `task`, when it captured one.
     fn captured(&self, task: &TaskName) -> PathBuf {
-        self.dir.join("files").join(&task.0)
+        CapturedFiles::new(&self.dir).dir(task)
     }
 }
 
@@ -229,7 +230,7 @@ impl Rerun {
             if !from.is_dir() {
                 continue;
             }
-            let to = state.join("files").join(&name.0);
+            let to = CapturedFiles::new(state).dir(name);
             let _ = std::fs::remove_dir_all(&to);
             copy_tree(&from, &to)?;
         }

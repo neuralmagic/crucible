@@ -257,3 +257,137 @@ workflow(type = "playbook", tasks = [broken])
     assert_eq!(ran(&dir), ["broken"]);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Keys a producer returned, repo slugs and relative paths among them. `audit` kills the engine
+/// the first time it reaches `..`, after the first instance has settled.
+const FANOUT: &str = r#"
+discover = command(
+    name = "discover",
+    run = "python3 -c 'import json; print(json.dumps({\"repos\": [\"llm-d/llm-d-router\", \"..\", \"../../escape\", \".hidden\", \"a/b\", \"a%2Fb\"]}))'",
+    emits = ["repos"],
+)
+audit = command(
+    name = "audit",
+    run = "item=$(python3 -c 'import json, os; print(json.load(open(os.environ[\"CRUCIBLE_INPUTS_FILE\"]))[\"item\"])') && echo \"audit $item\" >> ../ran.log && printf '%s' \"$item\" > out.txt && if [ \"$item\" = .. ] && [ ! -e ../crashed ]; then touch ../crashed; kill -9 $PPID; sleep 5; fi; printf '{}\\n'",
+    depends_on = [discover],
+    over = discover.repos,
+    max_fanout = 8,
+    emits_files = ["out.txt"],
+)
+consume = command(
+    name = "consume",
+    run = "for d in inputs/audit*; do printf '%s=%s\\n' \"$d\" \"$(cat \"$d/out.txt\")\" >> ../consumed.txt; done && printf '{}\\n'",
+    depends_on = [audit],
+)
+workflow(type = "playbook", tasks = [discover, audit, consume])
+"#;
+
+/// Each fan-out key and the directory its instance's files live in.
+const ESCAPED: [(&str, &str); 6] = [
+    ("llm-d/llm-d-router", "audit[llm-d%2Fllm-d-router]"),
+    ("..", "audit[%2E.]"),
+    ("../../escape", "audit[%2E.%2F..%2Fescape]"),
+    (".hidden", "audit[%2Ehidden]"),
+    ("a/b", "audit[a%2Fb]"),
+    ("a%2Fb", "audit[a%252Fb]"),
+];
+
+/// A fan-out key is runtime data, so a key holding a separator or climbing out runs instead of
+/// failing the node. Each instance's files land in one escaped directory under `state/files`, a
+/// consumer reads every set from there, and a resume after a crash in the middle of the fan-out
+/// matches the instances that settled by their raw key and does not run them again.
+#[test]
+fn a_fan_out_over_path_like_keys_runs_stages_escaped_and_resumes_by_raw_key() {
+    let dir = pack("fanout-keys");
+    std::fs::write(dir.join("workflow.star"), FANOUT).unwrap();
+
+    let killed = run(&dir, false);
+    assert!(!killed.status.success(), "{}", describe(&killed));
+    assert_eq!(ran(&dir), ["audit llm-d/llm-d-router", "audit .."]);
+    let before = events(&dir);
+    let settled: Vec<&str> = of_kind(&before, "task_result")
+        .iter()
+        .filter_map(|e| e["task"].as_str())
+        .collect();
+    assert_eq!(settled, ["discover", "audit[llm-d/llm-d-router]"]);
+
+    let resumed = run(&dir, true);
+    assert!(resumed.status.success(), "{}", describe(&resumed));
+    assert_eq!(
+        ran(&dir),
+        [
+            "audit llm-d/llm-d-router",
+            "audit ..",
+            "audit ..",
+            "audit ../../escape",
+            "audit .hidden",
+            "audit a/b",
+            "audit a%2Fb",
+        ],
+        "the instance that settled before the crash is matched by its raw key and not run again"
+    );
+
+    let files = dir.join("state/files");
+    let mut published: Vec<String> = std::fs::read_dir(&files)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    published.sort();
+    let mut expected: Vec<String> = ESCAPED.iter().map(|(_, d)| (*d).to_owned()).collect();
+    expected.sort();
+    assert_eq!(
+        published, expected,
+        "one directory per instance, directly under state/files"
+    );
+    for (key, escaped) in ESCAPED {
+        assert_eq!(
+            std::fs::read_to_string(files.join(escaped).join("out.txt")).unwrap(),
+            key,
+            "{escaped}"
+        );
+    }
+    for climbed in [
+        "state/files/escape]",
+        "state/escape]",
+        "workspace/inputs/escape]",
+    ] {
+        assert!(!dir.join(climbed).exists(), "{climbed}: a key climbed out");
+    }
+
+    let mut consumed: Vec<String> = std::fs::read_to_string(dir.join("consumed.txt"))
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    consumed.sort();
+    let mut staged: Vec<String> = ESCAPED
+        .iter()
+        .map(|(key, escaped)| format!("inputs/{escaped}={key}"))
+        .collect();
+    staged.sort();
+    assert_eq!(
+        consumed, staged,
+        "the consumer read every set where it was staged"
+    );
+
+    let after = events(&dir);
+    let mut instances: Vec<&str> = of_kind(&after, "task_result")
+        .iter()
+        .filter_map(|e| e["task"].as_str())
+        .filter(|task| task.starts_with("audit["))
+        .collect();
+    instances.sort();
+    let mut raw: Vec<String> = ESCAPED
+        .iter()
+        .map(|(key, _)| format!("audit[{key}]"))
+        .collect();
+    raw.sort();
+    assert_eq!(
+        instances, raw,
+        "each instance settles once, under its raw key"
+    );
+    let recovery = of_kind(&after, "recovery");
+    assert_eq!(recovery.len(), 1);
+    assert_eq!(of_kind(&after, "shutdown")[0]["outcome"], "finished");
+    let _ = std::fs::remove_dir_all(&dir);
+}
