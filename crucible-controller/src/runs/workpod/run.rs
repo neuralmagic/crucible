@@ -673,7 +673,7 @@ pub(crate) async fn dispatch_run(
         .await
     {
         let rejection = failure.into_rejection()?;
-        crate::runs::contract::refuse(db, issue_key, &rejection).await?;
+        crate::issues::transitions::refuse(db, issue_key, &rejection).await?;
         return Ok(RunAdmission::ContractRejected);
     }
 
@@ -1277,7 +1277,7 @@ pub(crate) async fn dispatch_grounded_rank(
         .collect();
     if let Err(failure) = cfg.runtime.admit_contract(kind.into(), &targets).await {
         let rejection = failure.into_rejection()?;
-        crate::runs::contract::refuse(db, issue_key, &rejection).await?;
+        crate::issues::transitions::refuse(db, issue_key, &rejection).await?;
         return Ok(DispatchOutcome::Failed);
     }
 

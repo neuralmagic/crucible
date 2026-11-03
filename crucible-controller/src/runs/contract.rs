@@ -21,9 +21,7 @@
 //! The deploy profile is read once at process start, so a loop-image pin change is a restart and
 //! the startup check is the "pin changed" check.
 
-use crate::client::Db;
-use crate::model::{ParkReason, ParkedBy};
-use crate::runs::workpod::WorkKind;
+use crate::model::ParkReason;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -201,16 +199,6 @@ impl RequestKind {
             Self::LocalGroundedRank => "local-grounded-rank",
             Self::LocalScope => "local-scope",
             Self::Fetch => "fetch",
-        }
-    }
-}
-
-impl From<WorkKind> for RequestKind {
-    fn from(kind: WorkKind) -> Self {
-        match kind {
-            WorkKind::AgentTurn(crate::runs::workpod::TurnKind::GroundedRank) => Self::GroundedRank,
-            WorkKind::AgentTurn(crate::runs::workpod::TurnKind::Scope) => Self::Scope,
-            WorkKind::Run => Self::Run,
         }
     }
 }
@@ -412,11 +400,11 @@ impl ContractRegistry {
 /// engine binary local launches spawn. Sandbox images are agent containers, not engines, and are
 /// deliberately absent.
 pub fn configured_targets(
-    cfg: &crate::config::ControllerCfg,
+    deploy_profile: Option<&Path>,
     engine_bin: PathBuf,
 ) -> Vec<DispatchTarget> {
     let mut targets = Vec::new();
-    if let Some(profile) = &cfg.deploy_profile {
+    if let Some(profile) = deploy_profile {
         match loop_image(profile) {
             Ok(image) => targets.push(DispatchTarget::Image(image)),
             Err(e) => tracing::warn!(
@@ -444,72 +432,6 @@ pub fn loop_image(path: &Path) -> anyhow::Result<String> {
 /// render failure.
 pub fn profile_target(path: &Path) -> Option<DispatchTarget> {
     loop_image(path).ok().map(DispatchTarget::Image)
-}
-
-/// Record a refusal on `issue_key`'s ledger and park the issue. The event carries the rejection
-/// as its reason and the structured evidence; the park keeps the item off every automatic retry
-/// until a human unparks it or a restart finds the target matching again.
-pub async fn refuse(db: &Db, issue_key: &str, rejection: &ContractRejection) -> anyhow::Result<()> {
-    let issue = crate::issues::store::get_issue(db.pool(), issue_key).await?;
-    let status = issue
-        .as_ref()
-        .map(|i| i.status.as_str())
-        .unwrap_or(crate::model::Status::New.as_str());
-    db.events()
-        .append(&crate::event_log::Event::now(
-            issue_key,
-            status,
-            status,
-            Some(&rejection.to_string()),
-            Some(&rejection.evidence()),
-        ))
-        .await?;
-    if let Some(issue) = issue
-        && issue.status != crate::model::Status::Parked
-    {
-        crate::issues::transitions::park(
-            db.pool(),
-            db.events(),
-            issue_key,
-            issue.status,
-            &rejection.park_reason(),
-            ParkedBy::Machine,
-        )
-        .await?;
-    }
-    if let Some(m) = db.metrics() {
-        m.record_turn(rejection.request.as_str(), "contract-rejected");
-    }
-    Ok(())
-}
-
-/// Unpark every issue a contract rejection parked whose target now matches: the pin changed and
-/// this restart's check found the new image compatible.
-pub async fn release_parked(db: &Db, registry: &ContractRegistry) -> anyhow::Result<usize> {
-    let snapshot = registry.snapshot();
-    let mut released = 0;
-    for (key, reason) in crate::runs::store::contract_parked(db.pool()).await? {
-        let ParkReason::ContractRejected { image, .. } = ParkReason::parse(&reason) else {
-            continue;
-        };
-        let matches = snapshot
-            .images
-            .iter()
-            .any(|r| r.reference == image && r.matches);
-        if matches
-            && crate::issues::transitions::unpark(
-                db.pool(),
-                db.events(),
-                &key,
-                Some("dispatch image contract now matches the controller"),
-                None,
-            )
-            .await?
-        {
-            released += 1;
-        }
-    }
-    Ok(released)
 }
 
 /// The production reader: an image's version is the [`CONTRACT_VERSION_LABEL`] on its OCI config,
@@ -649,6 +571,7 @@ pub(crate) fn permissive() -> Arc<ContractRegistry> {
 
 #[cfg(test)]
 mod tests {
+    use crate::client::Db;
     use crate::runs::contract::*;
 
     fn image(r: &str) -> DispatchTarget {
@@ -973,7 +896,10 @@ mod tests {
                 image("quay.io/x/loop:still-old"),
             ])
             .await;
-        assert_eq!(release_parked(&db, &registry).await?, 1);
+        assert_eq!(
+            crate::issues::transitions::release_parked(&db, &registry).await?,
+            1
+        );
         for (key, expected) in [
             ("owner/repo#1", Status::New),
             ("owner/repo#2", Status::Parked),
@@ -985,7 +911,10 @@ mod tests {
             assert_eq!(issue.status, expected, "{key}");
         }
         // Idempotent: a second pass finds nothing left to release.
-        assert_eq!(release_parked(&db, &registry).await?, 0);
+        assert_eq!(
+            crate::issues::transitions::release_parked(&db, &registry).await?,
+            0
+        );
         Ok(())
     }
 
@@ -1002,7 +931,10 @@ mod tests {
             "--scope-sandbox-image",
             "quay.io/x/sandbox:s",
         ]);
-        let targets = configured_targets(&cfg, crate::runs::engine::resolve_bin());
+        let targets = configured_targets(
+            cfg.deploy_profile.as_deref(),
+            crate::runs::engine::resolve_bin(),
+        );
         let loop_image = loop_image(&profile).expect("profile loads");
         assert!(targets.contains(&DispatchTarget::Image(loop_image)));
         assert!(

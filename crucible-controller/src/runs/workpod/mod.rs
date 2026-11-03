@@ -31,10 +31,10 @@
 
 pub(crate) mod agent_servers;
 mod core;
-mod dispatcher;
+pub(crate) mod dispatcher;
 mod drain;
 pub mod gateway;
-mod kube_dispatcher;
+pub(crate) mod kube_dispatcher;
 mod markers;
 pub(crate) mod retry;
 mod run;
@@ -80,9 +80,9 @@ pub(crate) use scrape::*;
 pub(crate) use sweep::*;
 
 pub use core::{WorkKind, WorkPodState};
-pub use dispatcher::PodDispatcher;
+pub use dispatcher::{PodDispatcher, TerminalState, TurnPhase};
 pub(crate) use gateway::GatewaySweep;
-pub use kube_dispatcher::{KubePodDispatcher, reconcile_on_startup};
+pub use kube_dispatcher::KubePodDispatcher;
 pub(crate) use run::dispatch_run;
 pub use run::{
     LaunchSecrets, RunAdmission, RunDisposition, RunDocs, RunRenderOpts, collect_run_pod,
@@ -90,4 +90,4 @@ pub use run::{
 };
 #[cfg(feature = "autoresearch")]
 pub use run::{ScopeOutcome, dispatch_scope};
-pub use scrape::{TerminalState, TurnPhase};
+pub use sweep::reconcile_on_startup;

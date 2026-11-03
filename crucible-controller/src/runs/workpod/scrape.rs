@@ -5,7 +5,6 @@ use crate::runs::workpod::*;
 use anyhow::{Context, Result};
 #[cfg(feature = "autoresearch")]
 use crucible_contract::verdict::Ruled;
-use k8s_openapi::api::core::v1::PodStatus;
 
 /// Scrape the verdict off a turn pod's logs: the last `CRUCIBLE_VERDICT:` marker line, robust to the
 /// podman/git chatter ahead of it. The marker's payload is the same verdict JSON the local
@@ -218,56 +217,6 @@ fn cap_session_tail(payload: String) -> String {
         cut += i + 1;
     }
     payload[cut..].to_string()
-}
-
-/// A turn pod's terminal phase, as the dispatcher observed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnPhase {
-    Succeeded,
-    Failed,
-    TimedOut,
-}
-
-/// The terminal outcome [`PodDispatcher::await_terminal`] observed: the pod's [`TurnPhase`] plus the
-/// kubelet-captured termination message when present. Turn pods are single-container, so `message` is
-/// that container's `state.terminated.message`; it is `None` on a timeout, on an OOM/eviction that
-/// wrote nothing, or from an old engine image that only emits the marker (the controller then falls
-/// back to the marker scrape).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalState {
-    pub phase: TurnPhase,
-    pub message: Option<String>,
-}
-
-impl TerminalState {
-    /// The kubelet termination envelope, available only for a terminal pod.
-    #[cfg(feature = "autoresearch")]
-    pub(crate) fn termination_message(&self) -> Option<&str> {
-        match self.phase {
-            TurnPhase::TimedOut => None,
-            TurnPhase::Succeeded | TurnPhase::Failed => self.message.as_deref(),
-        }
-    }
-
-    /// The current container-waiting reason, available only while the pod is non-terminal.
-    pub(crate) fn waiting_detail(&self) -> Option<&str> {
-        match self.phase {
-            TurnPhase::TimedOut => self.message.as_deref(),
-            TurnPhase::Succeeded | TurnPhase::Failed => None,
-        }
-    }
-}
-
-/// The kubelet-captured termination message from pod status. Turn pods are single-container, so this
-/// reads the first container status carrying a terminated state; an empty message (an OOM/eviction
-/// that never wrote the file) collapses to `None`.
-pub(crate) fn terminated_message(status: Option<&PodStatus>) -> Option<String> {
-    status?
-        .container_statuses
-        .as_ref()?
-        .iter()
-        .find_map(|cs| cs.state.as_ref()?.terminated.as_ref()?.message.clone())
-        .filter(|m| !m.trim().is_empty())
 }
 
 #[cfg(test)]

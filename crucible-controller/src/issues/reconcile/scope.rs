@@ -298,7 +298,7 @@ pub(super) async fn run_scope_and_transition(
         )
         .await
     {
-        crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?).await?;
+        crate::issues::transitions::refuse(db, &issue.key, &failure.into_rejection()?).await?;
         return Ok(());
     }
     // The turn drafts into scratch; the surviving tree is tarred into `pack_tarballs`, the

@@ -667,7 +667,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     {
         let contracts = contracts.clone();
         let targets = crucible_controller::runs::contract::configured_targets(
-            &cfg,
+            cfg.deploy_profile.as_deref(),
             crucible_controller::runs::engine::resolve_bin(),
         );
         tokio::spawn(async move {
@@ -973,7 +973,9 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             let contracts = contracts.clone();
             let db = db.clone();
             tokio::spawn(async move {
-                match crucible_controller::runs::contract::release_parked(&db, &contracts).await {
+                match crucible_controller::issues::transitions::release_parked(&db, &contracts)
+                    .await
+                {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
                         released = n,

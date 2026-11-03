@@ -38,7 +38,7 @@ async fn plan_builds_or_park(
     issue: &Issue,
     from: Status,
     pack_dir: &std::path::Path,
-) -> Result<Option<Vec<crate::builds::lifecycle::BuildRequest>>> {
+) -> Result<Option<Vec<crate::builds::backend::BuildRequest>>> {
     match crate::builds::lifecycle::plan_builds(pack_dir) {
         Ok(r) => Ok(Some(r)),
         Err(e) if crate::builds::lifecycle::is_permanent_plan_error(&e) => {

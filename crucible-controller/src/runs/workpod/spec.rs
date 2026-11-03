@@ -11,7 +11,8 @@ use crate::config::ControllerCfg;
 use crate::issues::engine;
 use crate::runs::workpod::*;
 use anyhow::{Context, Result};
-use crucible::deploy::DigestResolver;
+use crucible::deploy::{DeployProfile, DigestResolver, render_turn};
+use k8s_openapi::api::core::v1::Pod;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -392,6 +393,20 @@ async fn fail_turn(
     Ok(CasResult::Won)
 }
 
+/// Render one turn pod through the linked engine (`crucible::deploy::render_turn`, the library form
+/// of `deploy render-turn`), returning the parsed, unstamped [`Pod`]. Blocking (profile read, image
+/// pinning), so the caller runs it under `spawn_blocking`.
+pub(crate) fn render_turn_pod(
+    spec: &WorkPodSpec,
+    profile_path: &Path,
+    digests: Option<Arc<dyn DigestResolver>>,
+) -> Result<Pod> {
+    let opts = spec.turn_opts(digests)?;
+    let profile = DeployProfile::load(profile_path)?;
+    let yaml = render_turn(&profile, &opts)?;
+    serde_norway::from_str::<Pod>(&yaml).context("decoding the rendered turn Pod")
+}
+
 /// `spawn_blocking(render + stamp)` then `dispatcher.create`. Under isolated gateways the turn gets
 /// its own gateway pod first, exactly as a run does, with certificates valid for `deadline`; it is
 /// torn down here when the launch fails, and by the gateway sweep once the turn's row closes. The
@@ -647,7 +662,7 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         .collect();
     if let Err(failure) = cfg.runtime.admit_contract(kind.into(), &targets).await {
         let rejection = failure.into_rejection()?;
-        crate::runs::contract::refuse(db, issue_key, &rejection).await?;
+        crate::issues::transitions::refuse(db, issue_key, &rejection).await?;
         return Ok(TurnDispatch::Failed {
             reason: rejection.to_string(),
         });
@@ -665,7 +680,7 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
             cfg.runtime.recorded_engine_version(target).await,
             unsupported.to_string(),
         );
-        crate::runs::contract::refuse(db, issue_key, &rejection).await?;
+        crate::issues::transitions::refuse(db, issue_key, &rejection).await?;
         return Ok(TurnDispatch::Failed {
             reason: rejection.to_string(),
         });

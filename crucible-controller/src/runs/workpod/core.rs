@@ -1,3 +1,4 @@
+use crate::runs::contract::RequestKind;
 use crate::wire_enum::{ParseError, wire_enum};
 #[cfg(feature = "autoresearch")]
 use crucible::deploy::{DigestResolver, TurnOpts};
@@ -63,6 +64,16 @@ impl WorkKind {
                 noun: "work-kind",
                 value: other.to_string(),
             }),
+        }
+    }
+}
+
+impl From<WorkKind> for RequestKind {
+    fn from(kind: WorkKind) -> Self {
+        match kind {
+            WorkKind::AgentTurn(TurnKind::GroundedRank) => Self::GroundedRank,
+            WorkKind::AgentTurn(TurnKind::Scope) => Self::Scope,
+            WorkKind::Run => Self::Run,
         }
     }
 }

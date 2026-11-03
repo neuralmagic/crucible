@@ -1,16 +1,7 @@
-use crate::runs::workpod::*;
-#[cfg(feature = "autoresearch")]
-use anyhow::Context;
 use anyhow::Result;
-#[cfg(feature = "autoresearch")]
-use crucible::deploy::{DeployProfile, DigestResolver, render_turn};
 use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
 use k8s_openapi::api::networking::v1::NetworkPolicy;
 use std::collections::BTreeSet;
-#[cfg(feature = "autoresearch")]
-use std::path::Path;
-#[cfg(feature = "autoresearch")]
-use std::sync::Arc;
 use std::time::Duration;
 
 /// A create the dispatcher has no implementation for.
@@ -130,6 +121,44 @@ pub trait PodDispatcher: Send + Sync {
     }
 }
 
+/// A turn pod's terminal phase, as the dispatcher observed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnPhase {
+    Succeeded,
+    Failed,
+    TimedOut,
+}
+
+/// The terminal outcome [`PodDispatcher::await_terminal`] observed: the pod's [`TurnPhase`] plus the
+/// kubelet-captured termination message when present. Turn pods are single-container, so `message` is
+/// that container's `state.terminated.message`; it is `None` on a timeout, on an OOM/eviction that
+/// wrote nothing, or from an old engine image that only emits the marker (the controller then falls
+/// back to the marker scrape).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalState {
+    pub phase: TurnPhase,
+    pub message: Option<String>,
+}
+
+impl TerminalState {
+    /// The kubelet termination envelope, available only for a terminal pod.
+    #[cfg(feature = "autoresearch")]
+    pub(crate) fn termination_message(&self) -> Option<&str> {
+        match self.phase {
+            TurnPhase::TimedOut => None,
+            TurnPhase::Succeeded | TurnPhase::Failed => self.message.as_deref(),
+        }
+    }
+
+    /// The current container-waiting reason, available only while the pod is non-terminal.
+    pub(crate) fn waiting_detail(&self) -> Option<&str> {
+        match self.phase {
+            TurnPhase::TimedOut => self.message.as_deref(),
+            TurnPhase::Succeeded | TurnPhase::Failed => None,
+        }
+    }
+}
+
 /// Whether an orphaned turn pod can be adopted NOW without blocking the single queue worker: already
 /// terminal (collect the result), or gone (adopt anyway — the collection records the lost turn so the
 /// row never wedges at `running`). A still-running pod says no: dispatch defers it (a `Launched`
@@ -158,19 +187,4 @@ pub(crate) async fn turn_pod_adoptable(
                 | Some(crate::runs::workpod::retry::KubeFailure::AuthRejected(_))
         ),
     }
-}
-
-/// Render one turn pod through the linked engine (`crucible::deploy::render_turn`, the library form
-/// of `deploy render-turn`), returning the parsed, unstamped [`Pod`]. Blocking (profile read, image
-/// pinning), so the caller runs it under `spawn_blocking`.
-#[cfg(feature = "autoresearch")]
-pub(crate) fn render_turn_pod(
-    spec: &WorkPodSpec,
-    profile_path: &Path,
-    digests: Option<Arc<dyn DigestResolver>>,
-) -> Result<Pod> {
-    let opts = spec.turn_opts(digests)?;
-    let profile = DeployProfile::load(profile_path)?;
-    let yaml = render_turn(&profile, &opts)?;
-    serde_norway::from_str::<Pod>(&yaml).context("decoding the rendered turn Pod")
 }

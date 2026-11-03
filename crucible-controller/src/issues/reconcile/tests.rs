@@ -1485,23 +1485,23 @@ struct FakeBuildBackend;
 
 #[cfg(feature = "autoresearch")]
 #[async_trait::async_trait]
-impl crate::builds::lifecycle::BuildBackend for FakeBuildBackend {
+impl crate::builds::backend::BuildBackend for FakeBuildBackend {
     async fn dispatch(
         &self,
         _ns: &str,
-        req: &crate::builds::lifecycle::BuildRequest,
+        req: &crate::builds::backend::BuildRequest,
     ) -> Result<String> {
         Ok(format!("job-{}", req.name))
     }
     async fn poll(
         &self,
         _ns: &str,
-        _req: &crate::builds::lifecycle::BuildRequest,
+        _req: &crate::builds::backend::BuildRequest,
         _id: &str,
-    ) -> Result<crate::builds::lifecycle::BuildProgress> {
-        Ok(crate::builds::lifecycle::BuildProgress::Running)
+    ) -> Result<crate::builds::backend::BuildProgress> {
+        Ok(crate::builds::backend::BuildProgress::Running)
     }
-    async fn resolve_digest(&self, req: &crate::builds::lifecycle::BuildRequest) -> Result<String> {
+    async fn resolve_digest(&self, req: &crate::builds::backend::BuildRequest) -> Result<String> {
         Ok(format!("{}@sha256:beef", req.image))
     }
     async fn adopt(&self, _ns: &str) -> Result<Vec<String>> {

@@ -73,7 +73,7 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
                 )
                 .await
             {
-                crate::runs::contract::refuse(db, key, &failure.into_rejection()?).await?;
+                crate::issues::transitions::refuse(db, key, &failure.into_rejection()?).await?;
                 return Ok(Grounded::Refused);
             }
             match run_grounded_local(cfg, key, repo, bin).await {

@@ -4,7 +4,8 @@
 
 use crate::daemon::queue::WorkQueue;
 use crate::runs::contract::{AdmitFailure, ContractRegistry, DispatchTarget, RequestKind};
-use crate::runs::workpod::{KubePodDispatcher, PodDispatcher};
+use crate::runs::workpod::dispatcher::PodDispatcher;
+use crate::runs::workpod::kube_dispatcher::KubePodDispatcher;
 use std::sync::Arc;
 
 #[derive(Clone)]
@@ -16,7 +17,7 @@ pub struct Runtime {
     pub contracts: Option<Arc<ContractRegistry>>,
     /// What runs a declared `[build]`; the not-installed backend refuses with a typed reason.
     #[cfg(feature = "autoresearch")]
-    pub builds: Arc<dyn crate::builds::lifecycle::BuildBackend>,
+    pub builds: Arc<dyn crate::builds::backend::BuildBackend>,
     /// The reconcile queue a collection re-drives a queued issue through once it frees a slot.
     /// `None` leaves the backlog to the timeout sweep and the next pass.
     pub queue: Option<WorkQueue>,
@@ -32,7 +33,7 @@ impl Default for Runtime {
             ))),
             contracts: None,
             #[cfg(feature = "autoresearch")]
-            builds: Arc::new(crate::builds::lifecycle::StubBuildBackend),
+            builds: Arc::new(crate::builds::backend::StubBuildBackend),
             queue: None,
         }
     }

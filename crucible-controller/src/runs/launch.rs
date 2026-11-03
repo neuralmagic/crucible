@@ -308,7 +308,7 @@ async fn start_local(
         .admit_contract(crate::runs::contract::RequestKind::LocalRun, &[engine])
         .await
     {
-        crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?).await?;
+        crate::issues::transitions::refuse(db, &issue.key, &failure.into_rejection()?).await?;
         return Ok(Started::ContractRejected);
     }
     if let Some(refusal) = resolve_local_secrets(db, issue, secrets).await? {
