@@ -625,12 +625,13 @@ async fn kubernetes_rbac_decides_what_the_launcher_may_create() {
 
 #[test]
 fn the_contract_names_the_scopes_crucible_kueue_checks() {
+    use crucible_contract::oauth::Scope;
     assert_eq!(
-        crucible_contract::kueue::SCOPE_READ,
+        Scope::KueueRead.as_str(),
         crucible_kueue::access::SCOPE_READ
     );
     assert_eq!(
-        crucible_contract::kueue::SCOPE_SUBMIT,
+        Scope::KueueSubmit.as_str(),
         crucible_kueue::access::SCOPE_SUBMIT
     );
 }
