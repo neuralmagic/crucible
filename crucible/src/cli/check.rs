@@ -711,7 +711,7 @@ fn agent_editable_gate_warning(
             return Some(format!(
                 "[judge].measure_cmd references `{tok}`, a file inside the workspace with no \
                  matching frozen [[workspace.inject]] — the agent can edit its own gate (see \
-                 docs/adr/0001-adaptive-harness.md)"
+                 docs/adr/ADR-0001.md)"
             ));
         }
     }

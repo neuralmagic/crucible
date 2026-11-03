@@ -3,9 +3,8 @@
 # tables: docs/loop-states.md (the run loop) and docs/plan-states.md (the plan executor).
 #   scripts/state-docs.sh          write the pages, the dot sources, and (with graphviz) the SVGs
 #   scripts/state-docs.sh --check  fail if a page or a dot source is stale, write nothing
-# The SVGs are rendered locally with graphviz `dot` and committed, the same way
-# docs/build-graph.png is; the check covers the text they are rendered from, so a runner
-# without graphviz still checks.
+# The SVGs are rendered locally with graphviz `dot` and committed; the check covers the text
+# they are rendered from, so a runner without graphviz still checks.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
