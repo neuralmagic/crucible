@@ -1113,7 +1113,7 @@ mod tests {
     /// oldest one after it).
     #[sqlx::test(migrations = false)]
     async fn the_migration_dates_existing_runs_from_their_ids(pool: PgPool) -> anyhow::Result<()> {
-        crate::MIGRATOR.run_to(72, &pool).await?;
+        crate::MIGRATOR.run_to(74, &pool).await?;
         for run_id in [
             "first-undated",
             "20260817T093000Z-goal-generalize-the-fused-gemm",

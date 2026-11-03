@@ -5,9 +5,11 @@ use crate::api::state::*;
 
 use crate::daemon::queue::IssueKey;
 
-use crate::playbooks::api::registry::{
-    PackDispatchDto, PlaybookLaunchAck, UNREADABLE_MANIFEST, check_ceilings, undispatchable,
-};
+use crate::playbooks::api::admission::{Admissible, DraftHead, LaunchRequest, admit};
+
+use crate::playbooks::api::registry::{PackDispatchDto, PlaybookLaunchAck};
+
+use crate::playbooks::blueprints::{Placeholder, PlaceholderReason};
 
 use crate::playbooks::co_draft::CoDraft;
 
@@ -185,12 +187,35 @@ dto! {
     }
 }
 
+/// A declared secret a draft started from a blueprint still has to bind.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PlaceholderDto {
+    pub declared_name: String,
+    pub projection_kind: Option<crate::secrets::ProjectionKind>,
+    pub projection: Option<String>,
+    pub reason: PlaceholderReason,
+}
+
+impl From<Placeholder> for PlaceholderDto {
+    fn from(p: Placeholder) -> Self {
+        let (projection_kind, projection) = p.projection.unzip();
+        PlaceholderDto {
+            declared_name: p.declared_name.to_string(),
+            projection_kind,
+            projection,
+            reason: p.reason,
+        }
+    }
+}
+
 /// A draft with its save history.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlaybookDraftDetail {
     #[serde(flatten)]
     pub draft: PlaybookDraftDto,
     pub versions: Vec<DraftVersionDto>,
+    /// Secrets a blueprint left for this draft to bind.
+    pub placeholders: Vec<PlaceholderDto>,
 }
 
 /// What one compile-on-save produced. Diagnostics are the payload, not an error: a save that did
@@ -497,9 +522,11 @@ pub(crate) async fn get_playbook_draft(
         diagnostics: latest.map_or(0, |v| v.diagnostics.len()),
         draft,
     };
+    let placeholders = crate::playbooks::blueprints::placeholders(state.db.pool(), &id).await?;
     Ok(Json(PlaybookDraftDetail {
         draft: PlaybookDraftDto::new(summary, actions),
         versions: versions.into_iter().map(DraftVersionDto::from).collect(),
+        placeholders: placeholders.into_iter().map(Into::into).collect(),
     })
     .into_response())
 }
@@ -1093,47 +1120,39 @@ pub(crate) async fn launch_playbook_draft(
         Ok(None) => return not_found(format!("no draft {id:?}")),
         Err(e) => return AppError::from(e).into_response(),
     };
-    let (Some(schema), Some(schema_digest)) = (latest.params_schema, latest.schema_digest) else {
+    let version = latest.version;
+    let Some(head) = DraftHead::compiled(draft, latest) else {
         return invalid_fields(vec![crate::playbooks::registry::FieldError {
             field: String::new(),
             message: format!(
-                "version {} of draft {id} did not compile, so there is no form to launch it with",
-                latest.version
+                "version {version} of draft {id} did not compile, so there is no form to launch it with"
             ),
         }]);
     };
-    if let Some(asked) = body.schema_digest.as_deref()
-        && asked != schema_digest
+    let authorized = match admit(
+        &state,
+        head,
+        LaunchRequest {
+            params: &body.params,
+            max_cost: body.max_cost,
+            max_time: &body.max_time,
+            schema_digest: body.schema_digest.as_deref(),
+        },
+    )
+    .await
     {
-        return (
-            StatusCode::CONFLICT,
-            Json(ErrorBody::new(format!(
-                "draft {id} now serves schema {schema_digest}, not {asked}; reload the form"
-            ))),
-        )
-            .into_response();
-    }
-    if let Some(refusal) = match latest.agent.as_ref() {
-        Some(agent) => state.dispatch.refusal(agent),
-        None => Some(UNREADABLE_MANIFEST.to_string()),
-    } {
-        return undispatchable(refusal);
-    }
-    let max_time = match check_ceilings(&state.playbook_caps, body.max_cost, &body.max_time) {
-        Ok(t) => t,
-        Err(field) => return invalid_fields(vec![field]),
+        Ok(a) => a,
+        Err(refusal) => return refusal,
     };
-    let params = match crate::playbooks::registry::validate_params(&schema, &body.params) {
-        Ok(v) => v,
-        Err(fields) => return invalid_fields(fields),
-    };
+    let head = authorized.pack;
+    let max_time = authorized.max_time;
     let saver = match crate::playbooks::api::saver::resolve_saver(
         &state,
         &caller,
         &groups,
         crate::playbooks::api::saver::Ownership::Session,
         crate::playbooks::api::saver::SaverRequest {
-            agent: latest.agent.clone(),
+            agent: head.agent.clone(),
             dispatch_target: body.dispatch_target.as_deref(),
             provider: body.provider.as_deref(),
             model: body.model.as_deref(),
@@ -1146,9 +1165,9 @@ pub(crate) async fn launch_playbook_draft(
     };
     let image = match crate::playbooks::api::registry::authorize_image(
         &state,
-        latest.agent.as_ref(),
+        head.agent.as_ref(),
         saver.provider.as_deref(),
-        draft.graduation_repo.as_deref(),
+        head.target().repo(),
     )
     .await
     {
@@ -1163,22 +1182,19 @@ pub(crate) async fn launch_playbook_draft(
     let actor = saver.actor.as_deref();
     let dispatch_target = saver.dispatch_target.clone();
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
-    let title = format!("draft {id}: {}", draft.description);
+    let title = format!("draft {id}: {}", head.draft.description);
     let launch = crate::launches::model::NewPlaybookLaunch {
         playbook: &id,
-        repo: draft
-            .graduation_repo
-            .as_deref()
-            .unwrap_or(crate::playbooks::registry::DRAFT_LAUNCH_REPO),
+        repo: head.target().launch_repo(),
         title: &title,
-        params: &params,
-        schema_digest: &schema_digest,
+        params: &authorized.params,
+        schema_digest: &head.schema_digest,
         max_cost: body.max_cost,
         max_time: &max_time,
         advance_dedupe: false,
         dedupe_schedule: None,
         origin: crate::model::LaunchOrigin::Draft,
-        draft_version: Some(latest.version),
+        draft_version: Some(head.version),
         created_by: actor,
         launcher_groups: Some(&saver.groups),
         rerun: rerun.as_ref(),
@@ -1186,7 +1202,7 @@ pub(crate) async fn launch_playbook_draft(
     // A draft's content changes on every save, so the disclosure is recomputed from the version
     // being launched and lands in the same transaction that adopts it, before anything executes.
     let exposure =
-        match crate::playbooks::drafts::exposure_of(state.db.pool(), &id, latest.version).await {
+        match crate::playbooks::drafts::exposure_of(state.db.pool(), &id, head.version).await {
             Ok(Some(extraction)) => extraction,
             Ok(None) => return not_found(format!("no draft {id:?}")),
             Err(crate::playbooks::drafts::DraftError::Invalid(message)) => {
@@ -1197,19 +1213,6 @@ pub(crate) async fn launch_playbook_draft(
             }
             Err(e) => return AppError::from(anyhow::Error::new(e)).into_response(),
         };
-    let tree =
-        match crate::playbooks::drafts::version_tree(state.db.pool(), &id, Some(latest.version))
-            .await
-        {
-            Ok(Some((_, tree))) => tree,
-            Ok(None) => return not_found(format!("no draft {id:?}")),
-            Err(e) => return crate::playbooks::api::registry::unreadable_tree(e),
-        };
-    if let Err(refusal) =
-        crate::playbooks::api::registry::check_plan(tree, &params, &max_time, None).await
-    {
-        return refusal;
-    }
     let exposure_dto = match ExposureDto::try_from(&exposure) {
         Ok(dto) => dto,
         Err(e) => return AppError::from(e).into_response(),
@@ -1248,7 +1251,7 @@ pub(crate) async fn launch_playbook_draft(
                 "new",
                 Some(&format!(
                     "draft {id} launched at version {} ({} params, max_cost {}, max_time {max_time})",
-                    latest.version,
+                    head.version,
                     body.params.len(),
                     body.max_cost
                 )),
@@ -1266,7 +1269,7 @@ pub(crate) async fn launch_playbook_draft(
             key,
             playbook: id,
             params: body.params,
-            schema_digest,
+            schema_digest: head.schema_digest,
             max_cost: body.max_cost,
             max_time: max_time.as_str().to_string(),
             advance_dedupe: false,

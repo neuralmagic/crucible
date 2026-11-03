@@ -34,6 +34,7 @@
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
 - [The codex harness](./codex-harness.md)
 - [The opencode and pi harnesses](./opencode-pi-harnesses.md)
+- [Agent tool plugins](./tool-plugins.md)
 - [The OpenShell fork](./openshell-fork.md)
 - [JIRA tools (mediated)](./jira-proxy.md)
 
@@ -43,6 +44,7 @@
 - [RFC-0002: Playbook workflows](./rfc/RFC-0002.md)
 - [RFC-0003: Teams, ownership, and policy-based authorization](./rfc/RFC-0003.md)
 - [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
+- [RFC-0006: Blueprints](./rfc/RFC-0006.md)
 
 # Architecture decisions
 

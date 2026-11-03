@@ -213,12 +213,16 @@ pub struct PlaybookRow {
     pub updated_at: String,
     /// The manifest variant the registration runs; `None` is the base manifest.
     pub variant: Option<VariantName>,
+    /// Offered as a starting point (RFC-0006 C-BLUEPRINT).
+    pub blueprint: bool,
+    /// Readable by every user (RFC-0006 C-PUBLIC); only a blueprint is.
+    pub public: bool,
 }
 
 const PLAYBOOK_COLS: &str = "id, description, repo, git_ref, rev, path, source_draft, \
      source_draft_version, tar_digest, tree_digest, schema_digest, agent_backend, \
      agent_sandbox_image, agent_requirements, core_rev, exposure_digest, owner, created_by, \
-     created_at, updated_at, variant";
+     created_at, updated_at, variant, blueprint, public";
 
 impl PlaybookRow {
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
@@ -242,7 +246,20 @@ impl PlaybookRow {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
             variant: crate::playbooks::packs::variant_from_row(row)?,
+            blueprint: row.try_get("blueprint")?,
+            public: row.try_get("public")?,
         })
+    }
+
+    /// The resource a decision on this playbook is about.
+    pub(crate) fn resource(&self) -> crate::authz::decision::Resource {
+        let mut resource = crate::authz::decision::Resource::new(
+            crate::authz::action::ResourceType::Playbook,
+            &self.id,
+            self.owner.clone(),
+        );
+        resource.public = self.public;
+        resource
     }
 
     /// The revision this row holds, as a launch authorized against it pins it.
@@ -1084,6 +1101,47 @@ pub async fn list(pool: &PgPool) -> Result<Vec<PlaybookRow>> {
     .await
     .context("listing playbooks")?;
     rows.iter().map(PlaybookRow::from_row).collect()
+}
+
+/// Every blueprint, by id.
+pub async fn list_blueprints(pool: &PgPool) -> Result<Vec<PlaybookRow>> {
+    let rows = sqlx::query(const_format::formatcp!(
+        "SELECT {PLAYBOOK_COLS} FROM playbooks WHERE blueprint ORDER BY id"
+    ))
+    .fetch_all(pool)
+    .await
+    .context("listing blueprints")?;
+    rows.iter().map(PlaybookRow::from_row).collect()
+}
+
+/// Mark or unmark `id` as a blueprint; unmarking makes it private. `false` when the id is unknown.
+pub async fn set_blueprint(pool: &PgPool, id: &str, blueprint: bool) -> Result<bool> {
+    let done =
+        sqlx::query("UPDATE playbooks SET blueprint = $2, public = public AND $2 WHERE id = $1")
+            .bind(id)
+            .bind(blueprint)
+            .execute(pool)
+            .await
+            .context("marking a blueprint")?;
+    Ok(done.rows_affected() > 0)
+}
+
+/// Make blueprint `id` public or private, returning what it was. `None` when `id` is not a
+/// blueprint.
+pub async fn set_public(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+    public: bool,
+) -> Result<Option<bool>> {
+    sqlx::query_scalar(
+        "WITH prior AS (SELECT public FROM playbooks WHERE id = $1 AND blueprint FOR UPDATE)
+         UPDATE playbooks SET public = $2 FROM prior WHERE id = $1 RETURNING prior.public",
+    )
+    .bind(id)
+    .bind(public)
+    .fetch_optional(conn)
+    .await
+    .context("publishing a blueprint")
 }
 
 /// One registered playbook's row, or `None` when the id is unknown.
