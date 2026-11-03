@@ -30,7 +30,7 @@ pub fn write_exec(path: &std::path::Path, body: &str) {
 
 /// A `ControllerCfg` for tests that drive the daemon against a temp state dir and a fresh test
 /// ledger, every field set explicitly rather than taken from the clap defaults.
-#[cfg(test)]
+#[cfg(all(test, feature = "autoresearch"))]
 pub(crate) fn controller_cfg(
     state_dir: &std::path::Path,
     repos: Vec<String>,

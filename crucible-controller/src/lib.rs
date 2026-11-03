@@ -48,16 +48,13 @@ pub mod telemetry;
 pub mod testing;
 mod wire_enum;
 
-pub use client::{
-    Db, MAINTENANCE_ADVISORY_LOCK, connect, db_name, sibling_db_url, try_maintenance_lock,
-};
+pub use client::{Db, MAINTENANCE_ADVISORY_LOCK, connect, sibling_db_url, try_maintenance_lock};
 pub use config::{ControllerCfg, GroundedExecutor, PlaybookExecutor, Profile, ScopeExecutor};
 #[cfg(feature = "autoresearch")]
 pub use daemon::autopilot_flag::AutopilotFlag;
 pub use daemon::overrides::{OverrideStore, QueueOverrideSink};
 pub use daemon::overrides_store::{ConfigStore, KubeConfigMapApi};
 pub use daemon::queue::{IssueKey, Override, OverrideSink, QueueConfig, WorkQueue};
-pub use daemon::rebuild::{Drift, DriftReport, rebuild, verify};
 pub use event_log::Event;
 pub use issues::model::{NewIssue, NewScope};
 #[cfg(feature = "autoresearch")]
@@ -388,7 +385,7 @@ pub async fn schema_version(pool: &sqlx::PgPool) -> anyhow::Result<i64> {
 static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A unique ledger URL on the test server (`DATABASE_URL`), for the tests that open a second
-/// "live" database beside their `#[sqlx::test]` pool (rebuild/verify, autopilot). The caller
+/// "live" database beside their `#[sqlx::test]` pool (autopilot, the session store). The caller
 /// owns cleanup: `sqlx::Postgres::drop_database` it (best-effort) before returning.
 #[cfg(test)]
 pub(crate) fn test_ledger_url() -> String {

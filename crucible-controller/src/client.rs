@@ -31,18 +31,9 @@ pub async fn connect(url: &str) -> Result<PgPool> {
     Ok(pool)
 }
 
-/// Whether the ledger's database exists at all — the rebuild path's "from-nothing disaster"
-/// check (the SQLite era asked `path.is_file()`).
-pub(crate) async fn ledger_exists(url: &str) -> Result<bool> {
-    use sqlx::migrate::MigrateDatabase;
-    sqlx::Postgres::database_exists(url)
-        .await
-        .context("checking the postgres ledger database exists")
-}
-
 /// The session-scoped advisory-lock key every mutually-exclusive writer of the ledger takes: the
-/// autopilot daemon for its lifetime, and the maintenance commands (`db rebuild`) for their run. The value is the ASCII bytes of
-/// `"crucible"` as a big-endian i64.
+/// autopilot daemon for its lifetime. The value is the ASCII bytes of `"crucible"` as a big-endian
+/// i64.
 pub const MAINTENANCE_ADVISORY_LOCK: i64 = 0x6372_7563_6962_6c65;
 
 /// Holds [`MAINTENANCE_ADVISORY_LOCK`] on a dedicated connection detached from the pool. Released
@@ -100,22 +91,12 @@ pub async fn try_maintenance_lock(pool: &PgPool) -> Result<Option<MaintenanceLoc
     Ok(Some(MaintenanceLock { conn }))
 }
 
-/// `url` with its database name replaced by `name` — the scratch databases `db verify`/`db
-/// rebuild` use live on the same server as the ledger.
+/// `url` with its database name replaced by `name` — the scratch database `db verify` uses lives
+/// on the same server as the ledger.
 pub fn sibling_db_url(url: &str, name: &str) -> Result<String> {
     let mut parsed = url::Url::parse(url).context("parsing the ledger URL")?;
     parsed.set_path(&format!("/{name}"));
     Ok(parsed.into())
-}
-
-/// The ledger URL's database name (scratch names are derived from it).
-pub fn db_name(url: &str) -> Result<String> {
-    let parsed = url::Url::parse(url).context("parsing the ledger URL")?;
-    let name = parsed.path().trim_start_matches('/');
-    if name.is_empty() {
-        anyhow::bail!("the ledger URL names no database");
-    }
-    Ok(name.to_string())
 }
 
 /// The controller's ledger handle: a Postgres pool plus the event log every transition appends to,

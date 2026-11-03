@@ -645,7 +645,6 @@ fn daemon_cfg() -> DaemonConfig {
         // The tests use a fixed cadence — no runtime override store threaded here.
         discovery_interval_fn: None,
         // The drift check must never fire mid-test (its first fire is one full interval out).
-        verify_interval: Duration::from_secs(3600),
         // No API surface in the harness — the manual reconcile trigger never fires.
         reconcile_now: None,
         launch_probe: Duration::from_millis(50),

@@ -221,8 +221,7 @@ pub struct NewCandidate {
     pub branch: Option<String>,
 }
 
-/// One `runs` row read back in full ([`crate::daemon::rebuild`]'s row-by-row diff needs every column;
-/// [`NewRun`] is write-only).
+/// One `runs` row read back in full ([`NewRun`] is write-only).
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Run {
     pub run_id: String,
@@ -260,8 +259,8 @@ pub struct RunImage {
     pub overridden: bool,
 }
 
-/// One `candidates` row read back in full. The table has no primary key; rebuild/drift key on
-/// `(run_id, kind, lane, iter)`, which a run never repeats.
+/// One `candidates` row read back in full. The table has no primary key; a run never repeats
+/// `(run_id, kind, lane, iter)`.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct Candidate {
     pub(crate) run_id: String,

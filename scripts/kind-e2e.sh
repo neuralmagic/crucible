@@ -66,7 +66,6 @@
 #      delivery to either replica each create their pod within seconds of being due; with the
 #      leader killed, the peer takes the lease and fires a one-shot on time, once
 #   M  a loop image labelled with another contract version parks the launch without a pod
-#   Z  db rebuild carries the trees and aliases the pack rows reference
 #   JP a run pod uploads its session, captured files and git memory to its own run under a pod
 #      token minted at dispatch and carried in the run's Secret, with nothing stored by pod and no
 #      ServiceAccount token projected; completion revokes the token; a person reads the evidence
@@ -85,7 +84,7 @@
 #      are reused with their commits and files, reused rows name the parent, and an edit upstream
 #      of the selection is refused
 # The scenarios run in three shards at once, each on its own kind cluster, database, and controller
-# ports, sharing one registry and loop image: store (A P U F C B D L T I W E X Q V G M Z), pods
+# ports, sharing one registry and loop image: store (A P U F C B D L T I W E X Q V M), pods
 # (H R S K Y JP JT), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
 # Needs docker, kind, kubectl, jq, curl, git, shasum, openssl. Uses $DATABASE_URL and $PG_CONTAINER when
 # set (the CI postgres action), else starts its own Postgres. KEEP=1 leaves everything up;

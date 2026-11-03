@@ -1126,21 +1126,4 @@ expect_parked M "contract rejection"
 [ "$(pods_seen M "$KEY")" = 0 ] || fail "[M] a pod was created for a rejected launch"
 pass "[M] no pod was created"
 
-# ---- scenario Z ----------------------------------------------------------------------------
 stop_controller
-log "[Z] rebuilding the ledger"
-PACK_STORE="SELECT 'row', issue_slug, tree_digest FROM pack_tarballs WHERE tree_digest IS NOT NULL
-UNION ALL SELECT 'files', digest, count(*)::TEXT FROM pack_tree_files
-    WHERE digest IN (SELECT tree_digest FROM pack_tarballs) GROUP BY digest
-UNION ALL SELECT 'alias', old_digest, coalesce(tree_digest, unconvertible_reason) FROM pack_digest_aliases
-ORDER BY 1, 2"
-sql -c "$PACK_STORE" >"$WORK/pack-store-before.txt"
-[ "$(grep -c '^row|' "$WORK/pack-store-before.txt")" -gt 10 ] || fail "[Z] too few pack rows to compare"
-DATABASE_URL="$DB" "$BIN/crucible-controller" db rebuild --state-dir "$WORK/state" >"$WORK/rebuild-Z.log" 2>&1 ||
-    fail "[Z] db rebuild failed: $(tail -n 20 "$WORK/rebuild-Z.log")"
-sql -c "$PACK_STORE" >"$WORK/pack-store-after.txt"
-diff "$WORK/pack-store-before.txt" "$WORK/pack-store-after.txt" >"$WORK/pack-store.diff" ||
-    fail "[Z] the rebuild changed the pack store:
-$(cat "$WORK/pack-store.diff")"
-pass "[Z] the rebuilt ledger holds every pack row's tree, its files, and every alias"
-

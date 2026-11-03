@@ -17,8 +17,6 @@ pub mod leader;
 pub mod overrides;
 pub mod overrides_store;
 pub mod queue;
-pub mod rebuild;
-pub mod store;
 
 use crate::daemon::queue::TestSyncMarker;
 use crate::daemon::queue::{
@@ -37,18 +35,13 @@ use tokio::time::{MissedTickBehavior, interval};
 /// harness feeds a channel-backed one so the daemon runs for real without a cluster.
 pub type CompletionStream = Pin<Box<dyn futures_util::Stream<Item = IssueKey> + Send>>;
 
-/// The periodic drift check: rebuild into a temp DB and diff it against the live one. `run`
-/// invokes it on its own long interval and logs the outcome; the callable itself (`verify`)
-/// lives in [`crate::daemon::rebuild`].
-pub type VerifyFn = Arc<dyn Fn() -> BoxFuture<Result<()>> + Send + Sync>;
-
 /// A live fetch of the non-terminal issue keys (`Db::non_terminal_keys`), for the manual
 /// reconcile-now pass — the startup re-enqueue's semantics, re-runnable at trigger time.
 pub type NonTerminalFn = Arc<dyn Fn() -> BoxFuture<Result<Vec<String>>> + Send + Sync>;
 
 /// Everything [`run`] plugs into its `select!` loop beyond the queue config: the reconcile core, the
-/// park callback, the discovery sources, the pod-completion stream, and the optional drift-verify
-/// hook. Bundled into one struct so `run` stays a five-parameter call as the wiring grows.
+/// park callback, the discovery sources, and the pod-completion stream. Bundled into one struct so
+/// `run` stays a five-parameter call as the wiring grows.
 pub struct Wiring {
     /// The work queue the worker drains. Passed in (not created inside [`run`]) so the caller can
     /// also hand its [`Enqueue`] handle to the override sink — human overrides enqueue into the very
@@ -60,7 +53,6 @@ pub struct Wiring {
     completions: CompletionStream,
     /// The due-time triggers the launch loop drives. `None` runs no launch loop.
     launches: Option<Arc<dyn DueSource>>,
-    verify: Option<VerifyFn>,
     /// Fresh non-terminal keys for the manual reconcile-now pass (the API's kick-it-now button):
     /// the pass runs a discovery poll AND a full re-enqueue, so stuck rows re-drive immediately
     /// instead of waiting out the cadence.
@@ -84,7 +76,7 @@ pub use crucible_contract::MANAGED_BY_SELECTOR;
 
 /// Assemble the production [`Wiring`] from an open ledger + config: the reconcile core with the
 /// human-override drain in front, the machine park callback, the three approval polls + upstream
-/// watermark as one [`MultiDiscovery`], and the scheduled drift check. The binary's daemon and the
+/// watermark as one [`MultiDiscovery`]. The binary's daemon and the
 /// integration harness both call this, so the daemon under test IS the assembled daemon — the
 /// harness substitutes only the two cluster edges ([`CompletionStream`] and the
 /// [`crate::runs::workpod::PodDispatcher`]).
@@ -213,25 +205,6 @@ pub async fn assemble(
     }
     let discovery: Arc<dyn DiscoverySource> = Arc::new(MultiDiscovery::new(sources));
 
-    // The periodic drift check: rebuild into a temp DB and diff against the live one.
-    // Best-effort; a divergence is reported, never fatal.
-    let verify_db = db.clone();
-    let verify_cfg = cfg.clone();
-    let verify: VerifyFn = Arc::new(move || {
-        let db = verify_db.clone();
-        let cfg = verify_cfg.clone();
-        Box::pin(async move {
-            let report = crate::daemon::rebuild::verify(&db, &cfg).await?;
-            if !report.is_clean() {
-                tracing::warn!(
-                    divergences = report.diffs.len() + report.gaps.len(),
-                    "daemon: drift check found divergences from evidence"
-                );
-            }
-            Ok(())
-        })
-    });
-
     let reenq_db = db.clone();
     let reenqueue_all: NonTerminalFn = Arc::new(move || {
         let db = reenq_db.clone();
@@ -245,7 +218,6 @@ pub async fn assemble(
         discovery,
         completions,
         launches: Some(launches),
-        verify: Some(verify),
         reenqueue_all,
     }
 }
@@ -369,9 +341,6 @@ pub struct DaemonConfig {
     /// A live source of the current discovery cadence, re-read each tick so a runtime override to
     /// `discovery_secs` takes effect without a restart. `None` keeps `discovery_interval` fixed.
     pub discovery_interval_fn: Option<DiscoveryIntervalFn>,
-    /// How often the drift check ([`Wiring::verify`]) runs — a long, staggered cadence so the
-    /// rebuild-and-diff never competes with discovery. Ignored when no verify hook is wired.
-    pub verify_interval: Duration,
     /// The manual reconcile trigger (`POST /api/reconcile` fires it with `notify_one`). Each fire
     /// runs one discovery poll plus a full non-terminal re-enqueue and wakes the launch loop; the
     /// permit semantics coalesce clicks that land while a pass is running. `None` (tests without
@@ -651,7 +620,6 @@ pub async fn run_led(
         discovery,
         completions,
         launches,
-        verify,
         reenqueue_all,
     } = wiring;
 
@@ -726,13 +694,6 @@ pub async fn run_led(
     // fire together and hammer the same endpoints at once.
     discovery_timer.reset_after(stagger_offset(discovery_period));
 
-    // The drift check runs on its own long, heavily-staggered cadence so a rebuild-and-diff never
-    // lands on a discovery tick. Its first fire is delayed a full interval — a fresh daemon has
-    // nothing to have drifted from yet.
-    let mut verify_timer = interval(cfg.verify_interval);
-    verify_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    verify_timer.reset_after(cfg.verify_interval);
-
     let enqueue: Arc<dyn Enqueue> = Arc::new(queue.clone());
 
     // One pinned, eagerly-enabled shutdown future for the whole loop. A fresh `notified()` per
@@ -776,12 +737,6 @@ pub async fn run_led(
                         discovery_timer.reset_after(discovery_period);
                     }
                 }
-            }
-            _ = verify_timer.tick(), if verify.is_some() => {
-                if let Some(v) = &verify
-                    && let Err(e) = v().await {
-                        tracing::warn!(error = format!("{e:#}"), "daemon: scheduled drift check failed (continuing)");
-                    }
             }
             // The manual pass: a discovery poll (what a tick does) plus a full non-terminal
             // re-enqueue (what startup does), so stuck rows re-drive without waiting out the
@@ -1228,7 +1183,6 @@ mod tests {
             discovery,
             completions,
             launches,
-            verify: None,
             reenqueue_all: Arc::new(move || {
                 let keys = reenqueue_keys.clone();
                 Box::pin(async move { Ok(keys) })
@@ -1240,7 +1194,6 @@ mod tests {
             queue: QueueConfig::default(),
             discovery_interval: Duration::from_secs(3600),
             discovery_interval_fn: None,
-            verify_interval: Duration::from_secs(3600),
             reconcile_now: Some(notify),
             launch_probe: Duration::from_millis(5),
         };

@@ -65,7 +65,7 @@ uuid.workspace = true
 # Compile-time SQL assembly: a query spliced from `const` column lists stays `&'static str`.
 const_format = "0.2"
 jsonschema.workspace = true
-# Scratch-database URL derivation for `db verify`/`db rebuild` (swap the database name in the
+# Scratch-database URL derivation for `db verify` (swap the database name in the
 # ledger URL); already in the tree via reqwest.
 url = "2"
 # The proxies whose X-Forwarded-For a client registration trusts.

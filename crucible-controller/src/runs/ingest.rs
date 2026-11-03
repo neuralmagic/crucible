@@ -1689,6 +1689,47 @@ mod tests {
         Ok(())
     }
 
+    /// The ledger is a function of the evidence: folding the same session log again reproduces the
+    /// run row and every candidate row field for field, and folding it under another run id
+    /// produces the same candidates.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn folding_the_same_session_reproduces_the_same_rows(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, sample_log())?;
+        let rows = |run_id: &'static str| {
+            let db = db.clone();
+            async move {
+                let run = crate::runs::store::get_run(db.pool(), run_id)
+                    .await?
+                    .expect("the run row");
+                let candidates =
+                    crate::runs::store::list_candidates_for_run(db.pool(), run_id).await?;
+                anyhow::Ok((run, candidates))
+            }
+        };
+
+        adopt_session_file(&db, "det-1", None, &path, "s3://b/det").await?;
+        let first = rows("det-1").await?;
+        adopt_session_file(&db, "det-1", None, &path, "s3://b/det").await?;
+        assert_eq!(rows("det-1").await?, first);
+
+        adopt_session_file(&db, "det-2", None, &path, "s3://b/det").await?;
+        let (_, other) = rows("det-2").await?;
+        let strip = |c: &[crate::runs::model::Candidate]| {
+            c.iter()
+                .map(|c| crate::runs::model::Candidate {
+                    run_id: String::new(),
+                    ..c.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&other), strip(&first.1));
+        assert!(!first.1.is_empty());
+        Ok(())
+    }
+
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn adopt_rejects_a_file_that_is_not_a_session_log(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);

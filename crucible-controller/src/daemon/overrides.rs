@@ -888,8 +888,8 @@ mod tests {
     }
 
     /// A ScopeNow on a parked issue whose pre-park status wasn't `new` forces it back to `new`,
-    /// and the forced transition lands in the event history (rebuild replays events; a silent
-    /// status flip would reconstruct the wrong status).
+    /// and the forced transition lands in the event history (a silent status flip would leave the
+    /// history naming the wrong status).
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn scope_now_on_a_parked_issue_logs_the_forced_return_to_new(pool: PgPool) -> Result<()> {
         let (db, _d) = db_with(pool);

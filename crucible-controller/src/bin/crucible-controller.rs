@@ -1,5 +1,5 @@
 //! crucible-controller — the control plane's CLI: discovery (`triage`), the reconcile daemon
-//! (`autopilot`), ledger maintenance (`db verify|rebuild`), the grounded-vs-API ranking
+//! (`autopilot`), ledger maintenance (`db verify|export-events|adopt`), the grounded-vs-API ranking
 //! comparison harness (`rank-compare`), and the OpenAPI spec print (`openapi`). Split out of the
 //! public `crucible` engine binary so the engine ships without the control plane: the controller
 //! shells the engine (`crucible rank-grounded`, `crucible deploy render`) as a subprocess and the
@@ -51,8 +51,8 @@ pub(crate) enum Cmd {
         #[arg(long)]
         once: bool,
     },
-    /// Controller ledger maintenance: verify the schema, rebuild from evidence, export the event
-    /// log, or adopt a run launched elsewhere.
+    /// Controller ledger maintenance: verify the schema, export the event log, or adopt a run
+    /// launched elsewhere.
     Db {
         #[command(subcommand)]
         action: DbAction,
@@ -111,25 +111,14 @@ pub(crate) enum Cmd {
     },
 }
 
-/// `crucible-controller db <verify|rebuild|export-events|adopt>`: open/migrate the ledger and
-/// report its schema version, re-derive it from evidence (lane H), export the event log, or adopt
-/// a foreign run.
+/// `crucible-controller db <verify|export-events|adopt>`: prove the migration set and report its
+/// schema version, export the event log, or adopt a foreign run.
 #[derive(clap::Subcommand)]
 pub(crate) enum DbAction {
-    /// Verify the ledger. When the database named by `--db`/`DATABASE_URL` already exists,
-    /// rebuilds it into a throwaway comparison database on the same server and reports the
-    /// drift (periodic disaster-fallback check, lane H). Otherwise falls back to the original
-    /// behavior: create a throwaway database, run migrations, and print the applied schema
-    /// version — proving the migration set without touching real state.
+    /// Create a throwaway database beside the ledger named by `--db`/`DATABASE_URL`, run the
+    /// migrations, print the applied schema version, and drop it — proving the migration set
+    /// without touching real state.
     Verify {
-        #[command(flatten)]
-        cfg: crucible_controller::ControllerCfg,
-    },
-    /// Re-derive the ledger from evidence (GitHub issue state, re-ingestible session logs, the event
-    /// log's transition history) into a fresh sibling database, then swap it in over the live one
-    /// (`ALTER DATABASE … RENAME`) on full success (disaster-fallback rebuild, lane H). Run with
-    /// the daemon stopped: the rename needs no live connections.
-    Rebuild {
         #[command(flatten)]
         cfg: crucible_controller::ControllerCfg,
     },
@@ -324,11 +313,10 @@ fn dispatch_rank_compare(
     Ok(())
 }
 
-/// `crucible-controller db <verify|rebuild|export-events|adopt>`.
+/// `crucible-controller db <verify|export-events|adopt>`.
 fn dispatch_db(action: DbAction) -> Result<()> {
     match action {
         DbAction::Verify { cfg } => dispatch_db_verify(cfg),
-        DbAction::Rebuild { cfg } => dispatch_db_rebuild(cfg),
         DbAction::ExportEvents { cfg, out } => dispatch_db_export_events(cfg, out),
         DbAction::Adopt {
             cfg,
@@ -377,10 +365,8 @@ fn dispatch_db_export_events(
 
 /// `crucible-controller db adopt`: fold a foreign run's session log into the live ledger. The
 /// stored `session_uri` is the original pointer (s3:// or local), never the downloaded temp path,
-/// so the artifact proxy and Flow tab resolve evidence off it. Note: `db verify` gaps `s3://`
-/// runs in its drift report (the comparison rebuild has no fetch bridge), so an adopted s3 run
-/// showing there is expected noise, and the run's cost is booked against THIS controller's daily
-/// caps — it is real spend.
+/// so the artifact proxy and Flow tab resolve evidence off it. The run's cost is booked against
+/// THIS controller's daily caps — it is real spend.
 fn dispatch_db_adopt(
     cfg: crucible_controller::ControllerCfg,
     session_uri: String,
@@ -447,25 +433,13 @@ fn dispatch_db_adopt(
     Ok(())
 }
 
-/// `crucible-controller db verify`: when `cfg`'s resolved DB path already exists as a file, rebuild
-/// it into a throwaway comparison database and print the drift (the periodic disaster-fallback
-/// check). Otherwise — no existing DB at that path, and no reason to create one just to "verify"
-/// it — fall back to the original behavior: open (creating if absent) a throwaway temp database,
-/// run migrations, and print the applied schema version.
+/// `crucible-controller db verify`: open a throwaway database beside the ledger, run the
+/// migrations, print the applied schema version, and drop it — proving the migration set without
+/// touching real state.
 fn dispatch_db_verify(cfg: crucible_controller::ControllerCfg) -> Result<()> {
     use sqlx::migrate::MigrateDatabase;
     let rt = cli_runtime()?;
     let url = cfg.db_url().to_string();
-    let exists = rt.block_on(sqlx::Postgres::database_exists(&url))?;
-    if exists {
-        let report = rt.block_on(async {
-            let live = crucible_controller::Db::open(&url).await?;
-            crucible_controller::verify(&live, &cfg).await
-        })?;
-        print_drift_report(crucible_controller::db_name(&url)?.as_str(), &report);
-        return Ok(());
-    }
-
     let scratch = crucible_controller::sibling_db_url(
         &url,
         &format!("crucible_db_verify_{}", std::process::id()),
@@ -481,161 +455,11 @@ fn dispatch_db_verify(cfg: crucible_controller::ControllerCfg) -> Result<()> {
     Ok(())
 }
 
-fn print_drift_report(db_name: &str, report: &crucible_controller::DriftReport) {
-    if report.is_clean() {
-        println!("crucible-controller db verify: {db_name} — no drift");
-    } else {
-        println!(
-            "crucible-controller db verify: {db_name} — {} drift line(s):",
-            report.diffs.len()
-        );
-        for d in &report.diffs {
-            println!(
-                "  {}:{} {} live={:?} rebuilt={:?}",
-                d.table, d.key, d.field, d.live, d.rebuilt
-            );
-        }
-    }
-    if !report.gaps.is_empty() {
-        println!(
-            "  {} known gap(s) in the comparison rebuild:",
-            report.gaps.len()
-        );
-        for g in &report.gaps {
-            println!("  {}:{} — {}", g.table, g.key, g.reason);
-        }
-    }
-}
-
-/// `crucible-controller db rebuild`: re-derive the ledger from evidence into a fresh sibling
-/// database on the same server, then swap it in over the live one (`ALTER DATABASE … RENAME`)
-/// only on full success. On any failure before the swap, the pre-existing live database is
-/// untouched and the scratch database is dropped. The rename needs zero connections to either
-/// database, so run this with the daemon stopped (it is the disaster-fallback path).
-fn dispatch_db_rebuild(cfg: crucible_controller::ControllerCfg) -> Result<()> {
-    use sqlx::migrate::MigrateDatabase;
-    let live_url = cfg.db_url().to_string();
-    let live_name = crucible_controller::db_name(&live_url)?;
-    let tmp_name = format!("{live_name}_rebuild_tmp");
-    let tmp_url = crucible_controller::sibling_db_url(&live_url, &tmp_name)?;
-    let rt = cli_runtime()?;
-    let result = rt.block_on(async {
-        // A previous crashed rebuild may have left the scratch database behind; start clean.
-        if sqlx::Postgres::database_exists(&tmp_url).await? {
-            sqlx::Postgres::drop_database(&tmp_url).await?;
-        }
-        // Fence off a running daemon (or another maintenance command) for the whole read; the
-        // swap below terminates the lock connection along with every other straggler.
-        let live_lock = if sqlx::Postgres::database_exists(&live_url).await? {
-            let live_pool = crucible_controller::connect(&live_url).await?;
-            let lock = crucible_controller::try_maintenance_lock(&live_pool)
-                .await?
-                .context(
-                    "the maintenance advisory lock is held by another session (a running daemon \
-                     or another maintenance command); stop it and retry",
-                )?;
-            Some((live_pool, lock))
-        } else {
-            None
-        };
-        let tmp_db = crucible_controller::Db::open(&tmp_url).await?;
-        let report = crucible_controller::rebuild(&tmp_db, &cfg).await;
-        tmp_db.pool().close().await;
-        if let Some((pool, lock)) = live_lock {
-            let _ = lock.release().await;
-            pool.close().await;
-        }
-        report
-    });
-
-    let report = match result {
-        Ok(report) => report,
-        Err(e) => {
-            let _ = rt.block_on(sqlx::Postgres::drop_database(&tmp_url));
-            return Err(
-                e.context("crucible-controller db rebuild failed; the live ledger is untouched")
-            );
-        }
-    };
-
-    rt.block_on(swap_databases(&live_url, &live_name, &tmp_name))
-        .context("swapping the rebuilt database into place")?;
-
-    println!(
-        "crucible-controller db rebuild: {live_name} — {} issue(s) upserted, {} run(s) ingested, {} candidate(s), {} event(s) replayed",
-        report.issues_upserted,
-        report.runs_ingested,
-        report.candidates_ingested,
-        report.events_replayed,
-    );
-    if !report.gaps.is_empty() {
-        println!("  {} gap(s):", report.gaps.len());
-        for g in &report.gaps {
-            println!("  {}:{} — {}", g.table, g.key, g.reason);
-        }
-    }
-    Ok(())
-}
-
-/// Swap `tmp_name` in over `live_name` via `ALTER DATABASE … RENAME` on an admin connection to
-/// the server's `postgres` maintenance database (a rename can't run from inside either database).
-/// Straggler connections are terminated first — this is the disaster-fallback path, run with the
-/// daemon stopped. The old live database survives as `<live>_pre_rebuild` until the rename of the
-/// scratch database succeeds, then it is dropped; a crash in between leaves both databases on the
-/// server for hand recovery rather than a half-swapped state.
-async fn swap_databases(live_url: &str, live_name: &str, tmp_name: &str) -> Result<()> {
-    use sqlx::Connection;
-    let admin_url = crucible_controller::sibling_db_url(live_url, "postgres")?;
-    let mut conn = sqlx::postgres::PgConnection::connect(&admin_url)
-        .await
-        .context("connecting to the postgres maintenance database")?;
-    let backup_name = format!("{live_name}_pre_rebuild");
-    sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = ANY($1) AND pid <> pg_backend_pid()")
-        .bind(vec![live_name.to_string(), tmp_name.to_string(), backup_name.clone()])
-        .execute(&mut conn)
-        .await
-        .context("terminating straggler connections")?;
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "DROP DATABASE IF EXISTS \"{backup_name}\""
-    )))
-    .execute(&mut conn)
-    .await
-    .context("dropping a leftover pre-rebuild backup")?;
-    let live_exists: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_database WHERE datname = $1)")
-            .bind(live_name)
-            .fetch_one(&mut conn)
-            .await?;
-    if live_exists {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "ALTER DATABASE \"{live_name}\" RENAME TO \"{backup_name}\""
-        )))
-        .execute(&mut conn)
-        .await
-        .context("setting the live database aside")?;
-    }
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "ALTER DATABASE \"{tmp_name}\" RENAME TO \"{live_name}\""
-    )))
-    .execute(&mut conn)
-    .await
-    .context("renaming the rebuilt database into place")?;
-    if live_exists {
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP DATABASE \"{backup_name}\""
-        )))
-        .execute(&mut conn)
-        .await
-        .context("dropping the pre-rebuild database")?;
-    }
-    Ok(())
-}
-
 /// `crucible-controller autopilot [--once]`. `--once` runs the reconcile core to quiescence
 /// (the dev/test/break-glass mode). The resident daemon opens the ledger, fetches the startup
 /// re-enqueue set, and hands [`crucible_controller::daemon::run`] the full wiring: the reconcile
 /// core with the human-override drain in front, the three approval polls + upstream watermark as
-/// discovery, the kube pod-completion watch, the scheduled drift check, and the HTTP API/UI on
+/// discovery, the kube pod-completion watch, and the HTTP API/UI on
 /// the same runtime. Owns a multi-thread runtime — the daemon's `select!` and the queue's
 /// spawned backoff timers need more than one worker thread.
 fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -> Result<()> {
@@ -863,13 +687,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         }
     }
 
-    // The drift check runs far less often than discovery (a rebuild-and-diff is expensive) and only
-    // needs to catch slow divergence; a fixed multiple of the discovery cadence keeps it a single
-    // knob with no new profile field.
-    let verify_interval = cfg
-        .profile
-        .discovery_interval()
-        .saturating_mul(DRIFT_CHECK_CADENCE_MULTIPLE);
     // The discovery cadence re-reads the effective config each tick, so an override to
     // `discovery_secs` retunes the timer without a restart.
     let cadence_store = config_store.clone();
@@ -882,7 +699,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         discovery_interval_fn: Some(std::sync::Arc::new(move || {
             cadence_store.effective().discovery_interval()
         })),
-        verify_interval,
         reconcile_now: Some(reconcile_now.clone()),
         launch_probe: crucible_controller::daemon::launch_loop::PROBE_INTERVAL,
     };
@@ -1260,9 +1076,8 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             &cfg.pod_namespace,
         );
 
-        // Everything else — reconcile core + override drain, machine park, the approval polls, the
-        // drift check — is the library's one production assembly (shared with the integration
-        // harness).
+        // Everything else — reconcile core + override drain, machine park, the approval polls — is
+        // the library's one production assembly (shared with the integration harness).
         let wiring = crucible_controller::daemon::assemble(
             &db,
             &cfg,
@@ -1293,10 +1108,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     led
 }
 
-/// Drift check cadence as a multiple of the discovery interval — the rebuild-and-diff is expensive
-/// and only needs to catch slow divergence, so it runs an order of magnitude less often.
-const DRIFT_CHECK_CADENCE_MULTIPLE: u32 = 12;
-
 /// The controller HTTP surface's bind address: `CONTROLLER_API_ADDR` (host:port) if set, else
 /// loopback on the default port. `serve` forces loopback anyway when no API token is configured.
 fn controller_api_addr() -> std::net::SocketAddr {
@@ -1313,9 +1124,9 @@ const CONTROLLER_API_PORT: u16 = 8870;
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "autoresearch")]
-    use crate::dispatch_triage;
+    use crate::Cli;
     #[cfg(feature = "autoresearch")]
-    use crate::{Cli, dispatch_db_rebuild};
+    use crate::dispatch_triage;
     #[cfg(feature = "autoresearch")]
     use clap::Parser;
     #[cfg(feature = "autoresearch")]
@@ -1481,103 +1292,6 @@ mod tests {
             "triage is pure discovery: no tier guess"
         );
         assert_eq!(issue.status, crucible_controller::Status::New);
-
-        let _ = fs::remove_dir_all(&dir);
-    }
-
-    /// `crucible-controller db rebuild`: a GitHub fetch that fails outright must abort the
-    /// whole rebuild before ever touching the live ledger. Forces the failure with a listener that
-    /// answers 200 with an undecodable body (no retries — an immediate hard error, unlike a
-    /// per-run evidence gap), then asserts the live database's rows are untouched and no
-    /// `_rebuild_tmp` scratch database is left behind.
-    #[cfg(feature = "autoresearch")]
-    #[test]
-    fn dispatch_db_rebuild_leaves_the_live_ledger_untouched_on_failure() {
-        let _guard = github_env_lock();
-
-        let dir = tempdir("rebuild-atomic-failure");
-        let db_url = test_ledger_url("rebuild_atomic");
-        let cfg = controller_cfg_from(&[
-            "ctl",
-            "--state-dir",
-            &dir.to_string_lossy(),
-            "--repo",
-            "owner/repo",
-            "--db",
-            &db_url,
-        ]);
-
-        // Seed a real live ledger with one row.
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("runtime");
-        let before = rt
-            .block_on(async {
-                let db = crucible_controller::Db::open(cfg.db_url()).await?;
-                // rebuild reads the live ledger's watch-set (Lane O3), not `cfg.repos` — seed it
-                // the way a real boot would.
-                crucible_controller::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)
-                    .await?;
-                crucible_controller::issues::store::upsert_issue(
-                    db.pool(),
-                    &crucible_controller::NewIssue {
-                        key: "owner/repo#1".to_string(),
-                        repo: "owner/repo".to_string(),
-                        priority: 0,
-                        evidence_url: None,
-                        title: None,
-                        author: None,
-                        body: None,
-                        labels: Vec::new(),
-                        upstream_updated_at: None,
-                    },
-                )
-                .await?;
-                let issue =
-                    crucible_controller::issues::store::get_issue(db.pool(), "owner/repo#1")
-                        .await?
-                        .expect("seeded issue");
-                db.pool().close().await;
-                anyhow::Ok(issue)
-            })
-            .expect("seed live ledger");
-
-        let (addr, server) = stub_github("not json");
-        unsafe {
-            std::env::set_var("GITHUB_API_URL", format!("http://{addr}"));
-        }
-
-        let err = dispatch_db_rebuild(cfg.clone()).expect_err("a GitHub decode failure must abort");
-        unsafe {
-            std::env::remove_var("GITHUB_API_URL");
-        }
-        server.join().expect("server thread");
-        assert!(
-            err.to_string().contains("untouched"),
-            "error should say the live ledger was left alone: {err:#}"
-        );
-
-        let live_name = crucible_controller::db_name(&db_url).expect("db name");
-        let tmp_url =
-            crucible_controller::sibling_db_url(&db_url, &format!("{live_name}_rebuild_tmp"))
-                .expect("tmp url");
-        rt.block_on(async {
-            use sqlx::migrate::MigrateDatabase;
-            let db = crucible_controller::Db::open(&db_url).await?;
-            let after = crucible_controller::issues::store::get_issue(db.pool(), "owner/repo#1")
-                .await?
-                .expect("issue still present");
-            assert_eq!(before, after, "the live ledger's row must be untouched");
-            db.pool().close().await;
-            assert!(
-                !sqlx::Postgres::database_exists(&tmp_url).await?,
-                "no leftover rebuild scratch database"
-            );
-            sqlx::Postgres::drop_database(&db_url).await?;
-            anyhow::Ok(())
-        })
-        .expect("post-rebuild assertions");
 
         let _ = fs::remove_dir_all(&dir);
     }
