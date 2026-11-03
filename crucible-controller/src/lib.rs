@@ -248,15 +248,15 @@ impl Surface {
         // like `/metrics` — public read-only by design. Disabled (routes 404) unless
         // CONTROLLER_EXTERNAL_URL names the mirror's own external base URL.
         let mirror = oidc_mirror::external_url_from_env().map(|base| {
-        let upstream: Arc<dyn oidc_mirror::DiscoveryUpstream> = match kube_client.as_ref() {
-            Ok(client) => Arc::new(oidc_mirror::KubeUpstream(client.clone())),
-            Err(e) => {
-                tracing::warn!(error = %e, "no kube client for the discovery mirror — it serves 503 until one is reachable");
-                Arc::new(oidc_mirror::UnavailableUpstream)
-            }
-        };
-        oidc_mirror::Mirror::new(upstream, base)
-    });
+            let upstream = match kube_client.as_ref() {
+                Ok(client) => Some(client.clone()),
+                Err(e) => {
+                    tracing::warn!(error = %e, "no kube client for the discovery mirror — it serves 503 until one is reachable");
+                    None
+                }
+            };
+            oidc_mirror::Mirror::new(upstream, base)
+        });
 
         // The cluster-snapshot push surface: outside the bearer guard like `/metrics`,
         // authenticated by its own per-cluster static tokens (see `cluster_push`'s module doc for
