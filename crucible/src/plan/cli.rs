@@ -1428,7 +1428,7 @@ mod tests {
             [budget]
             usd = 1.0
             [[task]]
-            name = "review/a"
+            name = "review.a"
             kind = "command"
             command = "true"
             [[task]]
@@ -1438,7 +1438,7 @@ mod tests {
         "#;
         let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
         let out = render_mermaid(&plan, &BTreeSet::new());
-        assert!(out.contains("t0[\"review/a\"]"));
+        assert!(out.contains("t0[\"review.a\"]"));
         assert!(out.contains("t1[\"review-a\"]"));
         assert!(!out.contains("run:"), "public source omits commands: {out}");
     }

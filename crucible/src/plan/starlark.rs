@@ -1828,15 +1828,10 @@ fn take_value(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Value> 
         })
 }
 
-/// A task's name as the author wrote it. Brackets are reserved for a mapped node's synthesized
-/// instance names, so a declared name carrying one is refused here, where the diagnostic can
-/// point at the constructor.
+/// A task's name as the author wrote it, refused here so the diagnostic points at the
+/// constructor rather than at the assembled graph.
 fn take_declared_name(named: &mut BTreeMap<String, Value>, key: &str) -> Result<TaskName> {
-    let raw = take_string(named, key)?;
-    if raw.contains(['[', ']']) {
-        return Err(CompileError::BracketInTaskName { task: raw });
-    }
-    Ok(TaskName(raw))
+    Ok(TaskName::declared(&take_string(named, key)?)?)
 }
 
 fn take_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String> {
@@ -5324,6 +5319,29 @@ workflow(type = "playbook", tasks = [discover, audit])
                 .expect_err("a bracketed task name compiled"),
         );
         assert!(error.contains("reserved for a mapped node"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A task name becomes a directory under `state/files/` and `inputs/`, so a name that climbs
+    /// out of either is refused at the constructor that declared it, with its location.
+    #[test]
+    fn a_task_name_that_escapes_its_directory_is_refused_where_it_is_declared() {
+        let pack = temp_pack("escaping-name");
+        for (name, expect) in [
+            ("..", "relative path component"),
+            ("/etc", "(try \"-etc\")"),
+            ("a/b", "(try \"a-b\")"),
+            ("", "empty name"),
+        ] {
+            let source = format!(
+                "\nlint = command(\n    name = {name:?},\n    run = \"./f.sh\",\n)\nworkflow(type = \"playbook\", tasks = [lint])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack).expect_err(name),
+            );
+            assert!(error.contains("workflow.star:2:8"), "{name:?}: {error}");
+            assert!(error.contains(expect), "{name:?}: {error}");
+        }
         let _ = std::fs::remove_dir_all(&pack);
     }
 

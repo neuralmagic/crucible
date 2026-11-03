@@ -68,6 +68,61 @@ impl From<&str> for TaskName {
     }
 }
 
+impl TaskName {
+    /// A name as an author wrote it. It must be one path component, since a task's files live
+    /// under `state/files/<name>` and are staged under `inputs/<name>`, and free of the brackets
+    /// a mapped node's instance names are made of.
+    pub fn declared(raw: &str) -> Result<TaskName, TaskNameError> {
+        if raw.trim().is_empty() {
+            return Err(TaskNameError::Empty);
+        }
+        if raw.contains(['[', ']']) {
+            return Err(TaskNameError::Bracket {
+                name: raw.to_owned(),
+            });
+        }
+        if matches!(raw, "." | "..") {
+            return Err(TaskNameError::DotComponent {
+                name: raw.to_owned(),
+            });
+        }
+        if let Some(separator) = raw.chars().find(|c| matches!(c, '/' | '\\')) {
+            return Err(TaskNameError::Separator {
+                name: raw.to_owned(),
+                separator,
+                suggest: raw.replace(['/', '\\'], "-"),
+            });
+        }
+        Ok(TaskName(raw.to_owned()))
+    }
+}
+
+/// Why [`TaskName::declared`] refused a name.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TaskNameError {
+    #[error("a task has an empty name")]
+    Empty,
+    #[error(
+        "task name {name:?} contains `[` or `]`. Those are reserved for a mapped node's \
+         instances, which are named `node[item]`."
+    )]
+    Bracket { name: String },
+    #[error(
+        "task name {name:?} is a relative path component; a task's files are kept in a \
+         directory named after it"
+    )]
+    DotComponent { name: String },
+    #[error(
+        "task name {name:?} contains {separator:?}; a task's files are kept in a directory \
+         named after it, so the name is one path component (try {suggest:?})"
+    )]
+    Separator {
+        name: String,
+        separator: char,
+        suggest: String,
+    },
+}
+
 /// A field name a task promises to include in its JSON output.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -782,8 +837,8 @@ pub enum PlanError {
     NoTasks,
     #[error("plan budget.usd must be a positive number, got {usd}")]
     NonPositiveBudget { usd: f64 },
-    #[error("task #{index} has an empty name")]
-    EmptyTaskName { index: usize },
+    #[error(transparent)]
+    TaskName(#[from] TaskNameError),
     #[error("duplicate task name {task:?}")]
     DuplicateTask { task: String },
     #[error("task {task:?} depends on itself")]
@@ -906,11 +961,6 @@ pub enum PlanError {
         first: String,
         second: String,
     },
-    #[error(
-        "task {task:?} contains `[` or `]`; those are reserved for a mapped node's instance \
-         names, which are synthesized as `node[item]`"
-    )]
-    BracketInTaskName { task: String },
     #[error(
         "task {task:?} maps over {reference} but does not depend on {producer:?}; a fan-out \
          reads its items from a dependency's output"
@@ -1364,14 +1414,7 @@ impl Plan {
             }
         }
         for (i, t) in self.tasks.iter().enumerate() {
-            if t.name.0.trim().is_empty() {
-                return Err(PlanError::EmptyTaskName { index: i });
-            }
-            if t.name.0.contains(['[', ']']) {
-                return Err(PlanError::BracketInTaskName {
-                    task: t.name.0.clone(),
-                });
-            }
+            TaskName::declared(&t.name.0)?;
             if index.insert(&t.name, i).is_some() {
                 return Err(PlanError::DuplicateTask {
                     task: t.name.0.clone(),
@@ -4156,6 +4199,55 @@ emits = ["lines"]
     }
     /// A plan that arrives as JSON never passes through the starlark front end, so the
     /// structural facts about a mapped node are checked here or nowhere.
+    /// A task's files live under `state/files/<name>` and are staged under `inputs/<name>`, so a
+    /// name that climbs, roots, or nests a path would put them outside that directory or on top
+    /// of another task's. The JSON route is what a plan file or the controller hands the engine,
+    /// so the rule holds there as well as at compile.
+    #[test]
+    fn a_task_name_that_is_not_one_path_component_does_not_validate() {
+        let refuse = |name: &str| -> PlanError {
+            let json = serde_json::to_string(&plan(vec![agent(name, &[])])).unwrap();
+            Plan::from_json_str(&json)
+                .unwrap()
+                .validate()
+                .expect_err(name)
+        };
+        for name in ["", "  "] {
+            assert_eq!(refuse(name), PlanError::TaskName(TaskNameError::Empty));
+        }
+        for name in [".", ".."] {
+            assert_eq!(
+                refuse(name),
+                PlanError::TaskName(TaskNameError::DotComponent { name: name.into() })
+            );
+        }
+        for (name, separator, suggest) in [
+            ("/x", '/', "-x"),
+            ("a/b", '/', "a-b"),
+            ("../escape", '/', "..-escape"),
+            ("a\\b", '\\', "a-b"),
+        ] {
+            let error = refuse(name);
+            assert_eq!(
+                error,
+                PlanError::TaskName(TaskNameError::Separator {
+                    name: name.into(),
+                    separator,
+                    suggest: suggest.into(),
+                })
+            );
+            assert!(
+                error.to_string().contains(&format!("{suggest:?}")),
+                "{error}"
+            );
+        }
+        for name in ["review", "review-1.final", "...", ".hidden", "a b"] {
+            plan(vec![agent(name, &[])])
+                .validate()
+                .unwrap_or_else(|error| panic!("{name:?}: {error}"));
+        }
+    }
+
     #[test]
     fn validate_checks_a_mapped_node_on_the_json_route() {
         let mapped = |over: Option<OutputRef>, max_fanout: Option<u32>, deps: &[&str]| {
@@ -4178,9 +4270,9 @@ emits = ["lines"]
 
         assert_eq!(
             refuse(vec![agent("audit[x]", &[])]),
-            PlanError::BracketInTaskName {
-                task: "audit[x]".into()
-            }
+            PlanError::TaskName(TaskNameError::Bracket {
+                name: "audit[x]".into()
+            })
         );
         assert_eq!(
             refuse(vec![

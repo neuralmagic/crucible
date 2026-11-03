@@ -1699,7 +1699,7 @@ fn instance_name(node: &TaskName, key: &str) -> TaskName {
 }
 
 /// The item key `name` carries when it is an instance of the mapped node `node`. Declared names
-/// may not contain a bracket ([`crate::plan::ir::PlanError::BracketInTaskName`]), so the match is
+/// may not contain a bracket ([`crate::plan::ir::TaskNameError::Bracket`]), so the match is
 /// exact.
 fn instance_key<'a>(node: &TaskName, name: &'a TaskName) -> Option<&'a str> {
     name.0
