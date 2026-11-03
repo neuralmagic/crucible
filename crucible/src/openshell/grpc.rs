@@ -1758,7 +1758,7 @@ pub(crate) mod in_process;
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::grpc::in_process::{ProfileGateway, Unary, Writes, unary};
+    use crate::openshell::grpc::in_process::{FakeGateway, Writes};
     use crate::openshell::grpc::*;
     use openshell_core::proto::NetworkAccessPreset;
 
@@ -2979,106 +2979,6 @@ pYBZ
         );
     }
 
-    #[derive(Clone)]
-    struct FakeGateway {
-        create: Result<&'static str, tonic::Code>,
-        phase: SandboxPhase,
-        deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl tonic::server::NamedService for FakeGateway {
-        const NAME: &'static str = "openshell.v1.OpenShell";
-    }
-
-    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for FakeGateway {
-        type Response = tonic::codegen::http::Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
-        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
-
-        fn poll_ready(
-            &mut self,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
-            use openshell_core::proto::{
-                DeleteSandboxResponse, DeletionOutcome, Sandbox, SandboxResponse, SandboxStatus,
-            };
-            let this = self.clone();
-            Box::pin(async move {
-                Ok(match req.uri().path() {
-                    "/openshell.v1.OpenShell/CreateSandbox" => {
-                        let create = this.create;
-                        unary(
-                            Unary(move |_: tonic::Request<CreateSandboxRequest>| async move {
-                                create
-                                    .map(|id| {
-                                        tonic::Response::new(SandboxResponse {
-                                            sandbox: Some(Sandbox {
-                                                metadata: Some(
-                                                    openshell_core::proto::datamodel::v1::ObjectMeta {
-                                                        id: id.to_string(),
-                                                        ..Default::default()
-                                                    },
-                                                ),
-                                                ..Sandbox::default()
-                                            }),
-                                            ..SandboxResponse::default()
-                                        })
-                                    })
-                                    .map_err(|code| tonic::Status::new(code, "create refused"))
-                            }),
-                            req,
-                        )
-                        .await
-                    }
-                    "/openshell.v1.OpenShell/GetSandbox" => {
-                        let phase = this.phase;
-                        unary(
-                            Unary(move |_: tonic::Request<GetSandboxRequest>| async move {
-                                Ok(tonic::Response::new(SandboxResponse {
-                                    sandbox: Some(Sandbox {
-                                        status: Some(SandboxStatus {
-                                            phase: phase.into(),
-                                            ..SandboxStatus::default()
-                                        }),
-                                        ..Sandbox::default()
-                                    }),
-                                    ..SandboxResponse::default()
-                                }))
-                            }),
-                            req,
-                        )
-                        .await
-                    }
-                    "/openshell.v1.OpenShell/DeleteSandbox" => {
-                        let deleted = this.deleted.clone();
-                        unary(
-                            Unary(move |r: tonic::Request<DeleteSandboxRequest>| {
-                                let deleted = deleted.clone();
-                                async move {
-                                    deleted
-                                        .lock()
-                                        .map_err(|e| tonic::Status::internal(e.to_string()))?
-                                        .push(r.into_inner().name);
-                                    Ok(tonic::Response::new(DeleteSandboxResponse {
-                                        outcome: DeletionOutcome::Completed.into(),
-                                        ..DeleteSandboxResponse::default()
-                                    }))
-                                }
-                            }),
-                            req,
-                        )
-                        .await
-                    }
-                    _ => tonic::Status::unimplemented(req.uri().path().to_string()).into_http(),
-                })
-            })
-        }
-    }
-
     /// Drive `Gateway::create_sandbox` against a real gRPC server on a loopback port and return
     /// the create's outcome plus every name the server was asked to delete.
     fn create_against(
@@ -3086,29 +2986,13 @@ pYBZ
         phase: SandboxPhase,
     ) -> (Result<Option<String>>, Vec<String>) {
         let _guard = crate::test_support::env_lock();
-        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let fake = FakeGateway {
-            create,
-            phase,
-            deleted: deleted.clone(),
-        };
+        let fake = FakeGateway::new().creating(create).in_phase(phase);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         let result = rt.block_on(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(
-                tonic::transport::Server::builder()
-                    .add_service(fake)
-                    .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
-            );
-            let gw = Gateway {
-                channel: Endpoint::from_shared(format!("http://{addr}"))
-                    .unwrap()
-                    .connect_lazy(),
-            };
+            let gw = fake.serve().await;
             gw.create_sandbox(
                 "ci-leak",
                 None,
@@ -3119,8 +3003,7 @@ pYBZ
             )
             .await
         });
-        let deleted = deleted.lock().unwrap().clone();
-        (result, deleted)
+        (result, fake.deleted())
     }
 
     #[test]
@@ -3214,7 +3097,7 @@ pYBZ
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_imports_converge_on_one_write() {
         let profile = grant_profile("Kueue access with controller-issued agent tokens");
-        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gateway = FakeGateway::new().hold_first_reads(TURNS);
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| {
             let profile = profile.clone();
@@ -3234,7 +3117,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_updates_of_a_stale_profile_converge_on_one_write() {
-        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gateway = FakeGateway::new().hold_first_reads(TURNS);
         gateway.seed_profile(grant_profile("an older description"));
         let profile = grant_profile("the current description");
         let gw = gateway.serve().await;
@@ -3254,7 +3137,7 @@ pYBZ
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stored_token_grant_profile_matches_without_a_write() {
         let profile = grant_profile("Kueue access with controller-issued agent tokens");
-        let gateway = ProfileGateway::new();
+        let gateway = FakeGateway::new();
         gateway.seed_profile(profile.clone());
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| {
@@ -3267,7 +3150,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_profile_that_keeps_changing_fails_after_bounded_writes() {
-        let gateway = ProfileGateway::new().with_rival_writer();
+        let gateway = FakeGateway::new().with_rival_writer();
         gateway.seed_profile(grant_profile("an older description"));
         let gw = gateway.serve().await;
         let err = gw
@@ -3293,7 +3176,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rejected_import_fails_with_its_diagnostics() {
-        let gateway = ProfileGateway::new().rejecting_imports();
+        let gateway = FakeGateway::new().rejecting_imports();
         let gw = gateway.serve().await;
         let err = gw
             .ensure_provider_profile(grant_profile("Kueue access"))
@@ -3312,7 +3195,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn parallel_turns_on_a_fresh_gateway_share_one_token_grant_provider() {
-        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gateway = FakeGateway::new().hold_first_reads(TURNS);
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| async move {
             gw.ensure_provider_profile(grant_profile("Kueue access"))
@@ -3332,7 +3215,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_minted_providers_converge_on_one_create() {
-        let gateway = ProfileGateway::new();
+        let gateway = FakeGateway::new();
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| async move {
             gw.ensure_minted_provider("kueue", "kueue-grant").await
@@ -3350,7 +3233,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn creating_a_taken_provider_name_reports_it() {
-        let gateway = ProfileGateway::new();
+        let gateway = FakeGateway::new();
         gateway.seed_provider("broker");
         let gw = gateway.serve().await;
         let taken = gw
