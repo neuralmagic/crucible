@@ -256,13 +256,13 @@ mod tests {
             caller: Resolved::named("alice"),
             base: "https://crucible.example.com".to_string(),
         }));
-        crux::ops::draft_create(&client, "studio", "a drafted pack", None, false)
+        crux::ops::drafts::draft_create(&client, "studio", "a drafted pack", None, false)
             .await
             .expect("create");
         bind(&pool, "user:alice", "studio", "gh-token").await;
         bind(&pool, "user:bob", "studio", "bob-token").await;
 
-        let renamed = crux::ops::draft_rename(&client, "studio", "survey-v2", false)
+        let renamed = crux::ops::drafts::draft_rename(&client, "studio", "survey-v2", false)
             .await
             .expect("rename");
         assert_eq!(
@@ -272,7 +272,7 @@ mod tests {
              studio: https://crucible.example.com/playbooks/drafts/survey-v2\n"
         );
 
-        let cloned = crux::ops::draft_clone(&client, "survey-v2", "copy", None, false)
+        let cloned = crux::ops::drafts::draft_clone(&client, "survey-v2", "copy", None, false)
             .await
             .expect("clone");
         assert_eq!(
@@ -291,7 +291,7 @@ mod tests {
             "defaults to the source's"
         );
 
-        let taken = crux::ops::draft_rename(&client, "survey-v2", "copy", false)
+        let taken = crux::ops::drafts::draft_rename(&client, "survey-v2", "copy", false)
             .await
             .expect_err("the id is taken");
         assert!(taken.to_string().contains("409"), "{taken:#}");
@@ -303,7 +303,7 @@ mod tests {
         );
 
         assert_eq!(
-            crux::ops::draft_delete(&client, "copy")
+            crux::ops::drafts::draft_delete(&client, "copy")
                 .await
                 .expect("delete"),
             "deleted draft copy\n"
