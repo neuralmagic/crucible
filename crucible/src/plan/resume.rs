@@ -222,6 +222,9 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
                     return Err(ResumeError::NotAdmitted { task: task.clone() });
                 }
                 held.remove(task);
+                if let Some((node, _)) = task.split_once('[') {
+                    held.remove(node);
+                }
                 let Some(row) = settled_row(plan, event)? else {
                     continue;
                 };
@@ -639,7 +642,7 @@ mod tests {
                 .unwrap()
                 .spent_usd()
         };
-        let cases: [(&str, Vec<String>, f64); 5] = [
+        let cases: [(&str, Vec<String>, f64); 6] = [
             ("died mid-attempt", vec![started("discover", 1, 0.25)], 0.25),
             (
                 "settled by its row",
@@ -665,6 +668,11 @@ mod tests {
                     row("discover", "pass", 0.1),
                 ],
                 0.35,
+            ),
+            (
+                "a row named under its task settles what that task started",
+                vec![started("audit", 1, 0.25), row("audit[a]", "pass", 0.1)],
+                0.1,
             ),
             (
                 "died twice",

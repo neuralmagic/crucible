@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
-use crate::plan::admission::{Admission, BatchLane, Journal, Refusal, Settled, estimate_usd};
+use crate::plan::admission::{Admission, BatchLane, Journal, Refusal, Settled};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
     COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
@@ -1374,22 +1374,27 @@ pub fn execute(
                                 )?;
                                 continue;
                             }
-                            machines
-                                .entry(instance.name.clone())
-                                .or_default()
-                                .advance(TaskEvent::Dispatched)?;
-                            let (result, event, overrun) = run_with_retries(
+                            let (result, event, overrun) = run_one(
                                 instance,
-                                &item_inputs(&instance.name),
+                                item_inputs(&instance.name),
                                 cfg,
                                 run_ceiling,
                                 runner,
                                 &mut spent,
                                 budget,
                             );
-                            let result = noted(&instance.name, result);
                             overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
-                            runner.settled(instance, result.status == TaskStatus::Pass);
+                            let result = if result.attempts > 0 {
+                                machines
+                                    .entry(instance.name.clone())
+                                    .or_default()
+                                    .advance(TaskEvent::Dispatched)?;
+                                let result = noted(&instance.name, result);
+                                runner.settled(instance, result.status == TaskStatus::Pass);
+                                result
+                            } else {
+                                result
+                            };
                             settled.push((key.clone(), result.clone()));
                             record(
                                 &mut *runner,
@@ -1433,12 +1438,12 @@ pub fn execute(
                 }
                 None => Vec::new(),
             };
-            machines
-                .entry(t.name.clone())
-                .or_default()
-                .advance(TaskEvent::Dispatched)?;
             let (result, event, overrun) = match &t.task {
                 TaskKind::TopK { k, direction } => {
+                    machines
+                        .entry(t.name.clone())
+                        .or_default()
+                        .advance(TaskEvent::Dispatched)?;
                     let reduced = reduce_top_k(&inputs, *k, *direction);
                     let event = if reduced.status == TaskStatus::Pass {
                         TaskEvent::Passed
@@ -1451,6 +1456,10 @@ pub fn execute(
                     questions,
                     decider: Decider::Output { task: source },
                 } => {
+                    machines
+                        .entry(t.name.clone())
+                        .or_default()
+                        .advance(TaskEvent::Dispatched)?;
                     let decided = decide_from_output(&inputs, questions, source);
                     let event = if decided.status == TaskStatus::Pass {
                         TaskEvent::Passed
@@ -1468,13 +1477,31 @@ pub fn execute(
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
                 | TaskKind::Engine { .. } => {
-                    run_with_retries(t, &inputs, cfg, run_ceiling, runner, &mut spent, budget)
+                    let dispatched =
+                        run_one(t, inputs, cfg, run_ceiling, runner, &mut spent, budget);
+                    if dispatched.0.attempts > 0 {
+                        machines
+                            .entry(t.name.clone())
+                            .or_default()
+                            .advance(TaskEvent::Dispatched)?;
+                    }
+                    dispatched
                 }
             };
             let mut result = result;
             note_unparsed(&mut result, &unparsed);
             overrun.halt(t.stage, &mut halted, &mut plan_machine)?;
-            runner.settled(t, result.status == TaskStatus::Pass);
+            let engine_settled = matches!(
+                t.task,
+                TaskKind::TopK { .. }
+                    | TaskKind::Route {
+                        decider: Decider::Output { .. },
+                        ..
+                    }
+            );
+            if engine_settled || result.attempts > 0 {
+                runner.settled(t, result.status == TaskStatus::Pass);
+            }
             record(
                 &mut *runner,
                 t,
@@ -2182,14 +2209,9 @@ where
                                 }
                             }
                             let name = round_task(t, round);
-                            ledger
-                                .machines
-                                .entry(name.name.clone())
-                                .or_default()
-                                .advance(TaskEvent::Dispatched)?;
-                            let (result, event, overrun) = run_with_retries(
+                            let (result, event, overrun) = run_one(
                                 t,
-                                &inputs,
+                                inputs,
                                 cfg,
                                 ledger.run_ceiling,
                                 runner,
@@ -2197,7 +2219,14 @@ where
                                 ledger.budget,
                             );
                             overrun.halt(t.stage, ledger.halted, ledger.plan_machine)?;
-                            runner.settled(t, result.status == TaskStatus::Pass);
+                            if result.attempts > 0 {
+                                ledger
+                                    .machines
+                                    .entry(name.name.clone())
+                                    .or_default()
+                                    .advance(TaskEvent::Dispatched)?;
+                                runner.settled(t, result.status == TaskStatus::Pass);
+                            }
                             if cfg.early_completion
                                 && t.stage == Stage::Iteration
                                 && t.name != reviewer.name
@@ -2755,67 +2784,37 @@ fn transport_result(
     )
 }
 
-/// Run one task, retrying transport-class failures up to `cfg.transport_retries` times while
-/// the budget allows. Every attempt runs under its own deadline.
-fn run_with_retries(
+/// Run one task as a batch of one through [`run_batch_with_retries`].
+fn run_one(
     t: &Task,
-    inputs: &BTreeMap<TaskName, Value>,
+    inputs: BTreeMap<TaskName, Value>,
     cfg: ExecCfg<'_>,
     run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
     spent: &mut f64,
     budget: f64,
 ) -> (TaskResult, TaskEvent, Overrun) {
-    let max_attempts = 1 + cfg.transport_retries;
-    let mut attempts = 0;
-    let mut cost = 0.0;
-    let mut last_transport = TransportFailure::new(TransportCause::Other, String::new());
-    while attempts < max_attempts {
-        attempts += 1;
-        let deadline = Deadline::for_attempt(Instant::now(), t.timeout, run_ceiling);
-        runner.budget_left(budget - *spent);
-        if let Some(journal) = cfg.journal {
-            journal.started(&t.name, attempts, estimate_usd(t, budget, cfg.width));
-        }
-        let a = runner.run(t, attempts, inputs, deadline);
-        cost += a.cost_usd;
-        *spent += a.cost_usd;
-        let outcome = enforce_emits(t, a.outcome);
-        let mut overrun = Overrun::of(&outcome);
-        overrun.budget = *spent > budget;
-        match settle_attempt(outcome, attempts, cost, a.repairs) {
-            Ok((mut result, event)) => {
-                note_refused_completion(cfg, t, &mut result);
-                return (result, event, overrun);
-            }
-            Err(failure) => {
-                if t.task.spends()
-                    && (*spent > budget || (*spent >= budget && attempts < max_attempts))
-                {
-                    let (result, event) = transport_result(
-                        attempts,
-                        max_attempts,
-                        cost,
-                        &failure,
-                        Some(Refusal::CostCeiling),
-                    );
-                    overrun.budget = true;
-                    return (result, event, overrun);
-                }
-                last_transport = failure;
-            }
+    let item = BatchItem {
+        task: t,
+        attempt: 1,
+        inputs,
+    };
+    let (mut settled, overrun) =
+        run_batch_with_retries(vec![item], cfg, run_ceiling, runner, spent, budget);
+    match settled.pop() {
+        Some((_, result, event)) => (result, event, overrun),
+        None => {
+            let note = format!("dispatching {} returned no result", t.name);
+            let (result, event) = settle_attempt(AttemptOutcome::fail(note), 0, 0.0, Vec::new())
+                .unwrap_or_else(|failure| transport_result(0, 0, 0.0, &failure, None));
+            (result, event, overrun)
         }
     }
-    let (result, event) = transport_result(attempts, max_attempts, cost, &last_transport, None);
-    let overrun = Overrun {
-        budget: *spent > budget,
-        time: false,
-    };
-    (result, event, overrun)
 }
 
-/// Run a batch of isolated tasks through the runner's parallel path, retrying the transport
-/// failures as a smaller wave until every task has a result or retries run out. Every lane of a
+/// Run a batch of tasks, retrying the transport failures as a smaller wave until every task has
+/// a result or retries run out. A batch of one runs through [`TaskRunner::run`], a wider one
+/// through the runner's parallel path. Every lane of a
 /// wave is admitted against the run's ceilings as it starts, under its own deadline; a lane the
 /// ceilings refuse settles blocked, or, on a retry, as the transport failure it already had.
 fn run_batch_with_retries<'a>(
@@ -2827,6 +2826,7 @@ fn run_batch_with_retries<'a>(
     budget: f64,
 ) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, Overrun) {
     let max_attempts = 1 + cfg.transport_retries;
+    let single = batch.len() == 1;
     let mut done: BTreeMap<usize, (TaskResult, TaskEvent)> = BTreeMap::new();
     let mut cost_so_far: Vec<f64> = vec![0.0; batch.len()];
     let order: Vec<&'a Task> = batch.iter().map(|b| b.task).collect();
@@ -2849,7 +2849,12 @@ fn run_batch_with_retries<'a>(
         runner.budget_left(budget - *spent);
         let admission =
             Admission::new(budget, *spent, run_ceiling, cfg.width).journaled(cfg.journal);
-        let attempts = runner.run_many(&items, &admission);
+        let attempts = match items.as_slice() {
+            [only] if single => vec![admission.run(only, |lane| {
+                runner.run(only.task, only.attempt, &only.inputs, lane.deadline())
+            })],
+            _ => runner.run_many(&items, &admission),
+        };
         let mut attempted = Vec::new();
         for ((idx, item, previous), a) in wave.into_iter().zip(attempts) {
             match a {
