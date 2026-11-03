@@ -57,6 +57,7 @@ added = [
     "keyed: a mapped task may narrow an object field of an unmapped dependency to its own element's entry, and the admitted-plan event carries it (C-ROUTE-EACH)",
     "score questions: ordered levels answered by a per-level distribution and recorded with an engine-computed expected position; asked natively where the decision API has an ordered question and as a choice where it has none (C-ROUTE-SCORE)",
     "a route may put declared JSON files of its dependencies in the decision model's state (C-ROUTE-FILES)",
+    "[repo.overrides] and [agent.overrides]: static bounds on the refs and per-task agent settings a launch may change (C-MANIFEST)",
 ]
 changed = [
     "DSL grammar admits dictionaries, conditionals, comprehensions, iteration, user-defined functions, load() and the pure standard library",
@@ -77,6 +78,8 @@ changed = [
     "a decision binding may speak decisions, the OpenAI Decisions API, reached at OpenAI's address when it names no URL (C-INFERENCE, C-ROUTE)",
     "the capability a model-decided route needs is decision, not systemone, since it names the role rather than one API (C-ROUTE)",
     "C-ROUTE-EACH: the cost ceiling blocks only an element whose decision asks the decision model (RFC-0002:C-PLAYBOOK-BUDGET)",
+    "C-MANIFEST: [repo].ref follows git's ref-name rules and never begins with -; the clone fetches the ref and checks it out detached, and a ref that does not resolve fails setup instead of running on the default branch",
+    "C-WORKFLOW: a harness or effort no turn can read is rejected at validation instead of at dispatch",
     "C-ROUTE: an all-join task may declare a dependency optional, so one that settled not taken satisfies the join and gives no input entry; C-WORKFLOW adds the optional constructor",
     "C-MANIFEST: a manifest may declare [variant.<name>] tables; a run that names one reads its top-level tables in place of the base's, and every variant is validated on load",
 ]

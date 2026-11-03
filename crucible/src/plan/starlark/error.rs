@@ -159,6 +159,11 @@ pub enum CompileError {
     ParamsNotLiteral { detail: String },
     #[error("parameter {param:?} declares no type")]
     ParamNeedsType { param: String },
+    #[error(
+        "parameter {param:?} contains a dot; a launch addresses an agent task's setting as \
+         <task>.<setting>, so a declared name cannot"
+    )]
+    ParamNameHasDot { param: String },
     #[error("parameter {param:?} field {field} must be {expected}")]
     ParamFieldWrongShape {
         param: String,

@@ -1823,6 +1823,7 @@ mod tests {
                 harness: Some(crate::manifest::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
+            crate::cli::setup::Start::Fresh,
         )
         .unwrap();
         assert_eq!(overridden.args.harness(), crate::manifest::Harness::Codex);
@@ -1837,6 +1838,208 @@ mod tests {
             "the toolbox lands in the override harness's skills dir"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A launch's agent settings reach each task's turn through the real setup path:
+    /// `*.<setting>` fills what a task leaves unset, `<task>.<setting>` replaces what it sets, and
+    /// a run-wide flag still decides what neither a task nor a launch value does.
+    #[test]
+    fn launch_settings_reach_each_tasks_turn() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-plan-launch-settings-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [agent.overrides]
+            allow = ["harness", "model", "effort"]
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+plan = agent(name = "plan", prompt = "p")
+review = agent(name = "review", prompt = "r", model = "authored-review", effort = "low", depends_on = [plan])
+ship = agent(name = "ship", prompt = "s", model = "authored-ship", depends_on = [review])
+workflow(type = "playbook", tasks = [plan, review, ship])
+"#,
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+        let params = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let turns = |pairs: &[(&str, &str)], flags: crate::args::AgentOverride| {
+            let (runner, m) = crate::cli::setup::prep_plan_runner_with_params(
+                &manifest,
+                None,
+                &params(pairs),
+                crate::openshell::gateway::ComputeDriver::Podman,
+                flags,
+                crate::cli::setup::Start::Fresh,
+            )
+            .unwrap();
+            m.workflow
+                .as_ref()
+                .unwrap()
+                .tasks
+                .iter()
+                .map(|t| {
+                    let a = resolved_agent(&runner.args, t).expect("an agent task");
+                    (t.name.0.clone(), (a.harness, a.model, a.effort))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let turn = |harness: &str, model: &str, effort: &str| {
+            (harness.to_string(), model.to_string(), effort.to_string())
+        };
+
+        let launched = turns(
+            &[
+                ("*.model", "launched-all"),
+                ("*.effort", "high"),
+                ("review.model", "launched-review"),
+                ("ship.harness", "opencode"),
+            ],
+            crate::args::AgentOverride::default(),
+        );
+        assert_eq!(launched["plan"], turn("claude", "launched-all", "high"));
+        assert_eq!(
+            launched["review"],
+            turn("claude", "launched-review", "low"),
+            "the task's own effort beats *.effort; review.model beats its own model"
+        );
+        assert_eq!(launched["ship"], turn("opencode", "authored-ship", "high"));
+
+        let flagged = turns(
+            &[("review.model", "launched-review")],
+            crate::args::AgentOverride {
+                harness: None,
+                model: Some("flag-model".into()),
+            },
+        );
+        assert_eq!(
+            flagged["plan"],
+            turn("claude", "flag-model", "medium"),
+            "the run-wide flag decides what nothing else sets"
+        );
+        assert_eq!(flagged["review"].1, "launched-review");
+        assert_eq!(flagged["ship"].1, "authored-ship");
+
+        let twice = crate::cli::setup::prep_plan_runner_with_params(
+            &manifest,
+            None,
+            &params(&[("*.model", "launched-all")]),
+            crate::openshell::gateway::ComputeDriver::Podman,
+            crate::args::AgentOverride {
+                harness: None,
+                model: Some("flag-model".into()),
+            },
+            crate::cli::setup::Start::Fresh,
+        )
+        .map(|_| ())
+        .expect_err("one setting, two run-wide sources");
+        assert!(twice.to_string().contains("model twice"), "{twice:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A launched ref is checked out on a fresh run, refused on a workspace a fresh run did not
+    /// clone, left to the recorded commit on a run that continues one, and, as a commit, kept
+    /// only when a branch or tag the pack admits holds it.
+    #[test]
+    fn a_launched_ref_is_checked_out_where_the_pack_admits_it() {
+        let origin = crate::testing::git_origin("launch-ref");
+        let dir = crate::testing::tempdir("launch-ref-pack");
+        let pack = |refs: &str| {
+            std::fs::write(
+                dir.join("crucible.toml"),
+                format!(
+                    "[repo]\npath = {:?}\n[repo.overrides]\nrefs = {refs}\n\
+                     [workspace]\ndir = \"workspace\"\n\
+                     [agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n\
+                     [workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n",
+                    origin.path.display().to_string()
+                ),
+            )
+            .unwrap();
+        };
+        std::fs::write(
+            dir.join("workflow.star"),
+            "a = agent(name = \"a\", prompt = \"p\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+        let workspace = dir.join("workspace");
+        let prep = |r: &str, start: crate::cli::setup::Start| {
+            crate::cli::setup::prep_plan_runner_with_params(
+                &manifest,
+                None,
+                &BTreeMap::from([("repo.ref".to_string(), r.to_string())]),
+                crate::openshell::gateway::ComputeDriver::Podman,
+                crate::args::AgentOverride::default(),
+                start,
+            )
+            .map(|_| ())
+        };
+        use crate::cli::setup::Start::{Continues, Fresh};
+
+        pack("[\"feature/*\"]");
+        prep("refs/heads/feature/x", Fresh).expect("a launched branch");
+        assert_eq!(
+            crate::testing::checked_out(&workspace),
+            (origin.feature.clone(), true)
+        );
+        let err = prep("feature/x", Fresh).expect_err("the workspace already exists");
+        assert!(
+            format!("{err:#}").contains("needs a fresh checkout"),
+            "{err:#}"
+        );
+        prep("feature/x", Continues).expect("a resume or rerun keeps its recorded commit");
+        let err = prep("main", Continues).expect_err("checked before the workspace is looked at");
+        assert!(
+            format!("{err:#}").contains("no [repo.overrides].refs pattern"),
+            "{err:#}"
+        );
+
+        std::fs::remove_dir_all(&workspace).unwrap();
+        prep(&origin.main, Fresh).expect("main's commit is in feature/x's history");
+        assert_eq!(crate::testing::checked_out(&workspace).0, origin.main);
+
+        std::fs::remove_dir_all(&workspace).unwrap();
+        let err = prep(&origin.dangling, Fresh).expect_err("no ref holds it");
+        assert!(
+            format!("{err:#}").contains("is on no branch or tag"),
+            "{err:#}"
+        );
+        assert!(!workspace.exists(), "a refused clone is removed");
+
+        pack("[\"release/*\"]");
+        let err = prep(&origin.feature, Fresh).expect_err("only feature/x holds it");
+        assert!(format!("{err:#}").contains("[feature/x]"), "{err:#}");
+        assert!(!workspace.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&origin.path);
     }
 
     /// A serial producer's declared file has to reach an isolated consumer, whose worktree is a
@@ -4817,6 +5020,7 @@ workflow(type = "playbook", tasks = [echo])
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
+            crate::cli::setup::Start::Fresh,
         )
         .unwrap()
         .0;
