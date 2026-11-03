@@ -443,6 +443,11 @@ impl CrucibleMcp {
         }
     }
 
+    /// Every tool as `tools/list` returns it.
+    pub fn tools() -> Vec<rmcp::model::Tool> {
+        Self::tool_router().list_all()
+    }
+
     #[tool(
         description = "List controller issues as a compact table: KEY STATUS TIER REF CONTRACT \
         UPSTREAM TITLE. Scenario issues have no upstream. Filter by kind/status; newest first, \

@@ -684,6 +684,11 @@ enum Command {
     },
 }
 
+/// The CLI definition, for the surface fixture test.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
+}
+
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let cfg = cli.connect.resolve()?;

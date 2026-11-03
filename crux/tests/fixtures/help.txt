@@ -1,0 +1,3344 @@
+==== crux --help ====
+A token-frugal CLI for the crucible controller API, and the MCP tool surface the controller hosts.
+
+Usage: crux [OPTIONS] <COMMAND>
+
+Commands:
+  whoami                Who the controller thinks you are, and how you got there
+  playbooks             List registered playbooks: what `launch` can start
+  playbook-caps         The admin caps on `--max-cost` and `--max-time`. Read before `launch` or `draft-launch`
+  playbook-schema       The JSON Schema a playbook's params are validated against. Read before `launch`
+  launch                Launch a playbook. Costs money against --max-cost
+  playbook-runs         Playbook launches: key, playbook, status, count, cost against cap, and what stopped one
+  playbook-run          One playbook launch whole, as JSON
+  runs                  The runs leaderboard
+  run                   One run with its candidates, as JSON
+  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
+  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  watch                 One tracker watch, as JSON
+  webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
+  webhook               One webhook, as JSON
+  webhook-deliveries    A webhook's recorded deliveries, newest first, with how each settled
+  provider-create       Register a provider from a JSON body (`POST /api/providers`)
+  provider-update       Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`)
+  provider-delete       Deregister a provider and every default naming it. Refused while issues or schedules pin it; `provider-update` with `"enabled": false` retires one that work still names
+  dispatch-defaults     The provider each scope's unpinned dispatches take, per workload class, and its fallback
+  dispatch-default-set  Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only
+  webhook-check         Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save does. Prints `ok`, or fails with one `field:line:col: message` per refusal
+  webhook-presets       Starting points for a webhook body: a sender's verifier and a transform, as JSON
+  webhook-create        Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once
+  webhook-update        Replace a webhook from a JSON body. Its verifier and secret stay as created
+  webhook-resume        Resume a paused webhook: its address takes deliveries again
+  webhook-pause         Pause a webhook: its address answers not found and its queued deliveries fail
+  webhook-rotate        Replace a webhook's secret and print the new one, once
+  webhook-delete        
+  webhook-preview       Run a transform on a sample delivery from a JSON body; nothing is stored
+  issues                List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title
+  issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the event trail
+  adopt                 Adopt a scenario: a controller issue with no upstream
+  park                  Park an issue: stop working it, and record why
+  unpark                Unpark an issue so the controller picks it up again
+  bump                  Change an issue's priority. Higher runs sooner
+  reconcile             Wake the controller's reconcile loop. A full pass, not one issue
+  redispatch            Re-dispatch an issue's run. Costs money
+  turns                 List work-pod turns
+  turn                  One turn, with its result and error text intact
+  graph                 A run's task graph in dependency order, each task with its latest status
+  deployed              Which build the controller is running, and whether it is the commit you expected
+  run-log               One window of a run's engine output, resumable by cursor
+  run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
+  run-file              One captured file's content, by the key `run-files` listed it under
+  contracts             The broker contract names this controller accepts
+  approve               Approve a scenario or jira issue's scope pack
+  approval-detail       One issue's approval gate: the PR to act on and the pack digest under it
+  approvals             Every scope currently awaiting approval, plus the PRs already kept
+  playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an admin registers
+  draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
+  draft-save            Save a draft pack version from a `{path: content}` JSON map
+  draft-pull            Write a draft pack into a directory, to edit it in your own editor
+  draft-push            Save a directory back as the next draft version. The whole tree is the save
+  providers             List the inference providers you may read: id, kind, default model, harness, the price per million tokens a run on it is charged, and whether launches may pick it
+  secrets               List the secrets you own: id, name, kind, visibility, mode, owner. Never a value
+  secret-create         Register a secret. The value is read from piped stdin, never from an argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value
+  secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it. One scope flag and one projection flag
+  draft-preview         What a draft version compiled to: its schema digest and diagnostics, without launching it
+  draft-launch          Test-fire a draft's newest save. Costs money against --max-cost
+  draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
+  draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
+  draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
+  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
+  help                  Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+
+  -V, --version
+          Print version
+==== crux -h ====
+A token-frugal CLI for the crucible controller API, and the MCP tool surface the controller hosts.
+
+Usage: crux [OPTIONS] <COMMAND>
+
+Commands:
+  whoami                Who the controller thinks you are, and how you got there
+  playbooks             List registered playbooks: what `launch` can start
+  playbook-caps         The admin caps on `--max-cost` and `--max-time`. Read before `launch` or `draft-launch`
+  playbook-schema       The JSON Schema a playbook's params are validated against. Read before `launch`
+  launch                Launch a playbook. Costs money against --max-cost
+  playbook-runs         Playbook launches: key, playbook, status, count, cost against cap, and what stopped one
+  playbook-run          One playbook launch whole, as JSON
+  runs                  The runs leaderboard
+  run                   One run with its candidates, as JSON
+  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
+  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  watch                 One tracker watch, as JSON
+  webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
+  webhook               One webhook, as JSON
+  webhook-deliveries    A webhook's recorded deliveries, newest first, with how each settled
+  provider-create       Register a provider from a JSON body (`POST /api/providers`)
+  provider-update       Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`)
+  provider-delete       Deregister a provider and every default naming it. Refused while issues or schedules pin it; `provider-update` with `"enabled": false` retires one that work still names
+  dispatch-defaults     The provider each scope's unpinned dispatches take, per workload class, and its fallback
+  dispatch-default-set  Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only
+  webhook-check         Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save does. Prints `ok`, or fails with one `field:line:col: message` per refusal
+  webhook-presets       Starting points for a webhook body: a sender's verifier and a transform, as JSON
+  webhook-create        Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once
+  webhook-update        Replace a webhook from a JSON body. Its verifier and secret stay as created
+  webhook-resume        Resume a paused webhook: its address takes deliveries again
+  webhook-pause         Pause a webhook: its address answers not found and its queued deliveries fail
+  webhook-rotate        Replace a webhook's secret and print the new one, once
+  webhook-delete        
+  webhook-preview       Run a transform on a sample delivery from a JSON body; nothing is stored
+  issues                List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title
+  issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the event trail
+  adopt                 Adopt a scenario: a controller issue with no upstream
+  park                  Park an issue: stop working it, and record why
+  unpark                Unpark an issue so the controller picks it up again
+  bump                  Change an issue's priority. Higher runs sooner
+  reconcile             Wake the controller's reconcile loop. A full pass, not one issue
+  redispatch            Re-dispatch an issue's run. Costs money
+  turns                 List work-pod turns
+  turn                  One turn, with its result and error text intact
+  graph                 A run's task graph in dependency order, each task with its latest status
+  deployed              Which build the controller is running, and whether it is the commit you expected
+  run-log               One window of a run's engine output, resumable by cursor
+  run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
+  run-file              One captured file's content, by the key `run-files` listed it under
+  contracts             The broker contract names this controller accepts
+  approve               Approve a scenario or jira issue's scope pack
+  approval-detail       One issue's approval gate: the PR to act on and the pack digest under it
+  approvals             Every scope currently awaiting approval, plus the PRs already kept
+  playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an admin registers
+  draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
+  draft-save            Save a draft pack version from a `{path: content}` JSON map
+  draft-pull            Write a draft pack into a directory, to edit it in your own editor
+  draft-push            Save a directory back as the next draft version. The whole tree is the save
+  providers             List the inference providers you may read: id, kind, default model, harness, the price per million tokens a run on it is charged, and whether launches may pick it
+  secrets               List the secrets you own: id, name, kind, visibility, mode, owner. Never a value
+  secret-create         Register a secret. The value is read from piped stdin, never from an argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value
+  secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it. One scope flag and one projection flag
+  draft-preview         What a draft version compiled to: its schema digest and diagnostics, without launching it
+  draft-launch          Test-fire a draft's newest save. Costs money against --max-cost
+  draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
+  draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
+  draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
+  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
+  help                  Print this message or the help of the given subcommand(s)
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+  -V, --version                Print version
+==== crux whoami --help ====
+Who the controller thinks you are, and how you got there
+
+Usage: crux whoami [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux whoami -h ====
+Who the controller thinks you are, and how you got there
+
+Usage: crux whoami [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux playbooks --help ====
+List registered playbooks: what `launch` can start
+
+Usage: crux playbooks [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux playbooks -h ====
+List registered playbooks: what `launch` can start
+
+Usage: crux playbooks [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux playbook-caps --help ====
+The admin caps on `--max-cost` and `--max-time`. Read before `launch` or `draft-launch`
+
+Usage: crux playbook-caps [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux playbook-caps -h ====
+The admin caps on `--max-cost` and `--max-time`. Read before `launch` or `draft-launch`
+
+Usage: crux playbook-caps [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux playbook-schema --help ====
+The JSON Schema a playbook's params are validated against. Read before `launch`
+
+Usage: crux playbook-schema [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Playbook id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux playbook-schema -h ====
+The JSON Schema a playbook's params are validated against. Read before `launch`
+
+Usage: crux playbook-schema [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Playbook id
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux launch --help ====
+Launch a playbook. Costs money against --max-cost
+
+Usage: crux launch [OPTIONS] --max-cost <MAX_COST> --max-time <MAX_TIME> <ID>
+
+Arguments:
+  <ID>
+          Playbook id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --params <PARAMS>
+          The params object its schema accepts, as JSON
+          
+          [default: {}]
+
+      --max-cost <MAX_COST>
+          Dollar ceiling for this launch
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --max-time <MAX_TIME>
+          Wall-clock ceiling, e.g. 30m, 2h
+
+      --dispatch-target <DISPATCH_TARGET>
+          Cluster to dispatch onto. Omit for the controller's default
+
+      --provider <PROVIDER>
+          Registered inference provider the run's agent talks to, replacing the pack manifest's `[agent]` harness. Omit to resolve through the configured defaults
+
+      --model <MODEL>
+          The model to ask that provider for. Needs --provider; omit for its default
+
+      --rerun-of <RUN>
+          Rerun this finished run of the same pack instead of starting afresh: every task it passed is reused, and the tasks --from names run again with everything after them
+
+      --from <TASK>
+          A task the rerun dispatches again, with everything downstream of it. Repeatable
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux launch -h ====
+Launch a playbook. Costs money against --max-cost
+
+Usage: crux launch [OPTIONS] --max-cost <MAX_COST> --max-time <MAX_TIME> <ID>
+
+Arguments:
+  <ID>  Playbook id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --params <PARAMS>
+          The params object its schema accepts, as JSON [default: {}]
+      --max-cost <MAX_COST>
+          Dollar ceiling for this launch
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --max-time <MAX_TIME>
+          Wall-clock ceiling, e.g. 30m, 2h
+      --dispatch-target <DISPATCH_TARGET>
+          Cluster to dispatch onto. Omit for the controller's default
+      --provider <PROVIDER>
+          Registered inference provider the run's agent talks to, replacing the pack manifest's `[agent]` harness. Omit to resolve through the configured defaults
+      --model <MODEL>
+          The model to ask that provider for. Needs --provider; omit for its default
+      --rerun-of <RUN>
+          Rerun this finished run of the same pack instead of starting afresh: every task it passed is reused, and the tasks --from names run again with everything after them
+      --from <TASK>
+          A task the rerun dispatches again, with everything downstream of it. Repeatable
+      --json
+          
+  -h, --help
+          Print help
+==== crux playbook-runs --help ====
+Playbook launches: key, playbook, status, count, cost against cap, and what stopped one
+
+Usage: crux playbook-runs [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --status <STATUS>
+          
+
+      --playbook <PLAYBOOK>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux playbook-runs -h ====
+Playbook launches: key, playbook, status, count, cost against cap, and what stopped one
+
+Usage: crux playbook-runs [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --status <STATUS>        
+      --playbook <PLAYBOOK>    
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --json                   
+  -h, --help                   Print help
+==== crux playbook-run --help ====
+One playbook launch whole, as JSON
+
+Usage: crux playbook-run [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          Issue key the launch became
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux playbook-run -h ====
+One playbook launch whole, as JSON
+
+Usage: crux playbook-run [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  Issue key the launch became
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux runs --help ====
+The runs leaderboard
+
+Usage: crux runs [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --status <STATUS>
+          
+
+      --repo <REPO>
+          Repository, owner/repo
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --dispatch-target <DISPATCH_TARGET>
+          Only runs dispatched to this cluster target
+
+      --limit <LIMIT>
+          
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux runs -h ====
+The runs leaderboard
+
+Usage: crux runs [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --status <STATUS>
+          
+      --repo <REPO>
+          Repository, owner/repo
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --dispatch-target <DISPATCH_TARGET>
+          Only runs dispatched to this cluster target
+      --limit <LIMIT>
+          
+      --json
+          
+  -h, --help
+          Print help
+==== crux run --help ====
+One run with its candidates, as JSON
+
+Usage: crux run [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux run -h ====
+One run with its candidates, as JSON
+
+Usage: crux run [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux schedules --help ====
+Recurrences: what fires when, and what is blocked on an owner signing in
+
+Usage: crux schedules [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux schedules -h ====
+Recurrences: what fires when, and what is blocked on an owner signing in
+
+Usage: crux schedules [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux watches --help ====
+Tracker watches: what each sweeps, and what is blocked on an owner signing in
+
+Usage: crux watches [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux watches -h ====
+Tracker watches: what each sweeps, and what is blocked on an owner signing in
+
+Usage: crux watches [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux watch --help ====
+One tracker watch, as JSON
+
+Usage: crux watch [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux watch -h ====
+One tracker watch, as JSON
+
+Usage: crux watch [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhooks --help ====
+Webhooks: what each launches, how it verifies, and when it last took a delivery
+
+Usage: crux webhooks [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhooks -h ====
+Webhooks: what each launches, how it verifies, and when it last took a delivery
+
+Usage: crux webhooks [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook --help ====
+One webhook, as JSON
+
+Usage: crux webhook [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook -h ====
+One webhook, as JSON
+
+Usage: crux webhook [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-deliveries --help ====
+A webhook's recorded deliveries, newest first, with how each settled
+
+Usage: crux webhook-deliveries [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --before <BEFORE>
+          Only deliveries recorded before this delivery id: the last id of the previous page
+
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --limit <LIMIT>
+          Page size, at most 200
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux webhook-deliveries -h ====
+A webhook's recorded deliveries, newest first, with how each settled
+
+Usage: crux webhook-deliveries [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --before <BEFORE>        Only deliveries recorded before this delivery id: the last id of the previous page
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --limit <LIMIT>          Page size, at most 200
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --json                   
+  -h, --help                   Print help
+==== crux provider-create --help ====
+Register a provider from a JSON body (`POST /api/providers`)
+
+Usage: crux provider-create [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --file <FILE>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux provider-create -h ====
+Register a provider from a JSON body (`POST /api/providers`)
+
+Usage: crux provider-create [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --file <FILE>            
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux provider-update --help ====
+Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`)
+
+Usage: crux provider-update [OPTIONS] --file <FILE> <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --file <FILE>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux provider-update -h ====
+Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`)
+
+Usage: crux provider-update [OPTIONS] --file <FILE> <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --file <FILE>            
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux provider-delete --help ====
+Deregister a provider and every default naming it. Refused while issues or schedules pin it; `provider-update` with `"enabled": false` retires one that work still names
+
+Usage: crux provider-delete [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux provider-delete -h ====
+Deregister a provider and every default naming it. Refused while issues or schedules pin it; `provider-update` with `"enabled": false` retires one that work still names
+
+Usage: crux provider-delete [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux dispatch-defaults --help ====
+The provider each scope's unpinned dispatches take, per workload class, and its fallback
+
+Usage: crux dispatch-defaults [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux dispatch-defaults -h ====
+The provider each scope's unpinned dispatches take, per workload class, and its fallback
+
+Usage: crux dispatch-defaults [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux dispatch-default-set --help ====
+Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only
+
+Usage: crux dispatch-default-set [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --file <FILE>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux dispatch-default-set -h ====
+Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only
+
+Usage: crux dispatch-default-set [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --file <FILE>            
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-check --help ====
+Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save does. Prints `ok`, or fails with one `field:line:col: message` per refusal
+
+Usage: crux webhook-check [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --file <FILE>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-check -h ====
+Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save does. Prints `ok`, or fails with one `field:line:col: message` per refusal
+
+Usage: crux webhook-check [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --file <FILE>            
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-presets --help ====
+Starting points for a webhook body: a sender's verifier and a transform, as JSON
+
+Usage: crux webhook-presets [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-presets -h ====
+Starting points for a webhook body: a sender's verifier and a transform, as JSON
+
+Usage: crux webhook-presets [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-create --help ====
+Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once
+
+Usage: crux webhook-create [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --file <FILE>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-create -h ====
+Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once
+
+Usage: crux webhook-create [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --file <FILE>            
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-update --help ====
+Replace a webhook from a JSON body. Its verifier and secret stay as created
+
+Usage: crux webhook-update [OPTIONS] --file <FILE> <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --file <FILE>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-update -h ====
+Replace a webhook from a JSON body. Its verifier and secret stay as created
+
+Usage: crux webhook-update [OPTIONS] --file <FILE> <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --file <FILE>            
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-resume --help ====
+Resume a paused webhook: its address takes deliveries again
+
+Usage: crux webhook-resume [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-resume -h ====
+Resume a paused webhook: its address takes deliveries again
+
+Usage: crux webhook-resume [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-pause --help ====
+Pause a webhook: its address answers not found and its queued deliveries fail
+
+Usage: crux webhook-pause [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-pause -h ====
+Pause a webhook: its address answers not found and its queued deliveries fail
+
+Usage: crux webhook-pause [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-rotate --help ====
+Replace a webhook's secret and print the new one, once
+
+Usage: crux webhook-rotate [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-rotate -h ====
+Replace a webhook's secret and print the new one, once
+
+Usage: crux webhook-rotate [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-delete --help ====
+Usage: crux webhook-delete [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-delete -h ====
+Usage: crux webhook-delete [OPTIONS] <ID>
+
+Arguments:
+  <ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux webhook-preview --help ====
+Run a transform on a sample delivery from a JSON body; nothing is stored
+
+Usage: crux webhook-preview [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --file <FILE>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux webhook-preview -h ====
+Run a transform on a sample delivery from a JSON body; nothing is stored
+
+Usage: crux webhook-preview [OPTIONS] --file <FILE>
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --file <FILE>            
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux issues --help ====
+List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title
+
+Usage: crux issues [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --kind <KIND>
+          Input kind: github | scenario | jira
+
+      --status <STATUS>
+          Status: new | scoped | awaiting-approval | building | running | pr-open | parked | done
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --limit <LIMIT>
+          Max rows. Default 50, applied client-side
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux issues -h ====
+List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title
+
+Usage: crux issues [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --kind <KIND>            Input kind: github | scenario | jira
+      --status <STATUS>        Status: new | scoped | awaiting-approval | building | running | pr-open | parked | done
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --limit <LIMIT>          Max rows. Default 50, applied client-side
+      --json                   
+  -h, --help                   Print help
+==== crux issue --help ====
+One issue in full: provenance, the whole park reason, scopes, runs, and the event trail
+
+Usage: crux issue [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          Issue key, e.g. owner/repo#12 or scenario:<uuid>. Encoding is handled for you
+
+Options:
+      --body-max <BODY_MAX>
+          Cut the issue body at this many chars
+          
+          [default: 6000]
+
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux issue -h ====
+One issue in full: provenance, the whole park reason, scopes, runs, and the event trail
+
+Usage: crux issue [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  Issue key, e.g. owner/repo#12 or scenario:<uuid>. Encoding is handled for you
+
+Options:
+      --body-max <BODY_MAX>    Cut the issue body at this many chars [default: 6000]
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux adopt --help ====
+Adopt a scenario: a controller issue with no upstream
+
+Usage: crux adopt [OPTIONS] --title <TITLE> --repo <REPOS> --justification <JUSTIFICATION>
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --title <TITLE>
+          
+
+      --body <BODY>
+          The ask, as prose. `-` reads stdin; otherwise it is a path to read
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --body-text <BODY_TEXT>
+          The ask, inline. Use --body for anything longer than a sentence
+
+      --repo <REPOS>
+          A repo this touches. Repeat for several; the first is the clone target
+
+      --justification <JUSTIFICATION>
+          Why the controller should spend money on this
+
+      --authoritative
+          Treat the body as authoritative (skips grounded ranking)
+
+      --git-ref <GIT_REF>
+          Branch or tag to clone. Omit for the repo's default branch
+
+      --codegen-contract <CODEGEN_CONTRACT>
+          A configured broker contract (see `contracts`). Omit for local measure
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux adopt -h ====
+Adopt a scenario: a controller issue with no upstream
+
+Usage: crux adopt [OPTIONS] --title <TITLE> --repo <REPOS> --justification <JUSTIFICATION>
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --title <TITLE>
+          
+      --body <BODY>
+          The ask, as prose. `-` reads stdin; otherwise it is a path to read
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --body-text <BODY_TEXT>
+          The ask, inline. Use --body for anything longer than a sentence
+      --repo <REPOS>
+          A repo this touches. Repeat for several; the first is the clone target
+      --justification <JUSTIFICATION>
+          Why the controller should spend money on this
+      --authoritative
+          Treat the body as authoritative (skips grounded ranking)
+      --git-ref <GIT_REF>
+          Branch or tag to clone. Omit for the repo's default branch
+      --codegen-contract <CODEGEN_CONTRACT>
+          A configured broker contract (see `contracts`). Omit for local measure
+      --json
+          
+  -h, --help
+          Print help
+==== crux park --help ====
+Park an issue: stop working it, and record why
+
+Usage: crux park [OPTIONS] --reason <REASON> <KEY>
+
+Arguments:
+  <KEY>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --reason <REASON>
+          
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux park -h ====
+Park an issue: stop working it, and record why
+
+Usage: crux park [OPTIONS] --reason <REASON> <KEY>
+
+Arguments:
+  <KEY>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --reason <REASON>        
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux unpark --help ====
+Unpark an issue so the controller picks it up again
+
+Usage: crux unpark [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --reason <REASON>
+          
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux unpark -h ====
+Unpark an issue so the controller picks it up again
+
+Usage: crux unpark [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --reason <REASON>        
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux bump --help ====
+Change an issue's priority. Higher runs sooner
+
+Usage: crux bump [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --priority <PRIORITY>
+          [default: 100]
+
+      --reason <REASON>
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux bump -h ====
+Change an issue's priority. Higher runs sooner
+
+Usage: crux bump [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --priority <PRIORITY>    [default: 100]
+      --reason <REASON>        
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --json                   
+  -h, --help                   Print help
+==== crux reconcile --help ====
+Wake the controller's reconcile loop. A full pass, not one issue
+
+Usage: crux reconcile [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux reconcile -h ====
+Wake the controller's reconcile loop. A full pass, not one issue
+
+Usage: crux reconcile [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux redispatch --help ====
+Re-dispatch an issue's run. Costs money
+
+Usage: crux redispatch [OPTIONS] --justification <JUSTIFICATION> <KEY>
+
+Arguments:
+  <KEY>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --justification <JUSTIFICATION>
+          
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux redispatch -h ====
+Re-dispatch an issue's run. Costs money
+
+Usage: crux redispatch [OPTIONS] --justification <JUSTIFICATION> <KEY>
+
+Arguments:
+  <KEY>  
+
+Options:
+      --config <CONFIG>                Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --justification <JUSTIFICATION>  
+      --json                           
+      --url <URL>                      Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                           Print help
+==== crux turns --help ====
+List work-pod turns
+
+Usage: crux turns [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --issue <ISSUE>
+          Only turns for this issue key
+
+      --kind <KIND>
+          Work kind: grounded-rank | scope | run
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --state <STATE>
+          Lifecycle state: queued | running | succeeded | failed | collected | swept
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux turns -h ====
+List work-pod turns
+
+Usage: crux turns [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --issue <ISSUE>          Only turns for this issue key
+      --kind <KIND>            Work kind: grounded-rank | scope | run
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --state <STATE>          Lifecycle state: queued | running | succeeded | failed | collected | swept
+      --json                   
+  -h, --help                   Print help
+==== crux turn --help ====
+One turn, with its result and error text intact
+
+Usage: crux turn [OPTIONS] <POD>
+
+Arguments:
+  <POD>
+          The turn's pod name
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux turn -h ====
+One turn, with its result and error text intact
+
+Usage: crux turn [OPTIONS] <POD>
+
+Arguments:
+  <POD>  The turn's pod name
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux graph --help ====
+A run's task graph in dependency order, each task with its latest status
+
+Usage: crux graph [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --mermaid
+          Emit a mermaid flowchart instead of the ASCII table
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux graph -h ====
+A run's task graph in dependency order, each task with its latest status
+
+Usage: crux graph [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --mermaid                Emit a mermaid flowchart instead of the ASCII table
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux deployed --help ====
+Which build the controller is running, and whether it is the commit you expected.
+
+With --expect it is a gate: exits non-zero when the commit you named is not the one answering, so a deploy step can stop instead of reporting success it did not verify. Pass a full sha, e.g. `crux deployed --expect $(git rev-parse HEAD)`.
+
+Usage: crux deployed [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --expect <EXPECT>
+          The commit you expect to be running. Compared by prefix, so a short sha works
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help (see a summary with '-h')
+==== crux deployed -h ====
+Which build the controller is running, and whether it is the commit you expected
+
+Usage: crux deployed [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --expect <EXPECT>        The commit you expect to be running. Compared by prefix, so a short sha works
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help (see more with '--help')
+==== crux run-log --help ====
+One window of a run's engine output, resumable by cursor
+
+Usage: crux run-log [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --cursor <CURSOR>
+          Line to resume from, as the previous window's `cursor=` line reported it
+          
+          [default: 0]
+
+      --limit <LIMIT>
+          Lines in this window. Capped at 200, which is also the default
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -f, --follow
+          Keep printing new lines until the run is no longer running
+
+      --interval <INTERVAL>
+          Seconds between polls under --follow
+          
+          [default: 5]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux run-log -h ====
+One window of a run's engine output, resumable by cursor
+
+Usage: crux run-log [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --cursor <CURSOR>        Line to resume from, as the previous window's `cursor=` line reported it [default: 0]
+      --limit <LIMIT>          Lines in this window. Capped at 200, which is also the default
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -f, --follow                 Keep printing new lines until the run is no longer running
+      --interval <INTERVAL>    Seconds between polls under --follow [default: 5]
+      --json                   
+  -h, --help                   Print help
+==== crux run-files --help ====
+The files a run's tasks captured: what the run produced, as opposed to what it narrated
+
+Usage: crux run-files [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux run-files -h ====
+The files a run's tasks captured: what the run produced, as opposed to what it narrated
+
+Usage: crux run-files [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux run-file --help ====
+One captured file's content, by the key `run-files` listed it under
+
+Usage: crux run-file [OPTIONS] <RUN_ID> <KEY>
+
+Arguments:
+  <RUN_ID>
+          
+
+  <KEY>
+          `<task>/<declared path>`, fan-out brackets included
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --out <OUT>
+          Write the content here instead of to stdout. Required for a file that is not text
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux run-file -h ====
+One captured file's content, by the key `run-files` listed it under
+
+Usage: crux run-file [OPTIONS] <RUN_ID> <KEY>
+
+Arguments:
+  <RUN_ID>  
+  <KEY>     `<task>/<declared path>`, fan-out brackets included
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --out <OUT>              Write the content here instead of to stdout. Required for a file that is not text
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux contracts --help ====
+The broker contract names this controller accepts
+
+Usage: crux contracts [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux contracts -h ====
+The broker contract names this controller accepts
+
+Usage: crux contracts [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux approve --help ====
+Approve a scenario or jira issue's scope pack
+
+Usage: crux approve [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux approve -h ====
+Approve a scenario or jira issue's scope pack
+
+Usage: crux approve [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux approval-detail --help ====
+One issue's approval gate: the PR to act on and the pack digest under it
+
+Usage: crux approval-detail [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux approval-detail -h ====
+One issue's approval gate: the PR to act on and the pack digest under it
+
+Usage: crux approval-detail [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux approvals --help ====
+Every scope currently awaiting approval, plus the PRs already kept
+
+Usage: crux approvals [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux approvals -h ====
+Every scope currently awaiting approval, plus the PRs already kept
+
+Usage: crux approvals [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux playbook-import --help ====
+Propose a playbook pack import: fetch, compile, and store the preview an admin registers
+
+Usage: crux playbook-import [OPTIONS] <REPO>
+
+Arguments:
+  <REPO>
+          owner/repo or a clone URL
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --git-ref <GIT_REF>
+          Branch or tag. Omit for the repo's default branch
+
+      --path <PATH>
+          The pack directory inside the repo. Omit for the repo root
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --variant <VARIANT>
+          The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the base manifest
+
+      --id <ID>
+          The registry id to propose registering under; prefills the review page
+
+      --description <DESCRIPTION>
+          The description to propose; prefills the review page
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux playbook-import -h ====
+Propose a playbook pack import: fetch, compile, and store the preview an admin registers
+
+Usage: crux playbook-import [OPTIONS] <REPO>
+
+Arguments:
+  <REPO>  owner/repo or a clone URL
+
+Options:
+      --config <CONFIG>            Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --git-ref <GIT_REF>          Branch or tag. Omit for the repo's default branch
+      --path <PATH>                The pack directory inside the repo. Omit for the repo root
+      --url <URL>                  Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>      The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --variant <VARIANT>          The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the base manifest
+      --id <ID>                    The registry id to propose registering under; prefills the review page
+      --description <DESCRIPTION>  The description to propose; prefills the review page
+      --json                       
+  -h, --help                       Print help
+==== crux draft-files --help ====
+A draft pack's files at one save, with the version a save must be based on
+
+Usage: crux draft-files [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --version <VERSION>
+          Which save to read. Omit for the newest
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-files -h ====
+A draft pack's files at one save, with the version a save must be based on
+
+Usage: crux draft-files [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --version <VERSION>      Which save to read. Omit for the newest
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux draft-create --help ====
+Create a draft pack in the authoring studio, from a template or a skeleton
+
+Usage: crux draft-create [OPTIONS] --description <DESCRIPTION> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --description <DESCRIPTION>
+          
+
+      --template <TEMPLATE>
+          A registered playbook id to seed version 1 from
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux draft-create -h ====
+Create a draft pack in the authoring studio, from a template or a skeleton
+
+Usage: crux draft-create [OPTIONS] --description <DESCRIPTION> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>            Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --description <DESCRIPTION>  
+      --template <TEMPLATE>        A registered playbook id to seed version 1 from
+      --url <URL>                  Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>      The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --json                       
+  -h, --help                       Print help
+==== crux draft-save --help ====
+Save a draft pack version from a `{path: content}` JSON map
+
+Usage: crux draft-save [OPTIONS] --base-version <BASE_VERSION> --files <FILES> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --base-version <BASE_VERSION>
+          The version these edits were made against (see `draft-files`)
+
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --files <FILES>
+          The whole pack as a JSON object of path to content. `-` reads stdin
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux draft-save -h ====
+Save a draft pack version from a `{path: content}` JSON map
+
+Usage: crux draft-save [OPTIONS] --base-version <BASE_VERSION> --files <FILES> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --base-version <BASE_VERSION>  The version these edits were made against (see `draft-files`)
+      --config <CONFIG>              Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --files <FILES>                The whole pack as a JSON object of path to content. `-` reads stdin
+      --url <URL>                    Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>        The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --json                         
+  -h, --help                         Print help
+==== crux draft-pull --help ====
+Write a draft pack into a directory, to edit it in your own editor
+
+Usage: crux draft-pull [OPTIONS] <DRAFT_ID> <DIR>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+  <DIR>
+          The directory to write the pack into. Created if it does not exist
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --version <VERSION>
+          Which save to pull. Omit for the newest
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-pull -h ====
+Write a draft pack into a directory, to edit it in your own editor
+
+Usage: crux draft-pull [OPTIONS] <DRAFT_ID> <DIR>
+
+Arguments:
+  <DRAFT_ID>  
+  <DIR>       The directory to write the pack into. Created if it does not exist
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --version <VERSION>      Which save to pull. Omit for the newest
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux draft-push --help ====
+Save a directory back as the next draft version. The whole tree is the save
+
+Usage: crux draft-push [OPTIONS] --base-version <BASE_VERSION> <DRAFT_ID> <DIR>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+  <DIR>
+          The directory holding the pack
+
+Options:
+      --base-version <BASE_VERSION>
+          The version these edits were made against (what `draft-pull` printed)
+
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-push -h ====
+Save a directory back as the next draft version. The whole tree is the save
+
+Usage: crux draft-push [OPTIONS] --base-version <BASE_VERSION> <DRAFT_ID> <DIR>
+
+Arguments:
+  <DRAFT_ID>  
+  <DIR>       The directory holding the pack
+
+Options:
+      --base-version <BASE_VERSION>  The version these edits were made against (what `draft-pull` printed)
+      --config <CONFIG>              Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                         
+      --url <URL>                    Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>        The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                         Print help
+==== crux providers --help ====
+List the inference providers you may read: id, kind, default model, harness, the price per million tokens a run on it is charged, and whether launches may pick it
+
+Usage: crux providers [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux providers -h ====
+List the inference providers you may read: id, kind, default model, harness, the price per million tokens a run on it is charged, and whether launches may pick it
+
+Usage: crux providers [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux secrets --help ====
+List the secrets you own: id, name, kind, visibility, mode, owner. Never a value
+
+Usage: crux secrets [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux secrets -h ====
+List the secrets you own: id, name, kind, visibility, mode, owner. Never a value
+
+Usage: crux secrets [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux secret-create --help ====
+Register a secret. The value is read from piped stdin, never from an argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value
+
+Usage: crux secret-create [OPTIONS] --kind <KIND> <NAME>
+
+Arguments:
+  <NAME>
+          The name a pack's `[[secret]] name` refers to. Unique per owner
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --kind <KIND>
+          [possible values: opaque, file, registry-authfile, kubeconfig, inference-api-key]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --visibility <VISIBILITY>
+          Omit for `broker-only`: the run gets it, the agent in the sandbox does not
+          
+          [possible values: broker-only, agent-visible]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --owner <OWNER>
+          `user:<login>` or a `group:` in your claims. Omit to own it yourself
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux secret-create -h ====
+Register a secret. The value is read from piped stdin, never from an argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value
+
+Usage: crux secret-create [OPTIONS] --kind <KIND> <NAME>
+
+Arguments:
+  <NAME>  The name a pack's `[[secret]] name` refers to. Unique per owner
+
+Options:
+      --config <CONFIG>          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --kind <KIND>              [possible values: opaque, file, registry-authfile, kubeconfig, inference-api-key]
+      --url <URL>                Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --visibility <VISIBILITY>  Omit for `broker-only`: the run gets it, the agent in the sandbox does not [possible values: broker-only, agent-visible]
+      --api-token <API_TOKEN>    The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --owner <OWNER>            `user:<login>` or a `group:` in your claims. Omit to own it yourself
+      --json                     
+  -h, --help                     Print help
+==== crux secret-bind --help ====
+Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it. One scope flag and one projection flag
+
+Usage: crux secret-bind [OPTIONS] <SECRET_ID>
+
+Arguments:
+  <SECRET_ID>
+          The secret's id, as `secrets` lists it
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --playbook <PLAYBOOK>
+          Scope: a draft or registered playbook id
+
+      --repo <REPO>
+          Scope: an `owner/name` repo
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --domain <DOMAIN>
+          Scope: a domain id
+
+      --env <ENV>
+          Projection: the environment variable the value arrives in
+
+      --file <FILE>
+          Projection: the absolute path the value is written to
+
+      --declared-name <DECLARED_NAME>
+          The manifest's `[[secret]] name` this binding satisfies. Defaults to the secret's name
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux secret-bind -h ====
+Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it. One scope flag and one projection flag
+
+Usage: crux secret-bind [OPTIONS] <SECRET_ID>
+
+Arguments:
+  <SECRET_ID>  The secret's id, as `secrets` lists it
+
+Options:
+      --config <CONFIG>                Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --playbook <PLAYBOOK>            Scope: a draft or registered playbook id
+      --repo <REPO>                    Scope: an `owner/name` repo
+      --url <URL>                      Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --domain <DOMAIN>                Scope: a domain id
+      --env <ENV>                      Projection: the environment variable the value arrives in
+      --file <FILE>                    Projection: the absolute path the value is written to
+      --declared-name <DECLARED_NAME>  The manifest's `[[secret]] name` this binding satisfies. Defaults to the secret's name
+      --json                           
+  -h, --help                           Print help
+==== crux draft-preview --help ====
+What a draft version compiled to: its schema digest and diagnostics, without launching it
+
+Usage: crux draft-preview [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --version <VERSION>
+          Which save to compile. Omit for the newest
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-preview -h ====
+What a draft version compiled to: its schema digest and diagnostics, without launching it
+
+Usage: crux draft-preview [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --version <VERSION>      Which save to compile. Omit for the newest
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux draft-launch --help ====
+Test-fire a draft's newest save. Costs money against --max-cost
+
+Usage: crux draft-launch [OPTIONS] --max-cost <MAX_COST> --max-time <MAX_TIME> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --params <PARAMS>
+          The form values its schema accepts, as a JSON object of string to string
+          
+          [default: {}]
+
+      --max-cost <MAX_COST>
+          Dollar ceiling for this launch
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --max-time <MAX_TIME>
+          Wall-clock ceiling, e.g. 30m, 2h
+
+      --schema-digest <SCHEMA_DIGEST>
+          The schema digest these values were filled against (see `draft-preview`). A save that landed since is refused instead of launched
+
+      --dispatch-target <DISPATCH_TARGET>
+          Cluster to dispatch onto. Omit for the controller's default
+
+      --provider <PROVIDER>
+          Registered inference provider the run's agent talks to, replacing the pack manifest's `[agent]` harness. Omit to resolve through the configured defaults
+
+      --model <MODEL>
+          The model to ask that provider for. Needs --provider; omit for its default
+
+      --rerun-of <RUN>
+          Rerun this finished run of the same pack instead of starting afresh: every task it passed is reused, and the tasks --from names run again with everything after them
+
+      --from <TASK>
+          A task the rerun dispatches again, with everything downstream of it. Repeatable
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux draft-launch -h ====
+Test-fire a draft's newest save. Costs money against --max-cost
+
+Usage: crux draft-launch [OPTIONS] --max-cost <MAX_COST> --max-time <MAX_TIME> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --params <PARAMS>
+          The form values its schema accepts, as a JSON object of string to string [default: {}]
+      --max-cost <MAX_COST>
+          Dollar ceiling for this launch
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --max-time <MAX_TIME>
+          Wall-clock ceiling, e.g. 30m, 2h
+      --schema-digest <SCHEMA_DIGEST>
+          The schema digest these values were filled against (see `draft-preview`). A save that landed since is refused instead of launched
+      --dispatch-target <DISPATCH_TARGET>
+          Cluster to dispatch onto. Omit for the controller's default
+      --provider <PROVIDER>
+          Registered inference provider the run's agent talks to, replacing the pack manifest's `[agent]` harness. Omit to resolve through the configured defaults
+      --model <MODEL>
+          The model to ask that provider for. Needs --provider; omit for its default
+      --rerun-of <RUN>
+          Rerun this finished run of the same pack instead of starting afresh: every task it passed is reused, and the tasks --from names run again with everything after them
+      --from <TASK>
+          A task the rerun dispatches again, with everything downstream of it. Repeatable
+      --json
+          
+  -h, --help
+          Print help
+==== crux draft-delete --help ====
+Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
+
+Usage: crux draft-delete [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-delete -h ====
+Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
+
+Usage: crux draft-delete [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux draft-rename --help ====
+Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
+
+Usage: crux draft-rename [OPTIONS] <DRAFT_ID> <TO>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+  <TO>
+          The new id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-rename -h ====
+Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
+
+Usage: crux draft-rename [OPTIONS] <DRAFT_ID> <TO>
+
+Arguments:
+  <DRAFT_ID>  
+  <TO>        The new id
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux draft-clone --help ====
+Copy a draft's newest save into a new draft, with the bindings you could make yourself
+
+Usage: crux draft-clone [OPTIONS] <DRAFT_ID> <TO>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+  <TO>
+          The copy's id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --description <DESCRIPTION>
+          Defaults to the source draft's
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-clone -h ====
+Copy a draft's newest save into a new draft, with the bindings you could make yourself
+
+Usage: crux draft-clone [OPTIONS] <DRAFT_ID> <TO>
+
+Arguments:
+  <DRAFT_ID>  
+  <TO>        The copy's id
+
+Options:
+      --config <CONFIG>            Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --description <DESCRIPTION>  Defaults to the source draft's
+      --json                       
+      --url <URL>                  Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>      The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                       Print help
+==== crux draft-publish --help ====
+Publish a draft: register its newest compiling version as a playbook, with no review
+
+Usage: crux draft-publish [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --playbook <PLAYBOOK>
+          The playbook to publish into. Omit to re-pin the one this draft last published into, else the one it was seeded from
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux draft-publish -h ====
+Publish a draft: register its newest compiling version as a playbook, with no review
+
+Usage: crux draft-publish [OPTIONS] <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --playbook <PLAYBOOK>    The playbook to publish into. Omit to re-pin the one this draft last published into, else the one it was seeded from
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux draft-graduate --help ====
+Graduate a draft: push its newest compiling version and open the export PR
+
+Usage: crux draft-graduate [OPTIONS] --repo <REPO> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --repo <REPO>
+          `owner/repo` the export PR opens against
+
+      --path <PATH>
+          The pack directory inside that repo. Omit for the repo root
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux draft-graduate -h ====
+Graduate a draft: push its newest compiling version and open the export PR
+
+Usage: crux draft-graduate [OPTIONS] --repo <REPO> <DRAFT_ID>
+
+Arguments:
+  <DRAFT_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --repo <REPO>            `owner/repo` the export PR opens against
+      --path <PATH>            The pack directory inside that repo. Omit for the repo root
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --json                   
+  -h, --help                   Print help
+==== crux help --help ====
+Print this message or the help of the given subcommand(s)
+
+Usage: crux help [COMMAND]
+
+Commands:
+  whoami                Who the controller thinks you are, and how you got there
+  playbooks             List registered playbooks: what `launch` can start
+  playbook-caps         The admin caps on `--max-cost` and `--max-time`. Read before `launch` or `draft-launch`
+  playbook-schema       The JSON Schema a playbook's params are validated against. Read before `launch`
+  launch                Launch a playbook. Costs money against --max-cost
+  playbook-runs         Playbook launches: key, playbook, status, count, cost against cap, and what stopped one
+  playbook-run          One playbook launch whole, as JSON
+  runs                  The runs leaderboard
+  run                   One run with its candidates, as JSON
+  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
+  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  watch                 One tracker watch, as JSON
+  webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
+  webhook               One webhook, as JSON
+  webhook-deliveries    A webhook's recorded deliveries, newest first, with how each settled
+  provider-create       Register a provider from a JSON body (`POST /api/providers`)
+  provider-update       Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`)
+  provider-delete       Deregister a provider and every default naming it. Refused while issues or schedules pin it; `provider-update` with `"enabled": false` retires one that work still names
+  dispatch-defaults     The provider each scope's unpinned dispatches take, per workload class, and its fallback
+  dispatch-default-set  Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only
+  webhook-check         Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save does. Prints `ok`, or fails with one `field:line:col: message` per refusal
+  webhook-presets       Starting points for a webhook body: a sender's verifier and a transform, as JSON
+  webhook-create        Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once
+  webhook-update        Replace a webhook from a JSON body. Its verifier and secret stay as created
+  webhook-resume        Resume a paused webhook: its address takes deliveries again
+  webhook-pause         Pause a webhook: its address answers not found and its queued deliveries fail
+  webhook-rotate        Replace a webhook's secret and print the new one, once
+  webhook-delete        
+  webhook-preview       Run a transform on a sample delivery from a JSON body; nothing is stored
+  issues                List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title
+  issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the event trail
+  adopt                 Adopt a scenario: a controller issue with no upstream
+  park                  Park an issue: stop working it, and record why
+  unpark                Unpark an issue so the controller picks it up again
+  bump                  Change an issue's priority. Higher runs sooner
+  reconcile             Wake the controller's reconcile loop. A full pass, not one issue
+  redispatch            Re-dispatch an issue's run. Costs money
+  turns                 List work-pod turns
+  turn                  One turn, with its result and error text intact
+  graph                 A run's task graph in dependency order, each task with its latest status
+  deployed              Which build the controller is running, and whether it is the commit you expected
+  run-log               One window of a run's engine output, resumable by cursor
+  run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
+  run-file              One captured file's content, by the key `run-files` listed it under
+  contracts             The broker contract names this controller accepts
+  approve               Approve a scenario or jira issue's scope pack
+  approval-detail       One issue's approval gate: the PR to act on and the pack digest under it
+  approvals             Every scope currently awaiting approval, plus the PRs already kept
+  playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an admin registers
+  draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
+  draft-save            Save a draft pack version from a `{path: content}` JSON map
+  draft-pull            Write a draft pack into a directory, to edit it in your own editor
+  draft-push            Save a directory back as the next draft version. The whole tree is the save
+  providers             List the inference providers you may read: id, kind, default model, harness, the price per million tokens a run on it is charged, and whether launches may pick it
+  secrets               List the secrets you own: id, name, kind, visibility, mode, owner. Never a value
+  secret-create         Register a secret. The value is read from piped stdin, never from an argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value
+  secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it. One scope flag and one projection flag
+  draft-preview         What a draft version compiled to: its schema digest and diagnostics, without launching it
+  draft-launch          Test-fire a draft's newest save. Costs money against --max-cost
+  draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
+  draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
+  draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
+  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
+  help                  Print this message or the help of the given subcommand(s)
+==== crux help -h ====
+Print this message or the help of the given subcommand(s)
+
+Usage: crux help [COMMAND]
+
+Commands:
+  whoami                Who the controller thinks you are, and how you got there
+  playbooks             List registered playbooks: what `launch` can start
+  playbook-caps         The admin caps on `--max-cost` and `--max-time`. Read before `launch` or `draft-launch`
+  playbook-schema       The JSON Schema a playbook's params are validated against. Read before `launch`
+  launch                Launch a playbook. Costs money against --max-cost
+  playbook-runs         Playbook launches: key, playbook, status, count, cost against cap, and what stopped one
+  playbook-run          One playbook launch whole, as JSON
+  runs                  The runs leaderboard
+  run                   One run with its candidates, as JSON
+  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
+  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  watch                 One tracker watch, as JSON
+  webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
+  webhook               One webhook, as JSON
+  webhook-deliveries    A webhook's recorded deliveries, newest first, with how each settled
+  provider-create       Register a provider from a JSON body (`POST /api/providers`)
+  provider-update       Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`)
+  provider-delete       Deregister a provider and every default naming it. Refused while issues or schedules pin it; `provider-update` with `"enabled": false` retires one that work still names
+  dispatch-defaults     The provider each scope's unpinned dispatches take, per workload class, and its fallback
+  dispatch-default-set  Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only
+  webhook-check         Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save does. Prints `ok`, or fails with one `field:line:col: message` per refusal
+  webhook-presets       Starting points for a webhook body: a sender's verifier and a transform, as JSON
+  webhook-create        Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once
+  webhook-update        Replace a webhook from a JSON body. Its verifier and secret stay as created
+  webhook-resume        Resume a paused webhook: its address takes deliveries again
+  webhook-pause         Pause a webhook: its address answers not found and its queued deliveries fail
+  webhook-rotate        Replace a webhook's secret and print the new one, once
+  webhook-delete        
+  webhook-preview       Run a transform on a sample delivery from a JSON body; nothing is stored
+  issues                List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title
+  issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the event trail
+  adopt                 Adopt a scenario: a controller issue with no upstream
+  park                  Park an issue: stop working it, and record why
+  unpark                Unpark an issue so the controller picks it up again
+  bump                  Change an issue's priority. Higher runs sooner
+  reconcile             Wake the controller's reconcile loop. A full pass, not one issue
+  redispatch            Re-dispatch an issue's run. Costs money
+  turns                 List work-pod turns
+  turn                  One turn, with its result and error text intact
+  graph                 A run's task graph in dependency order, each task with its latest status
+  deployed              Which build the controller is running, and whether it is the commit you expected
+  run-log               One window of a run's engine output, resumable by cursor
+  run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
+  run-file              One captured file's content, by the key `run-files` listed it under
+  contracts             The broker contract names this controller accepts
+  approve               Approve a scenario or jira issue's scope pack
+  approval-detail       One issue's approval gate: the PR to act on and the pack digest under it
+  approvals             Every scope currently awaiting approval, plus the PRs already kept
+  playbook-import       Propose a playbook pack import: fetch, compile, and store the preview an admin registers
+  draft-files           A draft pack's files at one save, with the version a save must be based on
+  draft-create          Create a draft pack in the authoring studio, from a template or a skeleton
+  draft-save            Save a draft pack version from a `{path: content}` JSON map
+  draft-pull            Write a draft pack into a directory, to edit it in your own editor
+  draft-push            Save a directory back as the next draft version. The whole tree is the save
+  providers             List the inference providers you may read: id, kind, default model, harness, the price per million tokens a run on it is charged, and whether launches may pick it
+  secrets               List the secrets you own: id, name, kind, visibility, mode, owner. Never a value
+  secret-create         Register a secret. The value is read from piped stdin, never from an argument or a terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value
+  secret-bind           Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it. One scope flag and one projection flag
+  draft-preview         What a draft version compiled to: its schema digest and diagnostics, without launching it
+  draft-launch          Test-fire a draft's newest save. Costs money against --max-cost
+  draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
+  draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
+  draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
+  draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
+  help                  Print this message or the help of the given subcommand(s)
