@@ -89,6 +89,7 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     m.resolve_workflow(&manifest_dir)?;
+    crate::cli::setup::warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = args
         .state_dir
@@ -213,6 +214,7 @@ fn read_seed_diff(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<Option
 /// co-locate under the base so the agent has one cwd / one sandbox upload tree spanning both repos.
 fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     let m = manifest::CompositeManifest::load_frozen(&manifest_path)?;
+    crate::cli::setup::warn_inherited_env(m.edition == manifest::edition::Edition::One);
     let manifest_dir = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())

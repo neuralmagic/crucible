@@ -264,6 +264,10 @@ pub struct WorkflowCfg {
     /// hash the graph itself or the hash stops discriminating between two different graphs.
     #[serde(skip)]
     pub resolved_from: Option<String>,
+    /// The manifest's top-level edition, never read from or written to the `[workflow]` table. A
+    /// compiled source carries the manifest's across.
+    #[serde(skip)]
+    pub edition: crate::manifest::edition::Edition,
     /// Every declared parameter's value as compilation bound it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamValue>,
@@ -279,9 +283,10 @@ pub struct WorkflowCfg {
 }
 
 impl WorkflowCfg {
-    /// What [`WorkflowCfg::env`] passes to the workflow's `command` and `evaluate` tasks.
+    /// What the workflow's `command` and `evaluate` tasks receive of the engine's environment
+    /// under [`WorkflowCfg::edition`].
     pub fn host_env(&self) -> Result<crate::host_env::HostEnv, crate::host_env::MissingEnv> {
-        crate::host_env::HostEnv::resolve("[workflow]", &self.env)
+        crate::host_env::HostEnv::resolve(self.edition, "[workflow]", &self.env)
     }
 
     /// True while the graph is still a path rather than tasks. The manifest is valid in this

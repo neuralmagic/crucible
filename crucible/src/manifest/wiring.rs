@@ -37,7 +37,7 @@ impl Manifest {
                 snapshot_cmd: w.snapshot_cmd.clone(),
                 restore_cmd: w.restore_cmd.clone(),
                 carry_forward,
-                env: HostEnv::resolve("[world]", &w.env)?,
+                env: HostEnv::resolve(self.edition, "[world]", &w.env)?,
             }))
         }
     }
@@ -59,7 +59,7 @@ impl Manifest {
             tiebreak_direction: self.tiebreak_direction()?,
             objective: judge.objective.clone(),
             frozen_injects,
-            env: HostEnv::resolve("[judge]", &judge.env)?,
+            env: HostEnv::resolve(self.edition, "[judge]", &judge.env)?,
         }))
     }
 }
@@ -83,7 +83,7 @@ impl CompositeManifest {
             snapshot_cmd: self.world.snapshot_cmd.clone(),
             restore_cmd: self.world.restore_cmd.clone(),
             carry_forward: Vec::new(),
-            env: HostEnv::resolve("[world]", &self.world.env)?,
+            env: HostEnv::resolve(self.edition, "[world]", &self.world.env)?,
         }))
     }
 
@@ -97,7 +97,7 @@ impl CompositeManifest {
             tiebreak_direction: self.tiebreak_direction()?,
             objective: self.judge.objective.clone(),
             frozen_injects: vec![],
-            env: HostEnv::resolve("[judge]", &self.judge.env)?,
+            env: HostEnv::resolve(self.edition, "[judge]", &self.judge.env)?,
         }))
     }
 }

@@ -5,6 +5,7 @@
 //! judge wall, applied here as a lint rather than a block).
 
 use crate::cli::selftest::{self, SelftestReport};
+use crate::manifest::edition::{Edition, INHERITED_ENV_WARNING};
 use crate::manifest::variant::{self, VariantName};
 use crate::manifest::{self, AgentCfg, CompositeManifest, Manifest, WorldCfg};
 use crate::openshell;
@@ -78,7 +79,11 @@ pub fn run_parse_only(manifest_path: &Path, variant: Option<&VariantName>) -> Re
         Err(composite_variant(variant))
     } else if manifest::is_composite(manifest_path) {
         CompositeManifest::load(manifest_path)
-            .map(|m| crate::exposure::render(&crate::exposure::compute_composite(&m)))
+            .map(|m| CheckOutcome {
+                exposure: crate::exposure::render(&crate::exposure::compute_composite(&m)),
+                warnings: composite_inherited_env_warning(&m).into_iter().collect(),
+                ..CheckOutcome::default()
+            })
             .map_err(|e| format!("composite manifest parse failed: {e:#}"))
     } else {
         Manifest::load_variant(manifest_path, variant)
@@ -86,16 +91,14 @@ pub fn run_parse_only(manifest_path: &Path, variant: Option<&VariantName>) -> Re
             .and_then(|m| {
                 let mut exposure = crate::exposure::render(&crate::exposure::compute(&m, None));
                 exposure.extend(history_limit_line(&m, operator_history_limit().as_deref())?);
-                Ok(exposure)
+                Ok(CheckOutcome {
+                    exposure,
+                    warnings: inherited_env_warning(&m).into_iter().collect(),
+                    ..CheckOutcome::default()
+                })
             })
     };
-    Ok(match result {
-        Ok(exposure) => CheckOutcome {
-            exposure,
-            ..CheckOutcome::default()
-        },
-        Err(msg) => CheckOutcome::fail(msg),
-    })
+    Ok(result.unwrap_or_else(CheckOutcome::fail))
 }
 
 /// Validate a deploy profile's spoke-cluster wiring: the named `[measure].cluster` resolves
@@ -153,6 +156,16 @@ pub fn check_profile(
         )),
     }
     out
+}
+
+/// The edition-1 warning, for a pack whose host commands inherit the engine's environment.
+fn inherited_env_warning(m: &Manifest) -> Option<String> {
+    crate::exposure::inherits_engine_env(m).then(|| INHERITED_ENV_WARNING.to_owned())
+}
+
+/// [`inherited_env_warning`] for a composite, whose required `[judge]` always runs a host command.
+fn composite_inherited_env_warning(m: &CompositeManifest) -> Option<String> {
+    (m.edition == Edition::One).then(|| INHERITED_ENV_WARNING.to_owned())
 }
 
 /// One warning naming every `[agent].env` credential with no `[[capabilities.secret]]` entry
@@ -242,6 +255,7 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
         Ok(line) => out.exposure.extend(line),
         Err(finding) => out.findings.push(finding),
     }
+    out.warnings.extend(inherited_env_warning(&m));
     out.warnings.extend(undeclared_credential_warnings(&m));
     out.warnings.extend(shadowed_deny_warnings(&m.agent));
     check_referenced_files(&m, &manifest_dir, &mut out);
@@ -313,7 +327,7 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
         }
         return Ok(out);
     };
-    check_measure_once(&judge.measure_cmd, &judge.env, &workspace, &mut out);
+    check_measure_once(judge, m.edition, &workspace, &mut out);
     if let Some(w) = agent_editable_gate_warning(&judge.measure_cmd, &frozen, &workspace) {
         out.warnings.push(w);
     }
@@ -438,6 +452,7 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
         exposure: crate::exposure::render(&crate::exposure::compute_composite(&m)),
         ..CheckOutcome::default()
     };
+    out.warnings.extend(composite_inherited_env_warning(&m));
     out.warnings.extend(shadowed_deny_warnings(&m.agent));
     if let Some(f) = &m.agent.goal_file {
         check_file_exists("[agent].goal_file", &manifest_dir, f, &mut out);
@@ -485,7 +500,7 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
     }
 
     let base = m.base_dir(&manifest_dir);
-    check_measure_once(&m.judge.measure_cmd, &m.judge.env, &base, &mut out);
+    check_measure_once(&m.judge, m.edition, &base, &mut out);
     if let Some(f) = unfenced_rig_toolbox_finding(&m.world, &m.agent) {
         out.findings.push(f);
     }
@@ -558,12 +573,13 @@ fn check_referenced_files(m: &Manifest, manifest_dir: &Path, out: &mut CheckOutc
 /// nonzero exit and a missing/invalid contract line are reported as distinct findings instead of
 /// collapsing into one opaque `valid: false`.
 fn check_measure_once(
-    measure_cmd: &str,
-    declared: &crucible::host_env::DeclaredEnv,
+    judge: &manifest::JudgeCfg,
+    edition: Edition,
     workspace: &Path,
     out: &mut CheckOutcome,
 ) {
-    let env = match crucible::host_env::HostEnv::resolve("[judge]", declared) {
+    let measure_cmd = &judge.measure_cmd;
+    let env = match crucible::host_env::HostEnv::resolve(edition, "[judge]", &judge.env) {
         Ok(env) => env,
         Err(missing) => {
             out.findings.push(missing.to_string());
@@ -778,14 +794,19 @@ mod tests {
     /// A minimal counter-shaped domain: repo path=".", explicit setup_cmd copying just the
     /// measure script in, so the workspace never needs a real git remote.
     fn scaffold_domain(dir: &Path, measure_body: &str) {
-        scaffold_domain_declaring(dir, measure_body, "[]");
+        scaffold(dir, measure_body, "", "");
     }
 
-    /// [`scaffold_domain`] with `[judge].env = <env>`.
+    /// [`scaffold_domain`] at edition 2 with `[judge].env = <env>`.
     fn scaffold_domain_declaring(dir: &Path, measure_body: &str, env: &str) {
+        scaffold(dir, measure_body, "edition = 2", &format!("env = {env}"));
+    }
+
+    fn scaffold(dir: &Path, measure_body: &str, edition: &str, env: &str) {
         write_exec(&dir.join("measure.sh"), measure_body);
         let manifest = format!(
             r#"
+            {edition}
             [repo]
             path = "."
             [workspace]
@@ -799,7 +820,7 @@ mod tests {
             measure_cmd = "./measure.sh"
             direction = "higher"
             objective = "score"
-            env = {env}
+            {env}
             "#
         );
         fs::write(dir.join(MANIFEST), manifest).expect("write manifest");
@@ -1005,6 +1026,58 @@ mod tests {
                 .any(|f| f.contains("no [agent].goal")),
             "{:?}",
             outcome.findings
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An edition-1 pack's probe runs `measure_cmd` with the engine's environment, as its runs
+    /// do, and the check says once that the pack inherits it, in its warnings and in the
+    /// disclosure; an edition-2 pack gets neither.
+    #[test]
+    fn an_edition_one_pack_is_warned_that_its_host_commands_inherit_the_engines_environment() {
+        let measure = "#!/bin/sh\ntest \"$CRUCIBLE_TEST_CHECK_INHERITED\" = kept || exit 1\necho \
+                       '{\"valid\": true, \"score\": 1.0}'\n";
+        let dir = tempdir("edition-one");
+        scaffold_domain(&dir, measure);
+        let outcome = {
+            let _guard = crucible::test_support::env_lock();
+            unsafe { std::env::set_var("CRUCIBLE_TEST_CHECK_INHERITED", "kept") };
+            let outcome = run(&dir.join(MANIFEST), None);
+            unsafe { std::env::remove_var("CRUCIBLE_TEST_CHECK_INHERITED") };
+            outcome.expect("check runs")
+        };
+        assert!(outcome.ok(), "findings: {:?}", outcome.findings);
+        let warned = |outcome: &CheckOutcome| {
+            outcome
+                .warnings
+                .iter()
+                .filter(|w| *w == INHERITED_ENV_WARNING)
+                .count()
+        };
+        assert_eq!(warned(&outcome), 1, "{:?}", outcome.warnings);
+        let disclosed = "  host-env    [judge] commands inherit the engine's whole environment";
+        assert!(
+            outcome.exposure.iter().any(|l| l == disclosed),
+            "{:?}",
+            outcome.exposure
+        );
+        let parsed = run_parse_only(&dir.join(MANIFEST), None).expect("check runs");
+        assert_eq!(warned(&parsed), 1, "{:?}", parsed.warnings);
+        let _ = fs::remove_dir_all(&dir);
+
+        let dir = tempdir("edition-two");
+        scaffold_domain_declaring(
+            &dir,
+            "#!/bin/sh\necho '{\"valid\": true, \"score\": 1.0}'\n",
+            "[]",
+        );
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        assert!(outcome.ok(), "findings: {:?}", outcome.findings);
+        assert_eq!(warned(&outcome), 0, "{:?}", outcome.warnings);
+        assert!(
+            !outcome.exposure.iter().any(|l| l.contains("host-env")),
+            "{:?}",
+            outcome.exposure
         );
         let _ = fs::remove_dir_all(&dir);
     }

@@ -14,6 +14,7 @@ refs = [
     "RFC-0002:C-PLAYBOOK-RESUME",
     "RFC-0004:C-CONTRACT-VERSION",
     "ADR-0027",
+    "ADR-0071",
 ]
 
 [content]
@@ -38,7 +39,7 @@ Constraints on changing delivery:
 - Nothing chooses the plan IR version; `version: 1` is written at every site that builds a plan (crucible/src/plan/cli.rs:666-667, crucible/src/plan/template.rs:21, :101, crucible/src/runloop/graph.rs:196, :1072, crucible/src/scope/pipeline.rs:1054, and the validation copy at crucible/src/plan/workflow.rs:337-338), and anything else is refused (ir.rs:1034-1038).
 - Which paths drop an unknown task field differs. `Task` does not deny unknown fields (ir.rs:443-501), so `[[workflow.task]]` tables in a manifest and plan files read by `Plan::from_toml_str` or `Plan::from_json_str` (cli.rs:58-65) lose a field an older engine does not know. A Starlark source does not: each constructor checks its kwargs against an allowlist (crucible/src/plan/starlark.rs:600-643), so an older engine fails to compile an unknown kwarg. `WorkflowCfg` denies unknown fields (workflow.rs:245-246), so an unknown `[workflow]` key is refused on every path."""
 decision = """
-Follow Tekton's split of params, results, workspaces, and artifacts: a task names the small values it reads, those travel as files by name, and bulk data travels as declared files. A pack opts in with an edition; an unchanged pack compiles and runs as it does today.
+Follow Tekton's split of params, results, workspaces, and artifacts: a task names the small values it reads, those travel as files by name, and bulk data travels as declared files. A pack opts in with an edition ([[ADR-0071]]); an unchanged pack compiles and runs as it does today.
 
 **Declared inputs.** A task declares `inputs`, a map from an input name to `producer.field`. Validation refuses an input whose producer is not a direct dependency or does not declare that field, and the input carries the field's declared type. JSON outputs keep the direct-dependency rule of [[RFC-0002:C-TASK-FILES]]. A task receives no upstream value it did not declare; the reserved inputs it receives today (`params` for command and evaluate tasks only, `item`, `history`, `revision`, `kept`, `outcome`) arrive the same way under their own names.
 
@@ -48,38 +49,38 @@ Follow Tekton's split of params, results, workspaces, and artifacts: a task name
 
 **Agent prompts.** The inputs section lists each input by name, type, size, and path. It inlines a value only when the value is small and the inlined total stays under a budget well below 128 KiB; the agent reads the rest from the files, which reach the sandbox with the workspace as staged files do today. History keeps its marked region.
 
-**Producer paths.** Every task name and every fan-out key maps to a single path component under `inputs/` and `state/files/`. This applies to both editions because it is an escape, not a delivery choice. Validation refuses a task name that is `.` or `..`, contains a path separator, or starts with the reserved directory's leading character; a valid name stages exactly where it does today. A fan-out key is runtime data, so the engine escapes it when it forms the instance directory instead of refusing it, and the index carries the raw key. Edition 2 adds no task-name rule of its own.
+**Producer paths.** Every task name and every fan-out key maps to a single path component under `inputs/` and `state/files/`. This applies to every edition because it is an escape, not a delivery choice. Validation refuses a task name that is `.` or `..`, contains a path separator, or starts with the reserved directory's leading character; a valid name stages exactly where it does today. A fan-out key is runtime data, so the engine escapes it when it forms the instance directory instead of refusing it, and the index carries the raw key. Edition 3 adds no task-name rule of its own.
 
-**Local agent argv.** The local claude and hermes paths send the prompt on stdin, as the sandbox path does; claude's print mode reads stdin when no prompt argument is given (claude.rs:56-59) and hermes accepts `-q -` (hermes.rs:116-121). The `--agent-cmd` stand-in gets its prompt in a file, with `CRUCIBLE_PROMPT` kept while it fits, as #210 did for inputs. This applies to both editions: it is a spawn fix that changes no plan bytes, and an edition-1 pack should not keep a spawn failure because it has not ported.
+**Local agent argv.** The local claude and hermes paths send the prompt on stdin, as the sandbox path does; claude's print mode reads stdin when no prompt argument is given (claude.rs:56-59) and hermes accepts `-q -` (hermes.rs:116-121). The `--agent-cmd` stand-in gets its prompt in a file, with `CRUCIBLE_PROMPT` kept while it fits, as #210 did for inputs. This applies to every edition: it is a spawn fix that changes no plan bytes, and a pack below edition 3 should not keep a spawn failure because it has not ported.
 
 **Editions and IR versions.**
 
-- `edition = 2` goes in the manifest's `[workflow]` table, the `WorkflowCfg` struct, and nowhere else. Absent is edition 1. The Starlark `workflow()` constructor does not take it: the compiler has to know the edition before it evaluates the source, to decide whether `inputs=` is a known kwarg, as [[RFC-0001:C-WORKFLOW]] already requires of the lane. `resolve_workflow_with` replaces the manifest's `WorkflowCfg` with the compiled one (manifest/mod.rs:1128-1130), so it carries `edition` across as it carries `resolved_from`.
-- The edition maps one-to-one to the IR version. Every site that builds a plan from an author's `WorkflowCfg` (cli.rs:666-667, template.rs:21, graph.rs:196, pipeline.rs:1054, workflow.rs:337-338) takes the version from `WorkflowCfg.edition`. The engine-built graphs with no author tasks (template.rs:101, graph.rs:1072) stay v1. Edition 2 applies in every lane, the scored loop included, where `kept` is staged like any other reserved input.
+- Declared inputs are edition 3. Editions are cumulative ([[ADR-0071]]), so edition 3 also has edition 2's declared host env. `edition` is the manifest's top-level key, not a `[workflow]` key, because edition 2 governs `[judge]` and `[world]` too; `WorkflowCfg` carries it from the manifest. The Starlark `workflow()` constructor does not take it: the compiler has to know the edition before it evaluates the source, to decide whether `inputs=` is a known kwarg, as [[RFC-0001:C-WORKFLOW]] already requires of the lane. `resolve_workflow_with` replaces the manifest's `WorkflowCfg` with the compiled one (manifest/mod.rs:1128-1130), so it carries `edition` across as it carries `resolved_from`.
+- The edition selects the IR version: editions 1 and 2 compile to v1, edition 3 to v2. Every site that builds a plan from an author's `WorkflowCfg` (cli.rs:666-667, template.rs:21, graph.rs:196, pipeline.rs:1054, workflow.rs:337-338) takes the version from `WorkflowCfg.edition`. The engine-built graphs with no author tasks (template.rs:101, graph.rs:1072) stay v1. Edition 3 applies in every lane, the scored loop included, where `kept` is staged like any other reserved input.
 - v2-only fields are skipped when empty and v1 serialization does not change, so an unchanged source compiles to the same bytes on an engine that knows v2. Source rev, schema digest, exposure digest, and plan digest all stay put: no re-approval, and resume works across the upgrade.
 - An engine runs each version with that version's semantics. v1 is the behaviour after #210 plus the two fixes above. v2 is the above.
-- An engine that predates v2 refuses an edition-2 manifest at parse, because `WorkflowCfg` denies unknown fields, and a v2 plan file with `UnsupportedVersion`. The version is the gate rather than the presence of `inputs`, because `[[workflow.task]]` tables and plan files would lose `inputs` on an older engine instead of refusing it.
+- An engine that predates v2 refuses an edition-3 manifest at parse, naming the editions it supports ([[ADR-0071]]), and a v2 plan file with `UnsupportedVersion`. The version is the gate rather than the presence of `inputs`, because `[[workflow.task]]` tables and plan files would lose `inputs` on an older engine instead of refusing it.
 - A run keeps the IR version it started with ([[RFC-0002:C-PLAYBOOK-RESUME]] folds results against the same graph). Resume recompiles the same source to the same version, and the digest check refuses anything else.
 
-**Specification.** This record chooses the design; it does not define the contract. Before it is accepted, these land as normative clauses: a new [[RFC-0002]] clause beside [[RFC-0002:C-TASK-FILES]] for the inputs directory, its environment variable, the file and index layout, key escaping, the cap's default and failure, and the inline budget; amendments to [[RFC-0002:C-SETTLED-JOIN]] and [[RFC-0002:C-PLAYBOOK-PARAMS]] scoping their delivery rules by edition and stating the settled-join staging above; an amendment to [[RFC-0001:C-WORKFLOW]] for `edition`, `inputs`, and the producer-name rule; and an amendment to [[RFC-0001:C-WIRE]] if `plan_admitted` is to carry each task's inputs (it already carries `plan_version`). The numbers this record does not fix (cap default, inline thresholds) are set there.
+**Specification.** This record chooses the design; it does not define the contract. Before it is accepted, these land as normative clauses: a new [[RFC-0002]] clause beside [[RFC-0002:C-TASK-FILES]] for the inputs directory, its environment variable, the file and index layout, key escaping, the cap's default and failure, and the inline budget; amendments to [[RFC-0002:C-SETTLED-JOIN]] and [[RFC-0002:C-PLAYBOOK-PARAMS]] scoping their delivery rules by edition and stating the settled-join staging above; an amendment to [[RFC-0001:C-WORKFLOW]] for `inputs` and the producer-name rule, with edition 3 added to the editions [[RFC-0001:C-COMMANDS]] defines; and an amendment to [[RFC-0001:C-WIRE]] if `plan_admitted` is to carry each task's inputs (it already carries `plan_version`). The numbers this record does not fix (cap default, inline thresholds) are set there.
 
-**Compatibility.** Every checked-in pack compiles byte-identical before and after the engine change, and that is tested. The engine keeps v1 while any pack or resumable run uses it; a warning on edition 1 is a later decision."""
+**Compatibility.** Every checked-in pack compiles byte-identical before and after the engine change, and that is tested. The engine keeps v1 while any pack or resumable run uses it; a warning below edition 3 is a later decision, beside the edition-1 warning [[ADR-0071]] adds."""
 consequences = """
 - A consumer's input is what it named, so a fan-out's width costs a consumer one directory, not one environment string or one prompt.
 - Agent prompts stop growing with upstream output. An agent that needs a large value reads a file, which costs a tool call where it used to cost prompt tokens on every turn.
-- A producer that returns a large blob in a declared JSON field fails under edition 2 with a note pointing at `emits_files`. Under edition 1 nothing changes.
+- A producer that returns a large blob in a declared JSON field fails under edition 3 with a note pointing at `emits_files`. Below edition 3 nothing changes.
 - The cap does not bound undeclared fields or whole result objects, so run records, `history_record`, and the `outcome` input stay as large as producers make them.
-- Edition 2 needs a declaration per value read, and every consumer in a pack is ported when the pack opts in. A consumer that forgets one finds the file absent at run time; validation cannot see what a command or prompt reads.
-- A settled consumer under edition 2 receives the fields it declared from a failed producer's retained output, not the whole retained output. [[RFC-0002:C-SETTLED-JOIN]] is amended to say so.
+- Edition 3 needs a declaration per value read, and every consumer in a pack is ported when the pack opts in. A consumer that forgets one finds the file absent at run time; validation cannot see what a command or prompt reads.
+- A settled consumer under edition 3 receives the fields it declared from a failed producer's retained output, not the whole retained output. [[RFC-0002:C-SETTLED-JOIN]] is amended to say so.
 - The index gives a consumer size and digest before it reads, and gives a run record what each task was handed.
 - The engine carries two input paths until no pack or resumable run uses v1.
-- Edition 1 changes in two places. A pack whose task name is `.`, `..`, contains a separator, or starts with the reserved character stops validating, and an in-flight run of such a pack cannot resume. An instance whose key contains a separator or starts with `.` stages and captures under an escaped directory, so a consumer that hard-coded the nested path breaks. Both were path escapes.
-- Local agent turns no longer fail to spawn on large prompts in either edition; the prompt's token cost under edition 1 is unchanged.
+- Editions 1 and 2 change in two places. A pack whose task name is `.`, `..`, contains a separator, or starts with the reserved character stops validating, and an in-flight run of such a pack cannot resume. An instance whose key contains a separator or starts with `.` stages and captures under an escaped directory, so a consumer that hard-coded the nested path breaks. Both were path escapes.
+- Local agent turns no longer fail to spawn on large prompts in any edition; the prompt's token cost below edition 3 is unchanged.
 - A dispatch image older than the edition is refused at parse, not degraded. [[RFC-0004:C-CONTRACT-VERSION]] already keeps dispatch images in step with the linked engine; this adds no second check.
 - The direct-dependency rule for JSON outputs is unchanged. Reading a value from a grandparent still means the parent re-emits it or the producer writes a file."""
 
 [[content.alternatives]]
-text = "Named, typed inputs staged as files with a producer-side cap on declared fields, gated by a pack edition that maps one-to-one to the IR version"
+text = "Named, typed inputs staged as files with a producer-side cap on declared fields, gated by a pack edition that selects the IR version"
 status = "accepted"
 pros = [
     "A consumer receives only what it declared, so input size tracks what it reads.",
@@ -90,7 +91,7 @@ pros = [
 cons = [
     "Two input paths in the engine until v1 is retired.",
     "Opting in means declaring every input of every consumer at once.",
-    "The producer-path fix and the local stdin fix change edition-1 behaviour for packs that relied on the old paths.",
+    "The producer-path fix and the local stdin fix change behaviour below edition 3 for packs that relied on the old paths.",
 ]
 
 [[content.alternatives]]

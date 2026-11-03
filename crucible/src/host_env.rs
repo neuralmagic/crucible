@@ -1,8 +1,10 @@
-//! The environment a pack-authored command runs with outside the sandbox (RFC-0001:C-COMMANDS):
-//! a fixed base plus exactly the variables its manifest table declares. Nothing else of the
-//! engine's environment reaches it, so a script the agent can edit cannot read the engine's own
-//! credentials.
+//! The environment a pack-authored command runs with outside the sandbox (RFC-0001:C-COMMANDS).
+//! From edition 2 it is a fixed base plus exactly the variables its manifest table declares, and
+//! nothing else of the engine's environment reaches it, so a script the agent can edit cannot
+//! read the engine's own credentials. An edition-1 pack's commands inherit the engine's
+//! environment.
 
+use crate::manifest::edition::Edition;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt;
@@ -167,25 +169,53 @@ pub struct MissingEnv {
     missing: Vec<String>,
 }
 
-/// The declared variables one manifest table's commands receive, with the values the engine had
-/// when the run resolved them.
-#[derive(Clone, Default)]
-pub struct HostEnv {
-    declared: Vec<(EnvName, OsString)>,
+/// What one manifest table's commands receive of the engine's environment. The default passes
+/// the base alone.
+#[derive(Clone)]
+pub struct HostEnv(Reach);
+
+#[derive(Clone)]
+enum Reach {
+    Inherited,
+    /// The declared variables, with the values the engine had when the run resolved them.
+    Declared(Vec<(EnvName, OsString)>),
+}
+
+impl Default for HostEnv {
+    fn default() -> Self {
+        HostEnv(Reach::Declared(Vec::new()))
+    }
 }
 
 impl fmt::Debug for HostEnv {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_list()
-            .entries(self.declared.iter().map(|(name, _)| name))
-            .finish()
+        match &self.0 {
+            Reach::Inherited => f.write_str("Inherited"),
+            Reach::Declared(declared) => f
+                .debug_list()
+                .entries(declared.iter().map(|(name, _)| name))
+                .finish(),
+        }
     }
 }
 
 impl HostEnv {
-    /// Resolve `table`'s declared names against the engine's environment.
-    pub fn resolve(table: &'static str, declared: &DeclaredEnv) -> Result<HostEnv, MissingEnv> {
-        Self::resolve_with(table, declared, |name| std::env::var_os(name))
+    /// What `table`'s commands receive under `edition`: the engine's environment for edition 1,
+    /// else its declared names resolved against the engine's environment.
+    pub fn resolve(
+        edition: Edition,
+        table: &'static str,
+        declared: &DeclaredEnv,
+    ) -> Result<HostEnv, MissingEnv> {
+        match edition {
+            Edition::One => Ok(HostEnv::inherited()),
+            Edition::Two => Self::resolve_with(table, declared, |name| std::env::var_os(name)),
+        }
+    }
+
+    /// The engine's whole environment.
+    pub fn inherited() -> HostEnv {
+        HostEnv(Reach::Inherited)
     }
 
     fn resolve_with(
@@ -203,22 +233,26 @@ impl HostEnv {
             }
         }
         if missing.is_empty() {
-            Ok(HostEnv { declared: found })
+            Ok(HostEnv(Reach::Declared(found)))
         } else {
             Err(MissingEnv { table, missing })
         }
     }
 
-    /// Replace `cmd`'s environment with the base and the declared variables. Variables the
-    /// engine sets for the command itself go on afterwards.
+    /// Replace `cmd`'s environment with the base and the declared variables, or leave it the
+    /// engine's when inherited. Variables the engine sets for the command itself go on
+    /// afterwards.
     pub fn apply(&self, cmd: &mut Command) {
+        let Reach::Declared(declared) = &self.0 else {
+            return;
+        };
         cmd.env_clear();
         for name in BASE {
             if let Some(value) = std::env::var_os(name) {
                 cmd.env(name, value);
             }
         }
-        for (name, value) in &self.declared {
+        for (name, value) in declared {
             cmd.env(name.as_str(), value);
         }
     }
@@ -229,6 +263,7 @@ mod tests {
     use crate::host_env::{
         DeclaredEnv, EnvDecl, EnvDeclError, EnvName, HostEnv, MissingEnv, RequiredAndOptional,
     };
+    use crate::manifest::edition::Edition;
     use std::ffi::OsString;
 
     fn declared(entries: &[&str]) -> DeclaredEnv {
@@ -461,5 +496,49 @@ mod tests {
         let seen = env_of(&env);
         assert!(seen.lines().any(|l| l == "KUBECONFIG=/k"), "{seen}");
         assert!(!seen.contains("EPP_ENDPOINT"), "{seen}");
+    }
+
+    /// Edition 1 keeps the behaviour packs were written against: the command runs with the
+    /// engine's environment, a variable no table declared included.
+    #[test]
+    fn an_edition_one_command_inherits_the_engines_environment() {
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("CRUCIBLE_TEST_INHERITED", "kept") };
+        let env = HostEnv::resolve(Edition::One, "[judge]", &DeclaredEnv::default());
+        let seen = env.as_ref().map(env_of);
+        unsafe { std::env::remove_var("CRUCIBLE_TEST_INHERITED") };
+        let seen = seen.unwrap();
+        assert!(
+            seen.lines().any(|l| l == "CRUCIBLE_TEST_INHERITED=kept"),
+            "{seen}"
+        );
+        assert!(seen.lines().any(|l| l == "UNDECLARED=leaked"), "{seen}");
+        assert_eq!(format!("{:?}", HostEnv::inherited()), "Inherited");
+    }
+
+    /// Edition 2 resolves the declared names against the engine's environment, so a required
+    /// one it lacks refuses; edition 1 has nothing to resolve.
+    #[test]
+    fn edition_two_resolves_declared_names_and_edition_one_does_not() {
+        let required = declared(&["CRUCIBLE_TEST_NEVER_SET"]);
+        let error = HostEnv::resolve(Edition::Two, "[world]", &required).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "[world].env declares CRUCIBLE_TEST_NEVER_SET, which the engine's environment does \
+             not set"
+        );
+        let env = HostEnv::resolve(Edition::Two, "[world]", &DeclaredEnv::default()).unwrap();
+        let seen = env_of(&env);
+        assert!(!seen.contains("UNDECLARED"), "{seen}");
+        assert!(seen.lines().any(|l| l.starts_with("PATH=")), "{seen}");
+    }
+
+    /// A command handed no resolved environment fails closed: the base alone.
+    #[test]
+    fn the_default_passes_the_base_alone() {
+        let seen = env_of(&HostEnv::default());
+        assert!(!seen.contains("UNDECLARED"), "{seen}");
+        assert!(seen.lines().any(|l| l.starts_with("PATH=")), "{seen}");
+        assert_eq!(format!("{:?}", HostEnv::default()), "[]");
     }
 }

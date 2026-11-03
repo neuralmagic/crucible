@@ -801,7 +801,7 @@ pub fn run(
                         workdir: std::env::current_dir()
                             .context("resolving the working directory")?,
                         agent_cmd,
-                        env: crucible::host_env::HostEnv::default(),
+                        env: crucible::host_env::HostEnv::inherited(),
                         buildit_socket: None,
                     }),
                     None,

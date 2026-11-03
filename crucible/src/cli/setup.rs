@@ -443,6 +443,16 @@ pub(crate) fn restore_for_rerun(
     Ok(base)
 }
 
+/// Say at run start that the pack's host commands inherit the engine's environment.
+pub(crate) fn warn_inherited_env(inherits: bool) {
+    if inherits {
+        eprintln!(
+            "[crucible] WARNING: {}",
+            manifest::edition::INHERITED_ENV_WARNING
+        );
+    }
+}
+
 /// Where a manifest run keeps its state: the session log, captured files, and run records.
 pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
     manifest::manifest_dir(manifest_path).join("state")
@@ -460,6 +470,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
+    warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     if let Some(all) = m.launch.all() {
         for (setting, flag, value) in [
             (

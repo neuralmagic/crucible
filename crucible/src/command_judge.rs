@@ -214,7 +214,7 @@ mod tests {
         let judge = CommandJudge {
             workspace: std::env::temp_dir(),
             measure_cmd: r#"test -z "$CRUCIBLE_TEST_UNDECLARED" && test "$CRUCIBLE_TEST_DECLARED" = passed && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
-            env: crate::host_env::HostEnv::resolve("[judge]", &declared).unwrap(),
+            env: crate::host_env::HostEnv::resolve(crate::manifest::edition::Edition::Two, "[judge]", &declared).unwrap(),
             ..judge(Direction::Higher)
         };
         let reading = judge.measure(&MeasureCtx {
@@ -231,6 +231,34 @@ mod tests {
         assert_eq!(reading.score, Some(3.0));
     }
 
+    /// An edition-1 pack's `measure_cmd` runs with the engine's environment, as packs written
+    /// before edition 2 expect, and still gets the engine's scores.
+    #[test]
+    fn an_edition_one_measure_inherits_the_engines_environment() {
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("CRUCIBLE_TEST_INHERITED", "kept") };
+        let judge = CommandJudge {
+            workspace: std::env::temp_dir(),
+            measure_cmd: r#"test "$CRUCIBLE_TEST_INHERITED" = kept && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
+            env: crate::host_env::HostEnv::resolve(
+                crate::manifest::edition::Edition::One,
+                "[judge]",
+                &crate::host_env::DeclaredEnv::default(),
+            )
+            .unwrap(),
+            ..judge(Direction::Higher)
+        };
+        let reading = judge.measure(&MeasureCtx {
+            baseline_score: None,
+            baseline_total: None,
+            best_score: Some(2.0),
+        });
+        unsafe { std::env::remove_var("CRUCIBLE_TEST_INHERITED") };
+        let reading = reading.unwrap();
+        assert!(reading.valid, "{}", reading.note);
+        assert_eq!(reading.score, Some(2.0));
+    }
+
     /// An optional variable reaches `measure_cmd` when the engine has it; one the engine lacks
     /// is absent rather than empty, and the measure still runs.
     #[test]
@@ -245,7 +273,11 @@ mod tests {
             "CRUCIBLE_TEST_OPTIONAL_UNSET?"
         ]))
         .unwrap();
-        let env = crate::host_env::HostEnv::resolve("[judge]", &declared);
+        let env = crate::host_env::HostEnv::resolve(
+            crate::manifest::edition::Edition::Two,
+            "[judge]",
+            &declared,
+        );
         unsafe {
             std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_SET");
         }

@@ -302,6 +302,7 @@ fn call<'v>(
                         tasks,
                         file: None,
                         resolved_from: None,
+                        edition: Default::default(),
                         params: BTreeMap::new(),
                         env: crate::host_env::DeclaredEnv::default(),
                         history_record: None,

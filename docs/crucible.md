@@ -72,13 +72,27 @@ Crucible defines a small contract. A repository implements it in any language. A
 | `restore <token>` | no | Rolls back to a token. Default: `git reset --hard` and `clean`. |
 | `setup` | no | Prepares the workspace. Default: Git clone and checkout. |
 
-`measure`, `apply`, `snapshot`, and `restore` get a minimal environment, not the engine's:
-`PATH`, `HOME`, `LANG`, and `TMPDIR`, the variables the engine sets for that command
-(`CRUCIBLE_BASELINE_*`, `CRUCIBLE_BEST_SCORE`, `CRUCIBLE_TOKEN`), and the variables its table
-declares. The agent can edit files a command runs, so nothing else of the engine's environment
-reaches it: no kubeconfig, registry authfile, broker token, or provider key unless you name it.
+What of the engine's environment `measure`, `apply`, `snapshot`, and `restore` get depends on
+the pack's edition, a top-level key of `crucible.toml`:
 
 ```toml
+edition = 2
+```
+
+A manifest without `edition` is edition 1. Its commands inherit the engine's whole environment,
+credentials included, and `crucible check` and every run warn that the pack should move to
+edition 2. The capability disclosure says so per table: `host-env [judge] commands inherit the
+engine's whole environment`.
+
+Under edition 2 the commands get a minimal environment, not the engine's: `PATH`, `HOME`,
+`LANG`, and `TMPDIR`, the variables the engine sets for that command (`CRUCIBLE_BASELINE_*`,
+`CRUCIBLE_BEST_SCORE`, `CRUCIBLE_TOKEN`), and the variables its table declares. The agent can
+edit files a command runs, so nothing else of the engine's environment reaches it: no
+kubeconfig, registry authfile, broker token, or provider key unless you name it.
+
+```toml
+edition = 2
+
 [judge]
 measure_cmd = "./measure.sh"
 direction = "lower"
@@ -89,16 +103,17 @@ apply_cmd = "./deploy.sh"
 env = ["KUBECONFIG", "REGISTRY_AUTH_FILE"]   # apply, snapshot, and restore
 ```
 
-`[workflow].env` does the same for a workflow's `command` and `evaluate` tasks. A name is a
-letter or underscore followed by letters, digits, and underscores. A required variable that the
-engine's environment does not set refuses the run before any of these commands runs, naming
-every missing one; `crucible check` reports it as a finding. A name with a trailing `?` is
-optional: the command gets it when the engine's environment sets it and runs without it
-otherwise, so a script can keep a shell default (`${EPP_ENDPOINT:-127.0.0.1:8000}`) that a
-deployment overrides. Only the trailing `?` is allowed (`?` alone, `A??`, and `A?B` fail the
-parse), and a name is either required or optional, not both. `crucible check` lists each
+`[workflow].env` does the same for a workflow's `command` and `evaluate` tasks. An `env` list
+in an edition-1 manifest fails the parse, and so does an edition this engine does not know. A
+name is a letter or underscore followed by letters, digits, and underscores. A required
+variable that the engine's environment does not set refuses the run before any of these
+commands runs, naming every missing one; `crucible check` reports it as a finding. A name with
+a trailing `?` is optional: the command gets it when the engine's environment sets it and runs
+without it otherwise, so a script can keep a shell default (`${EPP_ENDPOINT:-127.0.0.1:8000}`)
+that a deployment overrides. Only the trailing `?` is allowed (`?` alone, `A??`, and `A?B` fail
+the parse), and a name is either required or optional, not both. `crucible check` lists each
 table's declared variables in the capability disclosure as `host-env`, the optional ones marked
-`(optional)`. `setup` runs with the engine's environment.
+`(optional)`. `setup` runs with the engine's environment in every edition.
 
 The accept policy is the same for all domains. The engine keeps a candidate if it is `valid`
 and its `score` is better than the best score in the `direction`. The run is solved only if

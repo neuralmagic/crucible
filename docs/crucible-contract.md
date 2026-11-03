@@ -19,6 +19,8 @@ The engine reads exactly one manifest per run. Default path `./crucible.toml` (o
 config-relative paths below.
 
 ```toml
+edition = 2                                   # pack contract edition; absent = 1 (§3)
+
 [repo]
 # Exactly one of url|path. The upstream the agent edits a checkout of. A playbook may omit the
 # whole table: its workspace is then an empty dir the injects populate.
@@ -81,7 +83,7 @@ measure_cmd = "./measure.sh"                  # REQUIRED. §3. Any executable, a
 direction   = "lower"                         # lower | higher. REQUIRED.
 tiebreak_direction = "lower"                  # optional; direction of the `tiebreak` scalar (§4). default: direction
 objective   = "score"                         # display label (the old `gate` name). default "score"
-env         = ["KUBECONFIG", "EPP_ENDPOINT?"] # engine env measure_cmd receives (§3); NAME? only when set
+env         = ["KUBECONFIG", "EPP_ENDPOINT?"] # edition 2: engine env measure_cmd receives (§3); NAME? only when set
 
 [judge.selftest]                              # optional (ADR-0012). Runs in `crucible check`, never in a loop iteration.
 good_cmd = "..."                              # stages a known-good config in the workspace
@@ -93,7 +95,7 @@ runs     = 1                                  # measurements averaged per contro
 apply_cmd    = "..."                          # optional. §3.
 snapshot_cmd = "..."                          # optional. §3.
 restore_cmd  = "..."                          # optional. §3.
-env          = ["KUBECONFIG"]                 # engine env the three commands receive (§3); NAME? only when set
+env          = ["KUBECONFIG"]                 # edition 2: engine env the three commands receive (§3); NAME? only when set
 
 [search]                                      # optional (ADR-0010). Absent or wide=0 → pure-deep, the default.
 wide       = 0                                # u32. N parallel propose turns before the deep loop. default 0
@@ -112,6 +114,9 @@ Rules:
   stages one side isn't a control); `runs` must be `>= 1`.
 - `[search]`, if present with `wide > 0`, requires `approaches.len() >= wide` (hard error,
   diversity is engineered, not auto-generated) and `policy_k` in `1..=wide`.
+- **Edition.** `edition` is 1 when absent; 1 and 2 are the editions this engine runs, and any
+  other value fails the parse naming them. An `env` list in `[judge]`, `[world]`, or
+  `[workflow]` needs edition 2 and fails the parse of an edition-1 manifest (§3).
 - Unknown keys are an error (typo protection), not silently ignored.
 - **Frozen loading (`load_frozen`).** When the manifest file lives *inside* the workspace it
   targets (the BYO on-ramp: `crucible init` scaffolds `[repo] path = "."`), the engine parses it
@@ -534,11 +539,13 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
 - **cwd** = the agent workspace (`manifest_dir/[workspace].dir`).
 - **PATH inherited**, so a command may be a bare installed tool (`bench`) or a workspace-relative
   script (`./measure.sh`).
-- **env** = `PATH`, `HOME`, `LANG`, `TMPDIR`, the injected variables below, and what the
-  command's table declares in `env`: `[judge].env` for `measure_cmd`, `[world].env` for
+- **env**, edition 2 = `PATH`, `HOME`, `LANG`, `TMPDIR`, the injected variables below, and what
+  the command's table declares in `env`: `[judge].env` for `measure_cmd`, `[world].env` for
   `apply_cmd`, `snapshot_cmd`, and `restore_cmd`. A declared `NAME` the engine's environment
   does not set refuses the run; a declared `NAME?` is passed when set and left out when not.
-  `setup_cmd` gets the engine's env.
+- **env**, edition 1 = the engine's env plus the injected variables below. `crucible check` and
+  run start warn about it, and the capability disclosure states it.
+- `setup_cmd` gets the engine's env in every edition.
 
 ### `measure_cmd` (the Judge): REQUIRED
 - **Injected env:** `CRUCIBLE_BASELINE_SCORE`, `CRUCIBLE_BASELINE_TOTAL`, `CRUCIBLE_BEST_SCORE`

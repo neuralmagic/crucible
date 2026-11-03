@@ -111,10 +111,12 @@ The output of a task is JSON. It becomes the input of the task's dependents.
   name, in the file that `CRUCIBLE_INPUTS_FILE` names. `CRUCIBLE_TASK` gives the task name. The
   same JSON is also in `CRUCIBLE_INPUTS` if it is 64 KiB or smaller. If it is larger, the
   variable is not set, because Linux rejects an environment string larger than 128 KiB. Read
-  the file. Besides these, the command gets only `PATH`, `HOME`, `LANG`, `TMPDIR`, and the
-  variables `[workflow].env` names in the manifest (`env = ["GH_TOKEN", "GPUS?"]`). A named
-  variable the engine does not have refuses the run, unless its name ends in `?`: an optional
-  variable is passed when the engine has it and left out when it does not.
+  the file. In an edition-2 pack (`edition = 2` at the top of `crucible.toml`), the command
+  gets besides these only `PATH`, `HOME`, `LANG`, `TMPDIR`, and the variables `[workflow].env`
+  names in the manifest (`env = ["GH_TOKEN", "GPUS?"]`). A named variable the engine does not
+  have refuses the run, unless its name ends in `?`: an optional variable is passed when the
+  engine has it and left out when it does not. In an edition-1 pack the command inherits the
+  engine's whole environment, and `[workflow].env` fails the parse.
 - `agent` with `--manifest`: the turn writes one JSON object to `PLAN_TASK_RESULT.json` in the
   workspace root. If the file is missing after a normal turn, this is a measured failure. An
   explicit spawn, harness, or stream error is a transport failure and follows the retry policy.

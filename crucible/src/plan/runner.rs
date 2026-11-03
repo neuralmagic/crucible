@@ -613,7 +613,12 @@ mod tests {
         }
         let declared: crate::host_env::DeclaredEnv =
             serde_json::from_value(serde_json::json!(["CRUCIBLE_TEST_DECLARED"])).unwrap();
-        let env = crate::host_env::HostEnv::resolve("[workflow]", &declared).unwrap();
+        let env = crate::host_env::HostEnv::resolve(
+            crate::manifest::edition::Edition::Two,
+            "[workflow]",
+            &declared,
+        )
+        .unwrap();
         let plan = Plan {
             version: 1,
             reason: None,
@@ -646,6 +651,42 @@ mod tests {
         assert_ne!(probe["path"], "", "{probe}");
     }
 
+    /// An edition-1 pack's command task runs with the engine's environment, and still gets the
+    /// variables the engine sets for it.
+    #[test]
+    fn an_edition_one_command_task_inherits_the_engines_environment() {
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("CRUCIBLE_TEST_INHERITED", "kept") };
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
+            tasks: vec![command(
+                "probe",
+                r#"printf '{"inherited":"%s","task":"%s"}\n' "$CRUCIBLE_TEST_INHERITED" "$CRUCIBLE_TASK""#,
+                &[],
+            )],
+        }
+        .validate()
+        .unwrap();
+        let mut r = ShellRunner {
+            env: crate::host_env::HostEnv::inherited(),
+            ..runner()
+        };
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        unsafe { std::env::remove_var("CRUCIBLE_TEST_INHERITED") };
+        let probe = out.results[&"probe".into()].output.clone().unwrap();
+        assert_eq!(probe["inherited"], "kept", "{probe}");
+        assert_eq!(probe["task"], "probe", "{probe}");
+    }
+
     /// `[workflow].env = ["NAME?"]` passes a variable the engine has to a command task, and one
     /// it lacks is absent, not empty, while the task still runs.
     #[test]
@@ -660,7 +701,11 @@ mod tests {
             "CRUCIBLE_TEST_OPTIONAL_UNSET?"
         ]))
         .unwrap();
-        let env = crate::host_env::HostEnv::resolve("[workflow]", &declared);
+        let env = crate::host_env::HostEnv::resolve(
+            crate::manifest::edition::Edition::Two,
+            "[workflow]",
+            &declared,
+        );
         unsafe {
             std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_SET");
         }
