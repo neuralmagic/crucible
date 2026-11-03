@@ -24,6 +24,15 @@ pub enum AuthProvider {
     ApiKey,
 }
 
+impl AuthProvider {
+    /// Whether a turn with no key and no base URL in its environment runs on the deploy
+    /// profile's ambient Vertex credential: the Vertex harnesses do by construction, and a
+    /// key-authenticated one falls back to it through its provider table.
+    pub fn runs_on_ambient_vertex(self) -> bool {
+        matches!(self, AuthProvider::Vertex | AuthProvider::ApiKey)
+    }
+}
+
 /// The API families a harness can reach a model through. A harness that speaks both takes an
 /// OpenAI-speaking endpoint first when the environment names one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

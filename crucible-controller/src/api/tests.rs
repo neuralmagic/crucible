@@ -12813,8 +12813,8 @@ async fn a_provider_names_its_harness_from_those_that_speak_to_it(pool: PgPool) 
         (custom("bay", Some("gemini")), "not a harness"),
         (
             serde_json::json!({"id": "plat-vertex", "display_name": "Vertex", "kind": "vertex",
-                "harness": "pi"}),
-            "claude",
+                "harness": "codex"}),
+            "claude, opencode, pi",
         ),
     ] {
         let (status, refused) = post_admin(&app, "/api/providers", body).await;

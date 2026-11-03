@@ -33,7 +33,9 @@ pub(crate) fn resolve_auth(
 ) -> AuthProvider {
     match (harness.spec().auth, inference.anthropic_key.as_deref()) {
         (AuthProvider::Vertex, Some(_)) => AuthProvider::AnthropicKey,
-        (AuthProvider::ApiKey, _) if inference.is_ambient() => AuthProvider::Vertex,
+        (auth, _) if auth.runs_on_ambient_vertex() && inference.is_ambient() => {
+            AuthProvider::Vertex
+        }
         (auth, _) => auth,
     }
 }

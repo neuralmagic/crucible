@@ -94,12 +94,7 @@ pub async fn resolve_harness(
 
 /// The capability predicate a harness needs its sandbox to provide.
 fn harness_predicate(harness: Harness) -> Option<&'static str> {
-    match harness {
-        Harness::Claude => Some("agent.claude-code"),
-        Harness::Codex => Some("agent.codex"),
-        Harness::OpenCode => Some("agent.opencode"),
-        Harness::Pi => Some("agent.pi"),
-    }
+    harness.spec().sandbox_capability
 }
 
 /// The requirements a pack declares plus the one the effective harness implies.
