@@ -405,9 +405,11 @@ mod tests {
         assert!(ids.contains(&"playbook-publishers-publish".to_string()));
         assert!(ids.contains(&"everyone-launch-platform-playbooks".to_string()));
         assert!(ids.contains(&"operators-access-autoresearch".to_string()));
+        assert!(ids.contains(&"team-maintainer-approve-run".to_string()));
+        assert!(ids.contains(&"runs-never-approve".to_string()));
         assert!(ids.contains(&"everyone-read-public-blueprints".to_string()));
         assert!(ids.contains(&"team-member-bind-carried".to_string()));
-        assert_eq!(ids.len(), 21);
+        assert_eq!(ids.len(), 23);
     }
 
     #[test]

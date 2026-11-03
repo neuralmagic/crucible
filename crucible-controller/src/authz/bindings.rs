@@ -195,6 +195,15 @@ pub static BINDINGS: &[Binding] = &[
         Platform,
     ),
     bind("GET", "/api/approvals", R::Issue, V::Read, Route),
+    bind("GET", "/api/decisions", R::Run, V::Read, Route),
+    bind("GET", "/api/decisions/{id}", R::Run, V::Read, Route),
+    bind(
+        "POST",
+        "/api/decisions/{id}/answer",
+        R::Run,
+        V::Approve,
+        Route,
+    ),
     bind("GET", "/api/runs", R::Run, V::Read, Route),
     bind("GET", "/api/runs/{run_id}", R::Run, V::Read, Route),
     bind(
