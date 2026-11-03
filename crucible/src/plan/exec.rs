@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
-use crate::plan::admission::{Admission, BatchLane, Refusal, Settled};
+use crate::plan::admission::{Admission, BatchLane, Journal, Refusal, Settled, estimate_usd};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
     COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
@@ -167,6 +167,10 @@ impl BatchLane for BatchItem<'_> {
     fn task(&self) -> &Task {
         self.task
     }
+
+    fn attempt(&self) -> u32 {
+        self.attempt
+    }
 }
 
 impl Attempt {
@@ -263,7 +267,7 @@ pub trait TaskRunner {
         batch
             .iter()
             .map(|b| {
-                admission.run(b.task, |lane| {
+                admission.run(b, |lane| {
                     self.run(b.task, b.attempt, &b.inputs, lane.deadline())
                 })
             })
@@ -271,7 +275,7 @@ pub trait TaskRunner {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ExecCfg<'a> {
     /// Bounded auto-retry for transport failures (measured failures never retry).
     pub transport_retries: u32,
@@ -289,6 +293,9 @@ pub struct ExecCfg<'a> {
     /// How many lanes of one dispatch run at once. It bounds what lanes already in flight can
     /// spend past the cost ceiling.
     pub width: NonZeroUsize,
+    /// Where each attempt is recorded before it runs. `None` records nothing, which a run that
+    /// cannot resume wants.
+    pub journal: Option<&'a dyn Journal>,
 }
 
 impl Default for ExecCfg<'_> {
@@ -300,6 +307,7 @@ impl Default for ExecCfg<'_> {
             early_completion: false,
             prior: None,
             width: crate::plan::admission::DEFAULT_WIDTH,
+            journal: None,
         }
     }
 }
@@ -321,6 +329,9 @@ pub struct Prior {
     /// The rows a rerun reused, each with the run that settled it. Their spend was charged to
     /// that run, not this one.
     pub reused: BTreeMap<TaskName, String>,
+    /// What the attempts that started and never settled are charged, since their process died
+    /// before it could say what they spent.
+    pub reserved_usd: f64,
 }
 
 impl Prior {
@@ -332,9 +343,9 @@ impl Prior {
             .collect()
     }
 
-    /// What the settled rows cost. A mapped node's row and a revise loop's rows already total
-    /// their items and rounds, so a task counts its own row only when none of its items or rounds
-    /// were logged.
+    /// What the settled rows cost, plus what attempts that never settled are charged. A mapped
+    /// node's row and a revise loop's rows already total their items and rounds, so a task counts
+    /// its own row only when none of its items or rounds were logged.
     pub fn spent_usd(&self) -> f64 {
         let parents: BTreeSet<&str> = self
             .results
@@ -346,7 +357,8 @@ impl Prior {
             .filter(|(name, _)| name.0.contains('[') || !parents.contains(name.0.as_str()))
             .filter(|(name, _)| !self.reused.contains_key(*name))
             .map(|(_, r)| r.cost_usd)
-            .sum()
+            .sum::<f64>()
+            + self.reserved_usd
     }
 
     /// What the rows a rerun reused had cost the runs that settled them.
@@ -2727,6 +2739,9 @@ fn run_with_retries(
         attempts += 1;
         let deadline = Deadline::for_attempt(Instant::now(), t.timeout, run_ceiling);
         runner.budget_left(budget - *spent);
+        if let Some(journal) = cfg.journal {
+            journal.started(&t.name, attempts, estimate_usd(t, budget, cfg.width));
+        }
         let a = runner.run(t, attempts, inputs, deadline);
         cost += a.cost_usd;
         *spent += a.cost_usd;
@@ -2794,7 +2809,8 @@ fn run_batch_with_retries<'a>(
             })
             .collect();
         runner.budget_left(budget - *spent);
-        let admission = Admission::new(budget, *spent, run_ceiling, cfg.width);
+        let admission =
+            Admission::new(budget, *spent, run_ceiling, cfg.width).journaled(cfg.journal);
         let attempts = runner.run_many(&items, &admission);
         let mut attempted = Vec::new();
         for ((idx, item, previous), a) in wave.into_iter().zip(attempts) {
@@ -4535,7 +4551,7 @@ mod tests {
                 batch
                     .iter()
                     .map(|b| {
-                        admission.run(b.task, |_| Attempt {
+                        admission.run(b, |_| Attempt {
                             outcome: AttemptOutcome::Pass(serde_json::json!({})),
                             cost_usd: 0.0,
                             repairs: Vec::new(),
@@ -4816,7 +4832,7 @@ mod tests {
                 batch
                     .iter()
                     .map(|x| {
-                        admission.run(x.task, |_| Attempt {
+                        admission.run(x, |_| Attempt {
                             outcome: if x.task.name.0 == "iso-a" {
                                 AttemptOutcome::Pass(serde_json::json!({}))
                             } else {
@@ -5852,7 +5868,7 @@ mod tests {
             batch
                 .iter()
                 .map(|b| {
-                    admission.run(b.task, |lane| {
+                    admission.run(b, |lane| {
                         self.run(b.task, b.attempt, &b.inputs, lane.deadline())
                     })
                 })
@@ -6052,7 +6068,7 @@ mod tests {
                 return Vec::new();
             };
             let mut later = Vec::new();
-            let head = admission.run(first.task, |lane| {
+            let head = admission.run(first, |lane| {
                 self.ran.push(first.task.name.0.clone());
                 lane.spent_so_far(self.reported);
                 later = self.overlap(rest, admission);
@@ -8927,7 +8943,7 @@ mod tests {
             let attempts = batch
                 .iter()
                 .map(|b| {
-                    admission.run(b.task, |lane| {
+                    admission.run(b, |lane| {
                         assert_eq!(
                             lane.deadline().map(|d| d.bound),
                             b.task.timeout.map(Bound::Task),

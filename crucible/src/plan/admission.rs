@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use crate::deadline::{Deadline, RunCeiling};
-use crate::plan::ir::Task;
+use crate::plan::ir::{Task, TaskName};
 use crate::plan::machine::BlockedReason;
 
 /// Lanes of one dispatch in flight at once, unless the executor is configured otherwise.
@@ -21,9 +21,28 @@ pub trait Settled {
     fn panicked() -> Self;
 }
 
-/// One lane of a batch: the task it runs.
+/// One lane of a batch: the task it runs and which attempt of that task it is.
 pub trait BatchLane {
     fn task(&self) -> &Task;
+    fn attempt(&self) -> u32;
+}
+
+/// Where an attempt is recorded before it runs, so a resumed run can charge one whose process
+/// died before it settled (RFC-0002:C-PLAYBOOK-RESUME).
+pub trait Journal: Sync {
+    fn started(&self, task: &TaskName, attempt: u32, estimate_usd: f64);
+}
+
+/// What a resumed run charges for an attempt of `task` that started and never settled: nothing
+/// for a task that cannot spend, otherwise one lane's equal share of the cost ceiling. A dispatch
+/// interrupted at full width is charged at most the whole ceiling, and a task that kills its
+/// process on every attempt exhausts the ceiling within `width` resumes.
+pub fn estimate_usd(task: &Task, budget: f64, width: NonZeroUsize) -> f64 {
+    if !task.task.spends() {
+        return 0.0;
+    }
+    let lanes = u32::try_from(width.get()).map_or(f64::from(u32::MAX), f64::from);
+    budget / lanes
 }
 
 /// Which ceiling refused a lane. The lane never started.
@@ -48,11 +67,12 @@ impl From<Refusal> for BlockedReason {
 /// reported stays under the cost ceiling. The first refusal on cost refuses every later lane that
 /// can spend, so dispatch stops at one point instead of resuming when an in-flight figure
 /// settles lower. Any lane is refused once the run's wall-clock ceiling has fallen.
-pub struct Admission {
+pub struct Admission<'j> {
     budget: f64,
     run_ceiling: Option<RunCeiling>,
     width: NonZeroUsize,
     tally: Mutex<Tally>,
+    journal: Option<&'j dyn Journal>,
 }
 
 #[derive(Default)]
@@ -72,7 +92,7 @@ impl Tally {
 /// One admitted lane: the deadline it runs under, counted from when it was admitted, and the
 /// handle it reports its spend through while it runs.
 pub struct Lane<'a> {
-    admission: &'a Admission,
+    admission: &'a Admission<'a>,
     id: u64,
     deadline: Option<Deadline>,
 }
@@ -101,7 +121,7 @@ impl Drop for Lane<'_> {
     }
 }
 
-impl Admission {
+impl<'j> Admission<'j> {
     /// `spent` is what the run had settled before this dispatch.
     pub fn new(
         budget: f64,
@@ -117,14 +137,21 @@ impl Admission {
                 settled: spent,
                 ..Tally::default()
             }),
+            journal: None,
         }
+    }
+
+    /// Record every admitted lane in `journal` before it runs.
+    pub fn journaled(self, journal: Option<&'j dyn Journal>) -> Self {
+        Admission { journal, ..self }
     }
 
     fn tally(&self) -> MutexGuard<'_, Tally> {
         self.tally.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn admit(&self, task: &Task) -> Result<Lane<'_>, Refusal> {
+    fn admit(&self, lane: &impl BatchLane) -> Result<Lane<'_>, Refusal> {
+        let task = lane.task();
         if self.run_ceiling.is_some_and(|ceiling| ceiling.reached()) {
             return Err(Refusal::WallClockCeiling);
         }
@@ -137,6 +164,14 @@ impl Admission {
         let id = tally.next;
         tally.next += 1;
         tally.live.insert(id, 0.0);
+        drop(tally);
+        if let Some(journal) = self.journal {
+            journal.started(
+                &task.name,
+                lane.attempt(),
+                estimate_usd(task, self.budget, self.width),
+            );
+        }
         Ok(Lane {
             admission: self,
             id,
@@ -151,13 +186,13 @@ impl Admission {
         tally.settled += attempt.cost_usd();
     }
 
-    /// Run one lane of `task` if the ceilings admit it, and count what it cost.
+    /// Run `item` if the ceilings admit it, and count what it cost.
     pub fn run<A: Settled>(
         &self,
-        task: &Task,
+        item: &impl BatchLane,
         lane: impl FnOnce(&Lane<'_>) -> A,
     ) -> Result<A, Refusal> {
-        let admitted = self.admit(task)?;
+        let admitted = self.admit(item)?;
         let attempt = lane(&admitted);
         self.settle(admitted, &attempt);
         Ok(attempt)
@@ -177,7 +212,7 @@ impl Admission {
                 .unwrap_or_else(|_| A::panicked())
         };
         if let [only] = batch {
-            return vec![self.run(only.task(), |admitted| guarded(only, admitted))];
+            return vec![self.run(only, |admitted| guarded(only, admitted))];
         }
         let next = Mutex::new(0usize);
         let slots: Vec<OnceLock<Result<A, Refusal>>> =
@@ -187,7 +222,7 @@ impl Admission {
             let i = *next;
             let item = batch.get(i)?;
             *next += 1;
-            Some((item, slots.get(i)?, self.admit(item.task())))
+            Some((item, slots.get(i)?, self.admit(item)))
         };
         std::thread::scope(|scope| {
             for _ in 0..self.width.get().min(batch.len()) {
@@ -277,6 +312,14 @@ mod tests {
         }
     }
 
+    fn one(task: &Task) -> BatchItem<'_> {
+        BatchItem {
+            task,
+            attempt: 1,
+            inputs: BTreeMap::new(),
+        }
+    }
+
     fn width(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap()
     }
@@ -285,10 +328,10 @@ mod tests {
     fn a_lane_that_can_spend_is_refused_once_settled_spend_reaches_the_ceiling() {
         let admission = Admission::new(1.0, 0.0, None, width(1));
         let lane = agent("audit[a]");
-        assert!(admission.run(&lane, |_| costing(0.6)).is_ok());
-        assert!(admission.run(&lane, |_| costing(0.4)).is_ok());
+        assert!(admission.run(&one(&lane), |_| costing(0.6)).is_ok());
+        assert!(admission.run(&one(&lane), |_| costing(0.4)).is_ok());
         assert_eq!(
-            admission.run(&lane, |_| costing(0.1)).err(),
+            admission.run(&one(&lane), |_| costing(0.1)).err(),
             Some(Refusal::CostCeiling)
         );
     }
@@ -299,11 +342,11 @@ mod tests {
         let first = agent("audit[a]");
         let second = agent("audit[b]");
         let mut refused = None;
-        let ran = admission.run(&first, |lane| {
+        let ran = admission.run(&one(&first), |lane| {
             lane.spent_so_far(0.5);
             lane.spent_so_far(0.75);
             lane.spent_so_far(0.1);
-            refused = admission.run(&second, |_| costing(0.0)).err();
+            refused = admission.run(&one(&second), |_| costing(0.0)).err();
             costing(0.2)
         });
         assert!(ran.is_ok());
@@ -314,13 +357,13 @@ mod tests {
     fn a_refusal_on_cost_holds_after_an_in_flight_figure_settles_lower() {
         let admission = Admission::new(1.0, 0.0, None, width(2));
         let lane = agent("audit[a]");
-        let _ = admission.run(&lane, |admitted| {
+        let _ = admission.run(&one(&lane), |admitted| {
             admitted.spent_so_far(2.0);
-            assert!(admission.run(&lane, |_| costing(0.0)).is_err());
+            assert!(admission.run(&one(&lane), |_| costing(0.0)).is_err());
             costing(0.1)
         });
         assert_eq!(
-            admission.run(&lane, |_| costing(0.0)).err(),
+            admission.run(&one(&lane), |_| costing(0.0)).err(),
             Some(Refusal::CostCeiling),
             "dispatch stopped once and stays stopped"
         );
@@ -330,10 +373,16 @@ mod tests {
     fn a_lane_that_cannot_spend_is_admitted_past_the_cost_ceiling() {
         let admission = Admission::new(1.0, 5.0, None, width(1));
         assert_eq!(
-            admission.run(&agent("audit[a]"), |_| costing(0.0)).err(),
+            admission
+                .run(&one(&agent("audit[a]")), |_| costing(0.0))
+                .err(),
             Some(Refusal::CostCeiling)
         );
-        assert!(admission.run(&command("apply"), |_| costing(0.0)).is_ok());
+        assert!(
+            admission
+                .run(&one(&command("apply")), |_| costing(0.0))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -342,7 +391,7 @@ mod tests {
         let admission = Admission::new(10.0, 0.0, ceiling, width(1));
         for lane in [agent("audit[a]"), command("apply")] {
             assert_eq!(
-                admission.run(&lane, |_| costing(0.0)).err(),
+                admission.run(&one(&lane), |_| costing(0.0)).err(),
                 Some(Refusal::WallClockCeiling)
             );
         }
@@ -355,7 +404,7 @@ mod tests {
         let admission = Admission::new(10.0, 0.0, None, width(1));
         let before = Instant::now();
         let deadline = admission
-            .run(&limited, |lane| {
+            .run(&one(&limited), |lane| {
                 let deadline = lane.deadline().unwrap();
                 assert_eq!(deadline.bound, Bound::Task("1h".parse().unwrap()));
                 assert!(deadline.at >= before + Duration::from_secs(3600));
@@ -424,6 +473,52 @@ mod tests {
                 .skip_while(|r| r.is_ok())
                 .all(|r| r.as_ref().err() == Some(&Refusal::CostCeiling)),
             "once a lane is refused every later one is"
+        );
+    }
+
+    /// A lane is recorded as it is admitted, with its attempt and what a resume would charge
+    /// for it, so a lane the ceiling refused leaves nothing to charge.
+    #[test]
+    fn an_admitted_lane_is_journaled_before_it_runs_and_a_refused_one_is_not() {
+        #[derive(Default)]
+        struct Recorded(std::sync::Mutex<Vec<(String, u32, f64)>>);
+        impl crate::plan::admission::Journal for Recorded {
+            fn started(&self, task: &crate::plan::ir::TaskName, attempt: u32, estimate_usd: f64) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((task.0.clone(), attempt, estimate_usd));
+            }
+        }
+        let journal = Recorded::default();
+        let admission = Admission::new(1.0, 0.0, None, width(4)).journaled(Some(&journal));
+        let audit = agent("audit[a]");
+        let apply = command("apply");
+        let retried = BatchItem {
+            task: &audit,
+            attempt: 2,
+            ..one(&audit)
+        };
+        let ran = admission.run(&retried, |_| {
+            assert_eq!(
+                journal.0.lock().unwrap().len(),
+                1,
+                "journaled before it ran"
+            );
+            costing(1.0)
+        });
+        assert!(ran.is_ok());
+        assert_eq!(
+            admission.run(&one(&audit), |_| costing(0.0)).err(),
+            Some(Refusal::CostCeiling)
+        );
+        assert!(admission.run(&one(&apply), |_| costing(0.0)).is_ok());
+        assert_eq!(
+            *journal.0.lock().unwrap(),
+            [
+                ("audit[a]".to_owned(), 2, 0.25),
+                ("apply".to_owned(), 1, 0.0)
+            ]
         );
     }
 

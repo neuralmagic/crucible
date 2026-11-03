@@ -1,6 +1,8 @@
 //! Resuming a playbook from its session log: what the interrupted run settled, what it spent, and
 //! how long it had been running (RFC-0002:C-PLAYBOOK-RESUME).
 
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -8,6 +10,7 @@ use crucible_contract::session::SessionEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::variant::VariantName;
+use crate::plan::admission::Journal;
 use crate::plan::exec::{
     FanoutSummary, Prior, TaskResult, TaskStatus, UnknownTaskStatus, row_task,
 };
@@ -189,19 +192,36 @@ impl RunStart {
 
 /// Fold a session log into what the run settled by the time it had been going for `elapsed`.
 /// Torn lines are skipped: a process killed mid-write leaves one.
+///
+/// A `task_started` holds its estimate until a `task_result` for the same task settles it. A
+/// `recovery` line is written by the process that resumed, so whatever was still held there
+/// belonged to a process that died, and is charged; so is whatever is held at the end of the log.
 pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, ResumeError> {
     let mut prior = Prior {
         elapsed,
         ..Prior::default()
     };
+    let mut held: BTreeMap<String, f64> = BTreeMap::new();
     for event in log.lines().filter_map(crucible_contract::session::decode) {
         prior.shut_down = false;
         match event {
             SessionEvent::PlanAdmitted { .. } => prior.admitted = true,
+            SessionEvent::TaskStarted {
+                task, estimate_usd, ..
+            } => {
+                if estimate_usd.is_finite() && estimate_usd > 0.0 {
+                    *held.entry(task).or_default() += estimate_usd;
+                }
+            }
+            SessionEvent::Recovery { .. } => {
+                prior.reserved_usd += held.values().sum::<f64>();
+                held.clear();
+            }
             SessionEvent::TaskResult { ref task, .. } => {
                 if !prior.admitted {
                     return Err(ResumeError::NotAdmitted { task: task.clone() });
                 }
+                held.remove(task);
                 let Some(row) = settled_row(plan, event)? else {
                     continue;
                 };
@@ -217,7 +237,28 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
             _ => {}
         }
     }
+    prior.reserved_usd += held.values().sum::<f64>();
     Ok(prior)
+}
+
+/// The session log as the executor's journal: each attempt is a `task_started` line, synced to
+/// disk before the attempt runs.
+impl Journal for std::fs::File {
+    fn started(&self, task: &TaskName, attempt: u32, estimate_usd: f64) {
+        let mut line = crucible_contract::session::encode(&SessionEvent::TaskStarted {
+            task: task.0.clone(),
+            attempt,
+            estimate_usd,
+        });
+        line.push('\n');
+        let mut file = self;
+        if let Err(error) = file
+            .write_all(line.as_bytes())
+            .and_then(|()| file.sync_data())
+        {
+            tracing::warn!(task = %task, attempt, %error, "journaling an attempt start failed");
+        }
+    }
 }
 
 /// One settled row of a session log as the executor holds it.
@@ -575,5 +616,205 @@ mod tests {
         .unwrap();
         assert!((cut.spent_usd() - 0.75).abs() < 1e-9, "{}", cut.spent_usd());
         assert_eq!(Prior::default().spent_usd(), 0.0);
+    }
+
+    fn started(task: &str, attempt: u32, estimate: f64) -> String {
+        format!(
+            r#"{{"v":1,"kind":"task_started","task":"{task}","attempt":{attempt},"estimate_usd":{estimate}}}"#
+        )
+    }
+
+    const RECOVERY: &str =
+        r#"{"v":1,"kind":"recovery","class":"died_in_plan_task","iter":0,"detail":""}"#;
+
+    /// An attempt's cost reaches the log only on its task's row, so an attempt whose process died
+    /// first is charged what it reserved when it started. The row settles the reservations of its
+    /// own process; one left by a process that died before a resume stays charged even after
+    /// the task later settles.
+    #[test]
+    fn an_attempt_that_never_settled_is_charged_its_estimate() {
+        let plan = graph(1.0);
+        let spent = |lines: &[&str]| {
+            fold(&log(lines), &plan, Duration::ZERO)
+                .unwrap()
+                .spent_usd()
+        };
+        let cases: [(&str, Vec<String>, f64); 5] = [
+            ("died mid-attempt", vec![started("discover", 1, 0.25)], 0.25),
+            (
+                "settled by its row",
+                vec![started("discover", 1, 0.25), row("discover", "pass", 0.1)],
+                0.1,
+            ),
+            (
+                "a retried attempt reserves again until the row",
+                vec![
+                    started("audit[a]", 1, 0.25),
+                    started("audit[a]", 2, 0.25),
+                    started("audit[b]", 1, 0.25),
+                    row("audit[a]", "pass", 0.3),
+                ],
+                0.55,
+            ),
+            (
+                "died before a resume that later settled it",
+                vec![
+                    started("discover", 1, 0.25),
+                    RECOVERY.to_owned(),
+                    started("discover", 1, 0.25),
+                    row("discover", "pass", 0.1),
+                ],
+                0.35,
+            ),
+            (
+                "died twice",
+                vec![
+                    started("discover", 1, 0.25),
+                    RECOVERY.to_owned(),
+                    started("discover", 1, 0.25),
+                ],
+                0.5,
+            ),
+        ];
+        for (case, lines, want) in cases {
+            let lines: Vec<&str> = std::iter::once(ADMITTED)
+                .chain(lines.iter().map(String::as_str))
+                .collect();
+            let got = spent(&lines);
+            assert!((got - want).abs() < 1e-9, "{case}: {got} != {want}");
+        }
+    }
+
+    /// A task that takes its process down on every attempt never writes a row, so without a
+    /// durable start each resume would dispatch it again for free and the cost ceiling would
+    /// never see what it spent. Each crash here is the session log as it stood while the attempt
+    /// ran; the third resume finds the ceiling spent and blocks the task instead of running it.
+    #[test]
+    fn a_task_that_kills_its_process_every_attempt_is_stopped_by_the_cost_ceiling() {
+        use crate::plan::admission::Journal;
+        use crate::plan::exec::{
+            Attempt, AttemptOutcome, ExecCfg, PlanExit, Substrate, TaskRunner, execute,
+        };
+        use crate::plan::ir::Task;
+        use crate::plan::machine::BlockedReason;
+        use std::collections::BTreeMap;
+        use std::num::NonZeroUsize;
+
+        struct Crashing<'a> {
+            log: &'a std::path::Path,
+            crashed_at: Option<String>,
+            dispatched: Vec<String>,
+        }
+        impl TaskRunner for Crashing<'_> {
+            fn run(
+                &mut self,
+                task: &Task,
+                _attempt: u32,
+                _inputs: &BTreeMap<TaskName, serde_json::Value>,
+                _deadline: Option<crate::deadline::Deadline>,
+            ) -> Attempt {
+                self.dispatched.push(task.name.0.clone());
+                if task.name.0 == "write" && self.crashed_at.is_none() {
+                    self.crashed_at = Some(std::fs::read_to_string(self.log).unwrap());
+                }
+                Attempt {
+                    outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                    cost_usd: 0.3,
+                    repairs: Vec::new(),
+                }
+            }
+        }
+
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "draft"
+            kind = "agent"
+            prompt = "draft it"
+            [[task]]
+            name = "write"
+            kind = "agent"
+            prompt = "write it"
+            depends_on = ["draft"]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let dir = std::env::temp_dir().join(format!("crucible-crash-loop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, format!("{ADMITTED}\n")).unwrap();
+
+        let mut prior: Option<Prior> = None;
+        let mut spent_at_resume = Vec::new();
+        let outcome = loop {
+            if prior.is_some() {
+                let mut text = std::fs::read_to_string(&path).unwrap();
+                text.push_str(RECOVERY);
+                text.push('\n');
+                std::fs::write(&path, text).unwrap();
+            }
+            let journal = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            let mut runner = Crashing {
+                log: &path,
+                crashed_at: None,
+                dispatched: Vec::new(),
+            };
+            let outcome = execute(
+                &plan,
+                &Substrate::default(),
+                ExecCfg {
+                    prior: prior.as_ref(),
+                    width: NonZeroUsize::new(4).unwrap(),
+                    journal: Some(&journal as &dyn Journal),
+                    ..ExecCfg::default()
+                },
+                &mut runner,
+                |task, result| {
+                    let line = row(&task.name.0, result.status.as_str(), result.cost_usd);
+                    let mut file = &journal;
+                    std::io::Write::write_all(&mut file, format!("{line}\n").as_bytes()).unwrap();
+                },
+            )
+            .unwrap();
+            match runner.crashed_at {
+                Some(left) => {
+                    std::fs::write(&path, &left).unwrap();
+                    let folded = fold(&left, &plan, Duration::ZERO).unwrap();
+                    spent_at_resume.push(folded.spent_usd());
+                    prior = Some(folded);
+                    assert!(spent_at_resume.len() < 8, "the crash loop never stopped");
+                }
+                None => {
+                    assert!(
+                        !runner.dispatched.contains(&"write".to_owned()),
+                        "{:?}",
+                        runner.dispatched
+                    );
+                    break outcome;
+                }
+            }
+        };
+
+        let want = [0.55, 0.8, 1.05];
+        assert_eq!(spent_at_resume.len(), want.len(), "{spent_at_resume:?}");
+        for (got, want) in spent_at_resume.iter().zip(want) {
+            assert!((got - want).abs() < 1e-9, "{spent_at_resume:?}");
+        }
+        assert!(matches!(outcome.exit, PlanExit::BudgetExceeded));
+        assert!(!outcome.valid);
+        assert_eq!(
+            outcome.results[&TaskName::from("write")].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

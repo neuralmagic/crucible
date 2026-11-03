@@ -502,6 +502,14 @@ pub enum SessionEvent {
         task: String,
         asks: Vec<crate::ask::Ask>,
     },
+    /// A playbook attempt is about to start. Written before the attempt runs, so a log whose
+    /// process died before the task's `task_result` still shows what was in flight; a resume
+    /// charges `estimate_usd` for every such attempt.
+    TaskStarted {
+        task: String,
+        attempt: u32,
+        estimate_usd: f64,
+    },
     /// One work-graph task attempt reached a terminal status. Covers both the plan executor
     /// (`plan_version` + `kind` + `output`) and measure-DAG walks (`iter` + `digest` + `job` +
     /// `metric`); fields outside the emitting context default to empty. `status` is one of
@@ -1097,6 +1105,15 @@ mod tests {
     fn an_ask_with_an_unusable_key_does_not_decode() {
         let line = r#"{"v":1,"kind":"asks_emitted","task":"classify","asks":[{"key":"with space","workflow":"w","params":null}]}"#;
         assert!(decode(line).is_none(), "a bad key decoded");
+    }
+
+    #[test]
+    fn task_started_round_trips() {
+        assert_round_trips(SessionEvent::TaskStarted {
+            task: "audit[a]".into(),
+            attempt: 2,
+            estimate_usd: 0.125,
+        });
     }
 
     #[test]

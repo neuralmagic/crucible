@@ -944,6 +944,9 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
+            journal: events
+                .as_ref()
+                .map(|f| f as &dyn crate::plan::admission::Journal),
             ..ExecCfg::default()
         },
         runner.as_mut(),
@@ -1065,6 +1068,7 @@ mod tests {
     /// neither run reaches a task.
     #[test]
     fn an_undeclared_parameter_refuses_both_spellings_of_the_same_pack() {
+        let _guard = crucible::test_support::env_lock();
         let dir =
             std::env::temp_dir().join(format!("crucible-param-parity-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1130,6 +1134,7 @@ mod tests {
     /// of that run must select it again.
     #[test]
     fn a_variant_run_reads_its_own_graph_and_resumes_only_as_itself() {
+        let _guard = crucible::test_support::env_lock();
         let dir = crate::testing::tempdir("plan-run-variant");
         let base_ran = dir.join("base-ran");
         let offline_ran = dir.join("offline-ran");
