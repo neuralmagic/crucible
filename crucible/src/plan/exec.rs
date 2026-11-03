@@ -674,27 +674,41 @@ pub fn execute(
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> Result<PlanOutcome, IllegalTransition> {
     let runnable = runnable_set(plan, substrate);
-    let mut plan_machine = PlanMachine::new();
-    let mut machines: BTreeMap<TaskName, TaskMachine> = BTreeMap::new();
+    let clock = Clock {
+        started: Instant::now(),
+        before: cfg.prior.map_or(Duration::ZERO, |prior| prior.elapsed),
+    };
+    let mut ledger = Ledger {
+        results: BTreeMap::new(),
+        machines: BTreeMap::new(),
+        plan: PlanMachine::new(),
+        halted: None,
+        completed: None,
+        spent: 0.0,
+        budget: plan.plan().budget.usd,
+        clock,
+        run_ceiling: cfg
+            .wall_clock
+            .and_then(|ceiling| RunCeiling::after(clock.started, ceiling, clock.before)),
+        on_result: &mut on_result,
+    };
     if let Some(t) = plan
         .tasks_topo()
         .find(|t| t.required && t.stage == Stage::Iteration && !runnable.contains(&t.name))
     {
         // A truncated DAG can never produce an honest pass: fail fast, dispatch nothing.
-        plan_machine.advance(PlanEvent::RequiredTaskUnrunnable)?;
-        let mut results = BTreeMap::new();
+        ledger.plan.advance(PlanEvent::RequiredTaskUnrunnable)?;
         for task in plan.tasks_topo() {
-            machines
-                .entry(task.name.clone())
-                .or_default()
+            ledger
+                .machine(&task.name)
                 .advance(TaskEvent::PlanTruncated)?;
             let r = TaskResult::undispatched(
                 TaskStatus::Truncated,
                 format!("required task {} unrunnable on this substrate", t.name),
             );
             runner.drop_captured(task);
-            on_result(task, &r);
-            results.insert(task.name.clone(), r);
+            (ledger.on_result)(task, &r);
+            ledger.results.insert(task.name.clone(), r);
         }
         return Ok(PlanOutcome {
             valid: false,
@@ -702,10 +716,10 @@ pub fn execute(
                 task: t.name.clone(),
             },
             spent_usd: 0.0,
-            results,
+            results: ledger.results,
         });
     }
-    plan_machine.advance(PlanEvent::Started)?;
+    ledger.plan.advance(PlanEvent::Started)?;
 
     let loops: Vec<ReviseLoop<'_>> = plan
         .revise_loops()
@@ -721,31 +735,12 @@ pub fn execute(
             .get(&t.name)
             .map_or(t.task.spends(), |body| body.spends())
     };
-    let clock = Clock {
-        started: Instant::now(),
-        before: cfg.prior.map_or(Duration::ZERO, |prior| prior.elapsed),
-    };
-    let run_ceiling = cfg
-        .wall_clock
-        .and_then(|ceiling| RunCeiling::after(clock.started, ceiling, clock.before));
-    let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
-    let mut spent = 0.0f64;
-    let budget = plan.plan().budget.usd;
-    let mut halted: Option<Halt> = None;
-    let mut completed: Option<Completion> = None;
     if let Some(prior) = cfg.prior {
-        results = prior.results.clone();
-        spent = prior.spent_usd();
-        replay(
-            plan,
-            prior,
-            cfg.early_completion,
-            &mut halted,
-            &mut completed,
-            &mut plan_machine,
-        )?;
-        if spent > budget {
-            halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+        ledger.results = prior.results.clone();
+        ledger.spent = prior.spent_usd();
+        replay(plan, prior, cfg.early_completion, &mut ledger)?;
+        if ledger.spent > ledger.budget {
+            ledger.halt(Halt::Budget)?;
         }
     }
 
@@ -754,90 +749,55 @@ pub fn execute(
     // the first ready task and restarts, or, when the first ready task is
     // isolation-marked, the whole simultaneously-ready isolated set as one batch. For a
     // plan with no isolated tasks this reproduces the serial topo walk exactly.
-    // `gates` is false for one mapped instance: an instance is not a node of the graph, so its
-    // failure is folded into the node's result and it is the node that short-circuits or does
-    // not. Reporting still happens, because a reader wants the row per item.
-    let mut record = |runner: &mut dyn TaskRunner,
-                      t: &Task,
-                      r: TaskResult,
-                      event: TaskEvent,
-                      results: &mut BTreeMap<TaskName, TaskResult>,
-                      machines: &mut BTreeMap<TaskName, TaskMachine>,
-                      halted: &mut Option<Halt>,
-                      plan_machine: &mut PlanMachine,
-                      gates: bool|
-     -> Result<(), IllegalTransition> {
-        settle(machines.entry(t.name.clone()).or_default(), &r, event)?;
-        let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
-        if matches!(
-            r.status,
-            TaskStatus::Skipped
-                | TaskStatus::NotTaken
-                | TaskStatus::Transport
-                | TaskStatus::Blocked
-        ) {
-            runner.drop_captured(t);
-        }
-        on_result(t, &r);
-        results.insert(t.name.clone(), r);
-        if gates && failed && t.required && t.stage == Stage::Iteration {
-            halt(halted, plan_machine, Halt::ShortCircuit(t.name.clone()))?;
-        }
-        Ok(())
-    };
     loop {
-        let settled_before = results.len();
+        let settled_before = ledger.results.len();
         let mut dispatch: Vec<&Task> = Vec::new();
         for t in plan.tasks_topo() {
-            if results.contains_key(&t.name) {
+            if ledger.results.contains_key(&t.name) {
                 continue;
             }
-            if completed.is_some() && t.stage == Stage::Iteration {
+            if ledger.completed.is_some() && t.stage == Stage::Iteration {
                 continue;
             }
             // An epilogue observes the settled main graph. Declaration order is not an
             // ordering primitive, so an independent epilogue task must not race ahead of it.
             if t.stage == Stage::Epilogue
-                && completed.is_none()
-                && plan
-                    .tasks_topo()
-                    .any(|main| main.stage == Stage::Iteration && !results.contains_key(&main.name))
+                && ledger.completed.is_none()
+                && plan.tasks_topo().any(|main| {
+                    main.stage == Stage::Iteration && !ledger.results.contains_key(&main.name)
+                })
             {
                 continue;
             }
             let spends = unit_spends(t);
-            if let Some(halt) = &halted
+            if let Some(halt) = &ledger.halted
                 && halt.stops(t.stage, spends)
             {
                 let reason = halt.blocked();
                 // A node whose lanes an interrupted run partly settled folds them as the live
                 // run did.
-                let partial = fanout_items(t, &results).ok().filter(|keys| {
-                    keys.iter()
-                        .any(|key| results.contains_key(&TaskName::instance(&t.name, key)))
+                let partial = fanout_items(t, &ledger.results).ok().filter(|keys| {
+                    keys.iter().any(|key| {
+                        ledger
+                            .results
+                            .contains_key(&TaskName::instance(&t.name, key))
+                    })
                 });
                 if let Some(keys) = partial {
-                    machines
-                        .entry(t.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::FannedOut)?;
+                    ledger.machine(&t.name).advance(TaskEvent::FannedOut)?;
                     let mut settled = Vec::new();
                     for key in keys {
                         let instance = instance_task(t, &key);
-                        let r = match results.get(&instance.name) {
+                        let r = match ledger.results.get(&instance.name) {
                             Some(r) => r.clone(),
                             None => {
                                 let r = TaskResult::blocked(&reason);
-                                record(
+                                ledger.record(
                                     &mut *runner,
                                     &instance,
                                     r.clone(),
                                     reason.event(),
-                                    &mut results,
-                                    &mut machines,
-                                    &mut halted,
-                                    &mut plan_machine,
-                                    false,
+                                    Settles::Item,
                                 )?;
                                 r
                             }
@@ -846,47 +806,17 @@ pub fn execute(
                     }
                     let folded = fold_instances(settled);
                     let event = fold_event(folded.status);
-                    record(
-                        &mut *runner,
-                        t,
-                        folded,
-                        event,
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        true,
-                    )?;
+                    ledger.record(&mut *runner, t, folded, event, Settles::Node)?;
                     continue;
                 }
                 let r = TaskResult::blocked(&reason);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(&mut *runner, t, r, reason.event(), Settles::Node)?;
                 continue;
             }
             if !runnable.contains(&t.name) {
                 let r =
                     TaskResult::undispatched(TaskStatus::Skipped, "unrunnable on this substrate");
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    TaskEvent::Unrunnable,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(&mut *runner, t, r, TaskEvent::Unrunnable, Settles::Node)?;
                 continue;
             }
             if let Some(body) = loop_of.get(&t.name) {
@@ -895,12 +825,12 @@ pub fn execute(
                 let ready = body
                     .body
                     .iter()
-                    .find(|b| !results.contains_key(&b.name))
+                    .find(|b| !ledger.results.contains_key(&b.name))
                     .is_some_and(|first| first.name == t.name)
                     && body.body.iter().all(|b| {
                         b.depends_on
                             .iter()
-                            .all(|d| body.contains(d) || results.contains_key(d))
+                            .all(|d| body.contains(d) || ledger.results.contains_key(d))
                     });
                 if !ready {
                     continue;
@@ -910,76 +840,40 @@ pub fn execute(
                 }
                 break;
             }
-            if t.depends_on.iter().any(|d| !results.contains_key(d)) {
+            if t.depends_on.iter().any(|d| !ledger.results.contains_key(d)) {
                 continue;
             }
             let per_element = per_element_deps(plan, t);
-            if let Some((event, note)) = not_taken(t, &results, &per_element) {
+            if let Some((event, note)) = not_taken(t, &ledger.results, &per_element) {
                 let r = TaskResult::undispatched(TaskStatus::NotTaken, note);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    event,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(&mut *runner, t, r, event, Settles::Node)?;
                 continue;
             }
-            if !dependencies_allow(t, &results, &per_element) {
+            if !dependencies_allow(t, &ledger.results, &per_element) {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
                 // their dependents even though they never gate validity.
-                let reason = BlockedReason::DependencyDidNotPass;
-                let r = TaskResult::blocked(&reason);
-                record(
+                ledger.blocked(
                     &mut *runner,
                     t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
+                    BlockedReason::DependencyDidNotPass,
+                    Settles::Node,
                 )?;
                 continue;
             }
-            if spends && spent >= budget {
-                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                let reason = BlockedReason::BudgetCeiling;
-                let r = TaskResult::blocked(&reason);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+            if spends && ledger.spent >= ledger.budget {
+                ledger.halt(Halt::Budget)?;
+                ledger.blocked(&mut *runner, t, BlockedReason::BudgetCeiling, Settles::Node)?;
                 continue;
             }
             // Elapsed time is known continuously, unlike a cost total, so the ceiling is
             // checked before every dispatch rather than after an attempt settles.
-            if clock.past(cfg.wall_clock) {
-                halt(&mut halted, &mut plan_machine, Halt::Time)?;
-                let reason = BlockedReason::WallClockCeiling;
-                let r = TaskResult::blocked(&reason);
-                record(
+            if ledger.clock.past(cfg.wall_clock) {
+                ledger.halt(Halt::Time)?;
+                ledger.blocked(
                     &mut *runner,
                     t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
+                    BlockedReason::WallClockCeiling,
+                    Settles::Node,
                 )?;
                 continue;
             }
@@ -1001,11 +895,11 @@ pub fn execute(
                 break;
             }
         }
-        if let Some(halt) = &halted {
+        if let Some(halt) = &ledger.halted {
             dispatch.retain(|t| !halt.stops(t.stage, unit_spends(t)));
         }
         let Some(first) = dispatch.first() else {
-            if results.len() > settled_before {
+            if ledger.results.len() > settled_before {
                 continue;
             }
             // Nothing dispatchable and nothing left to settle: done.
@@ -1013,24 +907,7 @@ pub fn execute(
         };
 
         if let Some(body) = loop_of.get(&first.name).copied() {
-            run_loop(
-                body,
-                plan,
-                cfg,
-                runner,
-                &mut record,
-                &mut Ledger {
-                    results: &mut results,
-                    machines: &mut machines,
-                    halted: &mut halted,
-                    plan_machine: &mut plan_machine,
-                    spent: &mut spent,
-                    budget,
-                    clock,
-                    run_ceiling,
-                    completed: &mut completed,
-                },
-            )?;
+            run_loop(body, plan, cfg, runner, &mut ledger)?;
             continue;
         }
 
@@ -1044,18 +921,13 @@ pub fn execute(
         let mut inputs_for_dispatch: BTreeMap<TaskName, BTreeMap<TaskName, Value>> =
             BTreeMap::new();
         for t in &dispatch {
-            let producers = file_producers(plan, t, &results, &*runner);
-            let mut inputs = inputs_for(plan, t, &results, &producers);
+            let producers = file_producers(plan, t, &ledger.results, &*runner);
+            let mut inputs = inputs_for(plan, t, &ledger.results, &producers);
             cfg.add_history(t, &mut inputs);
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName::reserved(OUTCOME_INPUT),
-                    main_graph_outcome(
-                        plan,
-                        &results,
-                        &exit_of(halted.as_ref(), completed.as_ref()),
-                        &producers,
-                    ),
+                    main_graph_outcome(plan, &ledger.results, &ledger.exit(), &producers),
                 );
             }
             inputs_for_dispatch.insert(t.name.clone(), inputs);
@@ -1067,18 +939,11 @@ pub fn execute(
             producers_for.insert(t.name.clone(), producers);
         }
         if let Some((t, why)) = refused {
-            let reason = BlockedReason::StagingRefused(why);
-            let r = TaskResult::blocked(&reason);
-            record(
+            ledger.blocked(
                 &mut *runner,
                 t,
-                r,
-                reason.event(),
-                &mut results,
-                &mut machines,
-                &mut halted,
-                &mut plan_machine,
-                true,
+                BlockedReason::StagingRefused(why),
+                Settles::Node,
             )?;
             continue;
         }
@@ -1086,7 +951,7 @@ pub fn execute(
         if let Some(node) = dispatch.first().filter(|t| t.over.is_some()) {
             let node = *node;
             let base = inputs_for_dispatch.remove(&node.name).unwrap_or_default();
-            match fanout_items(node, &results) {
+            match fanout_items(node, &ledger.results) {
                 Err(why) => {
                     let r = TaskResult {
                         status: TaskStatus::Fail,
@@ -1099,16 +964,12 @@ pub fn execute(
                         transport: None,
                         repairs: Vec::new(),
                     };
-                    record(
+                    ledger.record(
                         &mut *runner,
                         node,
                         r,
                         TaskEvent::FanoutItemsInvalid,
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        true,
+                        Settles::Node,
                     )?;
                 }
                 Ok(keys) => {
@@ -1119,7 +980,7 @@ pub fn execute(
                     let mut folded: BTreeMap<&TaskName, TaskResult> = instances
                         .iter()
                         .filter_map(|instance| {
-                            Some((&instance.name, results.get(&instance.name)?.clone()))
+                            Some((&instance.name, ledger.results.get(&instance.name)?.clone()))
                         })
                         .collect();
                     // An instance is staged under its own name: it runs in its own root, and
@@ -1147,25 +1008,15 @@ pub fn execute(
                             runner.stage(instance, &own).err()
                         });
                     if let Some(why) = refused {
-                        let reason = BlockedReason::StagingRefused(why);
-                        let r = TaskResult::blocked(&reason);
-                        record(
+                        ledger.blocked(
                             &mut *runner,
                             node,
-                            r,
-                            reason.event(),
-                            &mut results,
-                            &mut machines,
-                            &mut halted,
-                            &mut plan_machine,
-                            true,
+                            BlockedReason::StagingRefused(why),
+                            Settles::Node,
                         )?;
                         continue;
                     }
-                    machines
-                        .entry(node.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::FannedOut)?;
+                    ledger.machine(&node.name).advance(TaskEvent::FannedOut)?;
                     let per_element = aligned_deps;
                     let staged: &[Task] = producers_for
                         .get(&node.name)
@@ -1180,76 +1031,73 @@ pub fn execute(
                         if folded.contains_key(&instance.name) {
                             continue;
                         }
-                        let settled_here = match instance_gate(node, key, &results, &per_element) {
-                            Some(gated) => Some(gated),
-                            None => match instance_inputs(
-                                node,
-                                key,
-                                &base,
-                                &results,
-                                &per_element,
-                                staged,
-                            ) {
-                                Err(note) => Some((measured_failure(note), TaskEvent::Failed)),
-                                Ok(mut inputs) => match &node.task {
-                                    TaskKind::Route {
-                                        questions,
-                                        decider: Decider::Output { task: source },
-                                    } => {
-                                        let read = if per_element.contains(source) {
-                                            &inputs
-                                        } else {
-                                            &base
-                                        };
-                                        let r = decide_instance(
+                        let settled_here =
+                            match instance_gate(node, key, &ledger.results, &per_element) {
+                                Some(gated) => Some(gated),
+                                None => match instance_inputs(
+                                    node,
+                                    key,
+                                    &base,
+                                    &ledger.results,
+                                    &per_element,
+                                    staged,
+                                ) {
+                                    Err(note) => Some((measured_failure(note), TaskEvent::Failed)),
+                                    Ok(mut inputs) => match &node.task {
+                                        TaskKind::Route {
                                             questions,
-                                            source,
-                                            key,
-                                            read,
-                                            &per_element,
-                                            node.join,
-                                        );
-                                        let event = if r.status == TaskStatus::Pass {
-                                            TaskEvent::Passed
-                                        } else {
-                                            TaskEvent::Failed
-                                        };
-                                        Some((r, event))
-                                    }
-                                    _ => {
-                                        if let Some((files, bad)) = route_files(
-                                            node,
-                                            Some(key),
-                                            &per_element,
-                                            staged,
-                                            &*runner,
-                                        ) {
-                                            inputs.insert(TaskName::reserved(FILES_INPUT), files);
-                                            unparsed.insert(instance.name.clone(), bad);
+                                            decider: Decider::Output { task: source },
+                                        } => {
+                                            let read = if per_element.contains(source) {
+                                                &inputs
+                                            } else {
+                                                &base
+                                            };
+                                            let r = decide_instance(
+                                                questions,
+                                                source,
+                                                key,
+                                                read,
+                                                &per_element,
+                                                node.join,
+                                            );
+                                            let event = if r.status == TaskStatus::Pass {
+                                                TaskEvent::Passed
+                                            } else {
+                                                TaskEvent::Failed
+                                            };
+                                            Some((r, event))
                                         }
-                                        prepared.insert(instance.name.clone(), inputs);
-                                        None
-                                    }
+                                        _ => {
+                                            if let Some((files, bad)) = route_files(
+                                                node,
+                                                Some(key),
+                                                &per_element,
+                                                staged,
+                                                &*runner,
+                                            ) {
+                                                inputs
+                                                    .insert(TaskName::reserved(FILES_INPUT), files);
+                                                unparsed.insert(instance.name.clone(), bad);
+                                            }
+                                            prepared.insert(instance.name.clone(), inputs);
+                                            None
+                                        }
+                                    },
                                 },
-                            },
-                        };
+                            };
                         if let Some((r, event)) = settled_here {
                             if r.attempts > 0 {
-                                machines
-                                    .entry(instance.name.clone())
-                                    .or_default()
+                                ledger
+                                    .machine(&instance.name)
                                     .advance(TaskEvent::Dispatched)?;
                             }
-                            record(
+                            ledger.record(
                                 &mut *runner,
                                 instance,
                                 r.clone(),
                                 event,
-                                &mut results,
-                                &mut machines,
-                                &mut halted,
-                                &mut plan_machine,
-                                false,
+                                Settles::Item,
                             )?;
                             folded.insert(&instance.name, r);
                         }
@@ -1277,15 +1125,9 @@ pub fn execute(
                                 inputs: item_inputs(&task.name),
                             })
                             .collect();
-                        let (batch_results, overrun) = run_batch_with_retries(
-                            batch,
-                            cfg,
-                            run_ceiling,
-                            runner,
-                            &mut spent,
-                            budget,
-                        );
-                        overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
+                        let (batch_results, overrun) =
+                            run_batch_with_retries(batch, cfg, runner, &mut ledger);
+                        ledger.overrun(node.stage, overrun)?;
                         let mut live = batch_results.into_iter();
                         for (instance, key) in instances.iter().zip(&keys) {
                             if let Some(result) = folded.get(&instance.name) {
@@ -1296,10 +1138,7 @@ pub fn execute(
                                 break;
                             };
                             let result = if result.attempts > 0 {
-                                machines
-                                    .entry(task.name.clone())
-                                    .or_default()
-                                    .advance(TaskEvent::Dispatched)?;
+                                ledger.machine(&task.name).advance(TaskEvent::Dispatched)?;
                                 let result = noted(&task.name, result);
                                 runner.settled(task, result.status == TaskStatus::Pass);
                                 result
@@ -1307,17 +1146,7 @@ pub fn execute(
                                 result
                             };
                             settled.push((key.clone(), result.clone()));
-                            record(
-                                &mut *runner,
-                                task,
-                                result,
-                                event,
-                                &mut results,
-                                &mut machines,
-                                &mut halted,
-                                &mut plan_machine,
-                                false,
-                            )?;
+                            ledger.record(&mut *runner, task, result, event, Settles::Item)?;
                         }
                     } else {
                         // Instances of a shared-workspace node are one serial task each: they
@@ -1329,28 +1158,25 @@ pub fn execute(
                                 continue;
                             }
                             let spends = node.task.spends();
-                            if spends && spent >= budget {
-                                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                            } else if clock.past(cfg.wall_clock) {
-                                halt(&mut halted, &mut plan_machine, Halt::Time)?;
+                            if spends && ledger.spent >= ledger.budget {
+                                ledger.halt(Halt::Budget)?;
+                            } else if ledger.clock.past(cfg.wall_clock) {
+                                ledger.halt(Halt::Time)?;
                             }
-                            if let Some(halt) = halted
+                            if let Some(halt) = ledger
+                                .halted
                                 .as_ref()
                                 .filter(|halt| halt.stops(node.stage, spends))
                             {
                                 let reason = halt.blocked();
                                 let r = TaskResult::blocked(&reason);
                                 settled.push((key.clone(), r.clone()));
-                                record(
+                                ledger.record(
                                     &mut *runner,
                                     instance,
                                     r,
                                     reason.event(),
-                                    &mut results,
-                                    &mut machines,
-                                    &mut halted,
-                                    &mut plan_machine,
-                                    false,
+                                    Settles::Item,
                                 )?;
                                 continue;
                             }
@@ -1358,16 +1184,13 @@ pub fn execute(
                                 instance,
                                 item_inputs(&instance.name),
                                 cfg,
-                                run_ceiling,
                                 runner,
-                                &mut spent,
-                                budget,
+                                &mut ledger,
                             );
-                            overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
+                            ledger.overrun(node.stage, overrun)?;
                             let result = if result.attempts > 0 {
-                                machines
-                                    .entry(instance.name.clone())
-                                    .or_default()
+                                ledger
+                                    .machine(&instance.name)
                                     .advance(TaskEvent::Dispatched)?;
                                 let result = noted(&instance.name, result);
                                 runner.settled(instance, result.status == TaskStatus::Pass);
@@ -1376,32 +1199,12 @@ pub fn execute(
                                 result
                             };
                             settled.push((key.clone(), result.clone()));
-                            record(
-                                &mut *runner,
-                                instance,
-                                result,
-                                event,
-                                &mut results,
-                                &mut machines,
-                                &mut halted,
-                                &mut plan_machine,
-                                false,
-                            )?;
+                            ledger.record(&mut *runner, instance, result, event, Settles::Item)?;
                         }
                     }
                     let folded = fold_instances(settled);
                     let event = fold_event(folded.status);
-                    record(
-                        &mut *runner,
-                        node,
-                        folded,
-                        event,
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        true,
-                    )?;
+                    ledger.record(&mut *runner, node, folded, event, Settles::Node)?;
                 }
             }
         } else if dispatch.len() == 1 {
@@ -1420,10 +1223,7 @@ pub fn execute(
             };
             let (result, event, overrun) = match &t.task {
                 TaskKind::TopK { k, direction } => {
-                    machines
-                        .entry(t.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::Dispatched)?;
+                    ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                     let reduced = reduce_top_k(&inputs, *k, *direction);
                     let event = if reduced.status == TaskStatus::Pass {
                         TaskEvent::Passed
@@ -1436,10 +1236,7 @@ pub fn execute(
                     questions,
                     decider: Decider::Output { task: source },
                 } => {
-                    machines
-                        .entry(t.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::Dispatched)?;
+                    ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                     let decided = decide_from_output(&inputs, questions, source);
                     let event = if decided.status == TaskStatus::Pass {
                         TaskEvent::Passed
@@ -1457,20 +1254,16 @@ pub fn execute(
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
                 | TaskKind::Engine { .. } => {
-                    let dispatched =
-                        run_one(t, inputs, cfg, run_ceiling, runner, &mut spent, budget);
+                    let dispatched = run_one(t, inputs, cfg, runner, &mut ledger);
                     if dispatched.0.attempts > 0 {
-                        machines
-                            .entry(t.name.clone())
-                            .or_default()
-                            .advance(TaskEvent::Dispatched)?;
+                        ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                     }
                     dispatched
                 }
             };
             let mut result = result;
             note_unparsed(&mut result, &unparsed);
-            overrun.halt(t.stage, &mut halted, &mut plan_machine)?;
+            ledger.overrun(t.stage, overrun)?;
             let engine_settled = matches!(
                 t.task,
                 TaskKind::TopK { .. }
@@ -1482,17 +1275,7 @@ pub fn execute(
             if engine_settled || result.attempts > 0 {
                 runner.settled(t, result.status == TaskStatus::Pass);
             }
-            record(
-                &mut *runner,
-                t,
-                result,
-                event,
-                &mut results,
-                &mut machines,
-                &mut halted,
-                &mut plan_machine,
-                true,
-            )?;
+            ledger.record(&mut *runner, t, result, event, Settles::Node)?;
         } else {
             // A concurrent batch of independent isolated tasks; results are recorded in
             // declaration order regardless of completion order, so the event stream
@@ -1505,36 +1288,23 @@ pub fn execute(
                     inputs: inputs_for_dispatch.remove(&t.name).unwrap_or_default(),
                 })
                 .collect();
-            let (batch_results, overrun) =
-                run_batch_with_retries(batch, cfg, run_ceiling, runner, &mut spent, budget);
-            overrun.halt(first.stage, &mut halted, &mut plan_machine)?;
+            let (batch_results, overrun) = run_batch_with_retries(batch, cfg, runner, &mut ledger);
+            ledger.overrun(first.stage, overrun)?;
             for (t, result, event) in batch_results {
                 if result.attempts > 0 {
-                    machines
-                        .entry(t.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::Dispatched)?;
+                    ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                     runner.settled(t, result.status == TaskStatus::Pass);
                 }
-                record(
-                    &mut *runner,
-                    t,
-                    result,
-                    event,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(&mut *runner, t, result, event, Settles::Node)?;
             }
         }
-        if cfg.early_completion && completed.is_none() {
+        if cfg.early_completion && ledger.completed.is_none() {
             let mut settled_now: Vec<(&Task, &TaskName)> = Vec::new();
             for t in dispatch.iter().filter(|t| t.stage == Stage::Iteration) {
                 if t.over.is_some() {
                     settled_now.extend(
-                        results
+                        ledger
+                            .results
                             .keys()
                             .filter(|n| n.is_instance_of(&t.name))
                             .map(|n| (*t, n)),
@@ -1542,26 +1312,26 @@ pub fn execute(
                 }
                 settled_now.push((*t, &t.name));
             }
-            if let Some(completion) = completion_among(&results, &settled_now) {
-                complete(&mut completed, &mut plan_machine, completion)?;
+            if let Some(completion) = completion_among(&ledger.results, &settled_now) {
+                ledger.complete(completion)?;
             }
         }
     }
 
-    plan_machine.advance(PlanEvent::Settled)?;
-    let exit = exit_of(halted.as_ref(), completed.as_ref());
-    let ceiling = matches!(halted, Some(Halt::Budget | Halt::Time));
+    ledger.plan.advance(PlanEvent::Settled)?;
+    let exit = ledger.exit();
+    let ceiling = matches!(ledger.halted, Some(Halt::Budget | Halt::Time));
     let valid = !ceiling
         && matches!(exit, PlanExit::Completed | PlanExit::CompletedEarly { .. })
-        && required_tasks_held(plan, |name| match results.get(name) {
+        && required_tasks_held(plan, |name| match ledger.results.get(name) {
             Some(r) => Some(r.status),
-            None => completed.is_some().then_some(TaskStatus::NotTaken),
+            None => ledger.completed.is_some().then_some(TaskStatus::NotTaken),
         });
     Ok(PlanOutcome {
         valid,
         exit,
-        spent_usd: spent,
-        results,
+        spent_usd: ledger.spent,
+        results: ledger.results,
     })
 }
 
@@ -1609,21 +1379,6 @@ impl Overrun {
             Refusal::CostCeiling => self.budget = true,
             Refusal::WallClockCeiling => self.time = true,
         }
-    }
-
-    fn halt(
-        self,
-        stage: Stage,
-        halted: &mut Option<Halt>,
-        plan_machine: &mut PlanMachine,
-    ) -> Result<(), IllegalTransition> {
-        if self.budget {
-            halt(halted, plan_machine, Halt::Budget)?;
-        }
-        if self.time && stage == Stage::Iteration {
-            halt(halted, plan_machine, Halt::Time)?;
-        }
-        Ok(())
     }
 }
 
@@ -1686,41 +1441,6 @@ fn note_refused_completion(cfg: ExecCfg<'_>, task: &Task, r: &mut TaskResult) {
     {
         r.note = Some(note);
     }
-}
-
-fn complete(
-    completed: &mut Option<Completion>,
-    plan_machine: &mut PlanMachine,
-    completion: Completion,
-) -> Result<(), IllegalTransition> {
-    plan_machine.advance(PlanEvent::EarlyCompletion)?;
-    *completed = Some(completion);
-    Ok(())
-}
-
-fn exit_of(halted: Option<&Halt>, completed: Option<&Completion>) -> PlanExit {
-    match (completed, halted) {
-        (Some(c), _) => PlanExit::CompletedEarly {
-            task: c.task.clone(),
-            reason: c.reason.clone(),
-        },
-        (None, Some(halt)) => halt.exit(),
-        (None, None) => PlanExit::Completed,
-    }
-}
-
-/// Fix the plan's exit on its first halt; later ceilings do not change how it ended.
-fn halt(
-    halted: &mut Option<Halt>,
-    plan_machine: &mut PlanMachine,
-    halt: Halt,
-) -> Result<(), IllegalTransition> {
-    if halted.is_some() {
-        return Ok(());
-    }
-    plan_machine.advance(halt.event())?;
-    *halted = Some(halt);
-    Ok(())
 }
 
 /// Settle one task's machine on its result: the retries its attempts imply, then the event
@@ -1981,16 +1701,126 @@ fn fanout_items(
     Ok(keys)
 }
 
-struct Ledger<'r> {
-    results: &'r mut BTreeMap<TaskName, TaskResult>,
-    machines: &'r mut BTreeMap<TaskName, TaskMachine>,
-    halted: &'r mut Option<Halt>,
-    plan_machine: &'r mut PlanMachine,
-    spent: &'r mut f64,
+/// Everything the executor settles as it walks the plan: each task's result and cursor, the
+/// plan's cursor, the halt and early completion fixed so far, and what the run has spent.
+struct Ledger<'a> {
+    results: BTreeMap<TaskName, TaskResult>,
+    machines: BTreeMap<TaskName, TaskMachine>,
+    plan: PlanMachine,
+    halted: Option<Halt>,
+    completed: Option<Completion>,
+    spent: f64,
     budget: f64,
     clock: Clock,
     run_ceiling: Option<RunCeiling>,
-    completed: &'r mut Option<Completion>,
+    on_result: &'a mut dyn FnMut(&Task, &TaskResult),
+}
+
+/// What a recorded result settles: a node of the graph, whose failure can short-circuit the
+/// plan, or one item of a node (a mapped instance, a revise round), whose failure folds into the
+/// node's result and gates nothing by itself. Both are reported: a reader wants the row per item.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settles {
+    Node,
+    Item,
+}
+
+impl Ledger<'_> {
+    fn machine(&mut self, name: &TaskName) -> &mut TaskMachine {
+        self.machines.entry(name.clone()).or_default()
+    }
+
+    /// Settle `t` on `r`: advance its cursor, drop a file set it did not earn, report it, and
+    /// short-circuit the plan when a required node failed.
+    fn record(
+        &mut self,
+        runner: &mut dyn TaskRunner,
+        t: &Task,
+        r: TaskResult,
+        event: TaskEvent,
+        settles: Settles,
+    ) -> Result<(), IllegalTransition> {
+        settle(self.machine(&t.name), &r, event)?;
+        let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
+        if matches!(
+            r.status,
+            TaskStatus::Skipped
+                | TaskStatus::NotTaken
+                | TaskStatus::Transport
+                | TaskStatus::Blocked
+        ) {
+            runner.drop_captured(t);
+        }
+        (self.on_result)(t, &r);
+        self.results.insert(t.name.clone(), r);
+        if settles == Settles::Node && failed && t.required && t.stage == Stage::Iteration {
+            self.halt(Halt::ShortCircuit(t.name.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Settle `t` blocked on `reason`, undispatched.
+    fn blocked(
+        &mut self,
+        runner: &mut dyn TaskRunner,
+        t: &Task,
+        reason: BlockedReason,
+        settles: Settles,
+    ) -> Result<(), IllegalTransition> {
+        let event = reason.event();
+        self.record(runner, t, TaskResult::blocked(&reason), event, settles)
+    }
+
+    /// Fix the plan's exit on its first halt; later ceilings do not change how it ended.
+    fn halt(&mut self, halt: Halt) -> Result<(), IllegalTransition> {
+        if self.halted.is_some() {
+            return Ok(());
+        }
+        self.plan.advance(halt.event())?;
+        self.halted = Some(halt);
+        Ok(())
+    }
+
+    /// Halt on the ceilings one dispatch of `stage` ran past.
+    fn overrun(&mut self, stage: Stage, overrun: Overrun) -> Result<(), IllegalTransition> {
+        if overrun.budget {
+            self.halt(Halt::Budget)?;
+        }
+        if overrun.time && stage == Stage::Iteration {
+            self.halt(Halt::Time)?;
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, completion: Completion) -> Result<(), IllegalTransition> {
+        self.plan.advance(PlanEvent::EarlyCompletion)?;
+        self.completed = Some(completion);
+        Ok(())
+    }
+
+    /// The ceiling a unit about to dispatch has reached. Only a unit that can spend is held to
+    /// the cost ceiling.
+    fn ceiling_reached(&self, wall_clock: Option<Duration>, spends: bool) -> Option<Halt> {
+        if spends && self.spent >= self.budget {
+            Some(Halt::Budget)
+        } else if self.clock.past(wall_clock) {
+            Some(Halt::Time)
+        } else {
+            None
+        }
+    }
+
+    /// How the plan ended, as fixed so far.
+    fn exit(&self) -> PlanExit {
+        match (&self.completed, &self.halted) {
+            (Some(c), _) => PlanExit::CompletedEarly {
+                task: c.task.clone(),
+                reason: c.reason.clone(),
+            },
+            (None, Some(halt)) => halt.exit(),
+            (None, None) => PlanExit::Completed,
+        }
+    }
 }
 
 struct RoundRow<'a> {
@@ -1999,27 +1829,13 @@ struct RoundRow<'a> {
     event: TaskEvent,
 }
 
-fn run_loop<R>(
+fn run_loop(
     body: &ReviseLoop<'_>,
     plan: &ValidPlan,
     cfg: ExecCfg<'_>,
     runner: &mut dyn TaskRunner,
-    record: &mut R,
     ledger: &mut Ledger<'_>,
-) -> Result<(), IllegalTransition>
-where
-    R: FnMut(
-        &mut dyn TaskRunner,
-        &Task,
-        TaskResult,
-        TaskEvent,
-        &mut BTreeMap<TaskName, TaskResult>,
-        &mut BTreeMap<TaskName, TaskMachine>,
-        &mut Option<Halt>,
-        &mut PlanMachine,
-        bool,
-    ) -> Result<(), IllegalTransition>,
-{
+) -> Result<(), IllegalTransition> {
     let reviewer = body.reviewer;
     let spends = body.spends();
     let mut view = ledger.results.clone();
@@ -2055,8 +1871,8 @@ where
             {
                 break;
             }
-            if let Some(halt) = ceiling_reached(cfg, ledger, spends) {
-                halt_on(ledger, halt)?;
+            if let Some(halt) = ledger.ceiling_reached(cfg.wall_clock, spends) {
+                ledger.halt(halt)?;
                 break;
             }
         }
@@ -2092,9 +1908,9 @@ where
             } else if !dependencies_allow(t, &view, &BTreeSet::new()) {
                 let reason = BlockedReason::DependencyDidNotPass;
                 Err((TaskResult::blocked(&reason), reason.event()))
-            } else if let Some(halt) = ceiling_reached(cfg, ledger, spends) {
+            } else if let Some(halt) = ledger.ceiling_reached(cfg.wall_clock, spends) {
                 let reason = halt.blocked();
-                halt_on(ledger, halt)?;
+                ledger.halt(halt)?;
                 Err((TaskResult::blocked(&reason), reason.event()))
             } else {
                 Ok(())
@@ -2121,12 +1937,7 @@ where
                             if t.stage == Stage::Epilogue {
                                 inputs.insert(
                                     TaskName::reserved(OUTCOME_INPUT),
-                                    main_graph_outcome(
-                                        plan,
-                                        &view,
-                                        &exit_of(ledger.halted.as_ref(), ledger.completed.as_ref()),
-                                        &producers,
-                                    ),
+                                    main_graph_outcome(plan, &view, &ledger.exit(), &producers),
                                 );
                             }
                             if let Some(verdict) = verdict.as_ref().filter(|_| is_target) {
@@ -2150,30 +1961,18 @@ where
                                         .advance(TaskEvent::RoundsStarted)?;
                                 }
                                 for row in pending.drain(..).map(|i| &rows[i]) {
-                                    record(
+                                    ledger.record(
                                         &mut *runner,
                                         &round_task(row.task, round),
                                         row.result.clone(),
                                         row.event,
-                                        ledger.results,
-                                        ledger.machines,
-                                        ledger.halted,
-                                        ledger.plan_machine,
-                                        false,
+                                        Settles::Item,
                                     )?;
                                 }
                             }
                             let name = round_task(t, round);
-                            let (result, event, overrun) = run_one(
-                                t,
-                                inputs,
-                                cfg,
-                                ledger.run_ceiling,
-                                runner,
-                                ledger.spent,
-                                ledger.budget,
-                            );
-                            overrun.halt(t.stage, ledger.halted, ledger.plan_machine)?;
+                            let (result, event, overrun) = run_one(t, inputs, cfg, runner, ledger);
+                            ledger.overrun(t.stage, overrun)?;
                             if result.attempts > 0 {
                                 ledger
                                     .machines
@@ -2196,16 +1995,12 @@ where
             };
             view.insert(t.name.clone(), result.clone());
             if entered {
-                record(
+                ledger.record(
                     &mut *runner,
                     &round_task(t, round),
                     result.clone(),
                     event,
-                    ledger.results,
-                    ledger.machines,
-                    ledger.halted,
-                    ledger.plan_machine,
-                    false,
+                    Settles::Item,
                 )?;
             } else {
                 pending.push(rows.len());
@@ -2251,17 +2046,7 @@ where
         } else {
             (row.result.clone(), row.event)
         };
-        record(
-            &mut *runner,
-            row.task,
-            result,
-            event,
-            ledger.results,
-            ledger.machines,
-            ledger.halted,
-            ledger.plan_machine,
-            true,
-        )?;
+        ledger.record(&mut *runner, row.task, result, event, Settles::Node)?;
     }
     if cfg.early_completion && ledger.completed.is_none() {
         let names: Vec<(&Task, &TaskName)> = last
@@ -2269,27 +2054,11 @@ where
             .filter(|row| row.task.stage == Stage::Iteration)
             .map(|row| (row.task, &row.task.name))
             .collect();
-        if let Some(completion) = completion_among(ledger.results, &names) {
-            complete(ledger.completed, ledger.plan_machine, completion)?;
+        if let Some(completion) = completion_among(&ledger.results, &names) {
+            ledger.complete(completion)?;
         }
     }
     Ok(())
-}
-
-/// The ceiling a unit about to dispatch has reached. Only a unit that can spend is held to the
-/// cost ceiling.
-fn ceiling_reached(cfg: ExecCfg<'_>, ledger: &Ledger<'_>, spends: bool) -> Option<Halt> {
-    if spends && *ledger.spent >= ledger.budget {
-        Some(Halt::Budget)
-    } else if ledger.clock.past(cfg.wall_clock) {
-        Some(Halt::Time)
-    } else {
-        None
-    }
-}
-
-fn halt_on(ledger: &mut Ledger<'_>, why: Halt) -> Result<(), IllegalTransition> {
-    halt(ledger.halted, ledger.plan_machine, why)
 }
 
 /// One round of a revise loop, as the task it runs as.
@@ -2353,9 +2122,7 @@ fn replay(
     plan: &ValidPlan,
     prior: &Prior,
     early_completion: bool,
-    halted: &mut Option<Halt>,
-    completed: &mut Option<Completion>,
-    plan_machine: &mut PlanMachine,
+    ledger: &mut Ledger<'_>,
 ) -> Result<(), IllegalTransition> {
     let settled: Vec<(&Task, &TaskResult)> = prior
         .order
@@ -2367,8 +2134,8 @@ fn replay(
             continue;
         };
         match r.blocked {
-            Some(BlockedReason::BudgetCeiling) => halt(halted, plan_machine, Halt::Budget)?,
-            Some(BlockedReason::WallClockCeiling) => halt(halted, plan_machine, Halt::Time)?,
+            Some(BlockedReason::BudgetCeiling) => ledger.halt(Halt::Budget)?,
+            Some(BlockedReason::WallClockCeiling) => ledger.halt(Halt::Time)?,
             _ => {}
         }
         let Some(t) = plan.get(name) else {
@@ -2376,7 +2143,7 @@ fn replay(
         };
         let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
         if failed && t.required && t.stage == Stage::Iteration {
-            halt(halted, plan_machine, Halt::ShortCircuit(t.name.clone()))?;
+            ledger.halt(Halt::ShortCircuit(t.name.clone()))?;
         }
     }
     if !early_completion {
@@ -2390,7 +2157,7 @@ fn replay(
         })
     });
     match completion {
-        Some(completion) => complete(completed, plan_machine, completion),
+        Some(completion) => ledger.complete(completion),
         None => Ok(()),
     }
 }
@@ -2739,18 +2506,15 @@ fn run_one(
     t: &Task,
     inputs: BTreeMap<TaskName, Value>,
     cfg: ExecCfg<'_>,
-    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
-    spent: &mut f64,
-    budget: f64,
+    ledger: &mut Ledger<'_>,
 ) -> (TaskResult, TaskEvent, Overrun) {
     let item = BatchItem {
         task: t,
         attempt: 1,
         inputs,
     };
-    let (mut settled, overrun) =
-        run_batch_with_retries(vec![item], cfg, run_ceiling, runner, spent, budget);
+    let (mut settled, overrun) = run_batch_with_retries(vec![item], cfg, runner, ledger);
     match settled.pop() {
         Some((_, result, event)) => (result, event, overrun),
         None => {
@@ -2770,10 +2534,8 @@ fn run_one(
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
     cfg: ExecCfg<'_>,
-    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
-    spent: &mut f64,
-    budget: f64,
+    ledger: &mut Ledger<'_>,
 ) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, Overrun) {
     let max_attempts = 1 + cfg.transport_retries;
     let single = batch.len() == 1;
@@ -2796,9 +2558,9 @@ fn run_batch_with_retries<'a>(
                 inputs: b.inputs.clone(),
             })
             .collect();
-        runner.budget_left(budget - *spent);
-        let admission =
-            Admission::new(budget, *spent, run_ceiling, cfg.width).journaled(cfg.journal);
+        runner.budget_left(ledger.budget - ledger.spent);
+        let admission = Admission::new(ledger.budget, ledger.spent, ledger.run_ceiling, cfg.width)
+            .journaled(cfg.journal);
         let attempts = match items.as_slice() {
             [only] if single => vec![admission.run(only, |lane| {
                 runner.run(only.task, only.attempt, &only.inputs, lane.deadline())
@@ -2826,7 +2588,7 @@ fn run_batch_with_retries<'a>(
                     done.insert(idx, settled);
                 }
                 Ok(a) => {
-                    *spent += a.cost_usd;
+                    ledger.spent += a.cost_usd;
                     cost_so_far[idx] += a.cost_usd;
                     let outcome = enforce_emits(item.task, a.outcome);
                     overrun.time |= Overrun::of(&outcome).time;
@@ -2834,8 +2596,8 @@ fn run_batch_with_retries<'a>(
                 }
             }
         }
-        let retry_budget_blocked = *spent >= budget;
-        overrun.budget |= *spent > budget;
+        let retry_budget_blocked = ledger.spent >= ledger.budget;
+        overrun.budget |= ledger.spent > ledger.budget;
         let mut next: Vec<(usize, BatchItem<'a>, Option<TransportFailure>)> = Vec::new();
         for (idx, item, outcome, repairs) in attempted {
             match settle_attempt(outcome, item.attempt, cost_so_far[idx], repairs) {
