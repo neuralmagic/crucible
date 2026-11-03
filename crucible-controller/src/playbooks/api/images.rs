@@ -40,7 +40,7 @@ pub(crate) async fn rank_images(
             Some(h) => h,
             None => {
                 return Ok(bad_request(format!(
-                    "unknown harness {name:?} (claude, hermes, codex, opencode or pi)"
+                    "unknown harness {name:?} (claude, codex, opencode or pi)"
                 )));
             }
         },

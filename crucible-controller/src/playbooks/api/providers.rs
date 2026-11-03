@@ -29,7 +29,7 @@ dto! {
     /// models it offers. The credential reference is not here — only an administrator has business
     /// knowing which secret pays for a provider.
     pub struct ProviderDto: From<p: ModelProvider> {
-        /// The agent CLI a dispatch to this provider runs: claude, hermes, codex, opencode, or pi.
+        /// The agent CLI a dispatch to this provider runs: claude, codex, opencode, or pi.
         /// Null for a provider that serves no agent.
         pub harness: Option<String> = p.serves(ModelRole::Agent).then(|| crate::playbooks::providers::harness_name(p.harness()).to_string()),
         /// What this provider can be chosen for: an agent, route decisions, or both.
@@ -222,7 +222,7 @@ dto! {
 
     /// A registration in full, including the credential it spends and whether it is offered at launch.
     pub struct ProviderDetailDto: From<p: ModelProvider> {
-        /// The agent CLI a dispatch to this provider runs: claude, hermes, codex, opencode, or pi.
+        /// The agent CLI a dispatch to this provider runs: claude, codex, opencode, or pi.
         /// Null for a provider that serves no agent.
         pub harness: Option<String> = p.serves(ModelRole::Agent).then(|| crate::playbooks::providers::harness_name(p.harness()).to_string()),
         /// What this provider can be chosen for: an agent, route decisions, or both.
@@ -312,7 +312,7 @@ pub(crate) struct ProviderBody {
     /// The API a custom provider speaks at that endpoint. Required with `endpoint`.
     #[serde(default)]
     protocol: Option<InferenceProtocol>,
-    /// The agent CLI to run the models under (claude, hermes, codex, opencode, or pi), one of
+    /// The agent CLI to run the models under (claude, codex, opencode, or pi), one of
     /// those that speak the kind's service or the custom endpoint's protocol. Absent runs the
     /// default: Claude Code for anthropic, vertex, and messages; Codex for openai and responses;
     /// opencode for chat_completions.
@@ -407,7 +407,7 @@ fn check_harness(
             crate::playbooks::providers::harness_list(allowed)
         )),
         None => Err(format!(
-            "harness: {raw:?} is not a harness (claude, hermes, codex, opencode, or pi)"
+            "harness: {raw:?} is not a harness (claude, codex, opencode, or pi)"
         )),
     }
 }

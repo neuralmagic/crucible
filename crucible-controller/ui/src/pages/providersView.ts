@@ -32,7 +32,7 @@ export const PROTOCOL_OPTIONS: readonly { value: InferenceProtocol; label: strin
 /// (`allowed_harnesses`), mirrored so the form offers only what the API accepts.
 const KIND_HARNESSES: Record<Exclude<ProviderKind, 'custom'>, readonly string[]> = {
   anthropic: ['claude', 'opencode', 'pi'],
-  vertex: ['claude', 'hermes'],
+  vertex: ['claude'],
   openai: ['codex', 'opencode', 'pi'],
 };
 
@@ -55,7 +55,6 @@ export function defaultHarness(kind: ProviderKind, protocol: InferenceProtocol):
 
 const HARNESS_LABELS: Record<string, string> = {
   claude: 'Claude Code',
-  hermes: 'Hermes',
   codex: 'Codex',
   opencode: 'OpenCode',
   pi: 'Pi',

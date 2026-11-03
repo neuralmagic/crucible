@@ -71,7 +71,7 @@ describe('providerBody', () => {
 describe('harness', () => {
   it('offers the harnesses the server accepts for the kind or protocol, default first', () => {
     expect(allowedHarnesses('openai', 'chat_completions')).toEqual(['codex', 'opencode', 'pi']);
-    expect(allowedHarnesses('vertex', 'messages')).toEqual(['claude', 'hermes']);
+    expect(allowedHarnesses('vertex', 'messages')).toEqual(['claude']);
     expect(allowedHarnesses('custom', 'chat_completions')).toEqual(['opencode', 'pi']);
     expect(allowedHarnesses('custom', 'responses')).toEqual(['codex', 'pi']);
     expect(allowedHarnesses('custom', 'messages')).toEqual(['claude', 'opencode', 'pi']);
