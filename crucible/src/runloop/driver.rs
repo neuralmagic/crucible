@@ -790,6 +790,9 @@ fn run_loop_body<R: Reporter>(
                 best_score: run.segment.best_score,
                 best_tiebreak: run.segment.best_tiebreak,
                 spent_before: run.spent,
+                time_left: args.max_time().map(|cap| {
+                    cap.saturating_sub(started.elapsed().saturating_sub(run.parked_total))
+                }),
                 workflow: args.workflow.as_ref(),
             },
             runner,
@@ -1700,7 +1703,7 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
 mod tests {
     use super::*;
     use crate::control::recovery::{ResumeFold, resume_finished};
-    use crate::report::reporter::{AgentTurn, Stop, TurnBudget};
+    use crate::report::reporter::Stop;
     use crate::report::session::Row;
     use crate::runloop::step::{TurnVerdict, drain_turn_markers};
     use crucible_contract::LoopPhase;
@@ -2235,18 +2238,6 @@ mod tests {
             self.notes.push(msg.to_string());
         }
         fn row(&mut self, _: &Row, _: bool) {}
-        fn run_agent(
-            &mut self,
-            _: &Args,
-            _: &Paths,
-            _: u32,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-            _: TurnBudget,
-        ) -> AgentTurn {
-            AgentTurn::default()
-        }
         fn check_interrupt(&mut self, _: &Paths, _: &[Row]) -> Stop {
             match &mut self.quit_after {
                 Some(0) => Stop::Quit,
@@ -2582,10 +2573,15 @@ mod tests {
     fn a_marker_parks_the_head_and_the_operator_rm_resumes_the_run() {
         let (f, root) = distress_fixture("loop-head-park", 2);
         let marker = root.dir.join("distress");
-        let r = RecordingReporter {
-            distress_after_turn: Some((1, marker.clone(), "torch skew".into())),
-            ..Default::default()
-        };
+        f.agent.runs(
+            Some(1),
+            &format!(
+                "printf '%s' '{}' > '{}'",
+                serde_json::json!({ "reason": "torch skew", "evidence": ["log-3"], "ts_ms": 42 }),
+                marker.display()
+            ),
+        );
+        let r = RecordingReporter::default();
         // The operator's `oc exec ... rm`, once the loop is actually parked on it.
         let clear = marker.clone();
         let operator = std::thread::spawn(move || {
@@ -2611,7 +2607,12 @@ mod tests {
         );
         outcome.expect("a granted distress resumes, it does not error");
         operator.join().unwrap();
-        assert_eq!(r.agent_calls, 2, "both iterations still run: {:?}", r.notes);
+        assert_eq!(
+            f.agent.calls(),
+            2,
+            "both iterations still run: {:?}",
+            r.notes
+        );
         let distressed: Vec<&Row> = r
             .rows
             .iter()
@@ -2689,7 +2690,7 @@ mod tests {
         );
         outcome.expect("a bad byte must never wedge a paid run");
 
-        assert_eq!(r.agent_calls, 3, "every iteration still ran");
+        assert_eq!(f.agent.calls(), 3, "every iteration still ran");
         assert_eq!(
             r.notes.iter().filter(|n| n.contains("unreadable")).count(),
             1,
@@ -2764,7 +2765,7 @@ mod tests {
             "one marker, one row: {results}"
         );
         assert_eq!(r.waits.len(), 1, "it still parks: no grant was given");
-        assert_eq!(r.agent_calls, 1, "iteration 2 runs after the grant");
+        assert_eq!(f.agent.calls(), 1, "iteration 2 runs after the grant");
     }
 
     // --- run_loop's shutdown emission: one Reporter::shutdown call per exit path ---
@@ -2834,8 +2835,7 @@ mod tests {
     }
 
     /// Records every `Reporter` call `run_loop` tests care about, plus scripted knobs:
-    /// `stop_now` fails `check_interrupt` on the very first checkpoint; `agent_cost`/
-    /// `write_escalation` let a test drive the budget/escalation exit paths from `run_agent`.
+    /// `stop_now` fails `check_interrupt` on the very first checkpoint.
     #[derive(Default)]
     struct RecordingReporter {
         shutdowns: Vec<(String, String)>,
@@ -2843,21 +2843,9 @@ mod tests {
         notes: Vec<String>,
         rows: Vec<Row>,
         stop_now: bool,
-        agent_cost: f64,
-        agent_is_error: bool,
-        agent_error: Option<String>,
-        /// Scripted turns, popped per `run_agent` call; when empty the `agent_*` knobs apply.
-        agent_turns: std::collections::VecDeque<AgentTurn>,
-        agent_calls: u32,
-        /// Every prompt the loop rendered, so a test can see what the turn actually carried.
-        prompts: Vec<String>,
-        escalation_path: Option<std::path::PathBuf>,
         recoveries: Vec<(crate::report::session::RecoveryClass, u32, String)>,
         waits: Vec<(String, String, provisioning::WaitMode)>,
         resolved: Vec<(String, String)>,
-        /// Plays the agent calling `distress(severity=error)`: after this many turns, write the
-        /// broker's park marker at the given path with the given reason.
-        distress_after_turn: Option<(u32, std::path::PathBuf, String)>,
         /// `(fingerprint, baseline_score, regime)` per segment boundary.
         segments: Vec<(String, f64, String)>,
     }
@@ -2871,43 +2859,6 @@ mod tests {
         }
         fn row(&mut self, row: &Row, _: bool) {
             self.rows.push(row.clone());
-        }
-        fn run_agent(
-            &mut self,
-            _: &Args,
-            _: &Paths,
-            _: u32,
-            prompt: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-            _: TurnBudget,
-        ) -> AgentTurn {
-            self.agent_calls += 1;
-            self.prompts.push(prompt.to_string());
-            if let Some((turn, path, reason)) = &self.distress_after_turn
-                && self.agent_calls == *turn
-            {
-                std::fs::write(
-                    path,
-                    serde_json::json!({ "reason": reason, "evidence": ["log-3"], "ts_ms": 42 })
-                        .to_string(),
-                )
-                .expect("plant the park marker");
-            }
-            if let Some(path) = &self.escalation_path {
-                let _ = std::fs::write(
-                    path,
-                    r#"{"category":"harness-limitation","reason":"gate is broken","evidence":""}"#,
-                );
-            }
-            if let Some(turn) = self.agent_turns.pop_front() {
-                return turn;
-            }
-            AgentTurn {
-                cost: self.agent_cost,
-                is_error: self.agent_is_error,
-                error: self.agent_error.clone(),
-            }
         }
         fn check_interrupt(&mut self, _: &Paths, _: &[Row]) -> Stop {
             if self.stop_now {
@@ -2945,6 +2896,81 @@ mod tests {
 
     /// A scratch workspace + the `Args`/`Paths`/`Prepared` triple `run_loop` needs, wired to a
     /// `FakeWorld`/scripted `FakeJudge` so the loop runs with no subprocess, no git, no gate.
+    /// The agent on the far edge: the `command` backend running a script that plays whatever
+    /// turns a test wrote into its directory. Turn `n` runs `turn-<n>.sh` if present, then
+    /// prints `turn-<n>.json`, else `default.json`; every turn records the prompt it got.
+    struct StandIn {
+        dir: std::path::PathBuf,
+    }
+
+    const STAND_IN: &str = r#"d="$STAND_IN_DIR"
+n=$(( $(cat "$d/calls" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$d/calls"
+printf '%s' "$CRUCIBLE_PROMPT" > "$d/prompt-$n"
+if [ -f "$d/each.sh" ]; then . "$d/each.sh"; fi
+if [ -f "$d/turn-$n.sh" ]; then . "$d/turn-$n.sh"; fi
+if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.json" ]; then cat "$d/default.json"; fi
+"#;
+
+    impl StandIn {
+        fn new(dir: std::path::PathBuf, args: &mut Args) -> Self {
+            std::fs::create_dir_all(&dir).expect("stand-in dir");
+            std::fs::write(dir.join("agent.sh"), STAND_IN).expect("stand-in script");
+            args.agent_cmd = Some(format!("sh {}", dir.join("agent.sh").display()));
+            args.env
+                .push(("STAND_IN_DIR".into(), dir.display().to_string()));
+            StandIn { dir }
+        }
+
+        fn result(cost: f64, error: Option<&str>) -> String {
+            serde_json::json!({
+                "v": 1,
+                "kind": "result",
+                "is_error": error.is_some(),
+                "cost_usd": cost,
+                "error": error,
+            })
+            .to_string()
+        }
+
+        /// What every turn without a script of its own prints.
+        fn every_turn(&self, cost: f64, error: Option<&str>) {
+            std::fs::write(self.dir.join("default.json"), Self::result(cost, error))
+                .expect("default turn");
+        }
+
+        /// What turn `n` prints.
+        fn turn(&self, n: u32, cost: f64, error: Option<&str>) {
+            std::fs::write(
+                self.dir.join(format!("turn-{n}.json")),
+                Self::result(cost, error),
+            )
+            .expect("scripted turn");
+        }
+
+        /// Shell every turn runs, or only turn `n` when given.
+        fn runs(&self, n: Option<u32>, script: &str) {
+            let name = n.map_or("each.sh".to_string(), |n| format!("turn-{n}.sh"));
+            std::fs::write(self.dir.join(name), script).expect("turn script");
+        }
+
+        fn calls(&self) -> u32 {
+            std::fs::read_to_string(self.dir.join("calls"))
+                .ok()
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0)
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            (1..=self.calls())
+                .map(|n| {
+                    std::fs::read_to_string(self.dir.join(format!("prompt-{n}")))
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+    }
+
     struct Fixture {
         /// The iteration head reads the distress marker and stamps `turn-meta.json` under the
         /// process-global `FORGE_STORAGE_ROOT`, so two concurrent loops fight over one directory.
@@ -2954,6 +2980,7 @@ mod tests {
         args: Args,
         paths: Paths,
         prepared: Prepared,
+        agent: StandIn,
     }
 
     /// Minimal `tempfile`-shaped scratch dir (no `tempfile` dependency in this crate): a directory
@@ -2988,7 +3015,7 @@ mod tests {
         let state = workspace.join("state");
         let escalation = workspace.join("ESCALATION.json");
         let provisioning = workspace.join("PROVISIONING_PENDING.json");
-        let args = Args {
+        let mut args = Args {
             manifest: None,
             state_dir: None,
             agent_cmd: None,
@@ -3069,12 +3096,14 @@ mod tests {
                 digest: "v2:0".into(),
             },
         };
+        let agent = StandIn::new(dir.path().join("stand-in"), &mut args);
         Fixture {
             _lock,
             _dir: dir,
             args,
             paths,
             prepared,
+            agent,
         }
     }
 
@@ -3100,14 +3129,18 @@ mod tests {
             LoopRuntime::default(),
         );
         outcome.expect("run_loop should finish cleanly");
-        assert_eq!(r.prompts.len(), 3, "one prompt per iteration");
+        assert_eq!(f.agent.prompts().len(), 3, "one prompt per iteration");
         assert!(
-            r.prompts[0].contains("## SEED (pack-declared starting diff)"),
+            f.agent.prompts()[0].contains("## SEED (pack-declared starting diff)"),
             "iter 1 gets the seed: {}",
-            r.prompts[0]
+            f.agent.prompts()[0]
         );
-        assert!(r.prompts[0].contains("--- a/x.py"), "{}", r.prompts[0]);
-        for (i, prompt) in r.prompts.iter().enumerate().skip(1) {
+        assert!(
+            f.agent.prompts()[0].contains("--- a/x.py"),
+            "{}",
+            f.agent.prompts()[0]
+        );
+        for (i, prompt) in f.agent.prompts().iter().enumerate().skip(1) {
             assert!(
                 !prompt.contains("## SEED") && !prompt.contains("--- a/x.py"),
                 "iter {} must not carry the seed: {prompt}",
@@ -3391,17 +3424,17 @@ mod tests {
 
     #[test]
     fn shutdown_emitted_once_on_budget() {
-        let f = fixture(3, 1.0, false);
+        let mut f = fixture(3, 1.0, false);
         let world = world_of(FakeWorld);
         let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_cost: 5.0, // over the 1.0 cap after the first iteration's turn
-            ..Default::default()
-        };
+        // A vendor-billed model, so the turn is charged the cost its harness reports.
+        f.args.model = Some("claude-opus-4-6".into());
+        f.agent.every_turn(5.0, None);
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3430,10 +3463,15 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            escalation_path: Some(f.paths.escalation.clone()),
-            ..Default::default()
-        };
+        f.agent.runs(
+            None,
+            &format!(
+                "printf '%s' '{}' > '{}'",
+                r#"{"category":"harness-limitation","reason":"gate is broken","evidence":""}"#,
+                f.paths.escalation.display()
+            ),
+        );
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3455,61 +3493,85 @@ mod tests {
         assert_eq!(r.shutdowns[0].0, "escalated");
     }
 
+    /// A turn whose result reports an error is a transport failure, as it is for a playbook
+    /// agent: the turn is retried in place and never measured, so a turn that fails every time
+    /// stalls the run instead of handing the judge an unchanged workspace.
     #[test]
-    fn is_error_turn_is_discarded_before_measuring() {
-        // The agent turn came back is_error (the credential-less "Not logged in" no-op).
-        // Even with a judge that would keep AND solve on the very first measure, the loop
-        // must never measure: it discards the iteration with the reason and runs to a
-        // clean finish. A measured turn would have exited "solved", so a "finished" exit
-        // with no solve is proof the measure was skipped.
+    fn an_is_error_turn_is_retried_and_never_measured() {
         let f = fixture(1, 0.0, false);
-        let world = world_of(FakeWorld);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_is_error: true,
-            agent_error: Some("Not logged in".into()),
-            ..Default::default()
-        };
+        f.agent.every_turn(0.0, Some("Not logged in"));
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
             &f.prepared,
             r,
-            &world,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         );
-        let outcome =
-            outcome.expect("a failed agent turn is a discarded iteration, not a run error");
-        assert!(
-            !outcome.solved,
-            "an is_error turn must never be measured/solved"
-        );
+        let outcome = outcome.expect("a failing turn stalls the run, it is not a run error");
+        assert!(!outcome.solved, "an is_error turn must never be measured");
         assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
-        assert_eq!(r.shutdowns[0].0, "finished");
+        assert_eq!(r.shutdowns[0].0, "stalled");
         assert!(
             r.notes
                 .iter()
-                .any(|n| n.contains("agent turn failed") && n.contains("Not logged in")),
-            "the discard note carries the CLI's reason: {:?}",
+                .any(|n| n.contains("transport error (retrying)") && n.contains("Not logged in")),
+            "the retry note carries the CLI's reason: {:?}",
+            r.notes
+        );
+    }
+
+    /// `--max-time` bounds the turn itself, not only the gap between iterations: a turn that
+    /// hangs is killed, with everything it started, when the run's wall clock runs out, and the
+    /// run then stops on its time cap.
+    #[test]
+    fn a_hung_turn_is_killed_when_the_runs_wall_clock_runs_out() {
+        let mut f = fixture(3, 0.0, false);
+        f.args.max_time = "2s".into();
+        f.agent.runs(Some(1), "sleep 60");
+        let judge = judge_of(FakeJudge {
+            keep: true,
+            solved: false,
+            fail_baseline: false,
+        });
+        let started = std::time::Instant::now();
+        let (r, outcome) = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            RecordingReporter::default(),
+            &world_of(FakeWorld),
+            &judge,
+            LoopRuntime::default(),
+        );
+        outcome.expect("a time stop is a clean exit, not an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the hung turn held the run for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(f.agent.calls(), 1, "no turn ran after the ceiling");
+        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "budget");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("wall-clock ceiling ended iter 1")),
+            "{:?}",
             r.notes
         );
     }
 
     /// The run-6 signature: a transport-class death before the agent produced anything.
-    fn dead_turn() -> AgentTurn {
-        AgentTurn {
-            cost: 0.0,
-            is_error: true,
-            error: Some(
-                "applying the sandbox egress policy: timed out waiting for policy version 1".into(),
-            ),
-        }
-    }
+    const DEAD_TURN: &str =
+        "applying the sandbox egress policy: timed out waiting for policy version 1";
 
     #[test]
     fn a_transport_death_is_retried_inside_the_turn_and_the_iteration_still_decides() {
@@ -3522,10 +3584,8 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_turns: [dead_turn(), AgentTurn::default()].into(),
-            ..Default::default()
-        };
+        f.agent.turn(1, 0.0, Some(DEAD_TURN));
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3537,7 +3597,8 @@ mod tests {
         );
         outcome.expect("a retried dead turn is a clean finish, not an error");
         assert_eq!(
-            r.agent_calls, 2,
+            f.agent.calls(),
+            2,
             "the turn was retried once inside the task"
         );
         assert_eq!(
@@ -3569,18 +3630,10 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_turns: [
-                dead_turn(),
-                dead_turn(),
-                AgentTurn::default(),
-                dead_turn(),
-                dead_turn(),
-                AgentTurn::default(),
-            ]
-            .into(),
-            ..Default::default()
-        };
+        for n in [1, 2, 4, 5] {
+            f.agent.turn(n, 0.0, Some(DEAD_TURN));
+        }
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3591,7 +3644,7 @@ mod tests {
             LoopRuntime::default(),
         );
         outcome.expect("the streak resets, so the run finishes");
-        assert_eq!(r.agent_calls, 6, "every scripted turn ran");
+        assert_eq!(f.agent.calls(), 6, "every scripted turn ran");
         assert_eq!(r.shutdowns[0].0, "finished");
     }
 
@@ -3649,54 +3702,20 @@ mod tests {
     }
 
     #[test]
-    fn discards_an_is_error_turn_before_measuring() {
-        let f = fixture(1, 0.0, false);
-        let judge = judge_of(FakeJudge {
-            keep: true,
-            solved: true,
-            fail_baseline: false,
-        });
-        let r = RecordingReporter {
-            agent_is_error: true,
-            agent_error: Some("Not logged in".into()),
-            ..Default::default()
-        };
-        let (r, outcome) = run_loop(
-            &f.args,
-            &f.paths,
-            &f.prepared,
-            r,
-            &world_of(FakeWorld),
-            &judge,
-            LoopRuntime::default(),
-        );
-        let outcome = outcome.expect("a failed turn is a discarded iteration, not a run error");
-        assert!(!outcome.solved, "an is_error turn must never be measured");
-        assert_eq!(r.shutdowns[0].0, "finished");
-        assert!(
-            r.notes
-                .iter()
-                .any(|n| n.contains("agent turn failed") && n.contains("Not logged in")),
-            "the discard note carries the CLI's reason: {:?}",
-            r.notes
-        );
-    }
-
-    #[test]
     fn budget_stop_still_measures_the_over_cap_turn() {
         // The iteration template carries no plan-level budget (f64::MAX) by design: the
         // driver owns the cap and checks it between rounds, so a turn that blows the cap
         // is still measured and decided (a keep!) before the run stops on budget.
-        let f = fixture(3, 1.0, false);
+        let mut f = fixture(3, 1.0, false);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_cost: 5.0, // over the 1.0 cap after the first turn
-            ..Default::default()
-        };
+        // A vendor-billed model, so the turn is charged the cost its harness reports.
+        f.args.model = Some("claude-opus-4-6".into());
+        f.agent.every_turn(5.0, None);
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3719,10 +3738,15 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            escalation_path: Some(f.paths.escalation.clone()),
-            ..Default::default()
-        };
+        f.agent.runs(
+            None,
+            &format!(
+                "printf '%s' '{}' > '{}'",
+                r#"{"category":"harness-limitation","reason":"gate is broken","evidence":""}"#,
+                f.paths.escalation.display()
+            ),
+        );
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3749,11 +3773,8 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_is_error: true,
-            agent_error: Some("request timed out".into()),
-            ..Default::default()
-        };
+        f.agent.every_turn(0.0, Some("request timed out"));
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3765,7 +3786,7 @@ mod tests {
         );
         outcome.expect("a stall is a clean exit, not an error");
         // 3 in-task turn attempts (1 + 2 transport retries) per dead iteration attempt.
-        assert_eq!(r.agent_calls, 3 * MAX_DEAD_TURN_ATTEMPTS);
+        assert_eq!(f.agent.calls(), 3 * MAX_DEAD_TURN_ATTEMPTS);
         assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
         assert_eq!(r.shutdowns[0].0, "stalled");
         assert!(
@@ -3981,14 +4002,14 @@ mod tests {
         );
         outcome.expect("run finishes");
         assert!(
-            r.prompts[0].contains("hoist the dup check"),
+            f.agent.prompts()[0].contains("hoist the dup check"),
             "the first turn carried it: {}",
-            r.prompts[0]
+            f.agent.prompts()[0]
         );
         assert!(
-            !r.prompts[1].contains("hoist the dup check"),
+            !f.agent.prompts()[1].contains("hoist the dup check"),
             "and only that turn: {}",
-            r.prompts[1]
+            f.agent.prompts()[1]
         );
         assert!(
             ledger.peek_steers().is_empty(),
@@ -4024,14 +4045,10 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let mut r = RecordingReporter::default();
+        let r = RecordingReporter::default();
         // The first turn dies in transport (never started); the second runs.
-        r.agent_turns.push_back(AgentTurn {
-            cost: 0.0,
-            is_error: true,
-            error: Some("Connection reset by peer".into()),
-        });
-        let (r, outcome) = run_loop(
+        f.agent.turn(1, 0.0, Some("Connection reset by peer"));
+        let (_, outcome) = run_loop(
             &f.args,
             &f.paths,
             &f.prepared,
@@ -4045,9 +4062,10 @@ mod tests {
         );
         outcome.expect("run finishes");
 
-        assert!(r.prompts.len() >= 2);
+        assert!(f.agent.prompts().len() >= 2);
         assert!(
-            r.prompts[0].contains("try cache-first") && r.prompts[1].contains("try cache-first"),
+            f.agent.prompts()[0].contains("try cache-first")
+                && f.agent.prompts()[1].contains("try cache-first"),
             "the re-run of the dead iteration carries the steer again"
         );
         assert!(
@@ -4110,7 +4128,7 @@ mod tests {
         )
         .unwrap();
         let mut r = NoteCapture::default();
-        let v = drain_turn_markers(&mut r, &f.paths, None, 1, &AgentTurn::default(), &[]);
+        let v = drain_turn_markers(&mut r, &f.paths, None, &[]);
         assert!(matches!(v, TurnVerdict::Proceed));
         assert_eq!(
             r.waits,
@@ -4122,7 +4140,7 @@ mod tests {
             r#"{"mode":"block","trace_id":"t2","handle":"h2"}"#,
         )
         .unwrap();
-        let v = drain_turn_markers(&mut r, &f.paths, None, 1, &AgentTurn::default(), &[]);
+        let v = drain_turn_markers(&mut r, &f.paths, None, &[]);
         assert!(matches!(v, TurnVerdict::Park(_)));
         assert_eq!(r.waits.len(), 2, "block mode opens the bracket too");
         assert_eq!(r.waits[1].2, provisioning::WaitMode::Block);
@@ -4183,7 +4201,7 @@ mod tests {
             format!("{err:#}").contains("libnvrtc.so not found"),
             "the stderr tail rides the error: {err:#}"
         );
-        assert_eq!(r.agent_calls, 0, "no iteration may be burned");
+        assert_eq!(f.agent.calls(), 0, "no iteration may be burned");
         assert_eq!(r.rows.len(), 1, "just the refusal row: {:?}", r.rows);
         assert_eq!(r.rows[0].decision, "preflight-failed");
         assert_eq!(r.rows[0].iter, 0);

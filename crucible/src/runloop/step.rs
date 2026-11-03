@@ -5,7 +5,7 @@ use crate::args::{Args, Paths};
 use crate::control;
 use crate::control::escalation;
 use crate::control::provisioning;
-use crate::report::reporter::{AgentTurn, Reporter, Stop};
+use crate::report::reporter::{Reporter, Stop};
 use crate::report::session::Row;
 use anyhow::Result;
 use crucible::crucible::{Judge, World};
@@ -67,16 +67,9 @@ pub(crate) enum IterStep {
 
 /// What the post-turn sentinel drains decided, in the exact order the loop checks them.
 /// Notes and the structured escalation event are emitted in here; the caller owns the
-/// world rollback and the loop control that follows. Shared by the typestate path and the
-/// graph runner so both react to a turn identically.
+/// world rollback and the loop control that follows.
 pub(crate) enum TurnVerdict {
     Proceed,
-    /// The turn failed (`is_error`): discard the iteration.
-    Discard,
-    /// The turn died on a transport-class error (auth expiry, rate limit, connection): worth
-    /// re-running the turn — the session survives, so a retry resumes rather than restarts.
-    /// Carries the surfaced error so the retry/stall records name the actual failure.
-    Retry(String),
     /// The agent escalated: halt for human review.
     Escalate,
     /// The agent blocked on a pending approval with no fallback.
@@ -84,61 +77,13 @@ pub(crate) enum TurnVerdict {
     Stop,
 }
 
-/// Whether an agent-turn error is transport-class: the infrastructure between us and the model
-/// failed, not the turn's content. Matched on the surfaced error text because the CLI backends
-/// flatten their HTTP/auth failures to strings.
-fn is_transport_turn_error(why: &str) -> bool {
-    let why = why.to_ascii_lowercase();
-    // HTTP status codes match only as standalone tokens: a bare `contains("502")` would
-    // misclassify any error mentioning "5023 rows" or a path like `/tmp/x502`.
-    let codes = ["401", "403", "429", "500", "502", "503", "529"];
-    let code_hit = why
-        .split(|c: char| !c.is_ascii_alphanumeric())
-        .any(|tok| codes.contains(&tok));
-    code_hit
-        || [
-            "unauthenticated",
-            "invalid authentication",
-            "rate limit",
-            "overloaded",
-            "connection reset",
-            "connection refused",
-            "failed to connect",
-            "timed out",
-            "timeout",
-        ]
-        .iter()
-        .any(|sig| why.contains(sig))
-}
-
+/// Read the markers a turn whose transport held left behind.
 pub(crate) fn drain_turn_markers<R: Reporter>(
     r: &mut R,
     p: &Paths,
     control: Option<&control::bridge::ControlState>,
-    it: u32,
-    turn: &AgentTurn,
     rows: &[Row],
 ) -> TurnVerdict {
-    // A failed agent turn (the CLI reported is_error, e.g. a credential-less
-    // "Not logged in" no-op with subtype "success", cost 0) left the workspace
-    // untouched. Discard the iteration with the reason instead of measuring an
-    // unchanged workspace and logging the no-op as a keep/discard "success", the
-    // same restore-and-continue an unscoreable (apply-failed) candidate takes.
-    if turn.is_error {
-        let why = turn.error.as_deref().unwrap_or("agent reported an error");
-        // A transport-class death (expired token, rate limit, dropped connection) says nothing
-        // about the candidate; the session survives, so a retried turn resumes where it died
-        // instead of the iteration being discarded (a 5h turn once died ungraded on one 401).
-        if is_transport_turn_error(why) {
-            r.note(&format!(
-                "agent turn hit a transport error (retrying): {why}"
-            ));
-            return TurnVerdict::Retry(why.to_string());
-        }
-        r.note(&format!("agent turn failed (discarding iter {it}): {why}"));
-        return TurnVerdict::Discard;
-    }
-
     // The agent's sanctioned move against a frozen judge: if it declared the harness
     // inadequate this turn, restore the world and halt for human review, never measure
     // or keep on top of an escalation. A malformed marker is surfaced but ignored, so
@@ -314,31 +259,4 @@ pub(crate) fn candidate_note(p: &Paths) -> (String, String) {
     let _ = std::fs::remove_file(&path);
     let note = full.replace('\n', " ").chars().take(120).collect();
     (note, full)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The 401 that killed a 5h turn, plus the other transport signatures, classify as retryable;
-    /// content-level failures (an escalation-worthy error string, a plain crash) do not.
-    #[test]
-    fn transport_turn_errors_classify_retryable() {
-        for why in [
-            "Failed to authenticate. API Error: 401 [{\"error\":{\"code\":401,\"status\":\"UNAUTHENTICATED\"}}]",
-            "API Error: 429 rate limit exceeded",
-            "server overloaded, try again later",
-            "connection reset by peer",
-            "request timed out",
-        ] {
-            assert!(is_transport_turn_error(why), "{why}");
-        }
-        for why in [
-            "agent reported an error",
-            "the model refused the task",
-            "candidate deleted the reference oracle",
-        ] {
-            assert!(!is_transport_turn_error(why), "{why}");
-        }
-    }
 }

@@ -434,18 +434,6 @@ mod tests {
         }
         fn note(&mut self, _: &str) {}
         fn row(&mut self, _: &crate::report::session::Row, _: bool) {}
-        fn run_agent(
-            &mut self,
-            _: &crate::args::Args,
-            _: &crate::args::Paths,
-            _: u32,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-            _: crate::report::reporter::TurnBudget,
-        ) -> crate::report::reporter::AgentTurn {
-            crate::report::reporter::AgentTurn::default()
-        }
         fn check_interrupt(
             &mut self,
             _: &crate::args::Paths,

@@ -19,23 +19,23 @@ use crate::args::{Args, Paths, Prepared};
 use crate::agent;
 use crate::control;
 use crate::plan::admission::{Admission, Refusal};
-use crate::plan::exec::TransportFailure;
 use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
 };
+use crate::plan::harness::CandidateEvent;
 use crate::plan::ir::{
     EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg};
 use crate::process::STOP;
-use crate::report::reporter::{Reporter, TurnBudget};
+use crate::report::reporter::Reporter;
 use crate::report::session::Row;
+use crate::report::session::SessionEvent;
 use crate::report::session::{EvidenceDisposition, EvidenceEntry};
 use crate::runloop::step::{Decided, IterStep, Measured, TurnVerdict};
 use crucible::crucible::Direction;
 use crucible::crucible::{Judge, MeasureCtx, Reading, World};
 use crucible::deadline::Deadline;
-use crucible_contract::TransportCause;
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph iteration ended with neither a decision nor a control signal (exit: {exit})")]
@@ -74,6 +74,9 @@ pub(crate) struct IterCtx<'a> {
     /// Run spend before this iteration, so the runner reports the same cumulative budget
     /// the typestate path would after the turn.
     pub spent_before: f64,
+    /// What is left of the run's wall-clock ceiling; every task of the iteration, the
+    /// candidate turn included, is cut off when it runs out.
+    pub time_left: Option<std::time::Duration>,
     pub workflow: Option<&'a WorkflowCfg>,
 }
 
@@ -111,7 +114,10 @@ pub(crate) fn run_iteration<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            wall_clock: cx.time_left,
+            ..ExecCfg::default()
+        },
         &mut *runner,
         |task, result| {
             states_of(&task_states).insert(task.name.clone(), (result.status, result.note.clone()));
@@ -173,6 +179,15 @@ pub(crate) fn run_iteration<R: Reporter>(
                         IterStep::Discarded {
                             reason: format!("{task} rejected the candidate: {why}"),
                         }
+                    }
+                }
+                crate::plan::exec::PlanExit::TimeExceeded => {
+                    runner.r.note(&format!(
+                        "the run's wall-clock ceiling ended iter {} before it decided",
+                        cx.it
+                    ));
+                    IterStep::Discarded {
+                        reason: "the run's wall-clock ceiling ended the iteration".to_string(),
                     }
                 }
                 exit => {
@@ -509,55 +524,93 @@ impl<R: Reporter> LoopTaskRunner<R> {
         self.workflow_runner = harness_runner(&self.args, &self.p);
     }
 
-    fn propose(&mut self, task: &Task, prompt: &str) -> Attempt {
-        let turn = self.r.run_agent(
-            &self.args,
-            &self.p,
-            self.it,
+    /// The candidate turn, run by the workflow runner under `deadline`. Its session events and
+    /// provisional spend go to the reporter as it streams, and the agent is stopped once that
+    /// spend reaches the cost cap.
+    fn candidate(&mut self, task: &Task, deadline: Option<Deadline>) -> Attempt {
+        let Self {
+            args,
+            r,
+            it,
+            spent_before,
+            started,
+            heartbeat,
+            control,
             prompt,
-            Some(&self.resume_prompt),
-            task.session.as_deref(),
-            TurnBudget {
-                spent_before: self.spent_before,
-                started: self.started,
-                max_cost: crate::runloop::step::live_max_cost(&self.args, self.control.as_deref()),
-                heartbeat: self.heartbeat.clone(),
-            },
-        );
-        let cost = turn.cost;
+            resume_prompt,
+            workflow_runner,
+            ..
+        } = self;
+        let max_cost = crate::runloop::step::live_max_cost(args, control.as_deref());
+        let pricing = args.pricing();
+        let mut stopped = false;
+        let attempt =
+            workflow_runner.candidate_turn(task, prompt, resume_prompt, deadline, &mut |event| {
+                match event {
+                    CandidateEvent::Starting(session) => {
+                        if let Some(turn) = session {
+                            r.plan_event(&SessionEvent::AgentSession {
+                                session: turn.logical_name.clone(),
+                                action: turn.action(),
+                                turn: turn.completed_turns + 1,
+                            });
+                        }
+                        r.plan_event(&SessionEvent::AgentStart { iter: *it });
+                    }
+                    CandidateEvent::Agent(ev) => {
+                        if let crate::agent::event::AgentEvent::Tokens(t) = ev {
+                            let spent = *spent_before + pricing.provisional(t);
+                            if let Some(heartbeat) = heartbeat {
+                                heartbeat.record(*it, spent);
+                            }
+                            r.plan_event(&SessionEvent::Budget {
+                                spent,
+                                elapsed_secs: started.elapsed().as_secs(),
+                            });
+                            if max_cost > 0.0 && spent >= max_cost && !stopped {
+                                stopped = true;
+                                r.note(&format!(
+                                "budget: provisional spend ${spent:.4} reached cap ${max_cost:.2} \
+                                 mid-turn — stopping the agent"
+                            ));
+                                crucible::deadline::terminate_live_groups();
+                            }
+                        }
+                        r.plan_event(&SessionEvent::Agent { event: ev.clone() });
+                    }
+                }
+            });
+        r.plan_event(&SessionEvent::AgentDone);
+        attempt
+    }
+
+    /// Record what the candidate turn cost and read the markers it left. A turn whose transport
+    /// failed goes back to the executor to retry; one that passed is held by its markers.
+    fn after_turn(&mut self, attempt: Attempt) -> Attempt {
+        let cost = attempt.cost_usd;
         if let Some(control) = self.control.as_ref() {
             control.set_spend(self.spent_before + cost);
         }
         self.r
             .budget(self.spent_before + cost, self.started.elapsed());
-        let turn_verdict = crate::runloop::step::drain_turn_markers(
+        match &attempt.outcome {
+            AttemptOutcome::Pass(_) => {}
+            AttemptOutcome::Transport(failure) => {
+                self.r.note(&format!(
+                    "agent turn hit a transport error (retrying): {}",
+                    failure.note
+                ));
+                return attempt;
+            }
+            _ => return attempt,
+        }
+        match crate::runloop::step::drain_turn_markers(
             &mut self.r,
             &self.p,
             self.control.as_deref(),
-            self.it,
-            &turn,
             &self.rows,
-        );
-        match turn_verdict {
-            TurnVerdict::Proceed => Attempt {
-                outcome: AttemptOutcome::Pass(serde_json::json!({ "cost_usd": cost })),
-                cost_usd: cost,
-                repairs: Vec::new(),
-            },
-            TurnVerdict::Discard => {
-                self.signal = Some(Signal::Discard("turn failed".to_string()));
-                Attempt::failed(cost, "turn failed; iteration discarded".to_string())
-            }
-            // Transport-class turn death: hand the executor a Transport outcome so
-            // `run_with_retries` re-runs the turn (the session resumes where it died).
-            TurnVerdict::Retry(why) => Attempt {
-                outcome: AttemptOutcome::Transport(TransportFailure::new(
-                    TransportCause::Provider,
-                    why,
-                )),
-                cost_usd: cost,
-                repairs: Vec::new(),
-            },
+        ) {
+            TurnVerdict::Proceed => attempt,
             TurnVerdict::Escalate => {
                 self.signal = Some(Signal::Escalate);
                 Attempt::failed(cost, "agent escalated".to_string())
@@ -746,8 +799,8 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
                 op: EngineOp::Propose,
                 ..
             } => {
-                let prompt = self.prompt.clone();
-                self.propose(task, &prompt)
+                let attempt = self.candidate(task, deadline);
+                self.after_turn(attempt)
             }
             TaskKind::Engine {
                 op: EngineOp::Apply,
@@ -2058,6 +2111,17 @@ mod tests {
             t.kinds.iter().filter(|k| *k == "task_result").count(),
             4,
             "one terminal result per template task"
+        );
+        let bracket: Vec<&str> = t
+            .kinds
+            .iter()
+            .map(String::as_str)
+            .filter(|k| matches!(*k, "agent_start" | "agent_done"))
+            .collect();
+        assert_eq!(
+            bracket,
+            ["agent_start", "agent_done"],
+            "the candidate turn is bracketed for the recovery classifier"
         );
     }
 

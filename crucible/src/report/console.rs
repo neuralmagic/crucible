@@ -5,11 +5,9 @@
 //! by the process-wide handler in `main`, and the checkpoint here offers the
 //! operator the steer/quit prompt.
 
-use crate::agent;
-use crate::agent::event::{AgentEvent, RawStream};
-use crate::args::{Args, Paths};
+use crate::args::Paths;
 use crate::process::STOP;
-use crate::report::reporter::{AgentTurn, Reporter, Stop, TurnBudget};
+use crate::report::reporter::{Reporter, Stop};
 use crate::report::session::Row;
 use crucible_contract::LoopPhase;
 use std::io::{IsTerminal, Write};
@@ -52,101 +50,6 @@ impl Reporter for ConsoleReporter {
         }
         if solved {
             println!("  SOLVED — the goal's win condition was met.");
-        }
-    }
-
-    fn run_agent(
-        &mut self,
-        args: &Args,
-        p: &Paths,
-        it: u32,
-        prompt: &str,
-        resume_prompt: Option<&str>,
-        session: Option<&str>,
-        budget: TurnBudget,
-    ) -> AgentTurn {
-        println!("  -> running agent (iteration {it}, {}) …", args.model());
-        // Pretty stream (json=false): echo each line so the human sees the same
-        // output as before, while the helper scrapes cost for budgeting and we
-        // watch the result event for a failed (is_error) no-op turn.
-        let mut is_error = false;
-        let mut error = None;
-        let mut over_cap_stopped = false;
-        let prepared = match crate::agent::agent_session::prepare_named(&p.state, session) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return AgentTurn {
-                    cost: 0.0,
-                    is_error: true,
-                    error: Some(error),
-                };
-            }
-        };
-        if let Some(turn) = &prepared {
-            println!(
-                "  -> agent session {} {} (turn {})",
-                turn.logical_name,
-                turn.action(),
-                turn.completed_turns + 1
-            );
-        }
-        let turn = agent::run_turn_with_session(
-            args,
-            p,
-            crate::agent::agent_session::effective_prompt(prepared.as_ref(), prompt, resume_prompt),
-            false,
-            prepared.as_ref(),
-            None,
-            |raw, stream, ev| {
-                if let Some(AgentEvent::Result {
-                    is_error: e,
-                    error: text,
-                    ..
-                }) = ev
-                {
-                    is_error = *e;
-                    error = text.clone();
-                }
-                if let Some(AgentEvent::Error { message, .. }) = ev {
-                    is_error = true;
-                    error = Some(message.clone());
-                }
-                if let Some(AgentEvent::Tokens(t)) = ev {
-                    // Same mid-turn cap check as the session reporter; the console
-                    // skips per-sample budget lines to keep the echo readable.
-                    let spent = budget.spent_before + args.pricing().provisional(t);
-                    budget.record_provisional(it, spent);
-                    if budget.over_cap(spent) && !over_cap_stopped {
-                        over_cap_stopped = true;
-                        println!(
-                            "  budget: provisional spend ${spent:.4} reached cap ${:.2} mid-turn — stopping the agent",
-                            budget.max_cost
-                        );
-                        crate::process::pid_registry::kill_all();
-                    }
-                }
-                match stream {
-                    RawStream::Stdout => println!("{}", raw.trim_end()),
-                    RawStream::Stderr => eprintln!("{}", raw.trim_end()),
-                }
-            },
-        );
-        // The turn's own failure channel: a transport that never produced a turn is an error
-        // even when no event carried one.
-        if let Some(failure) = turn.failure() {
-            is_error = true;
-            error = Some(failure.to_string());
-        }
-        if let Some(note) =
-            crate::agent::agent_session::commit_if_ok(&p.state, prepared.as_ref(), !is_error)
-        {
-            is_error = true;
-            error = Some(note);
-        }
-        AgentTurn {
-            cost: turn.cost_usd,
-            is_error,
-            error,
         }
     }
 

@@ -977,11 +977,51 @@ fn agent_turn(
     session: Option<&crate::agent::agent_session::SessionTurn>,
     banked: f64,
 ) -> (f64, TurnEnd) {
-    let paths = cx.paths;
-    let result_path = paths.workspace.join(RESULT_FILE);
+    let result_path = cx.paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
     let _ = std::fs::remove_file(&result_path);
+    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_| {});
+    let transport_error = match stop {
+        TurnStop::TimedOut(deadline) => {
+            let _ = std::fs::remove_file(&result_path);
+            return (cost, TurnEnd::TimedOut(deadline));
+        }
+        TurnStop::Transport(failure) => Some(failure),
+        TurnStop::Clean => None,
+    };
+    let end = match std::fs::read_to_string(&result_path) {
+        Ok(body) => {
+            let _ = std::fs::remove_file(&result_path);
+            match serde_json::from_str::<Value>(&body) {
+                Ok(v) => TurnEnd::Wrote(v),
+                Err(e) => TurnEnd::Unreadable(format!("{RESULT_FILE} is not valid JSON: {e}")),
+            }
+        }
+        Err(_) => match transport_error {
+            Some(failure) => TurnEnd::Transport(failure),
+            None => TurnEnd::Silent,
+        },
+    };
+    (cost, end)
+}
 
+/// How an agent turn's process ended, before anything it wrote is read.
+enum TurnStop {
+    Clean,
+    TimedOut(Deadline),
+    Transport(TransportFailure),
+}
+
+/// Stream one agent turn to its end under `cx.deadline`, showing every event to `on_event`, and
+/// advance a ledgered session only when the turn's transport held.
+fn stream_turn(
+    cx: &TurnCx<'_>,
+    prompt: &str,
+    session: Option<&crate::agent::agent_session::SessionTurn>,
+    banked: f64,
+    on_event: &mut dyn FnMut(&AgentEvent),
+) -> (f64, TurnStop) {
+    let paths = cx.paths;
     let name = cx.name.to_string();
     let mut transport_error: Option<TransportFailure> = None;
     let log = Arc::new(Mutex::new(TurnLog::new(Instant::now())));
@@ -1013,13 +1053,15 @@ fn agent_turn(
             if let Some(failure) = ev.and_then(agent_transport_error) {
                 transport_error = Some(failure);
             }
+            if let Some(ev) = ev {
+                on_event(ev);
+            }
         },
     );
     drop(heartbeat);
     let cost = turn.cost_usd;
     if let Some(TurnFailure::DeadlineExceeded(deadline)) = turn.failure() {
-        let _ = std::fs::remove_file(&result_path);
-        return (cost, TurnEnd::TimedOut(*deadline));
+        return (cost, TurnStop::TimedOut(*deadline));
     }
     if let Some(failure) = turn.failure() {
         transport_error = Some(TransportFailure::new(
@@ -1034,21 +1076,68 @@ fn agent_turn(
     ) {
         transport_error = Some(TransportFailure::new(TransportCause::Workspace, note));
     }
+    match transport_error {
+        Some(failure) => (cost, TurnStop::Transport(failure)),
+        None => (cost, TurnStop::Clean),
+    }
+}
 
-    let end = match std::fs::read_to_string(&result_path) {
-        Ok(body) => {
-            let _ = std::fs::remove_file(&result_path);
-            match serde_json::from_str::<Value>(&body) {
-                Ok(v) => TurnEnd::Wrote(v),
-                Err(e) => TurnEnd::Unreadable(format!("{RESULT_FILE} is not valid JSON: {e}")),
-            }
+#[cfg(feature = "autoresearch")]
+/// What the scored loop's candidate turn reports while it runs.
+pub(crate) enum CandidateEvent<'a> {
+    /// The turn is about to start, resuming or starting this session if it has one.
+    Starting(Option<&'a crate::agent::agent_session::SessionTurn>),
+    Agent(&'a AgentEvent),
+}
+
+#[cfg(feature = "autoresearch")]
+impl HarnessRunner {
+    /// The scored loop's candidate turn for `task`: `prompt`, or `resume_prompt` when the task's
+    /// session resumes, run in the shared workspace under `deadline`. The turn edits the
+    /// workspace and writes no result file, so a turn whose transport held passes.
+    pub(crate) fn candidate_turn(
+        &self,
+        task: &Task,
+        prompt: &str,
+        resume_prompt: &str,
+        deadline: Option<Deadline>,
+        on_event: &mut dyn FnMut(CandidateEvent<'_>),
+    ) -> Attempt {
+        let session = match crate::agent::agent_session::prepare_named(
+            &self.paths.state,
+            task.session.as_deref(),
+        ) {
+            Ok(session) => session,
+            Err(note) => return Attempt::transport(TransportCause::Workspace, note),
+        };
+        on_event(CandidateEvent::Starting(session.as_ref()));
+        let cx = TurnCx {
+            args: &self.args,
+            paths: &self.paths,
+            name: &task.name.0,
+            deadline,
+            ledgered: task.session.is_some(),
+            lane: None,
+        };
+        let prompt = crate::agent::agent_session::effective_prompt(
+            session.as_ref(),
+            prompt,
+            Some(resume_prompt),
+        );
+        let (cost, stop) = stream_turn(&cx, prompt, session.as_ref(), 0.0, &mut |ev| {
+            on_event(CandidateEvent::Agent(ev))
+        });
+        let outcome = match stop {
+            TurnStop::Clean => AttemptOutcome::Pass(serde_json::json!({ "cost_usd": cost })),
+            TurnStop::TimedOut(deadline) => AttemptOutcome::TimedOut(deadline),
+            TurnStop::Transport(failure) => AttemptOutcome::Transport(failure),
+        };
+        Attempt {
+            outcome,
+            cost_usd: cost,
+            repairs: Vec::new(),
         }
-        Err(_) => match transport_error {
-            Some(failure) => TurnEnd::Transport(failure),
-            None => TurnEnd::Silent,
-        },
-    };
-    (cost, end)
+    }
 }
 
 /// Resume `session` to fix a passing attempt whose output breaks the task's declared emits or
