@@ -1,5 +1,5 @@
 //! crucible-controller — the control plane's CLI: discovery (`triage`), the reconcile daemon
-//! (`autopilot`), ledger maintenance (`db verify|rebuild|import-sqlite`), the grounded-vs-API ranking
+//! (`autopilot`), ledger maintenance (`db verify|rebuild`), the grounded-vs-API ranking
 //! comparison harness (`rank-compare`), and the OpenAPI spec print (`openapi`). Split out of the
 //! public `crucible` engine binary so the engine ships without the control plane: the controller
 //! shells the engine (`crucible rank-grounded`, `crucible deploy render`) as a subprocess and the
@@ -51,8 +51,8 @@ pub(crate) enum Cmd {
         #[arg(long)]
         once: bool,
     },
-    /// Controller ledger maintenance: verify the schema, rebuild from evidence, or import a
-    /// pre-Postgres sqlite ledger.
+    /// Controller ledger maintenance: verify the schema, rebuild from evidence, export the event
+    /// log, or adopt a run launched elsewhere.
     Db {
         #[command(subcommand)]
         action: DbAction,
@@ -111,8 +111,9 @@ pub(crate) enum Cmd {
     },
 }
 
-/// `crucible-controller db <verify|rebuild|import-sqlite>`: open/migrate the ledger and report
-/// its schema version, re-derive it from evidence (lane H), or cut a sqlite-era ledger over.
+/// `crucible-controller db <verify|rebuild|export-events|adopt>`: open/migrate the ledger and
+/// report its schema version, re-derive it from evidence (lane H), export the event log, or adopt
+/// a foreign run.
 #[derive(clap::Subcommand)]
 pub(crate) enum DbAction {
     /// Verify the ledger. When the database named by `--db`/`DATABASE_URL` already exists,
@@ -131,29 +132,6 @@ pub(crate) enum DbAction {
     Rebuild {
         #[command(flatten)]
         cfg: crucible_controller::ControllerCfg,
-    },
-    /// One-shot cutover: copy every row of a pre-Postgres `outer.sqlite` ledger file into the
-    /// (empty) Postgres ledger at `--db`/`DATABASE_URL`. Run in-cluster with the daemon stopped —
-    /// the pod is what can reach both the state PVC and the database server.
-    ImportSqlite {
-        /// The sqlite ledger file to read (typically `<state-dir>/outer.sqlite`).
-        #[arg(long)]
-        from: PathBuf,
-        #[command(flatten)]
-        cfg: crucible_controller::ControllerCfg,
-    },
-    /// One-shot cutover of a legacy state volume into the shared-state tables: drop-box evidence
-    /// (digest-verified against `pod_artifacts`), run session logs (dispatched/adopted/external),
-    /// packs (re-tarred, `STEER.md` steering appends split out), `controller-events.jsonl`, and
-    /// `autopilot.json`. Idempotent, and refuses to run while the maintenance advisory lock is
-    /// held. Run with the daemon stopped, `--state-dir` at the old volume.
-    MigrateState {
-        #[command(flatten)]
-        cfg: crucible_controller::ControllerCfg,
-        /// Import the parseable event lines even when some lines are unparseable (they are
-        /// counted and reported instead of failing the run).
-        #[arg(long)]
-        skip_bad_lines: bool,
     },
     /// Export the events table as NDJSON in the frozen `controller-events.jsonl` line shape, to a
     /// file or stdout — the disaster-case export (the history survives losing the database) and
@@ -346,16 +324,11 @@ fn dispatch_rank_compare(
     Ok(())
 }
 
-/// `crucible-controller db <verify|rebuild|import-sqlite>`.
+/// `crucible-controller db <verify|rebuild|export-events|adopt>`.
 fn dispatch_db(action: DbAction) -> Result<()> {
     match action {
         DbAction::Verify { cfg } => dispatch_db_verify(cfg),
         DbAction::Rebuild { cfg } => dispatch_db_rebuild(cfg),
-        DbAction::ImportSqlite { from, cfg } => dispatch_db_import_sqlite(from, cfg),
-        DbAction::MigrateState {
-            cfg,
-            skip_bad_lines,
-        } => dispatch_db_migrate_state(cfg, skip_bad_lines),
         DbAction::ExportEvents { cfg, out } => dispatch_db_export_events(cfg, out),
         DbAction::Adopt {
             cfg,
@@ -364,86 +337,6 @@ fn dispatch_db(action: DbAction) -> Result<()> {
             run_id,
         } => dispatch_db_adopt(cfg, session_uri, issue, run_id),
     }
-}
-
-/// `crucible-controller db import-sqlite`: connect (creating + migrating the target if absent),
-/// stream the sqlite file in, print the per-table receipt.
-fn dispatch_db_import_sqlite(from: PathBuf, cfg: crucible_controller::ControllerCfg) -> Result<()> {
-    let rt = cli_runtime()?;
-    let report = rt.block_on(async {
-        let pool = crucible_controller::connect(cfg.db_url()).await?;
-        let lock = crucible_controller::try_maintenance_lock(&pool)
-            .await?
-            .context(
-                "the maintenance advisory lock is held by another session (a running daemon or \
-                 another maintenance command); stop it and retry",
-            )?;
-        let result = crucible_controller::daemon::import_sqlite::import_sqlite(&from, &pool).await;
-        let _ = lock.release().await;
-        pool.close().await;
-        result
-    })?;
-    println!(
-        "crucible-controller db import-sqlite: {} — {} row(s) across {} table(s)",
-        from.display(),
-        report.total(),
-        report.tables.len()
-    );
-    for (table, n) in &report.tables {
-        println!("  {table}: {n}");
-    }
-    Ok(())
-}
-
-/// `crucible-controller db migrate-state`: walk the legacy state volume into the shared-state
-/// tables and print the per-category receipt. Any failed item exits nonzero after the table.
-fn dispatch_db_migrate_state(
-    cfg: crucible_controller::ControllerCfg,
-    skip_bad_lines: bool,
-) -> Result<()> {
-    let rt = cli_runtime()?;
-    let report = rt.block_on(async {
-        let pool = crucible_controller::connect(cfg.db_url()).await?;
-        let report = crucible_controller::runs::migrate_state::migrate_state(
-            &pool,
-            &cfg.state_dir,
-            skip_bad_lines,
-        )
-        .await?;
-        pool.close().await;
-        Ok::<_, anyhow::Error>(report)
-    })?;
-    println!(
-        "crucible-controller db migrate-state: {}",
-        cfg.state_dir.display()
-    );
-    println!(
-        "{:<14} {:>9} {:>17} {:>7}",
-        "category", "migrated", "skipped-existing", "failed"
-    );
-    for (name, cat) in report.categories() {
-        println!(
-            "{:<14} {:>9} {:>17} {:>7}",
-            name,
-            cat.migrated,
-            cat.skipped,
-            cat.failed.len()
-        );
-    }
-    if report.events.bad_lines > 0 && report.events.failed.is_empty() {
-        println!(
-            "events: {} unparseable line(s) skipped (--skip-bad-lines)",
-            report.events.bad_lines
-        );
-    }
-    let failures = report.failures();
-    if !failures.is_empty() {
-        for f in &failures {
-            eprintln!("failed: {f}");
-        }
-        anyhow::bail!("{} item(s) failed to migrate", failures.len());
-    }
-    Ok(())
 }
 
 /// `crucible-controller db export-events`: dump the events table, oldest first, as NDJSON.

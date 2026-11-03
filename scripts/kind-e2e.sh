@@ -61,7 +61,6 @@
 #      reason at draft launch, template clone, open-as-draft, standing fire, and dispatch; an
 #      unpinned old tree is collected at startup and its legacy bytes store it again; the engine's
 #      scope pack is the controller's canonical tarball of the walked tree
-#   G  migrate-state stores a legacy pack dir as a tree with its steering split into rows
 #   N  with a peer controller standing by on the Lease and the discovery tick at its 300 s default,
 #      a launch on the peer's API, a one-shot, an every-minute schedule, and a signed webhook
 #      delivery to either replica each create their pod within seconds of being due; with the

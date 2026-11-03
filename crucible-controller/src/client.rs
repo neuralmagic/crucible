@@ -41,8 +41,7 @@ pub(crate) async fn ledger_exists(url: &str) -> Result<bool> {
 }
 
 /// The session-scoped advisory-lock key every mutually-exclusive writer of the ledger takes: the
-/// autopilot daemon for its lifetime, and the maintenance commands (`db rebuild`,
-/// `db import-sqlite`, `db migrate-state`) for their run. The value is the ASCII bytes of
+/// autopilot daemon for its lifetime, and the maintenance commands (`db rebuild`) for their run. The value is the ASCII bytes of
 /// `"crucible"` as a big-endian i64.
 pub const MAINTENANCE_ADVISORY_LOCK: i64 = 0x6372_7563_6962_6c65;
 

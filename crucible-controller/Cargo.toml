@@ -53,12 +53,9 @@ nix = { version = "0.31.3", features = ["signal"] }
 tokio = { workspace = true, features = ["sync", "process", "signal"] }
 # Async storage: Postgres working state + embedded migrations, compile-time checked queries in
 # offline mode (checked-in `.sqlx/`). The controller is the workspace's only sqlx user.
-# The `sqlite` driver exists ONLY for `db import-sqlite` (the one-shot cutover reader of a
-# pre-Postgres ledger file, runtime queries only) — never write new sqlite-facing code.
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "postgres",
-    "sqlite",
     "tls-rustls",
     "migrate",
     "macros",

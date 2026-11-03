@@ -249,8 +249,8 @@ pub struct ControllerCfg {
     /// [`ControllerCfg::secret_provider`]; `None` leaves a launcher on their stored groups.
     #[arg(skip)]
     pub owner_refresh: Option<std::sync::Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
-    /// The legacy state directory. Nothing durable lives here anymore; kept so
-    /// `db migrate-state` can read an old volume. The daemon never requires it to exist.
+    /// The state directory: the embedded Postgres's data and the scratch root when
+    /// `CONTROLLER_SCRATCH_DIR` is unset. Nothing durable lives here otherwise.
     #[arg(long, env = "CONTROLLER_STATE_DIR", default_value = "state")]
     pub state_dir: PathBuf,
     /// Scratch root for regenerable caches: repo checkouts (`checkouts/`) and the flow-render

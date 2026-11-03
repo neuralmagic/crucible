@@ -12,7 +12,6 @@ pub(crate) mod api;
 pub mod autopilot;
 #[cfg(feature = "autoresearch")]
 pub mod autopilot_flag;
-pub mod import_sqlite;
 pub mod launch_loop;
 pub mod leader;
 pub mod overrides;

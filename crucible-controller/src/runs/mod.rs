@@ -21,7 +21,6 @@ pub mod ingest;
 pub mod launch;
 pub(crate) mod live;
 pub mod local_run;
-pub mod migrate_state;
 pub mod mlflow;
 pub mod model;
 pub mod names;

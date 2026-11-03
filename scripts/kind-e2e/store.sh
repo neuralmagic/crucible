@@ -1112,33 +1112,6 @@ pass "[V] a non-reader's answer for the pre-tree digest is byte-identical to the
 stop_controller
 unset CONTROLLER_API_TOKEN
 
-# ---- scenario G ----------------------------------------------------------------------------
-log "[G] migrating a legacy state dir"
-OLD="$WORK/oldstate/packs/kind_e2e_legacy"
-small_pack "$OLD" "echo migrated-$ID
-$OK_JSON"
-printf 'frozen guidance\n<!-- steer @1790812800 by control -->\nfirst\n<!-- steer @1790812900 by control -->\nsecond\n' >"$OLD/STEER.md"
-"$BIN/crucible-controller" db migrate-state --state-dir "$WORK/oldstate" --db "$DB" >"$WORK/migrate-G.log" 2>&1 ||
-    fail "[G] migrate-state failed: $(cat "$WORK/migrate-G.log")"
-if ! grep -Eq '^packs +1 +0 +0$' "$WORK/migrate-G.log" || ! grep -Eq '^steering +2 +0 +0$' "$WORK/migrate-G.log"; then
-    fail "[G] migrate-state reported: $(cat "$WORK/migrate-G.log")"
-fi
-G_TREE=$(launch_tree kind_e2e_legacy)
-is_tree "$G_TREE" || fail "[G] the migrated pack holds tree '$G_TREE'"
-[ "$(tree_file "$G_TREE" STEER.md)" = "frozen guidance" ] || fail "[G] the stored STEER.md is: $(tree_file "$G_TREE" STEER.md)"
-[ "$(sql -c "SELECT string_agg(body_md, ',' ORDER BY seq) FROM pack_steering WHERE issue_slug = 'kind_e2e_legacy'")" = "first,second" ] ||
-    fail "[G] the steering rows are: $(sql -c "SELECT seq, body_md FROM pack_steering WHERE issue_slug = 'kind_e2e_legacy'")"
-pass "[G] the legacy pack dir became a tree with its steering split into rows"
-"$BIN/crucible-controller" db migrate-state --state-dir "$WORK/oldstate" --db "$DB" >"$WORK/migrate-G2.log" 2>&1 ||
-    fail "[G] the second migrate-state failed: $(cat "$WORK/migrate-G2.log")"
-if ! grep -Eq '^packs +0 +1 +0$' "$WORK/migrate-G2.log" || ! grep -Eq '^steering +0 +2 +0$' "$WORK/migrate-G2.log"; then
-    fail "[G] the second migrate-state reported: $(cat "$WORK/migrate-G2.log")"
-fi
-[ "$(launch_tree kind_e2e_legacy)" = "$G_TREE" ] &&
-    [ "$(sql -c "SELECT count(*) FROM pack_steering WHERE issue_slug = 'kind_e2e_legacy'")" = 2 ] ||
-    fail "[G] the second migrate-state changed the migrated pack"
-pass "[G] a second migrate-state leaves the migrated pack as it was"
-
 # ---- scenario M ----------------------------------------------------------------------------
 CONTROLLER_ENV=()
 start_controller "$WORK/profile-mismatch.toml"

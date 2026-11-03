@@ -553,8 +553,8 @@ pub(crate) async fn record_pod_artifact(
     Ok(())
 }
 
-/// The upload pointer for one (pod, kind), or `None`. The fold reads it to resolve + validate a Tier 1
-/// manifest entry against the stored bytes.
+/// The upload pointer for one (pod, kind), or `None`.
+#[cfg(test)]
 #[tracing::instrument(name = "db.pod_artifact", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod = %pod, kind = %kind), err)]
 pub(crate) async fn pod_artifact(
     ex: impl PgExecutor<'_>,
