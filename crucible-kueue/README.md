@@ -195,7 +195,7 @@ events (discovery of the kinds needs no grant); cluster-wide it may also create 
 list `groups.user.openshift.io`. The server trusts runs' tokens from `--issuer` (the controller's
 `CONTROLLER_AGENT_ISSUER`) with keys from `run_jwks_uri` (default the issuer's
 `/.well-known/jwks.json`; a plain-http URI adds `--insecure-jwks-http`), and its `--resource` is
-its Service URL. `--allowed-host` is set to the Service DNS name. The image is `Containerfile.kueue` at the repository root.
+its Service URL. `--allowed-host` is set to the Service DNS name. The image is `docker/Containerfile.kueue`.
 
 ## Test
 
