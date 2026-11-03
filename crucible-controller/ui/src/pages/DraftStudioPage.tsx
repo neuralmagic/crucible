@@ -25,6 +25,7 @@ import {
   Note,
   Notice,
   NumberInputField,
+  SelectField,
   TextField,
 } from './formControls';
 import { useMediaQuery } from '../useMediaQuery';
@@ -42,6 +43,7 @@ import { readSandboxImage, setSandboxImage } from './imagePicker';
 import { ProviderModelField } from './ProviderModelField';
 import { NO_AGENT_PICK, type AgentPick } from './agentPick';
 import { WorkflowGraph } from './WorkflowGraph';
+import { projectionLabel, reasonLabel } from './blueprints';
 import {
   clampCeiling,
   initialValues,
@@ -70,6 +72,7 @@ import {
 
 type CompileDto = components['schemas']['DraftCompileDto'];
 type LeftBinding = components['schemas']['LeftBindingDto'];
+type SecretDto = components['schemas']['SecretDto'];
 
 /// The stored tree, read outside the query cache so the buffers are not reloaded.
 async function fetchDraftFiles(id: string): Promise<Record<string, string>> {
@@ -87,6 +90,7 @@ const DEFAULT_MAX_COST = 5;
 const DEFAULT_MAX_TIME = '30m';
 const MANIFEST = 'crucible.toml';
 const NO_ERRORS: ReadonlyMap<string, string> = new Map();
+const NO_PLACEHOLDERS: readonly components['schemas']['PlaceholderDto'][] = [];
 
 /// The studio: the pack's text on the left, what the pinned engine makes of it on the right. One
 /// save answers with all three — the diagnostics anchored to their lines, the launch form the
@@ -103,6 +107,7 @@ function DraftStudio({ id }: { id: string }) {
   const queryClient = useQueryClient();
   const wide = useMediaQuery(WIDE);
   const draft = $api.useQuery('get', '/api/playbook-drafts/{id}', { params: { path: { id } } });
+  const placeholders = draft.data?.placeholders ?? NO_PLACEHOLDERS;
   const files = $api.useQuery('get', '/api/playbook-drafts/{id}/files', {
     params: { path: { id } },
   });
@@ -110,6 +115,10 @@ function DraftStudio({ id }: { id: string }) {
     params: { path: { id } },
   });
   const caps = $api.useQuery('get', '/api/config/playbook-caps');
+  const whoami = $api.useQuery('get', '/api/whoami');
+  const secrets = $api.useQuery('get', '/api/secrets', {
+    enabled: whoami.data?.user != null,
+  });
   const origin = draft.data?.origin ?? null;
   const moved = originMovedLabel(origin);
   const originFiles = $api.useQuery(
@@ -152,6 +161,7 @@ function DraftStudio({ id }: { id: string }) {
 
   const [gradRepo, setGradRepo] = useState('');
   const [gradPath, setGradPath] = useState('');
+  const [gradSecretId, setGradSecretId] = useState('');
   const [gradError, setGradError] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState<string | null>(null);
 
@@ -178,6 +188,26 @@ function DraftStudio({ id }: { id: string }) {
     if (publishTarget === null) return;
     setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
   }, [publishTarget]);
+
+  const personalGithubSecrets = useMemo<SecretDto[]>(() => {
+    const login = whoami.data?.user ?? null;
+    if (login === null) return [];
+    return (secrets.data ?? []).filter(
+      secret =>
+        secret.owner === `user:${login}` &&
+        secret.kind === 'opaque' &&
+        secret.visibility === 'broker_only' &&
+        secret.mode !== 'minted',
+    );
+  }, [secrets.data, whoami.data?.user]);
+
+  const githubSecretOptions = useMemo(
+    () => [
+      { value: '', label: 'Controller identity' },
+      ...personalGithubSecrets.map(secret => ({ value: secret.id, label: secret.name })),
+    ],
+    [personalGithubSecrets],
+  );
 
   const first = stored.data;
   useEffect(() => {
@@ -338,7 +368,11 @@ function DraftStudio({ id }: { id: string }) {
     try {
       const ack = await graduate.mutateAsync({
         params: { path: { id } },
-        body: { repo: gradRepo.trim(), path: gradPath.trim() },
+        body: {
+          repo: gradRepo.trim(),
+          path: gradPath.trim(),
+          ...(gradSecretId === '' ? {} : { github_secret_id: gradSecretId }),
+        },
       });
       setPrUrl(ack.pr_url);
       void draft.refetch();
@@ -518,6 +552,32 @@ function DraftStudio({ id }: { id: string }) {
                 too; copying across is the rebase.
               </Note>
             </div>
+          </SectionBody>
+        </Section>
+      )}
+
+      {placeholders.length === 0 ? null : (
+        <Section>
+          <SectionHeader
+            title="Placeholders"
+            actions={
+              <Button className="uppercase" render={<Link to="/secrets" />}>
+                Bind
+              </Button>
+            }
+          />
+          <SectionBody>
+            <ul className="m-0 grid list-none gap-1 p-0" data-testid="draft-placeholders">
+              {placeholders.map((placeholder) => (
+                <li key={placeholder.declared_name} className="flex flex-wrap gap-x-3">
+                  <Mono size="data">{placeholder.declared_name}</Mono>
+                  <Mono size="data" tone="ink-3">
+                    {projectionLabel(placeholder)}
+                  </Mono>
+                  <span className="text-ink-2">{reasonLabel(placeholder.reason)}</span>
+                </li>
+              ))}
+            </ul>
           </SectionBody>
         </Section>
       )}
@@ -739,6 +799,14 @@ function DraftStudio({ id }: { id: string }) {
                   value={gradPath}
                   onChange={setGradPath}
                   hint="The pack directory inside that repo. Blank is the repo root."
+                />
+                <SelectField
+                  id="studio-grad-secret"
+                  label="GitHub credential"
+                  value={gradSecretId}
+                  onChange={setGradSecretId}
+                  options={githubSecretOptions}
+                  hint="A personal opaque, broker-only secret pushes and opens the PR as you."
                 />
               </FormGrid>
             </SectionBody>

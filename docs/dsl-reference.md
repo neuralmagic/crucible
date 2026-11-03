@@ -26,13 +26,13 @@ An agent turn driven by a prompt.
 | `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, `"link"`, `"links"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. A `link` is one http(s) url and `links` a list of them, each naming a result the task produced outside the run (a pull request, a pushed branch, an issue), which the run and task views then link out to. A `schema_file(...)` promises a value its JSON Schema admits, and is checked against each consumer exactly: `over` needs `"type": "array"` with string items (by `type`, `const` or `enum`), a score a numeric `type` with no non-number in its `enum`, and a route a `const`, `enum` or boolean whose every value it can answer. A `when` label such a source can never give is refused. |
-| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
+| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A task is staged with the declared files of every ancestor that passed, not only its direct dependencies, under `inputs/<producer>/`; a `join = "settled"` task also gets those of a direct dependency that failed. JSON outputs, unlike files, come from direct dependencies only. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item. Each instance receives only its own item's entry in place of the whole field. Needs `over`. |
@@ -41,9 +41,9 @@ An agent turn driven by a prompt.
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `skill()`
 
@@ -60,13 +60,13 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, `"link"`, `"links"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. A `link` is one http(s) url and `links` a list of them, each naming a result the task produced outside the run (a pull request, a pushed branch, an issue), which the run and task views then link out to. A `schema_file(...)` promises a value its JSON Schema admits, and is checked against each consumer exactly: `over` needs `"type": "array"` with string items (by `type`, `const` or `enum`), a score a numeric `type` with no non-number in its `enum`, and a route a `const`, `enum` or boolean whose every value it can answer. A `when` label such a source can never give is refused. |
-| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
+| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A task is staged with the declared files of every ancestor that passed, not only its direct dependencies, under `inputs/<producer>/`; a `join = "settled"` task also gets those of a direct dependency that failed. JSON outputs, unlike files, come from direct dependencies only. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item. Each instance receives only its own item's entry in place of the whole field. Needs `over`. |
@@ -75,9 +75,9 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `command()`
 
@@ -87,13 +87,13 @@ A deterministic shell task in the candidate workspace.
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `run` | `str` | The command, run through `sh -c`. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, `"link"`, `"links"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. A `link` is one http(s) url and `links` a list of them, each naming a result the task produced outside the run (a pull request, a pushed branch, an issue), which the run and task views then link out to. A `schema_file(...)` promises a value its JSON Schema admits, and is checked against each consumer exactly: `over` needs `"type": "array"` with string items (by `type`, `const` or `enum`), a score a numeric `type` with no non-number in its `enum`, and a route a `const`, `enum` or boolean whose every value it can answer. A `when` label such a source can never give is refused. |
-| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
+| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A task is staged with the declared files of every ancestor that passed, not only its direct dependencies, under `inputs/<producer>/`; a `join = "settled"` task also gets those of a direct dependency that failed. JSON outputs, unlike files, come from direct dependencies only. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item. Each instance receives only its own item's entry in place of the whole field. Needs `over`. |
@@ -102,9 +102,9 @@ A deterministic shell task in the candidate workspace.
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `evaluate()`
 
@@ -114,15 +114,15 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `run` | `str` | The command, run through `sh -c`. |
-| `threshold` | `number` | Grade the emitted score against this bound. An explicit `pass` wins. |
+| `threshold` | `number` | Grade the emitted score against this bound. `pass = false` fails a score within it; `pass` cannot pass a score outside it. |
 | `direction` | `"lower" \| "higher"` | Which side of the threshold passes. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
 | `emits` | `list[str] \| dict[str, type]` | Result fields the task promises in its JSON output. The dict form also promises each field's type: `"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`, `"link"`, `"links"`, or a list of labels the value is one of. A passing output missing a field, or holding one of the wrong type, fails the task. Types are checked where the graph reads them: `over` needs a list, a `top_k` or grade score a number, and a `route(source = ...)` question labels it can answer. A `link` is one http(s) url and `links` a list of them, each naming a result the task produced outside the run (a pull request, a pushed branch, an issue), which the run and task views then link out to. A `schema_file(...)` promises a value its JSON Schema admits, and is checked against each consumer exactly: `over` needs `"type": "array"` with string items (by `type`, `const` or `enum`), a score a numeric `type` with no non-number in its `enum`, and a route a `const`, `enum` or boolean whose every value it can answer. A `when` label such a source can never give is refused. |
-| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
+| `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A task is staged with the declared files of every ancestor that passed, not only its direct dependencies, under `inputs/<producer>/`; a `join = "settled"` task also gets those of a direct dependency that failed. JSON outputs, unlike files, come from direct dependencies only. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
 | `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item. Each instance receives only its own item's entry in place of the whole field. Needs `over`. |
@@ -131,9 +131,9 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `report()`
 
@@ -276,6 +276,9 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `questions` | `dict[str, question]` | Question id to `noul()`, `choice()`, or `score()`. `gate.<id>` names one for `when`. |
 | `min_confidence` | `number` | A decision model answers, through the broker's `decision` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence` and `source`. |
 | `source` | `task` | A dependency's output answers instead: it emits one declared label (or a boolean, for a noul) under each question id. Deterministic, free, and needs no capability. Any other value fails the route. When the dependency types its emits, each question's field must be typed with labels the question answers, or `"boolean"` for a noul. |
+| `human` | `bool` | True: a person allowed to approve the run answers, from the controller UI, after seeing the dependencies' declared outputs and files. Needs the `human` capability. Tasks that do not depend on the route keep running while it waits. |
+| `review` | `path` | With `human`: a Markdown template in the pack, rendered over the evidence (`inputs`, `run`, `gated`) and shown above it. Every inserted value is escaped. |
+| `timeout` | `duration` | With `human`: how long the request stays open, from when it opens; the run's wall-clock ceiling by default. An unanswered request records every question as `"uncertain"`. |
 | `files` | `list[str]` | Declared JSON files of dependencies the model reads, under `files` in its state, by dependency and path. Each must be declared by a dependency with a `schema_file(...)`. Not with `source`. |
 | `over` | `producer.field` | Decide once per item. A task mapped over the same list reads each item's answer with `when`; one mapped over another list, or not mapped, cannot. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
@@ -284,9 +287,9 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `required` | `bool` | False makes the route advisory. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependency outputs form the state, as on any task. |
 | `stage` | `"iteration" \| "epilogue"` | As on any task. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `noul()`
 
@@ -304,8 +307,19 @@ A one-of-N question for `route()`.
 | Argument | Type | Purpose |
 | --- | --- | --- |
 | `ask` | `str` | What to decide. |
-| `options` | `list[str] \| dict[str, str \| None]` | At least two distinct identifier labels, optionally each with a description the model sees. `"uncertain"` is reserved. |
+| `options` | `list[str] \| dict[str, str \| None] \| producer.field` | At least two distinct identifier labels, optionally each with a description the model sees. `"uncertain"` is reserved. Or an unmapped dependency's field, read at each decision: the list itself, or, on a route with `over`, an object keyed by item holding each item's list. Each entry is a label or `{"value": label, "description": str}`; at most 64, a repeated label keeps its first entry, and fewer than two fails that decision. The answer records the options it chose among. Needs `min_confidence`. |
+| `multiple` | `bool` | Take one or more labels. Only a `human = True` route asks it; a `when` runs if any listed label was chosen. |
 | `drop` | `str \| list[str]` | Answers that deliberately lead nowhere, so no `when` has to list them. |
+
+### `pick()`
+
+A question for a `human = True` route whose options are a list a dependency produced. The route's output holds the picked values under the question id, so `over = gate.question` fans out over them. No `when` routes on it.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `ask` | `str` | What to pick. |
+| `source` | `producer.field` | A list of strings in the output of a task the route depends on, read when the route opens its request. |
+| `multiple` | `bool` | Take one or more values rather than one. |
 
 ### `score()`
 
@@ -317,6 +331,12 @@ An ordinal question for `route()`. It answers its most probable level, the lowes
 | `levels` | `list[str] \| dict[str, str \| None]` | At least two distinct identifier labels, lowest first in the order written, optionally each with a description the model sees. `"uncertain"` is reserved. |
 | `drop` | `str \| list[str]` | Answers that deliberately lead nowhere, so no `when` has to list them. |
 
+### `optional()`
+
+Mark an entry of `depends_on` that may settle `not_taken`. Under `join = "all"` the task dispatches past it as though it passed, and its inputs carry no entry for it; one that failed or was blocked still blocks. Refused under another join, on a dependency that can never settle `not_taken`, and on a task the reviewer revises.
+
+Takes one positional argument, `task`.
+
 ## Reserved fields
 
 Names the engine reads and writes for itself. They are not constructor arguments; they appear in a task's own JSON output and in the inputs it receives.
@@ -327,7 +347,8 @@ Read out of the object the task returns.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
+| `status` | `"pass" \| "fail" \| "skipped"` | `"fail"` or `"skipped"` settles the task that way, whatever its exit status, `pass` or threshold. `"pass"` cannot pass a task that exited nonzero or did not pass its grade. Any other value is ignored. |
+| `note` | `str` | Why the task failed or was skipped, recorded as its note when it is a non-blank string: after the exit status in place of the stderr tail when a command exits nonzero, before the threshold and log handles when an evaluation does not pass, and in place of the default note when `status` is `"fail"` or `"skipped"`. The control plane shows it as a parked run's reason. Read only from a result that fails or skips. |
 | `complete` | `bool` | `true` on a passing main-graph task of a playbook ends the run early and valid: nothing else in the main graph dispatches, undispatched tasks stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it in `emits`. |
 | `reason` | `str` | Why the run completed early, recorded with the shutdown. A task may not list it in `emits`. |
 

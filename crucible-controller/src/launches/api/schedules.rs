@@ -8,8 +8,8 @@ use crate::launches::schedules::Schedule;
 use crate::clock::stamp;
 use crate::launches::schedules::cron::CronSpec;
 
-use crate::playbooks::api::registry::{
-    AuthorizedLaunch, UNREADABLE_MANIFEST, authorize_launch, check_ceilings, undispatchable,
+use crate::playbooks::api::admission::{
+    Admissible, AuthorizedLaunch, DraftHead, LaunchPack, LaunchRequest, admit, decide_launch,
 };
 
 use axum::extract::{Path, State};
@@ -219,8 +219,8 @@ pub struct SchedulePreviewDto {
     pub firings: Vec<String>,
 }
 
-/// Validate a schedule body: the cron half here, the launch half through the same
-/// [`authorize_launch`] the form POST and the one-shots use.
+/// Validate a schedule body: the cron half here, the launch half through the same [`admit`] the
+/// form POST and the one-shots use.
 #[allow(clippy::result_large_err)]
 async fn authorize_schedule(
     state: &ApiState,
@@ -228,10 +228,9 @@ async fn authorize_schedule(
     body: &ScheduleBody,
 ) -> Result<
     (
-        AuthorizedLaunch,
+        AuthorizedLaunch<LaunchPack>,
         CronSpec,
         Option<crate::launches::model::CursorSpec>,
-        Option<i64>,
     ),
     Response,
 > {
@@ -253,27 +252,43 @@ async fn authorize_schedule(
                 message,
             }])
         })?;
-    if body.target_kind == "adopted" {
-        let authorized = authorize_launch(
-            state,
-            caller,
-            &body.playbook,
-            &body.params,
-            body.max_cost,
-            &body.max_time,
-            body.schema_digest.as_deref(),
-        )
-        .await?;
-        return Ok((authorized, spec, cursor, None));
-    }
-    if body.target_kind != "draft_head" {
-        return Err(invalid_fields(vec![
-            crate::playbooks::registry::FieldError {
-                field: "target_kind".to_string(),
-                message: "must be adopted or draft_head".to_string(),
-            },
-        ]));
-    }
+    let pack = match body.target_kind.as_str() {
+        "adopted" => LaunchPack::Registered(
+            crate::playbooks::api::registry::readable_playbook(
+                state,
+                caller,
+                &body.playbook,
+                crate::authz::action::Verb::Read,
+            )
+            .await?,
+        ),
+        "draft_head" => LaunchPack::Draft(draft_head(state, &body.playbook).await?),
+        _ => {
+            return Err(invalid_fields(vec![
+                crate::playbooks::registry::FieldError {
+                    field: "target_kind".to_string(),
+                    message: "must be adopted or draft_head".to_string(),
+                },
+            ]));
+        }
+    };
+    let authorized = admit(
+        state,
+        pack,
+        LaunchRequest {
+            params: &body.params,
+            max_cost: body.max_cost,
+            max_time: &body.max_time,
+            schema_digest: body.schema_digest.as_deref(),
+        },
+    )
+    .await?;
+    Ok((authorized, spec, cursor))
+}
+
+/// The draft head a `draft_head` schedule of `id` targets, when policy allows one.
+#[allow(clippy::result_large_err)]
+async fn draft_head(state: &ApiState, id: &str) -> Result<DraftHead, Response> {
     let allowed = state
         .config
         .as_ref()
@@ -286,90 +301,24 @@ async fn authorize_schedule(
             },
         ]));
     }
-    let draft = match crate::playbooks::drafts::get(state.db.pool(), &body.playbook).await {
+    let draft = match crate::playbooks::drafts::get(state.db.pool(), id).await {
         Ok(Some(d)) if d.retired_at.is_none() => d,
         Ok(Some(_)) => return Err(conflict("the draft retired after graduation")),
-        Ok(None) => return Err(not_found(format!("no draft {:?}", body.playbook))),
+        Ok(None) => return Err(not_found(format!("no draft {id:?}"))),
         Err(e) => return Err(AppError::from(e).into_response()),
     };
-    let latest = match crate::playbooks::drafts::latest(state.db.pool(), &body.playbook).await {
+    let latest = match crate::playbooks::drafts::latest(state.db.pool(), id).await {
         Ok(Some(v)) => v,
-        Ok(None) => return Err(not_found(format!("no draft {:?}", body.playbook))),
+        Ok(None) => return Err(not_found(format!("no draft {id:?}"))),
         Err(e) => return Err(AppError::from(e).into_response()),
     };
-    let (Some(schema), Some(schema_digest)) = (latest.params_schema, latest.schema_digest) else {
-        return Err(invalid_fields(vec![
-            crate::playbooks::registry::FieldError {
-                field: "playbook".to_string(),
-                message: format!("draft version {} did not compile", latest.version),
-            },
-        ]));
-    };
-    if let Some(asked) = body.schema_digest.as_deref()
-        && asked != schema_digest
-    {
-        return Err(conflict("the draft schema changed; reload the form"));
-    }
-    if let Some(refusal) = match latest.agent.as_ref() {
-        Some(agent) => state.dispatch.refusal(agent),
-        None => Some(UNREADABLE_MANIFEST.to_string()),
-    } {
-        return Err(undispatchable(refusal));
-    }
-    let max_time = check_ceilings(&state.playbook_caps, body.max_cost, &body.max_time)
-        .map_err(|field| invalid_fields(vec![field]))?;
-    let params = crate::playbooks::registry::validate_params(&schema, &body.params)
-        .map_err(invalid_fields)?;
     let version = latest.version;
-    let tree = match crate::playbooks::drafts::version_tree(
-        state.db.pool(),
-        &body.playbook,
-        Some(version),
-    )
-    .await
-    {
-        Ok(Some((_, tree))) => tree,
-        Ok(None) => return Err(not_found(format!("no draft {:?}", body.playbook))),
-        Err(e) => return Err(crate::playbooks::api::registry::unreadable_tree(e)),
-    };
-    crate::playbooks::api::registry::check_plan(tree, &params, &max_time).await?;
-    let pack = crate::playbooks::registry::PlaybookRow {
-        exposure_digest: None,
-        id: draft.id.clone(),
-        description: draft.description,
-        source: match draft.graduation_repo {
-            Some(repo) => crate::playbooks::registry::PlaybookSource::Git {
-                repo,
-                git_ref: None,
-                path: draft.graduation_path.unwrap_or_default(),
-            },
-            None => crate::playbooks::registry::PlaybookSource::Draft {
-                draft: draft.id.clone(),
-                version,
-            },
-        },
-        rev: format!("draft-v{version}"),
-        tar_digest: String::new(),
-        tree_digest: None,
-        schema_digest,
-        agent: latest.agent,
-        core_rev: crate::playbooks::registry::core_rev().unwrap_or_default(),
-        owner: draft.owner,
-        created_by: draft.created_by,
-        created_at: draft.created_at,
-        updated_at: draft.updated_at,
-    };
-    Ok((
-        AuthorizedLaunch {
-            pack,
-            params,
-            max_cost: body.max_cost,
-            max_time,
-        },
-        spec,
-        cursor,
-        Some(version),
-    ))
+    DraftHead::compiled(draft, latest).ok_or_else(|| {
+        invalid_fields(vec![crate::playbooks::registry::FieldError {
+            field: "playbook".to_string(),
+            message: format!("draft version {version} did not compile"),
+        }])
+    })
 }
 
 /// Schedule a playbook: validate it now, exactly as an immediate launch is validated, and store it
@@ -396,11 +345,10 @@ pub(crate) async fn create_schedule(
         Some(store) => Some(store.recurring_policy_read().await),
         None => None,
     };
-    let (authorized, spec, cursor, draft_version) =
-        match authorize_schedule(&state, &caller, &body).await {
-            Ok(ok) => ok,
-            Err(refusal) => return refusal,
-        };
+    let (authorized, spec, cursor) = match authorize_schedule(&state, &caller, &body).await {
+        Ok(ok) => ok,
+        Err(refusal) => return refusal,
+    };
     // The target is resolved against the saver, for the same reason the groups are snapshotted: a
     // firing has no session, so this save is the only authorization its dispatch will ever have.
     let saver = match crate::playbooks::api::saver::resolve_saver(
@@ -411,7 +359,7 @@ pub(crate) async fn create_schedule(
             asked: body.owner.as_deref(),
         },
         crate::playbooks::api::saver::SaverRequest {
-            agent: authorized.pack.agent.clone(),
+            agent: authorized.pack.target().agent().cloned(),
             dispatch_target: body.dispatch_target.as_deref(),
             provider: body.provider.as_deref(),
             model: body.model.as_deref(),
@@ -424,9 +372,9 @@ pub(crate) async fn create_schedule(
     };
     if let Err(refusal) = crate::playbooks::api::registry::authorize_image(
         &state,
-        authorized.pack.agent.as_ref(),
+        authorized.pack.target().agent(),
         saver.provider.as_deref(),
-        authorized.pack.source.repo(),
+        authorized.pack.target().repo(),
     )
     .await
     {
@@ -442,9 +390,7 @@ pub(crate) async fn create_schedule(
     {
         return denied.into_response();
     }
-    if let Err(denied) =
-        crate::playbooks::api::registry::decide_launch(&state, &caller, &authorized.pack).await
-    {
+    if let Err(denied) = decide_launch(&state, &caller, authorized.pack.target()).await {
         return denied;
     }
     let actor = saver.actor.as_deref();
@@ -453,16 +399,11 @@ pub(crate) async fn create_schedule(
         .create(
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
-                    playbook: &authorized.pack.id,
-                    target: match draft_version {
-                        Some(_) => crate::launches::standing::StandingTarget::DraftHead,
-                        None => crate::launches::standing::StandingTarget::Adopted(
-                            authorized.pack.revision(),
-                        ),
-                    },
-                    eligible_draft_version: draft_version,
+                    playbook: authorized.pack.target().id(),
+                    target: authorized.pack.target().standing(),
+                    eligible_draft_version: authorized.pack.target().draft_version(),
                     params: &authorized.params,
-                    schema_digest: &authorized.pack.schema_digest,
+                    schema_digest: authorized.pack.target().schema_digest(),
                     max_cost: authorized.max_cost,
                     max_time: &authorized.max_time,
                     advance_dedupe: body.advance_dedupe,
@@ -608,11 +549,10 @@ pub(crate) async fn update_schedule(
         Ok(row) => row,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let (authorized, spec, cursor, draft_version) =
-        match authorize_schedule(&state, &caller, &body).await {
-            Ok(ok) => ok,
-            Err(refusal) => return refusal,
-        };
+    let (authorized, spec, cursor) = match authorize_schedule(&state, &caller, &body).await {
+        Ok(ok) => ok,
+        Err(refusal) => return refusal,
+    };
     // The target is resolved against the saver, for the same reason the groups are snapshotted: a
     // firing has no session, so this save is the only authorization its dispatch will ever have.
     let saver = match crate::playbooks::api::saver::resolve_saver(
@@ -624,7 +564,7 @@ pub(crate) async fn update_schedule(
             groups: snapshot.groups.as_ref(),
         },
         crate::playbooks::api::saver::SaverRequest {
-            agent: authorized.pack.agent.clone(),
+            agent: authorized.pack.target().agent().cloned(),
             dispatch_target: body.dispatch_target.as_deref(),
             provider: body.provider.as_deref(),
             model: body.model.as_deref(),
@@ -637,24 +577,23 @@ pub(crate) async fn update_schedule(
     };
     if let Err(refusal) = crate::playbooks::api::registry::authorize_image(
         &state,
-        authorized.pack.agent.as_ref(),
+        authorized.pack.target().agent(),
         saver.provider.as_deref(),
-        authorized.pack.source.repo(),
+        authorized.pack.target().repo(),
     )
     .await
     {
         return refusal;
     }
     let firing_changed = prior.as_ref().is_none_or(|p| {
-        p.playbook != authorized.pack.id
+        p.playbook != authorized.pack.target().id()
             || p.params != authorized.params
             || p.dispatch_target.as_deref() != Some(saver.dispatch_target.as_str())
             || p.agent_provider != saver.provider
             || p.agent_model != saver.model
     });
     if firing_changed
-        && let Err(denied) =
-            crate::playbooks::api::registry::decide_launch(&state, &caller, &authorized.pack).await
+        && let Err(denied) = decide_launch(&state, &caller, authorized.pack.target()).await
     {
         return denied;
     }
@@ -665,16 +604,11 @@ pub(crate) async fn update_schedule(
             &id,
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
-                    playbook: &authorized.pack.id,
-                    target: match draft_version {
-                        Some(_) => crate::launches::standing::StandingTarget::DraftHead,
-                        None => crate::launches::standing::StandingTarget::Adopted(
-                            authorized.pack.revision(),
-                        ),
-                    },
-                    eligible_draft_version: draft_version,
+                    playbook: authorized.pack.target().id(),
+                    target: authorized.pack.target().standing(),
+                    eligible_draft_version: authorized.pack.target().draft_version(),
                     params: &authorized.params,
-                    schema_digest: &authorized.pack.schema_digest,
+                    schema_digest: authorized.pack.target().schema_digest(),
                     max_cost: authorized.max_cost,
                     max_time: &authorized.max_time,
                     advance_dedupe: body.advance_dedupe,

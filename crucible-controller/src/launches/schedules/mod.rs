@@ -863,7 +863,7 @@ pub(crate) async fn fire_due_refreshing(
 mod tests {
     use crate::daemon::queue::DiscoverySource;
     use crate::daemon::queue::{Enqueue, IssueKey};
-    use crate::launches::model::NewPlaybookLaunch;
+    use crate::launches::model::{LaunchFilter, NewPlaybookLaunch};
     use crate::launches::schedules::*;
     use crate::launches::standing::{
         StandingTarget, Unadoptable, clear_owner_signin, require_owner_signin,
@@ -1053,6 +1053,49 @@ mod tests {
         Ok(())
     }
 
+    /// A schedule adopts the registration's manifest variant with its tree, so a repin onto
+    /// another variant does not change what the existing recurrence runs.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_schedule_fires_the_variant_it_adopted_before_a_repin(pool: PgPool) -> Result<()> {
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &tree(b"v1")).await;
+        sqlx::query("UPDATE playbooks SET variant = 'offline' WHERE id = 'survey'")
+            .execute(&pool)
+            .await?;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let scheduled = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
+        set_due(&pool, &scheduled.id, Some("2026-08-23T12:00:00Z")).await;
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+        sqlx::query("UPDATE playbooks SET variant = NULL WHERE id = 'survey'")
+            .execute(&pool)
+            .await?;
+
+        let keys = fire_due(
+            &Db::new(pool.clone()),
+            ts("2026-08-23T12:01:00Z"),
+            1,
+            5,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            crate::launches::store::launch_variant(&pool, &keys[0])
+                .await?
+                .map(String::from),
+            Some("offline".to_string())
+        );
+        Ok(())
+    }
+
     /// A launch reports the exposure of the pack it runs. While the registry row still holds the
     /// adopted tree, that is the row's stored exposure. Once a repin moves the row on, every launch
     /// of the old tree, including one fired after the repin, reports the exposure extracted from
@@ -1119,7 +1162,7 @@ mod tests {
         let after = fire("2026-08-23T13:00:00Z", "2026-08-23T13:01:00Z").await;
         let extracted = {
             let pack = crate::playbooks::packs::materialize_tree(&first)?;
-            crate::playbooks::exposure::extract(pack.path(), None)
+            crate::playbooks::exposure::extract(pack.path(), None, None)
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?
         };
         for key in [&before, &after] {
@@ -2211,7 +2254,8 @@ mod tests {
         .await?;
         assert_eq!(fired.len(), 1, "{fired:?}");
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(
             launched[0].params,
             serde_json::json!({
@@ -2246,7 +2290,8 @@ mod tests {
         )
         .await?;
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(launched[0].params, params(), "no value, no param");
         Ok(())
     }
@@ -2345,7 +2390,8 @@ mod tests {
         )
         .await?;
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&again[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&again[0]), 10)
+                .await?;
         assert_eq!(launched[0].params["since"], "2026-08-23T11:59:00Z");
         Ok(())
     }
@@ -2490,7 +2536,8 @@ mod tests {
         assert!(row.enabled);
 
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(launched.len(), 1);
         assert_eq!(launched[0].origin, LaunchOrigin::Schedule);
         assert_eq!(launched[0].params, params(), "the stored values launched");
@@ -3145,7 +3192,8 @@ mod tests {
         )
         .await?;
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(
             launched[0].params.get("since"),
             None,

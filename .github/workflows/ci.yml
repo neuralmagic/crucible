@@ -327,7 +327,7 @@ jobs:
   # the required check until it has a flake-free record.
   kind-e2e:
     timeout-minutes: 45
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -336,6 +336,7 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
           cache: ${{ runner.environment == 'github-hosted' }}
+          cache-key: kind-ubuntu24
 
       - name: Enable sccache + mold
         if: runner.environment == 'self-hosted'

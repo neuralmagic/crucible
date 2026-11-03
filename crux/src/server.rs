@@ -268,6 +268,10 @@ pub struct ImportArgs {
     /// The pack directory inside the repo. Omit for the repo root.
     #[serde(default)]
     pub path: Option<String>,
+    /// The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the base
+    /// manifest.
+    #[serde(default)]
+    pub variant: Option<String>,
     /// The registry id you propose registering this pack under. Prefills the review page.
     #[serde(default)]
     pub id: Option<String>,
@@ -395,6 +399,19 @@ pub struct DraftPublishArgs {
     /// else the registered pack it was seeded from.
     #[serde(default)]
     pub playbook: Option<String>,
+    #[serde(default)]
+    pub json: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlueprintUseArgs {
+    /// The blueprint's id, as crucible_blueprints lists it.
+    pub id: String,
+    /// The new draft's id: a lowercase slug no draft or playbook holds.
+    pub draft_id: String,
+    /// Omit for the blueprint's.
+    #[serde(default)]
+    pub description: Option<String>,
     #[serde(default)]
     pub json: bool,
 }
@@ -612,9 +629,12 @@ impl CrucibleMcp {
         flatten(
             ops::playbook_import(
                 &self.client,
-                &a.repo,
-                a.git_ref.as_deref(),
-                a.path.as_deref(),
+                &crate::client::PackImportSource {
+                    repo: &a.repo,
+                    git_ref: a.git_ref.as_deref(),
+                    path: a.path.as_deref(),
+                    variant: a.variant.as_deref(),
+                },
                 a.id.as_deref(),
                 a.description.as_deref(),
                 a.json,
@@ -811,6 +831,35 @@ impl CrucibleMcp {
     )]
     async fn crucible_draft_publish(&self, Parameters(a): Parameters<DraftPublishArgs>) -> String {
         flatten(ops::draft_publish(&self.client, &a.draft_id, a.playbook.as_deref(), a.json).await)
+    }
+
+    #[tool(
+        description = "List the blueprints you can read: ID OWNER REV PUBLIC SECRETS DESCRIPTION. \
+        A blueprint is a registered playbook offered as a starting point; SECRETS counts what \
+        crucible_blueprint_use would carry for you and what it would leave to bind."
+    )]
+    async fn crucible_blueprints(&self, Parameters(a): Parameters<JsonOnlyArgs>) -> String {
+        flatten(ops::blueprints(&self.client, a.json).await)
+    }
+
+    #[tool(
+        description = "Start a draft from a blueprint: version 1 is its pack. Bindings of the \
+        owning team's secrets carry when you are in that team; every other declared secret comes \
+        back as a placeholder with its reason. Bind each with crucible_secret_bind at scope_kind \
+        `playbook`, scope_id = draft_id; a launch with one unbound is refused. Author it from \
+        there like any draft, starting with crucible_draft_pull."
+    )]
+    async fn crucible_blueprint_use(&self, Parameters(a): Parameters<BlueprintUseArgs>) -> String {
+        flatten(
+            ops::blueprint_use(
+                &self.client,
+                &a.id,
+                &a.draft_id,
+                a.description.as_deref(),
+                a.json,
+            )
+            .await,
+        )
     }
 
     #[tool(
@@ -1016,7 +1065,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 44, "tools: {names:?}");
+        assert_eq!(names.len(), 46, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -1051,6 +1100,8 @@ mod tests {
             "crucible_draft_launch",
             "crucible_draft_graduate",
             "crucible_draft_publish",
+            "crucible_blueprints",
+            "crucible_blueprint_use",
             "crucible_playbooks",
             "crucible_playbook_schema",
             "crucible_launch",
@@ -1159,6 +1210,22 @@ mod tests {
         let (publish_schema, publish) = tool_of("crucible_draft_publish");
         assert!(publish_schema.contains("playbook"), "{publish_schema}");
         assert!(publish.contains("playbook_draft:publish"), "{publish}");
+    }
+
+    /// A model that starts from a blueprint has to learn from the tools alone where the catalog
+    /// leads and how to fill what did not carry.
+    #[test]
+    fn the_blueprint_tools_lead_to_a_use_and_to_filling_its_placeholders() {
+        let (_, catalog) = tool_of("crucible_blueprints");
+        assert!(catalog.contains("crucible_blueprint_use"), "{catalog}");
+
+        let (schema, using) = tool_of("crucible_blueprint_use");
+        for field in ["\"id\"", "\"draft_id\"", "\"description\""] {
+            assert!(schema.contains(field), "{field} missing: {schema}");
+        }
+        assert!(using.contains("placeholder"), "{using}");
+        assert!(using.contains("crucible_secret_bind"), "{using}");
+        assert!(using.contains("crucible_draft_pull"), "{using}");
     }
 
     /// An error must arrive as readable text, not as an MCP fault the model can't see into.

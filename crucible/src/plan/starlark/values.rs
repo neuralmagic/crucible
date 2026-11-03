@@ -7,6 +7,7 @@
 //! is the clearest way to say what a fan-out runs over, and because naming the field in the
 //! source is what lets a typo be a compile error rather than an empty list at run time.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Display};
 
 use allocative::Allocative;
@@ -17,7 +18,7 @@ use starlark::values::{
 };
 
 use crate::plan::diag;
-use crucible_contract::decision::{Question, QuestionId};
+use crucible_contract::decision::{CompiledQuestion, QuestionId};
 use crucible_contract::emits::{FieldType, JsonSchema};
 
 use crate::plan::ir::{Declared, Emits, OutputField, OutputRef, Task, TaskKind, TaskName};
@@ -57,6 +58,18 @@ impl<'v> StarlarkValue<'v> for TaskValue {
                 .ok()
                 .and_then(|id| questions.get_key_value(&id));
             return Some(match asked {
+                Some((question, asked)) if asked.pick_source().is_some() => {
+                    heap.alloc(OutputRefValue {
+                        reference: OutputRef {
+                            task: self.0.name.clone(),
+                            field: OutputField(question.to_string()),
+                        },
+                        declared: Emits::Typed(BTreeMap::from([(
+                            OutputField(question.to_string()),
+                            FieldType::List,
+                        )])),
+                    })
+                }
                 Some((question, asked)) => heap.alloc(AnswerRefValue(AnswerRef {
                     task: self.0.name.clone(),
                     question: question.clone(),
@@ -143,13 +156,13 @@ impl<'v> StarlarkValue<'v> for OutputRefValue {}
 
 /// A `noul(...)`, `choice(...)`, or `score(...)` declaration, consumed by `route(questions = ...)`.
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
-pub(crate) struct QuestionValue(#[allocative(skip)] pub(crate) Question);
+pub(crate) struct QuestionValue(#[allocative(skip)] pub(crate) CompiledQuestion);
 
 starlark_simple_value!(QuestionValue);
 
 impl Display for QuestionValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "question({})", self.0.instructions)
+        write!(f, "question({})", self.0.instructions())
     }
 }
 
@@ -161,7 +174,7 @@ impl<'v> StarlarkValue<'v> for QuestionValue {}
 pub(crate) struct AnswerRef {
     pub(crate) task: TaskName,
     pub(crate) question: QuestionId,
-    pub(crate) asked: Question,
+    pub(crate) asked: CompiledQuestion,
 }
 
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
@@ -330,6 +343,21 @@ impl Display for SchemaValue {
 
 #[starlark_value(type = "schema")]
 impl<'v> StarlarkValue<'v> for SchemaValue {}
+
+/// `optional(task)`: an entry of `depends_on` whose settling not taken satisfies an `all` join.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct OptionalValue(#[allocative(skip)] pub(crate) TaskName);
+
+starlark_simple_value!(OptionalValue);
+
+impl Display for OptionalValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "optional({})", self.0)
+    }
+}
+
+#[starlark_value(type = "optional")]
+impl<'v> StarlarkValue<'v> for OptionalValue {}
 
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct WorkflowValue(#[allocative(skip)] pub(crate) WorkflowCfg);

@@ -31,8 +31,14 @@ $OK_JSON"
 new_draft "$DRAFT-ltamper" "$WORK/localtamper"
 crux draft-publish "$DRAFT-ltamper" --playbook "$DRAFT-ltpub" --json >"$WORK/publish-O.json"
 LOCAL_TAMPER=$(playbook_tree "$DRAFT-ltpub")
-tamper_file "$LOCAL_TAMPER" check.sh
+hold_dispatch O-tamper
 launch O-tamper launch "$DRAFT-ltpub"
+held O-tamper "$KEY"
+tamper_file "$LOCAL_TAMPER" check.sh
+expect_launch_refused O-tamper "$LOCAL_TAMPER no longer matches its stored files" launch "$DRAFT-ltpub"
+[ "$(sql -c "SELECT count(*) FROM playbook_launches WHERE playbook = '$DRAFT-ltpub'")" = 1 ] ||
+    fail "[O-tamper] a refused launch left a launch row"
+release_dispatch O-tamper
 settle O-tamper "$KEY"
 watch_stop
 expect_parked O-tamper "$LOCAL_TAMPER no longer matches its stored files"
@@ -43,7 +49,7 @@ LOCAL_PACK=$(ls -d "$WORK/scratch/local-runs/$(slug "$LOCAL_KEY")"-*/pack)
 [ "$(cat "$LOCAL_PACK/STEER.md")" = "frozen
 $STEER_STAMP
 kind-steer-marker" ] || fail "[O] the local run's STEER.md is: $(cat "$LOCAL_PACK/STEER.md")"
-pass "[O] the local executor ran the stored tree with its steering and parked the tampered one"
+pass "[O] the local executor ran the stored tree with its steering, refused the tampered one and parked its queued launch"
 
 # ---- scenario J ----------------------------------------------------------------------------
 # rerun_pack <dir> <check command>: produce -> edit -> check -> consume, each appending its name to

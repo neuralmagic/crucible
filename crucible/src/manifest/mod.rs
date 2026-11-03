@@ -6,17 +6,22 @@ mod backend;
 mod broker;
 mod capability;
 mod deploy;
+mod git_ref;
 mod judge;
+pub mod launch;
 pub mod mcp;
 mod measure;
 mod openshell;
 pub mod outputs;
+mod overrides;
 mod preflight;
 mod relay;
 mod resources;
 mod search;
 mod secret;
 mod selftest;
+mod tool_plugins;
+pub mod variant;
 mod wiring;
 mod world;
 
@@ -25,20 +30,24 @@ pub use backend::{AgentBackend, UnknownBackend};
 pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broker_url};
 pub use capability::{CapabilitiesCfg, CredentialContext};
 pub use deploy::DeployCfg;
+pub use git_ref::{GitRef, GitRefError, RepoOverridesCfg};
 pub use judge::JudgeCfg;
 pub use mcp::McpCfg;
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
+pub use overrides::AgentOverridesCfg;
 pub use preflight::{MODE_PLACEHOLDER, PreflightCfg};
 pub use relay::RelayFile;
 pub use resources::{Quantity, QuantityError, SandboxResources};
 pub use search::SearchCfg;
 pub use secret::{SecretDecl, SecretError, SecretKind};
 pub use selftest::SelftestCfg;
+pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
+use crate::manifest::variant::{VariantName, Variants};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -69,6 +78,15 @@ pub enum ManifestError {
     RepoNeedsOneSource,
     #[error("[repo] needs url or path; only a playbook may omit it")]
     RepoRequired,
+    #[error("[repo.overrides] needs a [repo] url or path to clone")]
+    RepoOverridesWithoutSource,
+    #[error("[repo.overrides] does nothing beside [workspace].setup_cmd, which replaces the clone")]
+    RepoOverridesWithSetup,
+    #[error(
+        "repo.ref cannot be launched while the manifest lives inside [workspace].dir {workspace:?}: \
+         the checked-out ref would supply its own manifest"
+    )]
+    RefWithManifestInWorkspace { workspace: String },
     #[error(
         "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
     )]
@@ -116,6 +134,10 @@ pub enum ManifestError {
     BadCarryForward { entry: String },
     #[error("[workspace].carry_forward is not supported in a composite manifest")]
     CompositeCarryForward,
+    #[error(
+        "[agent.overrides] is not supported in a composite manifest: a composite takes no launch values"
+    )]
+    CompositeOverrides,
     #[error(
         "[agent.codex].api_key `{name}` must be uppercase letters, digits, and underscore: it names one of the deployment's OpenAI keys, not an arbitrary host credential"
     )]
@@ -318,6 +340,13 @@ pub struct Manifest {
     /// MCP servers by `[mcp.<key>]`, started on the loop pod.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpCfg>,
+    /// The `[variant.<name>]` this manifest was read as; `None` for the base.
+    #[serde(skip)]
+    pub variant: Option<VariantName>,
+    /// What the launch set, already applied to `repo` and the workflow's tasks. Never read from
+    /// TOML.
+    #[serde(skip)]
+    pub launch: launch::LaunchSettings,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -342,7 +371,10 @@ pub struct Repo {
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default, rename = "ref")]
-    pub git_ref: Option<String>,
+    pub git_ref: Option<GitRef>,
+    /// The refs a launch may check out instead of `ref`.
+    #[serde(default)]
+    pub overrides: RepoOverridesCfg,
 }
 
 impl Repo {
@@ -351,12 +383,22 @@ impl Repo {
         self.url.as_deref().or(self.path.as_deref())
     }
 
-    fn validate(&self, playbook: bool) -> Result<(), ManifestError> {
+    fn validate(&self, playbook: bool, workspace: &Workspace) -> Result<(), ManifestError> {
         match (&self.url, &self.path) {
-            (Some(_), Some(_)) => Err(ManifestError::RepoNeedsOneSource),
-            (None, None) if !playbook => Err(ManifestError::RepoRequired),
-            _ => Ok(()),
+            (Some(_), Some(_)) => return Err(ManifestError::RepoNeedsOneSource),
+            (None, None) if !playbook => return Err(ManifestError::RepoRequired),
+            _ => {}
         }
+        if self.overrides.is_empty() {
+            return Ok(());
+        }
+        if self.source().is_none() {
+            return Err(ManifestError::RepoOverridesWithoutSource);
+        }
+        if workspace.setup_cmd.is_some() {
+            return Err(ManifestError::RepoOverridesWithSetup);
+        }
+        Ok(())
     }
 }
 
@@ -598,7 +640,17 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
 /// Research's hermes-agent) and `codex` (OpenAI's Codex CLI) are selected per-domain for harness
 /// ablations; `opencode` and `pi` are the harnesses that speak OpenAI Chat Completions to an
 /// endpoint that offers nothing else, which the newer claude and codex CLIs cannot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Deserialize,
+    serde::Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
     #[default]
@@ -638,7 +690,9 @@ impl Harness {
 /// Code picks its own default. Per-domain because the right tier is task-dependent (mechanical
 /// remove-deprecated fixes need ~none; algorithmic issues want real reasoning), and it's a harness
 /// hyperparameter worth ablating: does more thinking find better fixes, or just better reward hacks?
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningEffort {
     Low,
@@ -756,6 +810,13 @@ pub struct AgentCfg {
     /// that sandbox instead of the defaults above.
     #[serde(default)]
     pub sandbox: BTreeMap<String, SandboxProfile>,
+    /// The `[[agent.tool_plugins]]` chain every turn's tool events run through, in order. Absent
+    /// runs [`default_chain`]; an empty list runs none.
+    #[serde(default)]
+    pub tool_plugins: Option<Vec<ToolPluginSpec>>,
+    /// The agent settings a launch may set on the workflow's agent tasks.
+    #[serde(default)]
+    pub overrides: AgentOverridesCfg,
 }
 
 /// The env vars the engine writes for the model's own credential on every turn.
@@ -927,11 +988,13 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
     validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
+    overrides::validate(&c.agent.overrides)?;
     validate_sandboxes(c.agent, c.secrets)?;
     mcp::validate(c.mcp, c.agent)?;
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
+        launch::check_agent_knobs(&w.tasks)?;
         validate_task_sandboxes(c.agent, w)?;
     }
     match c.judge {
@@ -1033,10 +1096,41 @@ fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
 
 impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_variant(path, None)
+    }
+
+    /// Load `variant` of the manifest at `path`, or its base for `None`. Every variant the
+    /// manifest declares is validated, whichever is selected.
+    pub fn load_variant(path: &Path, variant: Option<&VariantName>) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading manifest {}", path.display()))?;
-        let m: Self = toml::from_str(&text)
-            .with_context(|| format!("parsing manifest {}", path.display()))?;
+        Self::parse_variant(&text, variant, &format!("manifest {}", path.display()))
+    }
+
+    /// Parse `text`, naming it `source` in errors.
+    fn parse_variant(text: &str, variant: Option<&VariantName>, source: &str) -> Result<Self> {
+        let parsing = || format!("parsing {source}");
+        let document: toml::Table = toml::from_str(text).with_context(parsing)?;
+        if variant.is_none() && !document.contains_key(variant::VARIANT_TABLE) {
+            let m: Self = toml::from_str(text).with_context(parsing)?;
+            m.validate()?;
+            return Ok(m);
+        }
+        let variants = Variants::split(document).with_context(parsing)?;
+        for name in variants.names() {
+            Self::from_document(variants.resolve(Some(name))?, &parsing)
+                .with_context(|| format!("[variant.{name}] of {source}"))?;
+        }
+        let mut m =
+            Self::from_document(variants.resolve(variant).with_context(parsing)?, &parsing)?;
+        m.variant = variant.cloned();
+        Ok(m)
+    }
+
+    fn from_document(document: toml::Table, parsing: &dyn Fn() -> String) -> Result<Self> {
+        let m: Self = toml::Value::Table(document)
+            .try_into()
+            .with_context(parsing)?;
         m.validate()?;
         Ok(m)
     }
@@ -1053,27 +1147,35 @@ impl Manifest {
     /// *whether* to prefer a frozen source; when one exists, its content, not the initial
     /// parse, is what's returned.
     pub fn load_frozen(manifest_path: &Path) -> Result<Self> {
-        let working_tree = Self::load(manifest_path)?;
+        Self::load_frozen_variant(manifest_path, None)
+    }
+
+    /// [`Self::load_frozen`] for `variant`, which also decides where the workspace is.
+    pub fn load_frozen_variant(
+        manifest_path: &Path,
+        variant: Option<&VariantName>,
+    ) -> Result<Self> {
+        let working_tree = Self::load_variant(manifest_path, variant)?;
         let manifest_dir = manifest_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let workspace = manifest_dir.join(&working_tree.workspace.dir);
         load_frozen_generic(manifest_path, working_tree, &workspace, |text| {
-            let m: Self = toml::from_str(text).with_context(|| {
-                format!(
-                    "parsing manifest {} at its workspace base commit",
+            Self::parse_variant(
+                text,
+                variant,
+                &format!(
+                    "manifest {} at its workspace base commit",
                     manifest_path.display()
-                )
-            })?;
-            m.validate()?;
-            Ok(m)
+                ),
+            )
         })
     }
 
     /// Cross-field checks the type system + `deny_unknown_fields` can't express. Run at load.
     fn validate(&self) -> Result<()> {
-        self.repo.validate(self.is_playbook())?;
+        self.repo.validate(self.is_playbook(), &self.workspace)?;
         validate_common(CommonCfg {
             workspace: &self.workspace,
             agent: &self.agent,
@@ -1100,24 +1202,45 @@ impl Manifest {
         self.resolve_workflow_with(manifest_dir, &std::collections::BTreeMap::new())
     }
 
-    /// Resolve with the values a launcher supplied. They are bound during compilation, so a
-    /// missing required parameter refuses the run before any task is dispatched.
+    /// Resolve with the values a launcher supplied. Declared parameters are bound during
+    /// compilation, agent settings are written onto the compiled tasks, and `repo.ref` replaces
+    /// `[repo].ref`, so a missing required parameter or a refused setting stops the run before
+    /// anything is cloned or dispatched.
     pub fn resolve_workflow_with(
         &mut self,
         manifest_dir: &Path,
         params: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
-        let Some(workflow) = &self.workflow else {
+        let (declared_params, addressed) = launch::split(params);
+        let launch = launch::LaunchSettings::parse(&addressed)?;
+        let Some(workflow) = &mut self.workflow else {
             return refuse_unconsumable(params);
         };
+        if let Some(r) = launch.repo_ref() {
+            launch.check_ref(&self.repo.overrides)?;
+            let workspace = absolute(&manifest_dir.join(&self.workspace.dir));
+            if absolute(manifest_dir).starts_with(&workspace) {
+                return Err(ManifestError::RefWithManifestInWorkspace {
+                    workspace: self.workspace.dir.clone(),
+                }
+                .into());
+            }
+            self.repo.git_ref = Some(r.clone());
+        }
         if !workflow.is_unresolved() {
-            return refuse_unconsumable(params);
+            refuse_unconsumable(&declared_params)?;
+            if !launch.is_empty() {
+                launch.apply(&mut workflow.tasks, &self.agent.overrides)?;
+                self.launch = launch;
+            }
+            return Ok(());
         }
         let declared = workflow.workflow_type;
         let file = workflow.file.clone().unwrap_or_default();
         let source = manifest_dir.join(&file);
-        let compiled = crate::plan::starlark::compile_file_with(&source, manifest_dir, params)
-            .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
+        let compiled =
+            crate::plan::starlark::compile_file_with(&source, manifest_dir, &declared_params)
+                .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
         if compiled.workflow.workflow_type != declared {
             return Err(ManifestError::WorkflowTypeMismatch {
                 declared,
@@ -1127,7 +1250,11 @@ impl Manifest {
         }
         let mut resolved = compiled.workflow;
         resolved.resolved_from = Some(file);
+        launch.apply(&mut resolved.tasks, &self.agent.overrides)?;
         self.workflow = Some(resolved);
+        if !launch.is_empty() {
+            self.launch = launch;
+        }
         self.validate()?;
         Ok(())
     }
@@ -1340,6 +1467,9 @@ impl CompositeManifest {
         }
         if !self.workspace.artifact.is_empty() {
             return Err(ManifestError::CompositeArtifact.into());
+        }
+        if !self.agent.overrides.is_empty() {
+            return Err(ManifestError::CompositeOverrides.into());
         }
         let mut seen = std::collections::BTreeSet::new();
         for c in &self.components {
@@ -2399,6 +2529,319 @@ mod tests {
     }
 
     #[test]
+    fn composite_rejects_agent_overrides() {
+        let text = r#"
+            [composite]
+            name = "x"
+            [[component]]
+            domain = "vllm"
+            [[component]]
+            domain = "kernels"
+            [agent]
+            goal = "g"
+            [agent.overrides]
+            allow = ["model"]
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+        "#;
+        let m: CompositeManifest = toml::from_str(text).unwrap();
+        let err = match m.validate() {
+            Err(e) => e.to_string(),
+            Ok(()) => panic!("composite [agent.overrides] must be rejected, not silently ignored"),
+        };
+        assert!(err.contains("[agent.overrides]"), "{err}");
+    }
+
+    fn launch(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn agent_knobs(m: &Manifest, task: &str) -> (Option<String>, Option<String>) {
+        let workflow = m.workflow.as_ref().expect("a workflow");
+        let task = workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == task)
+            .expect("task exists");
+        match &task.task {
+            crate::plan::ir::TaskKind::Agent { model, effort, .. } => {
+                (model.clone(), effort.clone())
+            }
+            other => panic!("not an agent task: {other:?}"),
+        }
+    }
+
+    const LAUNCHABLE: &str = "params = {\"topic\": {\"type\": \"string\", \"default\": \"x\"}}\n\
+         plan = agent(name = \"plan\", prompt = \"Plan \" + param(\"topic\"))\n\
+         review = agent(name = \"review\", prompt = \"Review\", model = \"authored\", depends_on = [plan])\n\
+         workflow(type = \"playbook\", tasks = [plan, review])\n";
+
+    const GATED_SOURCE: &str = "[agent.overrides]\nallow = [\"model\", \"effort\"]\n\
+         [workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
+
+    /// Declared parameters bind during compilation; addressed agent settings are checked against
+    /// the compiled graph and the pack's gate, written onto the tasks, and recorded beside the
+    /// bound parameters.
+    #[test]
+    fn launch_settings_land_on_the_compiled_tasks_beside_bound_params() {
+        let dir = tempdir("launch-settings");
+        std::fs::write(dir.join("graph.star"), LAUNCHABLE).expect("write source");
+        let mut m: Manifest = toml::from_str(&task_manifest(GATED_SOURCE)).expect("parses");
+        m.resolve_workflow_with(
+            &dir,
+            &launch(&[
+                ("topic", "sinks"),
+                ("*.effort", "high"),
+                ("review.model", "launched"),
+            ]),
+        )
+        .expect("resolves");
+        assert_eq!(agent_knobs(&m, "plan"), (None, Some("high".into())));
+        assert_eq!(
+            agent_knobs(&m, "review"),
+            (Some("launched".into()), Some("high".into()))
+        );
+        let workflow = serde_json::to_value(m.workflow.as_ref().expect("workflow")).expect("json");
+        assert_eq!(workflow["params"]["topic"], "sinks");
+        let launched = serde_json::to_value(&m.launch).expect("json");
+        assert_eq!(
+            launched,
+            serde_json::json!({"agents": {"*": {"effort": "high"}, "review": {"model": "launched"}}})
+        );
+
+        m.resolve_workflow(&dir)
+            .expect("resolving again is a no-op");
+        assert_eq!(
+            serde_json::to_value(&m.launch).expect("json"),
+            launched,
+            "resolving again keeps what the launch set"
+        );
+        assert_eq!(agent_knobs(&m, "review").0, Some("launched".into()));
+
+        let mut plain: Manifest = toml::from_str(&task_manifest(GATED_SOURCE)).expect("parses");
+        plain.resolve_workflow(&dir).expect("resolves");
+        assert_eq!(
+            agent_knobs(&plain, "review"),
+            (Some("authored".into()), None)
+        );
+        assert!(
+            plain.launch.is_empty(),
+            "a launch that set nothing records nothing"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn launch_settings_are_refused_before_any_task_runs() {
+        let dir = tempdir("launch-refusals");
+        std::fs::write(dir.join("graph.star"), LAUNCHABLE).expect("write source");
+        let refused = |manifest: &str, pairs: &[(&str, &str)]| {
+            toml::from_str::<Manifest>(&task_manifest(manifest))
+                .expect("parses")
+                .resolve_workflow_with(&dir, &launch(pairs))
+                .map_err(|e| format!("{e:#}"))
+                .expect_err("refused")
+        };
+        let ungated = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
+        let err = refused(ungated, &[("*.model", "m")]);
+        assert!(err.contains("[agent.overrides].allow"), "{err}");
+        let err = refused(GATED_SOURCE, &[("revew.model", "m")]);
+        assert!(err.contains("did you mean \"review\""), "{err}");
+        let err = refused(GATED_SOURCE, &[("review.harness", "pi")]);
+        assert!(err.contains("does not list"), "{err}");
+        let err = refused(GATED_SOURCE, &[("review.effort", "extreme")]);
+        assert!(err.contains("low, medium, high, xhigh or max"), "{err}");
+        let err = refused(GATED_SOURCE, &[("topik", "x")]);
+        assert!(
+            err.contains("did you mean \"topic\""),
+            "an undeclared parameter is still refused: {err}"
+        );
+
+        std::fs::write(
+            dir.join("graph.star"),
+            "params = {\"review.model\": {\"type\": \"string\", \"default\": \"x\"}}\n\
+             a = command(name = \"a\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+        )
+        .expect("write source");
+        let err = toml::from_str::<Manifest>(&task_manifest(GATED_SOURCE))
+            .expect("parses")
+            .resolve_workflow(&dir)
+            .expect_err("a dotted parameter name");
+        assert!(format!("{err:#}").contains("contains a dot"), "{err:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repo_overrides_need_a_clone_to_apply_to() {
+        let with = |repo: &str, workspace: &str| {
+            toml::from_str::<Manifest>(&format!(
+                "{repo}\n[repo.overrides]\nrefs = [\"feature/*\"]\n{workspace}\n\
+                 [agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n\
+                 [workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\n"
+            ))
+            .expect("parses")
+            .validate()
+        };
+        with("[repo]\nurl = \"https://example.com/r.git\"", "").expect("a cloned repo");
+        let err = with("[repo]", "").expect_err("nothing to clone");
+        assert!(err.to_string().contains("url or path to clone"), "{err:#}");
+        let err = with(
+            "[repo]\nurl = \"https://example.com/r.git\"",
+            "[workspace]\nsetup_cmd = \"make\"",
+        )
+        .expect_err("setup_cmd replaces the clone");
+        assert!(err.to_string().contains("setup_cmd"), "{err:#}");
+        assert!(
+            toml::from_str::<Manifest>(
+                "[repo]\nurl = \"u\"\nref = \"HEAD~1\"\n[agent]\ngoal = \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"lower\"\n"
+            )
+            .is_err(),
+            "a written ref is held to the same grammar"
+        );
+    }
+
+    #[test]
+    fn a_launched_ref_replaces_repo_ref_within_the_patterns() {
+        let dir = tempdir("launch-ref");
+        std::fs::write(dir.join("graph.star"), LAUNCHABLE).expect("write source");
+        let manifest = |workspace: &str| {
+            format!(
+                "[repo]\nurl = \"https://example.com/r.git\"\nref = \"main\"\n\
+                 [repo.overrides]\nrefs = [\"feature/*\"]\n[workspace]\ndir = \"{workspace}\"\n\
+                 [agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n\
+                 [workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\n"
+            )
+        };
+        let mut m: Manifest = toml::from_str(&manifest("workspace")).expect("parses");
+        m.resolve_workflow_with(&dir, &launch(&[("repo.ref", "refs/heads/feature/x")]))
+            .expect("resolves");
+        assert_eq!(
+            m.repo.git_ref.as_ref().map(GitRef::as_str),
+            Some("refs/heads/feature/x")
+        );
+        let record = serde_json::to_value(&m.launch).expect("json");
+        assert_eq!(record["ref"], "refs/heads/feature/x");
+
+        let err = toml::from_str::<Manifest>(&manifest("workspace"))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &launch(&[("repo.ref", "main")]))
+            .expect_err("main is not a launch pattern");
+        assert!(
+            format!("{err:#}").contains("no [repo.overrides].refs pattern"),
+            "{err:#}"
+        );
+
+        for inside in [".", "..", "../.."] {
+            let err = toml::from_str::<Manifest>(&manifest(inside))
+                .expect("parses")
+                .resolve_workflow_with(&dir, &launch(&[("repo.ref", "feature/x")]))
+                .expect_err("the manifest lives in the checkout");
+            assert!(
+                format!("{err:#}").contains("supply its own manifest"),
+                "{inside}: {err:#}"
+            );
+        }
+
+        let mut unset: Manifest = toml::from_str(&manifest("workspace")).expect("parses");
+        unset.resolve_workflow(&dir).expect("resolves");
+        assert_eq!(
+            unset.repo.git_ref.as_ref().map(GitRef::as_str),
+            Some("main"),
+            "without a launch value the written ref stands"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A harness or effort no turn can read fails the manifest, whether the graph was compiled or
+    /// carried inline, before any task runs.
+    #[test]
+    fn a_harness_or_effort_no_turn_can_read_fails_validation() {
+        let dir = tempdir("agent-knobs");
+        for (source, needle) in [
+            (
+                "a = agent(name = \"a\", prompt = \"p\", effort = \"extreme\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets effort \"extreme\", which is not low, medium, high, xhigh or max",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", harness = \"gpt\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets harness \"gpt\", which is not claude, hermes, codex, opencode or pi",
+            ),
+            (
+                "s = session(name = \"s\", effort = \"hgih\")\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets effort \"hgih\"",
+            ),
+        ] {
+            std::fs::write(dir.join("graph.star"), source).expect("write source");
+            let err = toml::from_str::<Manifest>(&task_manifest(
+                "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"",
+            ))
+            .expect("parses")
+            .resolve_workflow(&dir)
+            .expect_err("refused");
+            assert!(format!("{err:#}").contains(needle), "{source}: {err:#}");
+        }
+        std::fs::write(
+            dir.join("graph.star"),
+            "a = agent(name = \"a\", prompt = \"p\", harness = \"OpenCode\", effort = \"XHigh\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+        )
+        .expect("write source");
+        toml::from_str::<Manifest>(&task_manifest(
+            "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"",
+        ))
+        .expect("parses")
+        .resolve_workflow(&dir)
+        .expect("read case-insensitively, as a turn reads them");
+
+        let inline = "[workflow]\ntype = \"playbook\"\n\
+             [[workflow.task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"\neffort = \"extreme\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .validate()
+            .expect_err("an inline graph is checked at load");
+        assert!(
+            format!("{err:#}").contains("sets effort \"extreme\""),
+            "{err:#}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An inline graph binds no declared parameter, but its agent tasks take launch settings like
+    /// a compiled one's. With no graph at all, there is nothing to address.
+    #[test]
+    fn an_inline_graph_takes_launch_settings_and_no_graph_takes_none() {
+        let dir = tempdir("launch-inline");
+        let inline = "[agent.overrides]\nallow = [\"model\"]\n\
+             [workflow]\ntype = \"playbook\"\n\
+             [[workflow.task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"";
+        let mut m: Manifest = toml::from_str(&task_manifest(inline)).expect("parses");
+        m.resolve_workflow_with(&dir, &launch(&[("a.model", "launched")]))
+            .expect("an inline agent task takes a setting");
+        assert_eq!(agent_knobs(&m, "a"), (Some("launched".into()), None));
+
+        let err = toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &launch(&[("a.model", "m"), ("depth", "3")]))
+            .expect_err("inline tasks bind no declared parameter");
+        assert!(err.to_string().contains("depth"), "{err:#}");
+
+        let err = toml::from_str::<Manifest>(&task_manifest(""))
+            .expect("parses")
+            .resolve_workflow_with(&dir, &launch(&[("a.model", "m")]))
+            .expect_err("no graph to address");
+        assert!(err.to_string().contains("a.model"), "{err:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn broker_enabled_requires_bin() {
         // Each domain ships its own broker binary (it injects the domain resolver into the generic
         // crucible-broker engine), so there's no default bin: enabling the broker without naming one
@@ -3125,6 +3568,103 @@ dst = "traces/median_block.txt"
             ),
             "{err:#}"
         );
+    }
+
+    const VARIANTS: &str = r#"
+        [repo]
+        path = "."
+        [judge]
+        measure_cmd = "./m.nu"
+        direction = "higher"
+        objective = "value"
+        [agent]
+        backend = "openshell"
+        model = "base-model"
+        goal = "g"
+        [variant.offline.agent]
+        backend = "command"
+        agent_cmd = "./stand-in.sh"
+        goal = "g"
+    "#;
+
+    fn offline() -> VariantName {
+        VariantName::parse("offline").unwrap()
+    }
+
+    #[test]
+    fn a_variant_replaces_its_tables_and_the_base_reads_as_written() {
+        let base = Manifest::parse_variant(VARIANTS, None, "manifest test").unwrap();
+        assert_eq!(base.agent.backend, AgentBackend::Openshell);
+        assert_eq!(base.agent.model, "base-model");
+        assert_eq!(base.variant, None);
+
+        let selected =
+            Manifest::parse_variant(VARIANTS, Some(&offline()), "manifest test").unwrap();
+        assert_eq!(selected.agent.backend, AgentBackend::Command);
+        assert_eq!(selected.agent.agent_cmd.as_deref(), Some("./stand-in.sh"));
+        assert_eq!(
+            selected.agent.model,
+            default_model(),
+            "[agent] is replaced whole, so the base model does not carry over"
+        );
+        assert_eq!(selected.variant, Some(offline()));
+        assert_eq!(
+            selected.judge.map(|j| j.measure_cmd),
+            base.judge.map(|j| j.measure_cmd)
+        );
+    }
+
+    #[test]
+    fn every_declared_variant_is_validated_whichever_is_selected() {
+        let broken = format!("{VARIANTS}\n[variant.broken.agent]\nbakend = \"command\"\n");
+        for selected in [None, Some(offline())] {
+            let error = Manifest::parse_variant(&broken, selected.as_ref(), "manifest test")
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default();
+            assert!(
+                error.contains("[variant.broken] of manifest test"),
+                "{error}"
+            );
+            assert!(error.contains("bakend"), "{error}");
+        }
+        let unknown = Manifest::parse_variant(
+            VARIANTS,
+            Some(&VariantName::parse("ofline").unwrap()),
+            "manifest test",
+        )
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+        assert!(unknown.contains("did you mean \"offline\"?"), "{unknown}");
+    }
+
+    #[test]
+    fn a_manifest_without_variants_keeps_its_parse_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible.toml");
+        std::fs::write(
+            &path,
+            "[repo]\npath = \".\"\n[agnet]\nbackend = \"command\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", Manifest::load(&path).err().unwrap());
+        assert!(
+            error.contains(&format!("parsing manifest {}", path.display())),
+            "{error}"
+        );
+        assert!(error.contains("line 3"), "{error}");
+    }
+
+    #[test]
+    fn a_frozen_load_reads_the_selected_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible.toml");
+        std::fs::write(&path, VARIANTS).unwrap();
+        let m = Manifest::load_frozen_variant(&path, Some(&offline())).unwrap();
+        assert_eq!(m.agent.backend, AgentBackend::Command);
+        assert_eq!(m.variant, Some(offline()));
+        assert_eq!(Manifest::load_frozen(&path).unwrap().variant, None);
     }
 }
 

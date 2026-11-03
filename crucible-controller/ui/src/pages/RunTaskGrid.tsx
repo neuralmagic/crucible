@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { $api } from '../api/client';
-import { cn, Empty, ExternalLinks, Section, SectionBody, SectionHeader, Tooltip } from '../ui';
+import { cn, Empty, ExternalLinks, FoldSection, SectionBody, Tooltip } from '../ui';
 import {
+  attemptsSummary,
   barShare,
   blockedLine,
   formatSecs,
@@ -10,6 +11,7 @@ import {
   type GridCell,
   type GridRow,
   type GridSegment,
+  type RunGrid,
 } from './runGrid';
 import { formatCost } from './runReport';
 import { TaskEvidence } from './TaskEvidence';
@@ -25,6 +27,14 @@ const STATUS_SWATCH: Record<string, string> = {
   blocked: 'bg-amber',
   truncated: 'bg-amber',
   skipped: 'bg-rule-hard',
+};
+
+const OUTCOME_TEXT: Record<string, string> = {
+  pass: 'text-green',
+  fail: 'text-red',
+  transport: 'text-red',
+  blocked: 'text-amber',
+  truncated: 'text-amber',
 };
 
 function swatchOf(status: string): string {
@@ -132,7 +142,7 @@ function Segment({ row, segment, picked, onPick }: SegmentProps) {
 
 interface GridBodyProps {
   runId: string;
-  graph: RunGraph;
+  grid: RunGrid;
   /// The inference provider the run's launch pinned; blank when it resolved the defaults.
   provider: string;
 }
@@ -155,8 +165,7 @@ function AgentCell({ task, col, value }: { task: string; col: string; value: str
 /// Every attempt a run made, as tasks down and iterations across. The graph shows where each task
 /// ended up; this shows how it got there — which task was retried, which one flapped between
 /// iterations, and which one the run spent its time in. Picking a cell reads that task's evidence.
-function GridBody({ runId, graph, provider }: GridBodyProps) {
-  const grid = useMemo(() => runGridView(graph.tasks, graph.results), [graph]);
+function GridBody({ runId, grid, provider }: GridBodyProps) {
   const [picked, setPicked] = useState<Picked | null>(null);
 
   if (grid.iters.length === 0) {
@@ -282,15 +291,6 @@ function GridBody({ runId, graph, provider }: GridBodyProps) {
         </div>
       </SectionBody>
 
-      <SectionBody className="flex flex-wrap items-center gap-3 border-t border-rule py-2">
-        {grid.counts.map((count) => (
-          <span key={count.status} className="flex items-center gap-1.5 font-mono text-micro tracking-label text-ink-3 uppercase">
-            <span aria-hidden className={cn('h-2.5 w-2.5', swatchOf(count.status))} />
-            {count.status} {count.count}
-          </span>
-        ))}
-      </SectionBody>
-
       {picked !== null && pickedRow !== undefined && (
         <SectionBody className="border-t border-rule-hard">
           <p className="m-0 flex flex-wrap items-baseline gap-x-3 font-mono text-data text-ink-2">
@@ -353,12 +353,29 @@ export function RunTaskGrid({ runId }: { runId: string }) {
     params: { path: { run_id: runId } },
   });
   const graph: RunGraph | undefined = query.data;
+  const grid = useMemo(
+    () => (graph === undefined ? null : runGridView(graph.tasks, graph.results)),
+    [graph],
+  );
 
-  if (graph === undefined || graph.tasks.length === 0) return null;
+  if (graph === undefined || grid === null || graph.tasks.length === 0) return null;
+  const summary = attemptsSummary(grid.counts);
   return (
-    <Section>
-      <SectionHeader title="Grid" note={`${graph.results.length} attempts`} />
-      <GridBody runId={runId} graph={graph} provider={detail.data?.run.agent_provider ?? ''} />
-    </Section>
+    <FoldSection
+      title="Grid"
+      note={
+        <>
+          {summary.attempts}
+          {summary.outcomes.map((o) => (
+            <span key={o.status} className={OUTCOME_TEXT[o.status]}>
+              {' · '}
+              {o.label}
+            </span>
+          ))}
+        </>
+      }
+    >
+      <GridBody runId={runId} grid={grid} provider={detail.data?.run.agent_provider ?? ''} />
+    </FoldSection>
   );
 }

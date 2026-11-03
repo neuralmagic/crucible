@@ -4,12 +4,27 @@
 import type { components } from '../api/schema';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
+type PlaybookRun = components['schemas']['PlaybookRunDto'];
+type IssueEvent = components['schemas']['EventDto'];
 type DispatchState = components['schemas']['DispatchState'];
 
 /// A launch key addresses itself: `playbook:{pack}:{uuidv7}`. Its detail is the launch view, never
 /// the issue journey — a playbook row neither ranks nor scopes.
 export function isLaunchKey(key: string): boolean {
   return key.startsWith('playbook:');
+}
+
+/** A launch key as a reader names it: its pack and the head of its id. */
+export function launchLabel(key: string): string {
+  const match = /^playbook:(.+):([0-9a-f-]+)$/i.exec(key);
+  const pack = match?.[1];
+  const id = match?.[2];
+  return pack === undefined || id === undefined ? key : `${pack} ${id.slice(0, 8)}`;
+}
+
+/** A launch's run, on the run page nested under the launch. */
+export function launchRunPath(key: string, runId: string): string {
+  return `${launchPath(key)}/runs/${encodeURIComponent(runId)}`;
 }
 
 export function launchPath(key: string): string {
@@ -46,6 +61,27 @@ const ORIGIN_LABEL: Record<string, string> = {
 /** How the launch is described in one word: its origin, spelled for a reader. */
 export function originLabel(origin: string): string {
   return ORIGIN_LABEL[origin] ?? origin;
+}
+
+/** The pack a launch froze: a draft's save number, else the schema digest it was admitted under. */
+export function launchVersion(launch: Pick<PlaybookRun, 'draft_version' | 'schema_digest'>): string {
+  if (launch.draft_version !== null && launch.draft_version !== undefined) {
+    return `draft v${launch.draft_version}`;
+  }
+  return launch.schema_digest.replace(/^sha256:/, '').slice(0, 12);
+}
+
+/// How long a launch ran, in seconds: from its move into running to the move that took it out of
+/// running. Null while it still runs, or when its trail holds no such pair.
+export function launchWallSecs(events: readonly Pick<IssueEvent, 'from' | 'to' | 'ts'>[]): number | null {
+  const trail = [...events].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  const start = trail.findIndex((e) => e.to === 'running' && e.from !== 'running');
+  const started = trail[start];
+  if (started === undefined) return null;
+  const ended = trail.slice(start + 1).find((e) => e.from === 'running' && e.to !== 'running');
+  if (ended === undefined) return null;
+  const secs = (Date.parse(ended.ts) - Date.parse(started.ts)) / 1000;
+  return Number.isFinite(secs) && secs >= 0 ? secs : null;
 }
 
 /// Where a launch came from, as links back. A draft launch points at the studio that fired it, any
@@ -111,6 +147,20 @@ export interface RerunRow {
 
 /// A rerun's tasks as the panel lists them: what is reused in the order the parent settled it,
 /// then what runs again, then any reused task that changed since the parent.
+/** A rerun preview in one line: how many tasks, and how many of each are reused, rerun or changed. */
+export function rerunSummary(rows: readonly RerunRow[]): string {
+  const tasks = `${rows.length} ${rows.length === 1 ? 'task' : 'tasks'}`;
+  const count = (state: RerunState) => rows.filter((row) => row.state === state).length;
+  const reused = count('reused');
+  if (rows.length > 0 && reused === rows.length) return `${tasks} · all reused`;
+  const parts: [number, string][] = [
+    [reused, 'reused'],
+    [count('reruns'), 'rerun'],
+    [count('changed'), 'changed'],
+  ];
+  return [tasks, ...parts.filter(([n]) => n > 0).map(([n, word]) => `${n} ${word}`)].join(' · ');
+}
+
 export function rerunRows(preview: RerunPreview): RerunRow[] {
   return [
     ...preview.reused.map((r) => ({ task: r.task, state: 'reused' as const, costUsd: r.cost_usd })),

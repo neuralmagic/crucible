@@ -339,6 +339,9 @@ crucible plan params --file workflow.star           # the JSON Schema, without r
 crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max-time 5m
 ```
 
+A string parameter that sets `"multiline": True` takes its value in a text area on the control
+plane's launch, schedule and ask forms. The value is still one string.
+
 Parameters go into prompts and skill arguments. They do not go into a command line. If you
 put a parameter into `run`, the compiler rejects the pack:
 
@@ -419,6 +422,12 @@ draft is ready, `crux draft-graduate` opens a PR that exports it to a repository
 `crux playbook-import owner/repo --path haiku` proposes to register it from that repository.
 After registration, `crux launch` starts the playbook with parameters, and
 `crux playbook-runs` lists its runs.
+
+A registration runs one variant of the pack's manifest
+([variants](crucible-contract.md#1-the-manifest-crucibletoml)). Add `--variant offline` to
+`playbook-import`, or pick the variant in the import wizard, which lists the base manifest and
+every variant of each pack. Every launch of the registration then runs that variant. To run
+another variant of the same pack, register it again under another id.
 
 ### Let your own agent write it
 

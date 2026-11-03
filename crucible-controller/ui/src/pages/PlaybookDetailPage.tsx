@@ -27,6 +27,11 @@ export function PlaybookDetailPage() {
     params: { path: { id } },
   });
   const create = $api.useMutation('post', '/api/playbook-drafts');
+  const mark = $api.useMutation('put', '/api/playbooks/{id}/blueprint');
+  const unmark = $api.useMutation('delete', '/api/playbooks/{id}/blueprint');
+  const publish = $api.useMutation('put', '/api/playbooks/{id}/blueprint/public');
+  const unpublish = $api.useMutation('delete', '/api/playbooks/{id}/blueprint/public');
+  const [blueprintError, setBlueprintError] = useState<string | null>(null);
   const [active, setActive] = useState('');
   const [draftId, setDraftId] = useState('');
   const [description, setDescription] = useState('');
@@ -46,6 +51,17 @@ export function PlaybookDetailPage() {
   if (detail.isError) return <Empty title="Playbook unavailable" description={formatError(detail.error)} />;
 
   const playbook = detail.data;
+  const path = { params: { path: { id: playbook.id } } };
+  const toggling = mark.isPending || unmark.isPending || publish.isPending || unpublish.isPending;
+  const toggle = async (run: () => Promise<unknown>) => {
+    setBlueprintError(null);
+    try {
+      await run();
+      await detail.refetch();
+    } catch (err: unknown) {
+      setBlueprintError(formatError(err));
+    }
+  };
   const clone = async () => {
     setError(null);
     try {
@@ -73,6 +89,34 @@ export function PlaybookDetailPage() {
         description={playbook.description}
         actions={
           <div className="flex gap-2">
+            {playbook.actions.includes('update') ? (
+              <Button
+                variant="quiet"
+                className="uppercase"
+                disabled={toggling}
+                onClick={() => {
+                  void toggle(() =>
+                    playbook.blueprint ? unmark.mutateAsync(path) : mark.mutateAsync(path),
+                  );
+                }}
+              >
+                {playbook.blueprint ? 'Unmark blueprint' : 'Make blueprint'}
+              </Button>
+            ) : null}
+            {playbook.blueprint && playbook.actions.includes('share') ? (
+              <Button
+                variant="quiet"
+                className="uppercase"
+                disabled={toggling}
+                onClick={() => {
+                  void toggle(() =>
+                    playbook.public ? unpublish.mutateAsync(path) : publish.mutateAsync(path),
+                  );
+                }}
+              >
+                {playbook.public ? 'Make private' : 'Make public'}
+              </Button>
+            ) : null}
             <Button
               variant="quiet"
               className="uppercase"
@@ -91,6 +135,8 @@ export function PlaybookDetailPage() {
         }
       />
 
+      {blueprintError === null ? null : <FormError>{blueprintError}</FormError>}
+
       <Section>
         <SectionHeader title="Source" note="read only" />
         <SectionBody>
@@ -99,6 +145,12 @@ export function PlaybookDetailPage() {
             <span>@ {playbook.rev}</span>
             {playbook.tree_digest && playbook.tree_digest !== playbook.rev ? (
               <span>{playbook.tree_digest}</span>
+            ) : null}
+            {playbook.variant ? <span data-testid="playbook-variant">variant {playbook.variant}</span> : null}
+            {playbook.blueprint ? (
+              <span data-testid="playbook-blueprint">
+                {playbook.public ? 'public blueprint' : 'blueprint'}
+              </span>
             ) : null}
           </div>
           <div className="flex min-h-[32rem] flex-col gap-3 min-[900px]:flex-row">

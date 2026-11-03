@@ -59,6 +59,18 @@ If the route does not select the answer of a branch, the branch settles `not_tak
 not dispatch, does not spend, and does not change the verdict. A task that depends on it with
 the default `join = "all"` is also not taken. For this reason, `filed` uses `join = "passed"`.
 
+To run a task whether or not one branch was taken, keep `join = "all"` and mark that
+dependency `optional(...)`:
+
+```python
+summary = command(name = "summary", run = "./summarize.sh",
+                  depends_on = [read, optional(oncall)])
+```
+
+`summary` runs when `oncall` passed or was not taken, and its inputs have no `oncall` entry
+in the second case. If `oncall` failed, `summary` is blocked as before. Every other dependency
+keeps the `all` rule.
+
 **Source of the answer.** Set exactly one of these two:
 
 | | Answered by | Cost |
@@ -389,6 +401,41 @@ deep = agent(name = "deep", prompt = prompt_file("analyze.md"), effort = "high",
   output object keyed by item (`{"reachable": {"T-1": "no"}}`). Put that route first, and give
   the model route a `when` on it. The model then gets questions only about the items that the
   facts do not decide.
+
+### Choose among an item's own options
+
+A choice may take its options from a dependency instead of the pack. `options = prepare.packages`
+reads the field at each decision: the list itself on an unmapped route, or, on a route with
+`over`, the item's entry in an object keyed by item.
+
+```python
+match = route(
+    name = "match",
+    depends_on = [prepare],
+    over = prepare.members,
+    max_fanout = 120,
+    min_confidence = 0.7,
+    questions = {"package": choice(ask = "Which shipped package does the flaw affect?",
+                                   options = prepare.packages)},
+)
+analyze = agent(name = "analyze", prompt = prompt_file("analyze.md"),
+                depends_on = [prepare, match], over = prepare.members, max_fanout = 120,
+                when = match.package, otherwise = True)
+review = agent(name = "review", prompt = prompt_file("review.md"),
+               depends_on = [prepare, match], over = prepare.members, max_fanout = 120,
+               when = match.package, answers = "uncertain")
+```
+
+`prepare` emits `{"packages": {"T-1": [{"value": "p3", "description": "golang.org/x/net 0.17.0"},
+{"value": "none", "description": "No shipped package matches"}]}}`.
+
+- **Labels are identifiers.** Put raw text such as a package name in `description` and a short
+  key in `value`. An option every item should have, like `none`, is the producer's to emit.
+- **Bounded.** At most 64 options; a repeated label keeps its first entry. An item whose list is
+  malformed or holds fewer than two options fails without a request, and the rest decide.
+- **Branch on uncertain, read the pick.** The labels are unknown when the pack compiles, so a
+  `when` lists only `"uncertain"`, and `otherwise = True` covers every option. The task it gates
+  reads which option was chosen, and the options it was chosen among, from the route's output.
 
 ## Keep a conversation
 

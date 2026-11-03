@@ -3,9 +3,9 @@ import { useNavigate } from 'react-router-dom';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
 import type { components } from '../api/schema';
-import { Button, Mono, Section, SectionBody, SectionHeader, Status } from '../ui';
+import { Button, FoldSection, Mono, SectionBody, Status } from '../ui';
 import type { StatusTone } from '../ui';
-import { launchPath, rerunLaunchBody, rerunRows, withTask } from './launchView';
+import { launchPath, rerunLaunchBody, rerunRows, rerunSummary, withTask } from './launchView';
 import type { RerunState } from './launchView';
 import { formatCost } from './runReport';
 
@@ -53,11 +53,10 @@ export function RerunSection({ detail, runId }: { detail: LaunchDetail; runId: s
   };
 
   return (
-    <Section>
-      <SectionHeader
-        title="Rerun"
-        note={`${formatCost(preview.data.reused_usd)} reused`}
-        actions={
+    <FoldSection
+      title="Rerun"
+      note={`${rerunSummary(rows)}${preview.data.reused_usd > 0 ? ` · ${formatCost(preview.data.reused_usd)} reused` : ''}`}
+      actions={
           <Button
             variant="filled"
             className="uppercase"
@@ -68,8 +67,8 @@ export function RerunSection({ detail, runId }: { detail: LaunchDetail; runId: s
           >
             {pending ? 'Rerunning…' : `Rerun ${preview.data.rerun.length}`}
           </Button>
-        }
-      />
+      }
+    >
       <SectionBody className="grid gap-2">
         <ul data-testid="rerun-tasks" className="m-0 list-none p-0">
           {rows.map((row) => (
@@ -105,6 +104,6 @@ export function RerunSection({ detail, runId }: { detail: LaunchDetail; runId: s
           </p>
         )}
       </SectionBody>
-    </Section>
+    </FoldSection>
   );
 }

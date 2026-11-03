@@ -6,7 +6,7 @@
 //! servers, nothing: no provider, no egress entry, no `.mcp.json` entry.
 
 use crate::openshell::{buildit, provider};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS, LocalServer, Transport};
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
@@ -75,8 +75,9 @@ impl Granted {
         format!("{}:{}:full:rest", self.host, self.port)
     }
 
-    /// Start the server in the loop pod when it runs there, and wait until it listens.
-    pub fn start_local(&self) -> Result<()> {
+    /// Start the server in the loop pod when it runs there, and wait until it listens. A buildit
+    /// also serves the run's own tasks on `socket`.
+    pub fn start_local(&self, socket: Option<&buildit::RunSocket>) -> Result<()> {
         match &self.server.transport {
             Transport::Remote => Ok(()),
             Transport::Local(LocalServer::Buildit(site)) => buildit::Buildit {
@@ -84,10 +85,32 @@ impl Granted {
                 url: &self.server.url,
                 host: &self.host,
                 port: self.port,
+                socket,
             }
             .ensure_running(),
         }
     }
+}
+
+/// The socket a command or evaluate task reaches the run's buildit on, once it is running: none
+/// when the controller granted no buildit in this pod or the run has no socket.
+pub fn run_buildit(socket: Option<&buildit::RunSocket>) -> Result<Option<std::path::PathBuf>> {
+    let Some(socket) = socket else {
+        return Ok(None);
+    };
+    let servers = AgentServers::from_env().context("reading the run's agent servers")?;
+    let Some(granted) = servers.iter().find(|g| {
+        matches!(
+            g.server.transport,
+            Transport::Local(LocalServer::Buildit(_))
+        )
+    }) else {
+        return Ok(None);
+    };
+    granted
+        .start_local(Some(socket))
+        .with_context(|| format!("starting the run's {}", granted.server.name))?;
+    Ok(Some(socket.path.clone()))
 }
 
 /// The run's servers and where their supervisors get tokens.
@@ -358,7 +381,7 @@ mod tests {
     fn a_remote_server_starts_nothing() {
         let servers = granted(&[server("kueue", KUEUE, Transport::Remote)]);
         for g in servers.iter() {
-            g.start_local().unwrap();
+            g.start_local(None).unwrap();
         }
     }
 }

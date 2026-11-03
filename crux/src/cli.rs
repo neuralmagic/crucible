@@ -159,6 +159,37 @@ enum Command {
         json: bool,
     },
 
+    /// Register a provider from a JSON body (`POST /api/providers`).
+    ProviderCreate {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`).
+    ProviderUpdate {
+        id: String,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Deregister a provider and every default naming it. Refused while issues or schedules pin
+    /// it; `provider-update` with `"enabled": false` retires one that work still names.
+    ProviderDelete {
+        id: String,
+    },
+
+    /// The provider each scope's unpinned dispatches take, per workload class, and its fallback.
+    DispatchDefaults {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only.
+    DispatchDefaultSet {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
     /// Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save
     /// does. Prints `ok`, or fails with one `field:line:col: message` per refusal.
     WebhookCheck {
@@ -424,6 +455,10 @@ enum Command {
         /// The pack directory inside the repo. Omit for the repo root.
         #[arg(long)]
         path: Option<String>,
+        /// The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the
+        /// base manifest.
+        #[arg(long)]
+        variant: Option<String>,
         /// The registry id to propose registering under; prefills the review page.
         #[arg(long)]
         id: Option<String>,
@@ -502,6 +537,23 @@ enum Command {
 
     /// List the secrets you own: id, name, kind, visibility, mode, owner. Never a value.
     Secrets {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a secret. The value is read from piped stdin, never from an argument or a
+    /// terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value.
+    SecretCreate {
+        /// The name a pack's `[[secret]] name` refers to. Unique per owner.
+        name: String,
+        #[arg(long, value_enum)]
+        kind: ops::SecretKind,
+        /// Omit for `broker-only`: the run gets it, the agent in the sandbox does not.
+        #[arg(long, value_enum)]
+        visibility: Option<ops::Visibility>,
+        /// `user:<login>` or a `group:` in your claims. Omit to own it yourself.
+        #[arg(long)]
+        owner: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -607,6 +659,59 @@ enum Command {
         json: bool,
     },
 
+    /// List the blueprints you can read, with what each would carry for you and leave to bind.
+    Blueprints {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are
+    /// in that team; every other declared secret is a placeholder to bind with `secret-bind`.
+    BlueprintUse {
+        /// The blueprint's id, as `blueprints` lists it.
+        id: String,
+        /// The new draft's id.
+        to: String,
+        /// Defaults to the blueprint's.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Offer a registered playbook as a blueprint. Refused unless you may bind every secret
+    /// whose binding would carry.
+    BlueprintMark {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Withdraw a blueprint, public or not. Drafts started from it keep what they carried.
+    BlueprintUnmark {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Let every user read and use a blueprint. Only its owning team's members get its secrets.
+    BlueprintPublic {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Make a public blueprint private again.
+    BlueprintPrivate {
+        /// Playbook id.
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Publish a draft: register its newest compiling version as a playbook, with no review.
     DraftPublish {
         draft_id: String,
@@ -707,6 +812,11 @@ pub async fn run() -> Result<()> {
             limit,
             json,
         } => ops::webhook_deliveries(&client, &id, before.as_deref(), limit, json).await?,
+        Command::ProviderCreate { file } => ops::provider_create(&client, &file).await?,
+        Command::ProviderUpdate { id, file } => ops::provider_update(&client, &id, &file).await?,
+        Command::ProviderDelete { id } => ops::provider_delete(&client, &id).await?,
+        Command::DispatchDefaults { json } => ops::dispatch_defaults(&client, json).await?,
+        Command::DispatchDefaultSet { file } => ops::dispatch_default_set(&client, &file).await?,
         Command::WebhookCheck { file } => ops::webhook_check(&client, &file).await?,
         Command::WebhookPresets => ops::webhook_presets(&client).await?,
         Command::WebhookCreate { file } => ops::webhook_create(&client, &file).await?,
@@ -829,15 +939,19 @@ pub async fn run() -> Result<()> {
             repo,
             git_ref,
             path,
+            variant,
             id,
             description,
             json,
         } => {
             ops::playbook_import(
                 &client,
-                &repo,
-                git_ref.as_deref(),
-                path.as_deref(),
+                &crate::client::PackImportSource {
+                    repo: &repo,
+                    git_ref: git_ref.as_deref(),
+                    path: path.as_deref(),
+                    variant: variant.as_deref(),
+                },
                 id.as_deref(),
                 description.as_deref(),
                 json,
@@ -875,6 +989,28 @@ pub async fn run() -> Result<()> {
         } => ops::draft_push(&client, &draft_id, &dir, base_version, json).await?,
         Command::Providers { json } => ops::providers(&client, json).await?,
         Command::Secrets { json } => ops::secrets(&client, json).await?,
+        Command::SecretCreate {
+            name,
+            kind,
+            visibility,
+            owner,
+            json,
+        } => {
+            let stdin = std::io::stdin();
+            let value = read_secret_value(&stdin, std::io::IsTerminal::is_terminal(&stdin))?;
+            ops::secret_create(
+                &client,
+                ops::SecretCreate {
+                    name: &name,
+                    kind,
+                    visibility,
+                    owner: owner.as_deref(),
+                    value,
+                },
+                json,
+            )
+            .await?
+        }
         Command::SecretBind {
             secret_id,
             playbook,
@@ -960,6 +1096,25 @@ pub async fn run() -> Result<()> {
             description,
             json,
         } => ops::draft_clone(&client, &draft_id, &to, description.as_deref(), json).await?,
+        Command::Blueprints { json } => ops::blueprints(&client, json).await?,
+        Command::BlueprintUse {
+            id,
+            to,
+            description,
+            json,
+        } => ops::blueprint_use(&client, &id, &to, description.as_deref(), json).await?,
+        Command::BlueprintMark { id, json } => {
+            ops::blueprint_mark(&client, &id, true, json).await?
+        }
+        Command::BlueprintUnmark { id, json } => {
+            ops::blueprint_mark(&client, &id, false, json).await?
+        }
+        Command::BlueprintPublic { id, json } => {
+            ops::blueprint_public(&client, &id, true, json).await?
+        }
+        Command::BlueprintPrivate { id, json } => {
+            ops::blueprint_public(&client, &id, false, json).await?
+        }
         Command::DraftGraduate {
             draft_id,
             repo,
@@ -974,6 +1129,20 @@ pub async fn run() -> Result<()> {
     };
     println!("{}", out.trim_end());
     Ok(())
+}
+
+/// A secret value arrives on piped stdin only. A terminal would echo it as it is typed.
+fn read_secret_value(mut input: impl Read, terminal: bool) -> Result<ops::SecretValue> {
+    if terminal {
+        bail!(
+            "pipe the secret value on stdin, e.g. `pbpaste | crux secret-create NAME --kind opaque`"
+        );
+    }
+    let mut raw = String::new();
+    input
+        .read_to_string(&mut raw)
+        .context("reading the secret value from stdin")?;
+    ops::SecretValue::new(raw)
 }
 
 /// `--body -` reads stdin, `--body PATH` reads a file, `--body-text` is inline.
@@ -1115,6 +1284,74 @@ mod tests {
         assert!(
             Cli::try_parse_from(["crux", "run-log", "r1", "--interval", "2"]).is_err(),
             "--interval means nothing without --follow"
+        );
+    }
+
+    #[test]
+    fn secret_create_takes_no_value_argument() {
+        let cli = Cli::try_parse_from([
+            "crux",
+            "secret-create",
+            "bugwatch-label-token",
+            "--kind",
+            "opaque",
+            "--visibility",
+            "broker-only",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::SecretCreate {
+                name,
+                kind,
+                visibility,
+                owner,
+                ..
+            } => {
+                assert_eq!(name, "bugwatch-label-token");
+                assert_eq!(kind, ops::SecretKind::Opaque);
+                assert_eq!(visibility, Some(ops::Visibility::BrokerOnly));
+                assert_eq!(owner, None);
+            }
+            _ => panic!("expected secret-create"),
+        }
+        for bad in [
+            vec![
+                "crux",
+                "secret-create",
+                "n",
+                "--kind",
+                "opaque",
+                "--value",
+                "x",
+            ],
+            vec![
+                "crux",
+                "secret-create",
+                "n",
+                "--kind",
+                "opaque",
+                "ghp_positional",
+            ],
+            vec!["crux", "secret-create", "n", "--kind", "password"],
+            vec!["crux", "secret-create", "n"],
+        ] {
+            assert!(Cli::try_parse_from(&bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_secret_value_comes_from_a_pipe_and_never_a_terminal() {
+        assert!(read_secret_value("ghp_abc\n".as_bytes(), false).is_ok());
+        let refused = read_secret_value("ghp_abc\n".as_bytes(), true)
+            .err()
+            .expect("a terminal is refused");
+        assert!(
+            refused.to_string().contains("pipe the secret value"),
+            "{refused}"
+        );
+        assert!(
+            read_secret_value("".as_bytes(), false).is_err(),
+            "empty is refused"
         );
     }
 
@@ -1353,6 +1590,46 @@ mod tests {
                 assert_eq!(files, "-");
             }
             _ => panic!("expected draft-save"),
+        }
+    }
+
+    #[test]
+    fn a_blueprint_use_names_the_blueprint_and_the_new_draft() {
+        assert!(Cli::try_parse_from(["crux", "blueprint-use", "mlr-pack"]).is_err());
+        let cli = Cli::try_parse_from([
+            "crux",
+            "blueprint-use",
+            "mlr-pack",
+            "kim-copy",
+            "--description",
+            "mine",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::BlueprintUse {
+                id,
+                to,
+                description,
+                json,
+            } => {
+                assert_eq!(id, "mlr-pack");
+                assert_eq!(to, "kim-copy");
+                assert_eq!(description.as_deref(), Some("mine"));
+                assert!(!json);
+            }
+            _ => panic!("expected blueprint-use"),
+        }
+        for toggle in [
+            "blueprint-mark",
+            "blueprint-unmark",
+            "blueprint-public",
+            "blueprint-private",
+        ] {
+            assert!(Cli::try_parse_from(["crux", toggle]).is_err(), "{toggle}");
+            assert!(
+                Cli::try_parse_from(["crux", toggle, "mlr-pack"]).is_ok(),
+                "{toggle}"
+            );
         }
     }
 

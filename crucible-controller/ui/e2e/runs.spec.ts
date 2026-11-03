@@ -16,11 +16,11 @@ const table = (page: Page) => page.locator('main table');
 const run = (page: Page, key: string) => table(page).locator(`a[href="/playbook-runs/${encodeURIComponent(key)}"]`);
 
 test.describe('the playbook runs list', () => {
-  test('shows status, playbook, who, when and cost, with the parked reason under the playbook', async ({ page }) => {
+  test('shows status, playbook, origin, who, when and cost, with the parked reason under the playbook', async ({ page }) => {
     await stubApi(page);
     await ready(page, '/playbook-runs?drafts=shown');
 
-    await expect(table(page).locator('thead th')).toHaveText(['Status', 'Playbook', 'Launched by', 'When', 'Cost', '']);
+    await expect(table(page).locator('thead th')).toHaveText(['Status', 'Playbook', 'Origin', 'Launched by', 'When', 'Cost', '']);
     await expect(
       table(page).getByText('secrets: the pack declares secret pr_token, and repo neuralmagic/crucible has no binding for it'),
     ).toBeVisible();
@@ -68,6 +68,35 @@ test.describe('the playbook runs list', () => {
 
     await expect(run(page, 'playbook:studio:0196')).toBeVisible();
     await expect(run(page, 'playbook:survey:0199')).toHaveCount(0);
+  });
+
+  test('lists a schedule\'s firings beside the form launches', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, '/playbook-runs');
+
+    await expect(run(page, 'playbook:survey:0198')).toBeVisible();
+    const firing = page.locator(`a[href="/playbook-runs/${encodeURIComponent('playbook:survey:0198')}"]`);
+    await expect(table(page).locator('tr', { has: firing })).toContainText('schedule');
+
+    await page.locator('dl[aria-label="Filters"]').getByRole('button', { name: /^schedule/ }).click();
+    await expect(page).toHaveURL(/origin=schedule/);
+    await expect(run(page, 'playbook:survey:0198')).toBeVisible();
+    await expect(run(page, 'playbook:survey:0199')).toHaveCount(0);
+  });
+
+  test('a schedule links to the launches it fired', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, '/schedules');
+
+    await table(page).locator('a[href="/playbook-runs?origin=schedule&schedule=sch-0001"]').click();
+
+    await expect(page).toHaveURL(/\/playbook-runs\?origin=schedule&schedule=sch-0001$/);
+    await expect(run(page, 'playbook:survey:0198')).toBeVisible();
+    await expect(table(page).locator('tbody tr')).toHaveCount(1);
+    await expect(page.getByText('schedule: sch-0001')).toBeVisible();
+
+    await page.getByRole('button', { name: 'Clear all' }).click();
+    await expect(run(page, 'playbook:survey:0199')).toBeVisible();
   });
 
   test('the personal view shows only what the user launched', async ({ page }) => {

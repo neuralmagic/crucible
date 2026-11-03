@@ -259,6 +259,12 @@ async fn rebuild_mode(into: &Db, cfg: &ControllerCfg, mode: RebuildMode) -> Resu
         for run in crate::daemon::store::list_all_runs(&live_pool).await? {
             match ingest_one_run(into, &live_pool, &run).await {
                 Ok(Some(parsed_candidates)) => {
+                    crate::runs::store::set_run_created_at(
+                        into.pool(),
+                        &run.run_id,
+                        &run.created_at,
+                    )
+                    .await?;
                     report.runs_ingested += 1;
                     report.candidates_ingested += parsed_candidates;
                 }
@@ -899,7 +905,7 @@ async fn diff_ledger_daily_sums(live: &Db, rebuilt: &Db) -> Result<Vec<Drift>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::daemon::rebuild::*;
     use crate::issues::model::NewIssue;
     use crate::runs::model::NewRun;
     use sqlx::PgPool;
@@ -966,6 +972,8 @@ mod tests {
             },
         )
         .await?;
+        crate::runs::store::set_run_created_at(live.pool(), "run-1", "2026-07-04T10:00:00Z")
+            .await?;
 
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1008,6 +1016,14 @@ mod tests {
         assert_eq!(run.status, "finished");
         assert_eq!(run.best_score, Some(230.0));
         assert_eq!(run.pod.as_deref(), Some("loop-1"));
+        let created_at: String =
+            sqlx::query_scalar("SELECT created_at FROM runs WHERE run_id = 'run-1'")
+                .fetch_one(into.pool())
+                .await?;
+        assert_eq!(
+            created_at, "2026-07-04T10:00:00Z",
+            "a rebuilt run keeps when the live one was recorded"
+        );
 
         live.pool().close().await;
         Ok(())

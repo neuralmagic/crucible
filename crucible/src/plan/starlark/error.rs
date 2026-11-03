@@ -159,6 +159,11 @@ pub enum CompileError {
     ParamsNotLiteral { detail: String },
     #[error("parameter {param:?} declares no type")]
     ParamNeedsType { param: String },
+    #[error(
+        "parameter {param:?} contains a dot; a launch addresses an agent task's setting as \
+         <task>.<setting>, so a declared name cannot"
+    )]
+    ParamNameHasDot { param: String },
     #[error("parameter {param:?} field {field} must be {expected}")]
     ParamFieldWrongShape {
         param: String,
@@ -358,6 +363,11 @@ pub enum CompileError {
     )]
     RouteFilesWithSource { task: String },
     #[error(
+        "route {task:?} reads files but is decided by a person, who sees its dependencies' files \
+         as evidence already; drop files"
+    )]
+    RouteFilesWithHuman { task: String },
+    #[error(
         "argument {argument:?} carries a value supplied from outside the pack. A prompt marks \
          such a span so an agent can tell it from an instruction; nothing else can, so do not \
          build it into {argument:?}. A command or evaluate task reads it as data from the \
@@ -520,12 +530,23 @@ pub enum CompileError {
         error: crucible_contract::decision::QuestionError,
     },
     #[error(
-        "route {task:?} needs exactly one of min_confidence (a decision model answers) or \
-         source (a dependency's output answers)"
+        "route {task:?} needs exactly one of min_confidence (a decision model answers), \
+         source (a dependency's output answers), or human = True (a person answers)"
     )]
     RouteDecider { task: String },
+    #[error("route {task:?}: review is shown to the person who answers, so it needs human = True")]
+    ReviewWithoutHuman { task: String },
+    #[error(
+        "route {task:?}: timeout bounds how long a person has to answer, so it needs human = True"
+    )]
+    TimeoutWithoutHuman { task: String },
     #[error("argument \"when\" must be one question of a route task, like `gate.area`")]
     WhenNotAnAnswer,
+    #[error(
+        "\"source\" must name a declared list field of a task the route depends on, as \
+         `source = producer.field`"
+    )]
+    PickNotOutputField,
     #[error("argument \"answers\" has no meaning without \"when\"")]
     AnswersWithoutWhen,
     #[error("argument \"answers\" lists no labels")]
@@ -549,6 +570,11 @@ pub enum CompileError {
         suggestion: Option<String>,
         declared: String,
     },
+    #[error(
+        "{asked} reads its options at run time, so answers may list only \"uncertain\"; use \
+         otherwise = True for the options, and read which one was chosen from the route's output"
+    )]
+    AnswerNamesDynamicOption { asked: String, label: String },
     #[error("missing required argument {argument:?}")]
     MissingArgument { argument: String },
     /// One arm for every scalar-kwarg type check; `expected` completes the sentence.
@@ -563,6 +589,11 @@ pub enum CompileError {
     TaskNamesNotList { argument: String },
     #[error("{argument} entries must be tasks or task-name strings")]
     TaskNameEntryWrongType { argument: String },
+    #[error(
+        "optional(...) marks a dependency of agent, skill, command, evaluate or route; here \
+         {argument} takes plain tasks"
+    )]
+    OptionalOutsideDependsOn { argument: String },
 
     #[error("workflow source must end with workflow(...) or default_autoresearch([...])")]
     NoWorkflowResult,

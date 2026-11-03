@@ -792,6 +792,7 @@ pub fn pack_import(i: &dto::PackImport, preview_url: &str) -> String {
         or_dash(i.git_ref.as_deref())
     ));
     line(&mut out, "path", Some(&i.path));
+    line(&mut out, "variant", i.variant.as_deref());
     out.push_str(&format!("rev: {}\n", i.rev));
     line(&mut out, "tree", i.tree_digest.as_deref());
     out.push_str(&format!(
@@ -920,6 +921,76 @@ pub fn draft_cloned(source: &str, c: &dto::DraftCloned, studio_url: &str) -> Str
         out.push_str("not copied:\n");
         for left in &c.left_bindings {
             out.push_str(&format!("  {}: {}\n", left.declared_name, left.reason));
+        }
+    }
+    out.push_str(&format!("studio: {studio_url}\n"));
+    out
+}
+
+/// The catalog. `SECRETS` counts what a use would carry for this caller and what it would leave to
+/// bind.
+pub fn blueprints(list: &[dto::Blueprint]) -> String {
+    if list.is_empty() {
+        return "no blueprints you can read\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|b| {
+            let carried = b.secrets.iter().filter(|s| s.carries).count();
+            let left = b.secrets.len() - carried;
+            vec![
+                b.id.clone(),
+                b.owner.clone(),
+                short_rev(&b.rev),
+                if b.public { "public" } else { "-" }.to_string(),
+                format!("{carried} carried, {left} to bind"),
+                truncate(&b.description, TITLE_MAX),
+            ]
+        })
+        .collect();
+    format!(
+        "{} blueprints\n{}",
+        list.len(),
+        table(
+            &["ID", "OWNER", "REV", "PUBLIC", "SECRETS", "DESCRIPTION"],
+            &rows
+        )
+    )
+}
+
+pub fn blueprint_state(s: &dto::BlueprintState) -> String {
+    let what = match (s.blueprint, s.public) {
+        (false, _) => "not a blueprint",
+        (true, false) => "a private blueprint",
+        (true, true) => "a public blueprint",
+    };
+    format!("{} is {what}\n", s.id)
+}
+
+pub fn blueprint_used(blueprint: &str, u: &dto::BlueprintUsed, studio_url: &str) -> String {
+    let mut out = format!(
+        "started draft {} from blueprint {blueprint} at version {}\n",
+        u.id, u.version
+    );
+    if !u.bindings.is_empty() {
+        let names: Vec<&str> = u
+            .bindings
+            .iter()
+            .map(|b| b.declared_name.as_str())
+            .collect();
+        out.push_str(&format!("carried: {}\n", names.join(", ")));
+    }
+    if !u.placeholders.is_empty() {
+        out.push_str("to bind:\n");
+        for p in &u.placeholders {
+            let projection = match (&p.projection_kind, &p.projection) {
+                (Some(kind), Some(projection)) => format!(" as {kind} {projection}"),
+                _ => String::new(),
+            };
+            out.push_str(&format!(
+                "  {}{projection}: {}\n",
+                p.declared_name, p.reason
+            ));
         }
     }
     out.push_str(&format!("studio: {studio_url}\n"));
@@ -1122,6 +1193,14 @@ pub fn secrets(list: &[dto::Secret]) -> String {
     )
 }
 
+pub fn secret_created(s: &dto::Secret) -> String {
+    format!(
+        "registered {} as {}\n  kind: {}  visibility: {}  mode: {}  owner: {}\n\
+         bind it: crux secret-bind {} --playbook <id> --env <VAR>\n",
+        s.name, s.id, s.kind, s.visibility, s.mode, s.owner, s.id
+    )
+}
+
 pub fn secret_bound(b: &dto::SecretBinding) -> String {
     format!(
         "bound {} to {}/{}: accepted\n  as {} -> {} {}\n  binding: {}\nactor: {}\n",
@@ -1248,6 +1327,43 @@ pub fn runs(list: &[dto::RunRow]) -> String {
         table(
             &[
                 "RUN", "NAME", "STATUS", "REPO", "ISSUE", "BEST", "COST", "CLUSTER", "CREATED"
+            ],
+            &rows
+        )
+    )
+}
+
+pub fn dispatch_defaults(list: &[dto::DispatchDefault]) -> String {
+    if list.is_empty() {
+        return "no dispatch defaults\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|d| {
+            vec![
+                match d.scope_ref.as_str() {
+                    "" => d.scope_kind.clone(),
+                    scope_ref => format!("{}:{scope_ref}", d.scope_kind),
+                },
+                d.workload_class.clone(),
+                d.provider.clone(),
+                or_dash(d.model.as_deref()),
+                or_dash(d.fallback_provider.as_deref()),
+                or_dash(d.fallback_model.as_deref()),
+            ]
+        })
+        .collect();
+    format!(
+        "{} dispatch defaults\n{}",
+        list.len(),
+        table(
+            &[
+                "SCOPE",
+                "CLASS",
+                "PROVIDER",
+                "MODEL",
+                "FALLBACK",
+                "FALLBACK MODEL"
             ],
             &rows
         )
@@ -2608,6 +2724,21 @@ mod tests {
         );
         assert!(out.contains("repo: owner/packs @ main\n"), "{out}");
         assert!(out.contains("path: packs/calibrate\n"), "{out}");
+        assert!(
+            !out.contains("variant:"),
+            "the base manifest prints no variant: {out}"
+        );
+        let offline = pack_import(
+            &dto::PackImport {
+                variant: Some("offline".to_string()),
+                ..import()
+            },
+            "https://c.example.com/playbooks/import/0192f4a1",
+        );
+        assert!(
+            offline.contains("path: packs/calibrate\nvariant: offline\nrev: 9f1c2b3\n"),
+            "{offline}"
+        );
         assert!(out.contains("rev: 9f1c2b3\n"), "{out}");
         assert!(out.contains("tree: tree1:aa\n"), "{out}");
         assert!(out.contains("schema: sha256:bb\n"), "{out}");
@@ -2984,5 +3115,73 @@ mod tests {
             "{openai}"
         );
         assert_eq!(providers(&[]), "no providers registered\n");
+    }
+
+    #[test]
+    fn the_blueprint_catalog_counts_what_carries_and_what_is_left() {
+        let list: Vec<dto::Blueprint> = serde_json::from_str(
+            r#"[{"id":"mlr-pack","description":"mlr sweep","owner":"team:mlr",
+                 "rev":"tree1:0123456789abcdef0123","public":true,
+                 "secrets":[{"declared_name":"gh_token","carries":true,"reason":null},
+                            {"declared_name":"key","carries":false,"reason":"unbound"}]},
+                {"id":"bare","description":"","owner":"user:reed","rev":"abc","public":false,
+                 "secrets":[]}]"#,
+        )
+        .expect("the catalog fixture parses");
+        let out = blueprints(&list);
+        assert!(out.starts_with("2 blueprints\n"), "{out}");
+        let mlr = out
+            .lines()
+            .find(|l| l.starts_with("mlr-pack"))
+            .expect("mlr-pack");
+        for column in [
+            "team:mlr",
+            "tree1:0123456789ab",
+            "public",
+            "1 carried, 1 to bind",
+        ] {
+            assert!(mlr.contains(column), "{column} missing: {mlr}");
+        }
+        let bare = out.lines().find(|l| l.starts_with("bare")).expect("bare");
+        assert!(bare.contains("0 carried, 0 to bind"), "{bare}");
+        assert!(!bare.contains("public"), "{bare}");
+        assert_eq!(blueprints(&[]), "no blueprints you can read\n");
+    }
+
+    #[test]
+    fn a_blueprint_use_lists_what_carried_and_each_placeholder_with_its_reason() {
+        let used: dto::BlueprintUsed = serde_json::from_str(
+            r#"{"id":"kim-copy","version":1,"bindings":[],
+                "placeholders":[{"declared_name":"key","projection_kind":null,"projection":null,
+                                 "reason":"unbound"}]}"#,
+        )
+        .expect("the use fixture parses");
+        assert_eq!(
+            blueprint_used(
+                "mlr-pack",
+                &used,
+                "https://c.example/playbooks/drafts/kim-copy"
+            ),
+            "started draft kim-copy from blueprint mlr-pack at version 1\n\
+             to bind:\n  key: unbound\n\
+             studio: https://c.example/playbooks/drafts/kim-copy\n"
+        );
+        let state = |blueprint, public| dto::BlueprintState {
+            id: "mlr-pack".into(),
+            blueprint,
+            public,
+        };
+        assert_eq!(
+            blueprint_state(&state(false, false)),
+            "mlr-pack is not a blueprint\n"
+        );
+        assert_eq!(
+            blueprint_state(&state(true, false)),
+            "mlr-pack is a private blueprint\n"
+        );
+        assert_eq!(
+            blueprint_state(&state(true, true)),
+            "mlr-pack is a public blueprint\n"
+        );
     }
 }

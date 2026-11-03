@@ -34,6 +34,8 @@ relation epilogue : task → Bool
 relation runnable : task → Bool
 relation route_of : task → task → Bool
 function join : task → jkind
+-- `optional t d`: d, which has a `when`, satisfies t's `all` join by settling not taken (C-ROUTE).
+relation optional : task → task → Bool
 relation isolated : task → Bool
 relation spends : task → Bool
 -- `revises r t`: reviewer r sends t back (C-REVISE-LOOP).
@@ -86,7 +88,10 @@ ghost relation route_undecided (t : task) :=
   ∃ r, route_of t r ∧ status r ≠ t_pass ∧ status r ≠ t_not_taken ∧ join t ≠ j_all
 
 ghost relation branch_not_taken (t : task) :=
-  join t = j_all ∧ ∃ d, dep t d ∧ status d = t_not_taken
+  join t = j_all ∧ ∃ d, dep t d ∧ ¬ optional t d ∧ status d = t_not_taken
+
+-- What an `all` join accepts of one dependency.
+ghost relation dep_held (t d : task) := status d = t_pass ∨ (optional t d ∧ status d = t_not_taken)
 
 ghost relation route_passed (t : task) := ∃ r, route_of t r ∧ status r = t_pass
 
@@ -95,11 +100,11 @@ ghost relation paired (t : task) := ∃ r, revises r t ∧ runnable r
 
 -- The reviewer's join against this round's target result.
 ghost relation review_allowed (r t : task) :=
-  (join r = j_all → last t = t_pass ∧ ∀ d, dep r d ∧ d ≠ t → status d = t_pass) ∧
+  (join r = j_all → last t = t_pass ∧ ∀ d, dep r d ∧ d ≠ t → dep_held r d) ∧
   (join r = j_passed → last t = t_pass ∨ ∃ d, dep r d ∧ d ≠ t ∧ status d = t_pass)
 
 ghost relation deps_allow (t : task) :=
-  (join t = j_all → ∀ d, dep t d → status d = t_pass) ∧
+  (join t = j_all → ∀ d, dep t d → dep_held t d) ∧
   (join t = j_passed → ∃ d, dep t d ∧ status d = t_pass)
 
 after_init {
@@ -122,6 +127,8 @@ after_init {
     (∀ r1 r2 t, revises r1 t ∧ revises r2 t → r1 = r2) ∧
     (∀ r t x, revises r t → ¬ revises t x ∧ ¬ revises x r) ∧
     (∀ r t d, revises r t ∧ dep r d ∧ d ≠ t → ¬ reach d t)
+  optional T D := *
+  require ∀ t d, optional t d → dep t d ∧ join t = j_all ∧ ¬ revises t d ∧ ∃ r, route_of d r
   required T := *
   isolated T := *
   spends T := *
@@ -336,6 +343,8 @@ invariant [runnable_by_join]
   runnable T → (join T = j_all → ∀ d, dep T d → runnable d) ∧ (join T = j_passed → ∃ d, dep T d ∧ runnable d)
 invariant [stages_do_not_cross] dep T D → (epilogue T ↔ epilogue D)
 invariant [route_is_dep] route_of T R → dep T R
+invariant [optional_well_formed]
+  optional T D → dep T D ∧ join T = j_all ∧ ¬ revises T D ∧ ∃ r, route_of D r
 invariant [lossy_join_has_deps] join T ≠ j_all → ∃ d, dep T d
 
 -- Facts the safety properties rest on.
@@ -355,12 +364,14 @@ safety [unrunnable_required_truncates]
 safety [not_taken_never_dispatched] status T = t_not_taken → ¬ dispatched T
 
 safety [not_taken_has_a_cause]
-  status T = t_not_taken → (∃ r, route_of T r) ∨ (join T = j_all ∧ ∃ d, dep T d ∧ status d = t_not_taken)
+  status T = t_not_taken →
+    (∃ r, route_of T r) ∨ (join T = j_all ∧ ∃ d, dep T d ∧ ¬ optional T d ∧ status d = t_not_taken)
 
 safety [dispatch_after_dependencies] dispatched T ∧ dep T D → settled D
 
--- An `all` join reads only passing dependencies.
-safety [all_join_reads_passing] dispatched T ∧ join T = j_all ∧ dep T D → status D = t_pass
+-- An `all` join reads only passing dependencies, and optional ones that were not taken.
+safety [all_join_reads_passing]
+  dispatched T ∧ join T = j_all ∧ dep T D → status D = t_pass ∨ (optional T D ∧ status D = t_not_taken)
 
 -- An epilogue observes the settled main graph.
 safety [epilogue_after_main] dispatched E ∧ epilogue E ∧ ¬ epilogue M → settled M

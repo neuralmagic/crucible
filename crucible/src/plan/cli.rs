@@ -67,6 +67,8 @@ pub fn load(path: &Path) -> Result<ValidPlan> {
     } else {
         Plan::from_json_str(&src)?
     };
+    crate::manifest::launch::check_agent_knobs(&plan.tasks)
+        .with_context(|| format!("validating plan {}", path.display()))?;
     plan.validate()
         .with_context(|| format!("validating plan {}", path.display()))
 }
@@ -126,6 +128,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     crate::plan::ir::Decider::Model { min_confidence, .. } =>
                         format!("model >= {min_confidence}"),
                     crate::plan::ir::Decider::Output { task } => format!("from {task}"),
+                    crate::plan::ir::Decider::Human { .. } => "human".to_string(),
                 }
             ),
             TaskKind::Report { .. } => "report".to_string(),
@@ -312,7 +315,12 @@ fn render_mermaid_styled(
             let arrow = if aligned { "==>" } else { "-->" };
             let mut labels = Vec::new();
             if let Some(when) = t.when.as_ref().filter(|when| &when.task == d) {
-                let answers: Vec<&str> = when.is.iter().map(|l| l.as_str()).collect();
+                let answers: Vec<&str> = when
+                    .any_option
+                    .then_some("any option")
+                    .into_iter()
+                    .chain(when.is.iter().map(|l| l.as_str()))
+                    .collect();
                 labels.push(format!(
                     "{}: {}",
                     mermaid_label(when.question.as_str()),
@@ -517,6 +525,8 @@ pub struct RunOpts {
     pub agent: AgentOverride,
     /// Continue the playbook run the manifest's state dir holds instead of starting one.
     pub resume: bool,
+    /// The manifest variant the run reads.
+    pub variant: Option<crate::manifest::variant::VariantName>,
     /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
     pub rerun: Option<Rerun>,
 }
@@ -630,7 +640,7 @@ fn start_rerun(
         .restore_captured(&parent, &paths.state)
         .context("restoring the parent's captured files")?;
     let tree = crucible_vcs::git_memory::tree_of(&paths.workspace, &base)?.unwrap_or_default();
-    RunStart::begin(run, base, tree, plan).write(&paths.state)?;
+    RunStart::begin(run, base, tree, plan, loaded.variant.clone()).write(&paths.state)?;
     Ok(seeded.prior)
 }
 
@@ -649,6 +659,7 @@ pub fn run(
         compute_driver,
         agent,
         resume,
+        variant,
         rerun,
     } = opts;
 
@@ -674,11 +685,18 @@ pub fn run(
             (_, Some(m)) => {
                 let state = crate::cli::setup::state_dir(m);
                 let resumed = resume.then(|| RunStart::read(&state)).transpose()?;
+                let start = if resume || rerun.is_some() {
+                    crate::cli::setup::Start::Continues
+                } else {
+                    crate::cli::setup::Start::Fresh
+                };
                 let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
                     m,
+                    variant.as_ref(),
                     params,
                     compute_driver,
                     agent,
+                    start,
                 )?;
                 let session_log = prepared.paths.session_log.clone();
                 agent_args = Some(prepared.args.clone());
@@ -736,7 +754,7 @@ pub fn run(
                 }
                 match (resumed, &rerun) {
                     (Some(resumed), _) => {
-                        resumed.continues(run, &plan)?;
+                        resumed.continues(run, &plan, variant.as_ref())?;
                         crate::cli::setup::restore_pristine(m, &loaded, &resumed.base)?;
                         prior = Some(crate::plan::resume::fold_log(
                             &session_log,
@@ -756,7 +774,7 @@ pub fn run(
                             .context("reading the workspace's starting commit")?;
                         let tree = crucible_vcs::git_memory::tree_of(workspace, &base)?
                             .unwrap_or_default();
-                        RunStart::begin(run, base, tree, &plan).write(&state)?;
+                        RunStart::begin(run, base, tree, &plan, variant.clone()).write(&state)?;
                     }
                     (None, None) => {}
                 }
@@ -778,6 +796,7 @@ pub fn run(
                         workdir: std::env::current_dir()
                             .context("resolving the working directory")?,
                         agent_cmd,
+                        buildit_socket: None,
                     }),
                     None,
                 )
@@ -795,7 +814,6 @@ pub fn run(
     });
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
     let append = |f: &std::fs::File, ev: &crate::report::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;
@@ -804,6 +822,13 @@ pub fn run(
     // A log that already ends in a shutdown is closed: the run finished, and nothing may follow
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
+    // A run with an ingest surface can open decision requests, which is the `human` capability.
+    let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    let mut caps = caps.clone();
+    if desk.is_some() {
+        caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
+    }
+    let substrate = Substrate::detecting(caps, &crucible::inference::from_process_env()?);
     if let Some(f) = &events {
         if let Some(prior) = prior.as_ref().filter(|_| resuming) {
             append(
@@ -940,6 +965,9 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
+            decisions: desk
+                .as_ref()
+                .map(|d| d as &dyn crucible::plan::decide::DecisionDesk),
             ..ExecCfg::default()
         },
         runner.as_mut(),
@@ -1038,6 +1066,7 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest::variant::VariantName;
 
     const SRC: &str = r#"
         version = 1
@@ -1054,6 +1083,26 @@ mod tests {
         depends_on = ["propose"]
         needs = "gpu"
     "#;
+
+    /// A plan file carries its own tasks, so its harness and effort are checked as it loads.
+    #[test]
+    fn a_plan_file_naming_a_harness_no_turn_can_read_is_refused() {
+        let dir = crate::testing::tempdir("plan-file-knobs");
+        let file = dir.join("plan.toml");
+        std::fs::write(
+            &file,
+            SRC.replace("prompt = \"go\"", "prompt = \"go\"\nharness = \"gpt\""),
+        )
+        .unwrap();
+        let err = load(&file).map(|_| ()).expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("sets harness \"gpt\""),
+            "{err:#}"
+        );
+        std::fs::write(&file, SRC).unwrap();
+        load(&file).expect("a plan with no knobs set loads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// How a pack spells its graph is not a launcher's business. An undeclared `--param` is a
     /// mistake against the inline spelling exactly as it is against the file-backed one, and
@@ -1118,6 +1167,82 @@ mod tests {
         assert!(inline_error.contains("nope"), "{inline_error}");
         assert!(backed_error.contains("nope"), "{backed_error}");
         assert!(!sentinel.exists(), "neither run may dispatch a task");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A variant's tables replace the base's whole for the run that selects it, and a resume
+    /// of that run must select it again.
+    #[test]
+    fn a_variant_run_reads_its_own_graph_and_resumes_only_as_itself() {
+        let dir = crate::testing::tempdir("plan-run-variant");
+        let base_ran = dir.join("base-ran");
+        let offline_ran = dir.join("offline-ran");
+        for (file, sentinel) in [("base.star", &base_ran), ("offline.star", &offline_ran)] {
+            std::fs::write(
+                dir.join(file),
+                format!(
+                    "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"touch {} && echo '{{}}'\")])\n",
+                    sentinel.display()
+                ),
+            )
+            .expect("workflow");
+        }
+        let manifest = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest,
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [workflow]
+            type = "playbook"
+            file = "base.star"
+            [variant.offline.workflow]
+            type = "playbook"
+            file = "offline.star"
+            "#,
+        )
+        .expect("manifest");
+        let launch = |variant: Option<&str>, resume: bool| {
+            run(
+                None,
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                None,
+                Some(&manifest),
+                RunOpts {
+                    ceilings: Ceilings {
+                        usd: Some(1.0),
+                        wall_clock: Some(std::time::Duration::from_secs(60)),
+                        wall_clock_raw: Some("60s".to_string()),
+                    },
+                    variant: variant.map(|v| VariantName::parse(v).expect("variant name")),
+                    resume,
+                    ..Default::default()
+                },
+            )
+        };
+
+        launch(Some("offline"), false).expect("the offline variant runs");
+        assert!(offline_ran.exists(), "the variant's graph ran");
+        assert!(!base_ran.exists(), "the base [workflow] was replaced whole");
+
+        let error = launch(None, true).expect_err("a resume under the base is another run");
+        assert!(
+            format!("{error:#}").contains(
+                "reads the base manifest, but the interrupted run read [variant.offline]"
+            ),
+            "{error:#}"
+        );
+        launch(Some("missing"), false).expect_err("an undeclared variant is refused");
+        launch(Some("offline"), true).expect("a resume under the same variant continues");
+        assert!(!base_ran.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

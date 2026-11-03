@@ -142,6 +142,7 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
         params,
         max_cost,
         max_time,
+        variant,
         ..
     } = opts
     {
@@ -149,6 +150,10 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
         argv.push(format!("{max_cost}"));
         argv.push("--max-time".to_string());
         argv.push(max_time.as_str().to_string());
+        if let Some(variant) = variant {
+            argv.push("--variant".to_string());
+            argv.push(variant.to_string());
+        }
         for (name, value) in params {
             argv.push("--param".to_string());
             argv.push(format!("{name}={value}"));
@@ -246,7 +251,15 @@ pub(crate) async fn start(
         "FORGE_STORAGE_ROOT".to_string(),
         forge_root(&dir).to_string_lossy().into_owned(),
     ));
-    env.retain(|(name, _)| name != crucible_contract::ENV_RUN_NAME);
+    env.retain(|(name, _)| {
+        ![
+            crucible_contract::ENV_RUN_NAME,
+            crucible_contract::ENV_CONTROLLER_URL,
+            crucible_contract::ENV_POD_TOKEN,
+        ]
+        .contains(&name.as_str())
+    });
+    env.extend(controller_env(db, cfg, run_id, deadline).await?);
     env.push((
         crucible_contract::ENV_RUN_NAME.to_string(),
         run_id.to_string(),
@@ -421,6 +434,36 @@ async fn open_engine_log(dir: &Path) -> Option<Arc<Mutex<tokio::fs::File>>> {
     }
 }
 
+/// Where a local run reaches the controller that spawned it when no public URL is configured: the
+/// controller's default loopback bind.
+const LOCAL_CONTROLLER_URL: &str = "http://127.0.0.1:8870";
+
+/// What a local run reaches its own controller with: the controller's URL and a pod token for this
+/// run, which revokes when the run completes.
+async fn controller_env(
+    db: &Db,
+    cfg: &ControllerCfg,
+    run_id: &str,
+    lifetime: std::time::Duration,
+) -> Result<Vec<(String, String)>> {
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run_id.to_owned()),
+        None,
+        lifetime,
+    )
+    .await?;
+    Ok(vec![
+        (
+            crucible_contract::ENV_CONTROLLER_URL.to_string(),
+            cfg.public_url
+                .clone()
+                .unwrap_or_else(|| LOCAL_CONTROLLER_URL.to_string()),
+        ),
+        (crucible_contract::ENV_POD_TOKEN.to_string(), token),
+    ])
+}
+
 /// Read one of the child's pipes to EOF, logging every line, mirroring it into the run's engine
 /// log, and keeping it for a failure tail.
 async fn pump<R>(
@@ -589,6 +632,7 @@ mod tests {
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
             rerun: None,
+            variant: None,
         };
         assert_eq!(playbook.tracker_item("playbook:fences:0199"), None);
         let looped = RunRenderOpts::Loop {
@@ -614,6 +658,7 @@ mod tests {
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
             rerun: None,
+            variant: None,
         };
         assert_eq!(
             run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts),
@@ -634,6 +679,27 @@ mod tests {
         );
     }
 
+    /// A launch's manifest variant reaches `plan run` ahead of its params.
+    #[test]
+    fn a_variant_reaches_the_local_argv() {
+        let opts = RunRenderOpts::Playbook {
+            params: vec![("topic".to_string(), "t".to_string())],
+            max_cost: 4.5,
+            max_time: MaxTime::parse("30m").expect("duration"),
+            agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
+            variant: Some(
+                crucible::manifest::variant::VariantName::parse("offline").expect("name"),
+            ),
+        };
+        let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
+        assert_eq!(
+            argv[8..],
+            ["--variant", "offline", "--param", "topic=t"],
+            "{argv:?}"
+        );
+    }
+
     /// The pair the registry resolved reaches `plan run` as the flags the engine parses, spelled
     /// the way its `--harness` value enum reads them.
     #[test]
@@ -647,6 +713,7 @@ mod tests {
                 model: Some("gpt-5.6-luna".to_string()),
             },
             rerun: None,
+            variant: None,
         };
         let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
         assert_eq!(

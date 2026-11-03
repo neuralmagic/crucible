@@ -120,6 +120,10 @@ pub struct PlanTaskWire {
     pub kind: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// The dependencies whose settling not taken satisfies the task's `all` join. Empty when it
+    /// declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<String>,
     /// Logical durable agent session; empty means a fresh turn.
     #[serde(default)]
     pub session: String,
@@ -383,6 +387,8 @@ pub enum TransportCause {
     Workspace,
     /// A command task could not be spawned.
     Command,
+    /// The orchestrator holding a human-decided route's request could not be reached.
+    Orchestrator,
     /// A transport failure this engine does not classify further.
     Other,
 }
@@ -583,6 +589,14 @@ pub enum SessionEvent {
         outcome: String,
         #[serde(default)]
         reason: String,
+    },
+    /// A human-decided route opened its decision request, or a resumed run reopened it. Closed by
+    /// that task's result except on stop and process death.
+    DecisionWait {
+        task: String,
+        request: String,
+        evidence_digest: String,
+        expires_at: String,
     },
     /// A mediated write refused by the run's declared output bounds. The refusal fails the
     /// requesting tool call; it never terminates the run.
@@ -825,6 +839,12 @@ mod tests {
                 outcome: "granted".into(),
                 reason: "concurrency=48".into(),
             },
+            SessionEvent::DecisionWait {
+                task: "gate".into(),
+                request: "0199c0de-7a11-71ec-9a1b-3f0f5b6a1c22".into(),
+                evidence_digest: "sha256:ab12".into(),
+                expires_at: "2026-10-06T18:00:00Z".into(),
+            },
             SessionEvent::Recovery {
                 class: RecoveryClass::DiedMidTurn,
                 iter: 4,
@@ -975,6 +995,7 @@ mod tests {
                 timeout: "10m".into(),
                 history_depth: 5,
                 definition: String::new(),
+                optional: Vec::new(),
             }],
             history_record: "propose-a".into(),
         });
@@ -1046,6 +1067,7 @@ mod tests {
             timeout: String::new(),
             history_depth: 0,
             definition: String::new(),
+            optional: Vec::new(),
         };
         let written = |revise: Vec<String>| {
             serde_json::to_value(task(revise)).expect("encodes")["revise"].clone()

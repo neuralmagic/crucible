@@ -310,7 +310,8 @@ workspace.
 
 ### `join`
 
-`join = "all"` (default) needs every dependency to pass. `join = "passed"` waits for every
+`join = "all"` (default) needs every dependency to pass, except that a dependency marked
+`optional(...)` may also have settled `not_taken`. `join = "passed"` waits for every
 dependency, then collects the passing dependencies. There must be at least one. If no
 dependency can run or pass, the task fails.
 

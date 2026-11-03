@@ -1,6 +1,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use std::collections::BTreeMap;
+use std::future::IntoFuture;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +30,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, PodOpts, Resources};
+use crate::context::ContextDigest;
 use crate::logs::{LOG_DIR, Log, LogName, MAX_READ, Page, Query};
 use crate::pod::{BuilderPod, KUEUE_GATE, Release};
 use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace, is_label_value};
@@ -55,6 +57,8 @@ const LABEL_BUILD_ID: &str = "buildit.dev/build-id";
 const LABEL_LAUNCHED_BY: &str = "crucible.dev/launched-by";
 /// The Kueue LocalQueue a builder pod is submitted to.
 const LABEL_QUEUE: &str = "kueue.x-k8s.io/queue-name";
+/// The [`ContextDigest`] of what buildit uploaded to a builder pod.
+const ANNOTATION_CONTEXT_DIGEST: &str = "buildit.dev/context-digest";
 
 /// Scope that lets a token read build status and logs.
 pub const SCOPE_READ: &str = "buildit.read";
@@ -160,6 +164,53 @@ pub struct McpArgs {
     /// Registry authfile `push` uses, read on each push and piped to the builder pod for it alone
     #[arg(long, env = "MCP_PUSH_AUTHFILE", requires = "push_repo")]
     pub push_authfile: Option<PathBuf>,
+    /// Also serve the tools on this unix socket, without tokens, to one caller: the run itself.
+    /// Its builds are apart from every sandbox's, under the same policy and limits
+    #[arg(long, env = "MCP_SOCKET", requires = "socket_workdir")]
+    pub socket: Option<PathBuf>,
+    /// The directory the socket's builds read their contexts from and `run` publishes into
+    #[arg(long, env = "MCP_SOCKET_WORKDIR", requires = "socket")]
+    pub socket_workdir: Option<PathBuf>,
+}
+
+/// The sandbox name the run itself builds under on the socket: `loop-` and a hash of the run,
+/// which no openshell sandbox (`ci-<hex>`) takes and no other run shares.
+pub fn run_sandbox(run_id: Option<&str>) -> Result<SandboxName> {
+    use sha2::Digest;
+    match run_id {
+        None => SandboxName::parse("loop"),
+        Some(run) => {
+            let hash: String = sha2::Sha256::digest(run.as_bytes())[..8]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            SandboxName::parse(&format!("loop-{hash}"))
+        }
+    }
+}
+
+fn load_policy(text: Option<&str>) -> Result<ToolPolicy> {
+    match text {
+        Some(text) => ToolPolicy::from_toml(text).context("loading the tool policy"),
+        None => Ok(ToolPolicy::default()),
+    }
+}
+
+/// Binds the run's socket, replacing a stale one, readable and writable by this user alone.
+fn bind_socket(path: &Path) -> Result<tokio::net::UnixListener> {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_socket() => std::fs::remove_file(path)
+            .with_context(|| format!("removing the stale socket {}", path.display()))?,
+        Ok(_) => bail!("{} exists and is not a socket", path.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    }
+    let listener = tokio::net::UnixListener::bind(path)
+        .with_context(|| format!("binding {}", path.display()))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restricting {}", path.display()))?;
+    Ok(listener)
 }
 
 pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
@@ -191,14 +242,24 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
             ))
         }
     };
-    let policy = match &args.tool_policy {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("reading tool policy {}", path.display()))?;
-            ToolPolicy::from_toml(&text)
-                .with_context(|| format!("loading tool policy {}", path.display()))?
-        }
-        None => ToolPolicy::default(),
+    let policy_text = match &args.tool_policy {
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading tool policy {}", path.display()))?,
+        ),
+        None => None,
+    };
+    let policy = load_policy(policy_text.as_deref())?;
+    let socket = match (args.socket, args.socket_workdir) {
+        (Some(path), Some(dir)) => Some((
+            path,
+            Caller {
+                sandbox: run_sandbox(args.run_id.as_deref())?,
+                workspace: Workspace::Local { dir },
+                launched_by: None,
+            },
+        )),
+        _ => None,
     };
     let broker = Arc::new(Broker {
         client,
@@ -224,6 +285,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
             (Some(repo), Some(authfile)) => Some(PushTarget::new(repo, authfile)?),
             _ => None,
         },
+        run_caller: socket.as_ref().map(|(_, caller)| caller.sandbox.clone()),
     });
     let listener = tokio::net::TcpListener::bind(&args.bind)
         .await
@@ -233,8 +295,24 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         args.bind,
         broker.namespace
     );
-    axum::serve(listener, router(broker, &args.allowed_hosts, policy))
-        .await
+    let http = axum::serve(
+        listener,
+        router(broker.clone(), &args.allowed_hosts, policy),
+    )
+    .into_future();
+    let Some((path, caller)) = socket else {
+        return http.await.context("serving buildit mcp");
+    };
+    let unix = bind_socket(&path)?;
+    tracing::info!(
+        "buildit mcp serving run caller {} on {}",
+        caller.sandbox.as_str(),
+        path.display()
+    );
+    let policy = load_policy(policy_text.as_deref())?;
+    let local = axum::serve(unix, socket_router(broker, caller, policy)).into_future();
+    tokio::try_join!(http, local)
+        .map(|_| ())
         .context("serving buildit mcp")
 }
 
@@ -244,6 +322,38 @@ pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -
     let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
     hosts.extend(SANDBOX_HOSTS.map(String::from));
     hosts.extend(extra_hosts.iter().map(|h| h.trim().to_string()));
+    let oidc = broker.oidc.clone();
+    let mcp = tools(broker.clone(), hosts, policy, oidc.clone())
+        .layer(axum::middleware::from_fn_with_state(broker, authenticate));
+    let app = axum::Router::new().nest_service(MCP_PATH, mcp);
+    match oidc {
+        Some(server) => app.merge(crucible_mcp_auth::metadata::router(server)),
+        None => app,
+    }
+}
+
+/// The same tools and guard on the run's own socket, every request made as `caller`.
+pub fn socket_router(broker: Arc<Broker>, caller: Caller, policy: ToolPolicy) -> axum::Router {
+    let hosts = StreamableHttpServerConfig::default().allowed_hosts;
+    let mcp = tools(broker, hosts, policy, None).layer(axum::middleware::from_fn_with_state(
+        Arc::new(caller),
+        as_caller,
+    ));
+    axum::Router::new().nest_service(MCP_PATH, mcp)
+}
+
+async fn as_caller(State(caller): State<Arc<Caller>>, mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(caller.principal());
+    req.extensions_mut().insert(Caller::clone(&caller));
+    next.run(req).await
+}
+
+fn tools(
+    broker: Arc<Broker>,
+    hosts: Vec<String>,
+    policy: ToolPolicy,
+    server: Option<Arc<ResourceServer>>,
+) -> axum::Router {
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
@@ -261,25 +371,18 @@ pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -
             Arc::new(NeverSessionManager::default()),
             config,
         );
-    let oidc = broker.oidc.clone();
     let guard = PolicyGuard {
         policy,
         rules: Arc::new(BuilditRules),
-        server: oidc.clone(),
+        server,
         reviewer: None,
     };
-    let mcp = axum::Router::new()
+    axum::Router::new()
         .fallback_service(service)
         .layer(axum::middleware::from_fn_with_state(
             Arc::new(guard),
             crucible_mcp_auth::guard::enforce,
         ))
-        .layer(axum::middleware::from_fn_with_state(broker, authenticate));
-    let app = axum::Router::new().nest_service(MCP_PATH, mcp);
-    match oidc {
-        Some(server) => app.merge(crucible_mcp_auth::metadata::router(server)),
-        None => app,
-    }
 }
 
 async fn authenticate(State(broker): State<Arc<Broker>>, mut req: Request, next: Next) -> Response {
@@ -438,12 +541,14 @@ pub enum ClaimError {
     Person,
     #[error("the token is for another run than the one this server serves")]
     OtherRun,
+    #[error("sandbox {0} is the run's own caller, served on its socket alone")]
+    RunCaller(String),
 }
 
 impl Caller {
-    /// The principal a tokens-file caller stands for, claims shaped like a realm token's so one
-    /// tool policy covers both.
-    pub fn token_file_principal(&self) -> Principal {
+    /// The principal a caller without a realm token stands for (a tokens-file line, or the run on
+    /// its socket), claims shaped like a realm token's so one tool policy covers all of them.
+    pub fn principal(&self) -> Principal {
         let subject = format!("sandbox:{}", self.sandbox.as_str());
         let scope = format!("{SCOPE_READ} {SCOPE_BUILD}");
         let claims = serde_json::json!({
@@ -480,6 +585,8 @@ pub struct Broker {
     queue: Option<String>,
     run_id: Option<String>,
     push: Option<PushTarget>,
+    /// The sandbox name the run builds under on its socket, which no token may name.
+    run_caller: Option<SandboxName>,
 }
 
 /// Where `push` publishes: one repository the operator chose, and the authfile for it.
@@ -527,7 +634,7 @@ cat "$d""#,
     ])
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PushParams {
     /// build_id of a build whose status is succeeded
     pub build_id: String,
@@ -540,11 +647,14 @@ pub struct PushReply {
     pub image: String,
     /// The tag it was pushed under
     pub tag: String,
+    /// The digest of the context it was built from
+    pub context_digest: Option<ContextDigest>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct BuildParams {
-    /// Build context: a subdirectory of the workspace, e.g. "svc/api"
+    /// Build context: a subdirectory of the workspace, e.g. "svc/api", or on a local workspace
+    /// an absolute path inside it
     pub context: String,
     /// Dockerfile path relative to the context (default "Dockerfile")
     pub dockerfile: Option<String>,
@@ -558,13 +668,13 @@ pub struct BuildParams {
     pub timeout_s: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct StatusParams {
     /// build_id from build
     pub build_id: String,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct RunParams {
     /// build_id of a build whose status is succeeded
     pub build_id: String,
@@ -577,7 +687,7 @@ pub struct RunParams {
     pub fetch_paths: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct LogsParams {
     /// build_id from build
     pub build_id: String,
@@ -597,7 +707,7 @@ pub struct LogsParams {
     pub max_bytes: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CleanParams {
     /// Build to delete; omit to delete every build of this sandbox
     pub build_id: Option<String>,
@@ -636,30 +746,58 @@ impl PodView {
 }
 
 enum Found {
-    Live(BuilderPod),
+    Live {
+        pod: BuilderPod,
+        context_digest: Option<ContextDigest>,
+    },
     Ended {
         pod: BuilderPod,
         state: step::State,
         created: String,
+        context_digest: Option<ContextDigest>,
     },
 }
 
-#[derive(Debug, Serialize)]
+impl Found {
+    fn context_digest(&self) -> Option<&ContextDigest> {
+        match self {
+            Found::Live { context_digest, .. } | Found::Ended { context_digest, .. } => {
+                context_digest.as_ref()
+            }
+        }
+    }
+}
+
+// the digest a build's live pod was annotated with when buildit created it
+fn annotated_digest(pods: &[Pod]) -> Option<ContextDigest> {
+    pods.iter()
+        .find(|p| p.metadata.deletion_timestamp.is_none())?
+        .metadata
+        .annotations
+        .as_ref()?
+        .get(ANNOTATION_CONTEXT_DIGEST)
+        .and_then(|raw| ContextDigest::parse(raw).ok())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct BuildReply {
     pub build_id: String,
     pub status: Status,
+    /// The digest of the context buildit uploaded for this build
+    pub context_digest: ContextDigest,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StatusReply {
     pub build_id: String,
     pub status: Status,
     pub exit: Option<i32>,
     pub timed_out: bool,
     pub log_tail: String,
+    pub context_digest: Option<ContextDigest>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RunReply {
     pub log: String,
     pub exit: Option<i32>,
@@ -858,7 +996,7 @@ impl Broker {
                     sandbox = caller.sandbox.as_str(),
                     "caller authenticated"
                 );
-                let principal = caller.token_file_principal();
+                let principal = caller.principal();
                 Ok((caller, principal))
             }
             Err(StatusCode::UNAUTHORIZED) if self.oidc.is_some() => {
@@ -906,6 +1044,9 @@ impl Broker {
             .and_then(serde_json::Value::as_str)
             .ok_or(ClaimError::NoSandbox)?;
         let sandbox = SandboxName::parse(raw).map_err(|_| ClaimError::Sandbox(raw.to_string()))?;
+        if self.run_caller.as_ref() == Some(&sandbox) {
+            return Err(ClaimError::RunCaller(raw.to_string()));
+        }
         let workdir = match principal
             .claims
             .get("workdir")
@@ -957,6 +1098,14 @@ impl Broker {
                 }
             })
             .ok_or(StatusCode::UNAUTHORIZED)?;
+        if self.run_caller.as_ref() == Some(&line.sandbox) {
+            tracing::error!(
+                "{}: sandbox {} is the run's own caller, served on its socket alone",
+                tokens_file.display(),
+                line.sandbox.as_str()
+            );
+            return Err(StatusCode::FORBIDDEN);
+        }
         let Some(workspace) = self.workspace(line.workdir) else {
             tracing::error!(
                 "sandbox {} has no workdir and BROKER_SANDBOX_WORKDIR is unset",
@@ -998,8 +1147,12 @@ impl Broker {
             return Ok(None);
         };
         let pod = BuilderPod::existing(self.client.clone(), &self.namespace, &id.0);
+        let context_digest = annotated_digest(&pods);
         Ok(Some(match view {
-            PodView::Live => Found::Live(pod),
+            PodView::Live => Found::Live {
+                pod,
+                context_digest,
+            },
             PodView::Ended(state) => Found::Ended {
                 pod,
                 state,
@@ -1008,6 +1161,7 @@ impl Broker {
                     .find_map(|p| p.metadata.creation_timestamp.as_ref())
                     .map(|t| t.0.to_string())
                     .unwrap_or_default(),
+                context_digest,
             },
         }))
     }
@@ -1018,14 +1172,22 @@ impl Broker {
             .ok_or_else(|| anyhow!("no live build {}; build again", id.0))
     }
 
-    async fn find(&self, sandbox: &SandboxName, id: &BuildId) -> Result<BuilderPod> {
+    // the build's live pod and the digest of its context
+    async fn find(
+        &self,
+        sandbox: &SandboxName,
+        id: &BuildId,
+    ) -> Result<(BuilderPod, Option<ContextDigest>)> {
         match self.lookup(sandbox, id).await? {
-            Found::Live(pod) => Ok(pod),
+            Found::Live {
+                pod,
+                context_digest,
+            } => Ok((pod, context_digest)),
             Found::Ended { .. } => bail!("build {}'s pod has ended; build again", id.0),
         }
     }
 
-    fn builder_pod(&self, caller: &Caller, id: &BuildId) -> Result<Pod> {
+    fn builder_pod(&self, caller: &Caller, id: &BuildId, digest: &ContextDigest) -> Result<Pod> {
         let opts = PodOpts {
             idle_nodes: &[],
             resources: &self.resources,
@@ -1048,6 +1210,10 @@ impl Broker {
         if let Some(queue) = &self.queue {
             labels.insert(LABEL_QUEUE.to_string(), queue.clone());
         }
+        pod.metadata.annotations.get_or_insert_default().insert(
+            ANNOTATION_CONTEXT_DIGEST.to_string(),
+            digest.as_str().to_string(),
+        );
         let spec = pod.spec.get_or_insert_default();
         spec.active_deadline_seconds = Some(self.deadline_secs);
         spec.automount_service_account_token = Some(false);
@@ -1067,8 +1233,8 @@ impl Broker {
         &self,
         caller: &Caller,
         p: BuildParams,
-    ) -> Result<(BuildId, BuilderPod, Snapshot)> {
-        let context = RelPath::parse(&p.context)?;
+    ) -> Result<(BuildId, BuilderPod, Snapshot, ContextDigest)> {
+        let context = caller.workspace.context(&p.context)?;
         let dockerfile = RelPath::parse(p.dockerfile.as_deref().unwrap_or("Dockerfile"))?;
         let id = BuildId::fresh();
         let bud = bud_argv(&id, &dockerfile, p.target.as_deref(), &p.build_args)?;
@@ -1097,9 +1263,11 @@ impl Broker {
                 .workspace
                 .fetch_context(&caller.sandbox, &context, &ctx)
         })?;
-        let tarball = crate::context::tarball(&ctx)?;
+        let tar = crate::context::tar_bytes(&ctx)?;
+        let digest = crate::context::digest(&tar)?;
+        let tarball = crate::context::gzip(&tar)?;
         tracing::info!(
-            "build {}: sandbox {} context {} ({} KiB)",
+            "build {}: sandbox {} context {} {digest} ({} KiB)",
             id.0,
             caller.sandbox.as_str(),
             context.as_str(),
@@ -1108,7 +1276,7 @@ impl Broker {
         let pod = BuilderPod::create_from(
             self.client.clone(),
             &self.namespace,
-            &self.builder_pod(caller, &id)?,
+            &self.builder_pod(caller, &id, &digest)?,
         )
         .await?;
         let built = async {
@@ -1131,7 +1299,7 @@ impl Broker {
         }
         .await;
         match built {
-            Ok(snap) => Ok((id, pod, snap)),
+            Ok(snap) => Ok((id, pod, snap, digest)),
             Err(e) => {
                 if let Err(e) = pod.delete().await {
                     tracing::warn!("deleting builder pod {}: {e:#}", id.0);
@@ -1142,10 +1310,11 @@ impl Broker {
     }
 
     pub async fn build(&self, caller: &Caller, p: BuildParams) -> Result<BuildReply> {
-        let (id, _, snap) = self.start_build(caller, p).await?;
+        let (id, _, snap, context_digest) = self.start_build(caller, p).await?;
         Ok(BuildReply {
             build_id: id.0,
             status: snap.state.status(),
+            context_digest,
         })
     }
 
@@ -1154,7 +1323,7 @@ impl Broker {
             bail!("this server publishes no builds: it was started without --push-repo");
         };
         let id = BuildId::parse(&p.build_id)?;
-        let pod = self.find(&caller.sandbox, &id).await?;
+        let (pod, context_digest) = self.find(&caller.sandbox, &id).await?;
         match step::snapshot(&pod, LogName::Build).await?.map(|s| s.state) {
             Some(step::State::Exited { code: 0, .. }) => {}
             Some(step::State::Running) => bail!("build {} is still building; poll status", id.0),
@@ -1177,6 +1346,7 @@ impl Broker {
             build_id: id.0,
             image: format!("{}@{digest}", target.repo),
             tag,
+            context_digest,
         })
     }
 
@@ -1197,7 +1367,7 @@ impl Broker {
         found: &Found,
     ) -> Result<Option<(Snapshot, StatusReply)>> {
         let (snap, log_tail) = match found {
-            Found::Live(pod) => {
+            Found::Live { pod, .. } => {
                 let Some(snap) = step::snapshot(pod, LogName::Build).await? else {
                     return Ok(None);
                 };
@@ -1207,6 +1377,7 @@ impl Broker {
                 pod,
                 state,
                 created,
+                ..
             } => {
                 let tail = match Log::from_container(pod, SUMMARY_WINDOW).await {
                     Ok(log) => summary(&log),
@@ -1231,6 +1402,7 @@ impl Broker {
             exit: snap.state.exit(),
             timed_out: snap.state.timed_out(),
             log_tail,
+            context_digest: found.context_digest().cloned(),
         };
         Ok(Some((snap, reply)))
     }
@@ -1249,7 +1421,7 @@ impl Broker {
             .iter()
             .map(|f| RelPath::parse(f.trim_start_matches('/')))
             .collect::<Result<Vec<_>>>()?;
-        let pod = self.find(&caller.sandbox, &id).await?;
+        let (pod, _) = self.find(&caller.sandbox, &id).await?;
         let built = step::snapshot(&pod, LogName::Build)
             .await?
             .ok_or_else(|| anyhow!("build {} has no build step", id.0))?;
@@ -1377,7 +1549,7 @@ impl Broker {
             };
             return Ok(Some((snap, view)));
         }
-        let Found::Live(pod) = found else {
+        let Found::Live { pod, .. } = found else {
             return Ok(None);
         };
         let Some(mut snap) = step::snapshot(&pod, t.log).await? else {
@@ -1425,7 +1597,7 @@ impl Broker {
             return Ok(None);
         };
         let pod = match found {
-            Found::Live(pod) => pod,
+            Found::Live { pod, .. } => pod,
             Found::Ended { .. } if t.log == LogName::Build => return Ok(Some(())),
             Found::Ended { .. } => return Ok(None),
         };
@@ -1451,7 +1623,7 @@ impl Broker {
             .unwrap_or(DEFAULT_LOG_BYTES)
             .clamp(1024, MAX_LOG_BYTES);
         let log = match self.lookup(sandbox, &id).await? {
-            Found::Live(pod) => Log::fetch(&pod, name, MAX_READ).await?,
+            Found::Live { pod, .. } => Log::fetch(&pod, name, MAX_READ).await?,
             Found::Ended { pod, .. } if name == LogName::Build => {
                 Log::from_container(&pod, MAX_READ).await?
             }
@@ -1628,7 +1800,7 @@ impl BuilditMcp {
             return complete(async { self.broker.build(&caller(&ctx)?, p).await }.await);
         }
         let started = async { self.broker.start_build(&caller(&ctx)?, p).await }.await;
-        let (id, _, snap) = started.map_err(|e| format!("{e:#}"))?;
+        let (id, _, snap, _) = started.map_err(|e| format!("{e:#}"))?;
         let t = TaskRef {
             build: id,
             log: LogName::Build,
@@ -1771,6 +1943,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::backend::Resources;
+    use crate::context::ContextDigest;
     use std::time::Duration;
 
     use k8s_openapi::api::core::v1::Pod;
@@ -1779,7 +1952,8 @@ mod tests {
         Broker, BuildId, BuildParams, BuilditMcp, BuilditRules, Caller, KUEUE_GATE, LABEL_QUEUE,
         Launcher, LogsParams, MCP_PATH, PodView, PushParams, PushTarget, ResourceServer,
         ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, StatusCode, TokenLine, ToolPolicy,
-        TrustedIssuer, bud_argv, build_limit, held, parse_tokens, push_argv, router, unpack,
+        TrustedIssuer, annotated_digest, bind_socket, bud_argv, build_limit, held, parse_tokens,
+        push_argv, router, run_sandbox, socket_router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crate::step::{State, Status};
@@ -1811,7 +1985,12 @@ mod tests {
             queue: None,
             run_id: None,
             push: None,
+            run_caller: None,
         })
+    }
+
+    fn digest() -> ContextDigest {
+        ContextDigest::parse(&format!("sha256:{}", "ab".repeat(32))).unwrap()
     }
 
     fn sandbox_caller(sandbox: &str) -> Caller {
@@ -2026,7 +2205,7 @@ mod tests {
             "spiffe://example.crucible/openshell/sandbox/auth-spike"
         );
         let pod = broker
-            .builder_pod(&caller, &BuildId::parse("buildit-1").unwrap())
+            .builder_pod(&caller, &BuildId::parse("buildit-1").unwrap(), &digest())
             .unwrap();
         assert_eq!(
             pod.metadata.labels.unwrap()["crucible.dev/launched-by"],
@@ -2093,6 +2272,84 @@ mod tests {
             "a subject that is no label value is kept as a label-safe one: {}",
             launcher.as_str()
         );
+    }
+
+    #[test]
+    fn the_run_builds_under_one_name_per_run_that_no_sandbox_takes() {
+        let a = run_sandbox(Some("crucible-run-brave-otter")).unwrap();
+        assert_eq!(
+            a,
+            run_sandbox(Some("crucible-run-brave-otter")).unwrap(),
+            "stable across restarts of the run's server"
+        );
+        assert_ne!(a, run_sandbox(Some("crucible-run-calm-heron")).unwrap());
+        assert!(
+            a.as_str().starts_with("loop-") && a.as_str().len() == 21,
+            "{a:?}"
+        );
+        assert!(crate::sandbox::is_label_value(a.as_str()));
+        assert_eq!(run_sandbox(None).unwrap().as_str(), "loop");
+    }
+
+    #[tokio::test]
+    async fn no_token_may_name_the_runs_own_caller() {
+        let run = run_sandbox(Some("crucible-run-brave-otter")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let file = tokens(
+            dir.path(),
+            &format!("tok-run {}\ntok-a sb-a\n", run.as_str()),
+        );
+        let (_jwks, realm) = realm_broker(&file).await;
+        let broker = Broker {
+            run_caller: Some(run.clone()),
+            ..Arc::into_inner(realm).unwrap()
+        };
+        assert_eq!(
+            broker
+                .caller(&headers(&[("authorization", "Bearer tok-run")]))
+                .await,
+            Err(StatusCode::FORBIDDEN)
+        );
+        assert!(
+            broker
+                .caller(&headers(&[("authorization", "Bearer tok-a")]))
+                .await
+                .is_ok()
+        );
+        let mut claims = realm_claims();
+        claims["sandbox"] = serde_json::json!(run.as_str());
+        let token = crucible_mcp_auth::testing::sign("a", &claims);
+        let refused = broker
+            .authenticate(&bearer_header(&token))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            status_of(broker.respond(&bearer_header(&token), refused))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let ours = crucible_mcp_auth::testing::sign("a", &realm_claims());
+        assert!(broker.authenticate(&bearer_header(&ours)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_socket_replaces_a_stale_one_is_private_and_never_clobbers_a_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("buildit.sock");
+        drop(bind_socket(&path).unwrap());
+        assert!(path.exists(), "a dropped listener leaves its socket file");
+        let _live = bind_socket(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        tokio::net::UnixStream::connect(&path).await.unwrap();
+
+        let file = dir.path().join("state.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let e = bind_socket(&file).unwrap_err();
+        assert!(format!("{e:#}").contains("not a socket"), "{e:#}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"{}");
     }
 
     #[tokio::test]
@@ -2733,8 +2990,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let broker = broker(offline_client(), &tokens(dir.path(), ""), None);
         let id = BuildId::parse("buildit-1").unwrap();
-        let pod = serde_json::to_value(broker.builder_pod(&sandbox_caller("sb-a"), &id).unwrap())
-            .unwrap();
+        let pod = serde_json::to_value(
+            broker
+                .builder_pod(&sandbox_caller("sb-a"), &id, &digest())
+                .unwrap(),
+        )
+        .unwrap();
         assert_eq!(refused_by_admission(&pod), Vec::<String>::new());
 
         let escape = |edit: &dyn Fn(&mut serde_json::Value)| {
@@ -3004,14 +3265,15 @@ mod tests {
         let caller = sandbox_caller("sb-a");
         let id = BuildId::parse("buildit-1").unwrap();
         let plain = broker(offline_client(), &tokens(dir.path(), ""), None)
-            .builder_pod(&caller, &id)
+            .builder_pod(&caller, &id, &digest())
             .unwrap();
         assert!(!plain.metadata.labels.unwrap().contains_key(LABEL_QUEUE));
         let queued = Broker {
             queue: Some("builds".to_string()),
             ..Arc::into_inner(broker(offline_client(), &tokens(dir.path(), ""), None)).unwrap()
         };
-        let mut gated = serde_json::to_value(queued.builder_pod(&caller, &id).unwrap()).unwrap();
+        let mut gated =
+            serde_json::to_value(queued.builder_pod(&caller, &id, &digest()).unwrap()).unwrap();
         assert_eq!(gated["metadata"]["labels"][LABEL_QUEUE], "builds");
 
         gated["metadata"]["labels"]["kueue.x-k8s.io/managed"] = serde_json::json!("true");
@@ -3096,7 +3358,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let broker = broker(offline_client(), &tokens(dir.path(), ""), None);
         let id = BuildId::parse("buildit-1").unwrap();
-        let pod = broker.builder_pod(&sandbox_caller("sb-a"), &id).unwrap();
+        let pod = broker
+            .builder_pod(&sandbox_caller("sb-a"), &id, &digest())
+            .unwrap();
+        assert_eq!(
+            annotated_digest(std::slice::from_ref(&pod)),
+            Some(digest()),
+            "the context digest outlives the server on the pod"
+        );
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(labels["buildit.dev/sandbox"], "sb-a");
         assert_eq!(labels["buildit.dev/build-id"], "buildit-1");
@@ -3128,7 +3397,7 @@ mod tests {
         let sandbox = sandbox_caller("sb-a");
         let id = BuildId::parse("buildit-1").unwrap();
         let unpinned = broker(offline_client(), &tokens(dir.path(), ""), None)
-            .builder_pod(&sandbox, &id)
+            .builder_pod(&sandbox, &id, &digest())
             .unwrap();
         let arch = |pod: Pod| {
             pod.spec
@@ -3143,7 +3412,7 @@ mod tests {
             ..Arc::into_inner(broker(offline_client(), &tokens(dir.path(), ""), None)).unwrap()
         };
         assert_eq!(
-            arch(pinned.builder_pod(&sandbox, &id).unwrap()).as_deref(),
+            arch(pinned.builder_pod(&sandbox, &id, &digest()).unwrap()).as_deref(),
             Some("amd64")
         );
     }
@@ -3734,5 +4003,112 @@ done; echo "$n""#;
         assert_eq!(cleaned["deleted"], serde_json::json!(both));
         assert!(get_task(&a, &build).await.is_err());
         assert!(cancel_task(&a, &fetch).await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_the_runs_socket_builds_runs_and_reports_the_context_it_built() {
+        use crate::client::{Call, run};
+        use crate::mcp::{CleanParams, RunParams};
+        use std::os::unix::fs::PermissionsExt;
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap().join("ws");
+        let svc = work.join("svc");
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::write(
+            svc.join("Dockerfile"),
+            "FROM docker.io/library/busybox:latest\nCOPY run.sh /run.sh\nRUN echo socket-build\n",
+        )
+        .unwrap();
+        std::fs::write(svc.join("run.sh"), "#!/bin/sh\necho ran-from-context\n").unwrap();
+        std::fs::set_permissions(svc.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        let caller = Caller {
+            sandbox: run_sandbox(Some("buildit-socket-e2e")).unwrap(),
+            workspace: Workspace::Local { dir: work.clone() },
+            launched_by: None,
+        };
+        let socket = tmp.path().join("buildit.sock");
+        let listener = bind_socket(&socket).unwrap();
+        let app = socket_router(
+            broker(client, &tokens(tmp.path(), ""), None),
+            caller,
+            ToolPolicy::from_toml(POLICY).unwrap(),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let build = |wait| Call::Build {
+            params: BuildParams {
+                context: svc.to_str().unwrap().to_string(),
+                dockerfile: None,
+                target: None,
+                build_args: BTreeMap::new(),
+                timeout_s: None,
+            },
+            wait,
+        };
+        let expected = crate::context::digest_dir(&svc).unwrap();
+
+        let built = run(&socket, build(true)).await;
+        assert!(built.ok, "{}", built.reply);
+        assert_eq!(built.reply["status"], "succeeded", "{}", built.reply);
+        assert_eq!(built.reply["context_digest"], expected.as_str());
+        assert!(
+            built.reply["log_tail"]
+                .as_str()
+                .unwrap()
+                .contains("socket-build")
+        );
+        let id = built.reply["build_id"].as_str().unwrap().to_string();
+
+        let exec = |cmd: &[&str]| {
+            Call::Run(RunParams {
+                build_id: id.clone(),
+                cmd: cmd.iter().map(|s| s.to_string()).collect(),
+                timeout_s: None,
+                fetch_paths: Vec::new(),
+            })
+        };
+        let ran = run(&socket, exec(&["/run.sh"])).await;
+        assert!(ran.ok, "{}", ran.reply);
+        assert!(
+            ran.reply["log_tail"]
+                .as_str()
+                .unwrap()
+                .contains("ran-from-context")
+        );
+        let failed = run(&socket, exec(&["sh", "-c", "exit 3"])).await;
+        assert!(!failed.ok, "{}", failed.reply);
+        assert_eq!(failed.reply["exit"], 3);
+
+        let pushed = run(
+            &socket,
+            Call::Push(PushParams {
+                build_id: id.clone(),
+            }),
+        )
+        .await;
+        assert!(!pushed.ok);
+        assert!(
+            pushed.reply["error"]
+                .as_str()
+                .unwrap()
+                .contains("publishes no builds")
+        );
+
+        let started = run(&socket, build(false)).await;
+        assert!(started.ok, "{}", started.reply);
+        assert_eq!(started.reply["status"], "running");
+        assert_eq!(started.reply["context_digest"], expected.as_str());
+        let second = started.reply["build_id"].as_str().unwrap().to_string();
+
+        let cleaned = run(&socket, Call::Clean(CleanParams { build_id: None })).await;
+        assert!(cleaned.ok, "{}", cleaned.reply);
+        let mut both = vec![id, second];
+        both.sort();
+        assert_eq!(cleaned.reply["deleted"], serde_json::json!(both));
     }
 }

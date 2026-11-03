@@ -20,11 +20,12 @@ const SECRET_COLUMNS: &str = "id, name, owner, kind, visibility, consumer, mode,
 
 const BINDING_COLUMNS: &str = "id, secret_id, scope_kind, scope_id, projection_kind, projection, \
                                declared_name, pack_rev, pack_digest, schema_digest, created_by, \
-                               created_at";
+                               created_at, origin, origin_binding";
 
 /// [`BINDING_COLUMNS`] qualified by the `b` alias, for the bindings-with-secrets join.
 const BINDING_COLUMNS_B: &str = "b.id, b.secret_id, b.scope_kind, b.scope_id, b.projection_kind, b.projection, \
-    b.declared_name, b.pack_rev, b.pack_digest, b.schema_digest, b.created_by, b.created_at";
+    b.declared_name, b.pack_rev, b.pack_digest, b.schema_digest, b.created_by, b.created_at, \
+    b.origin, b.origin_binding";
 
 /// [`SECRET_COLUMNS`] qualified by the `s` alias and renamed `sec_*`, so the join's secret half
 /// decodes apart from its binding half.
@@ -100,6 +101,17 @@ pub struct BindingRow {
     pub schema_digest: Option<String>,
     pub created_by: Option<String>,
     pub created_at: String,
+    /// The blueprint this binding came from (RFC-0006 C-CARRY).
+    pub origin: Option<String>,
+    /// The binding on that blueprint it copies.
+    pub origin_binding: Option<String>,
+}
+
+/// Where a carried binding was copied from.
+#[derive(Debug, Clone, Copy)]
+pub struct Origin<'a> {
+    pub blueprint: &'a str,
+    pub binding: &'a str,
 }
 
 /// What a bind stores.
@@ -314,16 +326,35 @@ pub async fn insert_binding(
     conn: &mut PgConnection,
     new: &NewBinding<'_>,
 ) -> Result<BindingRow, StoreError> {
+    insert_binding_row(conn, new, None).await
+}
+
+/// Store a binding carried from a blueprint, recording its source.
+pub async fn insert_carried_binding(
+    conn: &mut PgConnection,
+    new: &NewBinding<'_>,
+    source: Origin<'_>,
+) -> Result<BindingRow, StoreError> {
+    insert_binding_row(conn, new, Some(source)).await
+}
+
+async fn insert_binding_row(
+    conn: &mut PgConnection,
+    new: &NewBinding<'_>,
+    source: Option<Origin<'_>>,
+) -> Result<BindingRow, StoreError> {
     let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO secret_bindings (id, secret_id, scope_kind, scope_id, projection_kind,
                                         projection, declared_name, pack_rev, schema_digest,
-                                        created_by, created_at, pack_digest)
+                                        created_by, created_at, pack_digest, origin,
+                                        origin_binding)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                    COALESCE(
                        (SELECT tree_digest FROM playbooks
                         WHERE $3 = 'playbook' AND id = $4 AND rev = $8),
                        (SELECT tree_digest FROM pack_digest_aliases
-                        WHERE $3 = 'playbook' AND old_digest = $8)))
+                        WHERE $3 = 'playbook' AND old_digest = $8)),
+                   $12, $13)
            RETURNING {BINDING_COLUMNS}"#
     ))
     .bind(new.id)
@@ -337,6 +368,8 @@ pub async fn insert_binding(
     .bind(new.schema_digest)
     .bind(new.created_by)
     .bind(crate::clock::now_rfc3339())
+    .bind(source.map(|s| s.blueprint))
+    .bind(source.map(|s| s.binding))
     .fetch_one(conn)
     .await;
     match row {

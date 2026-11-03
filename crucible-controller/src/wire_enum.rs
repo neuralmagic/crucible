@@ -177,6 +177,7 @@ mod tests {
     #[test]
     fn every_wire_enum_round_trips() {
         assert_round_trip::<Status>();
+        assert_round_trip::<crate::playbooks::blueprints::PlaceholderReason>();
         assert_round_trip::<ParkedBy>();
         assert_round_trip::<UpstreamState>();
         assert_round_trip::<BuildState>();

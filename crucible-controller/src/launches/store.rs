@@ -6,7 +6,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use crate::launches::model::{NewPlaybookLaunch, PlaybookLaunch, PlaybookRun};
+use crate::launches::model::{LaunchFilter, NewPlaybookLaunch, PlaybookLaunch, PlaybookRun};
 use crate::model::{LaunchOrigin, Status};
 use crate::playbooks::exposure::Exposure;
 use crate::playbooks::registry::PackRevision;
@@ -104,7 +104,7 @@ pub(crate) async fn get_playbook_launch(
 ) -> Result<Option<PlaybookLaunch>> {
     let row = sqlx::query!(
         "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, \
-         launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from \
+         launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from, variant \
          FROM playbook_launches WHERE key = $1",
         key,
     )
@@ -134,7 +134,31 @@ pub(crate) async fn get_playbook_launch(
             run,
             from: serde_json::from_value(row.rerun_from).unwrap_or_default(),
         }),
+        variant: row
+            .variant
+            .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+            .transpose()
+            .with_context(|| format!("stored manifest variant for {key}"))?,
     }))
+}
+
+/// The manifest variant the launch under `key` runs. `None` for the base manifest, and for a key
+/// that names no playbook launch.
+pub(crate) async fn launch_variant(
+    pool: &PgPool,
+    key: &str,
+) -> Result<Option<crucible::manifest::variant::VariantName>> {
+    let stored: Option<Option<String>> =
+        sqlx::query_scalar("SELECT variant FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .context("reading a launch's manifest variant")?;
+    stored
+        .flatten()
+        .map(|v| crucible::manifest::variant::VariantName::parse(&v))
+        .transpose()
+        .with_context(|| format!("stored manifest variant for {key}"))
 }
 
 /// The stored group snapshot as plain strings. A row written before the snapshot existed, or one
@@ -182,14 +206,13 @@ fn decode_params(params: &serde_json::Value) -> Vec<(String, String)> {
 }
 
 /// The runs surface: launches with the authorization they froze, what the run did, and what it
-/// cost. `key = Some(..)` reads one launch of any origin (a relaunch prefills from it); `None`
-/// lists the ad-hoc ones, since a schedule's firings belong to the schedules surface.
+/// cost, newest first.
 ///
 /// A launch's runs are the `runs` rows carrying its key as `issue`.
 #[tracing::instrument(name = "db.list_playbook_runs", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn list_playbook_runs(
     pool: &PgPool,
-    key: Option<&str>,
+    filter: &LaunchFilter,
     limit: i64,
 ) -> Result<Vec<PlaybookRun>> {
     let rows = sqlx::query!(
@@ -214,11 +237,19 @@ pub(crate) async fn list_playbook_runs(
             FROM runs r
             WHERE r.issue = pl.key
         ) c ON TRUE
-        WHERE ($1::text IS NULL AND pl.origin <> 'schedule') OR pl.key = $1
+        WHERE ($1::text IS NULL OR pl.key = $1)
+          AND ($2::text IS NULL OR i.status = $2)
+          AND ($3::text IS NULL OR pl.playbook = $3)
+          AND ($4::text IS NULL OR pl.origin = $4)
+          AND ($5::text IS NULL OR pl.dedupe_schedule = $5)
         ORDER BY pl.created_at DESC, pl.key DESC
-        LIMIT $2
+        LIMIT $6
         "#,
-        key,
+        filter.key.as_deref(),
+        filter.status.map(Status::as_str),
+        filter.playbook.as_deref(),
+        filter.origin.map(LaunchOrigin::as_str),
+        filter.schedule.as_deref(),
         limit,
     )
     .fetch_all(pool)
@@ -257,7 +288,7 @@ pub(crate) async fn list_playbook_runs(
 #[tracing::instrument(name = "db.list_runs_for_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn list_runs_for_launch(ex: impl PgExecutor<'_>, key: &str) -> Result<Vec<Run>> {
     let sql = const_format::formatcp!(
-        "SELECT {RUN_COLS} FROM runs WHERE issue = $1 ORDER BY run_id DESC"
+        "SELECT {RUN_COLS} FROM runs WHERE issue = $1 ORDER BY created_at DESC, seq DESC"
     );
     sqlx::query_as::<_, crate::runs::model::Run>(sql)
         .bind(key)
@@ -522,10 +553,12 @@ pub(crate) async fn launch_exposure(
     let pack = crate::playbooks::packs::materialize_pack(pool, issue_key)
         .await?
         .with_context(|| format!("no stored pack for launch {issue_key}"))?;
-    let extracted =
-        tokio::task::spawn_blocking(move || crate::playbooks::exposure::extract(pack.path(), None))
-            .await
-            .context("joining the launch exposure worker")?;
+    let variant = launch.variant.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        crate::playbooks::exposure::extract(pack.path(), None, variant.as_ref())
+    })
+    .await
+    .context("joining the launch exposure worker")?;
     let exposure = match extracted {
         Ok(exposure) => exposure,
         Err(crate::playbooks::exposure::ExtractError::Refused(message)) => {

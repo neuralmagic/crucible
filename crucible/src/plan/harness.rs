@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::Context;
 use clap::ValueEnum;
 
 use serde_json::Value;
@@ -40,6 +41,9 @@ use crate::plan::STAGED_INPUTS;
 /// The most a single run may capture. Operator-owned, and the run's bound rather than any one
 /// task's: a pipeline that captures a little at every stage can still fill a disk.
 const MAX_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Upstream results larger than this reach an agent as a file instead of inline in its prompt.
+const MAX_INLINE_INPUTS_BYTES: usize = 64 * 1024;
 
 /// A declared path resolved inside the workspace, or why it is refused. Symlinks are refused per
 /// component and a second name is refused outright, for the same reason the pack's own paths are:
@@ -617,17 +621,45 @@ fn withheld(attempt: Attempt, why: String) -> Attempt {
 fn agent_prompt(
     prompt: &str,
     inputs: &BTreeMap<TaskName, Value>,
-) -> Result<String, serde_json::Error> {
+    workspace: &Path,
+) -> anyhow::Result<String> {
     let history_key = TaskName(crate::plan::ir::HISTORY_INPUT.to_string());
     let mut upstream = inputs.clone();
     let history = upstream.remove(&history_key);
-    let inputs_json = serde_json::to_string_pretty(&upstream)?;
+    let inputs_json =
+        serde_json::to_string_pretty(&upstream).context("serializing upstream task results")?;
+
+    let inputs_section = if inputs_json.len() > MAX_INLINE_INPUTS_BYTES {
+        let declared = format!("{STAGED_INPUTS}/.task-results.json");
+        let path = confined(workspace, &declared).map_err(anyhow::Error::msg)?;
+
+        std::fs::create_dir_all(workspace.join(STAGED_INPUTS))
+            .context("creating the agent inputs directory")?;
+        engine_mode(&path);
+        std::fs::write(&path, &inputs_json).context("writing complete agent task inputs")?;
+
+        let mut permissions = std::fs::metadata(&path)
+            .context("reading agent input file permissions")?
+            .permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&path, permissions)
+            .context("making agent task inputs read-only")?;
+
+        format!(
+            "Full upstream task results are in `{declared}` ({} bytes). Read and query this JSON file as needed; it contains every upstream result.",
+            inputs_json.len(),
+        )
+    } else {
+        format!("Upstream task results, as JSON:\n\n{inputs_json}")
+    };
+
     let history_section = match history {
-        Some(history) => crate::plan::history::history_section(&history)?,
+        Some(history) => crate::plan::history::history_section(&history)
+            .context("rendering agent task history")?,
         None => String::new(),
     };
     Ok(format!(
-        "{prompt}\n\n## Task inputs\n\nUpstream task results, as JSON:\n\n{inputs_json}\n\n\
+        "{prompt}\n\n## Task inputs\n\n{inputs_section}\n\n\
          {history_section}## Result contract\n\nWhen done, write your final result as a single \
          JSON object to `{RESULT_FILE}` in the workspace root. The run is graded on that file."
     ))
@@ -819,9 +851,22 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         | TaskKind::Evaluate { .. }
         | TaskKind::Route { .. }
         | TaskKind::Report { .. } => {
+            let buildit_socket = match task.task {
+                TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
+                    match crate::openshell::agent_servers::run_buildit(args.buildit_socket.as_ref())
+                    {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            return Attempt::transport(TransportCause::Other, format!("{e:#}"));
+                        }
+                    }
+                }
+                _ => None,
+            };
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
+                buildit_socket,
             };
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs, deadline)
@@ -863,9 +908,9 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         );
     }
 
-    let full_prompt = match agent_prompt(prompt, inputs) {
+    let full_prompt = match agent_prompt(prompt, inputs, &paths.workspace) {
         Ok(p) => p,
-        Err(e) => return Attempt::failed(0.0, format!("inputs not serializable: {e}")),
+        Err(e) => return Attempt::failed(0.0, format!("preparing task prompt failed: {e:#}")),
     };
 
     let ledgered = task.session.is_some();
@@ -1358,6 +1403,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: sandboxed_args(),
@@ -1519,6 +1565,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -1782,12 +1829,14 @@ mod tests {
 
         let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
+            None,
             &BTreeMap::new(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
                 harness: Some(crate::manifest::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
+            crate::cli::setup::Start::Fresh,
         )
         .unwrap();
         assert_eq!(overridden.args.harness(), crate::manifest::Harness::Codex);
@@ -1802,6 +1851,208 @@ mod tests {
             "the toolbox lands in the override harness's skills dir"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A launch's agent settings reach each task's turn through the real setup path:
+    /// `*.<setting>` fills what a task leaves unset, `<task>.<setting>` replaces what it sets, and
+    /// a run-wide flag still decides what neither a task nor a launch value does.
+    #[test]
+    fn launch_settings_reach_each_tasks_turn() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-plan-launch-settings-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [repo]
+            path = "."
+            [workspace]
+            dir = "workspace"
+            setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=c@l -c user.name=c -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [agent.overrides]
+            allow = ["harness", "model", "effort"]
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+plan = agent(name = "plan", prompt = "p")
+review = agent(name = "review", prompt = "r", model = "authored-review", effort = "low", depends_on = [plan])
+ship = agent(name = "ship", prompt = "s", model = "authored-ship", depends_on = [review])
+workflow(type = "playbook", tasks = [plan, review, ship])
+"#,
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+        let params = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let turns = |pairs: &[(&str, &str)], flags: crate::args::AgentOverride| {
+            let (runner, m) = crate::cli::setup::prep_plan_runner_with_params(
+                &manifest,
+                None,
+                &params(pairs),
+                crate::openshell::gateway::ComputeDriver::Podman,
+                flags,
+                crate::cli::setup::Start::Fresh,
+            )
+            .unwrap();
+            m.workflow
+                .as_ref()
+                .unwrap()
+                .tasks
+                .iter()
+                .map(|t| {
+                    let a = resolved_agent(&runner.args, t).expect("an agent task");
+                    (t.name.0.clone(), (a.harness, a.model, a.effort))
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let turn = |harness: &str, model: &str, effort: &str| {
+            (harness.to_string(), model.to_string(), effort.to_string())
+        };
+
+        let launched = turns(
+            &[
+                ("*.model", "launched-all"),
+                ("*.effort", "high"),
+                ("review.model", "launched-review"),
+                ("ship.harness", "opencode"),
+            ],
+            crate::args::AgentOverride::default(),
+        );
+        assert_eq!(launched["plan"], turn("claude", "launched-all", "high"));
+        assert_eq!(
+            launched["review"],
+            turn("claude", "launched-review", "low"),
+            "the task's own effort beats *.effort; review.model beats its own model"
+        );
+        assert_eq!(launched["ship"], turn("opencode", "authored-ship", "high"));
+
+        let flagged = turns(
+            &[("review.model", "launched-review")],
+            crate::args::AgentOverride {
+                harness: None,
+                model: Some("flag-model".into()),
+            },
+        );
+        assert_eq!(
+            flagged["plan"],
+            turn("claude", "flag-model", "medium"),
+            "the run-wide flag decides what nothing else sets"
+        );
+        assert_eq!(flagged["review"].1, "launched-review");
+        assert_eq!(flagged["ship"].1, "authored-ship");
+
+        let twice = crate::cli::setup::prep_plan_runner_with_params(
+            &manifest,
+            None,
+            &params(&[("*.model", "launched-all")]),
+            crate::openshell::gateway::ComputeDriver::Podman,
+            crate::args::AgentOverride {
+                harness: None,
+                model: Some("flag-model".into()),
+            },
+            crate::cli::setup::Start::Fresh,
+        )
+        .map(|_| ())
+        .expect_err("one setting, two run-wide sources");
+        assert!(twice.to_string().contains("model twice"), "{twice:#}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A launched ref is checked out on a fresh run, refused on a workspace a fresh run did not
+    /// clone, left to the recorded commit on a run that continues one, and, as a commit, kept
+    /// only when a branch or tag the pack admits holds it.
+    #[test]
+    fn a_launched_ref_is_checked_out_where_the_pack_admits_it() {
+        let origin = crate::testing::git_origin("launch-ref");
+        let dir = crate::testing::tempdir("launch-ref-pack");
+        let pack = |refs: &str| {
+            std::fs::write(
+                dir.join("crucible.toml"),
+                format!(
+                    "[repo]\npath = {:?}\n[repo.overrides]\nrefs = {refs}\n\
+                     [workspace]\ndir = \"workspace\"\n\
+                     [agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n\
+                     [workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n",
+                    origin.path.display().to_string()
+                ),
+            )
+            .unwrap();
+        };
+        std::fs::write(
+            dir.join("workflow.star"),
+            "a = agent(name = \"a\", prompt = \"p\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+        let workspace = dir.join("workspace");
+        let prep = |r: &str, start: crate::cli::setup::Start| {
+            crate::cli::setup::prep_plan_runner_with_params(
+                &manifest,
+                None,
+                &BTreeMap::from([("repo.ref".to_string(), r.to_string())]),
+                crate::openshell::gateway::ComputeDriver::Podman,
+                crate::args::AgentOverride::default(),
+                start,
+            )
+            .map(|_| ())
+        };
+        use crate::cli::setup::Start::{Continues, Fresh};
+
+        pack("[\"feature/*\"]");
+        prep("refs/heads/feature/x", Fresh).expect("a launched branch");
+        assert_eq!(
+            crate::testing::checked_out(&workspace),
+            (origin.feature.clone(), true)
+        );
+        let err = prep("feature/x", Fresh).expect_err("the workspace already exists");
+        assert!(
+            format!("{err:#}").contains("needs a fresh checkout"),
+            "{err:#}"
+        );
+        prep("feature/x", Continues).expect("a resume or rerun keeps its recorded commit");
+        let err = prep("main", Continues).expect_err("checked before the workspace is looked at");
+        assert!(
+            format!("{err:#}").contains("no [repo.overrides].refs pattern"),
+            "{err:#}"
+        );
+
+        std::fs::remove_dir_all(&workspace).unwrap();
+        prep(&origin.main, Fresh).expect("main's commit is in feature/x's history");
+        assert_eq!(crate::testing::checked_out(&workspace).0, origin.main);
+
+        std::fs::remove_dir_all(&workspace).unwrap();
+        let err = prep(&origin.dangling, Fresh).expect_err("no ref holds it");
+        assert!(
+            format!("{err:#}").contains("is on no branch or tag"),
+            "{err:#}"
+        );
+        assert!(!workspace.exists(), "a refused clone is removed");
+
+        pack("[\"release/*\"]");
+        let err = prep(&origin.feature, Fresh).expect_err("only feature/x holds it");
+        assert!(format!("{err:#}").contains("[feature/x]"), "{err:#}");
+        assert!(!workspace.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&origin.path);
     }
 
     /// A serial producer's declared file has to reach an isolated consumer, whose worktree is a
@@ -1855,6 +2106,59 @@ workflow(type = "playbook", tasks = [write, copy, review])
                 "round {round}: nothing was captured"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wedged agent instance is stopped and retried in a fresh turn while its batch sibling
+    /// keeps its own result, so one stuck agent costs a retry rather than the run's deadline.
+    #[test]
+    fn a_wedged_agent_is_stopped_and_retried_without_holding_its_batch() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-wedged-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "stuck": {"loop_tool": "$ go list -deps ./cmd/server",
+                        "turns": [{}, {"loop_tool": null, "result": {"traced": true}}]},
+              "steady": {"result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+stuck = agent(name = "stuck", prompt = "trace", isolated = True, timeout = "10m")
+steady = agent(name = "steady", prompt = "trace", isolated = True, timeout = "10m")
+workflow(type = "playbook", tasks = [stuck, steady])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+        let manifest = std::fs::read_to_string(dir.join("crucible.toml")).unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            manifest.replace(
+                "[agent.env]\n",
+                &format!(
+                    "[[agent.tool_plugins]]\n                plugin = \"repeat_guard\"\n                limit = 5\n                [agent.env]\n                FAKE_AGENT_STATE = \"{}\"\n",
+                    dir.join("fake-state").display()
+                ),
+            ),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = run_playbook(&dir);
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+        assert!(out.valid, "{:?}", out.results);
+        let stuck = &out.results[&"stuck".into()];
+        assert_eq!(stuck.status, TaskStatus::Pass);
+        assert_eq!(stuck.attempts, 2, "the wedged turn was retried once");
+        assert_eq!(stuck.output.as_ref().unwrap()["traced"], true);
+        let steady = &out.results[&"steady".into()];
+        assert_eq!((steady.status, steady.attempts), (TaskStatus::Pass, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3505,6 +3809,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -4777,9 +5082,11 @@ workflow(type = "playbook", tasks = [echo])
         .unwrap();
         let mut runner = crate::cli::setup::prep_plan_runner_with_params(
             &manifest_path,
+            None,
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
+            crate::cli::setup::Start::Fresh,
         )
         .unwrap()
         .0;
@@ -5221,6 +5528,124 @@ workflow(type = "playbook", tasks = [author, repro])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn a_real_agent_backend_reads_large_upstream_results_without_a_large_prompt() {
+        let dir = playbook_pack(
+            "large-agent-input-backend",
+            r#"
+produce = command(
+    name = "produce",
+    run = "python3 -c 'import json; print(json.dumps({\"blob\": \"x\" * 180000}))'"
+)
+review = agent(
+    name = "review",
+    prompt = "Inspect all upstream results.",
+    depends_on = [produce]
+)
+workflow(type = "playbook", tasks = [produce, review])
+"#,
+        );
+
+        let script = dir.join("read-inputs.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, pathlib
+
+assert len(os.environ['CRUCIBLE_PROMPT']) < 4096
+
+path = pathlib.Path('inputs/.task-results.json')
+assert path.stat().st_mode & 0o222 == 0
+
+inputs = json.loads(path.read_text())
+assert inputs['produce']['blob'] == 'x' * 180000
+
+pathlib.Path('PLAN_TASK_RESULT.json').write_text(
+    json.dumps({'saw': len(inputs['produce']['blob'])})
+)
+"#,
+        )
+        .unwrap();
+
+        let manifest = dir.join("crucible.toml");
+        let text = std::fs::read_to_string(&manifest).unwrap();
+        let text = text
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("agent_cmd =") {
+                    format!("agent_cmd = \"python3 {}\"", script.display())
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(manifest, text).unwrap();
+
+        let out = run_playbook(&dir);
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            out.results[&TaskName("review".into())]
+                .output
+                .as_ref()
+                .unwrap()["saw"],
+            180000
+        );
+        assert!(
+            git_output(
+                &dir.join("workspace"),
+                &["ls-tree", "-r", "--name-only", "HEAD", "--", "inputs"]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn large_agent_inputs_remain_complete_in_a_read_only_file() {
+        let dir = crate::testing::tempdir("large-agent-inputs");
+        let inputs = BTreeMap::from([(
+            TaskName("measurement".into()),
+            serde_json::json!({"detail": "evidence".repeat(20000)}),
+        )]);
+        let prompt = agent_prompt("Review the evidence.", &inputs, &dir).unwrap();
+
+        assert!(prompt.len() < 4096);
+        assert!(prompt.contains("inputs/.task-results.json"));
+
+        let path = dir.join("inputs/.task-results.json");
+        let held: BTreeMap<TaskName, Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(held, inputs);
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+
+        let updated = BTreeMap::from([(
+            TaskName("measurement".into()),
+            serde_json::json!({"detail": "changed".repeat(20000)}),
+        )]);
+        agent_prompt("Review again.", &updated, &dir).unwrap();
+
+        let held: BTreeMap<TaskName, Value> =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(held, updated);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn large_agent_inputs_refuse_a_symlinked_destination() {
+        let dir = crate::testing::tempdir("agent-input-symlink");
+        let outside = dir.join("outside.json");
+        std::fs::write(&outside, "untouched").unwrap();
+        std::fs::create_dir(dir.join("inputs")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("inputs/.task-results.json")).unwrap();
+
+        let inputs = BTreeMap::from([(
+            TaskName("measurement".into()),
+            serde_json::json!({"detail": "evidence".repeat(20000)}),
+        )]);
+
+        assert!(agent_prompt("Review.", &inputs, &dir).is_err());
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "untouched");
+    }
+
     /// History is text earlier agents wrote. It reaches the prompt inside the external-input
     /// markers and nowhere else, and a marker it carries cannot close the region early.
     #[test]
@@ -5233,7 +5658,12 @@ workflow(type = "playbook", tasks = [author, repro])
                 serde_json::json!({"records": [{"run": "r9", "entry": {"output": {"note": hostile}}}], "dropped": 0}),
             ),
         ]);
-        let prompt = agent_prompt("Fix what broke.", &inputs).unwrap();
+        let prompt = agent_prompt(
+            "Fix what broke.",
+            &inputs,
+            &crate::testing::tempdir("agent-history"),
+        )
+        .unwrap();
         let (head, marked) = prompt
             .split_once("<<<EXTERNAL INPUT")
             .unwrap_or_else(|| panic!("no marked region: {prompt}"));
@@ -5253,7 +5683,12 @@ workflow(type = "playbook", tasks = [author, repro])
         assert_eq!(prompt.matches("<<<END EXTERNAL INPUT>>>").count(), 1);
 
         let without = BTreeMap::from([(TaskName("scan".into()), serde_json::json!({"found": 2}))]);
-        let prompt = agent_prompt("Fix what broke.", &without).unwrap();
+        let prompt = agent_prompt(
+            "Fix what broke.",
+            &without,
+            &crate::testing::tempdir("agent-no-history"),
+        )
+        .unwrap();
         assert!(!prompt.contains("EXTERNAL INPUT"), "{prompt}");
         assert!(!prompt.contains("Run history"), "{prompt}");
         assert!(
