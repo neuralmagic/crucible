@@ -6,10 +6,31 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 fn tools_listing() -> String {
-    let tools = crux::CrucibleMcp::tools();
-    let mut out = serde_json::to_string_pretty(&tools).expect("tools serialize");
+    let tools = serde_json::to_value(crux::CrucibleMcp::tools()).expect("tools serialize");
+    let mut out = serde_json::to_string_pretty(&sorted_keys(tools)).expect("tools serialize");
     out.push('\n');
     out
+}
+
+/// Workspace builds turn on serde_json's `preserve_order`, so object keys are put in one order
+/// here or the listing would depend on which crates share the build.
+fn sorted_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, sorted_keys(v)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(sorted_keys).collect())
+        }
+        other => other,
+    }
 }
 
 fn help_listing() -> String {
