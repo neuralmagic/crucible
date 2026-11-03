@@ -5,6 +5,7 @@
 pub mod admission;
 pub mod diag;
 pub mod exec;
+pub mod files;
 pub mod history;
 pub mod ir;
 pub mod machine;

@@ -937,6 +937,9 @@ pub fn run(
             observe(&task, result);
         }
     }
+    let files = evidence
+        .as_ref()
+        .map(|p| crate::plan::files::CapturedFiles::new(&p.state));
     let out = execute(
         &plan,
         &substrate,
@@ -946,6 +949,7 @@ pub fn run(
             early_completion: playbook,
             prior: prior.as_ref(),
             journal: events.as_ref(),
+            files: files.as_ref(),
             ..ExecCfg::default()
         },
         runner.as_mut(),

@@ -19,6 +19,7 @@ use crate::agent::harness::HarnessRuntime;
 use crate::agent::turn::TurnFailure;
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
+use crate::plan::files::CapturedFiles;
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
 use crate::plan::turn_log::{Heartbeat, TurnLog};
@@ -78,14 +79,6 @@ fn confined(workspace: &Path, declared: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(path)
-}
-
-fn captured_dir(state: &Path, task: &str) -> PathBuf {
-    state.join("files").join(task)
-}
-
-fn captured_path(state: &Path, task: &str, declared: &str) -> PathBuf {
-    captured_dir(state, task).join(declared)
 }
 
 /// The mode the engine gives a captured file, regardless of what the source carried. A
@@ -180,7 +173,7 @@ impl PriorContents {
 
 /// One file an ancestor declared, as the producer's name and the path it declared.
 pub struct StagedInput {
-    pub producer: String,
+    pub producer: TaskName,
     pub declared: String,
 }
 
@@ -206,7 +199,8 @@ impl HarnessRunner {
     /// Count what an interrupted process of this run already captured against the run's bound,
     /// which covers the run and not any one process of it.
     pub fn take_over(&mut self) {
-        self.captured_bytes = AtomicU64::new(tree_bytes(&self.paths.state.join("files")));
+        self.captured_bytes =
+            AtomicU64::new(tree_bytes(CapturedFiles::new(&self.paths.state).root()));
     }
 }
 
@@ -266,41 +260,13 @@ impl TaskRunner for HarnessRunner {
             .iter()
             .flat_map(|producer| {
                 producer.emits_files.iter().map(|declared| StagedInput {
-                    producer: producer.name.0.clone(),
+                    producer: producer.name.clone(),
                     declared: declared.path.clone(),
                 })
             })
             .collect();
         self.staged.insert(task.name.clone(), files);
         Ok(())
-    }
-
-    fn has_captured_files(&self, task: &Task) -> bool {
-        captured_dir(&self.paths.state, &task.name.0).is_dir()
-    }
-
-    fn captured_file(&self, producer: &TaskName, path: &str) -> Option<Vec<u8>> {
-        std::fs::read(captured_path(&self.paths.state, &producer.0, path)).ok()
-    }
-
-    /// Discards the set published under this task's name, and for a mapped node the sets
-    /// published under its instances' names too: a node that did not expand this run has no
-    /// instance rows, so nothing else in the run ever reaches them.
-    fn drop_captured(&mut self, task: &Task) {
-        let _ = std::fs::remove_dir_all(captured_dir(&self.paths.state, &task.name.0));
-        if task.over.is_none() {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(self.paths.state.join("files")) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if TaskName(name.to_string()).is_instance_of(&task.name) {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
     }
 
     /// Commit what a passing task did, and discard what a failing one did.
@@ -516,7 +482,7 @@ fn capture_declared(
         AttemptOutcome::Fail { .. } => true,
         AttemptOutcome::Skipped(..) | AttemptOutcome::Transport(_) => return attempt,
         AttemptOutcome::TimedOut(_) => {
-            let _ = std::fs::remove_dir_all(captured_dir(&paths.state, &task.name.0));
+            CapturedFiles::new(&paths.state).drop(task);
             return attempt;
         }
     };
@@ -575,7 +541,7 @@ fn capture_declared(
         }
         Ok(())
     })();
-    let published = captured_dir(&paths.state, &task.name.0);
+    let published = CapturedFiles::new(&paths.state).dir(&task.name);
     let outcome = taken.and_then(|()| {
         if let Some(parent) = published.parent() {
             std::fs::create_dir_all(parent)
@@ -681,12 +647,13 @@ fn materialize_inputs(
     };
     let inputs = root.join(STAGED_INPUTS);
     let _ = std::fs::remove_dir_all(&inputs);
+    let files = CapturedFiles::new(state);
     for file in staged {
-        let from = captured_path(state, &file.producer, &file.declared);
+        let from = files.path(&file.producer, &file.declared);
         if !from.exists() {
             continue;
         }
-        let to = inputs.join(&file.producer).join(&file.declared);
+        let to = inputs.join(file.producer.as_str()).join(&file.declared);
         if let Some(parent) = to.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {
@@ -821,7 +788,7 @@ pub(crate) fn resolved_agent(
     let backend = crate::agent::harness::HarnessRuntime::backend(args.harness());
     Some(crucible_contract::session::TaskAgent {
         harness: args.harness().as_str().to_string(),
-        model: backend.model(&args).to_string(),
+        model: backend.model(&args.turn_agent()).to_string(),
         effort: args
             .reasoning_effort
             .map(|e| e.as_flag().to_string())
@@ -1613,9 +1580,14 @@ mod tests {
         plan: &crate::plan::ir::ValidPlan,
         substrate: &Substrate,
         cfg: ExecCfg,
-        runner: &mut dyn crate::plan::exec::TaskRunner,
+        runner: &mut HarnessRunner,
         on_result: impl FnMut(&crate::plan::ir::Task, &crate::plan::exec::TaskResult),
     ) -> crate::plan::exec::PlanOutcome {
+        let files = CapturedFiles::new(&runner.paths.state);
+        let cfg = ExecCfg {
+            files: Some(&files),
+            ..cfg
+        };
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }

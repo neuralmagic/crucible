@@ -108,6 +108,7 @@ pub(crate) fn run_iteration<R: Reporter>(
     // here and append them after the executor returns (they're additive either way).
     let mut task_events = Vec::new();
     let agent_args = runner.args.clone();
+    let files = crate::plan::files::CapturedFiles::new(&runner.p.state);
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -116,6 +117,7 @@ pub(crate) fn run_iteration<R: Reporter>(
         ),
         ExecCfg {
             wall_clock: cx.time_left,
+            files: Some(&files),
             ..ExecCfg::default()
         },
         &mut *runner,
@@ -265,17 +267,14 @@ pub(crate) fn run_epilogue<R: Reporter>(
     ));
     r.plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
 
-    let mut runner = EpilogueRunner {
-        inner: crate::plan::harness::HarnessRunner {
-            args: args.clone(),
-            paths: p.clone(),
-            commit_per_task: false,
-            captured_bytes: std::sync::atomic::AtomicU64::new(0),
-            staged: Default::default(),
-            budget_left: f64::INFINITY,
-        },
-        kept: kept.to_value(),
-    };
+    // The executor derives inputs from dependencies, and the epilogue's roots have none, so the
+    // kept context rides in as a run input on every task.
+    let mut runner = harness_runner(args, p);
+    let files = crate::plan::files::CapturedFiles::new(&p.state);
+    let run_inputs = BTreeMap::from([(
+        TaskName::reserved(crate::plan::ir::KEPT_INPUT),
+        kept.to_value(),
+    )]);
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
@@ -283,7 +282,11 @@ pub(crate) fn run_epilogue<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            files: Some(&files),
+            run_inputs: Some(&run_inputs),
+            ..ExecCfg::default()
+        },
         &mut runner,
         |task, result| {
             task_events.push(crate::plan::events::task_result_event(
@@ -342,71 +345,6 @@ pub(crate) fn run_epilogue<R: Reporter>(
         });
     }
     Ok((rows, outcome.spent_usd))
-}
-
-/// [`crate::plan::harness::HarnessRunner`] plus the kept-candidate input: the executor
-/// derives inputs from dependencies, and the epilogue's roots have none, so the kept
-/// context rides in here on every task.
-struct EpilogueRunner {
-    inner: crate::plan::harness::HarnessRunner,
-    kept: Value,
-}
-
-impl EpilogueRunner {
-    fn with_kept(&self, inputs: &BTreeMap<TaskName, Value>) -> BTreeMap<TaskName, Value> {
-        let mut inputs = inputs.clone();
-        inputs.insert(crate::plan::ir::KEPT_INPUT.into(), self.kept.clone());
-        inputs
-    }
-}
-
-impl TaskRunner for EpilogueRunner {
-    fn run(
-        &mut self,
-        task: &Task,
-        attempt: u32,
-        inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
-    ) -> Attempt {
-        let inputs = self.with_kept(inputs);
-        self.inner.run(task, attempt, &inputs, deadline)
-    }
-
-    fn run_many(
-        &mut self,
-        batch: &[BatchItem<'_>],
-        admission: &Admission,
-    ) -> Vec<Result<Attempt, Refusal>> {
-        let batch: Vec<BatchItem<'_>> = batch
-            .iter()
-            .map(|b| BatchItem {
-                task: b.task,
-                attempt: b.attempt,
-                inputs: self.with_kept(&b.inputs),
-            })
-            .collect();
-        self.inner.run_many(&batch, admission)
-    }
-
-    fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
-        self.inner.stage(task, producers)
-    }
-
-    fn settled(&mut self, task: &Task, passed: bool) {
-        self.inner.settled(task, passed);
-    }
-
-    fn has_captured_files(&self, task: &Task) -> bool {
-        self.inner.has_captured_files(task)
-    }
-
-    fn drop_captured(&mut self, task: &Task) {
-        self.inner.drop_captured(task);
-    }
-
-    fn budget_left(&mut self, usd: f64) {
-        self.inner.budget_left(usd);
-    }
 }
 
 /// What the propose task's post-turn drains decided, parked here for the driver: the
@@ -861,14 +799,6 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
 
     fn settled(&mut self, task: &Task, passed: bool) {
         self.workflow_runner.settled(task, passed);
-    }
-
-    fn has_captured_files(&self, task: &Task) -> bool {
-        self.workflow_runner.has_captured_files(task)
-    }
-
-    fn drop_captured(&mut self, task: &Task) {
-        self.workflow_runner.drop_captured(task);
     }
 
     fn budget_left(&mut self, usd: f64) {
@@ -1518,62 +1448,6 @@ mod tests {
     fn the_loop_task_runner_is_send_and_static() {
         const fn assert_send_static<T: Send + 'static>() {}
         assert_send_static::<LoopTaskRunner<crate::report::console::ConsoleReporter>>();
-    }
-
-    /// The one-task plan the forwarding tests pull a `Task` out of.
-    fn task_named(name: &str) -> Task {
-        let plan: crate::plan::ir::Plan = toml::from_str(&format!(
-            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"{name}\"\nkind = \"command\"\ncommand = \"true\"\nemits_files = [\"out.txt\"]\n"
-        ))
-        .unwrap();
-        plan.validate()
-            .unwrap()
-            .tasks_topo()
-            .find(|t| t.name.0 == name)
-            .unwrap()
-            .clone()
-    }
-
-    fn harness_runner(state: &Path) -> crate::plan::harness::HarnessRunner {
-        crate::plan::harness::HarnessRunner {
-            args: <crate::cli::Cli as Parser>::try_parse_from(["crucible"])
-                .unwrap()
-                .run,
-            paths: crate::args::Paths::for_manifest(
-                state.to_path_buf(),
-                state.to_path_buf(),
-                state,
-                None,
-            ),
-            commit_per_task: false,
-            captured_bytes: std::sync::atomic::AtomicU64::new(0),
-            staged: Default::default(),
-            budget_left: f64::INFINITY,
-        }
-    }
-
-    /// An epilogue task consumes what the main graph declared, so the wrapper has to answer
-    /// from the runner that did the capturing. Inheriting the trait default reports `false`
-    /// for a set that is on disk, and the executor then stages nothing into `inputs/`.
-    #[test]
-    fn an_epilogue_runner_answers_captured_files_from_its_inner_runner() {
-        let dir = tempfile::tempdir().unwrap();
-        let task = task_named("probe");
-        std::fs::create_dir_all(dir.path().join("files").join("probe")).unwrap();
-
-        let runner = EpilogueRunner {
-            inner: harness_runner(dir.path()),
-            kept: Value::Null,
-        };
-
-        assert!(
-            runner.has_captured_files(&task),
-            "the epilogue wrapper reported no captured set for a task whose files are on disk"
-        );
-        assert!(
-            !runner.has_captured_files(&task_named("never-ran")),
-            "the wrapper claimed a captured set for a task that captured nothing"
-        );
     }
 
     /// Epilogue tasks stay out of the per-iteration plan entirely (legacy splice and
