@@ -34,6 +34,8 @@ clauses = [
     "clauses/C-RUN-HISTORY.toml",
     "clauses/C-PACK-BASE.toml",
     "clauses/C-PACK-PUBLISH.toml",
+    "clauses/C-HUMAN-DECISION.toml",
+    "clauses/C-DECISION-EVIDENCE.toml",
 ]
 
 [[changelog]]
@@ -45,6 +47,7 @@ added = [
     "C-PACK-BASE: a pack's digest is SHA-256 over its canonical tree; a draft may name a base, flattened at save into one tree with one digest, base and overlay digests kept as provenance; an unavailable base refused at save; the delivery budget checked at save and dispatch",
     "C-PACK-BASE: a pack's digest is a tree hash (tree1:); a draft may name a base, flattened at save into one tree with one digest and recorded provenance; an unavailable base is refused at save; the delivery budget is checked at save, registration, import, and dispatch; old digests are rewritten",
     "C-PACK-PUBLISH: optional OCI publication of registered, imported, and approved packs, readable only by the controller and dispatch targets, under digest-derived tags with a publication state",
+    "C-HUMAN-DECISION, C-DECISION-EVIDENCE: a human-decided route opens one decision request per run and route, polled by the run, answered against an evidence digest, recorded as uncertain on expiry; the controller shows the evidence with sandboxed visualizations and notifies approvers",
 ]
 changed = [
     "a settled join forwards a dependency that settled not taken",
@@ -53,9 +56,11 @@ changed = [
     "C-TASK-FILES: a declared file may carry a schema, validated from the captured copy when the task passes",
     "C-TASK-FILES: an absent or mismatched file is a repair note for an agent task that declares repair",
     "C-PLAYBOOK-BUDGET admits each fan-out lane against settled and in-flight spend under a bounded width, and the cost ceiling blocks only tasks that can spend, so commands after it still run; C-SETTLED-JOIN and C-PLAYBOOK-LANE follow",
+    "C-PLAYBOOK-PARAMS: a supplied dotted name is a launch setting (<task>.<setting>, *.<setting>, repo.ref), checked before dispatch and written onto the compiled tasks; a declared parameter name cannot contain a dot",
     "C-PLAYBOOK-PARAMS: a string parameter may carry a multiline flag for launch forms; it does not change binding",
     "C-SETTLED-JOIN: a failing task's own note, from a self-declared failure or a command's nonzero exit, is the note the engine records",
     "C-SETTLED-JOIN: an all-join task gets no entry for an optional dependency that settled not taken (RFC-0001:C-ROUTE)",
     "C-PLAYBOOK-RESUME: a resume reads the manifest variant the interrupted run read",
+    "C-SETTLED-JOIN: a failing evaluation's own note is recorded with its threshold and log handles, and a declared status fails or skips a task whatever its exit status or grade but never passes one",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

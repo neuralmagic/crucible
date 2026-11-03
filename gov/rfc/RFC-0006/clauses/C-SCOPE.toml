@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+A blueprint is a registered playbook its owner offers as a starting point. A user picks one from the catalog and gets a draft of their own, seeded from the blueprint's pack, with the owning team's secrets already bound when they are on that team, and a placeholder for each secret they bring themselves. The draft is then theirs to edit, launch, and publish like any other.
+
+
+
+This RFC adds to the ownership, sharing, and policy rules of [[RFC-0003]]; it does not change who may read, launch, or bind anything outside a blueprint's use."""

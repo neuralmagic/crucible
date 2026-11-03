@@ -2,6 +2,7 @@
 //! (exposure, agent substrate, params) and what this deployment can dispatch it onto.
 
 pub(crate) mod api;
+pub mod blueprints;
 pub mod co_draft;
 pub mod dispatch;
 pub mod drafts;

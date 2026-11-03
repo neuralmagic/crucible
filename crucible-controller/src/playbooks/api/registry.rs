@@ -1,6 +1,9 @@
 use crate::api::dto::*;
 use crate::api::state::*;
 use crate::daemon::queue::IssueKey;
+use crate::playbooks::api::admission::{
+    Admissible, LaunchRequest, UNREADABLE_MANIFEST, admit, decide_launch,
+};
 use crate::playbooks::registry::{PlaybookRow, PlaybookSource, RegisterError, RegisterPlaybook};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -212,29 +215,6 @@ pub(crate) async fn catalog(
         .map_err(|e| AppError::from(e).into_response())
 }
 
-/// Decide `launch` on a pack against its owner, for every surface that fires it: the form POST,
-/// one-shots, watches and schedules.
-#[allow(clippy::result_large_err)]
-pub(crate) async fn decide_launch(
-    state: &ApiState,
-    caller: &crate::authz::Caller,
-    pack: &PlaybookRow,
-) -> Result<(), Response> {
-    crate::authz::owner::decide_on(
-        state,
-        caller,
-        &crate::authz::decision::Resource::new(
-            crate::authz::action::ResourceType::Playbook,
-            &pack.id,
-            pack.owner.clone(),
-        ),
-        crate::authz::action::Verb::Launch,
-    )
-    .await
-    .map(|_| ())
-    .map_err(IntoResponse::into_response)
-}
-
 /// The capability preflight of a launch: the harness it resolves (its provider pin, else the
 /// scope's dispatch default) against the pack's image, over the catalog. `Err` is the 422 to
 /// answer with; `Ok` carries the warnings a launch proceeds under.
@@ -302,6 +282,8 @@ pub struct PlaybookDto {
     pub owner: String,
     /// What the caller may do with this playbook under the policy set in force.
     pub actions: Vec<crate::authz::action::Verb>,
+    pub blueprint: bool,
+    pub public: bool,
     pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -360,6 +342,8 @@ impl PlaybookDto {
             dispatch,
             owner: r.owner.to_string(),
             actions,
+            blueprint: r.blueprint,
+            public: r.public,
             created_by: r.created_by,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -485,20 +469,16 @@ pub(crate) async fn readable_playbook(
     id: &str,
     verb: crate::authz::action::Verb,
 ) -> Result<crate::playbooks::registry::PlaybookRow, Response> {
-    let row = crate::playbooks::registry::get(state.db.pool(), id)
+    let Some(row) = crate::playbooks::registry::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
-    crate::authz::owner::decide_row(
-        state,
-        caller,
-        crate::authz::action::ResourceType::Playbook,
-        id,
-        verb,
-        row,
-        |r| r.owner.clone(),
-    )
-    .await
-    .map_err(IntoResponse::into_response)
+        .map_err(|e| AppError::from(e).into_response())?
+    else {
+        return Err(not_found(format!("no playbook {id:?}")));
+    };
+    crate::authz::owner::decide_on(state, caller, &row.resource(), verb)
+        .await
+        .map_err(IntoResponse::into_response)?;
+    Ok(row)
 }
 
 /// `GET /api/playbooks` — the registry: what can be launched, pinned where, with which form.
@@ -517,13 +497,7 @@ pub(crate) async fn list_playbooks(
         &caller,
         crate::authz::action::ResourceType::Playbook,
         rows,
-        |r| {
-            crate::authz::decision::Resource::new(
-                crate::authz::action::ResourceType::Playbook,
-                &r.id,
-                r.owner.clone(),
-            )
-        },
+        crate::playbooks::registry::PlaybookRow::resource,
     )
     .await?;
     let catalog = crate::images::store::list_images(state.db.pool()).await?;
@@ -557,16 +531,7 @@ pub(crate) async fn get_playbook(
     let Some(files) = crate::playbooks::registry::files(state.db.pool(), &id).await? else {
         return Ok(not_found(format!("no playbook {id:?}")));
     };
-    let actions = crate::authz::owner::actions_on(
-        &state,
-        &caller,
-        crate::authz::decision::Resource::new(
-            crate::authz::action::ResourceType::Playbook,
-            &id,
-            row.owner.clone(),
-        ),
-    )
-    .await?;
+    let actions = crate::authz::owner::actions_on(&state, &caller, row.resource()).await?;
     let catalog = crate::images::store::list_images(state.db.pool()).await?;
     Ok(Json(PlaybookDetailDto {
         playbook: PlaybookDto::from_row(row, actions, &state.dispatch, &catalog),
@@ -673,62 +638,6 @@ pub struct PlaybookLaunchAck {
     pub image: crate::playbooks::preflight::ImagePreflight,
 }
 
-/// What a pack whose manifest never parsed is refused with. A launch would fail at the engine's
-/// first read of it, so it is refused here instead.
-pub(crate) const UNREADABLE_MANIFEST: &str =
-    "the pack's crucible.toml did not parse, so what substrate its agent needs is unknown";
-
-/// A launch this deployment has no substrate for. Refused here, at launch, rather than discovered
-/// at the bottom of a failed reconcile: the pack is fine, this deployment is what cannot run it.
-pub(crate) fn undispatchable(refusal: String) -> Response {
-    refused(
-        "this deployment cannot dispatch the pack's agent backend",
-        vec![crate::playbooks::registry::FieldError {
-            field: String::new(),
-            message: refusal,
-        }],
-    )
-}
-
-/// Check the launcher's ceilings against the admin caps. Ceilings are the launcher's — the pack
-/// declares none — so this is the only bound on them.
-pub(crate) fn check_ceilings(
-    caps: &crate::config::PlaybookCaps,
-    max_cost: f64,
-    max_time: &str,
-) -> Result<crate::model::MaxTime, crate::playbooks::registry::FieldError> {
-    let refuse = |field: &str, message: String| crate::playbooks::registry::FieldError {
-        field: field.to_string(),
-        message,
-    };
-    if !max_cost.is_finite() || max_cost <= 0.0 {
-        return Err(refuse(
-            "max_cost",
-            "max_cost must be a positive number of USD".to_string(),
-        ));
-    }
-    if max_cost > caps.max_cost {
-        return Err(refuse(
-            "max_cost",
-            format!(
-                "max_cost {max_cost} is above this controller's cap of {}",
-                caps.max_cost
-            ),
-        ));
-    }
-    let max_time = crate::model::MaxTime::parse(max_time).map_err(|m| refuse("max_time", m))?;
-    if max_time.secs() > caps.max_time.secs() {
-        return Err(refuse(
-            "max_time",
-            format!(
-                "max_time {max_time} is above this controller's cap of {}",
-                caps.max_time
-            ),
-        ));
-    }
-    Ok(max_time)
-}
-
 /// Launch a registered playbook: validate the supplied values against the pack's stored schema,
 /// bound the launcher's ceilings against the admin caps, and adopt an issue whose
 /// `playbook_launches` row carries both. The row lands at `new` with no scope turn ahead of it —
@@ -754,14 +663,20 @@ pub(crate) async fn launch_playbook(
     Path(id): Path<String>,
     Json(body): Json<LaunchPlaybookBody>,
 ) -> Response {
-    let authorized = match authorize_launch(
+    let pack = match readable_playbook(&state, &caller, &id, crate::authz::action::Verb::Read).await
+    {
+        Ok(pack) => pack,
+        Err(refusal) => return refusal,
+    };
+    let authorized = match admit(
         &state,
-        &caller,
-        &id,
-        &body.params,
-        body.max_cost,
-        &body.max_time,
-        body.schema_digest.as_deref(),
+        pack,
+        LaunchRequest {
+            params: &body.params,
+            max_cost: body.max_cost,
+            max_time: &body.max_time,
+            schema_digest: body.schema_digest.as_deref(),
+        },
     )
     .await
     {
@@ -769,7 +684,7 @@ pub(crate) async fn launch_playbook(
         Err(refusal) => return refusal,
     };
     let pack = authorized.pack;
-    if let Err(refused) = decide_launch(&state, &caller, &pack).await {
+    if let Err(refused) = decide_launch(&state, &caller, pack.target()).await {
         return refused;
     }
     let dedupe_schedule =
@@ -918,18 +833,6 @@ pub(crate) async fn launch_playbook(
         .into_response()
 }
 
-/// What a launch is authorized to run: the registry row it names, the values the pack's stored
-/// schema accepted, and the ceilings the admin caps allowed. The immediate launch and the deferred
-/// one-shot both come through here, so there is exactly one place values are enforced and exactly
-/// one 422 shape to answer with.
-pub(crate) struct AuthorizedLaunch {
-    pub pack: PlaybookRow,
-    /// The validated `{name: value}` object as stored.
-    pub params: serde_json::Value,
-    pub max_cost: f64,
-    pub max_time: crate::model::MaxTime,
-}
-
 /// Resolve the schedule an ad-hoc launch may advance the dedupe state of. A schedule that does not
 /// exist, or that runs a different pack, is a field-level refusal: advancing another playbook's
 /// cursor from this run's result would poison a recurrence nobody asked to touch.
@@ -957,120 +860,6 @@ pub(crate) async fn dedupe_target(
         Ok(None) => Err(refuse(format!("no schedule {id:?}"))),
         Err(e) => Err(AppError::from(e).into_response()),
     }
-}
-
-/// The registry half of a launch authorization: the pack, the schema its params are validated
-/// against, and the bounded ceilings. `Err` is the response to answer with: 404 for an
-/// unregistered id, 409 for a form rendered against a schema the pack no longer serves, 422 for
-/// ceilings.
-#[allow(clippy::result_large_err)]
-pub(crate) async fn authorize_pack(
-    state: &ApiState,
-    caller: &crate::authz::Caller,
-    id: &str,
-    max_cost: f64,
-    max_time: &str,
-    schema_digest: Option<&str>,
-) -> Result<(PlaybookRow, serde_json::Value, crate::model::MaxTime), Response> {
-    let pack = readable_playbook(state, caller, id, crate::authz::action::Verb::Read).await?;
-    if let Some(asked) = schema_digest
-        && asked != pack.schema_digest
-    {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ErrorBody::new(format!(
-                "playbook {id} now serves schema {}, not {asked}; reload the form",
-                pack.schema_digest
-            ))),
-        )
-            .into_response());
-    }
-    if let Some(refusal) = match pack.agent.as_ref() {
-        Some(agent) => state.dispatch.refusal(agent),
-        None => Some(UNREADABLE_MANIFEST.to_string()),
-    } {
-        return Err(undispatchable(refusal));
-    }
-    let max_time = match check_ceilings(&state.playbook_caps, max_cost, max_time) {
-        Ok(t) => t,
-        Err(field) => return Err(invalid_fields(vec![field])),
-    };
-    let schema = match crate::playbooks::registry::schema(state.db.pool(), id).await {
-        Ok(Some(s)) => s,
-        Ok(None) => return Err(not_found(format!("no playbook {id:?}"))),
-        Err(e) => return Err(AppError::from(e).into_response()),
-    };
-    Ok((pack, schema, max_time))
-}
-
-/// Refuse a launch of `tree` the engine would refuse at startup: compiled with the launch's
-/// validated values, its graph does not compile or declares a task timeout past `max_time`.
-#[allow(clippy::result_large_err)]
-pub(crate) async fn check_plan(
-    tree: crucible_contract::pack_tree::PackTree,
-    params: &serde_json::Value,
-    max_time: &crate::model::MaxTime,
-    variant: Option<&crucible::manifest::variant::VariantName>,
-) -> Result<(), Response> {
-    let params = crate::launches::store::stored_params(params);
-    match crate::playbooks::registry::check_tree_runnable(
-        tree,
-        params,
-        max_time.clone(),
-        variant.cloned(),
-    )
-    .await
-    {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(field)) => Err(invalid_fields(vec![field])),
-        Err(e) => Err(AppError::from(e).into_response()),
-    }
-}
-
-/// The response for a pack tree a launch could not read: a 422 naming why when the stored bytes
-/// cannot be a tree, a 500 otherwise.
-pub(crate) fn unreadable_tree(e: anyhow::Error) -> Response {
-    if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
-        .is_some()
-    {
-        return invalid_fields(vec![crate::playbooks::registry::FieldError {
-            field: String::new(),
-            message: format!("{e:#}"),
-        }]);
-    }
-    AppError::from(e).into_response()
-}
-
-/// Validate one launch request against the registry: [`authorize_pack`], then the values, then
-/// the graph those values compile.
-#[allow(clippy::result_large_err)]
-pub(crate) async fn authorize_launch(
-    state: &ApiState,
-    caller: &crate::authz::Caller,
-    id: &str,
-    params: &std::collections::BTreeMap<String, String>,
-    max_cost: f64,
-    max_time: &str,
-    schema_digest: Option<&str>,
-) -> Result<AuthorizedLaunch, Response> {
-    let (pack, schema, max_time) =
-        authorize_pack(state, caller, id, max_cost, max_time, schema_digest).await?;
-    let params = match crate::playbooks::registry::validate_params(&schema, params) {
-        Ok(v) => v,
-        Err(fields) => return Err(invalid_fields(fields)),
-    };
-    let tree = match crate::playbooks::registry::pack(state.db.pool(), id).await {
-        Ok(Some(tree)) => tree,
-        Ok(None) => return Err(not_found(format!("no playbook {id:?}"))),
-        Err(e) => return Err(unreadable_tree(e)),
-    };
-    check_plan(tree, &params, &max_time, pack.variant.as_ref()).await?;
-    Ok(AuthorizedLaunch {
-        pack,
-        params,
-        max_cost,
-        max_time,
-    })
 }
 
 #[cfg(test)]

@@ -245,6 +245,7 @@ mod tests {
             subagent: false,
             input: None,
             result: None,
+            failed: false,
         }
     }
 

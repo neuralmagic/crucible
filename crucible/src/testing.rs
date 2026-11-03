@@ -79,3 +79,78 @@ pub(crate) fn answer_one_request(
     let _ = s.flush();
     (line.to_string(), headers.to_ascii_lowercase(), body)
 }
+
+/// A local repository to clone from: `main`, a `feature/x` branch one commit past it, an
+/// annotated tag `v1` on `main`, a `refs/pull/7/head` commit no branch holds, and a commit no
+/// ref holds at all.
+pub(crate) struct GitOrigin {
+    pub(crate) path: PathBuf,
+    pub(crate) main: String,
+    pub(crate) feature: String,
+    pub(crate) pull: String,
+    pub(crate) dangling: String,
+}
+
+pub(crate) fn git_origin(name: &str) -> GitOrigin {
+    let path = tempdir(name);
+    let git = |args: &[&str]| -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&path)
+            .args([
+                "-c",
+                "user.email=c@l",
+                "-c",
+                "user.name=c",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
+    };
+    git(&["init", "-q"]);
+    fs::write(path.join("a.txt"), "main\n").expect("write");
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "main"]);
+    let main = git(&["rev-parse", "HEAD"]);
+    git(&["tag", "-a", "v1", "-m", "v1"]);
+    git(&["checkout", "-qb", "feature/x"]);
+    fs::write(path.join("a.txt"), "feature\n").expect("write");
+    git(&["commit", "-qam", "feature"]);
+    let feature = git(&["rev-parse", "HEAD"]);
+    let tree = git(&["rev-parse", "HEAD^{tree}"]);
+    let pull = git(&["commit-tree", &tree, "-p", &main, "-m", "pull"]);
+    git(&["update-ref", "refs/pull/7/head", &pull]);
+    let dangling = git(&["commit-tree", &tree, "-p", &main, "-m", "dangling"]);
+    git(&["checkout", "-q", "main"]);
+    GitOrigin {
+        path,
+        main,
+        feature,
+        pull,
+        dangling,
+    }
+}
+
+/// The commit `dir` has checked out, and whether it is detached.
+pub(crate) fn checked_out(dir: &std::path::Path) -> (String, bool) {
+    let repo = git2::Repository::open(dir).expect("a repository");
+    let head = repo
+        .head()
+        .expect("a head")
+        .peel_to_commit()
+        .expect("a commit")
+        .id()
+        .to_string();
+    (head, repo.head_detached().expect("head state"))
+}

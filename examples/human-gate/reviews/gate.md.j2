@@ -1,0 +1,8 @@
+## Launch {{ inputs.plan.output.model }} on {{ inputs.plan.output.gpus }} GPUs?
+
+The job runs about **{{ inputs.plan.output.hours }} hours** and costs about
+**${{ inputs.plan.output.est_usd }}**. This run has spent ${{ run.spent_usd }} of its
+${{ run.max_cost_usd }} so far.
+
+{% for task in gated %}- **{{ task.labels | join(" or ") }}** starts `{{ task.name }}`
+{% endfor %}

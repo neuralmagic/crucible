@@ -7,7 +7,11 @@ use crate::launches::tracker::TrackerKind;
 
 use crate::launches::watches::Watch;
 
-use crate::playbooks::api::registry::{AuthorizedLaunch, authorize_pack};
+use crate::playbooks::api::admission::{
+    Admissible, AuthorizedLaunch, LaunchRequest, admit_pack, decide_launch,
+};
+
+use crate::playbooks::registry::PlaybookRow;
 
 use axum::extract::{Path, State};
 
@@ -237,13 +241,13 @@ fn schema_without_key(
 }
 
 /// Validate a watch body: the trigger half here, the launch half through the same
-/// [`authorize_pack`] the form POST and the schedules use.
+/// [`admit_pack`] the form POST and the schedules use.
 #[allow(clippy::result_large_err)]
 async fn authorize_watch(
     state: &ApiState,
     caller: &crate::authz::Caller,
     body: &WatchBody,
-) -> Result<(AuthorizedLaunch, TrackerKind, Option<String>), Response> {
+) -> Result<(AuthorizedLaunch<PlaybookRow>, TrackerKind, Option<String>), Response> {
     let (kind, tracker) = tracker_for(state, &body.tracker)?;
     tracker
         .check_query(&body.query)
@@ -255,13 +259,22 @@ async fn authorize_watch(
             "is also given a fixed value in params; the sweep overlays it per item",
         )]));
     }
-    let (pack, schema, max_time) = authorize_pack(
+    let pack = crate::playbooks::api::registry::readable_playbook(
         state,
         caller,
         &body.playbook,
-        body.max_cost,
-        &body.max_time,
-        body.schema_digest.as_deref(),
+        crate::authz::action::Verb::Read,
+    )
+    .await?;
+    let (schema, max_time) = admit_pack(
+        state,
+        pack.target(),
+        LaunchRequest {
+            params: &body.params,
+            max_cost: body.max_cost,
+            max_time: &body.max_time,
+            schema_digest: body.schema_digest.as_deref(),
+        },
     )
     .await?;
     let relaxed =
@@ -333,9 +346,7 @@ pub(crate) async fn create_watch(
     {
         return denied.into_response();
     }
-    if let Err(denied) =
-        crate::playbooks::api::registry::decide_launch(&state, &caller, &authorized.pack).await
-    {
+    if let Err(denied) = decide_launch(&state, &caller, authorized.pack.target()).await {
         return denied;
     }
     let actor = saver.actor.as_deref();
@@ -526,8 +537,7 @@ pub(crate) async fn update_watch(
             || p.agent_model != saver.model
     });
     if firing_changed
-        && let Err(denied) =
-            crate::playbooks::api::registry::decide_launch(&state, &caller, &authorized.pack).await
+        && let Err(denied) = decide_launch(&state, &caller, authorized.pack.target()).await
     {
         return denied;
     }
