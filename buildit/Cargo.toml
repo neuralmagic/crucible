@@ -23,7 +23,7 @@ k8s-openapi.workspace = true
 kube = { workspace = true, features = ["client", "runtime", "rustls-tls", "ring", "ws"] }
 oci-client = { version = "0.17.0", default-features = false, features = ["rustls-tls"] }
 regex = "1.12.4"
-rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server", "client", "transport-streamable-http-client-unix-socket"] }
 rustls = { version = "0.23.41", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 serde.workspace = true
 serde_json.workspace = true

@@ -851,9 +851,22 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         | TaskKind::Evaluate { .. }
         | TaskKind::Route { .. }
         | TaskKind::Report { .. } => {
+            let buildit_socket = match task.task {
+                TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
+                    match crate::openshell::agent_servers::run_buildit(args.buildit_socket.as_ref())
+                    {
+                        Ok(socket) => socket,
+                        Err(e) => {
+                            return Attempt::transport(TransportCause::Other, format!("{e:#}"));
+                        }
+                    }
+                }
+                _ => None,
+            };
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
+                buildit_socket,
             };
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs, deadline)
