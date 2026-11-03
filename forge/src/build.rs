@@ -155,10 +155,7 @@ fn render_job(req: &ClusterBuildRequest) -> Job {
 
     // AppArmor blocks rootless mount syscalls on stock Ubuntu nodes; `unconfined` on the build
     // container unblocks buildah's user-namespace mounts (buildit's hard-won fix). Keyed by container.
-    let pod_annotations = BTreeMap::from([(
-        format!("container.apparmor.security.beta.kubernetes.io/{BUILD_CONTAINER}"),
-        "unconfined".to_string(),
-    )]);
+    let pod_annotations = BTreeMap::from([crate::buildah::apparmor_unconfined(BUILD_CONTAINER)]);
 
     let source_mount = core::VolumeMount {
         name: "source".to_string(),
@@ -215,12 +212,7 @@ fn render_job(req: &ClusterBuildRequest) -> Job {
             image_ref.clone(),
             req.context.clone(),
         ]),
-        env: Some(vec![core::EnvVar {
-            // Force rootless chroot isolation + vfs storage (no privilege, no overlay on emptyDir).
-            name: "BUILDAH_ISOLATION".to_string(),
-            value: Some("chroot".to_string()),
-            value_from: None,
-        }]),
+        env: Some(vec![crate::buildah::isolation_env()]),
         volume_mounts: Some(vec![source_mount, auth_mount]),
         ..Default::default()
     };

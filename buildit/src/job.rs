@@ -65,7 +65,7 @@ pub async fn create(
     let secrets: Api<Secret> = Api::namespaced(client, namespace);
     let name = pod::unique_name();
 
-    let spec = backend.job_spec(&name, namespace, args)?;
+    let spec = backend.job_spec(&name, namespace, args);
     let created = jobs
         .create(&PostParams::default(), &spec)
         .await

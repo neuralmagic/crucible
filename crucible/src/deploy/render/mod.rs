@@ -17,7 +17,8 @@
 //! `secret_env_vars`, `node_avoid_affinity`) and a handful of mount-path consts.
 
 pub mod gateway;
-mod kube;
+pub(in crate::deploy) mod kube;
+pub(in crate::deploy) mod pod;
 mod turn;
 
 use anyhow::{Context, Result};
@@ -52,9 +53,9 @@ pub(in crate::deploy) fn pin_image(
     }
 }
 
+pub(in crate::deploy) use kube::role_binding;
 pub use kube::{
     MANAGED_BY_LABEL, PACK_TARBALL_KEY, PackDelivery, PlaybookLaunch, RUN_INPUTS_KEY, RenderInput,
     RenderOpts, RerunLaunch, render,
 };
-pub(in crate::deploy) use kube::{node_avoid_affinity, role_binding};
 pub use turn::{PackPath, PackPathError, ProposeTier, TurnKind, TurnOpts, render_turn};

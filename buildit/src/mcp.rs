@@ -1032,7 +1032,7 @@ impl Broker {
             cache: None,
             node: None,
         };
-        let mut pod = Backend::Buildah.pod_spec(&id.0, &self.namespace, &opts)?;
+        let mut pod = Backend::Buildah.pod_spec(&id.0, &self.namespace, &opts);
         let labels = pod.metadata.labels.get_or_insert_default();
         labels.extend(
             [

@@ -1,13 +1,13 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::kube::{
-    FORGE_STORAGE_ROOT, PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env,
-    node_avoid_affinity, resources, secret_env_vars,
+    FORGE_STORAGE_ROOT, PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env, resources,
+    secret_env_vars,
 };
+use crate::deploy::render::pod::{ProfilePod, RestartPolicy, downward, env_var};
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1 as core;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -329,17 +329,18 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     )?;
 
     let mut env = secret_env_vars(profile);
-    let plain = |name: &str, value: String| core::EnvVar {
-        name: name.to_string(),
-        value: Some(value),
-        value_from: None,
-    };
     env.extend(driver_image_env(profile)?);
-    env.push(plain("FORGE_STORAGE_ROOT", FORGE_STORAGE_ROOT.to_string()));
+    env.push(env_var(
+        "FORGE_STORAGE_ROOT",
+        FORGE_STORAGE_ROOT.to_string(),
+    ));
     // See `Renderer::env`: podman reads REGISTRY_AUTH_FILE ahead of its own lookup path, so the
     // nested podman pulls a private sandbox without a `podman login` shell-out. Only when mounted.
     if profile.secrets.pull_authfile.is_some() {
-        env.push(plain("REGISTRY_AUTH_FILE", PULL_AUTHFILE_PATH.to_string()));
+        env.push(env_var(
+            "REGISTRY_AUTH_FILE",
+            PULL_AUTHFILE_PATH.to_string(),
+        ));
     }
     // Under the kubernetes driver, project the config the runtime `gateway_toml()` reads to build
     // the `[openshell.drivers.kubernetes]` block. Without this the turn/scope pod's gateway boots
@@ -355,14 +356,14 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // turn: no `[agent].env` exists, so the engine relays them from its own process env
     // (`openshell::relay_vertex_env`).
     for (k, v) in &profile.env {
-        env.push(plain(k, v.clone()));
+        env.push(env_var(k, v.clone()));
     }
 
     // When the profile names the controller, the turn uploads its pack and transcript there under
     // its own name, with the pod token the controller puts in its Secret. Absent = the engine falls
     // back to marker emission.
     if let Some(controller) = &profile.cluster.ingest_url {
-        env.push(plain(
+        env.push(env_var(
             crucible_contract::ENV_CONTROLLER_URL,
             controller.clone(),
         ));
@@ -371,17 +372,6 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // The pod learns its own name from the downward API: the `{pod}` segment its uploads go to,
     // and, with its uid, what lets the in-pod gateway create a client-TLS Secret unique to this
     // pod and owned by it, which is what gets it garbage-collected with the turn.
-    let downward = |name: &str, field_path: &str| core::EnvVar {
-        name: name.to_string(),
-        value: None,
-        value_from: Some(core::EnvVarSource {
-            field_ref: Some(core::ObjectFieldSelector {
-                field_path: field_path.to_string(),
-                api_version: None,
-            }),
-            ..Default::default()
-        }),
-    };
     env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
     env.push(downward("CRUCIBLE_POD_UID", "metadata.uid"));
 
@@ -591,37 +581,24 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         ..Default::default()
     };
 
-    let pod = core::Pod {
-        metadata: ObjectMeta {
-            name: Some(opts.name.clone()),
-            namespace: Some(profile.cluster.loop_namespace.clone()),
-            annotations: Some(BTreeMap::from([(
-                "sidecar.istio.io/inject".to_string(),
-                "false".to_string(),
-            )])),
-            labels: Some(turn_labels(profile, opts)),
-            ..Default::default()
-        },
-        spec: Some(core::PodSpec {
-            image_pull_secrets: Some(vec![core::LocalObjectReference {
-                name: profile.image.pull_secret.clone(),
-            }]),
-            service_account_name: Some(profile.cluster.service_account.clone()),
-            // Under kubernetes the in-pod gateway calls the API server directly (Sandbox CRs) and has
-            // no mounted kubeconfig like the loop pod does, so it needs the automounted token; podman
-            // never touches the API and stays tokenless.
-            automount_service_account_token: Some(
-                profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes,
-            ),
-            restart_policy: Some("Never".to_string()),
-            affinity: node_avoid_affinity(profile),
-            init_containers: Some(init),
-            containers: vec![container],
-            volumes: Some(volumes),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
+    let pod = ProfilePod {
+        profile,
+        labels: turn_labels(profile, opts),
+        service_account: profile.cluster.service_account.clone(),
+        // Under kubernetes the in-pod gateway calls the API server directly (Sandbox CRs) and has
+        // no mounted kubeconfig like the loop pod does, so it needs the automounted token; podman
+        // never touches the API and stays tokenless.
+        automount_token: Some(profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes),
+        restart: Some(RestartPolicy::Never),
+        host_aliases: None,
+    }
+    .pod(
+        opts.name.clone(),
+        profile.cluster.loop_namespace.clone(),
+        vec![container],
+        Some(init),
+        Some(volumes),
+    );
 
     serde_norway::to_string(&pod).context("serializing the turn pod")
 }

@@ -1,4 +1,5 @@
 use crate::deploy::profile::DeployProfile;
+use crate::deploy::render::pod::{ProfilePod, RestartPolicy, downward, env_var};
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{
@@ -700,52 +701,37 @@ impl Renderer<'_> {
             ..Default::default()
         };
 
-        Ok(core::Pod {
-            metadata: ObjectMeta {
-                name: Some(format!("{}-loop", self.input.name)),
-                namespace: Some(self.profile.cluster.loop_namespace.clone()),
-                annotations: Some(BTreeMap::from([(
-                    "sidecar.istio.io/inject".to_string(),
-                    "false".to_string(),
-                )])),
-                labels: Some(BTreeMap::from([
-                    ("app".to_string(), "autoresearch-local".to_string()),
-                    ("issue".to_string(), self.input.name.to_string()),
-                    // The `crucible ps` selector: every rendered loop pod, regardless of domain/profile.
-                    (
-                        crucible_contract::MANAGED_BY_KEY.to_string(),
-                        crucible_contract::MANAGED_BY_VALUE.to_string(),
-                    ),
-                    ("crucible/run".to_string(), self.input.name.to_string()),
-                ])),
-                ..Default::default()
-            },
-            spec: Some(core::PodSpec {
-                image_pull_secrets: Some(vec![core::LocalObjectReference {
-                    name: self.profile.image.pull_secret.clone(),
-                }]),
-                service_account_name: Some(self.profile.cluster.service_account.clone()),
-                automount_service_account_token: Some(false),
-                // A resumable run lets the kubelet restart a crashed container: the wrapper finds
-                // the session log and passes --resume. Otherwise a restart would start the run over
-                // from nothing, so the pod stays one-shot.
-                restart_policy: Some(
-                    if self.resumable() {
-                        "OnFailure"
-                    } else {
-                        "Never"
-                    }
-                    .to_string(),
+        Ok(ProfilePod {
+            profile: self.profile,
+            labels: BTreeMap::from([
+                ("app".to_string(), "autoresearch-local".to_string()),
+                ("issue".to_string(), self.input.name.to_string()),
+                // The `crucible ps` selector: every rendered loop pod, regardless of domain/profile.
+                (
+                    crucible_contract::MANAGED_BY_KEY.to_string(),
+                    crucible_contract::MANAGED_BY_VALUE.to_string(),
                 ),
-                affinity: node_avoid_affinity(self.profile),
-                host_aliases: self.host_aliases(),
-                init_containers: self.init_containers(),
-                containers: vec![container],
-                volumes: Some(self.volumes()),
-                ..Default::default()
+                ("crucible/run".to_string(), self.input.name.to_string()),
+            ]),
+            service_account: self.profile.cluster.service_account.clone(),
+            automount_token: Some(false),
+            // A resumable run lets the kubelet restart a crashed container: the wrapper finds
+            // the session log and passes --resume. Otherwise a restart would start the run over
+            // from nothing, so the pod stays one-shot.
+            restart: Some(if self.resumable() {
+                RestartPolicy::OnFailure
+            } else {
+                RestartPolicy::Never
             }),
-            ..Default::default()
-        })
+            host_aliases: self.host_aliases(),
+        }
+        .pod(
+            format!("{}-loop", self.input.name),
+            self.profile.cluster.loop_namespace.clone(),
+            vec![container],
+            self.init_containers(),
+            Some(self.volumes()),
+        ))
     }
 
     /// The in-pod domain directory the wrapper resolves (`<domains_root>/<domain>`). For a baked domain
@@ -809,11 +795,6 @@ impl Renderer<'_> {
     /// profile's + `[deploy]`'s generic maps, so no domain or Vertex name is baked into the engine.
     fn env(&self) -> Result<Vec<core::EnvVar>> {
         let mut env = Vec::new();
-        let plain = |name: &str, value: String| core::EnvVar {
-            name: name.to_string(),
-            value: Some(value),
-            value_from: None,
-        };
 
         // Generic pod env from secrets (e.g. the backend's Vertex ADC), names are the profile's.
         env.extend(secret_env_vars(self.profile));
@@ -825,25 +806,25 @@ impl Renderer<'_> {
         // Broker / composite wiring (manifest-derived, the broker IS the engine, so these are generic).
         // BROKER_BUILD is set by crucible when it spawns the broker (from [agent.broker].build), not here.
         if self.input.agent.broker.build {
-            env.push(plain("BROKER_COMPOSITE", "1".to_string()));
+            env.push(env_var("BROKER_COMPOSITE", "1".to_string()));
         }
         let ws_basename = Path::new(self.input.workspace_dir)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "workspace".to_string());
-        env.push(plain(
+        env.push(env_var(
             "BROKER_SANDBOX_WORKDIR",
             format!("/sandbox/{ws_basename}"),
         ));
-        env.push(plain(
+        env.push(env_var(
             "BROKER_COMPOSITE_CTX",
             format!("{FORGE_STORAGE_ROOT}/composite-ctx"),
         ));
         if let Some(measure_cmd) = self.input.measure_cmd {
-            env.push(plain("BROKER_MEASURE_CMD", measure_cmd.to_string()));
+            env.push(env_var("BROKER_MEASURE_CMD", measure_cmd.to_string()));
         }
         if let Some(apply) = self.input.apply_cmd {
-            env.push(plain("BROKER_COMPOSITE_APPLY_CMD", apply.to_string()));
+            env.push(env_var("BROKER_COMPOSITE_APPLY_CMD", apply.to_string()));
         }
 
         // In-pod buildah can't mount: no /dev/fuse for the image default (overlay+fuse-overlayfs)
@@ -851,13 +832,16 @@ impl Renderer<'_> {
         // forge's cluster build Jobs. Pairs with the Unconfined AppArmor profile
         // (loop_security_context); both halves are needed before a build succeeds.
         if self.builds_in_pod() {
-            env.push(plain("STORAGE_DRIVER", "vfs".to_string()));
-            env.push(plain("BUILDAH_ISOLATION", "chroot".to_string()));
+            env.push(forge::buildah::storage_driver_env());
+            env.push(forge::buildah::isolation_env());
         }
 
         // kubectl + forge path consts fixed by the template (the broker's hooks read these).
-        env.push(plain("KUBECONFIG", KUBECONFIG_PATH.to_string()));
-        env.push(plain("FORGE_STORAGE_ROOT", FORGE_STORAGE_ROOT.to_string()));
+        env.push(env_var("KUBECONFIG", KUBECONFIG_PATH.to_string()));
+        env.push(env_var(
+            "FORGE_STORAGE_ROOT",
+            FORGE_STORAGE_ROOT.to_string(),
+        ));
 
         // Point every containers/image consumer at the mounted authfiles, rather than shelling out to
         // `podman login`: podman honors REGISTRY_AUTH_FILE above all other lookup paths, so the
@@ -866,16 +850,19 @@ impl Renderer<'_> {
         // profile actually mounts one, an unset var falls back to podman's own lookup, whereas a
         // var pointing at an absent file is an error on the very first anonymous pull.
         if self.profile.secrets.pull_authfile.is_some() {
-            env.push(plain("REGISTRY_AUTH_FILE", PULL_AUTHFILE_PATH.to_string()));
+            env.push(env_var(
+                "REGISTRY_AUTH_FILE",
+                PULL_AUTHFILE_PATH.to_string(),
+            ));
         }
         if self.profile.secrets.push_authfile.is_some() {
-            env.push(plain("FORGE_AUTHFILE", PUSH_AUTHFILE_PATH.to_string()));
+            env.push(env_var("FORGE_AUTHFILE", PUSH_AUTHFILE_PATH.to_string()));
         }
 
         // Per-component build/deploy targets, from [deploy] (FORGE_* + the hook's own env names).
         for d in &self.input.deploy_targets {
             for (k, v) in d.broker_env() {
-                env.push(plain(&k, v));
+                env.push(env_var(&k, v));
             }
         }
 
@@ -884,26 +871,26 @@ impl Renderer<'_> {
         // => none of this is emitted.
         if let Some(measure) = self.input.measure {
             for (k, v) in measure.broker_env().map_err(anyhow::Error::msg)? {
-                env.push(plain(&k, v));
+                env.push(env_var(&k, v));
             }
             if let Some(sub) = &self.profile.measure {
                 for (k, v) in sub.broker_env() {
-                    env.push(plain(&k, v));
+                    env.push(env_var(&k, v));
                 }
             }
             // Delegated spoke: the mounted kubeconfig path + the tier (named in unreachable-spoke
             // tool errors). BROKER_CODEGEN_CLUSTER itself rides broker_env() above.
             if let Some((_, entry)) = &self.spoke {
-                env.push(plain(
+                env.push(env_var(
                     "BROKER_CODEGEN_KUBECONFIG",
                     SPOKE_KUBECONFIG_PATH.to_string(),
                 ));
-                env.push(plain(
+                env.push(env_var(
                     "BROKER_CODEGEN_CLUSTER_TIER",
                     entry.tier().as_str().to_string(),
                 ));
                 if let Some(proxy) = &entry.proxy_url {
-                    env.push(plain("BROKER_CODEGEN_PROXY_URL", proxy.clone()));
+                    env.push(env_var("BROKER_CODEGEN_PROXY_URL", proxy.clone()));
                 }
             }
         }
@@ -912,8 +899,8 @@ impl Renderer<'_> {
         if let Some(arn) = self.profile.cluster.aws_role_arn.as_deref()
             && !arn.is_empty()
         {
-            env.push(plain("AWS_ROLE_ARN", arn.to_string()));
-            env.push(plain(
+            env.push(env_var("AWS_ROLE_ARN", arn.to_string()));
+            env.push(env_var(
                 "AWS_WEB_IDENTITY_TOKEN_FILE",
                 AWS_TOKEN_PATH.to_string(),
             ));
@@ -924,7 +911,7 @@ impl Renderer<'_> {
         if let Some(arn) = self.profile.cluster.aws_sandbox_role_arn.as_deref()
             && !arn.is_empty()
         {
-            env.push(plain(AWS_SANDBOX_ROLE_ENV, arn.to_string()));
+            env.push(env_var(AWS_SANDBOX_ROLE_ENV, arn.to_string()));
         }
 
         // Under the kubernetes driver, project the config the runtime `gateway_toml()` reads to
@@ -934,18 +921,6 @@ impl Renderer<'_> {
         {
             env.extend(kubernetes_sandbox_env(self.profile, sandbox_image)?);
         }
-
-        let downward = |name: &str, field_path: &str| core::EnvVar {
-            name: name.to_string(),
-            value: None,
-            value_from: Some(core::EnvVarSource {
-                field_ref: Some(core::ObjectFieldSelector {
-                    field_path: field_path.to_string(),
-                    api_version: None,
-                }),
-                ..Default::default()
-            }),
-        };
 
         // The node's IP, so a profile can address a node-local collector as "$(HOST_IP):4317".
         // MUST precede the profile's own [env] below: kubelet expands $(VAR) only against vars
@@ -967,7 +942,7 @@ impl Renderer<'_> {
         // exported ancestor to group by. A resource attribute is on each span as it arrives.
         // The SDK reads this via Resource::builder()'s EnvResourceDetector. The profile's [env]
         // below can replace it outright (duplicate names: last wins).
-        env.push(plain(
+        env.push(env_var(
             "OTEL_RESOURCE_ATTRIBUTES",
             "k8s.pod.name=$(CRUCIBLE_POD_NAME),k8s.namespace.name=$(CRUCIBLE_POD_NAMESPACE)"
                 .to_string(),
@@ -976,27 +951,27 @@ impl Renderer<'_> {
         // Run identity for anything that has to name this run to a human (today: the broker's
         // distress page). The broker inherits the loop pod's env wholesale, so naming them here is
         // the whole plumbing. Before the profile's [env] so a profile can override them.
-        env.push(plain(
+        env.push(env_var(
             crucible_contract::ENV_RUN_NAME,
             self.input.name.to_string(),
         ));
-        env.push(plain(
+        env.push(env_var(
             "CRUCIBLE_ITERATIONS",
             self.opts.iterations.to_string(),
         ));
-        env.push(plain("CRUCIBLE_LOOP_IMAGE", self.image.clone()));
+        env.push(env_var("CRUCIBLE_LOOP_IMAGE", self.image.clone()));
 
         // Generic environment env the domain's hooks/gate need, names are the profile's. Last so
         // a profile can override a default if it ever needs to.
         for (k, v) in &self.profile.env {
-            env.push(plain(k, v.clone()));
+            env.push(env_var(k, v.clone()));
         }
 
         // The controller the run uploads its evidence to, with the run token the controller's
         // Secret projects (RFC-0004:C-RUN-EVIDENCE). Absent = no controller to reach; the wrapper
         // dumps the session behind the `SESSION` delimiter instead.
         if let Some(url) = &self.profile.cluster.ingest_url {
-            env.push(plain(crucible_contract::ENV_CONTROLLER_URL, url.clone()));
+            env.push(env_var(crucible_contract::ENV_CONTROLLER_URL, url.clone()));
         }
 
         Ok(env)
@@ -2101,7 +2076,7 @@ fn broker_ingress_port(bind: &str) -> i32 {
 
 /// The pod's CPU/memory requests+limits, from the profile's `[resources]`. Shared by the loop pod
 /// and a turn pod (both are the same agent-turn shape, resource-wise).
-pub(super) fn resources(profile: &DeployProfile) -> core::ResourceRequirements {
+pub(in crate::deploy) fn resources(profile: &DeployProfile) -> core::ResourceRequirements {
     let r = &profile.resources;
     core::ResourceRequirements {
         requests: Some(BTreeMap::from([
@@ -2148,17 +2123,12 @@ pub(super) fn secret_env_vars(profile: &DeployProfile) -> Vec<core::EnvVar> {
 /// The supervisor and sandbox runtime images the gateway's compute driver launches, as the env
 /// `gateway::DriverImages::from_env` reads. Shared by the loop and turn renders.
 pub(super) fn driver_image_env(profile: &DeployProfile) -> Result<Vec<core::EnvVar>> {
-    let plain = |name: &str, value: String| core::EnvVar {
-        name: name.to_string(),
-        value: Some(value),
-        value_from: None,
-    };
     Ok(vec![
-        plain(
+        env_var(
             SUPERVISOR_IMAGE_ENV,
             profile.cluster.supervisor_image.clone(),
         ),
-        plain(
+        env_var(
             SANDBOX_RUNTIME_IMAGE_ENV,
             profile.cluster.sandbox_runtime_image()?,
         ),
@@ -2169,11 +2139,6 @@ pub(super) fn kubernetes_sandbox_env(
     profile: &DeployProfile,
     sandbox_image: &str,
 ) -> Result<Vec<core::EnvVar>> {
-    let plain = |name: &str, value: String| core::EnvVar {
-        name: name.to_string(),
-        value: Some(value),
-        value_from: None,
-    };
     let mut env = vec![core::EnvVar {
         name: POD_IP_ENV.to_string(),
         value: None,
@@ -2185,15 +2150,15 @@ pub(super) fn kubernetes_sandbox_env(
             ..Default::default()
         }),
     }];
-    env.push(plain(
+    env.push(env_var(
         "CRUCIBLE_SANDBOX_NAMESPACE",
         profile.cluster.sandbox_namespace().to_string(),
     ));
-    env.push(plain(
+    env.push(env_var(
         "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT",
         profile.cluster.sandbox_service_account().to_string(),
     ));
-    env.push(plain(
+    env.push(env_var(
         "CRUCIBLE_SANDBOX_DEFAULT_IMAGE",
         sandbox_image.to_string(),
     ));
@@ -2202,7 +2167,7 @@ pub(super) fn kubernetes_sandbox_env(
     // `auth.json` for the nested podman, and handing it to `imagePullSecrets` yields an
     // ImagePullBackOff complaining about a missing `.dockerconfigjson` key.
     if !profile.image.pull_secret.is_empty() {
-        env.push(plain(
+        env.push(env_var(
             "CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS",
             profile.image.pull_secret.clone(),
         ));
@@ -2210,12 +2175,12 @@ pub(super) fn kubernetes_sandbox_env(
     if !profile.cluster.host_aliases.is_empty() {
         let aliases = serde_json::to_string(&profile.cluster.host_aliases)
             .context("serializing [cluster].host_aliases")?;
-        env.push(plain("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
+        env.push(env_var("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
     }
     if !profile.cluster.gpu_sandbox.is_empty() {
         let placement = serde_json::to_string(&profile.cluster.gpu_sandbox)
             .context("serializing [cluster.gpu_sandbox]")?;
-        env.push(plain(
+        env.push(env_var(
             crate::openshell::placement::GPU_PLACEMENT_ENV,
             placement,
         ));
