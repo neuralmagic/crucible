@@ -426,8 +426,7 @@ measurements, the engine sets `CRUCIBLE_BASELINE_SCORE`, `CRUCIBLE_BASELINE_TOTA
 | `openshell` | Runs the selected harness in an OpenShell sandbox and syncs workspace changes. | OpenShell, `sandbox_image`, and an applicable egress policy. |
 | `command` | Runs `[agent].agent_cmd` through `sh -c`. | The command and its local dependencies. |
 
-The default harness is `claude`. The other harnesses are `hermes`, `codex`, `opencode`, and
-`pi` (see [docs/codex-harness.md](docs/codex-harness.md) and
+The default harness is `claude`. The other harnesses are `codex`, `opencode`, and `pi` (see [docs/codex-harness.md](docs/codex-harness.md) and
 [docs/opencode-pi-harnesses.md](docs/opencode-pi-harnesses.md)). Use the `command` backend
 for deterministic tests and for integrations that supply their own proposer.
 

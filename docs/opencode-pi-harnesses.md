@@ -69,7 +69,7 @@ idle signal of the session. In a container, that signal can arrive before the la
 `bash` wrapper. It runs `opencode run`, then `opencode export <session>` into
 `/sandbox/.local/share/opencode/crucible-export.json`. That export is the transcript of the
 turn. It is the only source of the result, the token usage, and the tool spans
-(`backfill_required`, as for hermes). A missing export is a transcript error, never a $0
+(`backfill_required`). A missing export is a transcript error, never a $0
 success.
 
 The `--mode json` stream of Pi comes from its own process and is complete. Pi ends the turn

@@ -663,9 +663,9 @@ impl ReasoningEffort {
 pub struct AgentCfg {
     #[serde(default = "default_model")]
     pub model: String,
-    /// The agent harness that runs each turn: `claude` (default) or `hermes`. Per-domain so a
-    /// harness swap is a manifest edit (and an ablation axis), not engine surgery; the CLI
-    /// `--harness` overrides it.
+    /// The agent harness that runs each turn: `claude` (default), `codex`, `opencode`, or `pi`.
+    /// Per-domain so a harness swap is a manifest edit (and an ablation axis), not engine surgery;
+    /// the CLI `--harness` overrides it.
     #[serde(default)]
     pub harness: Harness,
     /// Codex-harness tuning; ignored (and harmless) when `harness = "claude"`.

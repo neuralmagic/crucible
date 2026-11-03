@@ -321,8 +321,8 @@ completed-turn count. It never copies that cursor or Claude's native transcript 
 unchanged. Claude Code implements native start/resume for both the local and Vertex/OpenShell paths. Because OpenShell sandboxes are
 per-turn-fresh, Crucible saves Claude's native transcript as mode-0600 private engine state and
 restores it at the exact pinned config path in the next sandbox; that file is never included in the
-published run record. Hermes fails closed for a persistent binding until it has an equivalent
-continuation store; it never silently degrades the binding to a fresh prompt.
+published run record. The other harnesses have no equivalent continuation store, so they fail closed
+for a persistent binding; none silently degrades the binding to a fresh prompt.
 
 The first turn receives the complete method and goal prompt. A resumed proposer receives only the
 new authoritative delta: current regime, current-best status, and new steering. Its retained

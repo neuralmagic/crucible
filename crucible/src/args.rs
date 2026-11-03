@@ -131,10 +131,9 @@ pub(crate) struct Args {
     /// The agent binding's token price, pinned with the model (see `Args::pricing`).
     #[arg(skip)]
     pub price: Option<crucible_contract::inference::TokenPrice>,
-    /// The agent harness that runs each turn: `claude` (default), `hermes`, `codex`, `opencode`,
-    /// or `pi`. Overrides
-    /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
-    /// `apply_agent_cfg`).
+    /// The agent harness that runs each turn: `claude` (default), `codex`, `opencode`, or `pi`.
+    /// Overrides the manifest's `[agent].harness`; when neither is set the engine defaults to
+    /// claude (see `apply_agent_cfg`).
     #[arg(long, value_enum)]
     pub harness: Option<crate::manifest::Harness>,
     /// Codex-harness tuning (from `[agent.codex]`). No CLI flag.

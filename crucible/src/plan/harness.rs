@@ -1,5 +1,5 @@
 //! The real-harness runner. `Agent` tasks execute through [`crate::agent::run_turn`], the
-//! same path the loop uses (local claude, hermes, openshell, or the free `command` backend),
+//! same path the loop uses (local claude, openshell, or the free `command` backend),
 //! with the task's harness/model/effort overriding the manifest's `[agent]` defaults.
 //! `Command` tasks run in the workspace via the shell runner.
 //!
