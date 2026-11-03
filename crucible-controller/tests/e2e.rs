@@ -1441,7 +1441,7 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
             overrides,
             queue.clone(),
         )),
-        Arc::new(queue),
+        queue,
         Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
             None,
         )),
@@ -1723,7 +1723,7 @@ async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
             overrides,
             api_queue.clone(),
         )),
-        Arc::new(api_queue),
+        api_queue,
         Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
             None,
         )),

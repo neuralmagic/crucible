@@ -8318,24 +8318,14 @@ impl crate::runs::workpod::PodDispatcher for ClusterRunPodDispatcher {
     }
 }
 
-#[derive(Default)]
-struct RecordingEnqueue(std::sync::Mutex<Vec<String>>);
-
-impl crate::daemon::queue::Enqueue for RecordingEnqueue {
-    fn enqueue(&self, key: crate::daemon::queue::IssueKey) {
-        self.0.lock().expect("lock").push(key.0);
-    }
-}
-
 /// One discovery tick of the run pod resync, returning the keys it enqueued.
 async fn resync_tick(db: &Db) -> Result<Vec<String>> {
     use crate::daemon::queue::DiscoverySource;
-    let recorded = std::sync::Arc::new(RecordingEnqueue::default());
+    let queue = crate::daemon::queue::WorkQueue::new();
     crate::runs::workpod::RunPodResync::new(db.clone())
-        .poll(recorded.clone())
+        .poll(queue.clone())
         .await?;
-    let keys = recorded.0.lock().expect("lock").clone();
-    Ok(keys)
+    Ok(queue.pending().plain)
 }
 
 /// Install `dispatcher`, run one resync tick and reconcile every key it enqueued, the way the

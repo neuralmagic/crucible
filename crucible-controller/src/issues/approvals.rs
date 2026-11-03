@@ -27,7 +27,7 @@
 
 use crate::client::Db;
 use crate::config::ControllerCfg;
-use crate::daemon::queue::{BoxFuture, Enqueue, IssueKey};
+use crate::daemon::queue::{BoxFuture, IssueKey, WorkQueue};
 use crate::issues::github::{
     self, Authz, Comment, PrRef, Review, github_api_base, github_token, parse_pr_url,
 };
@@ -109,7 +109,7 @@ impl ApprovalPoll {
         api_base: &str,
         token: Option<&str>,
         row: &crate::issues::model::AwaitingApproval,
-        enqueue: &dyn Enqueue,
+        queue: &WorkQueue,
     ) -> Result<bool> {
         let pr = parse_pr_url(&row.approval_pr)
             .with_context(|| format!("approval_pr is not a GitHub PR url: {}", row.approval_pr))?;
@@ -158,7 +158,7 @@ impl ApprovalPoll {
             {
                 m.observe_approval_latency(secs);
             }
-            enqueue.enqueue(IssueKey(row.key.clone()));
+            queue.enqueue(IssueKey(row.key.clone()));
             return Ok(true);
         }
         Ok(false)
@@ -187,8 +187,8 @@ async fn awaiting_since_secs(
 }
 
 impl crate::daemon::queue::DiscoverySource for ApprovalPoll {
-    fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
-        // Clones share the same DB pool + event log; the owned `enqueue` Arc moves into the future
+    fn poll(&self, queue: WorkQueue) -> BoxFuture<Result<()>> {
+        // Clones share the same DB pool + event log; the owned queue handle moves into the future
         // so a fresh authorized approval can enqueue after the async GitHub read.
         let this = ApprovalPoll {
             db: self.db.clone(),
@@ -218,7 +218,7 @@ impl crate::daemon::queue::DiscoverySource for ApprovalPoll {
             };
             for row in &rows {
                 if let Err(e) = this
-                    .poll_one(&api_base, token.as_deref(), row, enqueue.as_ref())
+                    .poll_one(&api_base, token.as_deref(), row, &queue)
                     .await
                 {
                     tracing::warn!(
@@ -253,7 +253,7 @@ impl UpstreamPoll {
 }
 
 impl crate::daemon::queue::DiscoverySource for UpstreamPoll {
-    fn poll(&self, enqueue: std::sync::Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+    fn poll(&self, queue: WorkQueue) -> BoxFuture<Result<()>> {
         let db = self.db.clone();
         Box::pin(async move {
             let repos = crate::issues::repo_watch::watched_repos(db.pool()).await?;
@@ -261,7 +261,7 @@ impl crate::daemon::queue::DiscoverySource for UpstreamPoll {
                 match crate::issues::triage::poll_repo(&db, repo).await {
                     Ok(keys) => {
                         for k in keys {
-                            enqueue.enqueue(IssueKey(k));
+                            queue.enqueue(IssueKey(k));
                         }
                     }
                     Err(e) => {
@@ -291,7 +291,7 @@ impl BackfillPoll {
 }
 
 impl crate::daemon::queue::DiscoverySource for BackfillPoll {
-    fn poll(&self, _enqueue: std::sync::Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+    fn poll(&self, _queue: WorkQueue) -> BoxFuture<Result<()>> {
         let db = self.db.clone();
         Box::pin(async move {
             crate::issues::triage::backfill_upstream_updated_at(&db).await?;
@@ -317,7 +317,7 @@ impl ClosedRepairPoll {
 }
 
 impl crate::daemon::queue::DiscoverySource for ClosedRepairPoll {
-    fn poll(&self, _enqueue: std::sync::Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+    fn poll(&self, _queue: WorkQueue) -> BoxFuture<Result<()>> {
         let db = self.db.clone();
         Box::pin(async move {
             crate::issues::triage::repair_closed_issues(&db).await?;
@@ -783,7 +783,7 @@ impl ReviewCommentPoll {
 }
 
 impl crate::daemon::queue::DiscoverySource for ReviewCommentPoll {
-    fn poll(&self, _enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+    fn poll(&self, _queue: WorkQueue) -> BoxFuture<Result<()>> {
         // Reseed writes steering rows the NEXT run reads; it enqueues nothing. The clones share the
         // DB pool and — crucially — the SAME `seen` map (an `Arc`), so this poll's baseline/marks
         // persist to the next tick.
@@ -1045,14 +1045,6 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A real recording `Enqueue` (not a mock framework): captures the keys the approval enqueues.
-    struct RecEnqueue(Arc<Mutex<Vec<String>>>);
-    impl Enqueue for RecEnqueue {
-        fn enqueue(&self, key: IssueKey) {
-            self.0.lock().unwrap().push(key.0);
-        }
-    }
-
     /// Seed one `awaiting-approval` issue with an open approval PR and return the poll's working row.
     async fn seed_awaiting(db: &Db) -> AwaitingApproval {
         crate::issues::store::upsert_issue(
@@ -1137,14 +1129,13 @@ mod tests {
         )
         .await;
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let enqueue = RecEnqueue(seen.clone());
+        let queue = WorkQueue::new();
         let poll = ApprovalPoll::new(
             db.clone(),
             crate::testing::cfg_from_args(["ctl"]),
             Authz::default(),
         );
-        let flipped = poll.poll_one(&server.uri(), None, &row, &enqueue).await?;
+        let flipped = poll.poll_one(&server.uri(), None, &row, &queue).await?;
 
         assert!(flipped, "an authorized review approval opens the approval");
         let scope = crate::issues::store::latest_scope_for_issue(db.pool(), "owner/repo#1")
@@ -1162,7 +1153,7 @@ mod tests {
             "a GitHub login nobody paired with a crucible login records no dispatcher"
         );
         assert_eq!(
-            *seen.lock().unwrap(),
+            queue.pending().plain,
             vec!["owner/repo#1"],
             "key enqueued for launch"
         );
@@ -1195,8 +1186,8 @@ mod tests {
                 (var == "CONTROLLER_GITHUB_LOGINS").then(|| "maint=alice".to_string())
             }),
         );
-        let enqueue = RecEnqueue(Arc::new(Mutex::new(Vec::new())));
-        assert!(poll.poll_one(&server.uri(), None, &row, &enqueue).await?);
+        let queue = WorkQueue::new();
+        assert!(poll.poll_one(&server.uri(), None, &row, &queue).await?);
         let requested: Option<String> =
             sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
                 .bind("owner/repo#1")
@@ -1269,14 +1260,13 @@ mod tests {
         )
         .await;
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let enqueue = RecEnqueue(seen.clone());
+        let queue = WorkQueue::new();
         let poll = ApprovalPoll::new(
             db.clone(),
             crate::testing::cfg_from_args(["ctl"]),
             Authz::default(),
         );
-        assert!(poll.poll_one(&server.uri(), None, &row, &enqueue).await?);
+        assert!(poll.poll_one(&server.uri(), None, &row, &queue).await?);
 
         let text = metrics.gather(crate::api::metrics::gauge_state(&db, None).await?)?;
         assert!(
@@ -1342,14 +1332,13 @@ mod tests {
         )
         .await;
 
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let enqueue = RecEnqueue(seen.clone());
+        let queue = WorkQueue::new();
         let poll = ApprovalPoll::new(
             db.clone(),
             crate::testing::cfg_from_args(["ctl"]),
             Authz::default(),
         );
-        let flipped = poll.poll_one(&server.uri(), None, &row, &enqueue).await?;
+        let flipped = poll.poll_one(&server.uri(), None, &row, &queue).await?;
 
         assert!(
             !flipped,
@@ -1359,7 +1348,7 @@ mod tests {
             .await?
             .unwrap();
         assert!(!scope.is_approved(), "approved_at stays null");
-        assert!(seen.lock().unwrap().is_empty(), "nothing enqueued");
+        assert!(queue.pending().plain.is_empty(), "nothing enqueued");
         Ok(())
     }
 
@@ -1395,11 +1384,10 @@ mod tests {
         let poll = UpstreamPoll::new(db.clone());
 
         // No repo is watched yet: the sweep touches nothing.
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        poll.poll(Arc::new(RecEnqueue(seen.clone())) as Arc<dyn Enqueue>)
-            .await?;
+        let queue = WorkQueue::new();
+        poll.poll(queue.clone()).await?;
         assert!(
-            seen.lock().unwrap().is_empty(),
+            queue.pending().plain.is_empty(),
             "nothing watched yet, nothing enqueued"
         );
 
@@ -1411,15 +1399,14 @@ mod tests {
         );
 
         // The very next sweep through the SAME poll instance picks it up.
-        let seen2 = Arc::new(Mutex::new(Vec::new()));
-        poll.poll(Arc::new(RecEnqueue(seen2.clone())) as Arc<dyn Enqueue>)
-            .await?;
+        let queue = WorkQueue::new();
+        poll.poll(queue.clone()).await?;
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }
 
         assert_eq!(
-            seen2.lock().unwrap().clone(),
+            queue.pending().plain,
             vec!["owner/repo#1".to_string()],
             "the newly-watched repo is discovered on the very next sweep"
         );

@@ -856,7 +856,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     let serve_state = crucible_controller::api::state::ApiState::new(
         db.clone(),
         serve_sink,
-        std::sync::Arc::new(queue.clone()),
+        queue.clone(),
         clusters.clone(),
         Some(config_store.clone()),
         reconcile_now.clone(),

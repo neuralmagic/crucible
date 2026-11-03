@@ -381,7 +381,7 @@ impl GatewaySweep {
 impl crate::daemon::queue::DiscoverySource for GatewaySweep {
     fn poll(
         &self,
-        _enqueue: std::sync::Arc<dyn crate::daemon::queue::Enqueue>,
+        _queue: crate::daemon::queue::WorkQueue,
     ) -> crate::daemon::queue::BoxFuture<Result<()>> {
         let db = self.db.clone();
         let cfg = self.cfg.clone();

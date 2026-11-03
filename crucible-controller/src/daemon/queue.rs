@@ -1,5 +1,5 @@
 //! The in-memory work queue: sources enqueue a key, one worker dequeues and reconciles it. The
-//! frozen contract is just [`IssueKey`] + [`Enqueue`]; everything else here is the
+//! frozen contract is just [`IssueKey`] + [`WorkQueue::enqueue`]; everything else here is the
 //! client-go/controller-runtime workqueue shape (coalescing set + FIFO order) plus exponential-backoff
 //! requeue and park-after-N-failures, adapted to run over a single mpsc-fed worker instead of a CRD
 //! reconciler.
@@ -22,18 +22,6 @@ use tokio::sync::Notify;
 /// GitHub issue, `scenario:{id}` for an adopted scenario — see [`crate::issues::model::InputKind`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct IssueKey(pub String);
-
-/// Sources (the discovery timer, the approval signal, the pod watch, the review-comment poll)
-/// only ever call this — they never touch the database or act directly (frozen).
-pub trait Enqueue: Send + Sync {
-    fn enqueue(&self, key: IssueKey);
-
-    /// Put newly authorized or human-directed work ahead of discovery backlog. Implementations
-    /// without priority support remain correct, merely FIFO.
-    fn enqueue_urgent(&self, key: IssueKey) {
-        self.enqueue(key);
-    }
-}
 
 /// A boxed, owned, `Send` future — the reconcile function's return type without naming a crate
 /// (`futures::future::BoxFuture` would do the same job; this avoids the extra dependency).
@@ -191,7 +179,7 @@ impl Inner {
     }
 }
 
-/// The queue handle: implements [`Enqueue`] for sources, and drives the worker loop via
+/// The queue handle: what every source enqueues through, and what drives the worker loop via
 /// [`WorkQueue::run`]. Cheap to clone (an `Arc` inside).
 #[derive(Clone)]
 pub struct WorkQueue {
@@ -229,16 +217,33 @@ impl WorkQueue {
         }
     }
 
-    /// Enqueue a human override ahead of machine-discovered work. Kept off the frozen [`Enqueue`]
-    /// trait so ordinary producers cannot accidentally bypass FIFO fairness.
-    pub(crate) fn enqueue_urgent(&self, key: IssueKey) {
+    /// Sources (the discovery timer, the approval signal, the pod watch, the review-comment poll)
+    /// only ever call this — they never touch the database or act directly (frozen).
+    pub fn enqueue(&self, key: IssueKey) {
+        self.inner.add(key.0);
+    }
+
+    /// Put newly authorized or human-directed work ahead of discovery backlog.
+    pub fn enqueue_urgent(&self, key: IssueKey) {
         self.inner.add_urgent(key.0);
     }
 
     /// Stop accepting new work and wake the worker so it exits `run` once the queue drains: drop
-    /// every `Enqueue` handle / source, then call this, then join the worker task.
+    /// every queue handle / source, then call this, then join the worker task.
     pub(crate) fn shut_down(&self) {
         self.inner.shut_down();
+    }
+
+    /// The keys waiting to be dequeued, urgent ones first, in the order they will run.
+    #[cfg(test)]
+    pub(crate) fn pending(&self) -> Pending {
+        let st = self.inner.state();
+        let order: Vec<String> = st.order.iter().cloned().collect();
+        let (urgent, plain) = order.split_at(st.urgent.min(order.len()));
+        Pending {
+            urgent: urgent.to_vec(),
+            plain: plain.to_vec(),
+        }
     }
 
     /// The worker loop: dequeue a key, reconcile it, and either clear it, requeue it after
@@ -296,19 +301,17 @@ impl WorkQueue {
     }
 }
 
-impl Enqueue for WorkQueue {
-    fn enqueue(&self, key: IssueKey) {
-        self.inner.add(key.0);
-    }
-
-    fn enqueue_urgent(&self, key: IssueKey) {
-        WorkQueue::enqueue_urgent(self, key);
-    }
+/// What a queue holds, split the way it will dequeue.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Pending {
+    pub(crate) urgent: Vec<String>,
+    pub(crate) plain: Vec<String>,
 }
 
 /// A human override submitted through the API/UI: park/unpark/bump plus
-/// the intent the queue-only [`Enqueue`] trait can't carry — a reason (park) or a new priority
-/// (bump). Accepted as a contract addition alongside the frozen [`IssueKey`]/[`Enqueue`] pair;
+/// the intent a bare [`WorkQueue::enqueue`] can't carry — a reason (park) or a new priority
+/// (bump). Accepted as a contract addition alongside the frozen [`IssueKey`];
 /// the daemon folds submissions into the reconcile flow so they compose with claims
 /// instead of racing them.
 #[derive(Debug, Clone, PartialEq)]
@@ -348,19 +351,18 @@ pub enum OverrideKind {
 }
 
 /// Where the API/UI hands an [`Override`] off. Reconcile is the only writer of `parked_by =
-/// human` stickiness; this sink just queues the intent — it never touches the DB itself,
-/// matching [`Enqueue`]'s shape.
+/// human` stickiness; this sink just queues the intent — it never touches the DB itself.
 pub trait OverrideSink: Send + Sync {
     fn submit(&self, ov: Override);
 }
 
 /// A discovery source: polls whatever it polls (the upstream watermark, the approval PRs, the
-/// review comments) and enqueues changed keys. Handed an owned `Arc<dyn Enqueue>` (not a borrow) so
-/// a source that enqueues *after* an async fetch can move it into its future — the queue handle is a
+/// review comments) and enqueues changed keys. Handed an owned [`WorkQueue`] (not a borrow) so a
+/// source that enqueues *after* an async fetch can move it into its future — the handle is a
 /// cheap `Arc` clone, so this costs nothing. Most sources only enqueue; the one-shot and schedule
 /// sweeps also write, claiming a due row and minting its launch before enqueueing the key.
 pub trait DiscoverySource: Send + Sync {
-    fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<anyhow::Result<()>>;
+    fn poll(&self, queue: WorkQueue) -> BoxFuture<anyhow::Result<()>>;
 }
 
 /// A source whose work has a due time. The launch loop asks it for the earliest one and runs a
@@ -368,8 +370,7 @@ pub trait DiscoverySource: Send + Sync {
 /// them out.
 pub trait DueSource: Send + Sync {
     fn next_due(&self, held: Vec<String>) -> BoxFuture<anyhow::Result<Option<jiff::Timestamp>>>;
-    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>)
-    -> BoxFuture<anyhow::Result<Pass>>;
+    fn pass(&self, queue: WorkQueue, held: Vec<String>) -> BoxFuture<anyhow::Result<Pass>>;
 }
 
 /// What one [`DueSource::pass`] did.

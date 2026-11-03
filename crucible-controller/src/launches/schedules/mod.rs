@@ -861,8 +861,7 @@ pub(crate) async fn fire_due_refreshing(
 
 #[cfg(test)]
 mod tests {
-    use crate::daemon::queue::DiscoverySource;
-    use crate::daemon::queue::{Enqueue, IssueKey};
+    use crate::daemon::queue::{DiscoverySource, WorkQueue};
     use crate::launches::model::NewPlaybookLaunch;
     use crate::launches::schedules::*;
     use crate::launches::standing::{
@@ -2975,20 +2974,12 @@ mod tests {
     /// dispatches a scheduled run exactly like a manual one.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_sweep_enqueues_every_launch_it_fires(pool: PgPool) -> Result<()> {
-        #[derive(Default)]
-        struct Recorder(std::sync::Mutex<Vec<String>>);
-        impl Enqueue for Recorder {
-            fn enqueue(&self, key: IssueKey) {
-                self.0.lock().expect("lock").push(key.0);
-            }
-        }
-
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         schedule_due_at(&pool, "0 * * * *", Some("2020-01-01T00:00:00Z")).await;
         schedule_due_at(&pool, "0 * * * *", Some("2020-01-02T00:00:00Z")).await;
 
-        let recorder = Arc::new(Recorder::default());
+        let queue = WorkQueue::new();
         standing::TriggerSweep::new(
             db.clone(),
             vec![Arc::new(ScheduleTrigger::new(db, None))],
@@ -2997,10 +2988,10 @@ mod tests {
             None,
             None,
         )
-        .poll(recorder.clone())
+        .poll(queue.clone())
         .await?;
 
-        let keys = recorder.0.lock().expect("lock").clone();
+        let keys = queue.pending().urgent;
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(
             keys.iter().all(|k| k.starts_with("playbook:survey:")),

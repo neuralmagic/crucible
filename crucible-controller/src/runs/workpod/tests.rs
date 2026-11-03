@@ -4349,19 +4349,6 @@ async fn timeout_sweep_honors_the_scaled_scope_deadline(pool: sqlx::PgPool) -> R
 
 // --- queue drain: collection re-drives the backlog, park purges it -----------------------------
 
-/// A test [`crate::daemon::queue::Enqueue`] that records the issue keys the drain re-drives.
-#[cfg(feature = "autoresearch")]
-#[derive(Default)]
-struct RecordingEnqueue {
-    keys: Arc<Mutex<Vec<String>>>,
-}
-#[cfg(feature = "autoresearch")]
-impl crate::daemon::queue::Enqueue for RecordingEnqueue {
-    fn enqueue(&self, key: crate::daemon::queue::IssueKey) {
-        self.keys.lock().expect("lock").push(key.0);
-    }
-}
-
 /// Seed a `queued` work-pod row backdated to `created_at`, so the FIFO drain order is deterministic.
 async fn seed_queued_turn_at(
     db: &Db,
@@ -4449,9 +4436,8 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
     )
     .await?;
 
-    let recorder = RecordingEnqueue::default();
-    let keys = recorder.keys.clone();
-    install_enqueue(Arc::new(recorder));
+    let queue = crate::daemon::queue::WorkQueue::new();
+    install_enqueue(queue.clone());
 
     let dispatcher = Arc::new(FakeDispatcher {
             phase: TurnPhase::Succeeded,
@@ -4468,8 +4454,8 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
 
     assert!(matches!(out, DispatchOutcome::Verdict(_)), "{out:?}");
     assert_eq!(
-        keys.lock().expect("lock").as_slice(),
-        &["owner/repo#2"],
+        queue.pending().plain,
+        ["owner/repo#2"],
         "the freed slot re-drives the ELDEST queued row's issue (FIFO), not the younger one"
     );
     // The drain only enqueues — the row is still queued until the reconcile pass promotes it.
@@ -4572,9 +4558,8 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
     )
     .await?;
 
-    let recorder = RecordingEnqueue::default();
-    let keys = recorder.keys.clone();
-    install_enqueue(Arc::new(recorder));
+    let queue = crate::daemon::queue::WorkQueue::new();
+    install_enqueue(queue.clone());
     let dispatcher = Arc::new(FakeDispatcher {
             phase: TurnPhase::Succeeded,
             message: None,
@@ -4594,8 +4579,8 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
         "the parked-issue queued row is purged, not left to wedge the drain"
     );
     assert_eq!(
-        keys.lock().expect("lock").as_slice(),
-        &["owner/repo#8"],
+        queue.pending().plain,
+        ["owner/repo#8"],
         "the drain skips the parked row and re-drives the next drainable issue"
     );
     Ok(())

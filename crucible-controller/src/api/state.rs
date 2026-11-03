@@ -2,7 +2,7 @@
 //! modules depend on this and on [`crate::api::dto`]; only [`crate::api`] itself assembles the router.
 
 use crate::client::Db;
-use crate::daemon::queue::{Enqueue, OverrideSink};
+use crate::daemon::queue::{OverrideSink, WorkQueue};
 #[cfg(feature = "autoresearch")]
 use crate::issues::repo_ref::RepoWhitelist;
 use axum::extract::{FromRequest, Request};
@@ -54,7 +54,7 @@ pub struct ApiState {
     pub(crate) db: Db,
     pub(crate) schedules: crate::launches::schedules::ScheduleStore,
     pub(crate) sink: Arc<dyn OverrideSink>,
-    pub(crate) queue: Arc<dyn Enqueue>,
+    pub(crate) queue: WorkQueue,
     pub(crate) caps: Option<Caps>,
     pub(crate) roles: crate::identity::auth::Roles,
     /// The daemon's autopilot flag; `None` where no daemon loaded one.
@@ -184,7 +184,7 @@ impl ApiState {
     pub fn new(
         db: Db,
         sink: Arc<dyn OverrideSink>,
-        queue: Arc<dyn Enqueue>,
+        queue: WorkQueue,
         clusters: Arc<crate::runs::clusters::ClusterClients>,
         config: Option<crate::daemon::overrides_store::ConfigStore>,
         reconcile_now: Arc<tokio::sync::Notify>,
@@ -358,7 +358,7 @@ impl ApiState {
             db,
             schedules,
             sink,
-            queue: Arc::new(crate::daemon::queue::WorkQueue::new()),
+            queue: WorkQueue::new(),
             caps: None,
             roles: crate::identity::auth::Roles::new(vec![], vec![], vec![]),
             #[cfg(feature = "autoresearch")]

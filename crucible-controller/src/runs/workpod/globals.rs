@@ -98,14 +98,14 @@ pub(crate) async fn recorded_engine_version(
 /// daemon assembly installs the real [`crate::daemon::queue::WorkQueue`]; unlike the dispatcher there is NO
 /// default — a process with no queue wired (a unit test not exercising the drain) makes the drain a
 /// safe no-op, since the timeout-sweep backstop and the next reconcile pass still drain the queue.
-static ACTIVE_ENQUEUE: std::sync::RwLock<Option<Arc<dyn crate::daemon::queue::Enqueue>>> =
+static ACTIVE_ENQUEUE: std::sync::RwLock<Option<crate::daemon::queue::WorkQueue>> =
     std::sync::RwLock::new(None);
 
 /// Install the active reconcile-queue handle (daemon assembly, or a test's recorder).
-pub fn install_enqueue(enqueue: Arc<dyn crate::daemon::queue::Enqueue>) {
+pub fn install_enqueue(queue: crate::daemon::queue::WorkQueue) {
     *ACTIVE_ENQUEUE
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(enqueue);
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(queue);
 }
 
 /// Drop the installed queue handle (a test's teardown).
@@ -117,7 +117,7 @@ pub fn reset_enqueue() {
 
 /// The installed reconcile-queue handle, or `None` when no queue is wired (drain is then a no-op).
 #[cfg(feature = "autoresearch")]
-fn active_enqueue() -> Option<Arc<dyn crate::daemon::queue::Enqueue>> {
+fn active_enqueue() -> Option<crate::daemon::queue::WorkQueue> {
     ACTIVE_ENQUEUE
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

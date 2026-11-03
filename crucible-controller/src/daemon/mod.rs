@@ -1,6 +1,6 @@
 //! The resident shell: `select!`s a discovery timer against the manual trigger and leadership,
 //! and runs the [`WorkQueue`] worker, the launch loop, and the pod-completion watch alongside it.
-//! Every source only ever calls [`Enqueue::enqueue`].
+//! Every source only ever calls [`WorkQueue::enqueue`].
 //!
 //! `crucible-controller autopilot` (no `--once`) builds a runtime, assembles the [`Wiring`], and calls
 //! [`run`]; `--once` ([`crate::daemon::autopilot::run_once`]) enqueues non-terminal rows and drains
@@ -20,8 +20,8 @@ pub mod queue;
 
 use crate::daemon::queue::TestSyncMarker;
 use crate::daemon::queue::{
-    BoxFuture, DiscoverySource, DueSource, Enqueue, IssueKey, ParkFn, Pass, QueueConfig,
-    ReconcileFn, WorkQueue,
+    BoxFuture, DiscoverySource, DueSource, IssueKey, ParkFn, Pass, QueueConfig, ReconcileFn,
+    WorkQueue,
 };
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Pod;
@@ -44,7 +44,7 @@ pub type NonTerminalFn = Arc<dyn Fn() -> BoxFuture<Result<Vec<String>>> + Send +
 /// `run` stays a five-parameter call as the wiring grows.
 pub struct Wiring {
     /// The work queue the worker drains. Passed in (not created inside [`run`]) so the caller can
-    /// also hand its [`Enqueue`] handle to the override sink — human overrides enqueue into the very
+    /// also hand its [`WorkQueue`] handle to the override sink — human overrides enqueue into the very
     /// queue the worker serves, composing with the sources instead of a second, disconnected one.
     queue: WorkQueue,
     reconcile: ReconcileFn,
@@ -92,7 +92,7 @@ pub async fn assemble(
     // queued backlog row's issue back through reconcile (the drain can't thread a handle through the
     // frozen reconcile signature — same rationale as the dispatcher global). Assembly is the one
     // shared production + harness build point, so both get the real queue.
-    crate::runs::workpod::install_enqueue(Arc::new(queue.clone()));
+    crate::runs::workpod::install_enqueue(queue.clone());
 
     // A failed reconcile that exhausts its retry budget parks the issue with the last error as the
     // reason (machine park — a human sweep or an upstream change can revive it).
@@ -261,11 +261,11 @@ impl MultiDiscovery {
 }
 
 impl DiscoverySource for MultiDiscovery {
-    fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+    fn poll(&self, queue: WorkQueue) -> BoxFuture<Result<()>> {
         let sources = self.sources.clone();
         Box::pin(async move {
             for src in &sources {
-                if let Err(e) = src.poll(enqueue.clone()).await {
+                if let Err(e) = src.poll(queue.clone()).await {
                     tracing::warn!(
                         error = format!("{e:#}"),
                         "daemon: a discovery source failed (continuing)"
@@ -308,12 +308,12 @@ impl DueSource for MultiDue {
         })
     }
 
-    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<Result<Pass>> {
+    fn pass(&self, queue: WorkQueue, held: Vec<String>) -> BoxFuture<Result<Pass>> {
         let sources = self.sources.clone();
         Box::pin(async move {
             let mut total = Pass::default();
             for src in &sources {
-                match src.pass(enqueue.clone(), held.clone()).await {
+                match src.pass(queue.clone(), held.clone()).await {
                     Ok(pass) => {
                         total.claimed += pass.claimed;
                         total.held.extend(pass.held);
@@ -677,7 +677,7 @@ pub async fn run_led(
         };
         sources.spawn(launch_loop::run(
             launches,
-            Arc::new(queue.clone()),
+            queue.clone(),
             launch_loop::LaunchLoopCfg {
                 probe: cfg.launch_probe,
                 hold,
@@ -693,8 +693,6 @@ pub async fn run_led(
     // Stagger the first tick so a fleet of daemons (or several sources within one) don't all
     // fire together and hammer the same endpoints at once.
     discovery_timer.reset_after(stagger_offset(discovery_period));
-
-    let enqueue: Arc<dyn Enqueue> = Arc::new(queue.clone());
 
     // One pinned, eagerly-enabled shutdown future for the whole loop. A fresh `notified()` per
     // select iteration loses any `notify_waiters` that fires while an arm body runs (a discovery
@@ -724,7 +722,7 @@ pub async fn run_led(
                 anyhow::bail!("stepping down: {reason}");
             }
             _ = discovery_timer.tick() => {
-                discovery.poll(enqueue.clone()).await.context("discovery poll")?;
+                discovery.poll(queue.clone()).await.context("discovery poll")?;
                 // Re-read the effective cadence: a runtime override to `discovery_secs` retunes the
                 // timer live (rebuilt only when the period actually changed, so a stable config is
                 // a cheap comparison).
@@ -747,7 +745,7 @@ pub async fn run_led(
             _ = manual_trigger(cfg.reconcile_now.as_ref()) => {
                 tracing::info!("daemon: manual reconcile triggered");
                 launch_wake.notify_one();
-                if let Err(e) = discovery.poll(enqueue.clone()).await {
+                if let Err(e) = discovery.poll(queue.clone()).await {
                     tracing::warn!(error = format!("{e:#}"), "daemon: manual reconcile discovery poll failed");
                 }
                 match (reenqueue_all)().await {
@@ -1083,9 +1081,9 @@ mod tests {
     }
 
     impl DiscoverySource for CountingDiscovery {
-        fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+        fn poll(&self, queue: WorkQueue) -> BoxFuture<Result<()>> {
             self.polls.fetch_add(1, Ordering::SeqCst);
-            enqueue.enqueue(self.key.clone());
+            queue.enqueue(self.key.clone());
             Box::pin(async { Ok(()) })
         }
     }
@@ -1120,8 +1118,7 @@ mod tests {
                 .await;
         });
 
-        let enqueue: Arc<dyn Enqueue> = Arc::new(queue.clone());
-        discovery.poll(enqueue).await.expect("poll");
+        discovery.poll(queue.clone()).await.expect("poll");
         sync.wait_for_count(1).await;
         queue.shut_down();
         worker.await.expect("worker joined");
@@ -1242,15 +1239,11 @@ mod tests {
             Box::pin(async move { Ok(due) })
         }
 
-        fn pass(
-            &self,
-            enqueue: Arc<dyn Enqueue>,
-            _held: Vec<String>,
-        ) -> BoxFuture<Result<queue::Pass>> {
+        fn pass(&self, queue: WorkQueue, _held: Vec<String>) -> BoxFuture<Result<queue::Pass>> {
             let claimed = if self.fired.swap(true, Ordering::SeqCst) {
                 0
             } else {
-                enqueue.enqueue_urgent(self.key.clone());
+                queue.enqueue_urgent(self.key.clone());
                 1
             };
             Box::pin(async move {

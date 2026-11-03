@@ -4,7 +4,6 @@ use crate::config::ControllerCfg;
 use crate::runs::workpod::*;
 use anyhow::{Context, Result};
 #[cfg(feature = "autoresearch")]
-use std::sync::Arc;
 use std::time::Duration;
 
 /// The retained-terminal pod names past the count cap: rows sorted newest-terminal first, everything
@@ -290,14 +289,14 @@ impl TurnTimeoutPoll {
 impl crate::daemon::queue::DiscoverySource for TurnTimeoutPoll {
     fn poll(
         &self,
-        enqueue: Arc<dyn crate::daemon::queue::Enqueue>,
+        queue: crate::daemon::queue::WorkQueue,
     ) -> crate::daemon::queue::BoxFuture<Result<()>> {
         let db = self.db.clone();
         let cfg = self.cfg.clone();
         Box::pin(async move {
             let dispatcher = active_dispatcher();
             for key in sweep_timed_out_turns(&db, dispatcher.as_ref(), &cfg).await {
-                enqueue.enqueue(crate::daemon::queue::IssueKey(key));
+                queue.enqueue(crate::daemon::queue::IssueKey(key));
             }
             Ok(())
         })
@@ -332,7 +331,7 @@ impl RunPodResync {
 impl crate::daemon::queue::DiscoverySource for RunPodResync {
     fn poll(
         &self,
-        enqueue: std::sync::Arc<dyn crate::daemon::queue::Enqueue>,
+        queue: crate::daemon::queue::WorkQueue,
     ) -> crate::daemon::queue::BoxFuture<Result<()>> {
         let db = self.db.clone();
         Box::pin(async move {
@@ -341,7 +340,7 @@ impl crate::daemon::queue::DiscoverySource for RunPodResync {
                     .await
                     .context("reading running work pods for the run pod resync")?;
             for key in run_pod_resync_keys(&rows) {
-                enqueue.enqueue(crate::daemon::queue::IssueKey(key));
+                queue.enqueue(crate::daemon::queue::IssueKey(key));
             }
             Ok(())
         })

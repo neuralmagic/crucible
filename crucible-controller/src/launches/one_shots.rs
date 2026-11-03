@@ -370,8 +370,7 @@ pub(crate) async fn fire_due(db: &Db, now: &str, cap: usize) -> Result<Vec<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::queue::DiscoverySource;
-    use crate::daemon::queue::{Enqueue, IssueKey};
+    use crate::daemon::queue::{DiscoverySource, WorkQueue};
     use crate::model::LaunchOrigin;
     use crate::model::Status;
     use std::sync::Arc;
@@ -629,20 +628,12 @@ mod tests {
     /// dispatches a deferred run exactly like a manual one.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_poll_enqueues_every_launch_it_fires(pool: PgPool) -> Result<()> {
-        #[derive(Default)]
-        struct Recorder(std::sync::Mutex<Vec<String>>);
-        impl Enqueue for Recorder {
-            fn enqueue(&self, key: IssueKey) {
-                self.0.lock().expect("lock").push(key.0);
-            }
-        }
-
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         defer(&pool, "2020-01-01T00:00:00Z").await;
         defer(&pool, "2020-01-02T00:00:00Z").await;
 
-        let recorder = Arc::new(Recorder::default());
+        let queue = WorkQueue::new();
         standing::TriggerSweep::new(
             db,
             vec![Arc::new(OneShotTrigger)],
@@ -651,10 +642,10 @@ mod tests {
             None,
             None,
         )
-        .poll(recorder.clone())
+        .poll(queue.clone())
         .await?;
 
-        let keys = recorder.0.lock().expect("lock").clone();
+        let keys = queue.pending().urgent;
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(
             keys.iter().all(|k| k.starts_with("playbook:survey:")),
@@ -702,20 +693,6 @@ mod tests {
     async fn a_launch_loop_pass_enqueues_urgent_and_counts_its_claims(pool: PgPool) -> Result<()> {
         use crate::daemon::queue::DueSource;
 
-        #[derive(Default)]
-        struct Recorder {
-            plain: std::sync::Mutex<Vec<String>>,
-            urgent: std::sync::Mutex<Vec<String>>,
-        }
-        impl Enqueue for Recorder {
-            fn enqueue(&self, key: IssueKey) {
-                self.plain.lock().expect("lock").push(key.0);
-            }
-            fn enqueue_urgent(&self, key: IssueKey) {
-                self.urgent.lock().expect("lock").push(key.0);
-            }
-        }
-
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         let held = defer(&pool, "2020-01-01T00:00:00Z").await;
@@ -730,19 +707,19 @@ mod tests {
             None,
         );
 
-        let recorder = Arc::new(Recorder::default());
-        let pass = DueSource::pass(&sweep, recorder.clone(), vec![held.id.clone()]).await?;
+        let queue = WorkQueue::new();
+        let pass = DueSource::pass(&sweep, queue.clone(), vec![held.id.clone()]).await?;
         assert_eq!(pass.claimed, 2);
         assert!(pass.held.is_empty());
-        assert_eq!(recorder.urgent.lock().expect("lock").len(), 2);
-        assert!(recorder.plain.lock().expect("lock").is_empty());
+        assert_eq!(queue.pending().urgent.len(), 2);
+        assert!(queue.pending().plain.is_empty());
         assert_eq!(
             sweep.next_due(vec![]).await?,
             Some("2020-01-01T00:00:00Z".parse()?),
             "the held row is still pending"
         );
 
-        let pass = DueSource::pass(&sweep, recorder.clone(), vec![]).await?;
+        let pass = DueSource::pass(&sweep, queue.clone(), vec![]).await?;
         assert_eq!(pass.claimed, 1);
         assert_eq!(sweep.next_due(vec![]).await?, None);
         Ok(())

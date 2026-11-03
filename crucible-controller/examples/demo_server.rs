@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
     let state = ApiState::new(
         db,
         sink,
-        Arc::new(queue),
+        queue,
         clusters,
         None,
         reconcile_now,

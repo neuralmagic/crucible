@@ -461,7 +461,7 @@ mod tests {
         let state = crate::api::state::ApiState::new(
             db.clone(),
             Arc::new(NoSink),
-            Arc::new(crate::daemon::queue::WorkQueue::new()),
+            crate::daemon::queue::WorkQueue::new(),
             clusters,
             None,
             Arc::new(tokio::sync::Notify::new()),

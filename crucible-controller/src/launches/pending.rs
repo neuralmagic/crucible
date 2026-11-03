@@ -1,13 +1,11 @@
 //! Launches minted but not yet dispatched. Any replica mints them; the leader's launch loop
 //! enqueues them, then holds them until the hold runs out or they leave `new`.
 
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use sqlx::PgPool;
 
-use crate::daemon::queue::{BoxFuture, DueSource, Enqueue, IssueKey, Pass};
+use crate::daemon::queue::{BoxFuture, DueSource, IssueKey, Pass, WorkQueue};
 
 pub struct PendingLaunches {
     pool: PgPool,
@@ -47,12 +45,12 @@ impl DueSource for PendingLaunches {
         })
     }
 
-    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<Result<Pass>> {
+    fn pass(&self, queue: WorkQueue, held: Vec<String>) -> BoxFuture<Result<Pass>> {
         let pool = self.pool.clone();
         Box::pin(async move {
             let keys = pending_launch_keys(&pool, &held).await?;
             for key in &keys {
-                enqueue.enqueue_urgent(IssueKey(key.clone()));
+                queue.enqueue_urgent(IssueKey(key.clone()));
             }
             Ok(Pass {
                 claimed: 0,
@@ -64,26 +62,9 @@ impl DueSource for PendingLaunches {
 
 #[cfg(test)]
 mod tests {
-    use crate::daemon::queue::{DueSource, Enqueue, IssueKey, Pass};
+    use crate::daemon::queue::{DueSource, Pass, WorkQueue};
     use crate::launches::pending::PendingLaunches;
     use sqlx::PgPool;
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Default)]
-    struct Recorder {
-        plain: Mutex<Vec<String>>,
-        urgent: Mutex<Vec<String>>,
-    }
-
-    impl Enqueue for Recorder {
-        fn enqueue(&self, key: IssueKey) {
-            self.plain.lock().expect("lock").push(key.0);
-        }
-
-        fn enqueue_urgent(&self, key: IssueKey) {
-            self.urgent.lock().expect("lock").push(key.0);
-        }
-    }
 
     async fn issue(pool: &PgPool, key: &str, status: &str, kind: &str, updated_at: &str) {
         sqlx::query(
@@ -156,12 +137,12 @@ mod tests {
             source.next_due(vec![]).await.expect("probe"),
             Some(at("2026-09-30T00:00:01Z"))
         );
-        let recorder = Arc::new(Recorder::default());
-        let pass = source.pass(recorder.clone(), vec![]).await.expect("pass");
+        let queue = WorkQueue::new();
+        let pass = source.pass(queue.clone(), vec![]).await.expect("pass");
 
         let pending = vec!["playbook:a:1".to_string(), "playbook:b:2".to_string()];
-        assert_eq!(*recorder.urgent.lock().expect("lock"), pending);
-        assert!(recorder.plain.lock().expect("lock").is_empty());
+        assert_eq!(queue.pending().urgent, pending);
+        assert!(queue.pending().plain.is_empty());
         assert_eq!(
             pass,
             Pass {
@@ -197,12 +178,9 @@ mod tests {
             source.next_due(held.clone()).await.expect("probe"),
             Some(at("2026-09-30T00:00:02Z"))
         );
-        let recorder = Arc::new(Recorder::default());
-        source.pass(recorder.clone(), held).await.expect("pass");
-        assert_eq!(
-            *recorder.urgent.lock().expect("lock"),
-            vec!["playbook:b:2".to_string()]
-        );
+        let queue = WorkQueue::new();
+        source.pass(queue.clone(), held).await.expect("pass");
+        assert_eq!(queue.pending().urgent, vec!["playbook:b:2".to_string()]);
         assert_eq!(
             source
                 .next_due(vec!["playbook:a:1".into(), "playbook:b:2".into()])
@@ -224,11 +202,11 @@ mod tests {
         .await;
         let source = PendingLaunches::new(pool.clone());
         assert_eq!(source.next_due(vec![]).await.expect("probe"), None);
-        let recorder = Arc::new(Recorder::default());
-        let pass = source.pass(recorder.clone(), vec![]).await.expect("pass");
+        let queue = WorkQueue::new();
+        let pass = source.pass(queue.clone(), vec![]).await.expect("pass");
         assert_eq!(pass, Pass::default());
-        assert!(recorder.urgent.lock().expect("lock").is_empty());
-        assert!(recorder.plain.lock().expect("lock").is_empty());
+        assert!(queue.pending().urgent.is_empty());
+        assert!(queue.pending().plain.is_empty());
     }
 
     fn at(stamp: &str) -> jiff::Timestamp {
