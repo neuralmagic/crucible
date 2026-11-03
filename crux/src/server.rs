@@ -8,8 +8,8 @@
 use crate::client::Client;
 use crate::ops::blueprints::{BlueprintUse, Blueprints};
 use crate::ops::drafts::{
-    DraftCreate, DraftDelete, DraftFiles, DraftGraduate, DraftLaunch, DraftPreview, DraftPublish,
-    DraftPull, DraftPush, DraftSaveFiles,
+    DraftCreate, DraftDelete, DraftFiles, DraftGraduate, DraftLaunch, DraftMigrate, DraftPreview,
+    DraftPublish, DraftPull, DraftPush, DraftSaveFiles,
 };
 use crate::ops::issues::{
     Adopt, ApprovalDetail, Approvals, Approve, Bump, Contracts, Issue, Issues, Park, Reconcile,
@@ -280,6 +280,18 @@ impl CrucibleMcp {
     }
 
     #[tool(
+        description = "Move a draft to a newer pack edition with the controller's engine: set the \
+        manifest's edition and declare, as optional, each variable its host commands read. A dry \
+        run unless apply is set: returns each diff, the changes, and what needs review, and saves \
+        nothing. With apply, each migration is saved as the draft's next version. all sweeps every \
+        draft you may read, owner narrows that sweep, and drafts already at the edition are \
+        skipped."
+    )]
+    async fn crucible_draft_migrate(&self, Parameters(a): Parameters<DraftMigrate>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
         description = "Graduate a draft to a registered playbook: push its newest compiling \
         version as a branch under repo/path and open the export PR. Returns the PR URL. The draft \
         retires itself once that merged pack is imported. A draft already graduated is refused \
@@ -481,7 +493,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 46, "tools: {names:?}");
+        assert_eq!(names.len(), 47, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",

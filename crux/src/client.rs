@@ -763,6 +763,50 @@ impl Client {
             self.hint_for(status)
         );
     }
+
+    /// Move a draft to a newer pack edition against `base_version`, or preview the move when
+    /// `dry_run`. `to: None` lets the controller pick the newest edition its engine runs.
+    pub async fn migrate_draft(
+        &self,
+        id: &str,
+        to: Option<u32>,
+        base_version: i64,
+        dry_run: bool,
+    ) -> Result<MigrateReply> {
+        let path = format!("/api/playbook-drafts/{}/migrate", encode(id));
+        let mut body = serde_json::json!({ "base_version": base_version, "dry_run": dry_run });
+        if let Some(to) = to {
+            body["to"] = serde_json::json!(to);
+        }
+        let (status, text) = self
+            .transport
+            .send(reqwest::Method::POST, &path, Some(&body))
+            .await?;
+        if status.is_success() {
+            return Ok(MigrateReply::Migrated(parse(text, &path)?));
+        }
+        if status == reqwest::StatusCode::CONFLICT
+            && let Ok(stale) = serde_json::from_str::<dto::StaleBase>(&text)
+        {
+            return Ok(MigrateReply::Stale(stale));
+        }
+        let error = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v.get("error")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| text.trim().to_string());
+        Ok(MigrateReply::Refused(format!(
+            "HTTP {status}: {error}{}",
+            self.hint_for(status)
+        )))
+    }
+}
+
+/// What a draft migration came back as. Every refusal is data, so a sweep over many drafts reports
+/// each one and carries on.
+pub enum MigrateReply {
+    Migrated(serde_json::Value),
+    Stale(dto::StaleBase),
+    Refused(String),
 }
 
 /// What a draft save landed: the stored version, or the refusal naming the save that overtook it.

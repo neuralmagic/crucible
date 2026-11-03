@@ -353,6 +353,21 @@ fn draft_launch() {
 }
 
 #[test]
+fn draft_migrate() {
+    let op = same::<ops::drafts::DraftMigrate>(
+        &["cal", "--to", "2", "--apply", "--json"],
+        json!({"draft_id": "cal", "to": 2, "apply": true, "json": true}),
+    );
+    assert!(op.apply && !op.all);
+    let sweep = same::<ops::drafts::DraftMigrate>(
+        &["--all", "--owner", "user:alice", "--dry-run"],
+        json!({"all": true, "owner": "user:alice", "dry_run": true}),
+    );
+    assert_eq!(sweep.draft_id, None);
+    assert!(!sweep.apply);
+}
+
+#[test]
 fn draft_delete() {
     same::<ops::drafts::DraftDelete>(&["cal"], json!({"draft_id": "cal"}));
 }

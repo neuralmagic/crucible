@@ -67,6 +67,7 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-migrate         Move one draft, or every draft with --all, to a newer pack edition. Prints each diff and what needs review; saves nothing without --apply
   blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
   blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
   blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
@@ -167,6 +168,7 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-migrate         Move one draft, or every draft with --all, to a newer pack edition. Prints each diff and what needs review; saves nothing without --apply
   blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
   blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
   blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
@@ -3110,6 +3112,70 @@ Options:
       --url <URL>                  Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
       --api-token <API_TOKEN>      The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
   -h, --help                       Print help
+==== crux draft-migrate --help ====
+Move one draft, or every draft with --all, to a newer pack edition. Prints each diff and what needs review; saves nothing without --apply
+
+Usage: crux draft-migrate [OPTIONS] [DRAFT_ID]
+
+Arguments:
+  [DRAFT_ID]
+          The draft to migrate. Omit with --all
+
+Options:
+      --all
+          Every draft you may read that is below the target edition, retired ones aside
+
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --owner <OWNER>
+          With --all, only drafts this principal owns: `user:<login>` or `team:<slug>`
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+      --to <TO>
+          The edition to move to. Omit for the newest the controller's engine runs
+
+      --dry-run
+          Print each diff and its findings and save nothing. The default
+
+      --apply
+          Save each migration as its draft's next version
+
+      --json
+          
+
+  -h, --help
+          Print help
+==== crux draft-migrate -h ====
+Move one draft, or every draft with --all, to a newer pack edition. Prints each diff and what needs review; saves nothing without --apply
+
+Usage: crux draft-migrate [OPTIONS] [DRAFT_ID]
+
+Arguments:
+  [DRAFT_ID]  The draft to migrate. Omit with --all
+
+Options:
+      --all                    Every draft you may read that is below the target edition, retired ones aside
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --owner <OWNER>          With --all, only drafts this principal owns: `user:<login>` or `team:<slug>`
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+      --to <TO>                The edition to move to. Omit for the newest the controller's engine runs
+      --dry-run                Print each diff and its findings and save nothing. The default
+      --apply                  Save each migration as its draft's next version
+      --json                   
+  -h, --help                   Print help
 ==== crux blueprints --help ====
 List the blueprints you can read, with what each would carry for you and leave to bind
 
@@ -3544,6 +3610,7 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-migrate         Move one draft, or every draft with --all, to a newer pack edition. Prints each diff and what needs review; saves nothing without --apply
   blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
   blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
   blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
@@ -3622,6 +3689,7 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  draft-migrate         Move one draft, or every draft with --all, to a newer pack edition. Prints each diff and what needs review; saves nothing without --apply
   blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
   blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
   blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry

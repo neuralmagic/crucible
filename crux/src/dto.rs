@@ -773,6 +773,77 @@ pub struct GraduateAck {
     pub pr_url: String,
 }
 
+/// One `GET /api/playbook-drafts` entry: what a sweep over drafts needs to pick and address one.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftListEntry {
+    pub id: String,
+    pub owner: String,
+    pub latest_version: i64,
+    #[serde(default)]
+    pub retired_at: Option<String>,
+}
+
+/// `GET /api/playbook-drafts/{id}`, as far as a migration reads it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftDetail {
+    pub draft: DraftListEntry,
+}
+
+/// One changed file's unified diff.
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileDiff {
+    pub path: String,
+    pub unified: String,
+}
+
+/// A migration's change or finding, by the sentence the controller renders it as.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MigrationNote {
+    pub message: String,
+}
+
+/// `POST /api/playbook-drafts/{id}/migrate`: the diff, the changes, what needs review, and the
+/// version stored when the migration was applied.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftMigration {
+    pub from: i64,
+    pub to: i64,
+    pub base_version: i64,
+    #[serde(default)]
+    pub diffs: Vec<FileDiff>,
+    #[serde(default)]
+    pub changes: Vec<MigrationNote>,
+    #[serde(default)]
+    pub findings: Vec<MigrationNote>,
+    #[serde(default)]
+    pub saved: Option<DraftCompile>,
+}
+
+/// What `crux draft-migrate` did: each draft migrated, each passed over and why, and each the
+/// controller refused.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftMigrations {
+    pub dry_run: bool,
+    pub migrated: Vec<DraftMigrated>,
+    pub skipped: Vec<PassedDraft>,
+    pub refused: Vec<PassedDraft>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftMigrated {
+    pub draft_id: String,
+    pub studio_url: String,
+    #[serde(flatten)]
+    pub migration: DraftMigration,
+}
+
+/// A draft a sweep did not migrate, and why.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PassedDraft {
+    pub draft_id: String,
+    pub reason: String,
+}
+
 /// The 409 a save gets when another editor landed first. `error` is the controller's own wording;
 /// `current_version` is what the writer must re-read and merge onto.
 #[derive(Debug, Clone, Deserialize)]

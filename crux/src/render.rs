@@ -1041,6 +1041,60 @@ fn compiled(saved: &dto::DraftCompile, studio_url: &str) -> String {
 
 /// A save refused because another editor landed first. The controller's own sentence, then the
 /// two calls that resolve it — an agent that reads only the last line still does the right thing.
+/// A migration sweep: each draft's diff with its changes and what needs review, then the drafts
+/// passed over and the ones refused.
+pub fn draft_migrations(m: &dto::DraftMigrations) -> String {
+    let mut out = String::new();
+    if m.dry_run {
+        out.push_str(
+            "dry run: nothing saved; --apply saves each migration as its draft's next version\n",
+        );
+    }
+    for d in &m.migrated {
+        let migration = &d.migration;
+        let _ = write!(
+            out,
+            "== draft {} (version {}): edition {} -> {}",
+            d.draft_id, migration.base_version, migration.from, migration.to
+        );
+        match &migration.saved {
+            Some(saved) => {
+                let _ = writeln!(out, ", saved as version {}", saved.version);
+            }
+            None => out.push('\n'),
+        }
+        for diff in &migration.diffs {
+            out.push_str(&diff.unified);
+            if !diff.unified.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        for change in &migration.changes {
+            let _ = writeln!(out, "change: {}", change.message);
+        }
+        for finding in &migration.findings {
+            let _ = writeln!(out, "review: {}", finding.message);
+        }
+        if let Some(saved) = &migration.saved {
+            out.push_str(&diagnostics(&saved.diagnostics));
+        }
+        let _ = writeln!(out, "studio: {}", d.studio_url);
+    }
+    for (label, list) in [("skipped", &m.skipped), ("refused", &m.refused)] {
+        for passed in list {
+            let _ = writeln!(out, "{label}: {} ({})", passed.draft_id, passed.reason);
+        }
+    }
+    let _ = writeln!(
+        out,
+        "{} migrated, {} skipped, {} refused",
+        m.migrated.len(),
+        m.skipped.len(),
+        m.refused.len()
+    );
+    out
+}
+
 pub fn stale_base(id: &str, stale: &dto::StaleBase) -> String {
     format!(
         "REFUSED: {}\ncurrent version: {}\nnothing was written. Re-read that version \

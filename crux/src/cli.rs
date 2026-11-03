@@ -225,6 +225,10 @@ enum Command {
     /// Copy a draft's newest save into a new draft, with the bindings you could make yourself.
     DraftClone(ops::drafts::DraftClone),
 
+    /// Move one draft, or every draft with --all, to a newer pack edition. Prints each diff and
+    /// what needs review; saves nothing without --apply.
+    DraftMigrate(ops::drafts::DraftMigrate),
+
     /// List the blueprints you can read, with what each would carry for you and leave to bind.
     Blueprints(ops::blueprints::Blueprints),
 
@@ -491,6 +495,7 @@ pub async fn run() -> Result<()> {
         Command::DraftDelete(op) => op.run(&c).await?,
         Command::DraftRename(op) => op.run(&c).await?,
         Command::DraftClone(op) => op.run(&c).await?,
+        Command::DraftMigrate(op) => op.run(&c).await?,
         Command::Blueprints(op) => op.run(&c).await?,
         Command::BlueprintUse(op) => op.run(&c).await?,
         Command::BlueprintMark(op) => op.run(&c).await?,
