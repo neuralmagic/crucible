@@ -398,16 +398,18 @@ jobs:
         if: always() && env.PG_CONTAINER != ''
         run: docker rm -f "$PG_CONTAINER" || true
 
-  # The required check: green only when every job above is.
+  # The required check: green only when every job it needs is.
   build-and-test:
-    needs: [lint, test-all-features, test-default-features]
+    needs: [lint, test-all-features, test-default-features, ui, audit]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
           [ "${{ needs.lint.result }}" = success ] &&
             [ "${{ needs.test-all-features.result }}" = success ] &&
-            [ "${{ needs.test-default-features.result }}" = success ]
+            [ "${{ needs.test-default-features.result }}" = success ] &&
+            [ "${{ needs.ui.result }}" = success ] &&
+            [ "${{ needs.audit.result }}" = success ]
 
   # The controller SPA, independent of the Rust build. The package pre-hooks regenerate the
   # OpenAPI spec (from the controller's own bin) and the typed client before check/test/build.
