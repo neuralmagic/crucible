@@ -74,6 +74,15 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         std::process::exit(1);
     }
 
+    if let Some(Cmd::Migrate {
+        manifest,
+        to,
+        write,
+    }) = &cli.command
+    {
+        return crate::cli::migrate::run(manifest, *to, *write);
+    }
+
     #[cfg(feature = "autoresearch")]
     if let Some(Cmd::Scope(args)) = cli.command {
         // The engine runtime a `--propose` openshell turn runs on; held for the duration of

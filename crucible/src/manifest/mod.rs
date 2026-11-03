@@ -12,6 +12,7 @@ mod judge;
 pub mod launch;
 pub mod mcp;
 mod measure;
+pub mod migrate;
 mod openshell;
 pub mod outputs;
 mod overrides;
@@ -48,6 +49,7 @@ pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
+use crate::host_env::HostTable;
 use crate::manifest::edition::Edition;
 use crate::manifest::variant::{VariantName, Variants};
 use anyhow::{Context, Result};
@@ -115,7 +117,7 @@ pub enum ManifestError {
         "{table}.env needs `edition = 2` at the top of the manifest; an edition-1 pack's host \
          commands inherit the engine's whole environment"
     )]
-    EnvNeedsEdition { table: &'static str },
+    EnvNeedsEdition { table: HostTable },
     #[error("manifest has no [judge] (task mode)")]
     NoJudge,
     #[error("{table} requires a [judge]: a task manifest has no scores to rank, grade, or seed")]
@@ -1032,9 +1034,9 @@ fn validate_edition(c: &CommonCfg<'_>) -> Result<(), ManifestError> {
         return Ok(());
     }
     let declared = [
-        ("[judge]", c.judge.map(|j| &j.env)),
-        ("[world]", Some(&c.world.env)),
-        ("[workflow]", c.workflow.as_ref().map(|w| &w.env)),
+        (HostTable::Judge, c.judge.map(|j| &j.env)),
+        (HostTable::World, Some(&c.world.env)),
+        (HostTable::Workflow, c.workflow.as_ref().map(|w| &w.env)),
     ];
     match declared
         .into_iter()

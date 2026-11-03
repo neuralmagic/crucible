@@ -286,7 +286,11 @@ impl WorkflowCfg {
     /// What the workflow's `command` and `evaluate` tasks receive of the engine's environment
     /// under [`WorkflowCfg::edition`].
     pub fn host_env(&self) -> Result<crate::host_env::HostEnv, crate::host_env::MissingEnv> {
-        crate::host_env::HostEnv::resolve(self.edition, "[workflow]", &self.env)
+        crate::host_env::HostEnv::resolve(
+            self.edition,
+            crate::host_env::HostTable::Workflow,
+            &self.env,
+        )
     }
 
     /// True while the graph is still a path rather than tasks. The manifest is valid in this

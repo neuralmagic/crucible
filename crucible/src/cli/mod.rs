@@ -3,6 +3,7 @@
 pub(crate) mod build;
 pub(crate) mod check;
 pub(crate) mod init;
+pub(crate) mod migrate;
 pub(crate) mod ps;
 pub(crate) mod run;
 #[cfg(feature = "autoresearch")]
@@ -76,6 +77,19 @@ pub(crate) enum Cmd {
         /// Explicit fleet-file path, overriding the `clusters.toml` sibling of `--profile`.
         #[arg(long)]
         clusters: Option<PathBuf>,
+    },
+    /// Move a pack to a newer edition: print the manifest diff, what changed, and what needs a
+    /// reviewer's eye. Writes the pack only with `--write`.
+    Migrate {
+        /// The pack's manifest.
+        #[arg(long)]
+        manifest: PathBuf,
+        /// The edition to move to; the newest this engine runs when omitted.
+        #[arg(long, value_name = "EDITION")]
+        to: Option<i64>,
+        /// Write the migrated files over the pack's own.
+        #[arg(long)]
+        write: bool,
     },
     /// The scoping pipeline: ingest the goal, optionally `--propose` a fresh
     /// pack via one agent turn, validate the manifest (`crucible check`), and freeze a `SCOPE.md`

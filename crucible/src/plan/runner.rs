@@ -19,19 +19,13 @@ use crate::deadline::{Deadline, Supervised};
 use crate::plan::attempt::{Attempt, AttemptOutcome, own_note};
 use crate::plan::exec::TaskRunner;
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
+use crate::plan::{BUILDIT_SOCKET_ENV, INPUTS_ENV, INPUTS_FILE_ENV};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 
-/// Upstream results as JSON, set only while they fit [`INPUTS_ENV_MAX`].
-pub const INPUTS_ENV: &str = "CRUCIBLE_INPUTS";
-/// Path to a file holding the same JSON, always set.
-pub const INPUTS_FILE_ENV: &str = "CRUCIBLE_INPUTS_FILE";
 /// Linux refuses any one environment string over 128 KiB, and the whole environment shares
 /// `ARG_MAX` with argv.
 const INPUTS_ENV_MAX: usize = 64 * 1024;
-/// The run's buildit socket, set for command and evaluate tasks alone; `buildit` calls the server
-/// there.
-pub const BUILDIT_SOCKET_ENV: &str = "CRUCIBLE_BUILDIT_SOCKET";
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
@@ -615,7 +609,7 @@ mod tests {
             serde_json::from_value(serde_json::json!(["CRUCIBLE_TEST_DECLARED"])).unwrap();
         let env = crate::host_env::HostEnv::resolve(
             crate::manifest::edition::Edition::Two,
-            "[workflow]",
+            crate::host_env::HostTable::Workflow,
             &declared,
         )
         .unwrap();
@@ -703,7 +697,7 @@ mod tests {
         .unwrap();
         let env = crate::host_env::HostEnv::resolve(
             crate::manifest::edition::Edition::Two,
-            "[workflow]",
+            crate::host_env::HostTable::Workflow,
             &declared,
         );
         unsafe {

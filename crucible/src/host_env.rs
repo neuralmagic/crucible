@@ -23,6 +23,60 @@ pub const BASE: [&str; 7] = [
     crucible_contract::ENV_UI_BASE_URL,
 ];
 
+/// The baseline score `measure_cmd` receives once the baseline is measured.
+pub const BASELINE_SCORE: &str = "CRUCIBLE_BASELINE_SCORE";
+/// The baseline total `measure_cmd` receives once the baseline is measured.
+pub const BASELINE_TOTAL: &str = "CRUCIBLE_BASELINE_TOTAL";
+/// The best kept score `measure_cmd` receives once one is kept.
+pub const BEST_SCORE: &str = "CRUCIBLE_BEST_SCORE";
+/// The token `snapshot_cmd` printed, which `restore_cmd` receives.
+pub const SNAPSHOT_TOKEN: &str = "CRUCIBLE_TOKEN";
+
+/// A manifest table whose commands run outside the sandbox.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum HostTable {
+    /// `measure_cmd`.
+    Judge,
+    /// `apply_cmd`, `snapshot_cmd`, and `restore_cmd`.
+    World,
+    /// Workflow `command` and `evaluate` tasks.
+    Workflow,
+}
+
+impl HostTable {
+    pub const ALL: [HostTable; 3] = [HostTable::Judge, HostTable::World, HostTable::Workflow];
+
+    /// The table's key in the manifest.
+    pub fn key(self) -> &'static str {
+        match self {
+            HostTable::Judge => "judge",
+            HostTable::World => "world",
+            HostTable::Workflow => "workflow",
+        }
+    }
+
+    /// What the engine sets on this table's commands itself, beside [`BASE`] and the declared
+    /// variables. Each is set only when the engine has a value for it.
+    pub fn engine_sets(self) -> &'static [&'static str] {
+        match self {
+            HostTable::Judge => &[BASELINE_SCORE, BASELINE_TOTAL, BEST_SCORE],
+            HostTable::World => &[SNAPSHOT_TOKEN],
+            HostTable::Workflow => &[
+                crate::plan::TASK_NAME_ENV,
+                crate::plan::INPUTS_ENV,
+                crate::plan::INPUTS_FILE_ENV,
+                crate::plan::BUILDIT_SOCKET_ENV,
+            ],
+        }
+    }
+}
+
+impl fmt::Display for HostTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}]", self.key())
+    }
+}
+
 /// A variable a manifest table declares its commands receive.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct EnvName(String);
@@ -175,7 +229,7 @@ impl DeclaredEnv {
     .missing.join(", ")
 )]
 pub struct MissingEnv {
-    table: &'static str,
+    table: HostTable,
     missing: Vec<String>,
 }
 
@@ -214,7 +268,7 @@ impl HostEnv {
     /// else its declared names resolved against the engine's environment.
     pub fn resolve(
         edition: Edition,
-        table: &'static str,
+        table: HostTable,
         declared: &DeclaredEnv,
     ) -> Result<HostEnv, MissingEnv> {
         match edition {
@@ -229,7 +283,7 @@ impl HostEnv {
     }
 
     fn resolve_with(
-        table: &'static str,
+        table: HostTable,
         declared: &DeclaredEnv,
         lookup: impl Fn(&str) -> Option<OsString>,
     ) -> Result<HostEnv, MissingEnv> {
@@ -271,7 +325,8 @@ impl HostEnv {
 #[cfg(test)]
 mod tests {
     use crate::host_env::{
-        BASE, DeclaredEnv, EnvDecl, EnvDeclError, EnvName, HostEnv, MissingEnv, RequiredAndOptional,
+        BASE, DeclaredEnv, EnvDecl, EnvDeclError, EnvName, HostEnv, HostTable, MissingEnv,
+        RequiredAndOptional,
     };
     use crate::manifest::edition::Edition;
     use std::ffi::OsString;
@@ -417,7 +472,7 @@ mod tests {
     fn every_declared_variable_the_engine_lacks_is_named_at_once() {
         let lookup = |name: &str| (name == "KUBECONFIG").then(|| OsString::from("/k"));
         let error = HostEnv::resolve_with(
-            "[judge]",
+            HostTable::Judge,
             &declared(&["GH_TOKEN", "KUBECONFIG", "X"]),
             lookup,
         )
@@ -425,7 +480,7 @@ mod tests {
         assert_eq!(
             error,
             MissingEnv {
-                table: "[judge]",
+                table: HostTable::Judge,
                 missing: vec!["GH_TOKEN".into(), "X".into()],
             }
         );
@@ -440,10 +495,11 @@ mod tests {
     #[test]
     fn a_required_variable_the_engine_lacks_refuses_and_an_optional_one_does_not() {
         let unset = |_: &str| None;
-        let env = HostEnv::resolve_with("[world]", &declared(&["EPP_ENDPOINT?"]), unset).unwrap();
+        let env =
+            HostEnv::resolve_with(HostTable::World, &declared(&["EPP_ENDPOINT?"]), unset).unwrap();
         assert_eq!(format!("{env:?}"), "[]");
         let error = HostEnv::resolve_with(
-            "[world]",
+            HostTable::World,
             &declared(&["EPP_ENDPOINT?", "KUBECONFIG"]),
             unset,
         )
@@ -458,7 +514,7 @@ mod tests {
     /// variables and never their values.
     #[test]
     fn debug_names_the_variables_without_their_values() {
-        let env = HostEnv::resolve_with("[world]", &declared(&["TOKEN"]), |_| {
+        let env = HostEnv::resolve_with(HostTable::World, &declared(&["TOKEN"]), |_| {
             Some(OsString::from("s3cret"))
         })
         .unwrap();
@@ -473,7 +529,7 @@ mod tests {
     /// table did not declare is not there.
     #[test]
     fn a_command_sees_the_base_and_the_declared_variables_and_nothing_else() {
-        let env = HostEnv::resolve_with("[workflow]", &declared(&["DECLARED"]), |_| {
+        let env = HostEnv::resolve_with(HostTable::Workflow, &declared(&["DECLARED"]), |_| {
             Some(OsString::from("yes"))
         })
         .unwrap();
@@ -486,7 +542,8 @@ mod tests {
     #[test]
     fn an_optional_variable_the_engine_sets_reaches_the_command() {
         let lookup = |name: &str| (name == "EPP_ENDPOINT").then(|| OsString::from("10.0.0.1:8000"));
-        let env = HostEnv::resolve_with("[world]", &declared(&["EPP_ENDPOINT?"]), lookup).unwrap();
+        let env =
+            HostEnv::resolve_with(HostTable::World, &declared(&["EPP_ENDPOINT?"]), lookup).unwrap();
         let seen = env_of(&env);
         assert!(
             seen.lines().any(|l| l == "EPP_ENDPOINT=10.0.0.1:8000"),
@@ -498,7 +555,7 @@ mod tests {
     fn an_optional_variable_the_engine_lacks_is_absent_from_the_command() {
         let lookup = |name: &str| (name == "KUBECONFIG").then(|| OsString::from("/k"));
         let env = HostEnv::resolve_with(
-            "[world]",
+            HostTable::World,
             &declared(&["KUBECONFIG", "EPP_ENDPOINT?"]),
             lookup,
         )
@@ -514,7 +571,7 @@ mod tests {
     fn an_edition_one_command_inherits_the_engines_environment() {
         let _guard = crate::test_support::env_lock();
         unsafe { std::env::set_var("CRUCIBLE_TEST_INHERITED", "kept") };
-        let env = HostEnv::resolve(Edition::One, "[judge]", &DeclaredEnv::default());
+        let env = HostEnv::resolve(Edition::One, HostTable::Judge, &DeclaredEnv::default());
         let seen = env.as_ref().map(env_of);
         unsafe { std::env::remove_var("CRUCIBLE_TEST_INHERITED") };
         let seen = seen.unwrap();
@@ -531,13 +588,14 @@ mod tests {
     #[test]
     fn edition_two_resolves_declared_names_and_edition_one_does_not() {
         let required = declared(&["CRUCIBLE_TEST_NEVER_SET"]);
-        let error = HostEnv::resolve(Edition::Two, "[world]", &required).unwrap_err();
+        let error = HostEnv::resolve(Edition::Two, HostTable::World, &required).unwrap_err();
         assert_eq!(
             error.to_string(),
             "[world].env declares CRUCIBLE_TEST_NEVER_SET, which the engine's environment does \
              not set"
         );
-        let env = HostEnv::resolve(Edition::Two, "[world]", &DeclaredEnv::default()).unwrap();
+        let env =
+            HostEnv::resolve(Edition::Two, HostTable::World, &DeclaredEnv::default()).unwrap();
         let seen = env_of(&env);
         assert!(!seen.contains("UNDECLARED"), "{seen}");
         assert!(seen.lines().any(|l| l.starts_with("PATH=")), "{seen}");
@@ -564,7 +622,7 @@ mod tests {
         for (name, value) in set {
             unsafe { std::env::set_var(name, value) };
         }
-        let env = HostEnv::resolve(Edition::Two, "[judge]", &DeclaredEnv::default());
+        let env = HostEnv::resolve(Edition::Two, HostTable::Judge, &DeclaredEnv::default());
         let seen = env.as_ref().map(env_of);
         for (name, _) in set {
             unsafe { std::env::remove_var(name) };

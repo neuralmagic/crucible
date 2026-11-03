@@ -32,7 +32,7 @@ fn run_cmd(workspace: &Path, env: &HostEnv, cmd: &str, token: Option<&str>) -> R
     c.arg("-c").arg(cmd).current_dir(workspace);
     env.apply(&mut c);
     if let Some(t) = token {
-        c.env("CRUCIBLE_TOKEN", t);
+        c.env(crate::host_env::SNAPSHOT_TOKEN, t);
     }
     let out = c
         .output()

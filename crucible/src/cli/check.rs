@@ -579,7 +579,11 @@ fn check_measure_once(
     out: &mut CheckOutcome,
 ) {
     let measure_cmd = &judge.measure_cmd;
-    let env = match crucible::host_env::HostEnv::resolve(edition, "[judge]", &judge.env) {
+    let env = match crucible::host_env::HostEnv::resolve(
+        edition,
+        crucible::host_env::HostTable::Judge,
+        &judge.env,
+    ) {
         Ok(env) => env,
         Err(missing) => {
             out.findings.push(missing.to_string());
