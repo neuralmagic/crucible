@@ -4,14 +4,14 @@ A Crucible run uses two pods. A domain that needs a toolchain must install it in
 
 | Pod | What runs there | Base image | Derive with |
 | --- | --- | --- | --- |
-| loop pod | the engine, `setup_cmd`, `measure_cmd`, `[judge.selftest]`, git memory | `ghcr.io/neuralmagic/crucible` (`Containerfile.runtime`) | `Containerfile.runtime-<domain>` |
+| loop pod | the engine, `setup_cmd`, `measure_cmd`, `[judge.selftest]`, git memory | `ghcr.io/neuralmagic/crucible` (`docker/Containerfile.runtime`) | `Containerfile.runtime-<domain>` |
 | agent sandbox | the agent turn (`claude`/`codex`/`opencode`/`pi` and the commands that the agent runs) | `quay.io/aipcc/agentic-ci/claude-sandbox` | `Containerfile.sandbox-<domain>` |
 
 The runtime image does not depend on a domain. It contains `gcc`, `openssl-devel`,
 `python3`, `git`, and `jq`, and no other measurement tools. The sandbox contains the agent
 CLI and Python. The domain image must add all other tools that `measure_cmd` or the agent
-turn needs. `examples/selfhost` (Rust) is the example: `Containerfile.runtime-rust` and
-`Containerfile.sandbox-rust`.
+turn needs. `examples/selfhost` (Rust) is the example: `docker/Containerfile.runtime-rust` and
+`docker/Containerfile.sandbox-rust`.
 
 ## What the two images must satisfy
 
