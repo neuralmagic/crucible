@@ -441,6 +441,26 @@ pub async fn delete_run_cascade(pool: &sqlx::PgPool, run_id: &str) -> Result<()>
     Ok(())
 }
 
+/// Drop the row of a run whose dispatch never started it, handing back the dispatch request
+/// [`stamp_dispatcher`] consumed so the next dispatch of the issue acts for the same principal.
+pub(crate) async fn delete_unstarted_run(tx: &mut sqlx::PgConnection, run_id: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE issues i SET dispatch_requested_by = r.dispatched_by FROM runs r
+          WHERE r.run_id = $1 AND i.key = r.issue AND i.dispatch_requested_by IS NULL
+            AND r.dispatched_by IS DISTINCT FROM r.attributed_to",
+    )
+    .bind(run_id)
+    .execute(&mut *tx)
+    .await
+    .context("restoring a released run's dispatch request")?;
+    sqlx::query("DELETE FROM runs WHERE run_id = $1")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .context("deleting a released run")?;
+    Ok(())
+}
+
 /// Drop a run's folded candidate rows so a re-ingest replaces instead of appending (`candidates`
 /// has no primary key and [`insert_candidate`] is a plain INSERT — without this an adopt re-run
 /// silently duplicates rows).
@@ -746,6 +766,7 @@ mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                     rerun: None,
+                    dispatch: Default::default(),
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
@@ -883,6 +904,7 @@ mod tests {
                 dedupe_schedule: None,
                 launcher_groups: None,
                 rerun: None,
+                dispatch: Default::default(),
                 origin: crate::model::LaunchOrigin::Manual,
                 draft_version: None,
                 created_by: Some("wren"),

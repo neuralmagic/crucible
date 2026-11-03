@@ -554,6 +554,9 @@ pub enum RunAdmission {
     /// The loop image or the pack's sandbox image carries another contract version. The issue is
     /// already ledgered and parked; nothing was written and no pod was created.
     ContractRejected,
+    /// The issue left the status it was dispatched from before the dispatch could claim it.
+    /// Nothing was written and no pod was created.
+    ClaimLost,
 }
 
 /// Whether the hub can only receive pushes from a cluster, and so cannot create a run's gateway
@@ -597,10 +600,12 @@ fn secrets_refused(db: &Db, reason: String) -> RunAdmission {
 /// vs the in-flight run count, under the global daily ceiling the reconcile already holds), then
 /// render the pack's loop pod through the linked engine, stamp it controller-owned, and CREATE it —
 /// non-blocking. A run is hours long, so unlike a grounded turn it is never watched in-band here: its
-/// completion arrives out-of-band on the shared pod watch, which ingests `session.jsonl`. A
-/// `work_pods` row (kind `run`) is recorded BEFORE the pod is created, so a crash mid-create still
-/// leaves a row the startup sweep reconciles. The run's cost is booked exactly once by that session
-/// ingest — never by this primitive.
+/// completion arrives out-of-band on the shared pod watch, which ingests `session.jsonl`. Once every
+/// refusal is decided, `claim` moves the issue to `running` and records the run and its `work_pods`
+/// row (kind `run`) in one transaction BEFORE the pod is created, so a restart mid-create finds the
+/// issue claimed and its run's completion edge settles the pod; a failure after that releases the
+/// claim ([`crate::runs::claim::RunClaim::release`]). The run's cost is booked exactly once by that
+/// session ingest — never by this primitive.
 ///
 /// The pack ConfigMap delivers exactly `pack`'s tree, refused unless it reads back to
 /// `pack`'s digest, with the run's steering and cursor file beside it ([`RunInputs`]).
@@ -613,21 +618,21 @@ fn secrets_refused(db: &Db, reason: String) -> RunAdmission {
 // `run` span and draws the async controller → crucible edge.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
-    skip(db, cfg, dispatcher, pack, build_digests),
-    fields(otel.kind = "producer", %issue_key, %run_id)
+    skip(db, cfg, dispatcher, claim, pack, build_digests),
+    fields(otel.kind = "producer", issue_key = %claim.key, run_id = %claim.run_id)
 )]
-pub async fn dispatch_run(
+pub(crate) async fn dispatch_run(
     db: &Db,
     cfg: &ControllerCfg,
     dispatcher: Arc<dyn PodDispatcher>,
-    issue_key: &str,
-    run_id: &str,
+    claim: &crate::runs::claim::RunClaim<'_>,
     pack: &crate::playbooks::packs::MaterializedPack,
     build_digests: &BTreeMap<String, String>,
     codegen_contract: Option<&str>,
     opts: RunRenderOpts,
     secrets: Option<&LaunchSecrets>,
 ) -> Result<RunAdmission> {
+    let (issue_key, run_id) = (claim.key, claim.run_id);
     // The concurrency cap first — a declined launch needs no render config. The cap counts `issues`
     // at `running` (one run per running issue, the authoritative concurrent-run count today), under
     // the global daily ceiling the reconcile already enforced.
@@ -758,121 +763,6 @@ pub async fn dispatch_run(
             }
         }
     };
-    let name = crate::runs::names::reserve(db.pool()).await?;
-    let pod_name = run_pod_name(name.as_str());
-    crate::runs::work_pods::insert_work_pod(
-        db.pool(),
-        &NewWorkPod {
-            pod_name: pod_name.clone(),
-            kind: WorkKind::Run.label_value().to_string(),
-            issue_key: Some(issue_key.to_string()),
-            state: WorkPodState::Running,
-            cost_tag: WorkKind::Run.cost_tag().to_string(),
-            cluster: cluster.clone(),
-        },
-    )
-    .await?;
-
-    // The bound values, read from Vault here so a run that cannot get them fails before it costs a
-    // pod. They reach the pod as one mounted Secret; the spec names it and carries nothing else.
-    let (mut delivery, pushes_as_the_app) = match mints.is_empty() {
-        true => (crate::secrets::deliver::Delivery::default(), false),
-        false => {
-            let reader = secrets
-                .and_then(|s| s.provider.clone())
-                .context("this scope binds a secret and this deployment can read no values")?;
-            let mut rows = Vec::with_capacity(mints.len());
-            let mut values = Vec::with_capacity(mints.len());
-            for mint in &mints {
-                let row = crate::secrets::store::get(db.pool(), &mint.item.secret_id)
-                    .await?
-                    .with_context(|| {
-                        format!(
-                            "the binding for {} names no secret",
-                            mint.item.declared_name
-                        )
-                    })?;
-                let value = reader.value_of(&row).await?;
-                // A reference-mode secret's far end can rotate into a controller key after the
-                // binding was made, and this is the last stop before the value reaches a pod.
-                crate::secrets::check_agent_visible_value(
-                    row.visibility,
-                    &crate::secrets::SecretValue::new(&value),
-                )
-                .with_context(|| format!("redeeming {} for this run", row.name))?;
-                rows.push(row);
-                values.push(value);
-            }
-            let by_the_app = crate::secrets::minter::any_github_app(&rows);
-            (
-                crate::secrets::deliver::assemble(&mints, &rows, &values)?,
-                by_the_app,
-            )
-        }
-    };
-    if let Some(extra) = provider_extra {
-        delivery
-            .merge(extra)
-            .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
-    }
-    if let Some(tokens) = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?
-        && let Some(access) = crate::runs::workpod::agent_servers::access(
-            &agent_servers,
-            &cluster,
-            &tokens,
-            loaded
-                .as_deref()
-                .map_or(crucible::deploy::profile::DEFAULT_SPIFFE_SOCKET, |p| {
-                    p.cluster.spiffe_socket()
-                }),
-        )?
-    {
-        delivery.merge(access).map_err(|e| {
-            anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
-        })?;
-        crate::runs::agent_tools::grant(db, &agent_servers, run_id, &cluster, &tokens)
-            .await
-            .context("recording the run's agent tools")?;
-    }
-    let reads_run = match &opts {
-        RunRenderOpts::Playbook {
-            rerun: Some(rerun), ..
-        } => Some(rerun.run.as_str()),
-        _ => None,
-    };
-    let lifetime = crate::runs::completion::run_pod_deadline(db, cfg, issue_key).await?;
-    let token = crate::runs::pod_token::mint(
-        db.pool(),
-        &crate::runs::pod_token::Subject::Run(run_id.to_string()),
-        reads_run,
-        lifetime,
-    )
-    .await?;
-    delivery
-        .merge(crate::secrets::deliver::pod_token(token))
-        .map_err(|e| anyhow::anyhow!("folding the run token into the run's delivery: {e}"))?;
-    // A run pushing as the App has to have the identity, so a failed resolve fails the dispatch.
-    // Everywhere else it is a default, and a failure degrades to the pack's own.
-    let git_identity = match cfg.github_app.as_ref() {
-        Some(app) => match app.identity().await {
-            Ok(who) => Some(who),
-            Err(e) if pushes_as_the_app => {
-                return Err(e)
-                    .context("resolving the App's git identity for a run that pushes as it");
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = format!("{e:#}"),
-                    "could not resolve the App's git identity; this run's commits keep whatever \
-                     identity its pack sets"
-                );
-                None
-            }
-        },
-        None => None,
-    };
-    let secret_name = crate::secrets::deliver::secret_name(&pod_name);
-
     let namespace = dispatcher
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
@@ -889,144 +779,248 @@ pub async fn dispatch_run(
             crate::agent_auth::placement::controller_namespace().as_deref(),
         )?;
     }
-    // An isolated gateway's Service address goes into its server certificate, and the loop pod's
-    // client material into the run Secret, so both precede the render.
-    let mut gateway = None;
-    let reserved: Result<()> = match isolated {
-        Some(gateway_profile) => {
-            match crate::runs::workpod::gateway::RunGateway::reserve(
-                dispatcher.as_ref(),
-                &cluster,
-                gateway_profile,
-                &pod_name,
-                opts.max_time_secs(),
-            )
-            .await
-            {
-                Ok(reserved) => delivery
-                    .merge(reserved.loop_delivery())
-                    .map(|()| gateway = Some(reserved))
-                    .map_err(|e| {
-                        anyhow::anyhow!("folding the gateway client material into the run's: {e}")
-                    }),
-                Err(e) => Err(e),
-            }
-        }
-        None => Ok(()),
-    };
-    let job = RunPodRender {
-        isolated: isolated.is_some(),
-        pack: pack.path().to_path_buf(),
-        pack_digest: pack.digest().clone(),
-        inputs,
-        profile,
-        pod_name: pod_name.clone(),
-        issue_key: issue_key.to_string(),
-        run_id: run_id.to_string(),
-        name: name.clone(),
-        opts,
-        digests: cfg.digest_resolver(),
-        owner: owner_reference_from_env(),
-        overlay,
-        public_url: cfg.public_url.clone(),
-        git_identity,
-        secret_name: secret_name.clone(),
-        delivery: delivery.clone(),
-    };
-    // The render reads the pack and pins images, so it stays on a blocking thread; the pod + CM
-    // creates are plain async kube calls awaited here.
-    let rendered = match reserved {
-        Ok(()) => tokio::task::spawn_blocking(move || job.render())
-            .await
-            .context("joining the loop-run render task")?,
-        Err(e) => Err(e),
-    };
+    let name = crate::runs::names::reserve(db.pool()).await?;
+    let pod_name = run_pod_name(name.as_str());
+    let location = crate::runs::model::RunLocation::new(cluster.clone(), Some(namespace.clone()));
+    let claimed = claim
+        .claim(
+            db,
+            &crate::runs::claim::RunPlacement {
+                name: &name,
+                dispatch: crate::runs::model::RunDispatch::Pod,
+                location: &location,
+                work_pod: Some(&NewWorkPod {
+                    pod_name: pod_name.clone(),
+                    kind: WorkKind::Run.label_value().to_string(),
+                    issue_key: Some(issue_key.to_string()),
+                    state: WorkPodState::Running,
+                    cost_tag: WorkKind::Run.cost_tag().to_string(),
+                    cluster: cluster.clone(),
+                }),
+                stamp_dispatcher: cfg.issues_agent_tokens(),
+            },
+        )
+        .await?;
+    if !claimed {
+        return Ok(RunAdmission::ClaimLost);
+    }
 
-    let issue_for_cm = issue_key.to_string();
-    // Create the pod FIRST (so its UID exists to owner-ref the CM to), then the CM. A pack pod waits
-    // in ContainerCreating on its init-container's ConfigMap mount until the CM lands a beat later; the
-    // CM owner-ref'd to the pod means k8s cascade-GCs it whenever the pod is deleted, so no delete site
-    // needs to know the CM exists.
-    let created = match rendered {
-        Ok(RunDocs {
+    let created: Result<()> = async {
+        // The bound values, read from Vault here so a run that cannot get them fails before it
+        // costs a pod. They reach the pod as one mounted Secret; the spec names it and carries
+        // nothing else.
+        let (mut delivery, pushes_as_the_app) = match mints.is_empty() {
+            true => (crate::secrets::deliver::Delivery::default(), false),
+            false => {
+                let reader = secrets
+                    .and_then(|s| s.provider.clone())
+                    .context("this scope binds a secret and this deployment can read no values")?;
+                let mut rows = Vec::with_capacity(mints.len());
+                let mut values = Vec::with_capacity(mints.len());
+                for mint in &mints {
+                    let row = crate::secrets::store::get(db.pool(), &mint.item.secret_id)
+                        .await?
+                        .with_context(|| {
+                            format!(
+                                "the binding for {} names no secret",
+                                mint.item.declared_name
+                            )
+                        })?;
+                    let value = reader.value_of(&row).await?;
+                    // A reference-mode secret's far end can rotate into a controller key after the
+                    // binding was made, and this is the last stop before the value reaches a pod.
+                    crate::secrets::check_agent_visible_value(
+                        row.visibility,
+                        &crate::secrets::SecretValue::new(&value),
+                    )
+                    .with_context(|| format!("redeeming {} for this run", row.name))?;
+                    rows.push(row);
+                    values.push(value);
+                }
+                let by_the_app = crate::secrets::minter::any_github_app(&rows);
+                (
+                    crate::secrets::deliver::assemble(&mints, &rows, &values)?,
+                    by_the_app,
+                )
+            }
+        };
+        if let Some(extra) = provider_extra {
+            delivery.merge(extra).map_err(|e| {
+                anyhow::anyhow!("folding the provider's delivery into the run's: {e}")
+            })?;
+        }
+        if let Some(tokens) = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?
+            && let Some(access) = crate::runs::workpod::agent_servers::access(
+                &agent_servers,
+                &cluster,
+                &tokens,
+                loaded
+                    .as_deref()
+                    .map_or(crucible::deploy::profile::DEFAULT_SPIFFE_SOCKET, |p| {
+                        p.cluster.spiffe_socket()
+                    }),
+            )?
+        {
+            delivery.merge(access).map_err(|e| {
+                anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
+            })?;
+            crate::runs::agent_tools::grant(db, &agent_servers, run_id, &cluster, &tokens)
+                .await
+                .context("recording the run's agent tools")?;
+        }
+        let reads_run = match &opts {
+            RunRenderOpts::Playbook {
+                rerun: Some(rerun), ..
+            } => Some(rerun.run.as_str()),
+            _ => None,
+        };
+        let lifetime = crate::runs::completion::run_pod_deadline(db, cfg, issue_key).await?;
+        let token = crate::runs::pod_token::mint(
+            db.pool(),
+            &crate::runs::pod_token::Subject::Run(run_id.to_string()),
+            reads_run,
+            lifetime,
+        )
+        .await?;
+        delivery
+            .merge(crate::secrets::deliver::pod_token(token))
+            .map_err(|e| anyhow::anyhow!("folding the run token into the run's delivery: {e}"))?;
+        // A run pushing as the App has to have the identity, so a failed resolve fails the
+        // dispatch. Everywhere else it is a default, and a failure degrades to the pack's own.
+        let git_identity = match cfg.github_app.as_ref() {
+            Some(app) => match app.identity().await {
+                Ok(who) => Some(who),
+                Err(e) if pushes_as_the_app => {
+                    return Err(e)
+                        .context("resolving the App's git identity for a run that pushes as it");
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = format!("{e:#}"),
+                        "could not resolve the App's git identity; this run's commits keep \
+                         whatever identity its pack sets"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let secret_name = crate::secrets::deliver::secret_name(&pod_name);
+
+        // An isolated gateway's Service address goes into its server certificate, and the loop
+        // pod's client material into the run Secret, so both precede the render.
+        let gateway = match isolated {
+            Some(gateway_profile) => {
+                let reserved = crate::runs::workpod::gateway::RunGateway::reserve(
+                    dispatcher.as_ref(),
+                    &cluster,
+                    gateway_profile,
+                    &pod_name,
+                    opts.max_time_secs(),
+                )
+                .await?;
+                delivery.merge(reserved.loop_delivery()).map_err(|e| {
+                    anyhow::anyhow!("folding the gateway client material into the run's: {e}")
+                })?;
+                Some(reserved)
+            }
+            None => None,
+        };
+        let job = RunPodRender {
+            isolated: isolated.is_some(),
+            pack: pack.path().to_path_buf(),
+            pack_digest: pack.digest().clone(),
+            inputs,
+            profile,
+            pod_name: pod_name.clone(),
+            issue_key: issue_key.to_string(),
+            run_id: run_id.to_string(),
+            name: name.clone(),
+            opts,
+            digests: cfg.digest_resolver(),
+            owner: owner_reference_from_env(),
+            overlay,
+            public_url: cfg.public_url.clone(),
+            git_identity,
+            secret_name: secret_name.clone(),
+            delivery: delivery.clone(),
+        };
+        // The render reads the pack and pins images, so it stays on a blocking thread; the pod + CM
+        // creates are plain async kube calls awaited here.
+        let RunDocs {
             mut pod,
             pack: cm,
             sandbox_ports,
-        }) => {
-            // Pin the run pod's image(s) to the digests the pack's builds produced, so the measurement
-            // can never run on a stale or half-built image. A no-op for a build-free pack (empty map)
-            // — the static manifest image stands.
-            apply_build_digests(&mut pod, build_digests);
-            // Inject this dispatch's W3C trace context so the loop pod's engine re-roots its `run`
-            // span under it (a no-op when the controller isn't exporting spans).
-            crate::runs::workpod::trace::inject_dispatch_context(&mut pod);
-            let gateway_started = match gateway.as_ref() {
-                Some(gateway) => {
-                    gateway
-                        .start(
-                            dispatcher.as_ref(),
-                            &cluster,
-                            &namespace,
-                            &pod,
-                            &sandbox_ports,
-                        )
-                        .await
-                }
-                None => Ok(()),
-            };
-            let loop_pod_created = match gateway_started {
-                Ok(()) => dispatcher
-                    .create(&cluster, &namespace, pod)
-                    .await
-                    .context("creating the loop-run pod"),
-                Err(e) => Err(e),
-            };
-            match loop_pod_created {
-                Ok(created_pod) => {
-                    if let Some(uid) = created_pod
-                        .metadata
-                        .uid
-                        .as_deref()
-                        .filter(|uid| !uid.is_empty())
-                    {
-                        crate::runs::work_pods::set_work_pod_uid(db.pool(), &pod_name, uid).await?;
-                    }
-                    // The values, owner-referenced to the pod that just came back so the cluster
-                    // collects them with it. The pod waits in ContainerCreating on the mount until
-                    // this lands, the same beat the pack ConfigMap takes.
-                    if !delivery.is_empty() {
-                        let object = crate::secrets::deliver::secret_object(
-                            &secret_name,
-                            &namespace,
-                            &delivery,
-                            &created_pod,
-                        );
-                        if object.metadata.owner_references.is_none() {
-                            bail!(
-                                "the pod create response carried no UID, so its Secret would \
-                                 outlive every run that could have used it"
-                            )
-                        }
-                        dispatcher
-                            .create_secret(&cluster, &namespace, object)
-                            .await
-                            .context("creating the run Secret")?;
-                    }
-                    if let Some(mut cm) = cm {
-                        stamp_run_configmap(&mut cm, &created_pod, &issue_for_cm);
-                        dispatcher
-                            .create_configmap(&cluster, &namespace, cm)
-                            .await
-                            .context("creating the pack ConfigMap")
-                    } else {
-                        Ok(())
-                    }
-                }
-                Err(e) => Err(e),
-            }
+        } = tokio::task::spawn_blocking(move || job.render())
+            .await
+            .context("joining the loop-run render task")??;
+
+        // Create the pod FIRST (so its UID exists to owner-ref the CM to), then the CM. A pack pod
+        // waits in ContainerCreating on its init-container's ConfigMap mount until the CM lands a
+        // beat later; the CM owner-ref'd to the pod means k8s cascade-GCs it whenever the pod is
+        // deleted, so no delete site needs to know the CM exists.
+        //
+        // Pin the run pod's image(s) to the digests the pack's builds produced, so the measurement
+        // can never run on a stale or half-built image. A no-op for a build-free pack (empty map)
+        // — the static manifest image stands.
+        apply_build_digests(&mut pod, build_digests);
+        // Inject this dispatch's W3C trace context so the loop pod's engine re-roots its `run`
+        // span under it (a no-op when the controller isn't exporting spans).
+        crate::runs::workpod::trace::inject_dispatch_context(&mut pod);
+        if let Some(gateway) = gateway.as_ref() {
+            gateway
+                .start(
+                    dispatcher.as_ref(),
+                    &cluster,
+                    &namespace,
+                    &pod,
+                    &sandbox_ports,
+                )
+                .await?;
         }
-        Err(e) => Err(e),
-    };
+        let created_pod = dispatcher
+            .create(&cluster, &namespace, pod)
+            .await
+            .context("creating the loop-run pod")?;
+        if let Some(uid) = created_pod
+            .metadata
+            .uid
+            .as_deref()
+            .filter(|uid| !uid.is_empty())
+        {
+            crate::runs::work_pods::set_work_pod_uid(db.pool(), &pod_name, uid).await?;
+        }
+        // The values, owner-referenced to the pod that just came back so the cluster collects them
+        // with it. The pod waits in ContainerCreating on the mount until this lands, the same beat
+        // the pack ConfigMap takes.
+        if !delivery.is_empty() {
+            let object = crate::secrets::deliver::secret_object(
+                &secret_name,
+                &namespace,
+                &delivery,
+                &created_pod,
+            );
+            if object.metadata.owner_references.is_none() {
+                bail!(
+                    "the pod create response carried no UID, so its Secret would outlive every \
+                     run that could have used it"
+                )
+            }
+            dispatcher
+                .create_secret(&cluster, &namespace, object)
+                .await
+                .context("creating the run Secret")?;
+        }
+        if let Some(mut cm) = cm {
+            stamp_run_configmap(&mut cm, &created_pod, issue_key);
+            dispatcher
+                .create_configmap(&cluster, &namespace, cm)
+                .await
+                .context("creating the pack ConfigMap")?;
+        }
+        Ok(())
+    }
+    .await;
 
     match created {
         Ok(()) => {
@@ -1036,7 +1030,7 @@ pub async fn dispatch_run(
             Ok(RunAdmission::Launched {
                 pod_name,
                 name,
-                location: crate::runs::model::RunLocation::new(cluster, Some(namespace)),
+                location,
             })
         }
         Err(e) => {
@@ -1056,22 +1050,19 @@ pub async fn dispatch_run(
                     "a failed launch left its gateway; the gateway sweep removes it"
                 );
             }
-            crate::runs::pod_token::revoke(
+            if let Err(revoke) = crate::runs::pod_token::revoke(
                 db.pool(),
                 &crate::runs::pod_token::Subject::Run(run_id.to_string()),
             )
-            .await?;
-            // Retain a failed-to-launch row with the real reason (swept after retention), then let the
-            // reconcile see the error and retry the issue from `awaiting-approval`.
-            let reason = format!("{e:#}");
-            crate::runs::work_pods::set_work_pod_state(
-                db.pool(),
-                &pod_name,
-                WorkPodState::Failed,
-                None,
-                Some(&reason),
-            )
-            .await?;
+            .await
+            {
+                tracing::warn!(
+                    error = format!("{revoke:#}"),
+                    run_id,
+                    "revoking a failed launch's run token failed"
+                );
+            }
+            let released = claim.release(db, Some(&pod_name), e).await;
             sweep_failed_pod_overflow(
                 db,
                 dispatcher.as_ref(),
@@ -1082,7 +1073,7 @@ pub async fn dispatch_run(
             if let Some(m) = db.metrics() {
                 m.record_turn(WorkKind::Run.label_value(), "failed");
             }
-            Err(e.context("dispatching the loop run"))
+            Err(released.context("dispatching the loop run"))
         }
     }
 }

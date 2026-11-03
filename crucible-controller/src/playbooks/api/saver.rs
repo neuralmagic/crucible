@@ -114,25 +114,15 @@ pub(crate) async fn resolve_saver(
     })
 }
 
-/// Pin the cluster and the provider/model a freshly adopted launch dispatches with onto its issue
-/// row.
-#[allow(clippy::result_large_err)]
-pub(crate) async fn pin_dispatch(
-    state: &ApiState,
-    key: &str,
-    saver: &Saver,
-) -> Result<(), Response> {
-    crate::issues::store::set_dispatch_target(state.db.pool(), key, Some(&saver.dispatch_target))
-        .await
-        .map_err(|e| AppError::from(e).into_response())?;
-    crate::issues::store::set_agent_dispatch(
-        state.db.pool(),
-        key,
-        saver.provider.as_deref(),
-        saver.model.as_deref(),
-    )
-    .await
-    .map_err(|e| AppError::from(e).into_response())
+impl Saver {
+    /// The dispatch pin a launch this saver mints is written with.
+    pub(crate) fn pin(&self) -> crate::launches::model::DispatchPin<'_> {
+        crate::launches::model::DispatchPin {
+            target: Some(&self.dispatch_target),
+            provider: self.provider.as_deref(),
+            model: self.model.as_deref(),
+        }
+    }
 }
 
 /// Resolve what a launch asked to dispatch onto against what its caller may reach. A refusal is a

@@ -1365,6 +1365,7 @@ mod tests {
             created_by: Some("wren"),
             launcher_groups: None,
             rerun: None,
+            dispatch: Default::default(),
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
         assert!(matches!(
@@ -2487,6 +2488,7 @@ mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                     rerun: None,
+                    dispatch: Default::default(),
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )

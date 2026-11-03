@@ -2584,8 +2584,7 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#8",
-        "owner_repo_8-1",
+        &dispatching(&db, "owner/repo#8", "owner_repo_8-1").await,
         &materialized(&pack),
         &BTreeMap::new(),
         None,
@@ -2634,8 +2633,7 @@ async fn dispatch_run_creates_and_stamps_both_docs_and_owner_refs_the_cm(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -2721,19 +2719,19 @@ async fn dispatch_delivers_the_stored_tree_with_steering_beside_it(
         .await?
         .expect("stored");
     let no_builds = BTreeMap::new();
-    let dispatch = |run_id: &'static str| {
+    let dispatch = |run_id: &'static str| async {
         dispatch_run(
             &db,
             &cfg,
             dispatcher.clone(),
-            "owner/repo#7",
-            run_id,
+            &dispatching(&db, "owner/repo#7", run_id).await,
             &pack,
             &no_builds,
             None,
             RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
             None,
         )
+        .await
     };
 
     let out = dispatch("owner_repo_7-1").await?;
@@ -2777,6 +2775,32 @@ async fn dispatch_delivers_the_stored_tree_with_steering_beside_it(
     );
     assert_eq!(created_pods.lock().expect("lock").len(), 1, "no second pod");
     Ok(())
+}
+
+/// Put `key` at `new`, where every dispatch finds its issue, and build the claim a playbook
+/// dispatch of it makes.
+async fn dispatching<'a>(
+    db: &Db,
+    key: &'a str,
+    run_id: &'a str,
+) -> crate::runs::claim::RunClaim<'a> {
+    sqlx::query(
+        "INSERT INTO issues (key, repo, status, updated_at) \
+         VALUES ($1, 'owner/repo', 'new', '2026-01-01T00:00:00Z') \
+         ON CONFLICT (key) DO UPDATE SET status = 'new'",
+    )
+    .bind(key)
+    .execute(db.pool())
+    .await
+    .expect("seed the dispatched issue");
+    crate::runs::claim::RunClaim {
+        key,
+        from: crate::model::Status::New,
+        run_id,
+        origin: crate::runs::claim::RunOrigin::Playbook {
+            image: crate::runs::model::RunImage::default(),
+        },
+    }
 }
 
 async fn seed_running_issue(db: &Db, key: &str) -> Result<()> {
@@ -2828,8 +2852,7 @@ async fn dispatch_run_launches_tracks_and_returns_the_stamped_pod(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -2951,8 +2974,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(
             &tmp.path().join("loop"),
         )),
@@ -2978,8 +3000,12 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:0199c0de-7c2c-71a5-8000-1",
-        "playbook_survey_0199c0de-42",
+        &dispatching(
+            &db,
+            "playbook:survey:0199c0de-7c2c-71a5-8000-1",
+            "playbook_survey_0199c0de-42",
+        )
+        .await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             &tmp.path().join("playbook"),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -3031,8 +3057,7 @@ async fn dispatch_run_forwards_iteration_and_budget_knobs(pool: sqlx::PgPool) ->
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3076,8 +3101,7 @@ async fn dispatch_run_forwards_the_mapped_pr_repo(pool: sqlx::PgPool) -> Result<
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3132,8 +3156,7 @@ async fn dispatch_run_omits_pr_repo_when_unmapped(pool: sqlx::PgPool) -> Result<
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3217,8 +3240,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(&pack),
         &BTreeMap::new(),
         None,
@@ -3292,8 +3314,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3356,8 +3377,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:1",
-        "playbook_survey_1-42",
+        &dispatching(&db, "playbook:survey:1", "playbook_survey_1-42").await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -3411,8 +3431,7 @@ async fn dispatch_run_caps_at_the_concurrency_limit(pool: sqlx::PgPool) -> Resul
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#3",
-        "owner_repo_3-1",
+        &dispatching(&db, "owner/repo#3", "owner_repo_3-1").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3478,8 +3497,7 @@ async fn dispatch_run_honors_a_runtime_override_tightening_the_cap(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#2",
-        "owner_repo_2-1",
+        &dispatching(&db, "owner/repo#2", "owner_repo_2-1").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3518,8 +3536,12 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:0199c0de-7c2c-71a5-8000-1",
-        "playbook_survey_0199c0de-42",
+        &dispatching(
+            &db,
+            "playbook:survey:0199c0de-7c2c-71a5-8000-1",
+            "playbook_survey_0199c0de-42",
+        )
+        .await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -3599,8 +3621,12 @@ async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) ->
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:0199c0de-7c2c-71a5-8000-2",
-        "playbook_survey_0199c0de-43",
+        &dispatching(
+            &db,
+            "playbook:survey:0199c0de-7c2c-71a5-8000-2",
+            "playbook_survey_0199c0de-43",
+        )
+        .await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -4824,8 +4850,7 @@ async fn a_dispatch_with_bindings_records_the_created_pods_uid(pool: sqlx::PgPoo
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -4887,8 +4912,7 @@ async fn a_redeemed_agent_visible_controller_key_refuses_the_dispatch(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -4931,8 +4955,7 @@ async fn the_pod_spec_carries_a_secret_reference_and_no_value(pool: sqlx::PgPool
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5093,8 +5116,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5376,8 +5398,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5529,8 +5550,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
             &db,
             &cfg,
             dispatcher,
-            "owner/repo#7",
-            "owner_repo_7-42",
+            &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
             &materialized(&pack),
             &BTreeMap::new(),
             None,
@@ -5640,8 +5660,7 @@ async fn an_already_exists_create_fails_the_dispatch(pool: sqlx::PgPool) -> Resu
         &db,
         &cfg,
         Arc::new(AlreadyExistsDispatcher),
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5701,8 +5720,7 @@ async fn a_launcher_who_does_not_own_a_bound_secret_is_refused_before_anything_i
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5744,8 +5762,7 @@ async fn a_run_pod_carries_its_id_and_its_display_name(pool: sqlx::PgPool) -> Re
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5892,8 +5909,7 @@ async fn dispatch_with_kueue(db: &Db, tmp: &Path, issuer: Option<&str>) -> Vec<K
         db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp)),
         &BTreeMap::new(),
         None,
@@ -6200,8 +6216,7 @@ async fn dispatch_isolated(
         db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp)),
         &BTreeMap::new(),
         None,
@@ -6704,8 +6719,7 @@ async fn an_isolated_dispatch_to_a_push_only_cluster_is_refused_before_anything_
         &db,
         &cfg,
         dispatcher.clone(),
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,

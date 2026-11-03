@@ -6,6 +6,7 @@ pub mod agent_tools;
 pub(crate) mod api;
 pub mod artifacts;
 pub mod blob_store;
+pub(crate) mod claim;
 pub mod cluster_push;
 pub mod cluster_stats;
 pub mod clusters;

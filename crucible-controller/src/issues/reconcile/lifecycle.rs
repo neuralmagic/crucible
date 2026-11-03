@@ -1,10 +1,9 @@
 use crate::client::Db;
 use crate::config::ControllerCfg;
-use crate::event_log::Event;
 use crate::issues::approvals;
 use crate::issues::model::Issue;
 use crate::model::{ParkReason, ParkedBy, Status};
-use crate::runs::model::{NewRun, new_run_id};
+use crate::runs::model::new_run_id;
 use anyhow::Context;
 use anyhow::Result;
 
@@ -120,10 +119,11 @@ pub(super) async fn reconcile_awaiting(db: &Db, cfg: &ControllerCfg, issue: &Iss
 }
 
 /// Launch the approved pack's loop run and advance `from` → `running` (`from` is
-/// `awaiting-approval` for a build-free pack, `building` once its images pinned). Mints the run id,
-/// dispatches the loop pod through the WorkPod primitive (non-blocking), and — on a won CAS —
-/// records the run + logs the transition + clears any redispatch stash. A full concurrency cap
-/// declines with a `capped` ledger row, leaving the issue at `from` to re-drive when a slot frees.
+/// `awaiting-approval` for a build-free pack, `building` once its images pinned). Mints the run id
+/// and dispatches the loop pod through the WorkPod primitive (non-blocking), which claims the issue
+/// and records the run before the pod exists; a launch clears any redispatch stash. A full
+/// concurrency cap declines with a `capped` ledger row, leaving the issue at `from` to re-drive
+/// when a slot frees.
 async fn launch_approved_run(
     db: &Db,
     cfg: &ControllerCfg,
@@ -152,12 +152,20 @@ async fn launch_approved_run(
         crate::playbooks::providers::WorkloadClass::Autoresearch,
     )
     .await?;
+    let claim = crate::runs::claim::RunClaim {
+        key: &issue.key,
+        from,
+        run_id: &run_id,
+        origin: crate::runs::claim::RunOrigin::Loop {
+            scope: scope.id,
+            identity_digest: scope.pack_digest.clone(),
+        },
+    };
     let admission = crate::runs::workpod::dispatch_run(
         db,
         cfg,
         crate::runs::workpod::active_dispatcher(),
-        &issue.key,
-        &run_id,
+        &claim,
         pack,
         &build_digests,
         // The NAME; the dispatch resolves it against the configured set and projects the JSON onto
@@ -180,33 +188,19 @@ async fn launch_approved_run(
         }),
     )
     .await;
-    // Surface the real render/create failure before the retry/park machinery eats it: the bare
-    // "dispatching the loop run" context alone never reaches the event log, so a bad pack manifest
-    // (the un-runnable-freeze class this branch fixes on the scope side) died invisibly. Best-effort
-    // event, then propagate the untouched error so the row stays at `from` and retries.
     let admission = match admission {
         Ok(a) => a,
-        Err(e) => {
-            let evidence = crate::model::truncate_chain(&format!("{e:#}"));
-            let _ = db
-                .events()
-                .append(&Event::now(
-                    &issue.key,
-                    from.as_str(),
-                    from.as_str(),
-                    Some("loop-run dispatch failed"),
-                    Some(&evidence),
-                ))
-                .await;
-            return Err(e);
-        }
+        Err(e) => return Err(claim.record_failure(db, e).await),
     };
-    let (pod_name, name, location) = match admission {
-        crate::runs::workpod::RunAdmission::Launched {
-            pod_name,
-            name,
-            location,
-        } => (pod_name, name, location),
+    match admission {
+        crate::runs::workpod::RunAdmission::Launched { .. } => {
+            // A redispatch's one-shot stash has served its purpose (it reopened the approval and
+            // exempted this dispatch from the autopilot pause); clear it so a later re-drive can't
+            // double-launch. A no-op for the normal (non-redispatch) launch — the column is already
+            // NULL.
+            crate::runs::work_pods::clear_redispatch(db.pool(), &issue.key).await?;
+            crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
+        }
         crate::runs::workpod::RunAdmission::SecretsRefused { reason } => {
             crate::issues::transitions::park(
                 db.pool(),
@@ -217,54 +211,14 @@ async fn launch_approved_run(
                 crate::model::ParkedBy::Machine,
             )
             .await?;
-            return Ok(());
         }
         crate::runs::workpod::RunAdmission::Capped => {
             // The per-kind concurrency cap is full: decline, record `capped`, and leave the row at
             // `from` to re-drive when a slot frees.
             db.ledger_append(None, "capped", 0.0).await?;
-            return Ok(());
         }
-        crate::runs::workpod::RunAdmission::ContractRejected => return Ok(()),
-    };
-
-    let mut tx = db.pool().begin().await?;
-    if crate::issues::store::claim_issue(&mut *tx, &issue.key, from, Status::Running).await? {
-        crate::runs::store::insert_run(
-            &mut *tx,
-            &NewRun {
-                run_id: run_id.clone(),
-                scope: Some(scope.id),
-                issue: Some(issue.key.clone()),
-                identity_digest: scope.pack_digest.clone(),
-                status: "running".to_string(),
-                pod: Some(pod_name),
-                session_uri: None,
-                best_score: None,
-                cost_usd: None,
-            },
-        )
-        .await?;
-        crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
-        if cfg.issues_agent_tokens() {
-            crate::runs::store::stamp_dispatcher(&mut *tx, &run_id).await?;
-        }
-        crate::runs::names::set(&mut *tx, &run_id, &name).await?;
-        let ev = Event::now(
-            &issue.key,
-            from.as_str(),
-            "running",
-            Some("loop pod launched"),
-            Some(&run_id),
-        );
-        crate::event_log::insert(&mut *tx, &ev).await?;
-        // A redispatch's one-shot stash has served its purpose (it reopened the approval and exempted
-        // this dispatch from the autopilot pause); clear it so a later re-drive can't double-launch.
-        // A no-op for the normal (non-redispatch) launch — the column is already NULL.
-        crate::runs::work_pods::clear_redispatch(&mut *tx, &issue.key).await?;
-        tx.commit().await?;
-        db.events().publish(&ev);
-        crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
+        crate::runs::workpod::RunAdmission::ContractRejected
+        | crate::runs::workpod::RunAdmission::ClaimLost => {}
     }
     Ok(())
 }

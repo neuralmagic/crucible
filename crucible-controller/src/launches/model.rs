@@ -36,6 +36,18 @@ pub(crate) struct NewPlaybookLaunch<'a> {
     pub launcher_groups: Option<&'a serde_json::Value>,
     /// The finished run this launch reruns, and from which tasks.
     pub rerun: Option<&'a RerunOf>,
+    /// Where the launch dispatches and with which model, written with the launch row.
+    pub dispatch: DispatchPin<'a>,
+}
+
+/// The cluster and the provider/model a launch dispatches with. Written in the transaction that
+/// mints the launch, since its issue is dispatchable from that commit on; `None` takes the
+/// controller's default at dispatch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DispatchPin<'a> {
+    pub target: Option<&'a str>,
+    pub provider: Option<&'a str>,
+    pub model: Option<&'a str>,
 }
 
 /// A launch that reruns a finished run: that run's id and the tasks it dispatches again

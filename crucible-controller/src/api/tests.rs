@@ -7763,7 +7763,7 @@ async fn a_launch_reads_back_its_dispatch_state_and_runs(pool: PgPool) -> Result
             &key,
             "new",
             "new",
-            Some(crate::runs::launch::PLAYBOOK_DISPATCH_FAILED),
+            Some(crate::runs::claim::PLAYBOOK_DISPATCH_FAILED),
             Some("dispatch_run needs a deploy profile"),
         ))
         .await?;

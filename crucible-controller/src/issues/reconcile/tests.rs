@@ -6842,6 +6842,7 @@ async fn adopt_launch_with_groups(
                     created_by: Some("wren"),
                     launcher_groups,
                     rerun: None,
+                    dispatch: Default::default(),
                 },
                 registered.revision()
             )
@@ -6912,6 +6913,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             created_by: Some("wren"),
             launcher_groups: None,
             rerun: None,
+            dispatch: Default::default(),
         },
         registered.revision(),
     )
@@ -7159,7 +7161,7 @@ async fn a_launch_whose_stored_tree_was_tampered_with_is_refused(pool: PgPool) -
     let failed: i64 =
         sqlx::query_scalar("SELECT count(*) FROM events WHERE key = $1 AND reason = $2")
             .bind(key)
-            .bind(crate::runs::launch::PLAYBOOK_DISPATCH_FAILED)
+            .bind(crate::runs::claim::PLAYBOOK_DISPATCH_FAILED)
             .fetch_one(db.pool())
             .await?;
     assert_eq!(failed, 1, "the refusal is on the launch's event log");
@@ -8940,4 +8942,342 @@ async fn a_failed_run_that_is_not_the_live_run_does_not_park_the_issue(pool: PgP
         Status::Running
     );
     Ok(())
+}
+
+/// How [`InterruptibleDispatcher`] answers.
+#[derive(Clone, Copy)]
+enum PodSide {
+    /// `create` never returns, recording the pod first when `created` is set: the controller dies
+    /// inside the create call, after or before the API server took the pod.
+    Hang { created: bool },
+    /// Every pod is still running.
+    Live,
+    /// Every pod is gone.
+    Gone,
+}
+
+/// The cluster edge of a controller that can die mid-dispatch: every pod handed to `create` is
+/// kept, and `reached` fires once a create is underway.
+struct InterruptibleDispatcher {
+    side: PodSide,
+    created: CreatedPods,
+    reached: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl InterruptibleDispatcher {
+    fn new(side: PodSide, created: &CreatedPods) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            side,
+            created: created.clone(),
+            reached: std::sync::Arc::new(tokio::sync::Notify::new()),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runs::workpod::PodDispatcher for InterruptibleDispatcher {
+    async fn create(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        mut pod: k8s_openapi::api::core::v1::Pod,
+    ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        if let PodSide::Hang { created } = self.side {
+            if created {
+                self.created.lock().expect("lock").push(pod.clone());
+            }
+            self.reached.notify_one();
+            std::future::pending::<()>().await;
+        }
+        pod.metadata.uid = Some("run-pod-uid".to_string());
+        self.created.lock().expect("lock").push(pod.clone());
+        Ok(pod)
+    }
+    async fn await_terminal(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _name: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::runs::workpod::TerminalState> {
+        match self.side {
+            PodSide::Gone => Err(kube::Error::Api(Box::new(kube::core::Status {
+                status: Some(kube::core::response::StatusSummary::Failure),
+                message: "pod not found".into(),
+                reason: "NotFound".into(),
+                code: 404,
+                ..Default::default()
+            }))
+            .into()),
+            _ => Ok(crate::runs::workpod::TerminalState {
+                phase: crate::runs::workpod::TurnPhase::TimedOut,
+                message: None,
+            }),
+        }
+    }
+    async fn logs(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+        panic!("no pod here finished")
+    }
+    async fn delete(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A registered launch at `new`, and a controller config that dispatches it onto a pod.
+async fn pod_launch(db: &Db, dir: &Path, key: &str) -> ControllerCfg {
+    seed_registered_playbook(db, "survey").await;
+    adopt_launch(db, key, 3.5).await;
+    ControllerCfg {
+        deploy_profile: Some(crate::testing::fixtures::write_deploy_profile(dir)),
+        ..cfg_with(dir, Profile::default())
+    }
+}
+
+/// Reconcile `key` until the dispatch is inside its pod create, then drop it there, as a
+/// controller that dies at that instant would.
+async fn die_inside_the_create(
+    db: &Db,
+    cfg: &ControllerCfg,
+    key: &str,
+    side: PodSide,
+) -> CreatedPods {
+    let created = CreatedPods::default();
+    let dispatcher = InterruptibleDispatcher::new(side, &created);
+    crate::runs::workpod::install_dispatcher(dispatcher.clone());
+    let (db, cfg, key) = (db.clone(), cfg.clone(), key.to_string());
+    let pass = tokio::spawn(async move { reconcile(&db, &cfg, &key).await });
+    dispatcher.reached.notified().await;
+    pass.abort();
+    assert!(pass.await.expect_err("aborted").is_cancelled());
+    crate::runs::workpod::reset_dispatcher();
+    created
+}
+
+async fn runs_of(db: &Db, key: &str) -> Result<Vec<(String, String, Option<String>)>> {
+    Ok(
+        sqlx::query_as("SELECT run_id, status, pod FROM runs WHERE issue = $1 ORDER BY seq")
+            .bind(key)
+            .fetch_all(db.pool())
+            .await?,
+    )
+}
+
+/// The controller dies after the API server took the run's pod. The restart finds the issue
+/// already claimed, with the run and its pod row recorded, so it creates no second pod and the
+/// run's completion edge watches the first.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_dispatch_that_dies_after_creating_its_pod_is_never_dispatched_again(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c1";
+    let cfg = pod_launch(&db, dir.path(), key).await;
+
+    let first = die_inside_the_create(&db, &cfg, key, PodSide::Hang { created: true }).await;
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Live, &created));
+    let restart = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    restart?;
+
+    assert_eq!(first.lock().expect("lock").len(), 1);
+    assert!(created.lock().expect("lock").is_empty(), "no second pod");
+    let runs = runs_of(&db, key).await?;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let (_, status, pod) = &runs[0];
+    assert_eq!(status, "running");
+    let pod = pod.as_deref().expect("the run names its pod");
+    assert_eq!(
+        first.lock().expect("lock")[0].metadata.name.as_deref(),
+        Some(pod)
+    );
+    assert_eq!(
+        work_pod(&db, pod).await?.state,
+        crate::runs::workpod::WorkPodState::Running
+    );
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .expect("issue")
+            .status,
+        Status::Running
+    );
+    Ok(())
+}
+
+/// The controller dies inside the create before the pod exists. The restart creates nothing: the
+/// claimed run's completion edge finds the pod gone and settles the run as lost, closing its pod
+/// row and parking the launch for a human.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_dispatch_that_dies_before_its_pod_exists_settles_as_lost(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c2";
+    let cfg = pod_launch(&db, dir.path(), key).await;
+
+    die_inside_the_create(&db, &cfg, key, PodSide::Hang { created: false }).await;
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Gone, &created));
+    let restart = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    restart?;
+
+    assert!(
+        created.lock().expect("lock").is_empty(),
+        "nothing dispatched"
+    );
+    let runs = runs_of(&db, key).await?;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    let (_, status, pod) = &runs[0];
+    assert_eq!(status, "infrastructure-error");
+    assert_eq!(
+        work_pod(&db, pod.as_deref().expect("pod")).await?.state,
+        crate::runs::workpod::WorkPodState::Failed
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    assert!(
+        issue
+            .parked_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("disappeared before terminal session evidence")),
+        "{:?}",
+        issue.parked_reason
+    );
+    Ok(())
+}
+
+/// A launch whose issue moved after the reconcile read it (a human parked it) loses the claim and
+/// creates nothing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_issue_moved_before_the_claim_creates_no_pod(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c3";
+    let cfg = pod_launch(&db, dir.path(), key).await;
+    let read = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    human_park(&db, key, "held by hand").await?;
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Live, &created));
+    let launched = crate::runs::launch::launch(&db, &cfg, &read).await;
+    crate::runs::workpod::reset_dispatcher();
+    launched?;
+
+    assert!(created.lock().expect("lock").is_empty(), "no pod");
+    assert!(runs_of(&db, key).await?.is_empty());
+    assert!(
+        crate::runs::work_pods::work_pods_in_states(
+            db.pool(),
+            &[
+                crate::runs::workpod::WorkPodState::Running,
+                crate::runs::workpod::WorkPodState::Failed
+            ]
+        )
+        .await?
+        .is_empty()
+    );
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .expect("issue")
+            .status,
+        Status::Parked
+    );
+    Ok(())
+}
+
+/// A dispatch whose pod create fails releases its claim: the launch is back at `new` with no run,
+/// its pod row keeps the reason, the failure is on the event log once, and the retry dispatches
+/// exactly one pod for one run.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_failed_pod_create_releases_the_claim_for_the_retry(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c4";
+    let cfg = pod_launch(&db, dir.path(), key).await;
+
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RefusingCreateDispatcher));
+    let failed = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    let err = format!("{:#}", failed.expect_err("the create failed"));
+    assert!(err.contains("admission webhook refused"), "{err}");
+
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::New);
+    assert!(
+        runs_of(&db, key).await?.is_empty(),
+        "the claimed run is gone"
+    );
+    let rows = crate::runs::work_pods::work_pods_in_states(
+        db.pool(),
+        &[crate::runs::workpod::WorkPodState::Failed],
+    )
+    .await?;
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("admission webhook refused")),
+        "{:?}",
+        rows[0].error
+    );
+    let events = db.events().read_for_key(key).await?;
+    let failures: Vec<_> = events
+        .iter()
+        .filter(|e| e.reason.as_deref() == Some(crate::runs::claim::PLAYBOOK_DISPATCH_FAILED))
+        .collect();
+    assert_eq!(failures.len(), 1, "{events:?}");
+    assert_eq!(
+        (failures[0].from.as_str(), failures[0].to.as_str()),
+        ("running", "new")
+    );
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Live, &created));
+    let retried = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    retried?;
+    assert_eq!(created.lock().expect("lock").len(), 1);
+    let runs = runs_of(&db, key).await?;
+    assert_eq!(runs.len(), 1, "{runs:?}");
+    Ok(())
+}
+
+/// The API server refuses every pod.
+struct RefusingCreateDispatcher;
+
+#[async_trait::async_trait]
+impl crate::runs::workpod::PodDispatcher for RefusingCreateDispatcher {
+    async fn create(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _pod: k8s_openapi::api::core::v1::Pod,
+    ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        anyhow::bail!("admission webhook refused the pod")
+    }
+    async fn await_terminal(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _name: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::runs::workpod::TerminalState> {
+        panic!("no pod was created to watch")
+    }
+    async fn logs(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+        panic!("no pod was created to read")
+    }
+    async fn delete(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
 }

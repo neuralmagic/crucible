@@ -86,9 +86,10 @@ pub use globals::{
     reset_enqueue,
 };
 pub use kube_dispatcher::{KubePodDispatcher, reconcile_on_startup};
+pub(crate) use run::dispatch_run;
 pub use run::{
     LaunchSecrets, RunAdmission, RunDisposition, RunDocs, RunRenderOpts, collect_run_pod,
-    dispatch_run, render_run_docs, run_pod_name, stamp_run_pod,
+    render_run_docs, run_pod_name, stamp_run_pod,
 };
 #[cfg(feature = "autoresearch")]
 pub use run::{ScopeOutcome, dispatch_scope};

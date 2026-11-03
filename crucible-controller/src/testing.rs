@@ -235,6 +235,7 @@ pub(crate) async fn launch_playbook(
             created_by: Some("wren"),
             launcher_groups: None,
             rerun: None,
+            dispatch: Default::default(),
         },
         &crate::playbooks::exposure::Extraction::Absent,
     )

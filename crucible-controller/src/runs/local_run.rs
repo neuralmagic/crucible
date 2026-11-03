@@ -177,21 +177,15 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
 /// Write the launch's stored pack into its own directory, checked against the stored tree, write
 /// the run's inputs over it, and spawn the engine on it. Returns as
 /// soon as the child is running: a playbook run is minutes to hours, and the serial reconcile
-/// worker may not park on it. The caller records the run row, then hands the child to
-/// [`supervise`]. `None` is the concurrency cap declining the launch, the same bound a work-pod
-/// dispatch is held to.
+/// worker may not park on it. The caller has already claimed the issue and recorded the run row,
+/// and hands the child to [`supervise`].
 pub(crate) async fn start(
     db: &Db,
     cfg: &ControllerCfg,
     issue_key: &str,
     run_id: &str,
     opts: RunRenderOpts,
-) -> Result<Option<LocalRun>> {
-    if u32::try_from(crate::runs::store::count_running(db.pool()).await?).unwrap_or(u32::MAX)
-        >= cfg.effective().max_concurrent_pods
-    {
-        return Ok(None);
-    }
+) -> Result<LocalRun> {
     // Absolute: the engine is spawned with the pack as its cwd, so a scratch root that is
     // configured relatively (the default `state`) would resolve against the wrong directory.
     let dir = std::path::absolute(run_dir(cfg.scratch_root(), run_id))
@@ -270,13 +264,13 @@ pub(crate) async fn start(
         .with_context(|| format!("spawning `{} plan run` for {run_id}", bin.display()))?;
     let group = ProcessGroup::led_by(&child)?;
     tracing::info!(%issue_key, %run_id, dir = %dir.display(), "playbook launch running locally");
-    Ok(Some(LocalRun {
+    Ok(LocalRun {
         child,
         group,
         dir,
         run_id: run_id.to_string(),
         deadline,
-    }))
+    })
 }
 
 /// Drive one local run to its end: stream its output into the log, kill it if it outlives its own

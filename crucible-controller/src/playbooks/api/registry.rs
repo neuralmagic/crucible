@@ -830,6 +830,7 @@ pub(crate) async fn launch_playbook(
         created_by: actor,
         launcher_groups: Some(&saver.groups),
         rerun: rerun.as_ref(),
+        dispatch: saver.pin(),
     };
     use crate::launches::store::AdoptPlaybookOutcome;
     match crate::launches::store::adopt_playbook_launch(
@@ -840,15 +841,7 @@ pub(crate) async fn launch_playbook(
     )
     .await
     {
-        Ok(AdoptPlaybookOutcome::Adopted) => {
-            // The issue row the adopt just wrote is what every later dispatch reads its cluster
-            // off, so the pin lands before the launch is enqueued.
-            if let Err(refusal) =
-                crate::playbooks::api::saver::pin_dispatch(&state, &key, &saver).await
-            {
-                return refusal;
-            }
-        }
+        Ok(AdoptPlaybookOutcome::Adopted) => {}
         Ok(AdoptPlaybookOutcome::UnknownPlaybook) => {
             return not_found(format!("no playbook {id:?}"));
         }

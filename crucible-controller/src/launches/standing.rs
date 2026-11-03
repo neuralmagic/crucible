@@ -470,6 +470,11 @@ pub(crate) async fn fire(
             .or(core.created_by.as_deref()),
         launcher_groups: core.owner_groups.as_ref(),
         rerun: None,
+        dispatch: crate::launches::model::DispatchPin {
+            target: core.dispatch_target.as_deref(),
+            provider: core.agent_provider.as_deref(),
+            model: core.agent_model.as_deref(),
+        },
     };
     match crate::launches::store::insert_playbook_launch_with(tx, key, &launch, exposure).await {
         Ok(true) => {}
@@ -482,17 +487,6 @@ pub(crate) async fn fire(
         }
         Err(e) => return Err(format!("{noun} launch insert: {e:#}").into()),
     }
-    crate::issues::store::set_dispatch_target(&mut **tx, key, core.dispatch_target.as_deref())
-        .await
-        .map_err(|e| format!("{noun} dispatch target: {e:#}"))?;
-    crate::issues::store::set_agent_dispatch(
-        &mut **tx,
-        key,
-        core.agent_provider.as_deref(),
-        core.agent_model.as_deref(),
-    )
-    .await
-    .map_err(|e| format!("{noun} agent dispatch: {e:#}"))?;
     // `insert_playbook_launch_with` preserves its one shared path by initially copying the current
     // registry row. Replace that copy inside the same transaction with the revision this row
     // explicitly adopted, so a later registry repin cannot move an existing recurrence.

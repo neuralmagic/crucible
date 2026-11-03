@@ -6,17 +6,12 @@
 
 use crate::client::Db;
 use crate::config::{ControllerCfg, PlaybookExecutor};
-use crate::event_log::Event;
 use crate::issues::model::Issue;
 use crate::model::{ParkReason, ParkedBy, Status};
 use crate::playbooks::providers::WorkloadClass;
-use crate::runs::model::new_run_id;
-use crate::runs::model::{NewRun, RunDispatch};
+use crate::runs::claim::{PLAYBOOK_DISPATCH_FAILED, RunClaim, RunOrigin, RunPlacement};
+use crate::runs::model::{RunDispatch, RunLocation, new_run_id};
 use anyhow::{Context, Result};
-
-/// The reason stamped on an attempt that could not start the engine. The launch view reads its
-/// dispatch state back off these events, so the text is a shared constant rather than a literal.
-pub(crate) const PLAYBOOK_DISPATCH_FAILED: &str = "playbook dispatch failed";
 
 /// Dispatch `issue`'s playbook launch, parking it when its pack is unconvertible.
 pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
@@ -39,21 +34,6 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
     )
     .await?;
     Ok(())
-}
-
-/// Record `e` on `key`'s event log as a failed dispatch, and hand it back.
-async fn dispatch_failed(db: &Db, key: &str, e: anyhow::Error) -> anyhow::Error {
-    let _ = db
-        .events()
-        .append(&Event::now(
-            key,
-            "new",
-            "new",
-            Some(PLAYBOOK_DISPATCH_FAILED),
-            Some(&crate::model::truncate_chain(&format!("{e:#}"))),
-        ))
-        .await;
-    e
 }
 
 /// Why the engine would refuse `launch` at startup, judged against the pack it froze. `None` when
@@ -106,7 +86,16 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     };
     let refusal = match plan_refusal(db, &issue.key, &launch).await {
         Ok(refusal) => refusal,
-        Err(e) => return Err(dispatch_failed(db, &issue.key, e).await),
+        Err(e) => {
+            return Err(crate::runs::claim::record_dispatch_failure(
+                db,
+                &issue.key,
+                Status::New,
+                PLAYBOOK_DISPATCH_FAILED,
+                e,
+            )
+            .await);
+        }
     };
     if let Some(detail) = refusal {
         crate::issues::transitions::park(
@@ -256,121 +245,102 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         rerun: launch.rerun,
         variant: launch.variant,
     };
+    let claim = RunClaim {
+        key: &issue.key,
+        from: Status::New,
+        run_id: &run_id,
+        origin: RunOrigin::Playbook { image },
+    };
     let started = match cfg.playbook_executor {
-        PlaybookExecutor::Pod => {
-            dispatch_pod(db, cfg, issue, &run_id, opts, secrets.as_ref()).await
-        }
+        PlaybookExecutor::Pod => dispatch_pod(db, cfg, issue, &claim, opts, secrets.as_ref()).await,
         PlaybookExecutor::Local => {
-            let engine =
-                crate::runs::contract::DispatchTarget::Binary(crate::runs::engine::resolve_bin());
-            match crate::runs::workpod::admit_contract(
-                crate::runs::contract::RequestKind::LocalRun,
-                &[engine],
-            )
-            .await
-            {
-                Ok(()) => match resolve_local_secrets(db, issue, secrets.as_ref()).await? {
-                    Some(refusal) => Ok(Some(Started::SecretsRefused(refusal))),
-                    None => crate::runs::local_run::start(db, cfg, &issue.key, &run_id, opts)
-                        .await
-                        .map(|run| run.map(|r| Started::Local(Box::new(r)))),
-                },
-                Err(failure) => {
-                    crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?)
-                        .await?;
-                    return Ok(());
-                }
-            }
+            start_local(db, cfg, issue, &claim, opts, secrets.as_ref()).await
         }
     };
     let started = match started {
-        Ok(Some(s)) => s,
+        Ok(started) => started,
+        Err(e) => return Err(claim.record_failure(db, e).await),
+    };
+    match started {
         // Capped: the issue stays at `new`, and the reconcile re-drives it when a slot frees.
-        Ok(None) => {
-            db.ledger_append(None, "capped", 0.0).await?;
-            return Ok(());
-        }
-        Err(e) => return Err(dispatch_failed(db, &issue.key, e).await),
-    };
-
-    if let Started::SecretsRefused(detail) = &started {
-        crate::issues::transitions::park(
-            db.pool(),
-            db.events(),
-            &issue.key,
-            Status::New,
-            &ParkReason::SecretsUnresolved {
-                detail: detail.clone(),
-            },
-            ParkedBy::Machine,
-        )
-        .await?;
-        return Ok(());
-    }
-    let (pod, name, dispatch, location, reason) = match &started {
-        Started::Pod {
-            pod_name,
-            name,
-            location,
-        } => (
-            Some(pod_name.clone()),
-            name.clone(),
-            RunDispatch::Pod,
-            location.clone(),
-            "playbook pod launched",
-        ),
-        Started::Local(_) => (
-            None,
-            crate::runs::names::reserve(db.pool()).await?,
-            RunDispatch::Local,
-            crate::runs::model::RunLocation::hub(),
-            "playbook running locally",
-        ),
-        // Handled above; the issue is parked and nothing is dispatched.
-        Started::SecretsRefused(_) | Started::ContractRejected => return Ok(()),
-    };
-    let mut tx = db.pool().begin().await?;
-    let claimed =
-        crate::issues::store::claim_issue(&mut *tx, &issue.key, Status::New, Status::Running)
+        Started::Capped => db.ledger_append(None, "capped", 0.0).await,
+        Started::SecretsRefused(detail) => {
+            crate::issues::transitions::park(
+                db.pool(),
+                db.events(),
+                &issue.key,
+                Status::New,
+                &ParkReason::SecretsUnresolved { detail },
+                ParkedBy::Machine,
+            )
             .await?;
-    if claimed {
-        crate::runs::store::insert_run(
-            &mut *tx,
-            &NewRun {
-                run_id: run_id.clone(),
-                scope: None,
-                issue: Some(issue.key.clone()),
-                identity_digest: None,
-                status: "running".to_string(),
-                pod,
-                session_uri: None,
-                best_score: None,
-                cost_usd: None,
+            Ok(())
+        }
+        Started::ContractRejected | Started::ClaimLost => Ok(()),
+        Started::Pod => {
+            crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
+            Ok(())
+        }
+        // The subprocess is supervised out of band, exactly as the pod watch drives a pod's
+        // completion — and only once the run row it will fold into is committed.
+        Started::Local(run) => {
+            crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
+            let db = db.clone();
+            let key = issue.key.clone();
+            tokio::spawn(async move { crate::runs::local_run::supervise(db, key, *run).await });
+            Ok(())
+        }
+    }
+}
+
+/// Run the launch as a local subprocess: the same contract and binding checks as the pod arm,
+/// then the claim, then the engine.
+async fn start_local(
+    db: &Db,
+    cfg: &ControllerCfg,
+    issue: &Issue,
+    claim: &RunClaim<'_>,
+    opts: crate::runs::workpod::RunRenderOpts,
+    secrets: Option<&crate::runs::workpod::LaunchSecrets>,
+) -> Result<Started> {
+    let engine = crate::runs::contract::DispatchTarget::Binary(crate::runs::engine::resolve_bin());
+    if let Err(failure) = crate::runs::workpod::admit_contract(
+        crate::runs::contract::RequestKind::LocalRun,
+        &[engine],
+    )
+    .await
+    {
+        crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?).await?;
+        return Ok(Started::ContractRejected);
+    }
+    if let Some(refusal) = resolve_local_secrets(db, issue, secrets).await? {
+        return Ok(Started::SecretsRefused(refusal));
+    }
+    if u32::try_from(crate::runs::store::count_running(db.pool()).await?).unwrap_or(u32::MAX)
+        >= cfg.effective().max_concurrent_pods
+    {
+        return Ok(Started::Capped);
+    }
+    let name = crate::runs::names::reserve(db.pool()).await?;
+    let claimed = claim
+        .claim(
+            db,
+            &RunPlacement {
+                name: &name,
+                dispatch: RunDispatch::Local,
+                location: &RunLocation::hub(),
+                work_pod: None,
+                stamp_dispatcher: cfg.issues_agent_tokens(),
             },
         )
         .await?;
-        crate::runs::store::attribute_run(&mut *tx, &run_id).await?;
-        if cfg.issues_agent_tokens() {
-            crate::runs::store::stamp_dispatcher(&mut *tx, &run_id).await?;
-        }
-        crate::runs::store::set_run_dispatch(&mut *tx, &run_id, dispatch).await?;
-        crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
-        crate::runs::store::set_run_image(&mut *tx, &run_id, &image).await?;
-        crate::runs::names::set(&mut *tx, &run_id, &name).await?;
-        let ev = Event::now(&issue.key, "new", "running", Some(reason), Some(&run_id));
-        crate::event_log::insert(&mut *tx, &ev).await?;
-        tx.commit().await?;
-        db.events().publish(&ev);
-        crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
+    if !claimed {
+        return Ok(Started::ClaimLost);
     }
-    // The subprocess is supervised out of band, exactly as the pod watch drives a pod's
-    // completion — and only once the run row it will fold into is committed.
-    if let Started::Local(run) = started {
-        let db = db.clone();
-        let key = issue.key.clone();
-        tokio::spawn(async move { crate::runs::local_run::supervise(db, key, *run).await });
+    match crate::runs::local_run::start(db, cfg, &issue.key, claim.run_id, opts).await {
+        Ok(run) => Ok(Started::Local(Box::new(run))),
+        Err(e) => Err(claim.release(db, None, e).await),
     }
-    Ok(())
 }
 
 /// The local executor runs the same binding resolution as the pod arm and additionally refuses
@@ -407,29 +377,29 @@ async fn resolve_local_secrets(
     }
 }
 
-/// What a dispatch started. `None` from [`dispatch_pod`] is the concurrency cap declining it.
+/// What a dispatch started, or why it started nothing.
 enum Started {
-    Pod {
-        pod_name: String,
-        name: crate::runs::names::RunName,
-        location: crate::runs::model::RunLocation,
-    },
+    Pod,
     Local(Box<crate::runs::local_run::LocalRun>),
+    /// The concurrency cap declined it. Nothing ran.
+    Capped,
     /// The scope's bindings did not resolve for this launch. Nothing ran.
     SecretsRefused(String),
     /// The dispatch image's contract version is not this controller's. Ledgered and parked by the
     /// dispatch; nothing ran.
     ContractRejected,
+    /// The issue left `new` before the dispatch claimed it. Nothing ran.
+    ClaimLost,
 }
 
 async fn dispatch_pod(
     db: &Db,
     cfg: &ControllerCfg,
     issue: &Issue,
-    run_id: &str,
+    claim: &RunClaim<'_>,
     opts: crate::runs::workpod::RunRenderOpts,
     secrets: Option<&crate::runs::workpod::LaunchSecrets>,
-) -> Result<Option<Started>> {
+) -> Result<Started> {
     let pack = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key)
         .await?
         .with_context(|| format!("no stored pack for playbook launch {}", issue.key))?;
@@ -437,8 +407,7 @@ async fn dispatch_pod(
         db,
         cfg,
         crate::runs::workpod::active_dispatcher(),
-        &issue.key,
-        run_id,
+        claim,
         &pack,
         &std::collections::BTreeMap::new(),
         None,
@@ -447,19 +416,12 @@ async fn dispatch_pod(
     )
     .await?;
     Ok(match admission {
-        crate::runs::workpod::RunAdmission::Launched {
-            pod_name,
-            name,
-            location,
-        } => Some(Started::Pod {
-            pod_name,
-            name,
-            location,
-        }),
-        crate::runs::workpod::RunAdmission::Capped => None,
+        crate::runs::workpod::RunAdmission::Launched { .. } => Started::Pod,
+        crate::runs::workpod::RunAdmission::Capped => Started::Capped,
         crate::runs::workpod::RunAdmission::SecretsRefused { reason } => {
-            Some(Started::SecretsRefused(reason))
+            Started::SecretsRefused(reason)
         }
-        crate::runs::workpod::RunAdmission::ContractRejected => Some(Started::ContractRejected),
+        crate::runs::workpod::RunAdmission::ContractRejected => Started::ContractRejected,
+        crate::runs::workpod::RunAdmission::ClaimLost => Started::ClaimLost,
     })
 }

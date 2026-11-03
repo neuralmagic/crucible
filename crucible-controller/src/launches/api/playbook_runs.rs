@@ -260,14 +260,14 @@ pub(crate) async fn get_playbook_run(
 }
 
 /// Fold the launch's history into its dispatch state: a run means the engine started, and the
-/// failed attempts are the events [`crate::runs::launch::PLAYBOOK_DISPATCH_FAILED`] stamps.
+/// failed attempts are the events [`crate::runs::claim::PLAYBOOK_DISPATCH_FAILED`] stamps.
 fn dispatch_state(
     events: &[crate::event_log::EventRecord],
     runs: &[crate::runs::model::Run],
 ) -> LaunchDispatchDto {
     let failed: Vec<&crate::event_log::EventRecord> = events
         .iter()
-        .filter(|e| e.reason.as_deref() == Some(crate::runs::launch::PLAYBOOK_DISPATCH_FAILED))
+        .filter(|e| e.reason.as_deref() == Some(crate::runs::claim::PLAYBOOK_DISPATCH_FAILED))
         .collect();
     let last = failed.last();
     let state = if !runs.is_empty() {

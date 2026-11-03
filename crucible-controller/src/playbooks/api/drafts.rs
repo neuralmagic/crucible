@@ -1182,6 +1182,7 @@ pub(crate) async fn launch_playbook_draft(
         created_by: actor,
         launcher_groups: Some(&saver.groups),
         rerun: rerun.as_ref(),
+        dispatch: saver.pin(),
     };
     // A draft's content changes on every save, so the disclosure is recomputed from the version
     // being launched and lands in the same transaction that adopts it, before anything executes.
@@ -1219,13 +1220,7 @@ pub(crate) async fn launch_playbook_draft(
     match crate::launches::store::adopt_draft_launch(state.db.pool(), &key, &launch, &exposure)
         .await
     {
-        Ok(AdoptDraftOutcome::Adopted) => {
-            if let Err(refusal) =
-                crate::playbooks::api::saver::pin_dispatch(&state, &key, &saver).await
-            {
-                return refusal;
-            }
-        }
+        Ok(AdoptDraftOutcome::Adopted) => {}
         Ok(AdoptDraftOutcome::UnknownDraft) => return not_found(format!("no draft {id:?}")),
         Ok(AdoptDraftOutcome::Saved { current }) => {
             return (
