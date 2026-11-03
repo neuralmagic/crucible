@@ -337,6 +337,8 @@ async fn try_turn(
     //    proxy hop.
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
     let auth = crate::agent::harness::resolve_auth(harness, &inference);
+    let gen_ai_system =
+        crate::agent::harness::gen_ai_system(auth, args.model(), &inference, &args.env);
     let sandbox_auth = match auth {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
@@ -856,7 +858,8 @@ async fn try_turn(
         if harness.spec().backfill_required
             || crate::agent::engine::TurnExport::resolve().emits_anything()
         {
-            graft_turn_telemetry(harness, &gw, &name, &cancel, &mut cost, sink).await;
+            graft_turn_telemetry(harness, gen_ai_system, &gw, &name, &cancel, &mut cost, sink)
+                .await;
             spent.raise(cost.total());
         }
         Ok(cost.total())
@@ -1388,6 +1391,7 @@ async fn write_traceparent_files(
 /// turn's (possibly raised) cost.
 async fn graft_turn_telemetry(
     harness: Harness,
+    gen_ai_system: &'static str,
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
@@ -1432,7 +1436,7 @@ async fn graft_turn_telemetry(
             // Content logs come from the harness's own transcript reader (claude maps its jsonl;
             // hermes: Phase B), off the same in-memory bytes, no re-read.
             let records = harness.backend().content_records(&bytes);
-            crate::agent::engine::emit_conversation_logs(&span, &records);
+            crate::agent::engine::emit_conversation_logs(&span, &records, gen_ai_system);
         }
     }
 

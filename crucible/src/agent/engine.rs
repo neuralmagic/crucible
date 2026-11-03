@@ -435,6 +435,7 @@ fn content_logs_enabled() -> bool {
 pub(crate) fn emit_conversation_logs(
     parent: &tracing::Span,
     records: &[crate::turn_trace::GenAiRecord],
+    system: &'static str,
 ) {
     use opentelemetry::logs::LoggerProvider as _;
     use opentelemetry::trace::TraceContextExt as _;
@@ -451,7 +452,7 @@ pub(crate) fn emit_conversation_logs(
         return;
     }
     let logger = provider.logger(SERVICE_NAME);
-    emit_records(&logger, &sc, records);
+    emit_records(&logger, &sc, records, system);
 }
 
 /// The pure emission over a logger and a span context, split out so a test can drive it against an
@@ -461,6 +462,7 @@ fn emit_records<L>(
     logger: &L,
     sc: &opentelemetry::trace::SpanContext,
     records: &[crate::turn_trace::GenAiRecord],
+    system: &'static str,
 ) where
     L: opentelemetry::logs::Logger,
 {
@@ -473,8 +475,7 @@ fn emit_records<L>(
         let mut lr = logger.create_log_record();
         lr.set_severity_number(Severity::Info);
         lr.set_trace_context(sc.trace_id(), sc.span_id(), Some(sc.trace_flags()));
-        // Anthropic Claude is the only agent model behind these transcripts.
-        lr.add_attribute("gen_ai.system", "anthropic");
+        lr.add_attribute("gen_ai.system", system);
         map_record(&mut lr, rec, Some(i) == last_assistant);
         logger.emit(lr);
     }
@@ -984,7 +985,7 @@ mod tests {
                 model: None,
             },
         ];
-        emit_records(&logger, &sc, &records);
+        emit_records(&logger, &sc, &records, "openai");
         provider.force_flush().expect("flush");
 
         let logs = exporter.get_emitted_logs().expect("emitted logs");
@@ -1005,6 +1006,16 @@ mod tests {
             let tc = l.record.trace_context().expect("trace context set");
             assert_eq!(tc.trace_id, sc.trace_id());
             assert_eq!(tc.span_id, sc.span_id());
+            let system = l
+                .record
+                .attributes_iter()
+                .find(|(key, _)| key.as_str() == "gen_ai.system")
+                .map(|(_, value)| value);
+            assert_eq!(
+                any_str(system),
+                Some("openai".into()),
+                "the provider passed in"
+            );
         }
 
         // The user body is the full prompt string.

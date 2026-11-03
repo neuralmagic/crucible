@@ -56,6 +56,26 @@ pub(crate) fn resolve_auth(
     }
 }
 
+/// The GenAI provider name (`gen_ai.system`) of the API a turn on `auth` reaches. A
+/// key-authenticated harness names the API its endpoint speaks.
+pub(crate) fn gen_ai_system(
+    auth: AuthProvider,
+    model: &str,
+    inference: &InferenceEnv,
+    manifest_env: &[(String, String)],
+) -> &'static str {
+    match auth {
+        AuthProvider::Vertex => "gcp.vertex_ai",
+        AuthProvider::AnthropicKey => "anthropic",
+        AuthProvider::Codex => "openai",
+        AuthProvider::ApiKey => match api_endpoint(model, inference, manifest_env) {
+            ApiEndpoint::OpenAi { .. } => "openai",
+            ApiEndpoint::Anthropic { .. } => "anthropic",
+            ApiEndpoint::Vertex(_) => "gcp.vertex_ai",
+        },
+    }
+}
+
 /// The API family a provider-table harness (opencode, pi) talks to, with the base URL it is
 /// reached at.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -717,6 +737,43 @@ mod tests {
                 "only claude posts to its own log intake: {harness:?}"
             );
         }
+    }
+
+    /// A turn's content logs name the provider its credential reaches, not the vendor of the
+    /// harness that ran it.
+    #[test]
+    fn gen_ai_system_names_the_provider_the_turn_reaches() {
+        let ambient = crate::agent::inference::InferenceEnv::default();
+        let anthropic = crate::agent::inference::InferenceEnv {
+            anthropic_key: Some("k".into()),
+            ..Default::default()
+        };
+        let openai = crate::agent::inference::InferenceEnv {
+            openai_key: Some("k".into()),
+            ..Default::default()
+        };
+        let system =
+            |harness: Harness, model: &str, env: &crate::agent::inference::InferenceEnv| {
+                gen_ai_system(resolve_auth(harness, env), model, env, &[])
+            };
+        assert_eq!(
+            system(Harness::Claude, "claude-opus-4-6", &ambient),
+            "gcp.vertex_ai"
+        );
+        assert_eq!(
+            system(Harness::Claude, "claude-opus-4-6", &anthropic),
+            "anthropic"
+        );
+        assert_eq!(system(Harness::Codex, "gpt-5.6-sol", &ambient), "openai");
+        assert_eq!(system(Harness::OpenCode, "qwen", &openai), "openai");
+        assert_eq!(
+            system(Harness::Pi, "claude-opus-4-6", &anthropic),
+            "anthropic"
+        );
+        assert_eq!(
+            system(Harness::Pi, "claude-opus-4-6", &ambient),
+            "gcp.vertex_ai"
+        );
     }
 
     /// Where a key-authenticated turn goes: a named OpenAI base URL wins outright; otherwise the
