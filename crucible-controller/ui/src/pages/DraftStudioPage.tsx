@@ -113,9 +113,12 @@ function DraftStudio({ id }: { id: string }) {
   });
   const caps = $api.useQuery('get', '/api/config/playbook-caps');
   const whoami = $api.useQuery('get', '/api/whoami');
-  const secrets = $api.useQuery('get', '/api/secrets', {
-    enabled: whoami.data?.user != null,
-  });
+  const githubTokens = $api.useQuery(
+    'get',
+    '/api/secrets',
+    { params: { query: { kind: 'github_token' } } },
+    { enabled: whoami.data?.user != null },
+  );
   const origin = draft.data?.origin ?? null;
   const moved = originMovedLabel(origin);
   const originFiles = $api.useQuery(
@@ -186,24 +189,15 @@ function DraftStudio({ id }: { id: string }) {
     setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
   }, [publishTarget]);
 
-  const personalGithubSecrets = useMemo<SecretDto[]>(() => {
-    const login = whoami.data?.user ?? null;
-    if (login === null) return [];
-    return (secrets.data ?? []).filter(
-      secret =>
-        secret.owner === `user:${login}` &&
-        secret.kind === 'opaque' &&
-        secret.visibility === 'broker_only' &&
-        secret.mode !== 'minted',
-    );
-  }, [secrets.data, whoami.data?.user]);
-
   const githubSecretOptions = useMemo(
     () => [
       { value: '', label: 'Controller identity' },
-      ...personalGithubSecrets.map(secret => ({ value: secret.id, label: secret.name })),
+      ...(githubTokens.data ?? []).map((secret: SecretDto) => ({
+        value: secret.id,
+        label: `${secret.name} (${secret.owner})`,
+      })),
     ],
-    [personalGithubSecrets],
+    [githubTokens.data],
   );
 
   const first = stored.data;
@@ -777,7 +771,7 @@ function DraftStudio({ id }: { id: string }) {
                   value={gradSecretId}
                   onChange={setGradSecretId}
                   options={githubSecretOptions}
-                  hint="A personal opaque, broker-only secret pushes and opens the PR as you."
+                  hint="A github_token secret pushes and opens the PR as its account."
                 />
               </FormGrid>
             </SectionBody>

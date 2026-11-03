@@ -9490,6 +9490,145 @@ where
     (out, std::fs::read_to_string(&log).unwrap_or_default())
 }
 
+/// One registry row for the graduation tests: `owner`'s secret `name` of `kind`.
+async fn seed_registry_secret(
+    pool: &PgPool,
+    id: &str,
+    owner: &str,
+    name: &str,
+    kind: crate::secrets::SecretKind,
+) {
+    let owner = crate::authz::model::Principal::parse(owner).expect("principal");
+    let name = crate::secrets::SecretName::parse(name).expect("name");
+    let mut conn = pool.acquire().await.expect("conn");
+    crate::secrets::store::insert(
+        &mut conn,
+        &crate::secrets::store::NewSecret {
+            id,
+            name: &name,
+            owner: &owner,
+            kind,
+            visibility: crate::secrets::Visibility::BrokerOnly,
+            consumer: kind.default_consumer(),
+            mode: crate::secrets::SecretMode::Managed,
+            vault_path: "crucible/registry/key",
+            current_version: Some(1),
+            created_by: Some("wren"),
+        },
+    )
+    .await
+    .expect("insert a secret");
+}
+
+/// Graduating as yourself pushes with your own `github_token` secret: the token comes out of the
+/// registry's reader, the read lands on the secret's audit trail as the caller's, and the picker's
+/// list is filtered by kind on the server. A secret of another kind, one owned by someone the
+/// caller does not act for, and an unknown id are refused before anything is pushed or read.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn graduating_as_yourself_pushes_with_your_own_github_token(pool: PgPool) -> Result<()> {
+    use crate::secrets::SecretKind;
+    let (db, dir) = db_with(pool);
+    let app = router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
+        secret_provider: Some(Arc::new(crate::secrets::provider::MapProvider::new([
+            ("wren-pat".to_string(), "ghp-wren-0123".to_string()),
+            ("notes".to_string(), "not a token".to_string()),
+            ("bob-pat".to_string(), "ghp-bob-4567".to_string()),
+        ]))),
+        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+    });
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    seed_registry_secret(
+        db.pool(),
+        "s-wren-pat",
+        "user:wren",
+        "wren-pat",
+        SecretKind::GithubToken,
+    )
+    .await;
+    seed_registry_secret(
+        db.pool(),
+        "s-notes",
+        "user:wren",
+        "notes",
+        SecretKind::Opaque,
+    )
+    .await;
+    seed_registry_secret(
+        db.pool(),
+        "s-bob-pat",
+        "user:bob",
+        "bob-pat",
+        SecretKind::GithubToken,
+    )
+    .await;
+
+    let (status, listed) = get_json_as(&app, "/api/secrets?kind=github_token", "wren").await;
+    assert_eq!(status, StatusCode::OK, "{listed:?}");
+    let ids: Vec<&str> = listed.iter().filter_map(|s| s["id"].as_str()).collect();
+    assert_eq!(ids, vec!["s-wren-pat"], "{listed:?}");
+
+    let uri = "/api/playbook-drafts/studio/graduate";
+    let with = |secret: &str| serde_json::json!({"repo": "owner/packs", "path": "packs/studio", "github_secret_id": secret});
+    let (outcomes, log) = with_forge_stubs(dir.path(), || async {
+        let mut outcomes = Vec::new();
+        for secret in ["s-notes", "s-bob-pat", "s-missing", "s-wren-pat"] {
+            outcomes.push((secret, post_admin(&app, uri, with(secret)).await));
+        }
+        outcomes
+    })
+    .await;
+    let status_of = |secret: &str| {
+        outcomes
+            .iter()
+            .find(|(s, _)| *s == secret)
+            .map(|(_, (status, body))| (*status, body.clone()))
+            .expect("an outcome")
+    };
+    let (status, body) = status_of("s-notes");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("github_token")),
+        "{body}"
+    );
+    let (status, body) = status_of("s-bob-pat");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = status_of("s-missing");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let (status, body) = status_of("s-wren-pat");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["pr_url"], "https://github.com/owner/packs/pull/7");
+
+    assert!(
+        log.contains("x-access-token:ghp-wren-0123@github.com/owner/packs"),
+        "the push rides the caller's token: {log}"
+    );
+    assert!(!log.contains("ghp-bob-4567"), "{log}");
+    let audited: Vec<(String, String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT secret_id, action, actor, detail FROM secret_audit ORDER BY id")
+            .fetch_all(db.pool())
+            .await?;
+    assert_eq!(
+        audited,
+        vec![(
+            "s-wren-pat".to_string(),
+            "hub_read".to_string(),
+            Some("user:wren".to_string()),
+            Some("pushes draft studio to owner/packs".to_string()),
+        )],
+        "one read, by the caller, of the token that was used"
+    );
+    Ok(())
+}
+
 /// Graduation exports the draft as a PR over the pack-PR push, is idempotent against a second
 /// attempt, and the import of the merged pack is what retires the draft.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

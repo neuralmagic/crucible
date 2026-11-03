@@ -23,6 +23,7 @@ export const KIND_OPTIONS: readonly { value: SecretKind; label: string }[] = [
   { value: 'registry_authfile', label: 'registry_authfile (in-pod pulls and pushes)' },
   { value: 'kubeconfig', label: 'kubeconfig (a cluster the hub calls)' },
   { value: 'inference_api_key', label: 'inference_api_key (a model provider\'s credentials)' },
+  { value: 'github_token', label: 'github_token (the hub pushes your draft PRs with it)' },
 ];
 
 /// One entry of an inference key's credentials map: the environment variable it lands in, and
@@ -97,7 +98,7 @@ export function visibilityOptions(kind: SecretKind): readonly { value: Visibilit
 /// Whether a kind's value is one line of text rather than a document. An inference key is a
 /// credentials map, edited as rows rather than as a value at all.
 export function isKeyShaped(kind: SecretKind): boolean {
-  return kind === 'opaque' || kind === 'inference_api_key';
+  return kind === 'opaque' || kind === 'inference_api_key' || kind === 'github_token';
 }
 
 /// A file-shaped kind is written to a path. An environment variable would be echoed by anything

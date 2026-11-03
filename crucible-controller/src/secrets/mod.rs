@@ -82,6 +82,9 @@ pub enum SecretKind {
     /// An inference provider's API key. Projected as an environment variable the loop reads, never
     /// relayed into the sandbox: the agent talks to the model through the loop, not directly.
     InferenceApiKey,
+    /// A GitHub token the hub pushes and opens pull requests with on its owner's behalf. Read by
+    /// the hub only; never bound to a scope or projected into a run.
+    GithubToken,
 }
 
 wire_enum!(SecretKind, "secret kind", both, {
@@ -90,6 +93,7 @@ wire_enum!(SecretKind, "secret kind", both, {
     SecretKind::RegistryAuthfile => "registry_authfile",
     SecretKind::Kubeconfig => "kubeconfig",
     SecretKind::InferenceApiKey => "inference_api_key",
+    SecretKind::GithubToken => "github_token",
 });
 
 /// Whether the agent inside the sandbox may see the value. `BrokerOnly` is the default everywhere;
@@ -293,8 +297,12 @@ pub const VALUE_KEY: &str = "value";
 pub enum PolicyError {
     #[error("a {kind} secret is broker-side only and cannot be agent_visible")]
     NotAgentVisible { kind: &'static str },
-    #[error("consumer class hub is only for kubeconfig secrets")]
+    #[error("consumer class hub is only for kubeconfig and github_token secrets")]
     HubNeedsKubeconfig,
+    #[error("a github_token secret is read by the hub itself; its consumer class is hub")]
+    GithubTokenIsHubOnly,
+    #[error("a {kind} secret is read by the hub itself and is never bound to a scope")]
+    NotProjected { kind: &'static str },
     #[error("a reference secret has no version to rotate; re-point it instead")]
     RotateReference,
     #[error(
@@ -324,7 +332,7 @@ impl SecretKind {
     /// The consumer class a registration that named none gets.
     pub fn default_consumer(self) -> ConsumerClass {
         match self {
-            SecretKind::Kubeconfig => ConsumerClass::Hub,
+            SecretKind::Kubeconfig | SecretKind::GithubToken => ConsumerClass::Hub,
             _ => ConsumerClass::Run,
         }
     }
@@ -341,8 +349,13 @@ pub fn check_shape(
             kind: kind.as_str(),
         });
     }
-    if consumer == ConsumerClass::Hub && kind != SecretKind::Kubeconfig {
+    if consumer == ConsumerClass::Hub
+        && !matches!(kind, SecretKind::Kubeconfig | SecretKind::GithubToken)
+    {
         return Err(PolicyError::HubNeedsKubeconfig);
+    }
+    if kind == SecretKind::GithubToken && consumer != ConsumerClass::Hub {
+        return Err(PolicyError::GithubTokenIsHubOnly);
     }
     Ok(())
 }
@@ -382,6 +395,9 @@ pub fn check_agent_visible_value(
 /// variable, whose value would be echoed by anything that dumps the environment.
 pub fn check_projection(kind: SecretKind, projection: ProjectionKind) -> Result<(), PolicyError> {
     match (kind, projection) {
+        (SecretKind::GithubToken, _) => Err(PolicyError::NotProjected {
+            kind: kind.as_str(),
+        }),
         (SecretKind::Opaque | SecretKind::InferenceApiKey, _) => Ok(()),
         (_, ProjectionKind::File) => Ok(()),
         (kind, ProjectionKind::Env) => Err(PolicyError::NeedsFileProjection {
@@ -443,6 +459,54 @@ mod tests {
             ConsumerClass::Hub
         );
         assert_eq!(SecretKind::Opaque.default_consumer(), ConsumerClass::Run);
+    }
+
+    /// A GitHub token is the hub's to read on its owner's behalf: hub-consumed by default and
+    /// only, broker-side, and never bound to a scope where a run could receive it.
+    #[test]
+    fn a_github_token_is_hub_only_and_never_projected() {
+        assert_eq!(
+            SecretKind::GithubToken.default_consumer(),
+            ConsumerClass::Hub
+        );
+        assert!(
+            check_shape(
+                SecretKind::GithubToken,
+                Visibility::BrokerOnly,
+                ConsumerClass::Hub
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            check_shape(
+                SecretKind::GithubToken,
+                Visibility::BrokerOnly,
+                ConsumerClass::Run
+            ),
+            Err(PolicyError::GithubTokenIsHubOnly)
+        );
+        assert_eq!(
+            check_shape(
+                SecretKind::GithubToken,
+                Visibility::AgentVisible,
+                ConsumerClass::Hub
+            ),
+            Err(PolicyError::NotAgentVisible {
+                kind: "github_token"
+            })
+        );
+        for projection in [ProjectionKind::Env, ProjectionKind::File] {
+            assert_eq!(
+                check_projection(SecretKind::GithubToken, projection),
+                Err(PolicyError::NotProjected {
+                    kind: "github_token"
+                })
+            );
+        }
+        assert_eq!(
+            SecretKind::parse("github_token").ok(),
+            Some(SecretKind::GithubToken)
+        );
     }
 
     #[test]

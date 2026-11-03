@@ -119,6 +119,9 @@ pub struct ApiState {
     /// `None` — local mode, a deployment with no Vault reach, tests — answers the registry's
     /// write routes with 503 instead of storing metadata that points at nothing.
     pub(crate) vault: Option<Arc<crate::secrets::vault::VaultClient>>,
+    /// Where a registered secret's bytes are read from, the same reader a dispatch uses.
+    /// `None` reads nothing.
+    pub(crate) secret_provider: Option<Arc<dyn crate::secrets::provider::SecretProvider>>,
     /// The environment variable names the deploy profile already fills from pre-created cluster
     /// Secrets. The preview gate warns when a pack declares a secret one of these also supplies.
     pub(crate) profile_secret_env: Arc<Vec<String>>,
@@ -248,6 +251,7 @@ impl ApiState {
             public_url: cfg.public_url.clone(),
             hooks_public_url: cfg.hooks_public_url.clone(),
             vault: None,
+            secret_provider: cfg.secret_provider.clone(),
             profile_secret_env: Arc::new(
                 cfg.deploy_profile
                     .as_deref()
@@ -392,6 +396,7 @@ impl ApiState {
             public_url: None,
             hooks_public_url: None,
             vault: None,
+            secret_provider: None,
             profile_secret_env: Arc::new(Vec::new()),
             credential_keys: None,
             webhook_keys: None,

@@ -265,7 +265,7 @@ const NO_VAULT: &str = "this deployment has no Vault client, so the secrets regi
 /// The secret `id` names, decided for `verb` against its owner. A caller who may not read it is
 /// told it does not exist (RFC-0003 C-READ-SCOPING).
 #[allow(clippy::result_large_err)]
-async fn owned(
+pub(crate) async fn owned(
     state: &ApiState,
     caller: &crate::authz::Caller,
     id: &str,
@@ -635,7 +635,10 @@ pub(crate) async fn register_secret(
 #[utoipa::path(
     get,
     path = "/api/secrets",
-    params(("all" = Option<bool>, Query, description = "Admins only: every secret, not just the caller's")),
+    params(
+        ("all" = Option<bool>, Query, description = "Admins only: every secret, not just the caller's"),
+        ("kind" = Option<crate::secrets::SecretKind>, Query, description = "Only secrets of this kind")
+    ),
     responses(
         (status = 200, description = "Secret metadata", body = Vec<SecretDto>),
         (status = 403, description = "Not an operator", body = ErrorBody)
@@ -652,12 +655,18 @@ pub(crate) async fn list_secrets(
         Some(caller.principals.all())
     };
     let rows = store::list(state.db.pool(), owners.as_deref()).await?;
-    Ok(Json(rows.into_iter().map(SecretDto::from).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .filter(|row| q.kind.is_none_or(|kind| row.kind == kind))
+            .map(SecretDto::from)
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListSecretsQuery {
     all: Option<bool>,
+    kind: Option<crate::secrets::SecretKind>,
 }
 
 /// `GET /api/secrets/{id}` — one secret's metadata and its bindings.
