@@ -1,5 +1,6 @@
+import { useMemo } from 'react';
 import { $api } from '../api/client';
-import { eyebrowFor, narrow } from '../ownerContext';
+import { eyebrowFor, narrow, scopedPath } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
   Button,
@@ -17,6 +18,7 @@ import {
 import type { StatusTone } from '../ui';
 import { scheduleView, signinNeededCount, type ScheduleDto, type ScheduleState } from './schedulesView';
 import { shortRev } from './draftStudio';
+import { scheduleFiringsPath } from './playbookRunsView';
 
 const EMPTY: ScheduleDto[] = [];
 
@@ -29,7 +31,8 @@ const TONE: Record<ScheduleState, StatusTone> = {
 
 const helper = createDataColumnHelper<ScheduleDto>();
 
-const columns = helper.columns([
+/// The columns, with each schedule's firings linked inside `team`'s workspace when there is one.
+const columnsFor = (team: string | null) => helper.columns([
   helper.accessor('playbook', {
     header: 'Playbook',
     enableSorting: false,
@@ -72,7 +75,14 @@ const columns = helper.columns([
     header: 'Last fired',
     enableSorting: false,
     meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
-    cell: ({ getValue }) => formatStamp(getValue()),
+    cell: ({ getValue, row }) => {
+      const fired = getValue();
+      return fired ? (
+        <Identifier to={scopedPath(team, scheduleFiringsPath(row.original.id))}>{formatStamp(fired)}</Identifier>
+      ) : (
+        formatStamp(fired)
+      );
+    },
   }),
   helper.display({
     id: 'state',
@@ -111,6 +121,7 @@ export function SchedulesPage() {
   const schedules = $api.useQuery('get', '/api/schedules');
   const owner = useOwnerContext();
   const rows = narrow(schedules.data ?? EMPTY, owner.context, (row) => row.owner_principal);
+  const columns = useMemo(() => columnsFor(owner.team), [owner.team]);
   const table = useDataTable({ columns, data: rows, getRowId: (row) => row.id });
   const needSignin = signinNeededCount(rows);
 

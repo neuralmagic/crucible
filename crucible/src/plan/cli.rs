@@ -67,6 +67,8 @@ pub fn load(path: &Path) -> Result<ValidPlan> {
     } else {
         Plan::from_json_str(&src)?
     };
+    crate::manifest::launch::check_agent_knobs(&plan.tasks)
+        .with_context(|| format!("validating plan {}", path.display()))?;
     plan.validate()
         .with_context(|| format!("validating plan {}", path.display()))
 }
@@ -126,6 +128,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     crate::plan::ir::Decider::Model { min_confidence, .. } =>
                         format!("model >= {min_confidence}"),
                     crate::plan::ir::Decider::Output { task } => format!("from {task}"),
+                    crate::plan::ir::Decider::Human { .. } => "human".to_string(),
                 }
             ),
             TaskKind::Report { .. } => "report".to_string(),
@@ -312,7 +315,12 @@ fn render_mermaid_styled(
             let arrow = if aligned { "==>" } else { "-->" };
             let mut labels = Vec::new();
             if let Some(when) = t.when.as_ref().filter(|when| &when.task == d) {
-                let answers: Vec<&str> = when.is.iter().map(|l| l.as_str()).collect();
+                let answers: Vec<&str> = when
+                    .any_option
+                    .then_some("any option")
+                    .into_iter()
+                    .chain(when.is.iter().map(|l| l.as_str()))
+                    .collect();
                 labels.push(format!(
                     "{}: {}",
                     mermaid_label(when.question.as_str()),
@@ -677,12 +685,18 @@ pub fn run(
             (_, Some(m)) => {
                 let state = crate::cli::setup::state_dir(m);
                 let resumed = resume.then(|| RunStart::read(&state)).transpose()?;
+                let start = if resume || rerun.is_some() {
+                    crate::cli::setup::Start::Continues
+                } else {
+                    crate::cli::setup::Start::Fresh
+                };
                 let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
                     m,
                     variant.as_ref(),
                     params,
                     compute_driver,
                     agent,
+                    start,
                 )?;
                 let session_log = prepared.paths.session_log.clone();
                 agent_args = Some(prepared.args.clone());
@@ -782,6 +796,7 @@ pub fn run(
                         workdir: std::env::current_dir()
                             .context("resolving the working directory")?,
                         agent_cmd,
+                        buildit_socket: None,
                     }),
                     None,
                 )
@@ -799,7 +814,6 @@ pub fn run(
     });
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
     let append = |f: &std::fs::File, ev: &crate::report::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;
@@ -808,6 +822,13 @@ pub fn run(
     // A log that already ends in a shutdown is closed: the run finished, and nothing may follow
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
+    // A run with an ingest surface can open decision requests, which is the `human` capability.
+    let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    let mut caps = caps.clone();
+    if desk.is_some() {
+        caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
+    }
+    let substrate = Substrate::detecting(caps, &crucible::inference::from_process_env()?);
     if let Some(f) = &events {
         if let Some(prior) = prior.as_ref().filter(|_| resuming) {
             append(
@@ -944,6 +965,9 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
+            decisions: desk
+                .as_ref()
+                .map(|d| d as &dyn crucible::plan::decide::DecisionDesk),
             ..ExecCfg::default()
         },
         runner.as_mut(),
@@ -1059,6 +1083,26 @@ mod tests {
         depends_on = ["propose"]
         needs = "gpu"
     "#;
+
+    /// A plan file carries its own tasks, so its harness and effort are checked as it loads.
+    #[test]
+    fn a_plan_file_naming_a_harness_no_turn_can_read_is_refused() {
+        let dir = crate::testing::tempdir("plan-file-knobs");
+        let file = dir.join("plan.toml");
+        std::fs::write(
+            &file,
+            SRC.replace("prompt = \"go\"", "prompt = \"go\"\nharness = \"gpt\""),
+        )
+        .unwrap();
+        let err = load(&file).map(|_| ()).expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("sets harness \"gpt\""),
+            "{err:#}"
+        );
+        std::fs::write(&file, SRC).unwrap();
+        load(&file).expect("a plan with no knobs set loads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// How a pack spells its graph is not a launcher's business. An undeclared `--param` is a
     /// mistake against the inline spelling exactly as it is against the file-backed one, and

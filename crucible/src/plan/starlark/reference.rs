@@ -10,7 +10,7 @@ use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 use crate::plan::workflow::WorkflowType;
-use crucible_contract::decision::UNCERTAIN;
+use crucible_contract::decision::{MAX_DYNAMIC_OPTIONS, UNCERTAIN};
 use crucible_contract::history::MAX_HISTORY_DEPTH;
 
 /// Which lanes see a constructor.
@@ -205,7 +205,8 @@ fn otherwise_kwarg() -> Kwarg {
         format!(
             "In place of `answers`: every answer no other task lists and the question does not \
              `drop`, `\"{UNCERTAIN}\"` included. Expanded at compile time. An unreachable \
-             `otherwise` is an error."
+             `otherwise` is an error. On a choice whose options come from a field, it also \
+             stands for every option the choice resolves to, and is the only way to route them."
         ),
     )
 }
@@ -216,7 +217,8 @@ fn answers_kwarg() -> Kwarg {
         "str | list[str]",
         format!(
             "The answers `when` accepts: labels the question declares, or `\"{UNCERTAIN}\"`. \
-             Defaults to `\"yes\"` for a noul and is required for a choice or a score."
+             Defaults to `\"yes\"` for a noul and is required for a choice or a score. A choice \
+             whose options come from a field declares none, so only `\"{UNCERTAIN}\"`."
         ),
     )
 }
@@ -329,7 +331,8 @@ pub fn functions() -> Vec<Function> {
                     Kwarg::new(
                         "threshold",
                         "number",
-                        "Grade the emitted score against this bound. An explicit `pass` wins.",
+                        "Grade the emitted score against this bound. `pass = false` fails a score \
+                         within it; `pass` cannot pass a score outside it.",
                     ),
                     Kwarg::new(
                         "direction",
@@ -582,6 +585,28 @@ pub fn functions() -> Vec<Function> {
                      question answers, or `\"boolean\"` for a noul.",
                 ),
                 Kwarg::new(
+                    "human",
+                    "bool",
+                    "True: a person allowed to approve the run answers, from the controller \
+                     UI, after seeing the dependencies' declared outputs and files. Needs the \
+                     `human` capability. Tasks that do not depend on the route keep running \
+                     while it waits.",
+                ),
+                Kwarg::new(
+                    "review",
+                    "path",
+                    "With `human`: a Markdown template in the pack, rendered over the evidence \
+                     (`inputs`, `run`, `gated`) and shown above it. Every inserted value is \
+                     escaped.",
+                ),
+                Kwarg::new(
+                    "timeout",
+                    "duration",
+                    "With `human`: how long the request stays open, from when it opens; the \
+                     run's wall-clock ceiling by default. An unanswered request records every \
+                     question as `\"uncertain\"`.",
+                ),
+                Kwarg::new(
                     "files",
                     "list[str]",
                     "Declared JSON files of dependencies the model reads, under `files` in its \
@@ -643,14 +668,51 @@ pub fn functions() -> Vec<Function> {
                 Kwarg::new("ask", "str", "What to decide."),
                 Kwarg::new(
                     "options",
-                    "list[str] | dict[str, str | None]",
-                    "At least two distinct identifier labels, optionally each with a description \
-                     the model sees. `\"uncertain\"` is reserved.",
+                    "list[str] | dict[str, str | None] | producer.field",
+                    format!(
+                        "At least two distinct identifier labels, optionally each with a \
+                         description the model sees. `\"uncertain\"` is reserved. Or an unmapped \
+                         dependency's field, read at each decision: the list itself, or, on a \
+                         route with `over`, an object keyed by item holding each item's list. \
+                         Each entry is a label or `{{\"value\": label, \"description\": str}}`; \
+                         at most {MAX_DYNAMIC_OPTIONS}, a repeated label keeps its first entry, \
+                         and fewer than two fails that decision. The answer records the options \
+                         it chose among. Needs `min_confidence`."
+                    ),
+                ),
+                Kwarg::new(
+                    "multiple",
+                    "bool",
+                    "Take one or more labels. Only a `human = True` route asks it; a `when` runs \
+                     if any listed label was chosen.",
                 ),
                 Kwarg::new(
                     "drop",
                     "str | list[str]",
                     "Answers that deliberately lead nowhere, so no `when` has to list them.",
+                ),
+            ],
+        },
+        Function {
+            name: "pick",
+            lane: Lane::Routed,
+            purpose: "A question for a `human = True` route whose options are a list a \
+                      dependency produced. The route's output holds the picked values under the \
+                      question id, so `over = gate.question` fans out over them. No `when` \
+                      routes on it.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new("ask", "str", "What to pick."),
+                Kwarg::new(
+                    "source",
+                    "producer.field",
+                    "A list of strings in the output of a task the route depends on, read when \
+                     the route opens its request.",
+                ),
+                Kwarg::new(
+                    "multiple",
+                    "bool",
+                    "Take one or more values rather than one.",
                 ),
             ],
         },
@@ -733,15 +795,19 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
         Reserved::new(
             "status",
             declared_status_type(),
-            "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+            "`\"fail\"` or `\"skipped\"` settles the task that way, whatever its exit status, \
+             `pass` or threshold. `\"pass\"` cannot pass a task that exited nonzero or did not \
+             pass its grade. Any other value is ignored.",
         ),
         Reserved::new(
             crate::plan::ir::NOTE_FIELD,
             "str",
-            "Why the task failed or was skipped, recorded as its note: in place of the default \
-             note when `status` is `\"fail\"` or `\"skipped\"`, and after the exit status in \
-             place of the stderr tail when a command exits nonzero. The control plane shows it as \
-             a parked run's reason. Read only from a result that fails or skips.",
+            "Why the task failed or was skipped, recorded as its note when it is a non-blank \
+             string: after the exit status in place of the stderr tail when a command exits \
+             nonzero, before the threshold and log handles when an evaluation does not pass, and \
+             in place of the default note when `status` is `\"fail\"` or `\"skipped\"`. The \
+             control plane shows it as a parked run's reason. Read only from a result that fails \
+             or skips.",
         ),
         Reserved::new(
             crate::plan::ir::COMPLETE_FIELD,

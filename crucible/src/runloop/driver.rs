@@ -3010,6 +3010,7 @@ mod tests {
             broker_token: None,
             mcp: Vec::new(),
             mcp_scope: Vec::new(),
+            tool_plugins: None,
             sandboxes: Default::default(),
             relayed_secrets: Default::default(),
             model: Some("test-model".into()),
@@ -3035,6 +3036,7 @@ mod tests {
             workflow: None,
             workflow_frozen_injects: Vec::new(),
             workflow_toolbox_exclude: Vec::new(),
+            buildit_socket: None,
             watch_feedback: false,
         };
         let paths = Paths {

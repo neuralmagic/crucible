@@ -650,7 +650,8 @@ async fn get_json_object(app: &Router, uri: &str) -> (StatusCode, serde_json::Va
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_runs_page_sorts_filters_and_pages(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    // Time-first run ids so `created` (== run_id) order is meaningful; two repos for the filter.
+    // Two repos for the filter; each run's `created_at` an hour apart so the default order means
+    // something.
     seed_scoped_run(
         &db,
         "o/a",
@@ -695,9 +696,20 @@ async fn list_runs_page_sorts_filters_and_pages(pool: PgPool) -> Result<()> {
         },
     )
     .await?;
+    for (run_id, at) in [
+        ("20260704T100000Z-a", "2026-07-04T10:00:00Z"),
+        ("20260704T110000Z-b", "2026-07-04T11:00:00Z"),
+        ("20260704T120000Z-c", "2026-07-04T12:00:00Z"),
+    ] {
+        sqlx::query("UPDATE runs SET created_at = $2 WHERE run_id = $1")
+            .bind(run_id)
+            .bind(at)
+            .execute(db.pool())
+            .await?;
+    }
     let app = app(db.clone(), Arc::new(Recorder::default()));
 
-    // Default: sort=created desc → newest run_id first, and the join carries issue_key + repo.
+    // Default: sort=created desc → newest run first, and the join carries issue_key + repo.
     let (st, v) = get_json(&app, "/api/runs").await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(v.len(), 3);
@@ -3392,6 +3404,9 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/events",
         "/api/events/stream",
         "/api/approvals",
+        "/api/decisions",
+        "/api/decisions/{id}",
+        "/api/decisions/{id}/answer",
         "/api/issues/{key}/park",
         "/api/issues/{key}/unpark",
         "/api/reconcile",
@@ -3414,6 +3429,10 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbooks/{id}",
         "/api/playbooks/{id}/schema",
         "/api/playbooks/{id}/launch",
+        "/api/playbooks/{id}/blueprint",
+        "/api/playbooks/{id}/blueprint/public",
+        "/api/blueprints",
+        "/api/blueprints/{id}/use",
         "/api/playbook-drafts",
         "/api/playbook-drafts/from-git",
         "/api/playbook-limits",
@@ -7642,10 +7661,10 @@ fn one_shot_body(fire_at: &str) -> serde_json::Value {
     })
 }
 
-/// The runs section is the relaunch source: every ad-hoc launch with the values and ceilings it
-/// froze, its outcome, and its cost — and a schedule's firing is not one of them.
+/// The runs section is the relaunch source: every launch, a schedule's firings included, with the
+/// values and ceilings it froze, its outcome, and its cost.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn the_runs_list_carries_the_snapshot_and_leaves_schedules_out(pool: PgPool) -> Result<()> {
+async fn the_runs_list_carries_the_snapshot_and_every_origin(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
     let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
     register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
@@ -7663,35 +7682,67 @@ async fn the_runs_list_carries_the_snapshot_and_leaves_schedules_out(pool: PgPoo
     assert_eq!(status, StatusCode::CREATED, "{ack}");
     let key = ack["key"].as_str().expect("key").to_string();
 
-    // A schedule's firing lands the same row with a different origin (WI-005 writes these); the
-    // one-shot surface must not claim it.
-    let scheduled = "playbook:survey:scheduled-1";
-    sqlx::query(
-        "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) \
-         VALUES ($1, 'owner/repo', 'T1', 'new', 0, 'playbook', 'sched', '2026-08-23T00:00:00Z')",
+    // A schedule's firing lands the same row with a different origin and the schedule that
+    // minted it.
+    let (status, schedule) = send_json(
+        &app,
+        HttpRequest::post("/api/schedules"),
+        schedule_body("0 * * * *", "UTC"),
     )
-    .bind(scheduled)
-    .execute(db.pool())
-    .await?;
-    sqlx::query(
-        "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, \
-         advance_dedupe, origin, created_at) \
-         VALUES ($1, 'survey', '{}'::jsonb, 'sha256:x', 1.0, '5m', TRUE, 'schedule', \
-         '2026-08-23T00:00:00Z')",
-    )
-    .bind(scheduled)
-    .execute(db.pool())
-    .await?;
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{schedule}");
+    let schedule_id = schedule["id"].as_str().expect("id").to_string();
+    let due: jiff::Timestamp = schedule["next_due_at"].as_str().expect("due").parse()?;
+    let fired =
+        crate::launches::schedules::fire_due(&db, due, 8, 5, std::time::Duration::from_secs(3600))
+            .await?;
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    let firing = fired[0].as_str();
 
+    let keys = |rows: &serde_json::Value| -> Vec<String> {
+        rows.as_array()
+            .expect("array")
+            .iter()
+            .map(|r| r["key"].as_str().expect("key").to_string())
+            .collect()
+    };
     let (status, rows) = get_json_value(&app, "/api/playbook-runs").await;
     assert_eq!(status, StatusCode::OK);
-    let rows = rows.as_array().expect("array");
     assert_eq!(
-        rows.len(),
-        1,
-        "the scheduled firing stays off this list: {rows:?}"
+        keys(&rows),
+        [firing, key.as_str()],
+        "the firing is listed beside the form launch, newest first"
     );
-    let row = &rows[0];
+    assert_eq!(rows[0]["origin"], "schedule");
+    assert_eq!(rows[0]["schedule"], schedule_id.as_str());
+
+    let by_schedule = format!("schedule={schedule_id}");
+    let both_schedule = format!("origin=schedule&schedule={schedule_id}");
+    for (query, want) in [
+        ("origin=schedule", vec![firing]),
+        ("origin=manual", vec![key.as_str()]),
+        ("origin=webhook", vec![]),
+        (by_schedule.as_str(), vec![firing]),
+        ("schedule=nope", vec![]),
+        (both_schedule.as_str(), vec![firing]),
+        ("status=new&playbook=survey", vec![firing, key.as_str()]),
+        ("status=done", vec![]),
+        ("playbook=triage", vec![]),
+        (
+            "origin=&schedule=&status=&playbook=",
+            vec![firing, key.as_str()],
+        ),
+    ] {
+        let (status, rows) = get_json_value(&app, &format!("/api/playbook-runs?{query}")).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {rows}");
+        assert_eq!(keys(&rows), want, "{query}");
+    }
+    for query in ["origin=cron", "status=finished"] {
+        let (status, body) = get_json_value(&app, &format!("/api/playbook-runs?{query}")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{query}: {body}");
+    }
+
+    let row = &rows[1];
     assert_eq!(row["key"], key.as_str());
     assert_eq!(row["origin"], "manual");
     assert_eq!(row["status"], "new");
@@ -7725,7 +7776,7 @@ async fn the_runs_list_carries_the_snapshot_and_leaves_schedules_out(pool: PgPoo
 
     let (status, scheduled_row) = get_json_value(
         &app,
-        &format!("/api/playbook-runs/{}", urlencoding_encode(scheduled)),
+        &format!("/api/playbook-runs/{}", urlencoding_encode(firing)),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{scheduled_row}");
@@ -9370,6 +9421,163 @@ async fn a_registered_launch_shorter_than_a_task_timeout_is_refused(pool: PgPool
         status,
         StatusCode::CREATED,
         "a timeout equal to the ceiling fits: {body}"
+    );
+    Ok(())
+}
+
+/// A draft-head schedule is admitted against the draft's newest save like a draft launch: a
+/// `max_time` shorter than a task timeout is refused with the engine's message, a stale form is a
+/// 409 naming both digests, and neither stores a schedule.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_head_schedule_is_admitted_like_a_draft_launch(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_config(db, vec!["wren".to_string()], test_store());
+    let (status, body) = send_json(
+        &app,
+        HttpRequest::put("/api/config/overrides"),
+        serde_json::json!({
+            "allow_draft_head_schedules": true,
+            "justification": "schedule the studio draft",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(TIMED_WORKFLOW);
+    let saved = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    let digest = saved.1["schema_digest"]
+        .as_str()
+        .expect("the save compiles")
+        .to_string();
+    let schedule = |max_time: &str, schema_digest: &str| {
+        serde_json::json!({
+            "playbook": "studio",
+            "target_kind": "draft_head",
+            "params": {"topic": "attention", "depth": "deep"},
+            "max_cost": 1.0,
+            "max_time": max_time,
+            "cron_expr": "0 6 * * *",
+            "schema_digest": schema_digest,
+        })
+    };
+    let schedules = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM playbook_standing_launches")
+            .fetch_one(&pool)
+            .await
+            .expect("count schedules")
+    };
+
+    let (status, body) = post_admin(&app, "/api/schedules", schedule("1h", &digest)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["field"], "max_time", "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+    assert_eq!(schedules().await, 0, "a refused schedule stores nothing");
+
+    let (status, body) = post_admin(&app, "/api/schedules", schedule("2h", "sha256:stale")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"],
+        format!("draft studio now serves schema {digest}, not sha256:stale; reload the form"),
+    );
+    assert_eq!(schedules().await, 0, "a stale form stores nothing");
+
+    let (status, body) = post_admin(&app, "/api/schedules", schedule("2h", &digest)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["eligible_draft_version"], saved.1["version"], "{body}");
+    assert_eq!(schedules().await, 1);
+    Ok(())
+}
+
+/// Overwrite the stored `workflow.star` of `tree` so its files no longer hash to its digest.
+async fn tamper_tree(pool: &PgPool, tree: &str) {
+    sqlx::query(
+        "UPDATE pack_blobs SET content = 'print(\"evil\")' WHERE sha256 = \
+         (SELECT sha256 FROM pack_tree_files WHERE digest = $1 AND path = 'workflow.star')",
+    )
+    .bind(tree)
+    .execute(pool)
+    .await
+    .expect("tamper the tree");
+}
+
+/// A launch of a tree whose stored files were tampered with is refused naming the tree, on the
+/// draft, registered and one-shot paths alike, and adopts nothing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_of_a_tampered_tree_is_refused_naming_the_tree(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), TIMED_WORKFLOW).await;
+    crate::playbooks::pack_migration::convert_pack_trees(db.pool()).await?;
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(TIMED_WORKFLOW);
+    let saved = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    let registered: String =
+        sqlx::query_scalar("SELECT tree_digest FROM playbooks WHERE id = 'survey'")
+            .fetch_one(&pool)
+            .await?;
+    let drafted: String = sqlx::query_scalar(
+        "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = 'studio' \
+         ORDER BY version DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    tamper_tree(&pool, &registered).await;
+    tamper_tree(&pool, &drafted).await;
+    let launch = serde_json::json!({
+        "params": {"topic": "attention", "depth": "deep"},
+        "max_cost": 1.0,
+        "max_time": "2h",
+    });
+    let names = |tree: &str| format!("pack tree {tree} no longer matches its stored files");
+
+    let (status, body) = post_launch(&app, "survey", launch.clone()).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&names(&registered)), "{body}");
+
+    let mut deferred = launch.clone();
+    deferred["playbook"] = serde_json::json!("survey");
+    deferred["fire_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    let (status, body) = post_admin(&app, "/api/one-shots", deferred).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&names(&registered)), "{body}");
+
+    let (status, body) = post_admin(&app, "/api/playbook-drafts/studio/launch", launch).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&names(&drafted)), "{body}");
+
+    assert_eq!(
+        launch_count(&pool).await,
+        0,
+        "a refused launch adopts nothing"
     );
     Ok(())
 }
