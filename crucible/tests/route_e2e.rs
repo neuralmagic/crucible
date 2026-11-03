@@ -181,6 +181,22 @@ fn status_of<'a>(stdout: &'a str, task: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no row for {task} in:\n{stdout}"))
 }
 
+/// The JSON a task's row printed after `out=`.
+fn out_of(stdout: &str, task: &str) -> serde_json::Value {
+    let row = stdout
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(task))
+        .unwrap_or_else(|| panic!("no row for {task} in:\n{stdout}"));
+    let (_, out) = row
+        .split_once("out=")
+        .unwrap_or_else(|| panic!("no out= on {task}'s row: {row}"));
+    serde_json::Deserializer::from_str(out)
+        .into_iter::<serde_json::Value>()
+        .next()
+        .and_then(Result::ok)
+        .unwrap_or_else(|| panic!("{task}'s out= is not JSON: {row}"))
+}
+
 fn ran(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
         .unwrap()
@@ -560,24 +576,31 @@ fn a_dynamic_choice_asks_each_item_over_its_own_options() {
         "only the element whose list is too short fails: {}",
         run.stdout
     );
-    assert!(
-        run.stdout.contains(
-            r#""a":{"package":{"confidence":0.9,"label":"p1","options":[{"description":"golang.org/x/net 0.17.0","label":"p1"},{"description":"No shipped package matches","label":"none"}]"#
-        ),
+    let decided = out_of(&run.stdout, "match");
+    let a = &decided["outputs"]["a"]["package"];
+    assert_eq!(
+        (&a["label"], &a["confidence"]),
+        (&serde_json::json!("p1"), &serde_json::json!(0.9))
+    );
+    assert_eq!(
+        a["options"],
+        serde_json::json!([
+            {"label": "p1", "description": "golang.org/x/net 0.17.0"},
+            {"label": "none", "description": "No shipped package matches"},
+        ]),
         "the answer records the options it chose among: {}",
         run.stdout
     );
-    assert!(
-        run.stdout
-            .contains(r#""b":{"package":{"confidence":0.9,"label":"p1","options":[{"label":"p1"},{"label":"none"}]"#),
+    assert_eq!(
+        decided["outputs"]["b"]["package"]["options"],
+        serde_json::json!([{"label": "p1"}, {"label": "none"}]),
         "a repeated option collapses to its first entry: {}",
         run.stdout
     );
     assert_eq!(status_of(&run.stdout, "analyze"), "pass");
-    assert!(
-        run.stdout.contains(
-            r#"out={"failed":0,"instances":3,"not_taken":1,"outputs":{"a":{},"b":{}},"passed":2}"#
-        ),
+    assert_eq!(
+        out_of(&run.stdout, "analyze"),
+        serde_json::json!({"failed": 0, "instances": 3, "not_taken": 1, "outputs": {"a": {}, "b": {}}, "passed": 2}),
         "any option runs the analysis, the failed element's is not taken: {}",
         run.stdout
     );
