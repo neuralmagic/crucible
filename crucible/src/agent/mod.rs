@@ -317,9 +317,6 @@ fn run_turn_with(
         stderr,
     } = spawned;
 
-    let child_pid = child.id() as i32;
-    crate::process::pid_registry::register(child_pid);
-
     // Drain stderr into a buffer on a thread (keeps the sink single-threaded);
     // replay it through the sink after the process exits.
     let stderr_handle = thread::spawn(move || {
@@ -354,7 +351,6 @@ fn run_turn_with(
     }
 
     let killed_at = child.wait().ok().and_then(|reaped| reaped.killed_at);
-    crate::process::pid_registry::deregister(child_pid);
 
     if let Ok(errlines) = stderr_handle.join() {
         for line in errlines {

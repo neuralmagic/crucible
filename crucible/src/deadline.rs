@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::{Signal, killpg};
+use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
 
 use crate::duration::{Shown, TaskTimeout};
@@ -89,16 +89,38 @@ impl Deadline {
     }
 }
 
-/// Process groups spawned under a deadline and not yet reaped. They left the terminal's
-/// foreground group, so an interrupt handler can only reach them through this list.
-static LIVE_GROUPS: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+/// A child [`Supervised`] has not reaped yet. Under a deadline it leads a process group that
+/// left the terminal's foreground group, so an interrupt handler can only reach it through
+/// this list; without one it is listed by its own pid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Live {
+    Group(i32),
+    Child(i32),
+}
 
-/// SIGTERM every process group [`Supervised`] has not reaped yet.
-pub fn terminate_live_groups() {
-    let groups = LIVE_GROUPS.lock().unwrap_or_else(PoisonError::into_inner);
-    for &pgid in groups.iter() {
-        let _ = killpg(Pid::from_raw(pgid), Signal::SIGTERM);
+static LIVE: Mutex<Vec<Live>> = Mutex::new(Vec::new());
+
+/// SIGTERM every child [`Supervised`] has not reaped yet, with its whole group when it leads one.
+pub fn terminate_live_children() {
+    let live = LIVE.lock().unwrap_or_else(PoisonError::into_inner);
+    for entry in live.iter() {
+        let _ = match *entry {
+            Live::Group(pgid) => killpg(Pid::from_raw(pgid), Signal::SIGTERM),
+            Live::Child(pid) => kill(Pid::from_raw(pid), Signal::SIGTERM),
+        };
     }
+}
+
+fn track(entry: Live) {
+    LIVE.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push(entry);
+}
+
+fn untrack(entry: Live) {
+    LIVE.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|&e| e != entry);
 }
 
 fn kill_group(pgid: i32) {
@@ -115,7 +137,7 @@ const REAP_POLL: Duration = Duration::from_millis(10);
 pub struct Supervised {
     child: Child,
     deadline: Option<Deadline>,
-    group: Option<i32>,
+    live: Option<Live>,
     watchdog: Option<Watchdog>,
 }
 
@@ -129,41 +151,41 @@ pub struct Reaped {
 impl Supervised {
     pub fn spawn(cmd: &mut Command, deadline: Option<Deadline>) -> io::Result<Self> {
         use std::os::unix::process::CommandExt;
-        let Some(deadline) = deadline else {
-            return Ok(Supervised {
-                child: cmd.spawn()?,
-                deadline: None,
-                group: None,
-                watchdog: None,
-            });
-        };
-        cmd.process_group(0);
+        if deadline.is_some() {
+            cmd.process_group(0);
+        }
         let mut child = cmd.spawn()?;
-        let pgid = match i32::try_from(child.id()) {
-            Ok(pgid) => pgid,
+        let pid = match i32::try_from(child.id()) {
+            Ok(pid) => pid,
             Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(io::Error::other(format!(
-                    "child pid {} does not fit a process group id: {e}",
+                    "child pid {} does not fit a process id: {e}",
                     child.id()
                 )));
             }
         };
-        LIVE_GROUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(pgid);
-        let watchdog = match Watchdog::arm(pgid, deadline.at) {
+        let Some(deadline) = deadline else {
+            track(Live::Child(pid));
+            return Ok(Supervised {
+                child,
+                deadline: None,
+                live: Some(Live::Child(pid)),
+                watchdog: None,
+            });
+        };
+        track(Live::Group(pid));
+        let watchdog = match Watchdog::arm(pid, deadline.at) {
             Ok(watchdog) => watchdog,
             Err(e) => {
                 let mut unwatched = Supervised {
                     child,
                     deadline: Some(deadline),
-                    group: Some(pgid),
+                    live: Some(Live::Group(pid)),
                     watchdog: None,
                 };
-                kill_group(pgid);
+                kill_group(pid);
                 let _ = unwatched.reap(true);
                 return Err(e);
             }
@@ -171,7 +193,7 @@ impl Supervised {
         Ok(Supervised {
             child,
             deadline: Some(deadline),
-            group: Some(pgid),
+            live: Some(Live::Group(pid)),
             watchdog: Some(watchdog),
         })
     }
@@ -192,17 +214,14 @@ impl Supervised {
 
     fn reap(&mut self, fired: bool) -> io::Result<Reaped> {
         let result = self.reap_inner(fired);
-        if let Some(pgid) = self.group.take() {
-            LIVE_GROUPS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .retain(|&g| g != pgid);
+        if let Some(entry) = self.live.take() {
+            untrack(entry);
         }
         result
     }
 
     fn reap_inner(&mut self, fired: bool) -> io::Result<Reaped> {
-        let (Some(deadline), Some(pgid)) = (self.deadline, self.group) else {
+        let (Some(deadline), Some(Live::Group(pgid))) = (self.deadline, self.live) else {
             return Ok(Reaped {
                 status: self.child.wait()?,
                 killed_at: None,
@@ -288,10 +307,11 @@ impl Drop for Watchdog {
 
 #[cfg(test)]
 mod tests {
-    use crate::deadline::{Bound, Deadline, RunCeiling, Supervised};
+    use crate::deadline::{Bound, Deadline, LIVE, Live, RunCeiling, Supervised};
     use crate::duration::TaskTimeout;
     use std::io::Read;
     use std::process::{Command, Stdio};
+    use std::sync::PoisonError;
     use std::time::{Duration, Instant};
 
     fn timeout(s: &str) -> TaskTimeout {
@@ -440,6 +460,31 @@ mod tests {
             .output()
             .unwrap();
         String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    /// An interrupt reaches every live child through one list: a child under a deadline by its
+    /// group, one without by its own pid, and neither once it is reaped.
+    #[test]
+    fn every_live_child_is_listed_for_an_interrupt_until_it_is_reaped() {
+        let listed = |entry: Live| {
+            LIVE.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&entry)
+        };
+        let mut cmd = Command::new("true");
+        let child = Supervised::spawn(&mut cmd, None).unwrap();
+        let pid = i32::try_from(child.id()).unwrap();
+        assert!(listed(Live::Child(pid)));
+        child.wait().unwrap();
+        assert!(!listed(Live::Child(pid)));
+
+        let deadline = Deadline::for_attempt(Instant::now(), Some("1h".parse().unwrap()), None);
+        let mut cmd = Command::new("true");
+        let child = Supervised::spawn(&mut cmd, deadline).unwrap();
+        let pgid = i32::try_from(child.id()).unwrap();
+        assert!(listed(Live::Group(pgid)));
+        child.wait().unwrap();
+        assert!(!listed(Live::Group(pgid)));
     }
 
     #[test]

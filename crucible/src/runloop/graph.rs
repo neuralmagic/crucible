@@ -573,7 +573,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
                                 "budget: provisional spend ${spent:.4} reached cap ${max_cost:.2} \
                                  mid-turn — stopping the agent"
                             ));
-                                crucible::deadline::terminate_live_groups();
+                                crucible::deadline::terminate_live_children();
                             }
                         }
                         r.plan_event(&SessionEvent::Agent { event: ev.clone() });

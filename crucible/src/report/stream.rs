@@ -150,7 +150,7 @@ impl Reporter for SessionReporter {
         if let Some(control) = &self.control
             && crate::control::bridge::stop_file_says_stop(control)
         {
-            crate::process::pid_registry::kill_all();
+            crucible::deadline::terminate_live_children();
             return Stop::Quit;
         }
         Stop::Continue

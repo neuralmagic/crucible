@@ -795,7 +795,7 @@ pub fn run(
     // A task under a deadline runs in a process group of its own, where the terminal's SIGINT
     // does not reach it.
     let _ = ctrlc::set_handler(|| {
-        crucible::deadline::terminate_live_groups();
+        crucible::deadline::terminate_live_children();
         std::process::exit(130);
     });
     // Manifest runs append plan wire events to the run's session log so tailers (and the

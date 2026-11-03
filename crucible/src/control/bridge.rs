@@ -637,7 +637,7 @@ fn stop_the_run(id: Option<AdmissionKey>, input: AdmittedInput, ledger: &Admissi
     let recorded = ledger.admit(id, input);
     STOP.store(true, Ordering::SeqCst);
     if abort {
-        crate::process::pid_registry::kill_all();
+        crucible::deadline::terminate_live_children();
     }
     match recorded {
         Ok(Admitted::Fresh(key)) => {

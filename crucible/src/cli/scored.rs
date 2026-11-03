@@ -535,7 +535,7 @@ fn start_mcp<R: report::reporter::Reporter>(
 fn install_ctrlc() -> Result<()> {
     ctrlc::set_handler(|| {
         STOP.store(true, Ordering::SeqCst);
-        crate::process::pid_registry::kill_all();
+        crucible::deadline::terminate_live_children();
         eprintln!("\n[crucible] interrupt received — wrapping up the current step…");
     })
     .context("installing Ctrl+C handler")
