@@ -1181,13 +1181,6 @@ pub(crate) fn require_non_empty(fields: &[(&str, &str)]) -> Option<String> {
     }
 }
 
-/// The field-level rejection body: which form inputs the pack's schema refused, and why.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ValidationErrorBody {
-    pub error: String,
-    pub fields: Vec<crate::playbooks::registry::FieldError>,
-}
-
 pub(crate) fn invalid_fields(fields: Vec<crate::playbooks::registry::FieldError>) -> Response {
     ApiError::invalid_fields(fields).into_response()
 }
@@ -1447,7 +1440,7 @@ mod tests {
     /// to the field that produced it.
     #[test]
     fn playbook_validation_errors_carry_a_field_and_a_message() {
-        let body = crate::api::dto::ValidationErrorBody {
+        let body = crate::api::state::ValidationErrorBody {
             error: "the supplied parameters do not satisfy the playbook's schema".to_string(),
             fields: vec![crate::playbooks::registry::FieldError {
                 field: "topic".to_string(),

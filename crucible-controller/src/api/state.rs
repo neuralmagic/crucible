@@ -439,8 +439,12 @@ pub enum ApiError {
     },
     Unavailable(String),
     BadGateway(String),
-    /// A policy denial (RFC-0003), or the audit write it could not record.
-    Denied(crate::authz::owner::Denied),
+    /// A policy denial (RFC-0003): who was refused, the action, and the decision that refused it.
+    Denied {
+        who: String,
+        action: crate::authz::action::Action,
+        decision: crate::authz::decision::Decision,
+    },
     /// Something unplanned went wrong: a 500 with the error chain as its text.
     Internal(anyhow::Error),
 }
@@ -468,13 +472,26 @@ impl IntoResponse for ApiError {
             ApiError::Invalid { error, fields } => {
                 return (
                     StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(crate::api::dto::ValidationErrorBody { error, fields }),
+                    Json(ValidationErrorBody { error, fields }),
                 )
                     .into_response();
             }
             ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
             ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
-            ApiError::Denied(denied) => return denied.into_response(),
+            ApiError::Denied {
+                who,
+                action,
+                decision,
+            } => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(crate::authz::decision::DenialBody {
+                        error: format!("{who} may not {action} ({})", decision.reason()),
+                        rule: decision.reason(),
+                    }),
+                )
+                    .into_response();
+            }
             ApiError::Internal(e) => {
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
             }
@@ -507,10 +524,27 @@ impl From<tower_sessions::session::Error> for ApiError {
     }
 }
 
-impl From<crate::authz::owner::Denied> for ApiError {
-    fn from(denied: crate::authz::owner::Denied) -> Self {
-        ApiError::Denied(denied)
+impl From<crate::runs::dispatch_target::TargetRefusal> for ApiError {
+    fn from(refusal: crate::runs::dispatch_target::TargetRefusal) -> Self {
+        use crate::runs::dispatch_target::TargetRefusal;
+        let message = refusal.to_string();
+        match refusal {
+            TargetRefusal::Unknown { .. } => ApiError::NotFound(message),
+            TargetRefusal::Incompatible { .. } | TargetRefusal::NoneEligible { .. } => {
+                ApiError::Unprocessable(message)
+            }
+            TargetRefusal::NotAuthorized { .. } | TargetRefusal::Anonymous => {
+                ApiError::Forbidden(message)
+            }
+        }
     }
+}
+
+/// The field-level rejection body: which form inputs the pack's schema refused, and why.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ValidationErrorBody {
+    pub error: String,
+    pub fields: Vec<crate::playbooks::registry::FieldError>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

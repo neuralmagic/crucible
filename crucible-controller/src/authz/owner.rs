@@ -1,13 +1,12 @@
 //! Owner selection on a creation surface (RFC-0003 C-OWNERSHIP) and the decision a handler takes
 //! on a resource it resolved.
 
-use crate::api::state::{ApiError, ApiResult, ApiState, Json};
+use crate::api::state::{ApiError, ApiResult, ApiState};
 use crate::authz::Caller;
 use crate::authz::action::{Action, ResourceType, Verb};
-use crate::authz::decision::{Decision, DenialBody, Resource};
+use crate::authz::decision::{Decision, Resource};
 use crate::authz::model::Principal;
 use crate::authz::store;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 /// Why a requested owner was refused.
@@ -89,16 +88,26 @@ pub enum Denied {
     Unrecorded(anyhow::Error),
 }
 
-impl IntoResponse for Denied {
-    fn into_response(self) -> Response {
-        match self {
+impl From<Denied> for ApiError {
+    fn from(denied: Denied) -> Self {
+        match denied {
             Denied::Refused {
                 who,
                 action,
                 decision,
-            } => denial(&who, action, &decision),
-            Denied::Unrecorded(e) => ApiError::Internal(e).into_response(),
+            } => ApiError::Denied {
+                who,
+                action,
+                decision,
+            },
+            Denied::Unrecorded(e) => ApiError::Internal(e),
         }
+    }
+}
+
+impl IntoResponse for Denied {
+    fn into_response(self) -> Response {
+        ApiError::from(self).into_response()
     }
 }
 
@@ -190,7 +199,7 @@ impl From<Refused> for ApiError {
     fn from(refused: Refused) -> Self {
         match refused {
             Refused::NotFound(msg) => ApiError::NotFound(msg),
-            Refused::Denied(denied) => ApiError::Denied(denied),
+            Refused::Denied(denied) => ApiError::from(denied),
         }
     }
 }
@@ -342,17 +351,6 @@ pub async fn decide_row<T>(
     let resource = Resource::new(rtype, id, owner(&row));
     decide_on(state, caller, &resource, verb).await?;
     Ok(row)
-}
-
-pub(crate) fn denial(who: &str, action: Action, decision: &Decision) -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(DenialBody {
-            error: format!("{who} may not {action} ({})", decision.reason()),
-            rule: decision.reason(),
-        }),
-    )
-        .into_response()
 }
 
 #[cfg(test)]
