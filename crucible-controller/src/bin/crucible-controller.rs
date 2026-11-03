@@ -639,12 +639,9 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     // has a Vault to read from. Without one they cannot be registered either, and the eligible set
     // is the shared clusters alone.
     let clusters = std::sync::Arc::new(match serve_vault.clone() {
-        Some(vault) => clusters.with_personal(std::sync::Arc::new(
-            crucible_controller::runs::dispatch_target::RegistryKubeconfigs::new(
-                db.pool().clone(),
-                vault,
-            ),
-        )),
+        Some(vault) => clusters.with_personal(
+            crucible_controller::runs::clusters::RegistryKubeconfigs::new(db.pool().clone(), vault),
+        ),
         None => clusters,
     });
 

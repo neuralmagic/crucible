@@ -25,7 +25,7 @@ use crate::authz::action::ResourceType;
 use crate::authz::decision::Resource;
 use crate::authz::model::{Principal, Principals};
 use crate::playbooks::dispatch::{DispatchCapability, PackAgent};
-use crate::runs::clusters::{personal_name, personal_secret_id};
+use crate::runs::clusters::personal_name;
 use anyhow::{Result, bail};
 use std::collections::BTreeMap;
 
@@ -341,65 +341,6 @@ pub fn resolve(
             eligible: names,
         },
     })
-}
-
-/// The registry-backed [`crate::runs::clusters::PersonalKubeconfigs`]: look the secret up by the id
-/// inside the target name and read its current bytes with the hub's Vault identity.
-///
-/// Deleting the registry row is the revocation: the lookup misses, the resolver answers `None`, and
-/// [`crate::runs::clusters::ClusterClients::evict`] drops whatever client the target had cached.
-pub struct RegistryKubeconfigs {
-    pool: sqlx::PgPool,
-    vault: std::sync::Arc<crate::secrets::vault::VaultClient>,
-}
-
-impl RegistryKubeconfigs {
-    pub fn new(
-        pool: sqlx::PgPool,
-        vault: std::sync::Arc<crate::secrets::vault::VaultClient>,
-    ) -> Self {
-        RegistryKubeconfigs { pool, vault }
-    }
-}
-
-#[async_trait::async_trait]
-impl crate::runs::clusters::PersonalKubeconfigs for RegistryKubeconfigs {
-    async fn kubeconfig(&self, target: &str) -> Result<Option<String>> {
-        let Some(id) = personal_secret_id(target) else {
-            return Ok(None);
-        };
-        let Some(secret) = crate::secrets::store::get(&self.pool, id).await? else {
-            return Ok(None);
-        };
-        // The kind and consumer are re-checked at resolution, not just at listing: a row whose
-        // kind was changed out from under a pinned target must stop resolving, not keep working.
-        if secret.kind != crate::secrets::SecretKind::Kubeconfig
-            || secret.consumer != crate::secrets::ConsumerClass::Hub
-        {
-            bail!(
-                "secret {} is not a hub-consumed kubeconfig, so it is not a dispatch target",
-                secret.name
-            );
-        }
-        let owner = secret.owner.clone();
-        let name = secret.name.to_string();
-        let (value, version) = crate::secrets::read::current_value(&self.vault, &secret).await?;
-        let mut conn = self.pool.acquire().await?;
-        crate::secrets::store::audit(
-            &mut conn,
-            &crate::secrets::store::NewAudit {
-                secret_id: Some(id),
-                secret_name: &name,
-                owner: &owner,
-                action: crate::secrets::AuditAction::HubRead,
-                actor: None,
-                subject: None,
-                detail: Some(&format!("dispatch target resolved at version {version}")),
-            },
-        )
-        .await?;
-        Ok(Some(value))
-    }
 }
 
 /// Why a kubeconfig cannot serve as a dispatch target. The probe runs at registration, where the
@@ -804,8 +745,11 @@ mod tests {
     #[test]
     fn a_personal_name_round_trips_and_never_looks_like_a_cluster() {
         let name = personal_name("0199c0de");
-        assert_eq!(personal_secret_id(&name), Some("0199c0de"));
-        assert_eq!(personal_secret_id("hub"), None);
-        assert_eq!(personal_secret_id("wharf"), None);
+        assert_eq!(
+            crate::runs::clusters::personal_secret_id(&name),
+            Some("0199c0de")
+        );
+        assert_eq!(crate::runs::clusters::personal_secret_id("hub"), None);
+        assert_eq!(crate::runs::clusters::personal_secret_id("wharf"), None);
     }
 }
