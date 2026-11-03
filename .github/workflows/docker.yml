@@ -1,6 +1,6 @@
 name: Docker
 
-# Build the domain-neutral runtime image (Containerfile.runtime: crucible engine +
+# Build the domain-neutral runtime image (docker/Containerfile.runtime: crucible engine +
 # crucible-broker + forge bins on the UBI/OpenShell runtime) and push it to GHCR. Runs on the
 # main line, release tags, and manual dispatch (trusted refs only, never on pull_request).
 #
@@ -152,7 +152,7 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          file: Containerfile.runtime
+          file: docker/Containerfile.runtime
           platforms: linux/amd64
           push: true
           build-args: |
@@ -167,7 +167,7 @@ jobs:
 
   # The control plane on top of the runtime image this run just published: the controller (with
   # the SPA rust-embed folds in at compile time) and the crux CLI, staged the same way as above
-  # and packaged by Containerfile.controller FROM the runtime at its exact digest.
+  # and packaged by docker/Containerfile.controller FROM the runtime at its exact digest.
   controller:
     needs: build-push
     runs-on: [self-hosted, linux, x64, beefy, image]
@@ -243,7 +243,7 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
-          file: Containerfile.controller
+          file: docker/Containerfile.controller
           platforms: linux/amd64
           push: true
           build-args: |

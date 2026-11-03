@@ -1,7 +1,7 @@
 # produces: ghcr.io/neuralmagic/openshell-gateway:sha-<rev>
 # A pure distribution image for the OpenShell gateway + CLI built from the fork rev pinned in
 # Cargo.lock (openshell-core's git source). Never run directly — the loop images
-# (Containerfile.crucible*) `COPY --from=` it, so `FROM scratch` is enough. Both binaries come
+# (Containerfile.runtime*) `COPY --from=` it, so `FROM scratch` is enough. Both binaries come
 # from ONE rev, the same rev crucible's gRPC client compiled against, so client/gateway/CLI
 # skew is impossible by construction (crucible additionally gates the version at runtime).
 #
