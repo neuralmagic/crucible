@@ -2497,8 +2497,8 @@ mod tests {
         let root = crate::control::distress::testing::Root::new("loop-notes");
         std::fs::write(
             root.dir.join("distress-notes.jsonl"),
-            "{\"severity\":\"info\",\"reason\":\"cache warm\"}\n\
-             {\"severity\":\"warn\",\"reason\":\"flaky node\"}\n",
+            "{\"severity\":\"info\",\"reason\":\"cache warm\",\"ts_ms\":1}\n\
+             {\"severity\":\"warn\",\"reason\":\"flaky node\",\"ts_ms\":2}\n",
         )
         .unwrap();
         let mut r = NoteCapture::default();
