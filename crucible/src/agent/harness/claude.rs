@@ -1,13 +1,14 @@
 //! The claude arm of the harness boundary: Claude Code's argv grammar, env defaults, `.mcp.json`
 //! seeding, and transcript layout.
 
-use crate::agent::harness::{Backend, McpServer, StreamDecoder, TurnArtifacts, json_servers};
+use crate::agent::harness::{Backend, McpServer, TurnArtifacts, json_servers};
 use crate::agent::inference::InferenceEnv;
 use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::GenAiRecord;
 use crucible::harness::HarnessSpec;
+use crucible_harness::line::LineFormat;
 use crucible_harness::otel::LiveMeters;
 
 pub(crate) struct Claude;
@@ -144,7 +145,7 @@ impl Backend for Claude {
         _agent: &TurnAgent<'_>,
         meters: Option<&LiveMeters>,
         tool_io: bool,
-    ) -> Box<dyn StreamDecoder> {
+    ) -> Box<dyn LineFormat + Send> {
         Box::new(
             match meters {
                 Some(m) => StreamJsonParser::with_meters(m.clone()),

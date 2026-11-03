@@ -472,7 +472,6 @@ mod tests {
         };
         let messages = select(InferenceProtocol::Messages);
         assert_eq!(messages.harness(Harness::Claude), Harness::Claude);
-        assert_eq!(messages.harness(Harness::Hermes), Harness::Hermes);
         assert_eq!(messages.harness(Harness::Codex), Harness::Claude);
         for protocol in [
             InferenceProtocol::ChatCompletions,
@@ -480,19 +479,12 @@ mod tests {
         ] {
             assert_eq!(select(protocol).harness(Harness::Codex), Harness::Codex);
             assert_eq!(select(protocol).harness(Harness::Claude), Harness::Codex);
-            assert_eq!(select(protocol).harness(Harness::Hermes), Harness::Codex);
         }
         for both in [Harness::OpenCode, Harness::Pi] {
             assert_eq!(messages.harness(both), both);
             assert_eq!(select(InferenceProtocol::Responses).harness(both), both);
         }
-        for harness in [
-            Harness::Claude,
-            Harness::Hermes,
-            Harness::Codex,
-            Harness::OpenCode,
-            Harness::Pi,
-        ] {
+        for harness in Harness::all().iter().copied() {
             assert!(!harness.speaks(InferenceProtocol::SystemOne));
             assert!(!harness.speaks(InferenceProtocol::Decisions));
         }

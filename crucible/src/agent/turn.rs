@@ -1,8 +1,8 @@
 //! What one agent turn hands back, and the stream pump that folds its events into that.
 
 use crate::agent::event::{AgentEvent, Pricing, RawStream, Tokens, cost_of};
-use crate::agent::harness::StreamDecoder;
 use crucible_contract::TransportCause;
+use crucible_harness::line::LineFormat;
 
 /// How a turn ended when it did not complete: the agent never produced output because the
 /// transport itself failed. Distinct from a turn that ran and answered badly.
@@ -125,13 +125,13 @@ pub(crate) fn tool_io_full(env: &[(String, String)]) -> bool {
 /// gRPC stream. Splitting the loop from the byte source is what lets the async exec path reuse the
 /// exact same accounting + sink dispatch from any line source (BufReader or gRPC stream).
 pub(crate) struct StreamPump {
-    decoder: Box<dyn StreamDecoder>,
+    decoder: Box<dyn LineFormat + Send>,
     cost: TurnCost,
 }
 
 impl StreamPump {
     /// A fresh pump over the harness's `decoder` (see `Backend::decoder`).
-    pub(crate) fn new(decoder: Box<dyn StreamDecoder>, pricing: Pricing) -> Self {
+    pub(crate) fn new(decoder: Box<dyn LineFormat + Send>, pricing: Pricing) -> Self {
         Self {
             decoder,
             cost: TurnCost::new(pricing),

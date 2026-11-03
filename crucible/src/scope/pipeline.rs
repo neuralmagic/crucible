@@ -2049,7 +2049,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, score, trace, measurem
         let manifest_path = dir.join(MANIFEST_FILE);
         let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
             "backend = \"command\"",
-            "backend = \"local\"\n            harness = \"hermes\"",
+            "backend = \"local\"\n            harness = \"codex\"",
         );
         fs::write(&manifest_path, manifest).unwrap();
         fs::write(
@@ -2070,7 +2070,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             .iter()
             .find(|stage| stage.name == StageName::Validate)
             .expect("validate stage");
-        assert!(!validate.passed, "Hermes cannot resume Claude sessions");
+        assert!(!validate.passed, "Codex cannot resume Claude sessions");
         assert!(
             validate.detail.contains("agent.session.persist"),
             "{validate:?}"

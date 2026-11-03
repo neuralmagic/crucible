@@ -98,11 +98,6 @@ tar = "0.4"
 # serialized to YAML, plus forge's in-process registry digest resolver (no crane shell-out).
 k8s-openapi.workspace = true
 serde_norway = "0.9"
-# The hermes harness's post-turn parity reader: hermes has no live event stream, so its result +
-# cost + tool spans are reconstructed from its SQLite `state.db`. Pinned to 0.32 so its
-# libsqlite3-sys (0.30) unifies with sqlx-sqlite 0.8's; cargo links exactly one, `bundled` so both
-# share the vendored sqlite (no system-lib probe). Verify with `cargo tree -i libsqlite3-sys`.
-rusqlite = { version = "0.32", features = ["bundled"] }
 forge = { path = "../forge" }
 crucible-broker = { path = "../crucible-broker" }
 # The shared turn-result wire contract: the AgentEvent NDJSON types, the marker literals, the

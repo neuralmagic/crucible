@@ -148,7 +148,6 @@ pub(crate) fn apply_agent_cfg(
     if args.harness.is_none() {
         args.harness = Some(agent.harness);
     }
-    args.hermes = agent.hermes.clone();
     args.codex = agent.codex.clone();
     args.disallowed_tools = agent.disallowed_tools.clone();
     // Reasoning effort: CLI `--effort` wins, else the manifest's `[agent].reasoning_effort`, else
@@ -549,12 +548,12 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         assert_eq!(
             select_agent(
-                Some(Harness::Hermes),
+                Some(Harness::Pi),
                 Some("flag-model"),
                 &m.agent,
                 &injected(InferenceProtocol::Messages)
             ),
-            (Harness::Hermes, "bound-model".to_string())
+            (Harness::Pi, "bound-model".to_string())
         );
         assert_eq!(
             select_agent(
@@ -702,7 +701,7 @@ mod tests {
         .unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Claude);
 
-        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"pi\"")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(
             &mut a,
@@ -712,12 +711,12 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(a.harness(), crate::manifest::Harness::Hermes);
+        assert_eq!(a.harness(), crate::manifest::Harness::Pi);
     }
 
     #[test]
     fn cli_harness_beats_the_manifest() {
-        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"pi\"")).unwrap();
         let mut a = args_from(&["crucible", "--harness", "claude"]);
         apply_agent_cfg(
             &mut a,
@@ -765,37 +764,8 @@ mod tests {
         assert_eq!(a.model(), "gpt-5.6-luna");
     }
 
-    /// `[agent.hermes]` parses (and rides onto Args), and an unknown key inside it is a manifest
-    /// error, not silently ignored config.
-    #[test]
-    fn hermes_subtable_parses_and_denies_unknown_fields() {
-        let m: manifest::Manifest = toml::from_str(&format!(
-            "{}\n[agent.hermes]\nmodel = \"anthropic/claude-haiku-4-5\"\n",
-            manifest_toml("harness = \"hermes\"")
-        ))
-        .unwrap();
-        let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(
-            &mut a,
-            &m.agent,
-            &m.secrets,
-            Path::new("ws"),
-            &FrozenProjection::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            a.hermes.model.as_deref(),
-            Some("anthropic/claude-haiku-4-5")
-        );
-
-        let err = toml::from_str::<manifest::Manifest>(&format!(
-            "{}\n[agent.hermes]\nmodle = \"typo\"\n",
-            manifest_toml("")
-        ));
-        assert!(err.is_err(), "unknown [agent.hermes] key must be rejected");
-    }
-
-    /// `[agent.codex]` is the codex twin of the block above: the shared `[agent].model` names a
+    /// `[agent.codex]` parses (and rides onto Args), and an unknown key inside it is a manifest
+    /// error, not silently ignored config. The shared `[agent].model` names a
     /// Claude model, so a codex domain overrides it here.
     #[test]
     fn codex_subtable_parses_and_denies_unknown_fields() {

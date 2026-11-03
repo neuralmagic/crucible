@@ -71,7 +71,7 @@ impl ProviderKind {
     pub fn harnesses(self) -> Option<&'static [Harness]> {
         match self {
             ProviderKind::Anthropic => Some(&[Harness::Claude, Harness::OpenCode, Harness::Pi]),
-            ProviderKind::Vertex => Some(&[Harness::Claude, Harness::Hermes]),
+            ProviderKind::Vertex => Some(&[Harness::Claude]),
             ProviderKind::OpenAi => Some(&[Harness::Codex, Harness::OpenCode, Harness::Pi]),
             ProviderKind::Custom => None,
         }
@@ -82,7 +82,6 @@ impl ProviderKind {
 pub fn parse_harness(name: &str) -> Option<Harness> {
     match name.trim().to_ascii_lowercase().as_str() {
         "claude" => Some(Harness::Claude),
-        "hermes" => Some(Harness::Hermes),
         "codex" => Some(Harness::Codex),
         "opencode" => Some(Harness::OpenCode),
         "pi" => Some(Harness::Pi),
@@ -93,7 +92,6 @@ pub fn parse_harness(name: &str) -> Option<Harness> {
 pub fn harness_name(harness: Harness) -> &'static str {
     match harness {
         Harness::Claude => "claude",
-        Harness::Hermes => "hermes",
         Harness::Codex => "codex",
         Harness::OpenCode => "opencode",
         Harness::Pi => "pi",
@@ -1491,7 +1489,7 @@ mod tests {
         );
         assert_eq!(
             allowed_harnesses(ProviderKind::Vertex, None),
-            &[Harness::Claude, Harness::Hermes]
+            &[Harness::Claude]
         );
         assert_eq!(
             harness_list(&[Harness::OpenCode, Harness::Pi]),

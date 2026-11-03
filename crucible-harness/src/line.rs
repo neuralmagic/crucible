@@ -11,10 +11,7 @@ pub trait LineFormat {
     fn line(&mut self, msg: &Value, text: &str, out: &mut Vec<AgentEvent>);
 
     /// Decode one stdout line, returning every [`AgentEvent`] it completed.
-    fn push(&mut self, line: &str) -> Vec<AgentEvent>
-    where
-        Self: Sized,
-    {
+    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         let line = line.trim();
         if line.is_empty() {

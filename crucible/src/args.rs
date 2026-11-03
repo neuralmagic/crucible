@@ -133,9 +133,6 @@ pub(crate) struct Args {
     /// `apply_agent_cfg`).
     #[arg(long, value_enum)]
     pub harness: Option<crate::manifest::Harness>,
-    /// Hermes-harness tuning (from `[agent.hermes]`). No CLI flag.
-    #[arg(skip)]
-    pub hermes: manifest::HermesCfg,
     /// Codex-harness tuning (from `[agent.codex]`). No CLI flag.
     #[arg(skip)]
     pub codex: manifest::CodexCfg,
@@ -280,7 +277,6 @@ impl Args {
             reasoning_effort: self.reasoning_effort,
             disallowed_tools: &self.disallowed_tools,
             codex: &self.codex,
-            hermes: &self.hermes,
             env: &self.env,
         }
     }
@@ -315,7 +311,6 @@ pub(crate) struct TurnAgent<'a> {
     pub reasoning_effort: Option<manifest::ReasoningEffort>,
     pub disallowed_tools: &'a [String],
     pub codex: &'a manifest::CodexCfg,
-    pub hermes: &'a manifest::HermesCfg,
     pub env: &'a [(String, String)],
 }
 

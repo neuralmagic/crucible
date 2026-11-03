@@ -10,9 +10,7 @@
 //! only an `openshell:resolve:env:` placeholder that the L7 egress proxy resolves, while Codex
 //! uses an L4 WebSocket tunnel. The real credential therefore has to be in the auth file.
 
-use crate::agent::harness::{
-    Backend, McpServer, SandboxAuth, SeedFile, StreamDecoder, TurnArtifacts, json_str,
-};
+use crate::agent::harness::{Backend, McpServer, SandboxAuth, SeedFile, TurnArtifacts, json_str};
 use crate::agent::inference::InferenceEnv;
 use crate::args::TurnAgent;
 use crate::manifest::{Harness, ReasoningEffort};
@@ -20,6 +18,7 @@ use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::HarnessSpec;
 use crucible_harness::codex_json::CodexJsonParser;
+use crucible_harness::line::LineFormat;
 use crucible_harness::otel::LiveMeters;
 use jiff::Timestamp;
 use serde_json::Value;
@@ -141,7 +140,7 @@ fn config_toml(
                 // Codex's schema has no inline `bearer_token`; the choices are
                 // `bearer_token_env_var` (an env name) or static `http_headers`. The header keeps
                 // the token in the seeded file rather than the sandbox env, same posture as
-                // hermes's config.yaml.
+                // a provider table's.
                 let mut headers = toml::Table::new();
                 headers.insert("Authorization".into(), format!("Bearer {t}").into());
                 server.insert("http_headers".into(), headers.into());
@@ -220,7 +219,7 @@ impl Backend for Codex {
         agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         tool_io: bool,
-    ) -> Box<dyn StreamDecoder> {
+    ) -> Box<dyn LineFormat + Send> {
         Box::new(
             CodexJsonParser::new(self.model(agent))
                 .with_price(crate::agent::event::estimate_cost)

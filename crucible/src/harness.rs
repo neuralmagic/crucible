@@ -154,30 +154,6 @@ static CLAUDE: HarnessSpec = HarnessSpec {
     backfill_required: false,
 };
 
-static HERMES: HarnessSpec = HarnessSpec {
-    name: "hermes",
-    default_model: "claude-opus-4-6",
-    binaries: &["/usr/local/bin/hermes"],
-    skills_dir: ".claude/skills",
-    home_var: "HERMES_HOME",
-    home: "/sandbox/.hermes",
-    config: "/sandbox/.hermes/config.yaml",
-    sandbox_env: &[],
-    local_env: &[],
-    transcript: TranscriptLocator::File {
-        sandbox_path: "/sandbox/.hermes/state.db",
-    },
-    transcript_fetch_timeout: Duration::from_secs(60),
-    auth: AuthProvider::Vertex,
-    api: ApiFamily::Anthropic,
-    protocols: &[InferenceProtocol::Messages],
-    model_endpoints: &[],
-    sandbox_capability: None,
-    persistent_sessions: false,
-    otel_capable: false,
-    backfill_required: true,
-};
-
 static CODEX: HarnessSpec = HarnessSpec {
     name: "codex",
     default_model: "gpt-5.6-sol",
@@ -291,7 +267,6 @@ impl Harness {
     pub const fn spec(self) -> &'static HarnessSpec {
         match self {
             Harness::Claude => &CLAUDE,
-            Harness::Hermes => &HERMES,
             Harness::Codex => &CODEX,
             Harness::OpenCode => &OPENCODE,
             Harness::Pi => &PI,
@@ -366,11 +341,7 @@ mod tests {
             let spec = harness.spec();
             assert_eq!(spec.persistent_sessions, *harness == Harness::Claude);
             let key_free = matches!(spec.auth, AuthProvider::Vertex);
-            assert_eq!(
-                key_free,
-                matches!(harness, Harness::Claude | Harness::Hermes),
-                "{harness:?}"
-            );
+            assert_eq!(key_free, *harness == Harness::Claude, "{harness:?}");
         }
     }
 }

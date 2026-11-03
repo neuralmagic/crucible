@@ -23,18 +23,18 @@ pub(crate) mod agent_session;
 pub(crate) mod engine;
 pub(crate) mod event;
 pub(crate) mod harness;
-pub(crate) mod hermes_trace;
 pub(crate) mod inference;
 pub(crate) mod relay;
 pub(crate) mod sandbox_env;
 pub(crate) mod turn;
 
 use crate::agent::event::{AgentEvent, Pricing, RawStream};
-use crate::agent::harness::{StreamDecoder, backend};
+use crate::agent::harness::backend;
 use crate::args::{Args, Paths};
 #[cfg(feature = "autoresearch")]
 use crate::manifest::AgentBackend;
 use crucible::deadline::{Deadline, Supervised};
+use crucible_harness::line::LineFormat;
 use crucible_harness::otel::OtelCollector;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
@@ -427,7 +427,7 @@ fn line_event(line: &str, stream: RawStream) -> Option<AgentEvent> {
 pub(crate) fn pump_stream(
     reader: impl Read,
     json: bool,
-    decoder: Box<dyn StreamDecoder>,
+    decoder: Box<dyn LineFormat + Send>,
     pricing: Pricing,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnCost {

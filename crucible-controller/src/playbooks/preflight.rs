@@ -99,7 +99,6 @@ fn harness_predicate(harness: Harness) -> Option<&'static str> {
         Harness::Codex => Some("agent.codex"),
         Harness::OpenCode => Some("agent.opencode"),
         Harness::Pi => Some("agent.pi"),
-        Harness::Hermes => None,
     }
 }
 
@@ -584,8 +583,6 @@ mod tests {
             "{:?}",
             out.refusals
         );
-        // Hermes implies nothing the catalog can vouch for.
-        assert!(!preflight(&claude_only, Some(&pinned(Harness::Hermes)), &catalog).refused());
     }
 
     #[test]

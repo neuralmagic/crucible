@@ -15,14 +15,15 @@
 //! reaches the metadata emulator like claude's does.
 
 use crate::agent::harness::{
-    ApiEndpoint, Backend, CRUCIBLE_PROVIDER_ID, McpServer, StreamDecoder, TurnArtifacts,
-    api_endpoint, json_servers, json_str,
+    ApiEndpoint, Backend, CRUCIBLE_PROVIDER_ID, McpServer, TurnArtifacts, api_endpoint,
+    json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::{HarnessSpec, OPENCODE_EXPORT as EXPORT};
+use crucible_harness::line::LineFormat;
 use crucible_harness::opencode_json::OpenCodeJsonParser;
 use crucible_harness::otel::LiveMeters;
 use crucible_harness::tool_summary::summarize;
@@ -196,7 +197,7 @@ impl Backend for OpenCode {
         agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         tool_io: bool,
-    ) -> Box<dyn StreamDecoder> {
+    ) -> Box<dyn LineFormat + Send> {
         Box::new(
             OpenCodeJsonParser::new(agent.model)
                 .with_price(crate::agent::event::estimate_cost)

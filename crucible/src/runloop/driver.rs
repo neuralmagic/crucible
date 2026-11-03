@@ -3068,7 +3068,6 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             model: Some("test-model".into()),
             price: None,
             harness: None,
-            hermes: Default::default(),
             codex: Default::default(),
             disallowed_tools: Vec::new(),
             reasoning_effort: None,

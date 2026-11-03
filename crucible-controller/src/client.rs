@@ -508,6 +508,10 @@ mod tests {
                 "0074_drop_mlflow_exports_and_secret_grants.sql",
                 "fd1398bba4a22a81191df88ad25654570f869629e3e8f1a51f71067a34e30d73",
             ),
+            (
+                "0075_refuse_hermes_harness.sql",
+                "103726c625d02acb81954455efe62263b2549cecc87bdf1cf6900961f7646d49",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

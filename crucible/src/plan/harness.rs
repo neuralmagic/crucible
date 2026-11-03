@@ -2314,7 +2314,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
             name = "bump-2"
             kind = "agent"
             prompt = "raise it again"
-            harness = "hermes"
+            harness = "codex"
             depends_on = ["bump-1"]
             [[task]]
             name = "measure"

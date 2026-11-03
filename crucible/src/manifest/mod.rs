@@ -599,16 +599,14 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Which agent harness runs the turn. `claude` is the default everywhere; `hermes` (Nous
-/// Research's hermes-agent) and `codex` (OpenAI's Codex CLI) are selected per-domain for harness
-/// ablations; `opencode` and `pi` are the harnesses that speak OpenAI Chat Completions to an
-/// endpoint that offers nothing else, which the newer claude and codex CLIs cannot.
+/// Which agent harness runs the turn. `claude` is the default everywhere; `codex` (OpenAI's
+/// Codex CLI) is selected per-domain for harness ablations; `opencode` and `pi` are the harnesses
+/// that speak either API family through a provider table.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Harness {
     #[default]
     Claude,
-    Hermes,
     Codex,
     #[value(name = "opencode")]
     OpenCode,
@@ -625,7 +623,6 @@ impl Harness {
     pub const fn as_str(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
-            Harness::Hermes => "hermes",
             Harness::Codex => "codex",
             Harness::OpenCode => "opencode",
             Harness::Pi => "pi",
@@ -671,9 +668,6 @@ pub struct AgentCfg {
     /// `--harness` overrides it.
     #[serde(default)]
     pub harness: Harness,
-    /// Hermes-harness tuning; ignored (and harmless) when `harness = "claude"`.
-    #[serde(default)]
-    pub hermes: HermesCfg,
     /// Codex-harness tuning; ignored (and harmless) when `harness = "claude"`.
     #[serde(default)]
     pub codex: CodexCfg,
@@ -862,16 +856,6 @@ pub fn undeclared_sandbox(
 
 fn default_model() -> String {
     Harness::default().default_model().to_string()
-}
-
-/// `[agent.hermes]`: hermes-harness tuning. Phase B grows this (auth, config.yaml knobs); for
-/// now only the model override, mapped to hermes's `anthropic/<model>` syntax at invocation.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HermesCfg {
-    /// Model override for hermes turns; unset = the resolved `[agent].model`.
-    #[serde(default)]
-    pub model: Option<String>,
 }
 
 /// `[agent.codex]`: codex-harness tuning. The shared `[agent].model` names a Claude model by

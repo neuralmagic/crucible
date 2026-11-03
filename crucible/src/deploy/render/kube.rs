@@ -2458,9 +2458,12 @@ mod tests {
             .expect("render")
         };
 
-        let set = render_with(Some(crate::manifest::Harness::Hermes), Some("hermes-4-70b"));
-        assert!(set.contains("--harness=hermes"), "{set}");
-        assert!(set.contains("--model=hermes-4-70b"), "{set}");
+        let set = render_with(
+            Some(crate::manifest::Harness::OpenCode),
+            Some("qwen-3-8-27b"),
+        );
+        assert!(set.contains("--harness=opencode"), "{set}");
+        assert!(set.contains("--model=qwen-3-8-27b"), "{set}");
 
         let unset = render_with(None, None);
         assert!(!unset.contains("--harness"), "no harness, no flag: {unset}");

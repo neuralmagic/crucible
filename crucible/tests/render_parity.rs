@@ -65,9 +65,9 @@ fn deploy_render_matches_render_yaml() {
         "--pr-repo",
         "example/fork",
         "--harness",
-        "hermes",
+        "opencode",
         "--model",
-        "hermes-4-70b",
+        "qwen-3-8-27b",
     ]);
     let from_lib = render_yaml(
         &manifest,
@@ -79,8 +79,8 @@ fn deploy_render_matches_render_yaml() {
             pr_repo: Some("example/fork".to_string()),
             pack: None,
             clusters_file: None,
-            harness: Some(Harness::Hermes),
-            model: Some("hermes-4-70b".to_string()),
+            harness: Some(Harness::OpenCode),
+            model: Some("qwen-3-8-27b".to_string()),
             playbook: None,
             platform: None,
         },

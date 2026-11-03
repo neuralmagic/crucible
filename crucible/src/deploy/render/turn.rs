@@ -1319,17 +1319,17 @@ mod tests {
                 &profile,
                 &opts_with_run_config(
                     kind,
-                    Some(crate::manifest::Harness::Hermes),
-                    Some("hermes-4-70b"),
+                    Some(crate::manifest::Harness::OpenCode),
+                    Some("qwen-3-8-27b"),
                 ),
             )
             .expect("render turn");
             assert!(
-                turn_cmd(&yaml).contains("--harness hermes"),
+                turn_cmd(&yaml).contains("--harness opencode"),
                 "the run harness is forwarded: {yaml}"
             );
             assert!(
-                turn_cmd(&yaml).contains("--model hermes-4-70b"),
+                turn_cmd(&yaml).contains("--model qwen-3-8-27b"),
                 "the run model is forwarded: {yaml}"
             );
         }

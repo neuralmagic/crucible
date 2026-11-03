@@ -20,14 +20,15 @@
 //! from `codemode` scripts, which the turn enables explicitly whenever a server is in scope.
 
 use crate::agent::harness::{
-    ApiEndpoint, Backend, CRUCIBLE_PROVIDER_ID, McpServer, SandboxAuth, SeedFile, StreamDecoder,
-    TurnArtifacts, api_endpoint, json_servers, json_str,
+    ApiEndpoint, Backend, CRUCIBLE_PROVIDER_ID, McpServer, SandboxAuth, SeedFile, TurnArtifacts,
+    api_endpoint, json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, VertexConfig, WireApi};
 use crate::args::TurnAgent;
 use crate::manifest::{Harness, ReasoningEffort};
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::HarnessSpec;
+use crucible_harness::line::LineFormat;
 use crucible_harness::otel::LiveMeters;
 use crucible_harness::pi_json::PiJsonParser;
 use crucible_harness::tool_summary::summarize;
@@ -295,7 +296,7 @@ impl Backend for Pi {
         agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         tool_io: bool,
-    ) -> Box<dyn StreamDecoder> {
+    ) -> Box<dyn LineFormat + Send> {
         Box::new(
             PiJsonParser::new(agent.model)
                 .with_price(crate::agent::event::estimate_cost)

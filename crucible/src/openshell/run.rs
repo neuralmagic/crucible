@@ -1163,7 +1163,7 @@ async fn exec_and_stream(
     gw: &Gateway,
     name: &str,
     command: &[String],
-    decoder: Box<dyn crate::agent::harness::StreamDecoder>,
+    decoder: Box<dyn crucible_harness::line::LineFormat + Send>,
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
