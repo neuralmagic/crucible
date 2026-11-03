@@ -7,6 +7,7 @@ use crate::deploy::render::pod::{ProfilePod, RestartPolicy, downward, env_var};
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
+use crucible_contract::Tier;
 use k8s_openapi::api::core::v1 as core;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -77,42 +78,6 @@ impl TurnKind {
     }
 }
 
-/// The confirmed tier a propose turn drafts against: threaded from the controller's ranker verdict
-/// (`--tier t0|t1`) into the prompt's `{{TIER}}` slot, so the agent follows the right section of
-/// `scope-propose.md` instead of guessing.
-/// `T0` is the engine default when the flag is absent, every call site predating this flag never set
-/// it, and a bare `crucible scope --propose` (no controller in front of it) should keep behaving exactly
-/// as before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub enum ProposeTier {
-    #[default]
-    #[value(name = "t0")]
-    T0,
-    #[value(name = "t1")]
-    T1,
-}
-
-impl ProposeTier {
-    /// The `{{TIER}}` spelling the prompt substitutes, matches the ranker/DB vocabulary
-    /// (`Tier::as_str` in the controller crate) so a human reading the rendered prompt recognizes
-    /// it as the same tier the ledger shows.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ProposeTier::T0 => "T0",
-            ProposeTier::T1 => "T1",
-        }
-    }
-
-    /// The `--tier` CLI spelling (the clap `#[value(name)]`s above), what the turn pod
-    /// passes as `crucible scope --propose --tier …`.
-    pub fn cli_value(self) -> &'static str {
-        match self {
-            ProposeTier::T0 => "t0",
-            ProposeTier::T1 => "t1",
-        }
-    }
-}
-
 /// Options for [`render_turn`]: a single one-shot agent-turn pod (WorkPod
 /// primitive). Unlike the loop pod it runs no manifest: an init container clones `repo_url`, then
 /// the turn container runs the kind-specific command over that checkout and prints the marker its
@@ -145,7 +110,7 @@ pub struct TurnOpts {
     /// The issue's confirmed tier (The confirmed tier), passed to the scope turn as
     /// `crucible scope --propose --tier …`. `None` (or a rank turn) emits no flag, the engine
     /// defaults to t0.
-    pub tier: Option<ProposeTier>,
+    pub tier: Option<Tier>,
     /// Max gaming-review concern→refine→re-review cycles, passed to the scope turn as
     /// `crucible scope --propose --gaming-refine-rounds …`. Ignored by a rank turn.
     pub gaming_refine_rounds: u32,
@@ -453,7 +418,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
                 &max_cost.to_string(),
             ]));
             if let Some(t) = tier {
-                a.extend(strs(["--tier", t.cli_value()]));
+                a.extend(strs(["--tier", t.as_str_lower()]));
             }
             if *skip_gaming_review {
                 a.push("--skip-gaming-review".to_string());
@@ -1043,7 +1008,7 @@ mod tests {
                 sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
                 max_cost: 8.0,
                 digests: None,
-                tier: Some(ProposeTier::T1),
+                tier: Some(Tier::T1),
                 gaming_refine_rounds: 3,
                 skip_gaming_review: false,
                 authoritative: false,
@@ -1406,7 +1371,7 @@ mod tests {
     fn a_pack_path_turn_validates_instead_of_proposing() {
         let mut opts = opts_with_run_config(TurnKind::Scope, None, None);
         opts.pack_path = Some(PackPath::parse("examples/selfhost").expect("valid"));
-        opts.tier = Some(ProposeTier::T1);
+        opts.tier = Some(Tier::T1);
         opts.gaming_refine_rounds = 3;
         opts.authoritative = true;
         opts.goal_text = Some("a goal the pack does not need".to_string());

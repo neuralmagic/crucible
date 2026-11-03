@@ -14,85 +14,52 @@
 use crate::model::ParkReason;
 use crate::runs::engine::{ITEM_ENV, open_draft_pr, repo_clone_url};
 use anyhow::{Context, Result, bail};
-use crucible_contract::{Disposition, Tier};
-use serde::Deserialize;
+use crucible_contract::verdict::Ruled;
+use crucible_contract::{ScopeReport, Tier};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// One stage of the scope pipeline, mirrored from `crucible::scope::StageResult` on the wire (the
-/// second consumer of that shape — a plain serde mirror, decoupled from the
-/// engine's own type).
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScopeStage {
-    name: String,
-    pub(crate) passed: bool,
-    detail: String,
-}
-
-/// `crucible scope --json` output (`crucible::scope::ScopeReport`), decoded here.
-#[derive(Debug, Clone, Deserialize)]
-pub struct ScopeReport {
-    pub(crate) stages: Vec<ScopeStage>,
-    pub(crate) digest: Option<String>,
-    cost: Option<f64>,
-    /// The exact JSON the engine printed, kept verbatim for the `scope_reports` store — the refine
-    /// rounds ride only here (this mirror deliberately decodes just the fields the reconcile
-    /// gates on). Set by the parser, never on the wire.
-    #[serde(skip)]
+/// A scope turn's report with what the executor delivered beside it: the exact JSON the engine
+/// printed (stored verbatim as `scope_reports.report_json`), the gzipped agent transcript, and,
+/// from the pod executor, the surviving pack or why its marker was unusable.
+#[derive(Debug, Clone)]
+pub struct Scraped {
+    pub(crate) report: ScopeReport,
     pub(crate) raw: String,
-    /// The turn's preserved agent transcript (gzipped session NDJSON), when the turn delivered
-    /// one: the local executor reads it off `--transcript-out`, the pod executor scrapes the
-    /// `CRUCIBLE_SCOPE_TRANSCRIPT:` marker line. Never on the report's own wire.
-    #[serde(skip)]
     pub(crate) transcript_gz: Option<Vec<u8>>,
-    /// The surviving pack itself (gzip'd tar of the pack dir), scraped off the pod executor's
-    /// `CRUCIBLE_SCOPE_PACK:` marker line. The local executor never sets it — its pack is tarred
-    /// off the scratch tree it wrote. Never on the report's own wire.
-    #[serde(skip)]
     pub(crate) pack_tgz: Option<Vec<u8>>,
-    /// Why the pack marker was present but unusable (the engine's `{"error":…}` payload for an
-    /// oversize pack, or a garbled base64) — evidence for the loud handoff failure. `None` when
-    /// the blob landed or no marker existed at all.
-    #[serde(skip)]
     pub(crate) pack_error: Option<String>,
 }
 
-impl ScopeReport {
+impl Scraped {
     /// A pack survives when the pipeline froze an identity (a digest) and no stage said no. A
     /// failing check or selftest leaves `digest` empty and a `passed = false` stage behind.
     pub(crate) fn survived(&self) -> bool {
-        self.digest.is_some() && self.stages.iter().all(|s| s.passed)
+        self.report.digest.is_some() && self.report.stages.iter().all(|s| s.passed)
+    }
+
+    pub(crate) fn digest(&self) -> Option<&str> {
+        self.report.digest.as_deref()
     }
 
     /// The turn's cost, defaulting to 0 when the report omitted it (a non-propose pipeline).
     pub(crate) fn cost_usd(&self) -> f64 {
-        self.cost.unwrap_or(0.0)
+        self.report.cost.unwrap_or(0.0)
     }
 
-    /// Why the pipeline stopped: the first failing stage's name+detail, or the no-pack catch-all.
-    /// The reason a dead proposal parks with.
+    /// Why the pipeline stopped: the first failing stage's name and detail, or the no-pack
+    /// catch-all. The reason a dead proposal parks with.
     pub(crate) fn failure_reason(&self) -> ParkReason {
-        self.stages
+        self.report
+            .stages
             .iter()
             .find(|s| !s.passed)
             .map(|s| ParkReason::ScopeFailed {
-                stage: s.name.clone(),
+                stage: s.name.to_string(),
                 detail: s.detail.clone(),
             })
             .unwrap_or(ParkReason::ScopeProducedNoPack)
     }
-}
-
-/// A code-grounded ranking verdict, parsed off `crucible rank-grounded --json`'s stdout: the
-/// engine ran one sandboxed turn over the checkout and printed this. The escalation tier's answer —
-/// it overrides the text-only ranker's tier, or says the issue is `stale`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GroundedVerdict {
-    pub(crate) disposition: Disposition,
-    pub(crate) rationale: String,
-    pub(crate) confidence: Option<String>,
-    /// The grounded turn's own cost (USD), ledgered as `rank-grounded`.
-    pub(crate) cost_usd: f64,
 }
 
 /// The per-repo checkout the controller maintains for grounded ranking, under
@@ -164,7 +131,7 @@ pub(crate) fn rank_grounded(
     workspace: &Path,
     max_cost: f64,
     agent_cmd: Option<&str>,
-) -> Result<GroundedVerdict> {
+) -> Result<Ruled> {
     let workspace = workspace.to_string_lossy().to_string();
     let max_cost = format!("{max_cost}");
     let mut cmd = Command::new(bin);
@@ -198,7 +165,7 @@ pub(crate) fn rank_grounded(
 
 /// Parse the last JSON line rank-grounded prints: a verdict object, or an `{"error":…}` object when
 /// the turn produced no parseable verdict (which is an error to the caller, who keeps the text tier).
-fn parse_grounded_verdict(stdout: &str) -> Result<GroundedVerdict> {
+fn parse_grounded_verdict(stdout: &str) -> Result<Ruled> {
     let line = stdout
         .lines()
         .rev()
@@ -214,40 +181,26 @@ fn parse_grounded_verdict(stdout: &str) -> Result<GroundedVerdict> {
 /// re-read off a `Value` here. A turn that produced no verdict surfaces as `Err` naming both (the
 /// caller keeps the text tier). Shared by the `local` subprocess arm and [`crate::runs::workpod`]'s
 /// pod-log scraper.
-pub(crate) fn verdict_from_json_line(line: &str) -> Result<GroundedVerdict> {
+pub(crate) fn verdict_from_json_line(line: &str) -> Result<Ruled> {
     let wire: crucible_contract::GroundedVerdict = crucible_contract::json::from_str(line)
         .with_context(|| format!("rank-grounded output is not a verdict: {line:?}"))?;
     match wire {
-        crucible_contract::GroundedVerdict::Failed {
-            error,
-            error_kind,
-            output_tail,
-            cost_usd,
-            ..
-        } => {
+        crucible_contract::GroundedVerdict::Failed(failed) => {
             // The kind separates a turn that never ran from one that ran and said nothing, and the
             // tail is the agent's own last words. Both were on the wire and read by nobody.
-            let tail = output_tail
+            let tail = failed
+                .output_tail
                 .filter(|t| !t.trim().is_empty())
                 .map(|t| format!("; the agent printed: {}", t.trim()))
                 .unwrap_or_default();
             bail!(
-                "grounded ranker produced no verdict ({}, ${cost_usd:.4} spent): {error}{tail}",
-                error_kind.as_str()
+                "grounded ranker produced no verdict ({}, ${:.4} spent): {}{tail}",
+                failed.error_kind.as_str(),
+                failed.cost_usd,
+                failed.error
             )
         }
-        crucible_contract::GroundedVerdict::Ruled {
-            tier,
-            rationale,
-            confidence,
-            cost_usd,
-            ..
-        } => Ok(GroundedVerdict {
-            disposition: tier,
-            rationale,
-            confidence,
-            cost_usd,
-        }),
+        crucible_contract::GroundedVerdict::Ruled(ruled) => Ok(ruled),
     }
 }
 
@@ -279,7 +232,7 @@ pub(crate) fn scope_propose(
     skip_gaming_review: bool,
     goal_text: Option<&str>,
     authoritative: bool,
-) -> Result<ScopeReport> {
+) -> Result<Scraped> {
     let out = out.to_string_lossy().to_string();
     let repo_url = repo_clone_url(repo);
     let max_cost = format!("{max_cost}");
@@ -323,13 +276,9 @@ pub(crate) fn scope_propose(
         args.push("--gaming-refine-rounds".to_string());
         args.push(format!("{gaming_refine_rounds}"));
     }
-    if let Some(t) = tier.and_then(|t| match t {
-        Tier::T0 => Some("t0"),
-        Tier::T1 => Some("t1"),
-        Tier::T2 | Tier::T3 | Tier::N => None,
-    }) {
+    if let Some(t) = tier.filter(|t| matches!(t, Tier::T0 | Tier::T1)) {
         args.push("--tier".to_string());
-        args.push(t.to_string());
+        args.push(t.as_str_lower().to_string());
     }
     if authoritative {
         args.push("--authoritative".to_string());
@@ -341,7 +290,7 @@ pub(crate) fn scope_propose(
         .with_context(|| format!("spawning `{} scope --propose`", bin.display()))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut report: ScopeReport = serde_json::from_str(stdout.trim()).with_context(|| {
+    let report: ScopeReport = serde_json::from_str(stdout.trim()).with_context(|| {
         format!(
             "parsing `crucible scope --json` output (exit {:?}): stdout={:?} stderr={:?}",
             output.status.code(),
@@ -349,12 +298,16 @@ pub(crate) fn scope_propose(
             String::from_utf8_lossy(&output.stderr),
         )
     })?;
-    report.raw = stdout.trim().to_string();
-    // Absent/empty file = the turn streamed no transcript. Never fail the report over it.
-    report.transcript_gz = std::fs::read(&transcript_path)
-        .ok()
-        .filter(|b| !b.is_empty());
-    Ok(report)
+    Ok(Scraped {
+        report,
+        raw: stdout.trim().to_string(),
+        // Absent/empty file = the turn streamed no transcript. Never fail the report over it.
+        transcript_gz: std::fs::read(&transcript_path)
+            .ok()
+            .filter(|b| !b.is_empty()),
+        pack_tgz: None,
+        pack_error: None,
+    })
 }
 
 /// The repo (`owner/repo`) the approval PRs open against — `CONTROLLER_PACK_REPO`. Unset means the
@@ -416,46 +369,39 @@ pub(crate) fn open_pack_pr(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crucible_contract::Tier;
+    use crucible_contract::scope::{StageName, StageResult};
+    use crucible_contract::{Disposition, Tier};
 
     #[test]
     fn scope_report_survived_needs_a_digest_and_all_passed() {
-        let ok = ScopeReport {
-            stages: vec![ScopeStage {
-                name: "validate".into(),
-                passed: true,
-                detail: "ok".into(),
-            }],
-            digest: Some("v1:abc".into()),
-            cost: Some(0.5),
+        let stage = |name: StageName, passed: bool, detail: &str| StageResult {
+            name,
+            passed,
+            detail: detail.to_string(),
+        };
+        let scraped = |report: ScopeReport| Scraped {
+            report,
             raw: String::new(),
             transcript_gz: None,
             pack_tgz: None,
             pack_error: None,
         };
+        let ok = scraped(ScopeReport {
+            stages: vec![stage(StageName::Validate, true, "ok")],
+            digest: Some("v1:abc".into()),
+            cost: Some(0.5),
+            ..ScopeReport::default()
+        });
         assert!(ok.survived());
         assert_eq!(ok.cost_usd(), 0.5);
 
-        let failed = ScopeReport {
+        let failed = scraped(ScopeReport {
             stages: vec![
-                ScopeStage {
-                    name: "propose".into(),
-                    passed: true,
-                    detail: "drafted".into(),
-                },
-                ScopeStage {
-                    name: "validate".into(),
-                    passed: false,
-                    detail: "measure_cmd missing".into(),
-                },
+                stage(StageName::Propose, true, "drafted"),
+                stage(StageName::Validate, false, "measure_cmd missing"),
             ],
-            digest: None,
-            cost: None,
-            raw: String::new(),
-            transcript_gz: None,
-            pack_tgz: None,
-            pack_error: None,
-        };
+            ..ScopeReport::default()
+        });
         assert!(!failed.survived());
         assert_eq!(failed.cost_usd(), 0.0);
         assert_eq!(
@@ -513,7 +459,7 @@ mod tests {
         }
 
         let v = rank_grounded(&bin, "owner/repo#1", &dir, 5.0, None).expect("verdict parses");
-        assert_eq!(v.disposition, Disposition::Tier(Tier::T2));
+        assert_eq!(v.tier, Disposition::Tier(Tier::T2));
         assert_eq!(v.confidence.as_deref(), Some("low"));
         assert!((v.cost_usd - 0.2).abs() < 1e-9);
 
@@ -556,7 +502,7 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' '{\"tier\":\"stale\",\"rationale\":\"already fixed in src/foo.rs:42\",\"confidence\":\"high\",\"cost_usd\":0.1,\"over_budget\":false}'\n",
         );
         let v = rank_grounded(&bin, "owner/repo#1", &root, 5.0, Some("true")).expect("parses");
-        assert_eq!(v.disposition, Disposition::Stale);
+        assert_eq!(v.tier, Disposition::Stale);
         assert!(v.rationale.contains("src/foo.rs:42"));
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -353,7 +353,7 @@ pub(super) async fn apply_pod_scope_outcome(
                 db,
                 cfg,
                 issue,
-                report,
+                *report,
                 Some(pod_name),
                 PackSource::PodLogs,
                 scoped_reason,
@@ -426,7 +426,7 @@ async fn apply_scope_report(
     db: &Db,
     cfg: &ControllerCfg,
     issue: &Issue,
-    report: engine::ScopeReport,
+    report: engine::Scraped,
     pod_name: Option<String>,
     source: PackSource<'_>,
     scoped_reason: &str,
@@ -517,7 +517,7 @@ async fn apply_scope_report(
                 &mut *tx,
                 &NewScope {
                     issue: issue.key.clone(),
-                    pack_digest: report.digest.clone(),
+                    pack_digest: report.digest().map(str::to_string),
                     check_outcome: Some("PASS".to_string()),
                 },
             )
@@ -529,7 +529,7 @@ async fn apply_scope_report(
                 "new",
                 "scoped",
                 Some(scoped_reason),
-                report.digest.as_deref(),
+                report.digest(),
             );
             crate::event_log::insert(&mut *tx, &ev).await?;
             tx.commit().await?;

@@ -1,8 +1,10 @@
 #[cfg(feature = "autoresearch")]
-use crate::issues::engine::{self, GroundedVerdict};
+use crate::issues::engine;
 use crate::runs::workpod::*;
 #[cfg(feature = "autoresearch")]
 use anyhow::{Context, Result};
+#[cfg(feature = "autoresearch")]
+use crucible_contract::verdict::Ruled;
 use k8s_openapi::api::core::v1::PodStatus;
 
 /// Scrape the verdict off a turn pod's logs: the last `CRUCIBLE_VERDICT:` marker line, robust to the
@@ -10,7 +12,7 @@ use k8s_openapi::api::core::v1::PodStatus;
 /// subprocess arm parses, so an `{"error":…}` object surfaces as `Err` (the caller keeps the text
 /// tier) via the shared [`engine::verdict_from_json_line`] decoder.
 #[cfg(feature = "autoresearch")]
-pub(crate) fn parse_verdict_logs(logs: &str) -> Result<GroundedVerdict> {
+pub(crate) fn parse_verdict_logs(logs: &str) -> Result<Ruled> {
     let line = logs
         .lines()
         .rev()
@@ -24,18 +26,21 @@ pub(crate) fn parse_verdict_logs(logs: &str) -> Result<GroundedVerdict> {
 /// `CRUCIBLE_SCOPE_TRANSCRIPT:` line (gzip+base64) just before it — attached when present, and
 /// strictly best-effort: a missing or garbled transcript never fails the report.
 #[cfg(feature = "autoresearch")]
-pub(crate) fn parse_scope_report_logs(logs: &str) -> Result<engine::ScopeReport> {
+pub(crate) fn parse_scope_report_logs(logs: &str) -> Result<engine::Scraped> {
     let line = logs
         .lines()
         .rev()
         .find_map(|l| l.trim().strip_prefix(SCOPE_REPORT_MARKER))
         .context("no CRUCIBLE_SCOPE_REPORT marker line in the scope turn pod's logs")?;
-    let mut report: engine::ScopeReport =
-        serde_json::from_str(line.trim()).context("parsing scope report from pod logs")?;
-    report.raw = line.trim().to_string();
-    report.transcript_gz = parse_scope_transcript_logs(logs);
-    (report.pack_tgz, report.pack_error) = parse_scope_pack_logs(logs);
-    Ok(report)
+    let report = serde_json::from_str(line.trim()).context("parsing scope report from pod logs")?;
+    let (pack_tgz, pack_error) = parse_scope_pack_logs(logs);
+    Ok(engine::Scraped {
+        report,
+        raw: line.trim().to_string(),
+        transcript_gz: parse_scope_transcript_logs(logs),
+        pack_tgz,
+        pack_error,
+    })
 }
 
 /// The pack marker's decoded payload (gzip'd tar of the surviving pack dir), plus the reason it's

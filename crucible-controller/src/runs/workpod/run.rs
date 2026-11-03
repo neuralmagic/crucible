@@ -3,7 +3,7 @@
 use crate::client::Db;
 use crate::config::ControllerCfg;
 #[cfg(feature = "autoresearch")]
-use crate::issues::engine::{self, GroundedVerdict};
+use crate::issues::engine;
 use crate::playbooks::providers::AgentSelection;
 #[cfg(feature = "autoresearch")]
 use crate::runs::workpod::spec::{self, TurnSpec as _};
@@ -13,6 +13,8 @@ use crucible::deploy::{
     DigestResolver, PACK_TARBALL_KEY, PackDelivery, PlaybookLaunch, RenderOpts, render_yaml,
 };
 use crucible_contract::pack_tree::{PackFilePath, TreeDigest};
+#[cfg(feature = "autoresearch")]
+use crucible_contract::verdict::Ruled;
 #[cfg(feature = "autoresearch")]
 use crucible_contract::{ArtifactKind, content_digest};
 #[cfg(feature = "autoresearch")]
@@ -1153,7 +1155,7 @@ pub async fn collect_run_pod(
 /// both directions). A parseable verdict envelope is authoritative, INCLUDING its `{"error":…}`
 /// no-verdict payload, so only an absent/unparseable/wrong-kind message reaches the marker scrape.
 #[cfg(feature = "autoresearch")]
-pub(crate) fn collect_verdict(message: Option<&str>, logs: &str) -> Result<GroundedVerdict> {
+pub(crate) fn collect_verdict(message: Option<&str>, logs: &str) -> Result<Ruled> {
     if let Some(result) = message.and_then(verdict_from_termination) {
         return result;
     }
@@ -1165,7 +1167,7 @@ pub(crate) fn collect_verdict(message: Option<&str>, logs: &str) -> Result<Groun
 /// message isn't our envelope at all (empty, old-image marker text, or a wrong-kind envelope) so the
 /// caller can fall back to the marker scrape.
 #[cfg(feature = "autoresearch")]
-fn verdict_from_termination(message: &str) -> Option<Result<GroundedVerdict>> {
+fn verdict_from_termination(message: &str) -> Option<Result<Ruled>> {
     let env: Envelope = serde_json::from_str(message.trim()).ok()?;
     if env.kind != EnvelopeKind::Verdict {
         return None;
@@ -1193,7 +1195,7 @@ fn verdict_from_termination(message: &str) -> Option<Result<GroundedVerdict>> {
 #[cfg(feature = "autoresearch")]
 #[derive(Debug, Clone)]
 pub enum DispatchOutcome {
-    Verdict(GroundedVerdict),
+    Verdict(Ruled),
     Launched,
     Queued,
     Failed,
@@ -1442,9 +1444,7 @@ pub(crate) async fn adopt_grounded_turn(
 /// keeps the caller on the text tier without a string to thread), `AlreadyCollected` maps straight
 /// across.
 #[cfg(feature = "autoresearch")]
-fn grounded_into_dispatch_outcome(
-    collected: spec::TurnCollected<GroundedVerdict>,
-) -> DispatchOutcome {
+fn grounded_into_dispatch_outcome(collected: spec::TurnCollected<Ruled>) -> DispatchOutcome {
     match collected {
         spec::TurnCollected::Result { result, .. } => DispatchOutcome::Verdict(result),
         spec::TurnCollected::Failed { .. } => DispatchOutcome::Failed,
@@ -1460,7 +1460,7 @@ pub enum ScopeOutcome {
     /// `pod_name` is the turn pod that ran it, so the caller can persist the report with the
     /// operator's handle for cluster-log correlation.
     Report {
-        report: engine::ScopeReport,
+        report: Box<engine::Scraped>,
         pod_name: String,
     },
     /// The turn failed (no usable report), with the reason. The caller events it on the issue.
@@ -1524,7 +1524,7 @@ pub async fn dispatch_scope(
 /// (`ScopeOutcome::Failed` carries a `String`, matching the launch-fail create-context string
 /// surviving into the reconcile event).
 #[cfg(feature = "autoresearch")]
-fn scope_dispatch_into_outcome(dispatch: spec::TurnDispatch<engine::ScopeReport>) -> ScopeOutcome {
+fn scope_dispatch_into_outcome(dispatch: spec::TurnDispatch<engine::Scraped>) -> ScopeOutcome {
     match dispatch {
         spec::TurnDispatch::Launched => ScopeOutcome::Launched,
         spec::TurnDispatch::Collected(collected) => scope_into_outcome(collected),
@@ -1587,10 +1587,10 @@ pub(crate) async fn adopt_scope_turn(
 /// carries a `String`, unlike the grounded mapper's unit variant), `AlreadyCollected` maps straight
 /// across.
 #[cfg(feature = "autoresearch")]
-fn scope_into_outcome(collected: spec::TurnCollected<engine::ScopeReport>) -> ScopeOutcome {
+fn scope_into_outcome(collected: spec::TurnCollected<engine::Scraped>) -> ScopeOutcome {
     match collected {
         spec::TurnCollected::Result { result, pod_name } => ScopeOutcome::Report {
-            report: result,
+            report: Box::new(result),
             pod_name,
         },
         spec::TurnCollected::Failed { reason } => ScopeOutcome::Failed(reason),
@@ -1602,10 +1602,7 @@ fn scope_into_outcome(collected: spec::TurnCollected<engine::ScopeReport>) -> Sc
 /// the marker log scrape (compat, exactly as [`collect_verdict`]). A parseable scope-report envelope
 /// is authoritative; only an absent/unparseable/wrong-kind message reaches the marker scrape.
 #[cfg(feature = "autoresearch")]
-pub(crate) fn collect_scope_report(
-    message: Option<&str>,
-    logs: &str,
-) -> Result<engine::ScopeReport> {
+pub(crate) fn collect_scope_report(message: Option<&str>, logs: &str) -> Result<engine::Scraped> {
     if let Some(result) = message.and_then(|m| scope_report_from_termination(m, logs)) {
         return result;
     }
@@ -1615,7 +1612,7 @@ pub(crate) fn collect_scope_report(
 /// Decode a scope report from the termination message: `Some` once the message parses to a
 /// scope-report envelope, `None` when it isn't our envelope so the caller falls back to the marker.
 #[cfg(feature = "autoresearch")]
-fn scope_report_from_termination(message: &str, logs: &str) -> Option<Result<engine::ScopeReport>> {
+fn scope_report_from_termination(message: &str, logs: &str) -> Option<Result<engine::Scraped>> {
     let env: Envelope = serde_json::from_str(message.trim()).ok()?;
     if env.kind != EnvelopeKind::ScopeReport {
         return None;
@@ -1628,15 +1625,19 @@ fn scope_report_from_termination(message: &str, logs: &str) -> Option<Result<eng
 /// exactly as [`parse_scope_report_logs`] does. `raw` is the report's own JSON (what the
 /// `scope_reports` store keeps), matching the marker path where `raw` is the marker line body.
 #[cfg(feature = "autoresearch")]
-fn scope_report_from_envelope(env: Envelope, logs: &str) -> Result<engine::ScopeReport> {
+fn scope_report_from_envelope(env: Envelope, logs: &str) -> Result<engine::Scraped> {
     let raw = serde_json::to_string(&env.payload)
         .context("re-serializing the scope report from the termination envelope")?;
-    let mut report: engine::ScopeReport = serde_json::from_value(env.payload)
+    let report = serde_json::from_value(env.payload)
         .context("parsing the scope report from the termination envelope")?;
-    report.raw = raw;
-    report.transcript_gz = parse_scope_transcript_logs(logs);
-    (report.pack_tgz, report.pack_error) = parse_scope_pack_logs(logs);
-    Ok(report)
+    let (pack_tgz, pack_error) = parse_scope_pack_logs(logs);
+    Ok(engine::Scraped {
+        report,
+        raw,
+        transcript_gz: parse_scope_transcript_logs(logs),
+        pack_tgz,
+        pack_error,
+    })
 }
 
 /// The Tier 1 artifacts manifest carried by a scope-report termination message, or empty when the
@@ -1667,12 +1668,12 @@ pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
 /// path's long-standing discipline (a garbled transcript never failed a report).
 #[cfg(feature = "autoresearch")]
 pub(crate) async fn apply_turn_artifacts(
-    report: &mut engine::ScopeReport,
+    report: &mut engine::Scraped,
     manifest: &[ArtifactRef],
     pool: &sqlx::PgPool,
     pod: &str,
 ) -> Result<(), String> {
-    let survived = report.digest.is_some() && report.stages.iter().all(|s| s.passed);
+    let survived = report.survived();
     for art in manifest {
         match art.kind {
             ArtifactKind::ScopePack => match resolve_turn_artifact(pool, pod, art).await {

@@ -758,7 +758,7 @@ pub(crate) struct GroundedRankSpec;
 
 #[cfg(feature = "autoresearch")]
 impl TurnSpec for GroundedRankSpec {
-    type Result = engine::GroundedVerdict;
+    type Result = crucible_contract::verdict::Ruled;
 
     fn kind(&self) -> WorkKind {
         WorkKind::AgentTurn(TurnKind::GroundedRank)
@@ -801,7 +801,7 @@ impl TurnSpec for GroundedRankSpec {
         v.cost_usd
     }
     fn summary(&self, v: &Self::Result) -> String {
-        format!("{} (${:.4})", v.disposition.as_str(), v.cost_usd)
+        format!("{} (${:.4})", v.tier.as_str(), v.cost_usd)
     }
     fn success_metric(&self) -> &'static str {
         "verdict"
@@ -831,7 +831,7 @@ pub(crate) struct ScopeSpec;
 
 #[cfg(feature = "autoresearch")]
 impl TurnSpec for ScopeSpec {
-    type Result = engine::ScopeReport;
+    type Result = engine::Scraped;
 
     fn kind(&self) -> WorkKind {
         WorkKind::AgentTurn(TurnKind::Scope)

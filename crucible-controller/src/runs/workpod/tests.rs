@@ -49,8 +49,6 @@ fn turn_specs_convert_bare_repo_slugs_to_clone_urls() {
 use crate::runs::workpod::spec::TurnSpec as _;
 use crate::runs::workpod::*;
 #[cfg(feature = "autoresearch")]
-use crucible::deploy::ProposeTier;
-#[cfg(feature = "autoresearch")]
 use crucible_contract::{Disposition, Tier};
 use std::sync::Mutex;
 
@@ -212,7 +210,7 @@ fn turn_opts_scope_carries_kind_tier_and_the_gaming_bound() {
     assert_eq!(opts.max_cost, 8.0, "max-cost round-trips");
     assert_eq!(
         opts.tier,
-        Some(ProposeTier::T1),
+        Some(Tier::T1),
         "the confirmed tier rides into the render"
     );
     assert_eq!(
@@ -493,7 +491,7 @@ inspecting the checkout, grepping tests
 CRUCIBLE_VERDICT: {\"tier\":\"T1\",\"rationale\":\"needs a new bench in bench/\",\"confidence\":\"low\",\"cost_usd\":0.42,\"over_budget\":false}
 ";
     let v = parse_verdict_logs(logs).expect("verdict");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T1));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T1));
     assert_eq!(v.confidence.as_deref(), Some("low"));
     assert!((v.cost_usd - 0.42).abs() < 1e-9);
 }
@@ -504,7 +502,7 @@ fn parse_verdict_logs_takes_the_last_marker_and_surfaces_error_objects() {
     // Two markers (a retried turn): the LAST wins.
     let logs = "CRUCIBLE_VERDICT: {\"tier\":\"N\",\"rationale\":\"x\",\"cost_usd\":0.1}\nnoise\nCRUCIBLE_VERDICT: {\"tier\":\"stale\",\"rationale\":\"already done in src/a.rs\",\"cost_usd\":0.2}\n";
     let v = parse_verdict_logs(logs).expect("verdict");
-    assert_eq!(v.disposition, Disposition::Stale);
+    assert_eq!(v.tier, Disposition::Stale);
 
     // An error-object marker (no verdict) surfaces as Err — the caller keeps the text tier.
     let logs =
@@ -532,7 +530,7 @@ fn verdict_rides_the_termination_message_envelope() {
         .to_capped_json()
         .expect("cap");
     let v = collect_verdict(Some(&msg), "").expect("verdict from the termination message");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T1));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T1));
     assert_eq!(v.confidence.as_deref(), Some("low"));
     assert!((v.cost_usd - 0.42).abs() < 1e-9);
 
@@ -557,11 +555,11 @@ fn verdict_falls_back_to_the_marker_when_the_message_is_not_our_envelope() {
 
     // No message at all (old image / a pod that wrote nothing) → marker.
     let v = collect_verdict(None, logs).expect("verdict from marker");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::N));
+    assert_eq!(v.tier, Disposition::Tier(Tier::N));
 
     // A non-envelope message (stray log text on the file) → marker.
     let v = collect_verdict(Some("not json at all"), logs).expect("verdict from marker");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::N));
+    assert_eq!(v.tier, Disposition::Tier(Tier::N));
 
     // A well-formed but WRONG-KIND envelope (a scope report where a verdict is expected) →
     // marker, rather than a hard error that would drop the recoverable marker verdict.
@@ -572,7 +570,7 @@ fn verdict_falls_back_to_the_marker_when_the_message_is_not_our_envelope() {
     .to_capped_json()
     .expect("cap");
     let v = collect_verdict(Some(&foreign), logs).expect("verdict from marker");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::N));
+    assert_eq!(v.tier, Disposition::Tier(Tier::N));
 }
 
 /// A scope report rides the termination message while its pack + transcript still ride their log
@@ -605,7 +603,7 @@ fn scope_report_rides_the_message_with_pack_and_transcript_from_logs() {
         .expect("cap");
 
     let report = collect_scope_report(Some(&msg), &logs).expect("report from the message");
-    assert_eq!(report.digest.as_deref(), Some("v1:beef"));
+    assert_eq!(report.digest(), Some("v1:beef"));
     assert!(report.survived());
     assert!(
         !report.raw.is_empty(),
@@ -624,7 +622,7 @@ fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() 
         "{SCOPE_REPORT_MARKER} {{\"stages\":[{{\"name\":\"freeze\",\"passed\":true,\"detail\":\"ok\"}}],\"digest\":\"v1:cafe\",\"cost\":0.2}}\n"
     );
     let report = collect_scope_report(None, &logs).expect("report from marker");
-    assert_eq!(report.digest.as_deref(), Some("v1:cafe"));
+    assert_eq!(report.digest(), Some("v1:cafe"));
 
     // A verdict envelope where a scope report is expected → marker fallback.
     let foreign = Envelope::new(
@@ -634,13 +632,13 @@ fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() 
     .to_capped_json()
     .expect("cap");
     let report = collect_scope_report(Some(&foreign), &logs).expect("report from marker");
-    assert_eq!(report.digest.as_deref(), Some("v1:cafe"));
+    assert_eq!(report.digest(), Some("v1:cafe"));
 }
 
 /// Build a minimal surviving ScopeReport (digest frozen, one passed stage) for the turn
 /// artifact tests.
 #[cfg(feature = "autoresearch")]
-fn survived_report() -> engine::ScopeReport {
+fn survived_report() -> engine::Scraped {
     let env = Envelope::new(
         EnvelopeKind::ScopeReport,
         serde_json::json!({
@@ -815,7 +813,7 @@ async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result
         .await?
     {
         crate::runs::workpod::spec::TurnRunOutcome::Result(r) => {
-            assert_eq!(r.digest.as_deref(), Some("v1:beef"))
+            assert_eq!(r.digest(), Some("v1:beef"))
         }
         crate::runs::workpod::spec::TurnRunOutcome::NoResult { reason } => {
             panic!("expected a report, got: {reason}")
@@ -841,7 +839,7 @@ async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result
         .await?
     {
         crate::runs::workpod::spec::TurnRunOutcome::Result(v) => {
-            assert_eq!(v.disposition, Disposition::Tier(Tier::T2))
+            assert_eq!(v.tier, Disposition::Tier(Tier::T2))
         }
         crate::runs::workpod::spec::TurnRunOutcome::NoResult { reason } => {
             panic!("expected a verdict, got: {reason}")
@@ -1322,7 +1320,7 @@ async fn dispatch_launches_then_a_redrive_collects_and_ledgers_a_verdict(
     let DispatchOutcome::Verdict(v) = out else {
         panic!("expected the collected verdict, got {out:?}");
     };
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T2));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T2));
     assert_eq!(created.lock().expect("lock").len(), 1, "no second pod");
     assert_eq!(
         deleted.lock().expect("lock").len(),
@@ -1631,7 +1629,7 @@ async fn grounded_dispatch_adopts_a_running_turn_never_double_launches(
     let DispatchOutcome::Verdict(v) = out else {
         panic!("expected the adopted verdict, got {out:?}");
     };
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T1));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T1));
     assert_adopted_not_relaunched(&db, "crucible-turn-adopt-me", &created, &deleted, 0.3).await
 }
 

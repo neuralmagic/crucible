@@ -22,6 +22,7 @@ use crate::agent::{self};
 use crate::args::Paths;
 use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
+use crucible_contract::verdict::{Failed, Ruled};
 use crucible_contract::{Disposition, GroundedErrorKind, GroundedVerdict};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -129,14 +130,14 @@ impl GroundedReport {
     /// plus the turn's cost, or the error shape when the agent emitted no parseable verdict.
     fn wire(&self) -> GroundedVerdict {
         match &self.verdict {
-            Some(v) => GroundedVerdict::Ruled {
+            Some(v) => GroundedVerdict::Ruled(Ruled {
                 tier: v.disposition,
                 rationale: v.rationale.clone(),
                 confidence: Some(v.confidence.clone()),
                 cost_usd: self.cost_usd,
                 over_budget: self.over_budget,
-            },
-            None => GroundedVerdict::Failed {
+            }),
+            None => GroundedVerdict::Failed(Failed {
                 error: self
                     .error
                     .as_ref()
@@ -150,7 +151,7 @@ impl GroundedReport {
                 output_tail: self.output_tail.clone(),
                 cost_usd: self.cost_usd,
                 over_budget: self.over_budget,
-            },
+            }),
         }
     }
 
@@ -769,10 +770,10 @@ mod tests {
         assert_eq!(decoded.cost_usd(), 0.12);
         assert!(matches!(
             decoded,
-            GroundedVerdict::Failed {
+            GroundedVerdict::Failed(Failed {
                 error_kind: GroundedErrorKind::TurnFailed,
                 ..
-            }
+            })
         ));
     }
 

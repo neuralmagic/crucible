@@ -2,12 +2,13 @@
 //! exactly the bytes the `crucible` command line prints. Each test drives both paths.
 
 use crucible::deploy::{
-    DeployProfile, PackDelivery, PackPath, PlaybookLaunch, ProposeTier, RenderOpts, RerunLaunch,
-    TurnKind, TurnOpts, render_turn, render_yaml,
+    DeployProfile, PackDelivery, PackPath, PlaybookLaunch, RenderOpts, RerunLaunch, TurnKind,
+    TurnOpts, render_turn, render_yaml,
 };
 use crucible::flow::{FlowFormat, FlowInput, render};
 use crucible::manifest::Harness;
 use crucible::plan::starlark::{compile_file_with, declared_params, parent_or_cwd};
+use crucible_contract::Tier;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -378,7 +379,7 @@ fn deploy_render_turn_matches_render_turn() {
             sandbox_image: "registry.example.com/router-sandbox:latest".to_string(),
             max_cost: 2.5,
             digests: None,
-            tier: Some(ProposeTier::T1),
+            tier: Some(Tier::T1),
             gaming_refine_rounds: 2,
             skip_gaming_review: false,
             authoritative: true,

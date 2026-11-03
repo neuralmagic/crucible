@@ -15,7 +15,7 @@ strum.workspace = true
 # The shared turn-result wire contract: the marker literals the scrapers match, the managed-by
 # selector, the Tier 1 envelope, and the AgentEvent NDJSON types the SSE relay reads — one
 # source of truth, no cross-crate "keep in sync" drift.
-crucible-contract = { path = "../crucible-contract" }
+crucible-contract = { path = "../crucible-contract", features = ["openapi"] }
 crucible = { path = "../crucible", default-features = false }
 # The cluster-boundary traits (PodDispatcher, ConfigMapApi) are async + used as `dyn`, which
 # native async-fn-in-trait can't do; async-trait boxes the futures.
