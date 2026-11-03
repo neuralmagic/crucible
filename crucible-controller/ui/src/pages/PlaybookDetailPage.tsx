@@ -163,6 +163,7 @@ export function PlaybookDetailPage() {
                 value={files[active] ?? ''}
                 onChange={() => {}}
                 readOnly
+                height="32rem"
                 label={`${active} source`}
                 testId="playbook-inspector"
               />
