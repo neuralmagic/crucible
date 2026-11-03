@@ -35,6 +35,8 @@ When an output-decided route's source bounds a question's field to finitely many
 
 session = "name" must preserve one logical agent conversation across dependency-ordered tasks and loop iterations. Tasks sharing a session must not be isolated and must be dependency-ordered.
 
+An agent or skill task MAY set harness, model, and effort, and a session MAY declare them for the tasks it holds. A harness or effort that no agent turn can read MUST be rejected when the graph is validated, before any task is dispatched, naming the task, the setting, and the values accepted; values are read without regard to case. This holds whether the graph was compiled from workflow.star, carried inline as [workflow] tasks, or loaded from a plan file. A launch may change these settings per task under [[RFC-0002:C-PLAYBOOK-PARAMS]].
+
 A required task must not depend, through a path of "all"-join edges, on a task declared advisory. Such a graph asserts both that a failure is tolerable and that the work it gates must pass, and no execution of it can produce an honest verdict. Validation must reject it before dispatch, naming both tasks. A required task joining "passed" or "settled" is exempt: it declares that it runs on whatever settled.
 
 A list of tasks must be accepted wherever a list of task names is, so an author never wraps one to pass it. A task constructed in workflow.star but omitted from workflow(tasks = ...) must be a compile error.

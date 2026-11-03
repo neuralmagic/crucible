@@ -27,6 +27,7 @@ pub mod client;
 pub(crate) mod clock;
 pub mod config;
 pub mod daemon;
+pub mod decisions;
 pub(crate) mod dto;
 #[cfg(feature = "embedded-db")]
 pub mod embedded_db;
@@ -126,6 +127,7 @@ pub(crate) fn human_router(
         scratch_dir: state.scratch_dir.clone(),
         guard: both.clone(),
     });
+    let decisions = decisions::run_routes(state.db.clone());
     let router = api::router(state)
         .merge(spa::router(ui))
         .layer(axum::middleware::from_fn_with_state(
@@ -133,6 +135,7 @@ pub(crate) fn human_router(
             identity::auth::require_auth_or_api_key,
         ))
         .merge(evidence)
+        .merge(decisions)
         .merge(identity::oidc::routes::router(auth.routes));
     let router = match auth.issuer.filter(|i| i.people.is_some()) {
         Some(issuer) => router.merge(agent_auth::people::router(issuer)),

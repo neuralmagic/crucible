@@ -7,6 +7,7 @@
 //! is the clearest way to say what a fan-out runs over, and because naming the field in the
 //! source is what lets a typo be a compile error rather than an empty list at run time.
 
+use std::collections::BTreeMap;
 use std::fmt::{self, Display};
 
 use allocative::Allocative;
@@ -57,6 +58,18 @@ impl<'v> StarlarkValue<'v> for TaskValue {
                 .ok()
                 .and_then(|id| questions.get_key_value(&id));
             return Some(match asked {
+                Some((question, asked)) if asked.pick_source().is_some() => {
+                    heap.alloc(OutputRefValue {
+                        reference: OutputRef {
+                            task: self.0.name.clone(),
+                            field: OutputField(question.to_string()),
+                        },
+                        declared: Emits::Typed(BTreeMap::from([(
+                            OutputField(question.to_string()),
+                            FieldType::List,
+                        )])),
+                    })
+                }
                 Some((question, asked)) => heap.alloc(AnswerRefValue(AnswerRef {
                     task: self.0.name.clone(),
                     question: question.clone(),

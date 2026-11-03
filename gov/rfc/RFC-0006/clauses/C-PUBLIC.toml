@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PUBLIC"
+title = "Public blueprints"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Making a blueprint public or private MUST be the `share` action on the playbook, and MUST be audited as a share grant or revocation under [[RFC-0003:C-AUDIT]]. In addition to the grants of [[RFC-0003:C-POLICY]], the default policy set MUST grant every authenticated user principal `read` on a public blueprint, and publicity MUST NOT confer any other action or the read of the blueprint's shares. Only a blueprint MAY be public: unmarking a blueprint MUST make it private. Making a blueprint private MUST NOT change a draft already created from it or a binding already carried.
+
+
+
+Publicity widens who sees a blueprint, not what carries: [[RFC-0006:C-CARRY]] still requires the user to be in the owning team, so everyone else gets placeholders. The platform administrator team's public blueprints are the catalog every user starts with."""

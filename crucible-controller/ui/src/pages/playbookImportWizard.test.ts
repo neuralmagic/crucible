@@ -109,6 +109,8 @@ function playbook(overrides: Partial<PlaybookDto> = {}): PlaybookDto {
     schema_digest: 'sha256:old',
     core_rev: 'c'.repeat(40),
     dispatch: DISPATCH,
+    blueprint: false,
+    public: false,
     created_by: 'wren',
     created_at: '2026-08-22T00:00:00Z',
     updated_at: '2026-08-22T00:00:00Z',
