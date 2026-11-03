@@ -10,8 +10,18 @@ use std::ffi::OsString;
 use std::fmt;
 use std::process::Command;
 
-/// What every such command receives from the engine's environment, when the engine has it.
-pub const BASE: [&str; 4] = ["PATH", "HOME", "LANG", "TMPDIR"];
+/// What every such command receives from the engine's environment, when the engine has it: the
+/// process basics and the run's identity, which names and links the run and grants nothing. The
+/// pod token and the controller URL it authenticates against are not part of it.
+pub const BASE: [&str; 7] = [
+    "PATH",
+    "HOME",
+    "LANG",
+    "TMPDIR",
+    crucible_contract::ENV_RUN_NAME,
+    crucible_contract::ENV_RUN_DISPLAY_NAME,
+    crucible_contract::ENV_UI_BASE_URL,
+];
 
 /// A variable a manifest table declares its commands receive.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -261,7 +271,7 @@ impl HostEnv {
 #[cfg(test)]
 mod tests {
     use crate::host_env::{
-        DeclaredEnv, EnvDecl, EnvDeclError, EnvName, HostEnv, MissingEnv, RequiredAndOptional,
+        BASE, DeclaredEnv, EnvDecl, EnvDeclError, EnvName, HostEnv, MissingEnv, RequiredAndOptional,
     };
     use crate::manifest::edition::Edition;
     use std::ffi::OsString;
@@ -531,6 +541,54 @@ mod tests {
         let seen = env_of(&env);
         assert!(!seen.contains("UNDECLARED"), "{seen}");
         assert!(seen.lines().any(|l| l.starts_with("PATH=")), "{seen}");
+    }
+
+    /// The base carries the run's identity, which a command may print or link, and never the pod
+    /// token or the controller URL that token authenticates against.
+    #[test]
+    fn an_edition_two_command_gets_the_runs_identity_and_not_its_pod_token() {
+        let _guard = crate::test_support::env_lock();
+        let set = [
+            (crucible_contract::ENV_RUN_NAME, "playbook-x-17"),
+            (crucible_contract::ENV_RUN_DISPLAY_NAME, "benevolent-monkey"),
+            (
+                crucible_contract::ENV_UI_BASE_URL,
+                "https://crucible.example",
+            ),
+            (crucible_contract::ENV_POD_TOKEN, "pod-secret"),
+            (
+                crucible_contract::ENV_CONTROLLER_URL,
+                "http://controller:8080",
+            ),
+        ];
+        for (name, value) in set {
+            unsafe { std::env::set_var(name, value) };
+        }
+        let env = HostEnv::resolve(Edition::Two, "[judge]", &DeclaredEnv::default());
+        let seen = env.as_ref().map(env_of);
+        for (name, _) in set {
+            unsafe { std::env::remove_var(name) };
+        }
+        let seen = seen.unwrap();
+        for line in [
+            "CRUCIBLE_RUN_NAME=playbook-x-17",
+            "CRUCIBLE_RUN_DISPLAY_NAME=benevolent-monkey",
+            "CRUCIBLE_UI_BASE_URL=https://crucible.example",
+        ] {
+            assert!(seen.lines().any(|l| l == line), "{line}: {seen}");
+        }
+        assert!(!seen.contains("pod-secret"), "{seen}");
+        assert!(!seen.contains(crucible_contract::ENV_POD_TOKEN), "{seen}");
+        assert!(
+            !seen.contains(crucible_contract::ENV_CONTROLLER_URL),
+            "{seen}"
+        );
+        for secret in [
+            crucible_contract::ENV_POD_TOKEN,
+            crucible_contract::ENV_CONTROLLER_URL,
+        ] {
+            assert!(!BASE.contains(&secret), "{secret}");
+        }
     }
 
     /// A command handed no resolved environment fails closed: the base alone.

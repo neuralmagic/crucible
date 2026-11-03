@@ -539,8 +539,9 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
 - **cwd** = the agent workspace (`manifest_dir/[workspace].dir`).
 - **PATH inherited**, so a command may be a bare installed tool (`bench`) or a workspace-relative
   script (`./measure.sh`).
-- **env**, edition 2 = `PATH`, `HOME`, `LANG`, `TMPDIR`, the injected variables below, and what
-  the command's table declares in `env`: `[judge].env` for `measure_cmd`, `[world].env` for
+- **env**, edition 2 = `PATH`, `HOME`, `LANG`, `TMPDIR`, the run's identity
+  (`CRUCIBLE_RUN_NAME`, `CRUCIBLE_RUN_DISPLAY_NAME`, `CRUCIBLE_UI_BASE_URL`) when the engine has
+  it, the injected variables below, and what the command's table declares in `env`: `[judge].env` for `measure_cmd`, `[world].env` for
   `apply_cmd`, `snapshot_cmd`, and `restore_cmd`. A declared `NAME` the engine's environment
   does not set refuses the run; a declared `NAME?` is passed when set and left out when not.
 - **env**, edition 1 = the engine's env plus the injected variables below. `crucible check` and

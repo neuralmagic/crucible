@@ -95,7 +95,11 @@ impl RunPodRender {
             set_container_env(&mut pod, crate::runs::engine::ITEM_ENV, item);
         }
         if let Some(url) = self.public_url.as_deref() {
-            set_container_env(&mut pod, "CRUCIBLE_UI_BASE_URL", url.trim_end_matches('/'));
+            set_container_env(
+                &mut pod,
+                crucible_contract::ENV_UI_BASE_URL,
+                url.trim_end_matches('/'),
+            );
         }
         if let Some(who) = self.git_identity.as_ref() {
             stamp_git_identity(&mut pod, who);

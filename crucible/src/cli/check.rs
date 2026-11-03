@@ -1092,7 +1092,8 @@ mod tests {
         let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
         assert!(outcome.ok(), "findings: {:?}", outcome.findings);
         let disclosed = "  host-env    [judge] commands receive CRUCIBLE_TEST_NEVER_SET (optional) \
-                         besides PATH, HOME, LANG, TMPDIR";
+                         besides PATH, HOME, LANG, TMPDIR, CRUCIBLE_RUN_NAME, \
+                         CRUCIBLE_RUN_DISPLAY_NAME, CRUCIBLE_UI_BASE_URL";
         assert!(
             outcome.exposure.iter().any(|l| l == disclosed),
             "{:?}",

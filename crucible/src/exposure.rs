@@ -872,7 +872,7 @@ mod tests {
         assert_eq!(
             render_capability(&declared_env[0]),
             "host-env    [world] commands receive KUBECONFIG, KUBE_NAMESPACE besides PATH, HOME, \
-             LANG, TMPDIR"
+             LANG, TMPDIR, CRUCIBLE_RUN_NAME, CRUCIBLE_RUN_DISPLAY_NAME, CRUCIBLE_UI_BASE_URL"
         );
         assert_eq!(
             serde_json::to_value(&declared_env[0]).unwrap(),
@@ -904,12 +904,13 @@ mod tests {
         assert_eq!(
             render_capability(&declared_env[0]),
             "host-env    [judge] commands receive KUBECONFIG, EPP_ENDPOINT (optional) besides \
-             PATH, HOME, LANG, TMPDIR"
+             PATH, HOME, LANG, TMPDIR, CRUCIBLE_RUN_NAME, CRUCIBLE_RUN_DISPLAY_NAME, \
+             CRUCIBLE_UI_BASE_URL"
         );
         assert_eq!(
             render_capability(&declared_env[1]),
             "host-env    [workflow] commands receive GPUS (optional) besides PATH, HOME, LANG, \
-             TMPDIR"
+             TMPDIR, CRUCIBLE_RUN_NAME, CRUCIBLE_RUN_DISPLAY_NAME, CRUCIBLE_UI_BASE_URL"
         );
         assert_eq!(
             serde_json::to_value(&declared_env[0]).unwrap(),

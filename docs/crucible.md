@@ -85,8 +85,11 @@ edition 2. The capability disclosure says so per table: `host-env [judge] comman
 engine's whole environment`.
 
 Under edition 2 the commands get a minimal environment, not the engine's: `PATH`, `HOME`,
-`LANG`, and `TMPDIR`, the variables the engine sets for that command (`CRUCIBLE_BASELINE_*`,
-`CRUCIBLE_BEST_SCORE`, `CRUCIBLE_TOKEN`), and the variables its table declares. The agent can
+`LANG`, `TMPDIR`, the run's identity (`CRUCIBLE_RUN_NAME`, `CRUCIBLE_RUN_DISPLAY_NAME`, and
+`CRUCIBLE_UI_BASE_URL`, when the platform sets them), the variables the engine sets for that
+command (`CRUCIBLE_BASELINE_*`, `CRUCIBLE_BEST_SCORE`, `CRUCIBLE_TOKEN`), and the variables its
+table declares. The pod token and the controller URL it authenticates against are not part of
+the base. The agent can
 edit files a command runs, so nothing else of the engine's environment reaches it: no
 kubeconfig, registry authfile, broker token, or provider key unless you name it.
 
