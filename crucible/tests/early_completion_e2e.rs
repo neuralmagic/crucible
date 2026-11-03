@@ -14,6 +14,7 @@ goal = "sweep the queue"
 [workflow]
 type = "playbook"
 file = "workflow.star"
+env = ["FORGE_STORAGE_ROOT"]
 "#;
 
 fn workflow(check: &str) -> String {

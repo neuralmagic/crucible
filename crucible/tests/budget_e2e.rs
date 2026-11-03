@@ -65,6 +65,7 @@ goal = "audit every target"
 [workflow]
 type = "playbook"
 file = "workflow.star"
+env = ["LEDGER"]
 "#,
             agent.display()
         ),
