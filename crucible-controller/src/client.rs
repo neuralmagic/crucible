@@ -528,6 +528,10 @@ mod tests {
                 "0074_decision_requests.sql",
                 "f8570a13c3269c667da6add411d8927e4b8e4dccc3a629378970528f03f6baff",
             ),
+            (
+                "0075_run_created_at.sql",
+                "02e7fec4d2a7d484c499104de824c36274f508c86bcea83941db70f7e5336baa",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

@@ -863,7 +863,7 @@ pub(crate) async fn fire_due_refreshing(
 mod tests {
     use crate::daemon::queue::DiscoverySource;
     use crate::daemon::queue::{Enqueue, IssueKey};
-    use crate::launches::model::NewPlaybookLaunch;
+    use crate::launches::model::{LaunchFilter, NewPlaybookLaunch};
     use crate::launches::schedules::*;
     use crate::launches::standing::{
         StandingTarget, Unadoptable, clear_owner_signin, require_owner_signin,
@@ -2254,7 +2254,8 @@ mod tests {
         .await?;
         assert_eq!(fired.len(), 1, "{fired:?}");
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(
             launched[0].params,
             serde_json::json!({
@@ -2289,7 +2290,8 @@ mod tests {
         )
         .await?;
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(launched[0].params, params(), "no value, no param");
         Ok(())
     }
@@ -2388,7 +2390,8 @@ mod tests {
         )
         .await?;
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&again[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&again[0]), 10)
+                .await?;
         assert_eq!(launched[0].params["since"], "2026-08-23T11:59:00Z");
         Ok(())
     }
@@ -2533,7 +2536,8 @@ mod tests {
         assert!(row.enabled);
 
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(launched.len(), 1);
         assert_eq!(launched[0].origin, LaunchOrigin::Schedule);
         assert_eq!(launched[0].params, params(), "the stored values launched");
@@ -3188,7 +3192,8 @@ mod tests {
         )
         .await?;
         let launched =
-            crate::launches::store::list_playbook_runs(&pool, Some(&fired[0]), 10).await?;
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
+                .await?;
         assert_eq!(
             launched[0].params.get("since"),
             None,

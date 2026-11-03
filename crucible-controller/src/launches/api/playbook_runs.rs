@@ -3,13 +3,17 @@ use crate::dto::dto;
 
 use crate::api::state::*;
 
-use crate::launches::model::PlaybookRun;
+use crate::launches::model::{LaunchFilter, PlaybookRun};
 
 use crate::launches::one_shots::{CancelOutcome, NewOneShot, OneShot};
 
+use crate::model::{LaunchOrigin, Status};
+
 use crate::playbooks::api::admission::{Admissible, LaunchRequest, admit, decide_launch};
 
-use axum::extract::{Path, State};
+use crate::wire_enum::parse_opt;
+
+use axum::extract::{Path, Query, State};
 
 use axum::http::StatusCode;
 
@@ -19,10 +23,10 @@ use serde::{Deserialize, Serialize};
 
 use utoipa::ToSchema;
 
-// --- the one-shot runs surface (ad-hoc launches; a schedule's firings are the schedules') ------
+// --- the runs surface: every launch, whatever authorized it ------------------------------------
 
-/// One ad-hoc launch: the authorization it froze (a relaunch prefills from `params` and the
-/// ceilings), what the run did, and what it cost.
+/// One launch: the authorization it froze (a relaunch prefills from `params` and the ceilings),
+/// what the run did, and what it cost.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PlaybookRunDto {
     /// The issue key the run is tracked under.
@@ -116,20 +120,61 @@ impl From<PlaybookRun> for PlaybookRunDto {
 /// How many launches the runs list returns.
 const RUNS_LIMIT: i64 = 200;
 
-/// `GET /api/playbook-runs` — the one-shot runs section: every ad-hoc launch with its frozen
-/// snapshot, ceilings, outcome, and cost, newest first. A schedule's firings are left out; they
-/// belong to the schedules surface, and downstream the rows are identical anyway.
+/// The raw `GET /api/playbook-runs` query string. Each set value narrows by exact match.
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct PlaybookRunsQuery {
+    status: Option<String>,
+    playbook: Option<String>,
+    origin: Option<String>,
+    schedule: Option<String>,
+}
+
+impl PlaybookRunsQuery {
+    /// Parse into the store's filter, or a bad value's message (a 400). An empty value is no
+    /// filter.
+    fn into_filter(self) -> Result<LaunchFilter, String> {
+        Ok(LaunchFilter {
+            key: None,
+            status: parse_opt::<Status>(self.status.as_deref())?,
+            playbook: self.playbook.filter(|p| !p.is_empty()),
+            origin: parse_opt::<LaunchOrigin>(self.origin.as_deref())?,
+            schedule: self.schedule.filter(|s| !s.is_empty()),
+        })
+    }
+}
+
+/// `GET /api/playbook-runs` — every launch with its frozen snapshot, ceilings, outcome, and cost,
+/// newest first, whatever authorized it.
 #[utoipa::path(
     get,
     path = "/api/playbook-runs",
-    responses((status = 200, description = "Ad-hoc playbook launches", body = Vec<PlaybookRunDto>))
+    params(
+        ("status" = Option<String>, Query, description = "Only launches whose issue is in this status"),
+        ("playbook" = Option<String>, Query, description = "Only launches of this playbook id"),
+        ("origin" = Option<String>, Query, description = "Only launches from this origin (manual|deferred|schedule|draft|watch|webhook)"),
+        ("schedule" = Option<String>, Query, description = "Only launches belonging to this schedule id"),
+    ),
+    responses(
+        (status = 200, description = "Playbook launches", body = Vec<PlaybookRunDto>),
+        (status = 400, description = "Invalid query parameters", body = ErrorBody)
+    )
 )]
 pub(crate) async fn list_playbook_runs(
     State(state): State<ApiState>,
-) -> Result<Json<Vec<PlaybookRunDto>>, AppError> {
+    Query(q): Query<PlaybookRunsQuery>,
+) -> Result<Response, AppError> {
+    let filter = match q.into_filter() {
+        Ok(filter) => filter,
+        Err(msg) => return Ok(bad_request(msg)),
+    };
     let rows =
-        crate::launches::store::list_playbook_runs(state.db.pool(), None, RUNS_LIMIT).await?;
-    Ok(Json(rows.into_iter().map(PlaybookRunDto::from).collect()))
+        crate::launches::store::list_playbook_runs(state.db.pool(), &filter, RUNS_LIMIT).await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(PlaybookRunDto::from)
+            .collect::<Vec<_>>(),
+    )
+    .into_response())
 }
 
 /// Where a launch's engine is. A launch is authorized, then dispatched; nothing else stands
@@ -215,7 +260,9 @@ pub(crate) async fn get_playbook_run(
     State(state): State<ApiState>,
     Path(key): Path<String>,
 ) -> Result<Response, AppError> {
-    let rows = crate::launches::store::list_playbook_runs(state.db.pool(), Some(&key), 1).await?;
+    let rows =
+        crate::launches::store::list_playbook_runs(state.db.pool(), &LaunchFilter::key(&key), 1)
+            .await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(not_found(format!("no playbook launch {key:?}")));
     };

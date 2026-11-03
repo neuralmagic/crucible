@@ -242,6 +242,8 @@ pub struct Run {
     pub(crate) session_uri: Option<String>,
     pub best_score: Option<f64>,
     pub cost_usd: Option<f64>,
+    /// When the row was first recorded, RFC3339 UTC. The completion upsert never moves it.
+    pub created_at: String,
     /// The sandbox image the run was preflighted on (C-IDENTITY). Written once at dispatch.
     #[sqlx(flatten)]
     pub image: RunImage,
@@ -311,9 +313,7 @@ pub struct TaskResult {
     pub output: Option<serde_json::Value>,
 }
 
-/// The sort column for `GET /api/runs` (the leaderboard). `Created` orders by `run_id`, whose
-/// leading `YYYYMMDDTHHMMSSZ` stamp is the run's creation time — reverse-lexical puts the newest
-/// run on top (there is no `created_at` column on `runs`; the id carries the time).
+/// The sort column for `GET /api/runs` (the leaderboard).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, strum::EnumIter)]
 pub enum RunSort {
     BestScore,
@@ -329,8 +329,7 @@ impl RunSort {
         match self {
             RunSort::BestScore => "r.best_score",
             RunSort::Cost => "r.cost_usd",
-            // The id is time-first, so lexical order == chronological order.
-            RunSort::Created => "r.run_id",
+            RunSort::Created => "r.created_at",
         }
     }
 }
@@ -362,7 +361,7 @@ wire_enum!(RunKindFilter, "run kind", both, {
 });
 
 /// One leaderboard row: a `runs` row joined out to the issue key + repo it belongs to (via
-/// `runs.scope → scopes.issue → issues.repo`), with the creation stamp derived from the run id.
+/// `runs.scope → scopes.issue → issues.repo`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunRow {
     pub(crate) run_id: String,
@@ -377,31 +376,7 @@ pub struct RunRow {
     pub(crate) pr_url: Option<String>,
     /// Task attempts that ended `transport`: lost to infrastructure, not to a verdict.
     pub(crate) transport_losses: i64,
-    /// `YYYYMMDDTHHMMSSZ` parsed off the run id (an ISO-ish RFC3339 UTC stamp), or `None` when the
-    /// id isn't a time-first run id (a bare local goal-slug id).
-    pub(crate) created: Option<String>,
-}
-
-/// Parse the leading `YYYYMMDDTHHMMSSZ` stamp of a time-first run id into an RFC3339 UTC timestamp
-/// (`YYYY-MM-DDTHH:MM:SSZ`), or `None` when the id doesn't start with one.
-pub(crate) fn run_id_created(run_id: &str) -> Option<String> {
-    let b = run_id.as_bytes();
-    if b.len() < 16 || b[8] != b'T' || b[15] != b'Z' {
-        return None;
-    }
-    let digits = |r: std::ops::Range<usize>| run_id[r].bytes().all(|c| c.is_ascii_digit());
-    if !digits(0..8) || !digits(9..15) {
-        return None;
-    }
-    Some(format!(
-        "{}-{}-{}T{}:{}:{}Z",
-        &run_id[0..4],
-        &run_id[4..6],
-        &run_id[6..8],
-        &run_id[9..11],
-        &run_id[11..13],
-        &run_id[13..15],
-    ))
+    pub(crate) created_at: String,
 }
 
 /// Task-name fragments that mark the step spending an output of a given kind; a compiled plan

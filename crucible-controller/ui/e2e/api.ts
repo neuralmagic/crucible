@@ -83,6 +83,7 @@ const RUNS = [
     score_series: [358, 341, 327, 318, 299, 288, 270],
     identity_digest: 'sha256:aaaa',
     pod: 'work-0412',
+    created: '2026-08-24T09:10:00Z',
   },
   {
     run_id: 'RUN-0411',
@@ -97,6 +98,7 @@ const RUNS = [
     score_series: [358, 340, 318, 295, 271, 254, 241, 234],
     identity_digest: 'sha256:bbbb',
     pod: null,
+    created: '2026-08-23T18:40:00Z',
   },
   {
     run_id: 'RUN-0408',
@@ -111,6 +113,7 @@ const RUNS = [
     score_series: [412, 405, 398, 401, 410, 418],
     identity_digest: null,
     pod: null,
+    created: '2026-08-21T07:30:00Z',
   },
 ];
 
@@ -524,7 +527,7 @@ export const PACK_IMPORT = {
   resolved_at: null,
 };
 
-/** One ad-hoc launch, shared by the runs rail's list and the launch view's by-key read. */
+/** One form launch, shared by the runs rail's list and the launch view's by-key read. */
 export const PLAYBOOK_RUN = {
   key: 'playbook:survey:0199',
   playbook: 'survey',
@@ -547,6 +550,32 @@ export const PLAYBOOK_RUN = {
   created_by: 'wren',
   created_at: '2026-08-21T09:00:00Z',
 };
+
+/** The runs list, newest first; one of them a schedule's firing. */
+const PLAYBOOK_RUNS = [
+  { ...PLAYBOOK_RUN, key: 'playbook:triage:0201', playbook: 'triage', status: 'running', cost_usd: 0.42, created_by: 'kylesayrs', created_at: '2026-08-24T11:40:00Z' },
+  {
+    ...PLAYBOOK_RUN,
+    key: 'playbook:survey:0197',
+    status: 'parked',
+    cost_usd: null,
+    runs: 0,
+    parked_reason: 'secrets: the pack declares secret pr_token, and repo neuralmagic/crucible has no binding for it',
+    created_at: '2026-08-24T09:00:00Z',
+  },
+  {
+    ...PLAYBOOK_RUN,
+    key: 'playbook:survey:0198',
+    origin: 'schedule',
+    schedule: 'sch-0001',
+    advance_dedupe: true,
+    cost_usd: 3.1,
+    created_at: '2026-08-22T06:00:00Z',
+  },
+  PLAYBOOK_RUN,
+  { ...PLAYBOOK_RUN, key: 'playbook:studio:0196', playbook: 'studio', origin: 'draft', draft_version: 3, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+  { ...PLAYBOOK_RUN, key: 'playbook:studio:0195', playbook: 'studio', origin: 'draft', draft_version: 2, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
+];
 
 const TEAMS = [
   {
@@ -1035,21 +1064,7 @@ export const ROUTES: Record<string, Json> = {
     },
     runs: [],
   },
-  '/api/playbook-runs': [
-    { ...PLAYBOOK_RUN, key: 'playbook:triage:0201', playbook: 'triage', status: 'running', cost_usd: 0.42, created_by: 'kylesayrs', created_at: '2026-08-24T11:40:00Z' },
-    {
-      ...PLAYBOOK_RUN,
-      key: 'playbook:survey:0197',
-      status: 'parked',
-      cost_usd: null,
-      runs: 0,
-      parked_reason: 'secrets: the pack declares secret pr_token, and repo neuralmagic/crucible has no binding for it',
-      created_at: '2026-08-24T09:00:00Z',
-    },
-    PLAYBOOK_RUN,
-    { ...PLAYBOOK_RUN, key: 'playbook:studio:0196', playbook: 'studio', origin: 'draft', draft_version: 3, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
-    { ...PLAYBOOK_RUN, key: 'playbook:studio:0195', playbook: 'studio', origin: 'draft', draft_version: 2, status: 'parked', parked_reason: 'dispatch failed', cost_usd: null, runs: 0 },
-  ],
+  '/api/playbook-runs': PLAYBOOK_RUNS,
   '/api/turns': [],
   '/api/whoami': {
     user: 'wren',
@@ -1530,6 +1545,11 @@ export async function stubApi(page: Page): Promise<void> {
           contentType: 'application/json',
           body: JSON.stringify(proposed),
         });
+      }
+      if (path === '/api/playbook-runs') {
+        const schedule = new URL(route.request().url()).searchParams.get('schedule');
+        const rows = schedule ? PLAYBOOK_RUNS.filter((row) => row.schedule === schedule) : PLAYBOOK_RUNS;
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(rows) });
       }
       const body = ROUTES[path] ?? fallback(path);
       return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
