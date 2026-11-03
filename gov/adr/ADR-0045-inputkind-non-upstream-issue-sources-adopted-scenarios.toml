@@ -11,7 +11,7 @@ refs = ["ADR-0043", "ADR-0044"]
 context = """
 Related: [[ADR-0043]] (triage/autopilot; `InputKind` is the source-shape
 this discovery pipeline was built around), [[ADR-0044]] (the
-`issues` table this adds a discriminant column to), [ADR-0014](./0014-scoping-pipeline.md) (the
+`issues` table this adds a discriminant column to), [[ADR-0012]] (the
 `--issue`/`--goal-file` ingest arms a scenario's goal text rides).
 
 `crucible-controller` discovers work from one source: GitHub issues. Every reconcile gate — rank

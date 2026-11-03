@@ -5,7 +5,7 @@ domain. The engine implements it, and a domain satisfies it. A minimal fake doma
 (`examples/counter/`) tests it end to end without EPP and without a cluster.
 
 Concept: [The loop in one read](./crucible.md).
-Trust line (engine hands the agent a World, never a Judge): [ADR 0001](./adr/0001-adaptive-harness.md).
+Trust line (engine hands the agent a World, never a Judge): [ADR-0001](./adr/ADR-0001.md).
 
 > **Contract status: NORMATIVE.** Words like *must* / *exactly one* are binding. The engine
 > and every domain (EPP included) conform to this; tests assert it.
@@ -78,7 +78,7 @@ direction   = "lower"                         # lower | higher. REQUIRED.
 tiebreak_direction = "lower"                  # optional; direction of the `tiebreak` scalar (§4). default: direction
 objective   = "score"                         # display label (the old `gate` name). default "score"
 
-[judge.selftest]                              # optional (ADR-0014 S1). Runs in `crucible check`, never in a loop iteration.
+[judge.selftest]                              # optional (ADR-0012). Runs in `crucible check`, never in a loop iteration.
 good_cmd = "..."                              # stages a known-good config in the workspace
 bad_cmd  = "..."                              # stages a known-bad config in the workspace
 runs     = 1                                  # measurements averaged per control. default 1
@@ -133,7 +133,7 @@ Rules:
   variant's graph, so a broken variant fails whichever one runs. A resume must name the variant
   the run started with. A composite manifest declares no variants.
 
-### 1.1 The gate self-test (`crucible check`, ADR-0014 S1)
+### 1.1 The gate self-test (`crucible check`, ADR-0012)
 
 `[judge.selftest]` declares two controls the gate must tell apart before it's trusted. `crucible
 check` (§9) runs it pre-loop, never inside a loop iteration:
@@ -559,7 +559,7 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
 Between "the agent edited a file" and "`measure_cmd` read a score" sits a step whose shape you must
 choose when you design a pack. It differs **per component**, it is the dominant term in
 per-iteration wall-clock, and picking it wrong fails silently. Full rationale in
-[ADR-0020](./adr/0020-candidate-build-modes.md).
+[ADR-0016](./adr/ADR-0016.md).
 
 | Mode | When it applies | What `apply_cmd` does | Cost |
 | --- | --- | --- | --- |
@@ -734,7 +734,7 @@ binaries included. This is the only way to subtract a default, and it is require
   not be polluted by the open web has to drop that endpoint, and dropping it means opting out.
 
 The broker endpoint is **auto-appended** by the engine when `[agent.broker].enabled` is true
-(ADR-0019 P2). The engine first resolves the broker URL (an explicit `[agent.broker].url`
+(ADR-0015). The engine first resolves the broker URL (an explicit `[agent.broker].url`
 override, or derived from the active compute driver's hostname), then derives the egress
 `host:port:full` entry from that URL's authority. When no explicit port is present, the scheme
 default applies (`http` = 80, `https` = 443). Both values come from the same resolved URL, so
@@ -1019,13 +1019,13 @@ noted here tersely so this doc stays the map of what's authoritative:
   is reachable by the agent's own edits: a `measure_cmd` token pointing inside the workspace with
   no matching frozen inject). Exit nonzero with findings on failure; warnings never fail it.
 - **`crucible scope --pack <dir> [--issue owner/repo#N | --goal-file <f>] [--force] [--json]`**
-  (ADR-0014 S0): pipeline over a hand-written domain pack. **resolve** the goal (from `--issue`,
+  (ADR-0012): pipeline over a hand-written domain pack. **resolve** the goal (from `--issue`,
   fetched natively from the GitHub REST API (honors `GITHUB_TOKEN`/`GH_TOKEN` and
   `GITHUB_API_URL`), or `--goal-file`, or the pack's own `[agent].goal`/`goal_file`),
   then **validate** (`crucible check`, as a library call), then **freeze** (writes `SCOPE.md` in
   the pack dir with the goal, the check outcome, and the pack's `RunIdentity` digest). Stops at
   the first failing stage. `S2` (propose)/`S3` (preflight)/`S4` (approval) are listed in
-  `SCOPE.md` as pending, see [ADR 0014](./adr/0014-scoping-pipeline.md). A `--goal-file`'s text is
+  `SCOPE.md` as pending, see [ADR-0012](./adr/ADR-0012.md). A `--goal-file`'s text is
   goal framing under the same de-prescription rules as a `--issue`'s title/body: the problem for
   the pack-designing agent to solve, never a solution. §8's `_controls`/self-test strip at
   freeze applies identically regardless of which arm sourced the goal.

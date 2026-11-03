@@ -8,12 +8,12 @@ date = "2026-06-28"
 
 [content]
 context = """
-Related: [ADR-0004](./0004-core-loop-state-model.md) (the multi-iteration loop + git memory this
-orchestrates), [ADR-0003](./0003-async-approval-waits.md) (the draft-PR *watch* that already fires a
-re-scope on a human PR action — the foundation for the feedback edge), [ADR-0002](./0002-mediated-provisioning-mcp.md)
-(the broker + control bridge the controller drives), [ADR-0005](./0005-engine-side-builds.md) /
-[ADR-0009](./0009-composite-domains.md) (deploy-to-rank: a kept composite candidate is a tuple of
-per-component edits, published as a *set of linked* PRs), [ADR-0010](./0010-candidate-portfolios-and-search.md)
+Related: [[ADR-0004]] (the multi-iteration loop + git memory this
+orchestrates), [[ADR-0003]] (the draft-PR *watch* that already fires a
+re-scope on a human PR action — the foundation for the feedback edge), [[ADR-0002]]
+(the broker + control bridge the controller drives), [[ADR-0005]] /
+[[ADR-0009]] (deploy-to-rank: a kept composite candidate is a tuple of
+per-component edits, published as a *set of linked* PRs), [[ADR-0010]]
 (a portfolio of such candidates — the controller is what would drive a portfolio without a human babysitting).
 
 The composite P/D rollout-protection loop works end-to-end (ADR-0009 + the mediated composite deploy): the
@@ -99,7 +99,7 @@ consequences = """
   small `autoresearch` wrapper binary). The three defects above are fixed at their source rather than worked
   around per run.
 - **Reviewability stays first-class.** Every candidate is a draft PR; every refinement is a push to that PR;
-  every keep/discard decision is visible. This is the [ADR-0010](./0010-candidate-portfolios-and-search.md)
+  every keep/discard decision is visible. This is the [[ADR-0010]]
   "reviewable candidate" contract, now with a feedback channel.
 - **Composite-aware.** A kept composite candidate is a *set* of linked PRs (ADR-0009); a reviewer comment on
   one repo's PR can steer a cross-cut refinement that touches both. The controller keeps the set linked.

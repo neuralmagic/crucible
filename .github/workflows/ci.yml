@@ -247,10 +247,18 @@ jobs:
           repo: govctl-org/govctl
           tag: latest
 
-      - name: Rendered RFCs match the governance source
+      - name: Rendered RFCs and ADRs match the governance source
         run: |
           govctl render rfc
-          git diff --exit-code docs/rfc
+          govctl render adr
+          if [ -n "$(git status --porcelain -- docs/rfc docs/adr)" ]; then
+            git status --short -- docs/rfc docs/adr
+            git diff -- docs/rfc docs/adr
+            exit 1
+          fi
+          for f in docs/adr/ADR-*.md; do
+            grep -qF "(./${f#docs/})" docs/SUMMARY.md || { echo "$f is not listed in docs/SUMMARY.md"; exit 1; }
+          done
 
       - name: Start Postgres
         uses: ./.github/actions/postgres

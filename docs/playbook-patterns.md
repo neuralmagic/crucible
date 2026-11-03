@@ -233,7 +233,7 @@ platform or for one domain. The default names an OpenAI provider (which uses `gp
 the default names no model) or a custom provider with protocol `decisions` or `system_one`.
 Every playbook launch then gets this binding and the provider key, together with the binding
 of its agent
-([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)).
+([ADR-0065](./adr/ADR-0065.md)).
 A controller that you start with `just controller-local` does not read secret values. It
 passes its own `CRUCIBLE_*` variables to the runs that it launches. Export
 `CRUCIBLE_INFERENCE` before you start it, and give the key variable the same prefix

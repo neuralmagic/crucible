@@ -6,17 +6,17 @@ depend on a domain. A *domain* is a problem packaged for the loop. For a graph t
 time and ships, see [Your first playbook](./playbooks.md).
 
 This page describes the system in general concepts. Then it shows how the
-`examples/counter` domain maps to those concepts. [ADR 0001](./adr/0001-adaptive-harness.md)
+`examples/counter` domain maps to those concepts. [ADR-0001](./adr/ADR-0001.md)
 gives the reason that the judge is frozen.
 
 > **Scope.** The core is the engine, the `World`/`Judge` boundary, `CommandWorld` and
 > `CommandJudge`, and the `crucible.toml` manifest. A **composite** manifest
-> ([ADR 0009](./adr/0009-composite-domains.md)) runs the engine across more than one
+> ([ADR-0009](./adr/ADR-0009.md)) runs the engine across more than one
 > component. Around the loop there are: provisioning and issue-tracker grounding through an
-> MCP broker ([ADR 0002](./adr/0002-mediated-provisioning-mcp.md)), a profiler over MCP
-> ([ADR 0006](./adr/0006-profiling-over-mcp.md)), build and deploy in the engine
-> ([ADR 0005](./adr/0005-engine-side-builds.md)) with rendered deployment manifests
-> ([ADR 0012](./adr/0012-rendered-deployments.md)), and publish-on-keep with a draft PR for
+> MCP broker ([ADR-0002](./adr/ADR-0002.md)), a profiler over MCP
+> ([ADR-0006](./adr/ADR-0006.md)), build and deploy in the engine
+> ([ADR-0005](./adr/ADR-0005.md)) with rendered deployment manifests
+> ([ADR-0011](./adr/ADR-0011.md)), and publish-on-keep with a draft PR for
 > each fork. Authorized review comments on the PR steer the run again.
 
 ## Summary
@@ -53,7 +53,7 @@ flowchart LR
 - **remember**: kept states are Git commits. Each step is an NDJSON event.
 
 By default, the loop has one candidate in each iteration. A **wide round**
-([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)) can first run `N` independent
+([ADR-0010](./adr/ADR-0010.md)) can first run `N` independent
 propose turns in parallel, each biased to a different `[search].approaches` entry. The same
 Judge ranks them, and the winner is the start point of the loop. With `--wide 0` (the
 default), there is no wide round. The wide round is a step before the loop and does not
@@ -170,11 +170,11 @@ The engine reads only the JSON verdict, so all languages work the same way.
 | **Durable run state** | `[cluster] state_pvc` mounts a claim over the `state/` directory of the domain. A replacement pod resumes the run (loop or playbook) and does not start it again. A named (shared) claim uses a `state/<run>` subPath for each run and needs RWX. A `[cluster.state_pvc]` table creates a dedicated `<run>-state` claim, mounted at its root. | `deploy/profile.rs`, `deploy/render/kube.rs` |
 | **Provisioning** | MCP broker. The agent sends requests, and the host keeps the credentials (GPU capture, issue-tracker grounding, draft PRs). | `crucible-broker` (ADR-0002) |
 | **Profiler** | Profiling over MCP: pprof for a Go service, GPU traces for a model server. | `crucible-broker::profile` (ADR-0006) |
-| **Build and deploy** | Build in the engine. `crucible deploy render` writes digest-pinned loop and deployment manifests. | `forge`, `crucible/src/deploy/` (ADR-0005 / 0012) |
+| **Build and deploy** | Build in the engine. `crucible deploy render` writes digest-pinned loop and deployment manifests. | `forge`, `crucible/src/deploy/` (ADR-0005 / 0011) |
 | **Publish** | Publish-on-keep to S3 and a draft PR for each fork. Authorized review comments steer the run again. | `crucible/src/runloop/publish.rs`, `crucible-broker::draft_pr` |
-| **Search (wide round)** | Optional N parallel propose turns before the deep loop. The same Judge ranks them ([ADR 0010](./adr/0010-candidate-portfolios-and-search.md)). | `crucible/src/runloop/graph.rs` (`wide_template`) |
+| **Search (wide round)** | Optional N parallel propose turns before the deep loop. The same Judge ranks them ([ADR-0010](./adr/ADR-0010.md)). | `crucible/src/runloop/graph.rs` (`wide_template`) |
 | **Self-test** | Before a run uses the Judge, `crucible check` proves that the Judge can tell a known-good configuration from a known-bad one. | `[judge.selftest]`, `crucible/src/cli/selftest.rs` |
-| **Setup** | `crucible init` creates a manifest and a measure script in an existing repository. `crucible check` validates it without an agent turn. `crucible scope` reads a goal and freezes a `SCOPE.md` (ADR-0014 S0). | `crucible/src/cli/init.rs`, `crucible/src/cli/check.rs`, `crucible-contract/src/scope.rs` |
+| **Setup** | `crucible init` creates a manifest and a measure script in an existing repository. `crucible check` validates it without an agent turn. `crucible scope` reads a goal and freezes a `SCOPE.md` (ADR-0012). | `crucible/src/cli/init.rs`, `crucible/src/cli/check.rs`, `crucible-contract/src/scope.rs` |
 | **Preflight** | Runs the rung ladder of the domain against the unmodified tree before iteration 1. A failure stops the run. The optional baseline rung sets `segment.baseline_score`. | `[preflight]`, `crucible/src/runloop/preflight.rs` |
 
 The control plane (`crucible-controller`) is optional. It finds candidate issues, scopes
@@ -235,7 +235,7 @@ baseline = "python3 tools/gate.py --only-rung 3 --digest {digest}"
   `[composite]` table that references the component domain directories (used without
   change), a `CompositeWorld` (a tuple of Git overlays, one for each component, and the live
   deployment), and one combined gate over the full stack. The engine does not change. It runs
-  a *list* of workspaces ([ADR 0009](./adr/0009-composite-domains.md)).
+  a *list* of workspaces ([ADR-0009](./adr/ADR-0009.md)).
 - **New frontend:** implement `Reporter`.
 - **New agent transport:** add an `AgentSource`.
 
@@ -294,7 +294,7 @@ Some work has no objective to score, for example "consolidate the open dependabo
 usual (sandbox, broker, session log, publish, resume), with the built-in `TaskJudge`, which
 keeps everything. There is no baseline measure and no score. The engine keeps and snapshots
 every completed turn. The run exits with status 0 when no iterations remain
-([ADR-0026](./adr/0026-no-judge-task-lane.md)).
+([ADR-0021](./adr/ADR-0021.md)).
 
 ```toml
 [repo]

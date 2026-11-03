@@ -55,7 +55,7 @@ states. A domain that changes state outside Git (like on the cluster itself) can
 
 The manifest, the judge, and the frozen injected evaluation files make up the evaluation
 boundary. The [implementation contract](docs/crucible-contract.md) gives the normative
-behavior. [ADR-0001](docs/adr/0001-adaptive-harness.md) gives the trust model.
+behavior. [ADR-0001](docs/adr/ADR-0001.md) gives the trust model.
 
 ## The control plane
 
@@ -114,7 +114,7 @@ Crucible's executor has properties that neither system provides:
 - **Cost is an input.** `budget.usd` limits a plan and `--max-cost` limits a run. Spend
   accumulates per attempt, and a spent budget is a terminal state.
 - **An agent turn runs in a sandbox, not a graph pod.** The agent backend owns the sandbox
-  ([ADR-0019](docs/adr/0019-openshell-kubernetes-driver.md)). The graph runner does not
+  ([ADR-0015](docs/adr/ADR-0015.md)). The graph runner does not
   create a container for the turn.
 
 ## Requirements

@@ -27,7 +27,7 @@ relays the key into the sandbox. The environment selects the API of the turn:
 
 With a controller, these values come from the agent binding of the run in
 `CRUCIBLE_INFERENCE`. The controller renders the binding from the provider of the launch
-([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)).
+([ADR-0065](./adr/ADR-0065.md)).
 The engine sets the variables in the sandbox from the endpoint, protocol, and key of the
 binding. A custom provider with the `chat_completions` protocol becomes `OPENAI_BASE_URL` and
 `OPENAI_API_KEY`. If a turn has neither key, the engine rejects it before the sandbox starts.
