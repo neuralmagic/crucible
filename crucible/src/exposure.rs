@@ -39,6 +39,9 @@ pub enum Capability {
     McpServer { name: String, bin: String },
     /// Whether the pack runs commands outside the sandbox, which hold their executor's reach.
     ExternalCommands { present: bool },
+    /// Variables of the engine's environment a manifest table passes to its commands outside
+    /// the sandbox, beyond the base every such command gets.
+    HostEnv { table: String, names: Vec<String> },
     /// A named `[agent.sandbox]` and what it provisions: its image, the declared secrets and
     /// relay files passed in, broker reach, and the egress it adds after the pack's deny list.
     Sandbox {
@@ -118,6 +121,7 @@ pub fn capabilities(m: &Manifest) -> Vec<Capability> {
     if runs_external_commands(m) {
         out.push(Capability::ExternalCommands { present: true });
     }
+    out.extend(host_env(m));
     out.extend(sandboxes(&m.agent));
     out
 }
@@ -314,6 +318,29 @@ fn runs_external_commands(m: &Manifest) -> bool {
             .is_some_and(crate::plan::workflow::WorkflowCfg::runs_host_commands)
 }
 
+/// What each manifest table passes to its commands from the engine's environment, for the
+/// tables that declare anything.
+fn host_env(m: &Manifest) -> impl Iterator<Item = Capability> + '_ {
+    let empty: &[crate::host_env::EnvName] = &[];
+    [
+        (
+            "[judge]",
+            m.judge.as_ref().map_or(empty, |j| j.env.as_slice()),
+        ),
+        ("[world]", m.world.env.as_slice()),
+        (
+            "[workflow]",
+            m.workflow.as_ref().map_or(empty, |w| w.env.as_slice()),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, names)| !names.is_empty())
+    .map(|(table, names)| Capability::HostEnv {
+        table: table.to_owned(),
+        names: names.iter().map(ToString::to_string).collect(),
+    })
+}
+
 /// The grants a resolved disclosure covers, by kind. A grant supplied from outside the pack (a
 /// secret binding at launch, a relayed credential) is covered when a disclosed capability of the
 /// same kind has reach equal to or broader than the grant's; for a named credential or a relay
@@ -452,6 +479,13 @@ fn render_capability(cap: &Capability) -> String {
         }
         Capability::ExternalCommands { present: false } => {
             "external    no commands run outside the sandbox".to_string()
+        }
+        Capability::HostEnv { table, names } => {
+            format!(
+                "host-env    {table} commands receive {} besides {}",
+                names.join(", "),
+                crate::host_env::BASE.join(", ")
+            )
         }
         Capability::Sandbox {
             name,
@@ -700,6 +734,31 @@ mod tests {
                 .iter()
                 .any(|c| matches!(c, Capability::ExternalCommands { .. })),
             "a pack with no host-side commands makes no such statement"
+        );
+    }
+
+    /// A variable a table passes to its host-side commands is reach those commands hold, so it
+    /// is disclosed by table; a table that declares nothing adds no entry.
+    #[test]
+    fn declared_host_variables_are_disclosed_by_table() {
+        let m = manifest(&format!(
+            "{OPENSHELL}\n[world]\napply_cmd = \"./apply.sh\"\nenv = [\"KUBECONFIG\", \"KUBE_NAMESPACE\"]\n"
+        ));
+        let declared: Vec<Capability> = capabilities(&m)
+            .into_iter()
+            .filter(|c| matches!(c, Capability::HostEnv { .. }))
+            .collect();
+        assert_eq!(
+            declared,
+            [Capability::HostEnv {
+                table: "[world]".into(),
+                names: vec!["KUBECONFIG".into(), "KUBE_NAMESPACE".into()],
+            }]
+        );
+        assert_eq!(
+            render_capability(&declared[0]),
+            "host-env    [world] commands receive KUBECONFIG, KUBE_NAMESPACE besides PATH, HOME, \
+             LANG, TMPDIR"
         );
     }
 

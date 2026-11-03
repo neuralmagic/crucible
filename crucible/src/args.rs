@@ -211,6 +211,9 @@ pub(crate) struct Args {
     /// Toolbox exclusions for per-task harness overrides.
     #[arg(skip)]
     pub workflow_toolbox_exclude: Vec<String>,
+    /// What `[workflow].env` passes to `command` and `evaluate` tasks.
+    #[arg(skip)]
+    pub workflow_env: crucible::host_env::HostEnv,
     /// Opt-in: when publish-on-keep opens draft PR(s), spawn a detached `crucible watch-pr` pointed
     /// at them, reseeding this run's `STEER.md` from review comments so the NEXT run picks up feedback
     /// without a human running `watch-pr` by hand. Best-effort: spawn failure only logs (the PR still

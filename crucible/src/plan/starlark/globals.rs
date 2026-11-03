@@ -295,6 +295,7 @@ fn call<'v>(
                         file: None,
                         resolved_from: None,
                         params: BTreeMap::new(),
+                        env: Vec::new(),
                         history_record: None,
                     };
                     workflow.validate()?;

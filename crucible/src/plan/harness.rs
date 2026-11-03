@@ -854,6 +854,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
+                env: args.workflow_env.clone(),
             };
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs, deadline)

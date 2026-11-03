@@ -1171,6 +1171,7 @@ impl Manifest {
         }
         let mut resolved = compiled.workflow;
         resolved.resolved_from = Some(file);
+        resolved.env = workflow.env.clone();
         self.workflow = Some(resolved);
         self.validate()?;
         Ok(())
@@ -1643,6 +1644,48 @@ mod tests {
         assert!(err.to_string().contains("requires a [judge]"), "{err:#}");
     }
 
+    /// A command outside the sandbox gets only what its table declares, so a declared name must
+    /// be one an environment can hold, and a declared variable the engine lacks refuses the run
+    /// rather than letting the command run without it.
+    #[test]
+    fn a_declared_host_variable_must_be_a_name_and_must_be_set() {
+        let judged = |env: &str| {
+            format!(
+                "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = {env}\n[world]\nrestore_cmd = \"r\"\nsnapshot_cmd = \"s\"\nenv = {env}\n"
+            )
+        };
+        let error = toml::from_str::<Manifest>(&judged("[\"KUBE-CONFIG\"]"))
+            .err()
+            .expect("a bad name parsed")
+            .to_string();
+        assert!(
+            error.contains("\"KUBE-CONFIG\" is not an environment variable name"),
+            "{error}"
+        );
+
+        let m: Manifest = toml::from_str(&judged("[\"CRUCIBLE_TEST_NEVER_SET\"]")).expect("parses");
+        let workspace = std::env::temp_dir();
+        let error = m
+            .build_judge(workspace.clone(), Vec::new())
+            .err()
+            .expect("a judge built without its declared variable")
+            .to_string();
+        assert_eq!(
+            error,
+            "[judge].env declares CRUCIBLE_TEST_NEVER_SET, which the engine's environment does \
+             not set"
+        );
+        let error = m
+            .build_world(workspace)
+            .err()
+            .expect("a world built without its declared variable")
+            .to_string();
+        assert!(
+            error.starts_with("[world].env declares CRUCIBLE_TEST_NEVER_SET"),
+            "{error}"
+        );
+    }
+
     /// A manifest may name its source instead of carrying its output. The graph is compiled
     /// on resolve and validated then, so an unresolved manifest is valid and an unreadable
     /// source fails where it is read rather than where it is used.
@@ -1657,7 +1700,7 @@ mod tests {
         )
         .unwrap();
 
-        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
+        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\nenv = [\"GH_TOKEN\"]";
         let mut m: Manifest = toml::from_str(&task_manifest(table)).expect("parses");
         m.validate().expect("an unresolved manifest is valid");
         assert!(
@@ -1669,6 +1712,11 @@ mod tests {
         assert!(!workflow.is_unresolved());
         assert_eq!(workflow.tasks.len(), 1);
         assert_eq!(workflow.tasks[0].name.0, "a");
+        assert_eq!(
+            workflow.env.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
+            ["GH_TOKEN"],
+            "the compiled graph keeps the manifest's declared variables"
+        );
 
         // Resolving again is a no-op, so a caller never has to ask whether it already ran.
         m.resolve_workflow(&dir).expect("idempotent");

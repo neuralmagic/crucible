@@ -313,7 +313,7 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
         }
         return Ok(out);
     };
-    check_measure_once(&judge.measure_cmd, &workspace, &mut out);
+    check_measure_once(&judge.measure_cmd, &judge.env, &workspace, &mut out);
     if let Some(w) = agent_editable_gate_warning(&judge.measure_cmd, &frozen, &workspace) {
         out.warnings.push(w);
     }
@@ -324,7 +324,7 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
         match &judge.selftest {
             Some(cfg) => {
                 let result = (|| -> Result<SelftestReport> {
-                    let world = m.build_world(workspace.clone());
+                    let world = m.build_world(workspace.clone())?;
                     let judge = m.build_judge(workspace.clone(), frozen.clone())?;
                     let direction = m.direction()?;
                     selftest::run(world.as_ref(), judge.as_ref(), &workspace, cfg, direction)
@@ -485,7 +485,7 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
     }
 
     let base = m.base_dir(&manifest_dir);
-    check_measure_once(&m.judge.measure_cmd, &base, &mut out);
+    check_measure_once(&m.judge.measure_cmd, &m.judge.env, &base, &mut out);
     if let Some(f) = unfenced_rig_toolbox_finding(&m.world, &m.agent) {
         out.findings.push(f);
     }
@@ -557,12 +557,23 @@ fn check_referenced_files(m: &Manifest, manifest_dir: &Path, out: &mut CheckOutc
 /// The measure contract, checked directly (not via [`crate::command_judge::CommandJudge`]) so a
 /// nonzero exit and a missing/invalid contract line are reported as distinct findings instead of
 /// collapsing into one opaque `valid: false`.
-fn check_measure_once(measure_cmd: &str, workspace: &Path, out: &mut CheckOutcome) {
-    let output = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(measure_cmd)
-        .current_dir(workspace)
-        .output();
+fn check_measure_once(
+    measure_cmd: &str,
+    declared: &[crucible::host_env::EnvName],
+    workspace: &Path,
+    out: &mut CheckOutcome,
+) {
+    let env = match crucible::host_env::HostEnv::resolve("[judge]", declared) {
+        Ok(env) => env,
+        Err(missing) => {
+            out.findings.push(missing.to_string());
+            return;
+        }
+    };
+    let mut command = std::process::Command::new("sh");
+    command.arg("-c").arg(measure_cmd).current_dir(workspace);
+    env.apply(&mut command);
+    let output = command.output();
     let output = match output {
         Ok(o) => o,
         Err(e) => {

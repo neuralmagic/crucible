@@ -37,6 +37,8 @@ pub struct CommandJudge {
     /// Frozen judge files (absolute `src`, `dst`) re-copied before each scored measure so a candidate
     /// can't edit the gate (a tuning harness, a regression test) to game it. Empty for most domains.
     pub frozen_injects: Vec<(PathBuf, PathBuf)>,
+    /// What `[judge].env` passes to `measure_cmd`.
+    pub env: crate::host_env::HostEnv,
 }
 
 /// The last stdout line that looks like a JSON object (the contract's measurement line).
@@ -59,6 +61,7 @@ impl CommandJudge {
         c.arg("-c")
             .arg(&self.measure_cmd)
             .current_dir(&self.workspace);
+        self.env.apply(&mut c);
         if let Some(s) = ctx.baseline_score {
             c.env("CRUCIBLE_BASELINE_SCORE", s.to_string());
         }
@@ -174,6 +177,7 @@ mod tests {
             tiebreak_direction: None,
             objective: "score".into(),
             frozen_injects: Vec::new(),
+            env: crate::host_env::HostEnv::default(),
         }
     }
 
@@ -193,6 +197,38 @@ mod tests {
             tiebreak,
             ..Default::default()
         }
+    }
+
+    /// `measure_cmd` is pack content the agent may be able to edit, so it gets the base, what
+    /// `[judge].env` declares, and the engine's own scores; an undeclared engine variable is not
+    /// there.
+    #[test]
+    fn measure_sees_only_the_base_its_declared_variables_and_the_engines_scores() {
+        let _guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("CRUCIBLE_TEST_UNDECLARED", "leaked");
+            std::env::set_var("CRUCIBLE_TEST_DECLARED", "passed");
+        }
+        let declared =
+            [crate::host_env::EnvName::try_from("CRUCIBLE_TEST_DECLARED".to_owned()).unwrap()];
+        let judge = CommandJudge {
+            workspace: std::env::temp_dir(),
+            measure_cmd: r#"test -z "$CRUCIBLE_TEST_UNDECLARED" && test "$CRUCIBLE_TEST_DECLARED" = passed && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
+            env: crate::host_env::HostEnv::resolve("[judge]", &declared).unwrap(),
+            ..judge(Direction::Higher)
+        };
+        let reading = judge.measure(&MeasureCtx {
+            baseline_score: None,
+            baseline_total: None,
+            best_score: Some(3.0),
+        });
+        unsafe {
+            std::env::remove_var("CRUCIBLE_TEST_UNDECLARED");
+            std::env::remove_var("CRUCIBLE_TEST_DECLARED");
+        }
+        let reading = reading.unwrap();
+        assert!(reading.valid, "{}", reading.note);
+        assert_eq!(reading.score, Some(3.0));
     }
 
     #[test]

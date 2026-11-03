@@ -34,6 +34,8 @@ pub struct ShellRunner {
     /// Stand-in command for `Agent` tasks (receives the prompt and knobs via env). `None`
     /// means agent tasks are refused: `plan run` without `--agent-cmd` is command-only.
     pub agent_cmd: Option<String>,
+    /// What `[workflow].env` passes to `command` and `evaluate` tasks.
+    pub env: crate::host_env::HostEnv,
 }
 
 impl TaskRunner for ShellRunner {
@@ -85,6 +87,12 @@ impl ShellRunner {
     ) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
+        if matches!(
+            task.task,
+            TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+        ) {
+            self.env.apply(&mut cmd);
+        }
         crate::inference::withhold_from_task(&mut cmd);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
@@ -496,6 +504,7 @@ mod tests {
         ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: None,
+            env: crate::host_env::HostEnv::default(),
         }
     }
 
@@ -576,6 +585,51 @@ mod tests {
             &mut r,
             |_, _| {},
         )
+    }
+
+    /// A command task runs outside the sandbox, so it gets the base and what `[workflow].env`
+    /// declares, plus the variables the engine sets for it; an engine variable nobody declared,
+    /// a credential say, is not there.
+    #[test]
+    fn a_command_task_sees_only_the_base_its_declared_variables_and_the_engines_own() {
+        let _guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("CRUCIBLE_TEST_UNDECLARED", "leaked");
+            std::env::set_var("CRUCIBLE_TEST_DECLARED", "passed");
+        }
+        let declared =
+            [crate::host_env::EnvName::try_from("CRUCIBLE_TEST_DECLARED".to_owned()).unwrap()];
+        let env = crate::host_env::HostEnv::resolve("[workflow]", &declared).unwrap();
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
+            tasks: vec![command(
+                "probe",
+                r#"printf '{"undeclared":"%s","declared":"%s","task":"%s","path":"%s"}\n' "$CRUCIBLE_TEST_UNDECLARED" "$CRUCIBLE_TEST_DECLARED" "$CRUCIBLE_TASK" "$PATH""#,
+                &[],
+            )],
+        }
+        .validate()
+        .unwrap();
+        let mut r = ShellRunner { env, ..runner() };
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        unsafe {
+            std::env::remove_var("CRUCIBLE_TEST_UNDECLARED");
+            std::env::remove_var("CRUCIBLE_TEST_DECLARED");
+        }
+        let probe = out.results[&"probe".into()].output.clone().unwrap();
+        assert_eq!(probe["undeclared"], "", "{probe}");
+        assert_eq!(probe["declared"], "passed", "{probe}");
+        assert_eq!(probe["task"], "probe", "{probe}");
+        assert_ne!(probe["path"], "", "{probe}");
     }
 
     #[test]
@@ -1242,6 +1296,7 @@ mod tests {
         let mut r = ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: Some("true".into()),
+            env: crate::host_env::HostEnv::default(),
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {

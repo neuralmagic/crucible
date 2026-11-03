@@ -29,6 +29,9 @@ pub struct JudgeCfg {
     /// pristine baseline, and the measure path needs the sandbox that isn't up yet.
     #[serde(default)]
     pub skip_baseline: bool,
+    /// Variables of the engine's environment `measure_cmd` receives besides the base.
+    #[serde(default)]
+    pub env: Vec<crate::host_env::EnvName>,
 }
 
 fn default_objective() -> String {

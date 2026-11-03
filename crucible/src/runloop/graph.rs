@@ -1944,7 +1944,7 @@ mod tests {
                 digest: "v2:0".into(),
             },
         };
-        let world = m.build_world(workspace.clone());
+        let world = m.build_world(workspace.clone()).unwrap();
         let judge = m.build_judge(workspace.clone(), Vec::new()).unwrap();
         let r = stream::SessionReporter::stream(&p, report::reporter::RunMeta::from_args(&args))
             .unwrap();

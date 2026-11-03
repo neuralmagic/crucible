@@ -267,11 +267,20 @@ pub struct WorkflowCfg {
     /// Every declared parameter's value as compilation bound it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamValue>,
+    /// Variables of the engine's environment `command` and `evaluate` tasks receive besides the
+    /// base. Manifest-only: a compiled source carries the manifest's across.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<crate::host_env::EnvName>,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }
 
 impl WorkflowCfg {
+    /// What [`WorkflowCfg::env`] passes to the workflow's `command` and `evaluate` tasks.
+    pub fn host_env(&self) -> Result<crate::host_env::HostEnv, crate::host_env::MissingEnv> {
+        crate::host_env::HostEnv::resolve("[workflow]", &self.env)
+    }
+
     /// True while the graph is still a path rather than tasks. The manifest is valid in this
     /// state and the graph is validated once [`WorkflowCfg::file`] has been compiled into it.
     pub fn is_unresolved(&self) -> bool {
