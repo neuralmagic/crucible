@@ -175,7 +175,7 @@ impl ApiState {
 
     /// The trackers a watch may sweep on this controller, built from the same Jira credentials
     /// the adopt path uses.
-    pub(crate) fn trackers(&self) -> crate::launches::tracker::Trackers {
+    pub(crate) fn trackers(&self) -> crate::launches::jira::Trackers {
         crate::launches::jira::trackers(self.jira.clone())
     }
 

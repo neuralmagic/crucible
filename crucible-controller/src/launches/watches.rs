@@ -14,11 +14,12 @@
 //! raced the tracker's watermark slack is re-seen and idempotently skipped.
 
 use crate::client::Db;
+use crate::launches::jira::Trackers;
 use crate::launches::standing::{
     self, Claim, Claimed, Failed, FireError, LaunchTrigger, NewStanding, Recorded, Standing,
     SweepCfg, TriggerFuture,
 };
-use crate::launches::tracker::{TrackerKind, Trackers};
+use crate::launches::tracker::TrackerKind;
 use crate::model::Trigger;
 use anyhow::{Context, Result};
 use jiff::Timestamp;

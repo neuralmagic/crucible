@@ -6,7 +6,6 @@
 //! to the namespaced `issues.key` form that [`crate::issues::model::InputKind::from_parts`] parses back.
 
 use crate::daemon::queue::BoxFuture;
-use crate::launches::jira::JiraTracker;
 use crate::wire_enum::wire_enum;
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -98,23 +97,3 @@ pub(crate) enum TrackerKind {
 wire_enum!(TrackerKind, "tracker", both, {
     TrackerKind::Jira => "jira",
 });
-
-/// The trackers this deployment holds credentials for. A watch save refuses a kind that is not
-/// here, and the sweep skips one that went away.
-#[derive(Clone, Default)]
-pub struct Trackers {
-    pub(crate) jira: Option<JiraTracker>,
-}
-
-impl Trackers {
-    pub(crate) fn get(&self, kind: TrackerKind) -> Option<&JiraTracker> {
-        match kind {
-            TrackerKind::Jira => self.jira.as_ref(),
-        }
-    }
-
-    /// The kinds a watch may name here.
-    pub(crate) fn configured(&self) -> Vec<TrackerKind> {
-        self.jira.iter().map(|_| TrackerKind::Jira).collect()
-    }
-}

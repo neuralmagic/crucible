@@ -16,7 +16,7 @@ use crate::daemon::queue::BoxFuture;
 #[cfg(feature = "autoresearch")]
 use crate::launches::tracker::TrackerIssue;
 use crate::launches::tracker::{
-    EmittedKind, IssueEmitter, NewTrackerIssue, TrackerHit, TrackerQueryError,
+    EmittedKind, IssueEmitter, NewTrackerIssue, TrackerHit, TrackerKind, TrackerQueryError,
 };
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -549,9 +549,29 @@ impl IssueEmitter for JiraEmitter {
     }
 }
 
+/// The trackers this deployment holds credentials for. A watch save refuses a kind that is not
+/// here, and the sweep skips one that went away.
+#[derive(Clone, Default)]
+pub struct Trackers {
+    pub(crate) jira: Option<JiraTracker>,
+}
+
+impl Trackers {
+    pub(crate) fn get(&self, kind: TrackerKind) -> Option<&JiraTracker> {
+        match kind {
+            TrackerKind::Jira => self.jira.as_ref(),
+        }
+    }
+
+    /// The kinds a watch may name here.
+    pub(crate) fn configured(&self) -> Vec<TrackerKind> {
+        self.jira.iter().map(|_| TrackerKind::Jira).collect()
+    }
+}
+
 /// The trackers the controller config carries credentials for: Jira when the `jira_*` trio is
 /// set. Nothing else exists yet.
-pub fn trackers(jira: Option<JiraConfig>) -> crate::launches::tracker::Trackers {
+pub fn trackers(jira: Option<JiraConfig>) -> Trackers {
     let jira = jira.and_then(|cfg| match JiraTracker::new(cfg) {
         Ok(tracker) => Some(tracker),
         Err(e) => {
@@ -562,7 +582,7 @@ pub fn trackers(jira: Option<JiraConfig>) -> crate::launches::tracker::Trackers 
             None
         }
     });
-    crate::launches::tracker::Trackers { jira }
+    Trackers { jira }
 }
 
 #[cfg(test)]
