@@ -140,10 +140,7 @@ pub(crate) fn run_iteration(
         return Err(e);
     }
     let step = match runner.signal.take() {
-        Some(Signal::Discard(reason)) => IterStep::Discarded { reason },
-        Some(Signal::Escalate) => IterStep::Escalated,
-        Some(Signal::Park(pp)) => IterStep::Parked(pp),
-        Some(Signal::Stop) => IterStep::Stopped,
+        Some(step) => step,
         None => match runner.decided.remove(&result_task) {
             Some(d) => IterStep::Decided(Box::new(d)),
             // A pre-gate rejection discards the candidate.
@@ -347,15 +344,6 @@ pub(crate) fn run_epilogue(
     Ok((rows, outcome.spent_usd))
 }
 
-/// What the propose task's post-turn drains decided, parked here for the driver: the
-/// executor only sees pass/fail, the loop control travels out of band.
-enum Signal {
-    Discard(String),
-    Escalate,
-    Park(crate::control::provisioning::PendingProvisioning),
-    Stop,
-}
-
 /// [`TaskRunner`] over the driver's trait objects, armed once per iteration.
 pub(crate) struct LoopTaskRunner<'a> {
     args: Args,
@@ -374,7 +362,9 @@ pub(crate) struct LoopTaskRunner<'a> {
     best_score: f64,
     best_tiebreak: Option<f64>,
     spent_before: f64,
-    signal: Option<Signal>,
+    /// What the propose task's post-turn drains or a failed apply decided, parked here for the
+    /// driver: the executor only sees pass/fail, the loop control travels out of band.
+    signal: Option<IterStep>,
     measured: BTreeMap<TaskName, Measured>,
     decided: BTreeMap<TaskName, Decided>,
     fatal: Option<anyhow::Error>,
@@ -550,7 +540,9 @@ impl<'a> LoopTaskRunner<'a> {
                     "agent turn failed (discarding iter {}): {note}",
                     self.it
                 ));
-                self.signal = Some(Signal::Discard("turn failed".to_string()));
+                self.signal = Some(IterStep::Discarded {
+                    reason: "turn failed".to_string(),
+                });
                 return Attempt::failed(cost, "turn failed; iteration discarded".to_string());
             }
             _ => return attempt,
@@ -563,15 +555,15 @@ impl<'a> LoopTaskRunner<'a> {
         ) {
             TurnVerdict::Proceed => attempt,
             TurnVerdict::Escalate => {
-                self.signal = Some(Signal::Escalate);
+                self.signal = Some(IterStep::Escalated);
                 Attempt::failed(cost, "agent escalated".to_string())
             }
             TurnVerdict::Park(pp) => {
-                self.signal = Some(Signal::Park(pp));
+                self.signal = Some(IterStep::Parked(pp));
                 Attempt::failed(cost, "parked on a pending approval".to_string())
             }
             TurnVerdict::Stop => {
-                self.signal = Some(Signal::Stop);
+                self.signal = Some(IterStep::Stopped);
                 Attempt::failed(cost, "stop signal".to_string())
             }
         }
@@ -586,7 +578,9 @@ impl<'a> LoopTaskRunner<'a> {
                     "apply failed (discarding iter {}): {e:#}",
                     self.it
                 ));
-                self.signal = Some(Signal::Discard(format!("apply failed: {e:#}")));
+                self.signal = Some(IterStep::Discarded {
+                    reason: format!("apply failed: {e:#}"),
+                });
                 Attempt::failed(0.0, format!("apply failed: {e:#}"))
             }
         }
