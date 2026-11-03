@@ -2,7 +2,6 @@
 //! how long it had been running (RFC-0002:C-PLAYBOOK-RESUME).
 
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,7 +9,6 @@ use crucible_contract::session::SessionEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::variant::VariantName;
-use crate::plan::admission::Journal;
 use crate::plan::exec::{
     FanoutSummary, Prior, TaskResult, TaskStatus, UnknownTaskStatus, row_task,
 };
@@ -242,26 +240,6 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
     }
     prior.reserved_usd += held.values().sum::<f64>();
     Ok(prior)
-}
-
-/// The session log as the executor's journal: each attempt is a `task_started` line, synced to
-/// disk before the attempt runs.
-impl Journal for std::fs::File {
-    fn started(&self, task: &TaskName, attempt: u32, estimate_usd: f64) {
-        let mut line = crucible_contract::session::encode(&SessionEvent::TaskStarted {
-            task: task.0.clone(),
-            attempt,
-            estimate_usd,
-        });
-        line.push('\n');
-        let mut file = self;
-        if let Err(error) = file
-            .write_all(line.as_bytes())
-            .and_then(|()| file.sync_data())
-        {
-            tracing::warn!(task = %task, attempt, %error, "journaling an attempt start failed");
-        }
-    }
 }
 
 /// One settled row of a session log as the executor holds it.
@@ -699,7 +677,6 @@ mod tests {
     /// ran; the third resume finds the ceiling spent and blocks the task instead of running it.
     #[test]
     fn a_task_that_kills_its_process_every_attempt_is_stopped_by_the_cost_ceiling() {
-        use crate::plan::admission::Journal;
         use crate::plan::exec::{
             Attempt, AttemptOutcome, ExecCfg, PlanExit, Substrate, TaskRunner, execute,
         };
@@ -782,7 +759,7 @@ mod tests {
                 ExecCfg {
                     prior: prior.as_ref(),
                     width: NonZeroUsize::new(4).unwrap(),
-                    journal: Some(&journal as &dyn Journal),
+                    journal: Some(&journal),
                     ..ExecCfg::default()
                 },
                 &mut runner,

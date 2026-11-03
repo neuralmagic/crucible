@@ -945,9 +945,7 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
-            journal: events
-                .as_ref()
-                .map(|f| f as &dyn crate::plan::admission::Journal),
+            journal: events.as_ref(),
             ..ExecCfg::default()
         },
         runner.as_mut(),

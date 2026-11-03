@@ -3,34 +3,42 @@
 //! partway through rather than after every lane has run.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
+use crucible_contract::session::SessionEvent;
+
 use crate::deadline::{Deadline, RunCeiling};
+use crate::plan::exec::{Attempt, BatchItem};
 use crate::plan::ir::{Task, TaskName};
 use crate::plan::machine::BlockedReason;
 
 /// Lanes of one dispatch in flight at once, unless the executor is configured otherwise.
 pub const DEFAULT_WIDTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
 
-/// What a lane's attempt cost, and the result a lane that panicked settles as.
-pub trait Settled {
-    fn cost_usd(&self) -> f64;
-    fn panicked() -> Self;
+/// Record an attempt in the session log before it runs, synced to disk, so a resumed run can
+/// charge one whose process died before it settled (RFC-0002:C-PLAYBOOK-RESUME).
+fn journal_started(mut journal: &File, task: &TaskName, attempt: u32, estimate_usd: f64) {
+    let mut line = crucible_contract::session::encode(&SessionEvent::TaskStarted {
+        task: task.0.clone(),
+        attempt,
+        estimate_usd,
+    });
+    line.push('\n');
+    if let Err(error) = journal
+        .write_all(line.as_bytes())
+        .and_then(|()| journal.sync_data())
+    {
+        tracing::warn!(task = %task, attempt, %error, "journaling an attempt start failed");
+    }
 }
 
-/// One lane of a batch: the task it runs and which attempt of that task it is.
-pub trait BatchLane {
-    fn task(&self) -> &Task;
-    fn attempt(&self) -> u32;
-}
-
-/// Where an attempt is recorded before it runs, so a resumed run can charge one whose process
-/// died before it settled (RFC-0002:C-PLAYBOOK-RESUME).
-pub trait Journal: Sync {
-    fn started(&self, task: &TaskName, attempt: u32, estimate_usd: f64);
+fn panicked() -> Attempt {
+    Attempt::failed(0.0, "task thread panicked".to_string())
 }
 
 /// What a resumed run charges for an attempt of `task` that started and never settled: nothing
@@ -72,7 +80,7 @@ pub struct Admission<'j> {
     run_ceiling: Option<RunCeiling>,
     width: NonZeroUsize,
     tally: Mutex<Tally>,
-    journal: Option<&'j dyn Journal>,
+    journal: Option<&'j File>,
 }
 
 #[derive(Default)]
@@ -142,7 +150,7 @@ impl<'j> Admission<'j> {
     }
 
     /// Record every admitted lane in `journal` before it runs.
-    pub fn journaled(self, journal: Option<&'j dyn Journal>) -> Self {
+    pub fn journaled(self, journal: Option<&'j File>) -> Self {
         Admission { journal, ..self }
     }
 
@@ -150,8 +158,8 @@ impl<'j> Admission<'j> {
         self.tally.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn admit(&self, lane: &impl BatchLane) -> Result<Lane<'_>, Refusal> {
-        let task = lane.task();
+    fn admit(&self, lane: &BatchItem<'_>) -> Result<Lane<'_>, Refusal> {
+        let task = lane.task;
         if self.run_ceiling.is_some_and(|ceiling| ceiling.reached()) {
             return Err(Refusal::WallClockCeiling);
         }
@@ -166,9 +174,10 @@ impl<'j> Admission<'j> {
         tally.live.insert(id, 0.0);
         drop(tally);
         if let Some(journal) = self.journal {
-            journal.started(
+            journal_started(
+                journal,
                 &task.name,
-                lane.attempt(),
+                lane.attempt,
                 estimate_usd(task, self.budget, self.width),
             );
         }
@@ -180,18 +189,18 @@ impl<'j> Admission<'j> {
     }
 
     /// Count what an admitted lane cost and retire its running figure.
-    fn settle(&self, lane: Lane<'_>, attempt: &impl Settled) {
+    fn settle(&self, lane: Lane<'_>, attempt: &Attempt) {
         let mut tally = self.tally();
         tally.live.remove(&lane.id);
-        tally.settled += attempt.cost_usd();
+        tally.settled += attempt.cost_usd;
     }
 
     /// Run `item` if the ceilings admit it, and count what it cost.
-    pub fn run<A: Settled>(
+    pub fn run(
         &self,
-        item: &impl BatchLane,
-        lane: impl FnOnce(&Lane<'_>) -> A,
-    ) -> Result<A, Refusal> {
+        item: &BatchItem<'_>,
+        lane: impl FnOnce(&Lane<'_>) -> Attempt,
+    ) -> Result<Attempt, Refusal> {
         let admitted = self.admit(item)?;
         let attempt = lane(&admitted);
         self.settle(admitted, &attempt);
@@ -201,21 +210,19 @@ impl<'j> Admission<'j> {
     /// Run every lane of `batch` on at most `width` threads. Lanes are admitted in
     /// batch order as each starts, so once one is refused on cost every later lane that can spend
     /// is too. Results are in batch order. A lane that panics settles as a measured failure.
-    pub fn run_all<I, A, F>(&self, batch: &[I], lane: F) -> Vec<Result<A, Refusal>>
+    pub fn run_all<F>(&self, batch: &[BatchItem<'_>], lane: F) -> Vec<Result<Attempt, Refusal>>
     where
-        I: BatchLane + Sync,
-        A: Settled + Send + Sync,
-        F: Fn(&I, &Lane<'_>) -> A + Sync,
+        F: Fn(&BatchItem<'_>, &Lane<'_>) -> Attempt + Sync,
     {
-        let guarded = |item: &I, admitted: &Lane<'_>| {
+        let guarded = |item: &BatchItem<'_>, admitted: &Lane<'_>| {
             std::panic::catch_unwind(AssertUnwindSafe(|| lane(item, admitted)))
-                .unwrap_or_else(|_| A::panicked())
+                .unwrap_or_else(|_| panicked())
         };
         if let [only] = batch {
             return vec![self.run(only, |admitted| guarded(only, admitted))];
         }
         let next = Mutex::new(0usize);
-        let slots: Vec<OnceLock<Result<A, Refusal>>> =
+        let slots: Vec<OnceLock<Result<Attempt, Refusal>>> =
             batch.iter().map(|_| OnceLock::new()).collect();
         let take = || {
             let mut next = next.lock().unwrap_or_else(PoisonError::into_inner);
@@ -240,7 +247,7 @@ impl<'j> Admission<'j> {
         });
         slots
             .into_iter()
-            .map(|slot| slot.into_inner().unwrap_or_else(|| Ok(A::panicked())))
+            .map(|slot| slot.into_inner().unwrap_or_else(|| Ok(panicked())))
             .collect()
     }
 }
@@ -480,18 +487,25 @@ mod tests {
     /// for it, so a lane the ceiling refused leaves nothing to charge.
     #[test]
     fn an_admitted_lane_is_journaled_before_it_runs_and_a_refused_one_is_not() {
-        #[derive(Default)]
-        struct Recorded(std::sync::Mutex<Vec<(String, u32, f64)>>);
-        impl crate::plan::admission::Journal for Recorded {
-            fn started(&self, task: &crate::plan::ir::TaskName, attempt: u32, estimate_usd: f64) {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((task.0.clone(), attempt, estimate_usd));
-            }
-        }
-        let journal = Recorded::default();
-        let admission = Admission::new(1.0, 0.0, None, width(4)).journaled(Some(&journal));
+        use crucible_contract::session::{SessionEvent, decode};
+
+        let started = |path: &std::path::Path| -> Vec<(String, u32, f64)> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .filter_map(decode)
+                .map(|event| match event {
+                    SessionEvent::TaskStarted {
+                        task,
+                        attempt,
+                        estimate_usd,
+                    } => (task, attempt, estimate_usd),
+                    other => panic!("not a task start: {other:?}"),
+                })
+                .collect()
+        };
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let admission = Admission::new(1.0, 0.0, None, width(4)).journaled(Some(journal.as_file()));
         let audit = agent("audit[a]");
         let apply = command("apply");
         let retried = BatchItem {
@@ -500,11 +514,7 @@ mod tests {
             ..one(&audit)
         };
         let ran = admission.run(&retried, |_| {
-            assert_eq!(
-                journal.0.lock().unwrap().len(),
-                1,
-                "journaled before it ran"
-            );
+            assert_eq!(started(journal.path()).len(), 1, "journaled before it ran");
             costing(1.0)
         });
         assert!(ran.is_ok());
@@ -514,7 +524,7 @@ mod tests {
         );
         assert!(admission.run(&one(&apply), |_| costing(0.0)).is_ok());
         assert_eq!(
-            *journal.0.lock().unwrap(),
+            started(journal.path()),
             [
                 ("audit[a]".to_owned(), 2, 0.25),
                 ("apply".to_owned(), 1, 0.0)

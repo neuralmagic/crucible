@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
-use crate::plan::admission::{Admission, BatchLane, Journal, Refusal, Settled};
+use crate::plan::admission::{Admission, Refusal};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
     COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
@@ -153,26 +153,6 @@ pub struct Attempt {
     pub repairs: Vec<TaskRepair>,
 }
 
-impl Settled for Attempt {
-    fn cost_usd(&self) -> f64 {
-        self.cost_usd
-    }
-
-    fn panicked() -> Self {
-        Attempt::failed(0.0, "task thread panicked".to_string())
-    }
-}
-
-impl BatchLane for BatchItem<'_> {
-    fn task(&self) -> &Task {
-        self.task
-    }
-
-    fn attempt(&self) -> u32 {
-        self.attempt
-    }
-}
-
 impl Attempt {
     pub fn failed(cost_usd: f64, note: String) -> Self {
         Self {
@@ -293,9 +273,9 @@ pub struct ExecCfg<'a> {
     /// How many lanes of one dispatch run at once. It bounds what lanes already in flight can
     /// spend past the cost ceiling.
     pub width: NonZeroUsize,
-    /// Where each attempt is recorded before it runs. `None` records nothing, which a run that
-    /// cannot resume wants.
-    pub journal: Option<&'a dyn Journal>,
+    /// The session log each attempt is recorded in before it runs. `None` records nothing, which
+    /// a run that cannot resume wants.
+    pub journal: Option<&'a std::fs::File>,
 }
 
 impl Default for ExecCfg<'_> {
