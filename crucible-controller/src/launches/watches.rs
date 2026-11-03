@@ -535,7 +535,6 @@ mod tests {
     use crate::launches::jira::{JiraConfig, JiraTracker};
     use crate::model::MaxTime;
     use sqlx::Row;
-    use std::sync::Arc;
 
     /// Serve canned JSON bodies over real HTTP, one per connection: the reqwest path is exercised
     /// for real, no mocks.
@@ -569,7 +568,9 @@ mod tests {
             .expect("config"),
         )
         .expect("tracker");
-        Trackers::default().with(TrackerKind::Jira, Arc::new(tracker))
+        Trackers {
+            jira: Some(tracker),
+        }
     }
 
     fn search_body(keys: &[(&str, &str)]) -> String {

@@ -6,6 +6,7 @@
 //! to the namespaced `issues.key` form that [`crate::issues::model::InputKind::from_parts`] parses back.
 
 use crate::daemon::queue::BoxFuture;
+use crate::launches::jira::JiraTracker;
 use crate::wire_enum::wire_enum;
 use anyhow::Result;
 use std::collections::BTreeMap;
@@ -98,41 +99,22 @@ wire_enum!(TrackerKind, "tracker", both, {
     TrackerKind::Jira => "jira",
 });
 
-/// The read-side search capability a watch sweeps through: a query in the tracker's native
-/// language at or after a watermark, hits oldest-first. Kept apart from [`IssueEmitter`] so a
-/// deploy with read-only credentials can still watch.
-pub trait TrackerSearch: Send + Sync {
-    /// Refuse a query the sweep could never run (its own ordering, a syntax the impl rejects up
-    /// front), before it is stored.
-    fn check_query(&self, query: &str) -> Result<(), TrackerQueryError>;
-    /// Hits at or after `watermark` (the tracker's native update-time string, or RFC 3339),
-    /// oldest-first; the whole query when `None`.
-    fn search(&self, query: &str, watermark: Option<&str>) -> BoxFuture<Result<Vec<TrackerHit>>>;
-}
-
-/// The trackers this deployment holds credentials for, by kind. A watch save refuses a kind that
-/// is not here, and the sweep skips one that went away.
+/// The trackers this deployment holds credentials for. A watch save refuses a kind that is not
+/// here, and the sweep skips one that went away.
 #[derive(Clone, Default)]
 pub struct Trackers {
-    by_kind: BTreeMap<TrackerKind, std::sync::Arc<dyn TrackerSearch>>,
+    pub(crate) jira: Option<JiraTracker>,
 }
 
 impl Trackers {
-    pub(crate) fn with(
-        mut self,
-        kind: TrackerKind,
-        tracker: std::sync::Arc<dyn TrackerSearch>,
-    ) -> Self {
-        self.by_kind.insert(kind, tracker);
-        self
-    }
-
-    pub(crate) fn get(&self, kind: TrackerKind) -> Option<&std::sync::Arc<dyn TrackerSearch>> {
-        self.by_kind.get(&kind)
+    pub(crate) fn get(&self, kind: TrackerKind) -> Option<&JiraTracker> {
+        match kind {
+            TrackerKind::Jira => self.jira.as_ref(),
+        }
     }
 
     /// The kinds a watch may name here.
     pub(crate) fn configured(&self) -> Vec<TrackerKind> {
-        self.by_kind.keys().copied().collect()
+        self.jira.iter().map(|_| TrackerKind::Jira).collect()
     }
 }

@@ -172,13 +172,7 @@ fn field_error(field: &str, message: impl Into<String>) -> crate::playbooks::reg
 fn tracker_for(
     state: &ApiState,
     name: &str,
-) -> Result<
-    (
-        TrackerKind,
-        std::sync::Arc<dyn crate::launches::tracker::TrackerSearch>,
-    ),
-    Response,
-> {
+) -> Result<(TrackerKind, crate::launches::jira::JiraTracker), Response> {
     let kind = TrackerKind::parse(name)
         .map_err(|e| invalid_fields(vec![field_error("tracker", e.to_string())]))?;
     let trackers = state.trackers();
