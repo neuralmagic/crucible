@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
@@ -14,12 +13,6 @@ use sqlx::PgPool;
 use crate::Db;
 use crate::api::state::ApiState;
 use crate::decisions::store::{self, Refused};
-
-struct NoOverrides;
-
-impl crate::daemon::queue::OverrideSink for NoOverrides {
-    fn submit(&self, _ov: crate::daemon::queue::Override) {}
-}
 
 fn choice(labels: &[&str], multiple: bool) -> Question {
     Question {
@@ -428,7 +421,7 @@ async fn a_request_whose_digest_does_not_match_its_evidence_is_refused(pool: PgP
 }
 
 fn api(pool: &PgPool) -> axum::Router {
-    crate::api::router(ApiState::test(Db::new(pool.clone()), Arc::new(NoOverrides)))
+    crate::api::router(ApiState::test(Db::new(pool.clone())))
 }
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]

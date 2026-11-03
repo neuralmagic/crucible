@@ -1,6 +1,5 @@
 use crate::agent::activity::ActivityFeed;
 use crate::cli::init::MANIFEST_FILE;
-use crate::deploy::ProposeTier;
 use crate::manifest::AgentBackend;
 use crate::scope::pack::{SCOPE_PACK_MARKER, pack_gz, pack_marker_line};
 use crate::scope::pipeline::{Freeze, Ingest, Propose, ProposeOpts, ScopeCtx, Stage, Validate};
@@ -9,6 +8,7 @@ use crate::scope::transcript::{
 };
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use crucible_contract::Tier;
 use crucible_contract::scope::{ScopeReport, StageResult};
 use std::path::{Path, PathBuf};
 
@@ -143,8 +143,8 @@ pub struct ScopeArgs {
     #[arg(long, default_value_t = 1)]
     pub gaming_refine_rounds: u32,
     /// Ranker's confirmed tier (`t0` / `t1`). Absent defaults to `t0`.
-    #[arg(long, value_enum)]
-    pub tier: Option<ProposeTier>,
+    #[arg(long, value_parser = crate::cli::proposed_tier)]
+    pub tier: Option<Tier>,
     /// Real agent backend for the propose/adversary turns.
     #[arg(long, value_enum, default_value_t = crate::manifest::AgentBackend::Local)]
     pub agent_backend: AgentBackend,
@@ -162,7 +162,7 @@ pub struct ScopeArgs {
 /// CLI entry point: resolve `--propose` vs. the classic pack path, run the pipeline, print each
 /// stage as it runs (or, with `json`, the whole [`ScopeReport`] as one object), and exit nonzero
 /// if the pipeline stopped on a failure *or* the propose turn ran over `--max-cost`.
-pub fn run(a: ScopeArgs) -> Result<()> {
+pub fn run(a: ScopeArgs, engine: tokio::runtime::Handle) -> Result<()> {
     let (pack, propose_opts) = if a.propose {
         let out = a
             .out
@@ -183,12 +183,13 @@ pub fn run(a: ScopeArgs) -> Result<()> {
                 refine_rounds: a.refine_rounds,
                 skip_gaming_review: a.skip_gaming_review,
                 gaming_refine_rounds: a.gaming_refine_rounds,
-                tier: a.tier.unwrap_or_default(),
+                tier: a.tier.unwrap_or(Tier::T0),
                 agent_backend: a.agent_backend,
                 sandbox_image: a.sandbox_image,
                 progress: a.marker,
                 compute_driver: a.compute_driver,
                 authoritative: a.authoritative,
+                engine: Some(engine.clone()),
             }),
         )
     } else {

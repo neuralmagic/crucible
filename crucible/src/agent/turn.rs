@@ -1,10 +1,9 @@
 //! What one agent turn hands back, and the stream pump that folds its events into that.
 
 use crate::agent::event::{AgentEvent, Pricing, RawStream, Tokens, cost_of};
-use crate::agent::harness::StreamDecoder;
 use crate::agent::tool_chain::{StopReason, ToolChain};
-use crate::args::Args;
 use crucible_contract::TransportCause;
+use crucible_harness::line::LineFormat;
 
 /// How a turn ended when it did not complete: the agent never produced output because the
 /// transport itself failed. Distinct from a turn that ran and answered badly.
@@ -75,9 +74,9 @@ impl TurnOutcome {
 /// manifest's `[agent].env` or the process environment. Off by default keeps a local run's behavior
 /// byte-identical to today (pricing-table estimate). Promoting this to a first-class manifest field
 /// is a follow-up.
-pub(crate) fn otel_enabled(args: &Args) -> bool {
+pub(crate) fn otel_enabled(env: &[(String, String)]) -> bool {
     let truthy = |v: &str| matches!(v.trim(), "1" | "true" | "yes" | "on");
-    if let Some((_, v)) = args.env.iter().find(|(k, _)| k == "CRUCIBLE_OTEL") {
+    if let Some((_, v)) = env.iter().find(|(k, _)| k == "CRUCIBLE_OTEL") {
         return truthy(v);
     }
     std::env::var("CRUCIBLE_OTEL")
@@ -92,8 +91,10 @@ pub(crate) fn otel_enabled(args: &Args) -> bool {
 /// Spans are re-parented onto the turn span before they leave, so the agent's `llm_request` spans
 /// nest under the run instead of forming an orphan trace: the agent's exporter cannot adopt a
 /// parent itself, since the OTel JS SDK does not read `TRACEPARENT` from the environment.
-pub(crate) fn otel_forward(args: &Args) -> Option<crucible_harness::OtelForward> {
-    let endpoint = match args.env.iter().find(|(k, _)| k == "CRUCIBLE_OTEL_FORWARD") {
+pub(crate) fn otel_forward(
+    env: &[(String, String)],
+) -> Option<crucible_harness::otel::OtelForward> {
+    let endpoint = match env.iter().find(|(k, _)| k == "CRUCIBLE_OTEL_FORWARD") {
         Some((_, v)) => v.clone(),
         None => std::env::var("CRUCIBLE_OTEL_FORWARD").ok()?,
     };
@@ -101,7 +102,10 @@ pub(crate) fn otel_forward(args: &Args) -> Option<crucible_harness::OtelForward>
         return None;
     }
     let tp = crate::agent::engine::current_trace_env().map(|(tp, _)| tp);
-    Some(crucible_harness::OtelForward::new(endpoint, tp.as_deref()))
+    Some(crucible_harness::otel::OtelForward::new(
+        endpoint,
+        tp.as_deref(),
+    ))
 }
 
 /// Whether session-log tool events carry full inputs and result excerpts
@@ -109,13 +113,9 @@ pub(crate) fn otel_forward(args: &Args) -> Option<crucible_harness::OtelForward>
 /// env). Off by default: the compact name+summary form keeps the log small, but
 /// made a run's edits unreconstructable without diffing the PR — this flag exists
 /// for runs someone will want to review.
-pub(crate) fn tool_io_full(args: &Args) -> bool {
+pub(crate) fn tool_io_full(env: &[(String, String)]) -> bool {
     let full = |v: &str| v.trim().eq_ignore_ascii_case("full");
-    if let Some((_, v)) = args
-        .env
-        .iter()
-        .find(|(k, _)| k == "CRUCIBLE_SESSION_TOOL_IO")
-    {
+    if let Some((_, v)) = env.iter().find(|(k, _)| k == "CRUCIBLE_SESSION_TOOL_IO") {
         return full(v);
     }
     std::env::var("CRUCIBLE_SESSION_TOOL_IO")
@@ -137,8 +137,8 @@ pub(crate) struct PumpEnd {
 /// gRPC stream. Splitting the loop from the byte source is what lets the async exec path reuse the
 /// exact same accounting + sink dispatch from any line source (BufReader or gRPC stream).
 pub(crate) struct StreamPump {
-    decoder: Box<dyn StreamDecoder>,
-    chain_decoder: Option<Box<dyn StreamDecoder>>,
+    decoder: Box<dyn LineFormat + Send>,
+    chain_decoder: Option<Box<dyn LineFormat + Send>>,
     cost: TurnCost,
     chain: ToolChain,
 }
@@ -149,8 +149,8 @@ impl StreamPump {
     /// full tool IO for the chain when `decoder` is compact; `None` hands the chain `decoder`'s own
     /// events.
     pub(crate) fn new(
-        decoder: Box<dyn StreamDecoder>,
-        chain_decoder: Option<Box<dyn StreamDecoder>>,
+        decoder: Box<dyn LineFormat + Send>,
+        chain_decoder: Option<Box<dyn LineFormat + Send>>,
         chain: ToolChain,
         pricing: Pricing,
     ) -> Self {
@@ -346,7 +346,7 @@ mod tests {
     use crate::manifest::ToolPluginSpec;
     use crucible_contract::event::{AgentEvent, RawStream};
     use crucible_contract::inference::{TokenPrice, UsdPerMtok};
-    use crucible_harness::StreamJsonParser;
+    use crucible_harness::stream_json::StreamJsonParser;
     use std::num::NonZeroUsize;
 
     /// One Claude `stream-json` tool call, and its result when `result` is given, as the CLI emits them.

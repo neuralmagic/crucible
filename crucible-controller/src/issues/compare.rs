@@ -168,7 +168,7 @@ pub async fn run_compare(
             let key = iss.key.clone();
             let max_cost = cfg.profile.per_reconcile_cost;
             let agent_cmd = opts.agent_cmd.clone();
-            tokio::task::spawn_blocking(move || -> Result<engine::GroundedVerdict> {
+            tokio::task::spawn_blocking(move || -> Result<crucible_contract::verdict::Ruled> {
                 engine::ensure_checkout(&url, &ws)?;
                 engine::rank_grounded(&bin, &key, &ws, max_cost, agent_cmd.as_deref())
             })
@@ -176,7 +176,7 @@ pub async fn run_compare(
             .with_context(|| format!("grounded ranking {}", iss.key))?
         };
 
-        let grounded_tier = verdict.disposition.as_str().to_string();
+        let grounded_tier = verdict.tier.as_str().to_string();
         let row = CompareRow {
             key: iss.key.clone(),
             title,

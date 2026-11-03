@@ -69,7 +69,7 @@ pub(crate) fn run(
     cfg: &PreflightCfg,
     modes: &[String],
     workspace: &Path,
-    r: &mut impl Reporter,
+    r: &mut dyn Reporter,
 ) -> Result<Option<PreflightBaseline>> {
     let mut digest: Option<String> = None;
     for command in &cfg.commands {
@@ -116,7 +116,7 @@ fn run_rung(
     command: &str,
     digest: &mut Option<String>,
     workspace: &Path,
-    r: &mut impl Reporter,
+    r: &mut dyn Reporter,
 ) -> Result<Capture> {
     if STOP.load(Ordering::SeqCst) {
         return Err(PreflightStopped.into());
@@ -262,8 +262,8 @@ fn stderr_tail(stderr: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::args::{Args, Paths};
-    use crate::report::reporter::{AgentTurn, Stop, TurnBudget};
+    use crate::args::Paths;
+    use crate::report::reporter::Stop;
     use crate::report::session::Row;
 
     /// Collects notes; every other `Reporter` call is inert. Preflight only ever notes.
@@ -276,18 +276,6 @@ mod tests {
             self.0.push(msg.to_string());
         }
         fn row(&mut self, _: &Row, _: bool) {}
-        fn run_agent(
-            &mut self,
-            _: &Args,
-            _: &Paths,
-            _: u32,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-            _: TurnBudget,
-        ) -> AgentTurn {
-            AgentTurn::default()
-        }
         fn check_interrupt(&mut self, _: &Paths, _: &[Row]) -> Stop {
             Stop::Continue
         }

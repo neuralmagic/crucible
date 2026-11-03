@@ -338,7 +338,7 @@ fn refuse(status: StatusCode, error: String) -> Response {
 #[cfg(test)]
 mod tests {
     use crate::client::Db;
-    use crate::identity::auth::{AuthMode, BearerGuard, HumanOrKeyGuard, SharedToken};
+    use crate::identity::auth::{BearerGuard, HumanOrKeyGuard, SharedToken};
     use crate::runs::blob_store::ArtifactOwner;
     use crate::runs::evidence_api::{EvidenceState, router};
     use crate::runs::pod_token::{Subject, mint, revoke};
@@ -357,8 +357,7 @@ mod tests {
     /// The evidence routes over a real store, with a human guard that admits only the static
     /// machine token.
     fn app(pool: &PgPool, scratch: &Path) -> axum::Router {
-        let guard = BearerGuard::new(SharedToken::new(MACHINE), None, None, None, AuthMode::Proxy)
-            .expect("guard");
+        let guard = BearerGuard::new(SharedToken::new(MACHINE), None).expect("guard");
         router(EvidenceState {
             db: Db::new(pool.clone()),
             scratch_dir: scratch.to_path_buf(),

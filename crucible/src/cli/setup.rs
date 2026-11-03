@@ -1,7 +1,7 @@
 //! Resolving a run from its manifest: the agent config folded onto the CLI args, the frozen
 //! projection the broker sees, and a plan runner over the same workspace a loop run would use.
 
-use crate::agent::harness::HarnessRuntime;
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv, agent_visible, process_env};
 use crate::args::Args;
 use crate::control::broker;
 use crate::manifest;
@@ -159,7 +159,6 @@ pub(crate) fn apply_agent_cfg(
     if args.harness.is_none() {
         args.harness = Some(agent.harness);
     }
-    args.hermes = agent.hermes.clone();
     args.codex = agent.codex.clone();
     args.disallowed_tools = agent.disallowed_tools.clone();
     // Reasoning effort: CLI `--effort` wins, else the manifest's `[agent].reasoning_effort`, else
@@ -181,33 +180,36 @@ pub(crate) fn apply_agent_cfg(
     if args.sandbox_image.is_none() {
         args.sandbox_image = agent.sandbox_image.clone();
     }
-    args.env = agent
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    // Openshell turns run claude inside the sandbox, whose env is built ONLY from `args.env`
-    // (`openshell::run::env_script` / `vertex_config`, the sandbox never sees the pod's env).
-    // A manifest without `[agent.env]` (a controller-drafted pack) would launch claude with no
-    // Vertex config at all: it emits a synthetic "Not logged in" result claiming subtype=success,
-    // turns=1, $0, a silent no-op run. Relay the standard Vertex keys from the pod env (the
-    // deploy profile's `[env]`), exactly like the scope/rank turn paths; manifest values win.
-    // Only for a Vertex-authenticated harness; codex authenticates against the ChatGPT backend.
+    // The sandbox's env is built ONLY from `args.env`; it never sees the pod's. A manifest without
+    // `[agent.env]` (a controller-drafted pack) would launch claude with no Vertex config at all,
+    // which it reports as a $0 success, so a Vertex-authenticated openshell turn relays the
+    // standard Vertex keys from the pod env (the deploy profile's `[env]`); the pack's declared
+    // secrets the registry lets this agent hold and the identity the controller named for the
+    // run's commits cross the same way. A manifest value wins over every relay.
+    let mut env =
+        SandboxEnv::from_manifest(agent.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     if args.agent_backend == manifest::AgentBackend::Openshell
         && crate::agent::harness::resolve_auth(
             args.harness(),
             &crate::agent::inference::InferenceEnv::from_process_env()?,
-        ) == crate::agent::harness::AuthProvider::Vertex
+        ) == crucible::harness::AuthProvider::Vertex
     {
-        crate::openshell::run::relay_vertex_env(&mut args.env);
+        env.relay(
+            EnvSource::VertexRelay,
+            crate::openshell::policy::VERTEX_RELAY_KEYS.iter().copied(),
+            process_env,
+        );
     }
-    // The pack's declared secrets, for the ones the registry says this agent may hold. The kubelet
-    // put them in this process's environment; without this the sandbox never sees them.
-    args.relayed_secrets =
-        crate::openshell::run::relay_agent_visible_secrets(secrets, &mut args.env);
-    // Who the agent's commits are attributed to. Same reason: the sandbox never sees the pod's env,
-    // so the identity the controller named for this run has to be relayed like everything else.
-    crate::openshell::run::relay_identity_env(&mut args.env);
+    env.relay_secrets(secrets, &agent_visible(process_env), process_env);
+    env.relay(
+        EnvSource::IdentityRelay,
+        crate::openshell::policy::IDENTITY_RELAY_KEYS
+            .iter()
+            .copied(),
+        process_env,
+    );
+    args.relayed_secrets = env.relayed_secrets();
+    args.env = env.into_vars();
     args.sandboxes = agent.sandbox.clone();
     args.relay = agent.relay.clone();
     args.disclosure = frozen.disclosure.clone();
@@ -229,7 +231,9 @@ pub(crate) fn apply_agent_cfg(
     if args.broker.enabled && args.agent_backend == manifest::AgentBackend::Openshell {
         // Hand the broker the deep loop's per-workspace sandbox name, its build sync must download
         // from the same sandbox the turns run in.
-        let sandbox_name = crate::openshell::sandbox::name_for(workspace);
+        let run = crate::openshell::sandbox::RunId::mint();
+        let sandbox_name = crate::openshell::sandbox::name_for(workspace, &run);
+        args.sandbox_run_id = Some(run);
         args.broker_token = broker::ensure_running(
             &args.broker,
             &args.env,
@@ -314,6 +318,7 @@ pub(crate) fn prep_plan_runner(
         &std::collections::BTreeMap::new(),
         crate::openshell::gateway::ComputeDriver::Podman,
         crate::args::AgentOverride::default(),
+        None,
         Start::Fresh,
     )
 }
@@ -438,6 +443,16 @@ pub(crate) fn restore_for_rerun(
     Ok(base)
 }
 
+/// Say at run start that the pack's host commands inherit the engine's environment.
+pub(crate) fn warn_inherited_env(inherits: bool) {
+    if inherits {
+        eprintln!(
+            "[crucible] WARNING: {}",
+            manifest::edition::INHERITED_ENV_WARNING
+        );
+    }
+}
+
 /// Where a manifest run keeps its state: the session log, captured files, and run records.
 pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
     manifest::manifest_dir(manifest_path).join("state")
@@ -449,11 +464,13 @@ pub(crate) fn prep_plan_runner_with_params(
     params: &std::collections::BTreeMap<String, String>,
     compute_driver: crate::openshell::gateway::ComputeDriver,
     agent: crate::args::AgentOverride,
+    engine: Option<tokio::runtime::Handle>,
     start: Start,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
+    warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     if let Some(all) = m.launch.all() {
         for (setting, flag, value) in [
             (
@@ -509,6 +526,7 @@ pub(crate) fn prep_plan_runner_with_params(
     // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
     // the manifest's [agent] folded on top — the same resolution a loop run does.
     let mut args = Args::defaults().context("constructing default args")?;
+    args.engine = engine;
     args.manifest = Some(manifest_path.to_path_buf());
     args.compute_driver = compute_driver;
     args.harness = agent.harness;
@@ -529,6 +547,12 @@ pub(crate) fn prep_plan_runner_with_params(
     start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(&p, e))?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
+    args.workflow_env = m
+        .workflow
+        .as_ref()
+        .map(crate::plan::workflow::WorkflowCfg::host_env)
+        .transpose()?
+        .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
     // A playbook's git memory is per task; the scored loop owns the same repository for
     // keep/discard of whole candidates and must not find per-task commits inside an iteration.
@@ -635,12 +659,12 @@ mod tests {
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         assert_eq!(
             select_agent(
-                Some(Harness::Hermes),
+                Some(Harness::Pi),
                 Some("flag-model"),
                 &m.agent,
                 &injected(InferenceProtocol::Messages)
             ),
-            (Harness::Hermes, "bound-model".to_string())
+            (Harness::Pi, "bound-model".to_string())
         );
         assert_eq!(
             select_agent(
@@ -788,7 +812,7 @@ mod tests {
         .unwrap();
         assert_eq!(a.harness(), crate::manifest::Harness::Claude);
 
-        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"pi\"")).unwrap();
         let mut a = args_from(&["crucible"]);
         apply_agent_cfg(
             &mut a,
@@ -798,12 +822,12 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(a.harness(), crate::manifest::Harness::Hermes);
+        assert_eq!(a.harness(), crate::manifest::Harness::Pi);
     }
 
     #[test]
     fn cli_harness_beats_the_manifest() {
-        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"hermes\"")).unwrap();
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"pi\"")).unwrap();
         let mut a = args_from(&["crucible", "--harness", "claude"]);
         apply_agent_cfg(
             &mut a,
@@ -851,37 +875,8 @@ mod tests {
         assert_eq!(a.model(), "gpt-5.6-luna");
     }
 
-    /// `[agent.hermes]` parses (and rides onto Args), and an unknown key inside it is a manifest
-    /// error, not silently ignored config.
-    #[test]
-    fn hermes_subtable_parses_and_denies_unknown_fields() {
-        let m: manifest::Manifest = toml::from_str(&format!(
-            "{}\n[agent.hermes]\nmodel = \"anthropic/claude-haiku-4-5\"\n",
-            manifest_toml("harness = \"hermes\"")
-        ))
-        .unwrap();
-        let mut a = args_from(&["crucible"]);
-        apply_agent_cfg(
-            &mut a,
-            &m.agent,
-            &m.secrets,
-            Path::new("ws"),
-            &FrozenProjection::default(),
-        )
-        .unwrap();
-        assert_eq!(
-            a.hermes.model.as_deref(),
-            Some("anthropic/claude-haiku-4-5")
-        );
-
-        let err = toml::from_str::<manifest::Manifest>(&format!(
-            "{}\n[agent.hermes]\nmodle = \"typo\"\n",
-            manifest_toml("")
-        ));
-        assert!(err.is_err(), "unknown [agent.hermes] key must be rejected");
-    }
-
-    /// `[agent.codex]` is the codex twin of the block above: the shared `[agent].model` names a
+    /// `[agent.codex]` parses (and rides onto Args), and an unknown key inside it is a manifest
+    /// error, not silently ignored config. The shared `[agent].model` names a
     /// Claude model, so a codex domain overrides it here.
     #[test]
     fn codex_subtable_parses_and_denies_unknown_fields() {
@@ -1046,7 +1041,7 @@ mod tests {
             std::env::set_var("JIRA_TOKEN", "jira-value");
             std::env::set_var("REGISTRY_TOKEN", "registry-value");
             std::env::set_var(
-                crate::openshell::run::AGENT_VISIBLE_ENV,
+                crate::agent::sandbox_env::AGENT_VISIBLE_ENV,
                 "JIRA_TOKEN,REGISTRY_TOKEN",
             );
         }
@@ -1084,7 +1079,7 @@ mod tests {
         unsafe {
             std::env::remove_var("JIRA_TOKEN");
             std::env::remove_var("REGISTRY_TOKEN");
-            std::env::remove_var(crate::openshell::run::AGENT_VISIBLE_ENV);
+            std::env::remove_var(crate::agent::sandbox_env::AGENT_VISIBLE_ENV);
         }
         result.unwrap();
         let script = |sandbox: Option<&str>| {
@@ -1092,7 +1087,8 @@ mod tests {
             if let Some(name) = sandbox {
                 crate::plan::harness::enter_sandbox(&mut turn, name).unwrap();
             }
-            turn.harness().backend().env_script(&turn.env)
+            SandboxEnv::from_manifest(turn.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .script(turn.harness().spec())
         };
 
         let default = script(None);

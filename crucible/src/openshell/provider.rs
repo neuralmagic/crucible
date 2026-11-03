@@ -7,6 +7,7 @@
 //! the Vertex cred is never a readable sandbox env var; it rides the Create/UpdateProvider gRPC
 //! request body ([`crate::openshell::grpc`]), never an argv, so there is no process-listing leak.
 
+use crate::openshell::grpc::ProviderName;
 use anyhow::{Context, Result};
 
 /// Vertex needs a `cloud-platform`-scoped OAuth2 access token.
@@ -25,7 +26,7 @@ const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_CREDENTIALS_ENV: &str = "CODEX_CREDENTIALS";
 
 /// The provider name the sandbox attaches.
-pub const PROVIDER_NAME: &str = "ci-gcp";
+pub static PROVIDER_NAME: ProviderName = ProviderName::new("ci-gcp");
 
 /// The `google-cloud` provider credential slot we set the minted access token into. The
 /// gateway's metadata emulator serves this token to the sandbox's google-auth library.
@@ -287,7 +288,7 @@ async fn refresh_codex_token(
 /// endpoints, so attaching the provider is what makes sandbox S3 requests sign at the proxy;
 /// the sandbox itself never holds an AWS credential. Read-only is enforced by the assumed IAM
 /// role, not the endpoint access flag.
-pub const AWS_PROVIDER_NAME: &str = "crucible-s3-ro";
+pub static AWS_PROVIDER_NAME: ProviderName = ProviderName::new("crucible-s3-ro");
 
 /// The provider profile id of [`aws_s3_profile`]: STS refresh + S3 signing endpoints.
 pub const AWS_PROVIDER_TYPE: &str = "aws-s3";
@@ -305,7 +306,7 @@ pub const AWS_PRIMARY_CRED: &str = "AWS_ACCESS_KEY_ID";
 /// `credential_binding` naming this provider. The sandbox only ever sees the
 /// `openshell:resolve:env:` placeholder; the proxy resolves it to the real token at egress, for
 /// the broker endpoint alone.
-pub const BROKER_PROVIDER_NAME: &str = "crucible-broker";
+pub static BROKER_PROVIDER_NAME: ProviderName = ProviderName::new("crucible-broker");
 
 /// The custom (crucible-imported) profile id backing [`BROKER_PROVIDER_NAME`].
 pub const BROKER_PROFILE_ID: &str = "crucible-broker";
@@ -592,7 +593,7 @@ mod tests {
     #[test]
     fn provider_identity_constants_are_stable() {
         // The metadata emulator and any gateway-side logs key on these; keep them fixed.
-        assert_eq!(PROVIDER_NAME, "ci-gcp");
+        assert_eq!(PROVIDER_NAME.as_str(), "ci-gcp");
         assert_eq!(PROVIDER_TYPE, "google-cloud");
         assert_eq!(CRED_KEY, "GCP_ADC_ACCESS_TOKEN");
     }

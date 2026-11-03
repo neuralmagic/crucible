@@ -5,25 +5,16 @@ use crate::api::router;
 use crate::authz::api::*;
 use crate::authz::model::{PLATFORM_ADMINISTRATORS, PLATFORM_OPERATORS};
 use crate::client::Db;
-use crate::daemon::queue::{Override, OverrideSink};
 use crate::testing::call;
 use axum::Router;
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::sync::Arc;
 use tower::ServiceExt;
 
-#[derive(Default)]
-struct NoSink;
-
-impl OverrideSink for NoSink {
-    fn submit(&self, _ov: Override) {}
-}
-
 fn app(pool: PgPool) -> Router {
-    router(ApiState::test(Db::new(pool), Arc::new(NoSink)))
+    router(ApiState::test(Db::new(pool)))
 }
 
 fn as_user(
@@ -587,7 +578,7 @@ fn app_with_roles(pool: PgPool, admins: &[&str], operators: &[&str]) -> Router {
             operators.iter().map(|s| s.to_string()).collect(),
             vec![],
         ),
-        ..ApiState::test(Db::new(pool), Arc::new(NoSink))
+        ..ApiState::test(Db::new(pool))
     })
 }
 
@@ -1670,7 +1661,7 @@ async fn the_autoresearch_lane_is_granted_by_policy_and_hidden_from_everyone_els
     let signed_in = |path: &str, who: &str, groups: &[&str]| {
         let mut req = as_user("GET", path, Some(who), groups, None);
         req.extensions_mut()
-            .insert(crate::identity::auth::AuthPath::Edge);
+            .insert(crate::identity::auth::AuthPath::Session);
         req
     };
     let entitled = |who: &'static str, groups: &'static [&'static str]| {

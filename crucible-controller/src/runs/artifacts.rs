@@ -264,6 +264,7 @@ async fn walk_local(root: &std::path::Path) -> Vec<ArtifactEntry> {
 /// unknown run.
 pub(crate) async fn serve_artifact(
     metrics: Option<&Metrics>,
+    contracts: Option<&crate::runs::contract::ContractRegistry>,
     pool: &sqlx::PgPool,
     session_uri: Option<&str>,
     run_id: &str,
@@ -304,7 +305,7 @@ pub(crate) async fn serve_artifact(
 
     // Fetch: the artifact store for a db:// prefix, local path off the filesystem, s3:// via the
     // engine subprocess into a temp dir.
-    let (path, guard) = match fetch_artifact(pool, prefix, &artifact.rel()).await {
+    let (path, guard) = match fetch_artifact(pool, contracts, prefix, &artifact.rel()).await {
         Ok(f) => f,
         Err(FetchError::NotFound) => {
             record("not_found");
@@ -410,13 +411,14 @@ pub(crate) enum FetchError {
 /// every read of the returned path.
 pub(crate) async fn fetch_artifact(
     pool: &sqlx::PgPool,
+    contracts: Option<&crate::runs::contract::ContractRegistry>,
     prefix: &str,
     rel: &str,
 ) -> Result<(PathBuf, Option<tempfile::TempDir>), FetchError> {
     if let Some(run_id) = crate::runs::blob_store::run_id_of_session_uri(prefix) {
         fetch_db_session(pool, run_id, rel).await
     } else if prefix.starts_with("s3://") {
-        fetch_s3(prefix, rel).await
+        fetch_s3(contracts, prefix, rel).await
     } else {
         fetch_local(prefix, rel).await
     }
@@ -461,6 +463,7 @@ async fn fetch_local(
 /// Download an `s3://` artifact into a temp dir by shelling `crucible fetch`. The temp dir rides
 /// back with the path so it lives exactly as long as the caller needs the bytes.
 async fn fetch_s3(
+    contracts: Option<&crate::runs::contract::ContractRegistry>,
     prefix: &str,
     rel: &str,
 ) -> Result<(PathBuf, Option<tempfile::TempDir>), FetchError> {
@@ -468,12 +471,15 @@ async fn fetch_s3(
     let dir = tempfile::tempdir().map_err(|e| FetchError::Fetch(format!("temp dir: {e}")))?;
     let out = dir.path().join("artifact");
     let bin = crate::runs::engine::resolve_bin();
-    crate::runs::workpod::admit_contract(
-        crate::runs::contract::RequestKind::Fetch,
-        &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
-    )
-    .await
-    .map_err(|e| FetchError::Fetch(e.to_string()))?;
+    if let Some(contracts) = contracts {
+        contracts
+            .admit_all(
+                crate::runs::contract::RequestKind::Fetch,
+                &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
+            )
+            .await
+            .map_err(|e| FetchError::Fetch(e.to_string()))?;
+    }
 
     let status = tokio::process::Command::new(&bin)
         .arg("fetch")
@@ -667,7 +673,7 @@ mod tests {
             ),
             ("diffs/one.diff", "text/plain", "@@ diff"),
         ] {
-            let resp = serve_artifact(None, &pool, Some(&uri), "run-1", path, None).await;
+            let resp = serve_artifact(None, None, &pool, Some(&uri), "run-1", path, None).await;
             assert_eq!(resp.status(), StatusCode::OK, "serving {path}");
             let ct = resp
                 .headers()
@@ -698,7 +704,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
 
-        let resp = serve_artifact(None, &pool, Some(&uri), "run-1", "flow.html", None).await;
+        let resp = serve_artifact(None, None, &pool, Some(&uri), "run-1", "flow.html", None).await;
         let csp = resp
             .headers()
             .get(header::CONTENT_SECURITY_POLICY)
@@ -707,7 +713,8 @@ mod tests {
             .to_string();
         assert_eq!(csp, "sandbox allow-scripts");
 
-        let resp = serve_artifact(None, &pool, Some(&uri), "run-1", "summary.json", None).await;
+        let resp =
+            serve_artifact(None, None, &pool, Some(&uri), "run-1", "summary.json", None).await;
         assert!(
             resp.headers()
                 .get(header::CONTENT_SECURITY_POLICY)
@@ -724,7 +731,16 @@ mod tests {
             .join("session.jsonl")
             .to_string_lossy()
             .to_string();
-        let resp = serve_artifact(None, &pool, Some(&uri), "run-1", "diffs/../secret", None).await;
+        let resp = serve_artifact(
+            None,
+            None,
+            &pool,
+            Some(&uri),
+            "run-1",
+            "diffs/../secret",
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -736,13 +752,14 @@ mod tests {
             .join("session.jsonl")
             .to_string_lossy()
             .to_string();
-        let resp = serve_artifact(None, &pool, Some(&uri), "run-1", "summary.json", None).await;
+        let resp =
+            serve_artifact(None, None, &pool, Some(&uri), "run-1", "summary.json", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn no_session_uri_is_404(pool: sqlx::PgPool) {
-        let resp = serve_artifact(None, &pool, None, "run-1", "session.jsonl", None).await;
+        let resp = serve_artifact(None, None, &pool, None, "run-1", "session.jsonl", None).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -765,6 +782,7 @@ mod tests {
             .to_string();
 
         let resp = serve_artifact(
+            None,
             None,
             &pool,
             Some(&uri),
@@ -873,7 +891,16 @@ mod tests {
             .expect("store");
         let uri = crate::runs::blob_store::run_session_uri("run-db");
 
-        let resp = serve_artifact(None, &pool, Some(&uri), "run-db", "session.jsonl", None).await;
+        let resp = serve_artifact(
+            None,
+            None,
+            &pool,
+            Some(&uri),
+            "run-db",
+            "session.jsonl",
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let ct = resp
             .headers()
@@ -885,12 +912,22 @@ mod tests {
         assert_eq!(body_string(resp).await, session);
 
         // Only the session exists under a db:// prefix.
-        let resp = serve_artifact(None, &pool, Some(&uri), "run-db", "summary.json", None).await;
+        let resp = serve_artifact(
+            None,
+            None,
+            &pool,
+            Some(&uri),
+            "run-db",
+            "summary.json",
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 
         // A run whose session was never stored is a 404, not a 502.
         let missing = crate::runs::blob_store::run_session_uri("run-none");
         let resp = serve_artifact(
+            None,
             None,
             &pool,
             Some(&missing),
@@ -922,7 +959,8 @@ mod tests {
             .join("session.jsonl")
             .to_string_lossy()
             .to_string();
-        let first = serve_artifact(None, &pool, Some(&uri), "run-1", "summary.json", None).await;
+        let first =
+            serve_artifact(None, None, &pool, Some(&uri), "run-1", "summary.json", None).await;
         let etag = first
             .headers()
             .get(header::ETAG)
@@ -931,6 +969,7 @@ mod tests {
             .to_string();
 
         let resp = serve_artifact(
+            None,
             None,
             &pool,
             Some(&uri),
@@ -944,6 +983,7 @@ mod tests {
         // A backfilled/replaced file must produce a different tag, so the stale one misses.
         std::fs::write(dir.path().join("summary.json"), "{\"v\":2}").expect("w");
         let resp = serve_artifact(
+            None,
             None,
             &pool,
             Some(&uri),

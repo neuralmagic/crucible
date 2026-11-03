@@ -9,4 +9,7 @@ pub struct WorldCfg {
     pub snapshot_cmd: Option<String>,
     #[serde(default)]
     pub restore_cmd: Option<String>,
+    /// Variables of the engine's environment these commands receive besides the base.
+    #[serde(default)]
+    pub env: crate::host_env::DeclaredEnv,
 }

@@ -3,7 +3,7 @@
 use crate::wire_enum::wire_enum;
 
 /// The lifecycle of one declared image build (`builds`). A closed enum, not a raw string, so a
-/// state literal can't drift past the bookkeeping layer (the [`MlflowExportState`] discipline).
+/// state literal can't drift past the bookkeeping layer.
 /// `pending` → `dispatched` → (`succeeded` | `failed` | `timed-out`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum::EnumIter)]
 pub enum BuildState {

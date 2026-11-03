@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// The loop-pod variable carrying [`GpuPlacement`] as JSON.
-pub const GPU_PLACEMENT_ENV: &str = "CRUCIBLE_SANDBOX_GPU_POD";
+pub const GPU_PLACEMENT_ENV: &str = crucible_contract::driver_env::SANDBOX_GPU_POD;
 
 /// Scheduling for sandboxes that request GPUs. Field names are the OpenShell Kubernetes driver's
 /// pod config keys, so the value is handed over as is.

@@ -2,6 +2,7 @@
 //! dispatch to a pinned digest, with their ledger rows and HTTP surface.
 
 pub(crate) mod api;
+pub mod backend;
 pub mod lifecycle;
 pub mod model;
 pub(crate) mod store;

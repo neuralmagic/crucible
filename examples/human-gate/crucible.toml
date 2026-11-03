@@ -12,6 +12,8 @@
 # then open Approvals (or follow the notification) and answer. GPUS sets the job's size and
 # defaults to 8. Run without a controller, the plan truncates at `gate` before anything runs.
 
+edition = 2
+
 [workspace]
 inject = ["plan.sh", "act.sh"]
 
@@ -23,3 +25,4 @@ goal      = "Launch a training job once someone approves its cost."
 [workflow]
 type = "playbook"
 file = "workflow.star"
+env  = ["GPUS?"]

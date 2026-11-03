@@ -47,60 +47,54 @@ fn normalize_external_url(raw: Option<String>) -> Option<String> {
         .filter(|u| !u.is_empty())
 }
 
-/// Fetching one of the two hardcoded paths from the upstream cluster API. The `&'static str`
-/// path is the strictness boundary: an implementation can only ever be handed one of the two
-/// module constants, never request-derived input.
-pub(crate) trait DiscoveryUpstream: Send + Sync {
-    fn fetch(&self, path: &'static str) -> crate::daemon::queue::BoxFuture<Result<String, String>>;
+/// The two upstream paths the mirror serves. An enum, not a request path: a fetch can only ever
+/// be asked for one of these, never request-derived input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DiscoveryPath {
+    Discovery,
+    Jwks,
 }
 
-/// The production upstream: the controller's own in-cluster kube client (its SA authenticates
-/// the request; `system:service-account-issuer-discovery` grants every SA these two GETs).
-pub(crate) struct KubeUpstream(pub(crate) kube::Client);
-
-impl DiscoveryUpstream for KubeUpstream {
-    fn fetch(&self, path: &'static str) -> crate::daemon::queue::BoxFuture<Result<String, String>> {
-        let client = self.0.clone();
-        Box::pin(async move {
-            let req = axum::http::Request::builder()
-                .uri(path)
-                .body(Vec::new())
-                .map_err(|e| format!("building the upstream request: {e}"))?;
-            client
-                .request_text(req)
-                .await
-                .map_err(|e| format!("fetching {path} from the cluster API: {e}"))
-        })
+impl DiscoveryPath {
+    fn as_str(self) -> &'static str {
+        match self {
+            DiscoveryPath::Discovery => DISCOVERY_PATH,
+            DiscoveryPath::Jwks => JWKS_PATH,
+        }
     }
 }
 
-/// The upstream used when no kube client could be built at startup: every fetch fails, so the
+/// Fetch `path` from the cluster API as the controller's own SA
+/// (`system:service-account-issuer-discovery` grants every SA these two GETs). With no client the
 /// mirror serves 503 until the controller restarts with a reachable API.
-pub(crate) struct UnavailableUpstream;
-
-impl DiscoveryUpstream for UnavailableUpstream {
-    fn fetch(
-        &self,
-        _path: &'static str,
-    ) -> crate::daemon::queue::BoxFuture<Result<String, String>> {
-        Box::pin(async { Err("no kube client for the discovery mirror".to_string()) })
-    }
+async fn fetch(client: Option<&kube::Client>, path: DiscoveryPath) -> Result<String, String> {
+    let Some(client) = client else {
+        return Err("no kube client for the discovery mirror".to_string());
+    };
+    let req = axum::http::Request::builder()
+        .uri(path.as_str())
+        .body(Vec::new())
+        .map_err(|e| format!("building the upstream request: {e}"))?;
+    client
+        .request_text(req)
+        .await
+        .map_err(|e| format!("fetching {} from the cluster API: {e}", path.as_str()))
 }
 
-/// The enabled mirror: the upstream fetcher, the external base URL the discovery document is
-/// rewritten to, and one cached body per endpoint (keyed by the two hardcoded paths). The cache's
-/// `try_get_with` coalesces concurrent cold-cache requests into a single API-server call and never
-/// caches a failed fetch, so an outage retries upstream rather than pinning a dead entry.
+/// The enabled mirror: the upstream client, the external base URL the discovery document is
+/// rewritten to, and one cached body per endpoint. The cache's `try_get_with` coalesces concurrent
+/// cold-cache requests into a single API-server call and never caches a failed fetch, so an outage
+/// retries upstream rather than pinning a dead entry.
 pub(crate) struct Mirror {
-    upstream: Arc<dyn DiscoveryUpstream>,
+    upstream: Option<kube::Client>,
     external_base: String,
-    cache: moka::future::Cache<&'static str, String>,
+    cache: moka::future::Cache<DiscoveryPath, String>,
 }
 
 impl Mirror {
     /// `external_base` is the mirror's own externally reachable base URL (scheme + host, no
     /// trailing slash — [`external_url_from_env`] normalizes).
-    pub(crate) fn new(upstream: Arc<dyn DiscoveryUpstream>, external_base: String) -> Self {
+    pub(crate) fn new(upstream: Option<kube::Client>, external_base: String) -> Self {
         Mirror {
             upstream,
             external_base: external_base.trim_end_matches('/').to_string(),
@@ -111,24 +105,23 @@ impl Mirror {
     }
 
     /// Serve one endpoint: fresh cache wins, else fetch + transform + cache, else 503.
-    async fn serve(&self, path: &'static str) -> Response {
+    async fn serve(&self, path: DiscoveryPath) -> Response {
         let upstream = self.upstream.clone();
         let external_base = self.external_base.clone();
         // `&'static str` error carries the client-facing 503 message; a failed init is not cached.
         let result: Result<String, Arc<&'static str>> = self
             .cache
             .try_get_with(path, async move {
-                let fetched = upstream.fetch(path).await.map_err(|e| {
-                    tracing::warn!(path, error = %e, "discovery mirror upstream fetch failed");
+                let fetched = fetch(upstream.as_ref(), path).await.map_err(|e| {
+                    tracing::warn!(path = path.as_str(), error = %e, "discovery mirror upstream fetch failed");
                     "upstream cluster API unavailable"
                 })?;
-                if path == DISCOVERY_PATH {
-                    rewrite_discovery(&fetched, &external_base).map_err(|e| {
-                        tracing::warn!(path, error = %e, "discovery mirror got an unusable upstream document");
+                match path {
+                    DiscoveryPath::Discovery => rewrite_discovery(&fetched, &external_base).map_err(|e| {
+                        tracing::warn!(path = path.as_str(), error = %e, "discovery mirror got an unusable upstream document");
                         "upstream discovery document unusable"
-                    })
-                } else {
-                    Ok(fetched)
+                    }),
+                    DiscoveryPath::Jwks => Ok(fetched),
                 }
             })
             .await;
@@ -190,14 +183,14 @@ pub(crate) fn router(mirror: Option<Mirror>) -> Router {
 
 async fn serve_discovery(State(mirror): State<Arc<Option<Mirror>>>) -> Response {
     match mirror.as_ref() {
-        Some(m) => m.serve(DISCOVERY_PATH).await,
+        Some(m) => m.serve(DiscoveryPath::Discovery).await,
         None => err(StatusCode::NOT_FOUND, "discovery mirror disabled"),
     }
 }
 
 async fn serve_jwks(State(mirror): State<Arc<Option<Mirror>>>) -> Response {
     match mirror.as_ref() {
-        Some(m) => m.serve(JWKS_PATH).await,
+        Some(m) => m.serve(DiscoveryPath::Jwks).await,
         None => err(StatusCode::NOT_FOUND, "discovery mirror disabled"),
     }
 }
@@ -207,47 +200,39 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// A canned in-process upstream (unit-test boundary for the network edge, counting fetches).
-    struct CannedUpstream {
-        discovery: Result<String, String>,
-        jwks: Result<String, String>,
-        fetches: AtomicUsize,
+    /// A cluster API serving the two discovery paths, reached through a real kube client.
+    async fn upstream(discovery: &str, jwks: &str) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(DISCOVERY_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(discovery))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(JWKS_PATH))
+            .respond_with(ResponseTemplate::new(200).set_body_string(jwks))
+            .mount(&server)
+            .await;
+        server
     }
 
-    impl CannedUpstream {
-        fn ok(discovery: &str, jwks: &str) -> Self {
-            CannedUpstream {
-                discovery: Ok(discovery.to_string()),
-                jwks: Ok(jwks.to_string()),
-                fetches: AtomicUsize::new(0),
-            }
-        }
-
-        fn down() -> Self {
-            CannedUpstream {
-                discovery: Err("connection refused".to_string()),
-                jwks: Err("connection refused".to_string()),
-                fetches: AtomicUsize::new(0),
-            }
-        }
+    /// A cluster API that answers nothing.
+    async fn down() -> MockServer {
+        MockServer::start().await
     }
 
-    impl DiscoveryUpstream for CannedUpstream {
-        fn fetch(
-            &self,
-            path: &'static str,
-        ) -> crate::daemon::queue::BoxFuture<Result<String, String>> {
-            self.fetches.fetch_add(1, Ordering::SeqCst);
-            let resp = if path == DISCOVERY_PATH {
-                self.discovery.clone()
-            } else {
-                self.jwks.clone()
-            };
-            Box::pin(async move { resp })
-        }
+    fn client_for(server: &MockServer) -> kube::Client {
+        crate::install_crypto_provider();
+        let config = kube::Config::new(server.uri().parse().expect("uri"));
+        kube::Client::try_from(config).expect("client")
+    }
+
+    async fn fetches(server: &MockServer) -> usize {
+        server.received_requests().await.map_or(0, |r| r.len())
     }
 
     /// The shape the Kubernetes API actually serves at /.well-known/openid-configuration.
@@ -278,9 +263,9 @@ mod tests {
         (status, String::from_utf8(bytes.to_vec()).expect("utf8"))
     }
 
-    fn enabled_router(upstream: Arc<CannedUpstream>) -> Router {
+    fn enabled_router(upstream: &MockServer) -> Router {
         router(Some(Mirror::new(
-            upstream,
+            Some(client_for(upstream)),
             "https://crucible-ext.example.com".to_string(),
         )))
     }
@@ -310,7 +295,7 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_serves_rewritten_document() {
-        let app = enabled_router(Arc::new(CannedUpstream::ok(K8S_DISCOVERY, JWKS)));
+        let app = enabled_router(&upstream(K8S_DISCOVERY, JWKS).await);
         let (status, body) = get_path(app, DISCOVERY_PATH).await;
         assert_eq!(status, StatusCode::OK);
         let doc: serde_json::Value = serde_json::from_str(&body).expect("json");
@@ -323,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn jwks_passes_through_verbatim() {
-        let app = enabled_router(Arc::new(CannedUpstream::ok(K8S_DISCOVERY, JWKS)));
+        let app = enabled_router(&upstream(K8S_DISCOVERY, JWKS).await);
         let (status, body) = get_path(app, JWKS_PATH).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, JWKS);
@@ -331,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_mirror_paths_404() {
-        let upstream = Arc::new(CannedUpstream::ok(K8S_DISCOVERY, JWKS));
+        let upstream = upstream(K8S_DISCOVERY, JWKS).await;
         for path in [
             "/.well-known/other",
             "/.well-known/openid-configuration/extra",
@@ -340,12 +325,12 @@ mod tests {
             "/openid",
             "/api/v1/pods",
         ] {
-            let app = enabled_router(upstream.clone());
+            let app = enabled_router(&upstream);
             let (status, _) = get_path(app, path).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "path {path} must 404");
         }
         assert_eq!(
-            upstream.fetches.load(Ordering::SeqCst),
+            fetches(&upstream).await,
             0,
             "no non-mirror path may ever reach the upstream"
         );
@@ -362,32 +347,41 @@ mod tests {
     #[tokio::test]
     async fn upstream_failure_serves_503() {
         for path in [DISCOVERY_PATH, JWKS_PATH] {
-            let app = enabled_router(Arc::new(CannedUpstream::down()));
+            let app = enabled_router(&down().await);
             let (status, _) = get_path(app, path).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         }
     }
 
     #[tokio::test]
+    async fn no_kube_client_serves_503() {
+        let app = router(Some(Mirror::new(None, "https://x".to_string())));
+        for path in [DISCOVERY_PATH, JWKS_PATH] {
+            let (status, _) = get_path(app.clone(), path).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[tokio::test]
     async fn garbage_discovery_document_serves_503() {
-        let app = enabled_router(Arc::new(CannedUpstream::ok("not json", JWKS)));
+        let app = enabled_router(&upstream("not json", JWKS).await);
         let (status, _) = get_path(app, DISCOVERY_PATH).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
     async fn repeat_requests_within_ttl_hit_the_cache() {
-        let upstream = Arc::new(CannedUpstream::ok(K8S_DISCOVERY, JWKS));
+        let upstream = upstream(K8S_DISCOVERY, JWKS).await;
         let mirror = Mirror::new(
-            upstream.clone(),
+            Some(client_for(&upstream)),
             "https://crucible-ext.example.com".to_string(),
         );
         for _ in 0..3 {
-            let resp = mirror.serve(DISCOVERY_PATH).await;
+            let resp = mirror.serve(DiscoveryPath::Discovery).await;
             assert_eq!(resp.status(), StatusCode::OK);
         }
         assert_eq!(
-            upstream.fetches.load(Ordering::SeqCst),
+            fetches(&upstream).await,
             1,
             "one upstream fetch serves every request inside the TTL"
         );
@@ -395,14 +389,14 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_failure_is_not_cached() {
-        let upstream = Arc::new(CannedUpstream::down());
-        let mirror = Mirror::new(upstream.clone(), "https://x".to_string());
+        let upstream = down().await;
+        let mirror = Mirror::new(Some(client_for(&upstream)), "https://x".to_string());
         for _ in 0..2 {
-            let resp = mirror.serve(JWKS_PATH).await;
+            let resp = mirror.serve(DiscoveryPath::Jwks).await;
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         }
         assert_eq!(
-            upstream.fetches.load(Ordering::SeqCst),
+            fetches(&upstream).await,
             2,
             "failures retry upstream instead of pinning a dead cache"
         );

@@ -3,27 +3,54 @@
 //! partway through rather than after every lane has run.
 
 use std::collections::BTreeMap;
+use std::fs::File;
+use std::io::Write;
 use std::num::NonZeroUsize;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
+use crucible_contract::session::SessionEvent;
+
 use crate::deadline::{Deadline, RunCeiling};
-use crate::plan::ir::Task;
+use crate::plan::attempt::{Attempt, BatchItem};
+use crate::plan::ir::{Task, TaskName};
 use crate::plan::machine::BlockedReason;
 
 /// Lanes of one dispatch in flight at once, unless the executor is configured otherwise.
 pub const DEFAULT_WIDTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
 
-/// What a lane's attempt cost, and the result a lane that panicked settles as.
-pub trait Settled {
-    fn cost_usd(&self) -> f64;
-    fn panicked() -> Self;
+/// Record an attempt in the session log before it runs, synced to disk, so a resumed run can
+/// charge one whose process died before it settled (RFC-0002:C-PLAYBOOK-RESUME).
+fn journal_started(mut journal: &File, task: &TaskName, attempt: u32, estimate_usd: f64) {
+    let mut line = crucible_contract::session::encode(&SessionEvent::TaskStarted {
+        task: task.0.clone(),
+        attempt,
+        estimate_usd,
+    });
+    line.push('\n');
+    if let Err(error) = journal
+        .write_all(line.as_bytes())
+        .and_then(|()| journal.sync_data())
+    {
+        tracing::warn!(task = %task, attempt, %error, "journaling an attempt start failed");
+    }
 }
 
-/// One lane of a batch: the task it runs.
-pub trait BatchLane {
-    fn task(&self) -> &Task;
+fn panicked() -> Attempt {
+    Attempt::failed(0.0, "task thread panicked".to_string())
+}
+
+/// What a resumed run charges for an attempt of `task` that started and never settled: nothing
+/// for a task that cannot spend, otherwise one lane's equal share of the cost ceiling. A dispatch
+/// interrupted at full width is charged at most the whole ceiling, and a task that kills its
+/// process on every attempt exhausts the ceiling within `width` resumes.
+pub fn estimate_usd(task: &Task, budget: f64, width: NonZeroUsize) -> f64 {
+    if !task.task.spends() {
+        return 0.0;
+    }
+    let lanes = u32::try_from(width.get()).map_or(f64::from(u32::MAX), f64::from);
+    budget / lanes
 }
 
 /// Which ceiling refused a lane. The lane never started.
@@ -48,11 +75,12 @@ impl From<Refusal> for BlockedReason {
 /// reported stays under the cost ceiling. The first refusal on cost refuses every later lane that
 /// can spend, so dispatch stops at one point instead of resuming when an in-flight figure
 /// settles lower. Any lane is refused once the run's wall-clock ceiling has fallen.
-pub struct Admission {
+pub struct Admission<'j> {
     budget: f64,
     run_ceiling: Option<RunCeiling>,
     width: NonZeroUsize,
     tally: Mutex<Tally>,
+    journal: Option<&'j File>,
 }
 
 #[derive(Default)]
@@ -72,7 +100,7 @@ impl Tally {
 /// One admitted lane: the deadline it runs under, counted from when it was admitted, and the
 /// handle it reports its spend through while it runs.
 pub struct Lane<'a> {
-    admission: &'a Admission,
+    admission: &'a Admission<'a>,
     id: u64,
     deadline: Option<Deadline>,
 }
@@ -101,7 +129,7 @@ impl Drop for Lane<'_> {
     }
 }
 
-impl Admission {
+impl<'j> Admission<'j> {
     /// `spent` is what the run had settled before this dispatch.
     pub fn new(
         budget: f64,
@@ -117,14 +145,21 @@ impl Admission {
                 settled: spent,
                 ..Tally::default()
             }),
+            journal: None,
         }
+    }
+
+    /// Record every admitted lane in `journal` before it runs.
+    pub fn journaled(self, journal: Option<&'j File>) -> Self {
+        Admission { journal, ..self }
     }
 
     fn tally(&self) -> MutexGuard<'_, Tally> {
         self.tally.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn admit(&self, task: &Task) -> Result<Lane<'_>, Refusal> {
+    fn admit(&self, lane: &BatchItem<'_>) -> Result<Lane<'_>, Refusal> {
+        let task = lane.task;
         if self.run_ceiling.is_some_and(|ceiling| ceiling.reached()) {
             return Err(Refusal::WallClockCeiling);
         }
@@ -137,6 +172,15 @@ impl Admission {
         let id = tally.next;
         tally.next += 1;
         tally.live.insert(id, 0.0);
+        drop(tally);
+        if let Some(journal) = self.journal {
+            journal_started(
+                journal,
+                &task.name,
+                lane.attempt,
+                estimate_usd(task, self.budget, self.width),
+            );
+        }
         Ok(Lane {
             admission: self,
             id,
@@ -145,19 +189,19 @@ impl Admission {
     }
 
     /// Count what an admitted lane cost and retire its running figure.
-    fn settle(&self, lane: Lane<'_>, attempt: &impl Settled) {
+    fn settle(&self, lane: Lane<'_>, attempt: &Attempt) {
         let mut tally = self.tally();
         tally.live.remove(&lane.id);
-        tally.settled += attempt.cost_usd();
+        tally.settled += attempt.cost_usd;
     }
 
-    /// Run one lane of `task` if the ceilings admit it, and count what it cost.
-    pub fn run<A: Settled>(
+    /// Run `item` if the ceilings admit it, and count what it cost.
+    pub fn run(
         &self,
-        task: &Task,
-        lane: impl FnOnce(&Lane<'_>) -> A,
-    ) -> Result<A, Refusal> {
-        let admitted = self.admit(task)?;
+        item: &BatchItem<'_>,
+        lane: impl FnOnce(&Lane<'_>) -> Attempt,
+    ) -> Result<Attempt, Refusal> {
+        let admitted = self.admit(item)?;
         let attempt = lane(&admitted);
         self.settle(admitted, &attempt);
         Ok(attempt)
@@ -166,28 +210,26 @@ impl Admission {
     /// Run every lane of `batch` on at most `width` threads. Lanes are admitted in
     /// batch order as each starts, so once one is refused on cost every later lane that can spend
     /// is too. Results are in batch order. A lane that panics settles as a measured failure.
-    pub fn run_all<I, A, F>(&self, batch: &[I], lane: F) -> Vec<Result<A, Refusal>>
+    pub fn run_all<F>(&self, batch: &[BatchItem<'_>], lane: F) -> Vec<Result<Attempt, Refusal>>
     where
-        I: BatchLane + Sync,
-        A: Settled + Send + Sync,
-        F: Fn(&I, &Lane<'_>) -> A + Sync,
+        F: Fn(&BatchItem<'_>, &Lane<'_>) -> Attempt + Sync,
     {
-        let guarded = |item: &I, admitted: &Lane<'_>| {
+        let guarded = |item: &BatchItem<'_>, admitted: &Lane<'_>| {
             std::panic::catch_unwind(AssertUnwindSafe(|| lane(item, admitted)))
-                .unwrap_or_else(|_| A::panicked())
+                .unwrap_or_else(|_| panicked())
         };
         if let [only] = batch {
-            return vec![self.run(only.task(), |admitted| guarded(only, admitted))];
+            return vec![self.run(only, |admitted| guarded(only, admitted))];
         }
         let next = Mutex::new(0usize);
-        let slots: Vec<OnceLock<Result<A, Refusal>>> =
+        let slots: Vec<OnceLock<Result<Attempt, Refusal>>> =
             batch.iter().map(|_| OnceLock::new()).collect();
         let take = || {
             let mut next = next.lock().unwrap_or_else(PoisonError::into_inner);
             let i = *next;
             let item = batch.get(i)?;
             *next += 1;
-            Some((item, slots.get(i)?, self.admit(item.task())))
+            Some((item, slots.get(i)?, self.admit(item)))
         };
         std::thread::scope(|scope| {
             for _ in 0..self.width.get().min(batch.len()) {
@@ -205,7 +247,7 @@ impl Admission {
         });
         slots
             .into_iter()
-            .map(|slot| slot.into_inner().unwrap_or_else(|| Ok(A::panicked())))
+            .map(|slot| slot.into_inner().unwrap_or_else(|| Ok(panicked())))
             .collect()
     }
 }
@@ -219,7 +261,7 @@ mod tests {
 
     use crate::deadline::{Bound, RunCeiling};
     use crate::plan::admission::{Admission, Refusal};
-    use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem};
+    use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
     use crate::plan::ir::{Join, Stage, Task, TaskKind};
 
     fn task(name: &str, kind: TaskKind) -> Task {
@@ -277,6 +319,14 @@ mod tests {
         }
     }
 
+    fn one(task: &Task) -> BatchItem<'_> {
+        BatchItem {
+            task,
+            attempt: 1,
+            inputs: BTreeMap::new(),
+        }
+    }
+
     fn width(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap()
     }
@@ -285,10 +335,10 @@ mod tests {
     fn a_lane_that_can_spend_is_refused_once_settled_spend_reaches_the_ceiling() {
         let admission = Admission::new(1.0, 0.0, None, width(1));
         let lane = agent("audit[a]");
-        assert!(admission.run(&lane, |_| costing(0.6)).is_ok());
-        assert!(admission.run(&lane, |_| costing(0.4)).is_ok());
+        assert!(admission.run(&one(&lane), |_| costing(0.6)).is_ok());
+        assert!(admission.run(&one(&lane), |_| costing(0.4)).is_ok());
         assert_eq!(
-            admission.run(&lane, |_| costing(0.1)).err(),
+            admission.run(&one(&lane), |_| costing(0.1)).err(),
             Some(Refusal::CostCeiling)
         );
     }
@@ -299,11 +349,11 @@ mod tests {
         let first = agent("audit[a]");
         let second = agent("audit[b]");
         let mut refused = None;
-        let ran = admission.run(&first, |lane| {
+        let ran = admission.run(&one(&first), |lane| {
             lane.spent_so_far(0.5);
             lane.spent_so_far(0.75);
             lane.spent_so_far(0.1);
-            refused = admission.run(&second, |_| costing(0.0)).err();
+            refused = admission.run(&one(&second), |_| costing(0.0)).err();
             costing(0.2)
         });
         assert!(ran.is_ok());
@@ -314,13 +364,13 @@ mod tests {
     fn a_refusal_on_cost_holds_after_an_in_flight_figure_settles_lower() {
         let admission = Admission::new(1.0, 0.0, None, width(2));
         let lane = agent("audit[a]");
-        let _ = admission.run(&lane, |admitted| {
+        let _ = admission.run(&one(&lane), |admitted| {
             admitted.spent_so_far(2.0);
-            assert!(admission.run(&lane, |_| costing(0.0)).is_err());
+            assert!(admission.run(&one(&lane), |_| costing(0.0)).is_err());
             costing(0.1)
         });
         assert_eq!(
-            admission.run(&lane, |_| costing(0.0)).err(),
+            admission.run(&one(&lane), |_| costing(0.0)).err(),
             Some(Refusal::CostCeiling),
             "dispatch stopped once and stays stopped"
         );
@@ -330,10 +380,16 @@ mod tests {
     fn a_lane_that_cannot_spend_is_admitted_past_the_cost_ceiling() {
         let admission = Admission::new(1.0, 5.0, None, width(1));
         assert_eq!(
-            admission.run(&agent("audit[a]"), |_| costing(0.0)).err(),
+            admission
+                .run(&one(&agent("audit[a]")), |_| costing(0.0))
+                .err(),
             Some(Refusal::CostCeiling)
         );
-        assert!(admission.run(&command("apply"), |_| costing(0.0)).is_ok());
+        assert!(
+            admission
+                .run(&one(&command("apply")), |_| costing(0.0))
+                .is_ok()
+        );
     }
 
     #[test]
@@ -342,7 +398,7 @@ mod tests {
         let admission = Admission::new(10.0, 0.0, ceiling, width(1));
         for lane in [agent("audit[a]"), command("apply")] {
             assert_eq!(
-                admission.run(&lane, |_| costing(0.0)).err(),
+                admission.run(&one(&lane), |_| costing(0.0)).err(),
                 Some(Refusal::WallClockCeiling)
             );
         }
@@ -355,7 +411,7 @@ mod tests {
         let admission = Admission::new(10.0, 0.0, None, width(1));
         let before = Instant::now();
         let deadline = admission
-            .run(&limited, |lane| {
+            .run(&one(&limited), |lane| {
                 let deadline = lane.deadline().unwrap();
                 assert_eq!(deadline.bound, Bound::Task("1h".parse().unwrap()));
                 assert!(deadline.at >= before + Duration::from_secs(3600));
@@ -424,6 +480,55 @@ mod tests {
                 .skip_while(|r| r.is_ok())
                 .all(|r| r.as_ref().err() == Some(&Refusal::CostCeiling)),
             "once a lane is refused every later one is"
+        );
+    }
+
+    /// A lane is recorded as it is admitted, with its attempt and what a resume would charge
+    /// for it, so a lane the ceiling refused leaves nothing to charge.
+    #[test]
+    fn an_admitted_lane_is_journaled_before_it_runs_and_a_refused_one_is_not() {
+        use crucible_contract::session::{SessionEvent, decode};
+
+        let started = |path: &std::path::Path| -> Vec<(String, u32, f64)> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .filter_map(decode)
+                .map(|event| match event {
+                    SessionEvent::TaskStarted {
+                        task,
+                        attempt,
+                        estimate_usd,
+                    } => (task, attempt, estimate_usd),
+                    other => panic!("not a task start: {other:?}"),
+                })
+                .collect()
+        };
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let admission = Admission::new(1.0, 0.0, None, width(4)).journaled(Some(journal.as_file()));
+        let audit = agent("audit[a]");
+        let apply = command("apply");
+        let retried = BatchItem {
+            task: &audit,
+            attempt: 2,
+            ..one(&audit)
+        };
+        let ran = admission.run(&retried, |_| {
+            assert_eq!(started(journal.path()).len(), 1, "journaled before it ran");
+            costing(1.0)
+        });
+        assert!(ran.is_ok());
+        assert_eq!(
+            admission.run(&one(&audit), |_| costing(0.0)).err(),
+            Some(Refusal::CostCeiling)
+        );
+        assert!(admission.run(&one(&apply), |_| costing(0.0)).is_ok());
+        assert_eq!(
+            started(journal.path()),
+            [
+                ("audit[a]".to_owned(), 2, 0.25),
+                ("apply".to_owned(), 1, 0.0)
+            ]
         );
     }
 

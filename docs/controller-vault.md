@@ -4,8 +4,8 @@ Runs need credentials that belong to the people who launch them: a registry push
 Jira token, a GitHub App key. The secrets registry delivers these credentials to a run, so
 nobody has to put them in a pod spec. A user or a team registers a secret in the UI, and the
 controller keeps the value in Vault. When a launch binds the secret, the controller delivers
-it to the pod of the run as a Kubernetes Secret that the pod owns ([ADR-0028](https://github.com/neuralmagic/crucible/tree/main/gov/adr),
-[ADR-0036](https://github.com/neuralmagic/crucible/tree/main/gov/adr)).
+it to the pod of the run as a Kubernetes Secret that the pod owns ([ADR-0028](./adr/ADR-0028.md),
+[ADR-0036](./adr/ADR-0036.md)).
 
 The controller is the only Vault client in the fleet. Spokes do not have a Vault token. They
 get Kubernetes Secrets that the hub writes for one run and deletes with the run.

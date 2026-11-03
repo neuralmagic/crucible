@@ -14,11 +14,12 @@
 //! raced the tracker's watermark slack is re-seen and idempotently skipped.
 
 use crate::client::Db;
+use crate::launches::jira::Trackers;
 use crate::launches::standing::{
     self, Claim, Claimed, Failed, FireError, LaunchTrigger, NewStanding, Recorded, Standing,
     SweepCfg, TriggerFuture,
 };
-use crate::launches::tracker::{TrackerKind, Trackers};
+use crate::launches::tracker::TrackerKind;
 use crate::model::Trigger;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
@@ -535,7 +536,6 @@ mod tests {
     use crate::launches::jira::{JiraConfig, JiraTracker};
     use crate::model::MaxTime;
     use sqlx::Row;
-    use std::sync::Arc;
 
     /// Serve canned JSON bodies over real HTTP, one per connection: the reqwest path is exercised
     /// for real, no mocks.
@@ -569,7 +569,9 @@ mod tests {
             .expect("config"),
         )
         .expect("tracker");
-        Trackers::default().with(TrackerKind::Jira, Arc::new(tracker))
+        Trackers {
+            jira: Some(tracker),
+        }
     }
 
     fn search_body(keys: &[(&str, &str)]) -> String {

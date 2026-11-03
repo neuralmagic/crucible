@@ -265,7 +265,7 @@ pub(super) async fn run_scope_and_transition(
             crate::playbooks::providers::WorkloadClass::Autoresearch,
         )
         .await?;
-        let dispatcher = crate::runs::workpod::active_dispatcher();
+        let dispatcher = cfg.runtime.dispatcher.clone();
         let outcome = crate::runs::workpod::dispatch_scope(
             db,
             cfg,
@@ -290,13 +290,15 @@ pub(super) async fn run_scope_and_transition(
         return apply_pod_scope_outcome(db, cfg, issue, outcome, scoped_reason).await;
     }
     let bin = crate::runs::engine::resolve_bin();
-    if let Err(failure) = crate::runs::workpod::admit_contract(
-        crate::runs::contract::RequestKind::LocalScope,
-        &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
-    )
-    .await
+    if let Err(failure) = cfg
+        .runtime
+        .admit_contract(
+            crate::runs::contract::RequestKind::LocalScope,
+            &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
+        )
+        .await
     {
-        crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?).await?;
+        crate::issues::transitions::refuse(db, &issue.key, &failure.into_rejection()?).await?;
         return Ok(());
     }
     // The turn drafts into scratch; the surviving tree is tarred into `pack_tarballs`, the
@@ -351,7 +353,7 @@ pub(super) async fn apply_pod_scope_outcome(
                 db,
                 cfg,
                 issue,
-                report,
+                *report,
                 Some(pod_name),
                 PackSource::PodLogs,
                 scoped_reason,
@@ -424,7 +426,7 @@ async fn apply_scope_report(
     db: &Db,
     cfg: &ControllerCfg,
     issue: &Issue,
-    report: engine::ScopeReport,
+    report: engine::Scraped,
     pod_name: Option<String>,
     source: PackSource<'_>,
     scoped_reason: &str,
@@ -515,7 +517,7 @@ async fn apply_scope_report(
                 &mut *tx,
                 &NewScope {
                     issue: issue.key.clone(),
-                    pack_digest: report.digest.clone(),
+                    pack_digest: report.digest().map(str::to_string),
                     check_outcome: Some("PASS".to_string()),
                 },
             )
@@ -527,7 +529,7 @@ async fn apply_scope_report(
                 "new",
                 "scoped",
                 Some(scoped_reason),
-                report.digest.as_deref(),
+                report.digest(),
             );
             crate::event_log::insert(&mut *tx, &ev).await?;
             tx.commit().await?;

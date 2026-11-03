@@ -1,0 +1,112 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0071"
+title = "A pack edition gates contract changes, and edition 2 gives host commands only declared env"
+status = "proposed"
+date = "2026-11-03"
+refs = [
+    "RFC-0001:C-COMMANDS",
+    "RFC-0001:C-CAPABILITY-DISCLOSURE",
+    "RFC-0004:C-CONTRACT-VERSION",
+    "ADR-0058",
+]
+
+[content]
+context = """
+Until #294, measure_cmd, the [world] hooks, and workflow command and evaluate tasks ran with the engine's whole environment: kubeconfig, registry authfile, broker and pod tokens, provider keys, projected secrets. Each of them can be a script the agent was able to edit, so anything it ran could read all of that. #294 narrowed them to PATH, HOME, LANG, TMPDIR, the variables the engine sets for each command, and what the command's table declares in [judge].env, [world].env, or [workflow].env ([[RFC-0001:C-COMMANDS]]), and disclosed each declared variable as reach ([[RFC-0001:C-CAPABILITY-DISCLOSURE]]).
+
+That narrowing changes what an unchanged pack's commands receive. Packs in use have host commands that read variables they never declared; they could not have, since the env lists did not exist. On the narrowed engine those commands lose the values: a shell default takes over, or the command fails. Nothing in the pack changed and nobody re-approved it.
+
+Constraints:
+
+- The registry re-derives a stored pack's schema and exposure whenever the linked engine changes, without asking anyone ([[ADR-0058]] traces this). An engine release that changes what a pack's commands receive changes an approved pack's behaviour while its source digest stays the same.
+- [[ADR-0058]] already proposes a pack edition as the opt-in for a contract change, for declared input files. It places the key in [workflow] and maps it one-to-one to the plan IR version. Host env is not a workflow property: a scored pack with no [workflow] table still runs measure_cmd and its [world] hooks.
+- Manifest and CompositeManifest deny unknown fields, so an engine that predates a new top-level key refuses it at parse rather than ignoring it.
+- An edition-1 pack that keeps inheriting still holds that reach. The disclosure has to say so, or a reviewer reads an unlisted variable as one the pack cannot reach."""
+decision = """
+Gate the narrowing on a pack edition, declared at the manifest's top level.
+
+- **The key.** `edition` is a top-level key of crucible.toml, in single and composite manifests alike. Absent is edition 1. An engine supports a fixed set of editions and refuses any other at parse, naming the ones it supports. An engine runs every edition it supports with that edition's semantics, so an unchanged pack behaves the same across engine upgrades, and a pack changes behaviour only when its author raises the edition.
+- **Editions are cumulative.** Each edition is the previous one plus one named contract change. A pack that wants a later change takes every earlier one with it.
+- **Edition 2 is declared host env.** Host commands get the base, the engine's own variables for them, and what their table declares, as [[RFC-0001:C-COMMANDS]] states it. The disclosure names each declared variable by table.
+- **Edition 1 inherits.** Host commands keep the engine's environment, plus the variables the engine sets for them. An env list in an edition-1 manifest fails the parse naming the table and edition 2, because it would read as a narrowing that never happens. `crucible check` and every run start warn that the pack inherits and should move to edition 2, and the disclosure states, per table whose commands run, that they inherit the engine's whole environment.
+- **Where the edition lives.** The manifest owns it. A workflow's compiled form carries it from the manifest, as it carries the source it was compiled from, so a site that builds a plan from the workflow alone can read it.
+- **Amends [[ADR-0058]].** Its declared inputs become edition 3, its key moves from [workflow] to the top level, and editions 1 and 2 compile to plan IR v1, edition 3 to v2.
+
+The edition is the manifest's rather than the workflow's because the change it gates reaches [judge] and [world]. It is cumulative rather than a set of feature flags because each edition is one combination the engine is tested in."""
+consequences = """
+- Every pack that ran before keeps running as it did. It is warned at check and at every run start, and its disclosure now states the inherited reach, so a reviewer sees it.
+- The exposure of every edition-1 pack that runs host commands gains host-env entries. The registry's re-derivation updates the stored exposure on the engine bump, and the digest an approval accepted moves with it.
+- Moving a pack to edition 2 means declaring every variable its host commands read, across [judge], [world], and [workflow], in one change. A command that reads an undeclared variable finds it unset at run time; nothing static can see what a script reads.
+- An engine that predates editions refuses an edition-2 manifest at parse, because the key is unknown to it; it never runs the pack with inherited env. [[RFC-0004:C-CONTRACT-VERSION]] already keeps dispatch images in step with the linked engine.
+- The engine carries the inheriting path until no pack uses edition 1. Retiring edition 1 is a later decision.
+- Because editions are cumulative, a pack cannot take [[ADR-0058]]'s declared inputs without also declaring its host env.
+- setup_cmd and the --agent-cmd stand-in run with the engine's environment in every edition, as before.
+- A plan file run without a manifest has no edition and runs as edition 1."""
+
+[[content.alternatives]]
+text = "A top-level manifest edition, cumulative, where edition 2 is declared host env and edition 1 keeps inheriting"
+status = "accepted"
+pros = [
+    "Every pack that runs today keeps running on the new engine, with no source change and no re-approval.",
+    "One key covers [judge], [world], and [workflow], so a scored pack with no workflow is governed too.",
+    "An older engine refuses the key at parse instead of running the pack with inherited env.",
+    "The disclosure and the warnings make the remaining inherited reach visible.",
+]
+cons = [
+    "The engine carries two host-env paths until edition 1 is retired.",
+    "Edition-1 packs keep their reach until their authors move them.",
+    "Cumulative editions tie unrelated changes together: a later edition requires declared env.",
+]
+
+[[content.alternatives]]
+text = "Narrow every pack in one engine release, with no edition"
+status = "rejected"
+pros = ["One host-env path, and no pack keeps the engine's credentials."]
+cons = [
+    "Live packs whose commands read undeclared variables break on the upgrade.",
+    "Approved packs change behaviour with no source change and no re-approval, and no stored digest says so.",
+]
+rejection_reason = "It breaks running packs in exchange for not carrying the inheriting path."
+
+[[content.alternatives]]
+text = "Opt in per table by declaring an env list: a table with env gets the allowlist, one without inherits"
+status = "rejected"
+pros = ["A pack ports one table at a time and needs no new key."]
+cons = [
+    "Absent and empty mean different things: a table whose commands need nothing has to write env = [] to stop inheriting.",
+    "Inheriting stays the silent default for every table an author forgets, with nothing that says to move.",
+    "Which environment a command gets becomes a per-table fact a reviewer has to read off every table.",
+]
+rejection_reason = "It keeps the credential-reading default for every table nobody touched, and makes the narrowing a property of each table instead of the pack."
+
+[[content.alternatives]]
+text = "Place the edition in [workflow], as ADR-0058 proposed"
+status = "rejected"
+pros = ["The key sits beside the workflow fields whose compiled form it changes."]
+cons = [
+    "measure_cmd and the [world] hooks run in packs that have no [workflow] table, so the key cannot reach them.",
+    "A pack's edition would differ between its workflow and its judge.",
+]
+rejection_reason = "Host env reaches [judge] and [world]; an edition that only a workflow can state cannot gate it."
+
+[[content.alternatives]]
+text = "Independent per-change switches in the manifest, such as inherit_env = false per table"
+status = "rejected"
+pros = ["A pack takes exactly the changes it wants."]
+cons = [
+    "The engine has to run and test every combination of switches, and the combinations grow with each change.",
+    "The switches accumulate in manifests long after their defaults have flipped.",
+]
+rejection_reason = "An edition names one tested combination; switches name a product of them."
+
+[[content.alternatives]]
+text = "An operator setting in the engine's run configuration that turns the narrowing on per deployment"
+status = "rejected"
+pros = ["No pack changes; an operator narrows a whole deployment at once."]
+cons = [
+    "The same pack behaves differently on two deployments.",
+    "The disclosure is computed from the pack alone and could not state which environment a command gets.",
+]
+rejection_reason = "What a pack's commands can reach has to be a property of the pack that its disclosure can state."

@@ -113,7 +113,7 @@ impl RunsQuery {
 pub(crate) async fn get_run(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(run) = crate::runs::store::get_run(state.db.pool(), &run_id).await? else {
         return Ok(not_found(format!("run not found: {run_id}")));
     };
@@ -148,9 +148,7 @@ pub(crate) async fn get_run(
         (status = 200, description = "The MCP servers runs get by default, and the revision naming that set", body = crate::runs::agent_tools::Defaults)
     )
 )]
-pub(crate) async fn get_agent_tool_defaults(
-    State(state): State<ApiState>,
-) -> Result<Response, AppError> {
+pub(crate) async fn get_agent_tool_defaults(State(state): State<ApiState>) -> ApiResult<Response> {
     let servers = match state.profile().await? {
         Some(profile) => profile.agent_servers().map_err(anyhow::Error::from)?,
         None => Vec::new(),
@@ -197,7 +195,7 @@ pub(crate) async fn get_agent_clusters(State(state): State<ApiState>) -> Respons
 pub(crate) async fn get_run_graph(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(plan) = crate::runs::task_results::latest_run_plan(state.db.pool(), &run_id).await?
     else {
         return Ok(not_found(format!("no task graph for run: {run_id}")));
@@ -441,7 +439,7 @@ pub(crate) async fn live_turn(
 pub(crate) async fn list_runs(
     State(state): State<ApiState>,
     Query(q): Query<RunsQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let query = match q.into_model() {
         Ok(q) => q,
         Err(msg) => {
@@ -478,7 +476,7 @@ pub(crate) async fn list_runs(
 pub(crate) async fn get_run_iterations(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if crate::runs::store::get_run(state.db.pool(), &run_id)
         .await?
         .is_none()
@@ -511,7 +509,7 @@ pub(crate) async fn get_run_iterations(
 pub(crate) async fn list_run_artifacts(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(run) = crate::runs::store::get_run(state.db.pool(), &run_id).await? else {
         return Ok(not_found(format!("run not found: {run_id}")));
     };
@@ -563,13 +561,14 @@ pub(crate) async fn get_artifact(
             }
             return not_found(format!("run not found: {run_id}"));
         }
-        Err(e) => return AppError(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let if_none_match = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok());
     crate::runs::artifacts::serve_artifact(
         state.db.metrics(),
+        Some(&state.contracts),
         state.db.pool(),
         run.session_uri.as_deref(),
         &run_id,
@@ -602,7 +601,7 @@ fn parquet_response(bytes: Vec<u8>, filename: &str) -> Response {
         (status = 200, description = "runs.parquet (Apache Parquet)", content_type = "application/vnd.apache.parquet")
     )
 )]
-pub(crate) async fn export_runs(State(state): State<ApiState>) -> Result<Response, AppError> {
+pub(crate) async fn export_runs(State(state): State<ApiState>) -> ApiResult<Response> {
     let rows = crate::runs::store::export_run_rows(state.db.pool()).await?;
     let bytes = crate::runs::export::write_run_parquet(&rows)?;
     if let Some(m) = state.db.metrics() {
@@ -620,7 +619,7 @@ pub(crate) async fn export_runs(State(state): State<ApiState>) -> Result<Respons
         (status = 200, description = "iterations.parquet (Apache Parquet)", content_type = "application/vnd.apache.parquet")
     )
 )]
-pub(crate) async fn export_iterations(State(state): State<ApiState>) -> Result<Response, AppError> {
+pub(crate) async fn export_iterations(State(state): State<ApiState>) -> ApiResult<Response> {
     let rows = crate::runs::store::export_iteration_rows(state.db.pool()).await?;
     let bytes = crate::runs::export::write_iter_parquet(&rows)?;
     if let Some(m) = state.db.metrics() {

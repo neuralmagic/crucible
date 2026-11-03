@@ -34,7 +34,7 @@ pub(crate) fn import_refusal(err: RegisterError) -> Response {
         e @ RegisterError::ExposureChanged { .. } => {
             (StatusCode::CONFLICT, Json(ErrorBody::new(e.to_string()))).into_response()
         }
-        RegisterError::Internal(e) => AppError::from(e).into_response(),
+        RegisterError::Internal(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -97,7 +97,7 @@ pub(crate) async fn import_candidates(
     let repo = normalize_repo(body.repo.trim()).to_string();
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
         Ok(g) => g,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     let found = tokio::task::spawn_blocking(move || {
@@ -110,7 +110,7 @@ pub(crate) async fn import_candidates(
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return import_refusal(e),
         Err(e) => {
-            return AppError::from(anyhow::Error::new(e).context("joining the import worker"))
+            return ApiError::from(anyhow::Error::new(e).context("joining the import worker"))
                 .into_response();
         }
     };
@@ -144,7 +144,7 @@ fn import_error(err: ImportError) -> Response {
         }
         ImportError::Register(e) => import_refusal(e),
         ImportError::Draft(e) => draft_refusal(e),
-        ImportError::Internal(e) => AppError::from(e).into_response(),
+        ImportError::Internal(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -302,12 +302,12 @@ pub(crate) async fn propose_pack_import(
     .await
     {
         Ok(owner) => owner,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
 
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
         Ok(g) => g,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let proposed = match crate::playbooks::imports::propose(
         state.db.pool(),
@@ -373,7 +373,7 @@ async fn readable_import(
 ) -> Result<crate::playbooks::imports::PackImport, Response> {
     let row = crate::playbooks::imports::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     crate::authz::owner::decide_row(
         state,
         caller,
@@ -400,7 +400,7 @@ pub(crate) async fn get_pack_import(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let import = match readable_import(&state, &caller, &id, crate::authz::action::Verb::Read).await
     {
         Ok(import) => import,
@@ -525,7 +525,7 @@ pub(crate) async fn register_pack_import(
     let actor = identity.as_deref();
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
         Ok(g) => g,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let registered = match crate::playbooks::imports::register(
         state.db.pool(),
@@ -695,12 +695,12 @@ pub(crate) async fn create_draft_from_git(
     .await
     {
         Ok(owner) => owner,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
 
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
         Ok(g) => g,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let (proposed, saved) = match crate::playbooks::imports::propose_as_draft(
         state.db.pool(),

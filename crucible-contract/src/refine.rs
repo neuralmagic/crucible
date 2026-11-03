@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// after is a refine turn seeded with the prior round's failure evidence, and an `Adversary` round
 /// is the read-only gaming-review turn run after a pack validates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RoundKind {
     Propose,
@@ -32,6 +33,7 @@ impl RoundKind {
 /// cost, and the validation verdict. The full ordered `Vec<RoundRecord>` is the trail written into
 /// `SCOPE.md` (on success) or `REJECTED.md` (on exhaustion).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct RoundRecord {
     /// 1-based round number.
     pub round: u32,
@@ -51,6 +53,7 @@ pub struct RoundRecord {
 /// on, only a malformed turn, and the pack must NOT freeze on it (fail-closed, never treated as a
 /// pass).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum RoundOutcome {
     Passed,
@@ -62,6 +65,7 @@ pub enum RoundOutcome {
 /// refine turn is handed verbatim, concrete enough to diagnose from, structured enough for the
 /// controller's checkpoint UI to render.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(tag = "stage", rename_all = "snake_case")]
 pub enum FailureEvidence {
     /// Nothing usable to validate: no manifest written, it didn't parse, no `[judge.selftest]`, or
@@ -88,6 +92,7 @@ pub enum FailureEvidence {
 /// checklist. `narrative` names the exact mechanism; `suggestion` is the concrete
 /// fix to the manifest/gate/controls that would close it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Attack {
     pub kind: AttackKind,
     pub narrative: String,
@@ -96,6 +101,7 @@ pub struct Attack {
 
 /// Which of the adversary's five checklist categories an attack falls under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "kebab-case")]
 pub enum AttackKind {
     SelfReport,
@@ -108,6 +114,7 @@ pub enum AttackKind {
 /// A serde-friendly snapshot of a self-test that failed to discriminate: the direction and run
 /// count it was judged by, plus each control's readings and mean.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct SelftestEvidence {
     /// `"higher"` or `"lower"`, how the controls were compared.
     pub direction: String,
@@ -119,6 +126,7 @@ pub struct SelftestEvidence {
 /// One control's evidence: the staging command, its per-run readings, the mean, and whether every
 /// reading was valid.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ControlEvidence {
     pub cmd: String,
     pub mean: f64,
@@ -129,6 +137,7 @@ pub struct ControlEvidence {
 /// A single measurement, as the refiner should see it: valid flag, score (absent when the gate
 /// reported invalid), and the note the gate emitted.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct ReadingEvidence {
     pub valid: bool,
     pub score: Option<f64>,

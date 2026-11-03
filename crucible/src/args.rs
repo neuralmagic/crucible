@@ -27,6 +27,16 @@ pub(crate) enum Ui {
 
 #[derive(clap::Args, Clone)]
 pub(crate) struct Args {
+    /// The identity this run's sandboxes are named under, minted when its broker starts.
+    #[arg(skip)]
+    pub sandbox_run_id: Option<openshell::sandbox::RunId>,
+    /// The lock every turn of this process boots the gateway under.
+    #[arg(skip)]
+    pub gateway_boot: crucible::openshell::gateway::BootLock,
+    /// The engine runtime's handle, set by the arm that built the runtime; the async call sites
+    /// (the openshell turn, the S3 publish and fetch) run on it.
+    #[arg(skip)]
+    pub engine: Option<tokio::runtime::Handle>,
     /// The domain manifest: the engine reads it, builds a World + Judge, and works in its
     /// workspace. Required (every run is a manifest run).
     #[arg(long)]
@@ -125,15 +135,11 @@ pub(crate) struct Args {
     /// The agent binding's token price, pinned with the model (see `Args::pricing`).
     #[arg(skip)]
     pub price: Option<crucible_contract::inference::TokenPrice>,
-    /// The agent harness that runs each turn: `claude` (default), `hermes`, `codex`, `opencode`,
-    /// or `pi`. Overrides
-    /// the manifest's `[agent].harness`; when neither is set the engine defaults to claude (see
-    /// `apply_agent_cfg`).
+    /// The agent harness that runs each turn: `claude` (default), `codex`, `opencode`, or `pi`.
+    /// Overrides the manifest's `[agent].harness`; when neither is set the engine defaults to
+    /// claude (see `apply_agent_cfg`).
     #[arg(long, value_enum)]
     pub harness: Option<crate::manifest::Harness>,
-    /// Hermes-harness tuning (from `[agent.hermes]`). No CLI flag.
-    #[arg(skip)]
-    pub hermes: manifest::HermesCfg,
     /// Codex-harness tuning (from `[agent.codex]`). No CLI flag.
     #[arg(skip)]
     pub codex: manifest::CodexCfg,
@@ -215,6 +221,9 @@ pub(crate) struct Args {
     /// Toolbox exclusions for per-task harness overrides.
     #[arg(skip)]
     pub workflow_toolbox_exclude: Vec<String>,
+    /// What `[workflow].env` passes to `command` and `evaluate` tasks.
+    #[arg(skip)]
+    pub workflow_env: crucible::host_env::HostEnv,
     /// Where the run's buildit serves the run's own command and evaluate tasks, fixed from the
     /// run's top-level paths so every task and turn starts it the same way.
     #[arg(skip)]
@@ -270,6 +279,94 @@ impl Args {
     pub(crate) fn pricing(&self) -> crate::agent::event::Pricing {
         crate::agent::event::Pricing::resolve(self.model(), self.price.as_ref())
     }
+
+    /// The engine runtime, which every async call site runs on; an error, never a panic, when
+    /// the arm that built this run never built one.
+    #[cfg(feature = "autoresearch")]
+    pub(crate) fn engine_handle(&self) -> Result<&tokio::runtime::Handle, EngineUninitialized> {
+        self.engine.as_ref().ok_or(EngineUninitialized)
+    }
+
+    /// The slice a harness backend reads to build a turn.
+    pub(crate) fn turn_agent(&self) -> TurnAgent<'_> {
+        TurnAgent {
+            harness: self.harness(),
+            model: self.model(),
+            reasoning_effort: self.reasoning_effort,
+            disallowed_tools: &self.disallowed_tools,
+            codex: &self.codex,
+            env: &self.env,
+        }
+    }
+
+    /// The slice the openshell turn reads.
+    pub(crate) fn sandbox_turn(&self) -> SandboxTurn<'_> {
+        SandboxTurn {
+            agent: self.turn_agent(),
+            pricing: self.pricing(),
+            broker: &self.broker,
+            broker_token: self.broker_token.as_deref(),
+            openshell: &self.openshell,
+            sandbox_image: self.sandbox_image.as_deref(),
+            sandbox_resources: &self.sandbox_resources,
+            relay: &self.relay,
+            mcp: &self.mcp,
+            mcp_scope: &self.mcp_scope,
+            compute_driver: self.compute_driver,
+            disclosure: self.disclosure.as_ref(),
+            run_id: self.sandbox_run_id.as_ref(),
+            gateway_boot: &self.gateway_boot,
+            engine: self.engine.as_ref(),
+            tool_plugins: self.tool_plugins.as_deref(),
+            buildit_socket: self.buildit_socket.as_ref(),
+        }
+    }
+}
+
+/// An async call site reached before the arm that owns the run built the engine runtime.
+#[cfg(feature = "autoresearch")]
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the engine runtime is not initialized (EngineCtx::new was not called before an async call \
+     site) — this is an engine wiring bug"
+)]
+pub(crate) struct EngineUninitialized;
+
+/// What a harness backend reads off a run to build one turn: the resolved harness and model,
+/// the agent knobs, and the manifest `[agent].env`.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnAgent<'a> {
+    pub harness: manifest::Harness,
+    pub model: &'a str,
+    pub reasoning_effort: Option<manifest::ReasoningEffort>,
+    pub disallowed_tools: &'a [String],
+    pub codex: &'a manifest::CodexCfg,
+    pub env: &'a [(String, String)],
+}
+
+/// What the openshell turn reads off a run: the agent slice plus the sandbox, broker, egress,
+/// relay, and MCP settings that shape one sandboxed turn.
+pub(crate) struct SandboxTurn<'a> {
+    pub agent: TurnAgent<'a>,
+    pub pricing: crate::agent::event::Pricing,
+    pub broker: &'a manifest::BrokerCfg,
+    pub broker_token: Option<&'a str>,
+    pub openshell: &'a manifest::OpenshellCfg,
+    pub sandbox_image: Option<&'a str>,
+    pub sandbox_resources: &'a manifest::SandboxResources,
+    pub relay: &'a [manifest::RelayFile],
+    pub mcp: &'a [crate::control::mcp::Server],
+    pub mcp_scope: &'a [String],
+    pub compute_driver: openshell::gateway::ComputeDriver,
+    pub disclosure: Option<&'a crate::exposure::Covered>,
+    /// The run's sandbox identity; `None` names each turn's sandbox afresh.
+    pub run_id: Option<&'a openshell::sandbox::RunId>,
+    pub gateway_boot: &'a crucible::openshell::gateway::BootLock,
+    /// The engine runtime the turn runs on; `None` fails the turn as an orchestration error.
+    pub engine: Option<&'a tokio::runtime::Handle>,
+    /// The declared tool plugin chain; `None` runs the default chain.
+    pub tool_plugins: Option<&'a [manifest::ToolPluginSpec]>,
+    pub buildit_socket: Option<&'a crate::openshell::buildit::RunSocket>,
 }
 
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit

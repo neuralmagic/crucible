@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0065"
 title = "The controller hands the engine its models as the inference document"
-status = "proposed"
+status = "accepted"
 date = "2026-10-07"
 refs = [
     "RFC-0001:C-INFERENCE",
@@ -61,13 +61,9 @@ cons = [
 [[content.alternatives]]
 text = "A separate decision-provider registry"
 status = "rejected"
-cons = [
-    "Duplicates the ownership, secret reference, enablement and fallback rules the providers already have.",
-]
+cons = ["Duplicates the ownership, secret reference, enablement and fallback rules the providers already have."]
 
 [[content.alternatives]]
 text = "Pin a decision model per launch now"
 status = "rejected"
-cons = [
-    "No launch needs it yet; defaults per domain cover the packs that route today.",
-]
+cons = ["No launch needs it yet; defaults per domain cover the packs that route today."]

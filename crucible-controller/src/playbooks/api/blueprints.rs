@@ -138,7 +138,7 @@ async fn plan(
 ) -> Result<Plan, Response> {
     let bound = store::bindings_for_scope(state.db.pool(), ScopeKind::Playbook, &blueprint.id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     let mut carried = Vec::new();
     let mut refused = Vec::new();
     for (binding, secret) in bound {
@@ -211,7 +211,7 @@ pub(crate) async fn mark_blueprint(
     identity: crate::identity::session::Identity,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let mut row = match crate::playbooks::api::registry::readable_playbook(
         &state,
         &caller,
@@ -290,7 +290,7 @@ pub(crate) async fn unmark_blueprint(
     identity: crate::identity::session::Identity,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let mut row = match crate::playbooks::api::registry::readable_playbook(
         &state,
         &caller,
@@ -326,7 +326,7 @@ async fn set_public(
     caller: &crate::authz::Caller,
     id: &str,
     public: bool,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(mut row) = crate::playbooks::registry::get(state.db.pool(), id).await? else {
         return Ok(not_found(format!("no playbook {id:?}")));
     };
@@ -369,7 +369,7 @@ pub(crate) async fn publish_blueprint(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     set_public(&state, &caller, &id, true).await
 }
 
@@ -389,7 +389,7 @@ pub(crate) async fn unpublish_blueprint(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     set_public(&state, &caller, &id, false).await
 }
 
@@ -403,7 +403,7 @@ pub(crate) async fn unpublish_blueprint(
 pub(crate) async fn list_blueprints(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let rows = crate::playbooks::registry::list_blueprints(state.db.pool()).await?;
     let rows = crate::authz::owner::readable(&state, &caller, ResourceType::Playbook, rows, |r| {
         r.resource()
@@ -466,7 +466,7 @@ pub(crate) async fn use_blueprint(
     caller: crate::authz::Caller,
     Path(id): Path<String>,
     Json(body): Json<UseBlueprintBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Some(msg) = require_non_empty(&[("id", &body.id)]) {
         return Ok(unprocessable(msg));
     }
@@ -482,17 +482,13 @@ pub(crate) async fn use_blueprint(
             blueprint.rev
         )));
     }
-    let owner = match crate::authz::owner::owner_for_create(
+    let owner = crate::authz::owner::owner_for_create(
         &state,
         &caller,
         body.owner.as_deref(),
         ResourceType::PlaybookDraft,
     )
-    .await
-    {
-        Ok(owner) => owner,
-        Err(refused) => return Ok(refused),
-    };
+    .await?;
     let declared = crate::playbooks::blueprints::declared(state.db.pool(), &blueprint).await?;
     let mode = Mode::Use {
         vault_token: body.vault_token.as_deref(),
@@ -543,7 +539,7 @@ pub(crate) async fn use_blueprint(
             }
             return Ok(match e {
                 e @ store::StoreError::Duplicate { .. } => conflict(e.to_string()),
-                store::StoreError::Internal(e) => AppError::from(e).into_response(),
+                store::StoreError::Internal(e) => ApiError::from(e).into_response(),
             });
         }
     };

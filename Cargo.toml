@@ -49,6 +49,8 @@ openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "8350
 openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "8350ed52b7754750e93d505de6f5d62b9ed5de0b", default-features = false }
 tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 thiserror = "2"
+# One rmcp pin for every MCP server and client in the tree; members add features.
+rmcp = "3.6"
 strum = { version = "0.28", features = ["derive"] }
 # Cron expression parsing for playbook schedules. Owns the pattern grammar only: it matches
 # civil fields as integers, so jiff stays the single timezone authority. Default features off

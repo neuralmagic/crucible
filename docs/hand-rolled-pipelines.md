@@ -378,4 +378,4 @@ A delegated-cluster reachability error also includes the configured spoke name a
 [Work graphs](./work-graphs.md) describes the workflow DSL and the generic work-graph
 runner. The broker still has the fixed `codegen_benchmark`, `codegen_lm_eval`, and
 `codegen_profile` tools. The named-job registry in
-[ADR-0022](./adr/0022-measure-task-dags.md) is only partially implemented.
+[ADR-0017](./adr/ADR-0017.md) is only partially implemented.

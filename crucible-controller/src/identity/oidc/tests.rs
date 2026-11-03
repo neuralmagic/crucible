@@ -1,7 +1,5 @@
 use super::*;
 
-use crate::identity::auth::AuthMode;
-
 #[test]
 fn groups_come_from_the_groups_claim_and_fall_back_to_realm_roles() {
     let claims: GroupClaims = serde_json::from_value(
@@ -63,19 +61,6 @@ fn an_email_the_issuer_marks_unverified_is_dropped() {
     assert_eq!(verified_email(email(), Some(false)), None);
 }
 
-/// A JWT is the issuer's word; a cluster token is the API server's. The guard must never hand one
-/// to the other's validator.
-#[test]
-fn only_a_three_segment_token_looks_like_a_jwt() {
-    use crate::identity::auth::looks_like_jwt;
-    assert!(looks_like_jwt("aGVhZGVy.cGF5bG9hZA.c2ln"));
-    assert!(!looks_like_jwt("sha256~AbCdEf"));
-    assert!(!looks_like_jwt("opaque-token"));
-    assert!(!looks_like_jwt("two.segments"));
-    assert!(!looks_like_jwt("four.seg.ments.here"));
-    assert!(!looks_like_jwt("empty..segment"));
-}
-
 #[tokio::test]
 async fn the_registration_reads_off_the_environment_and_refuses_half_of_one() {
     let _lock = crate::ENV_LOCK.lock().await;
@@ -85,8 +70,6 @@ async fn the_registration_reads_off_the_environment_and_refuses_half_of_one() {
         "CONTROLLER_OIDC_CLIENT_SECRET",
         "CONTROLLER_OIDC_REDIRECT_URL",
         "CONTROLLER_OIDC_SCOPES",
-        "CONTROLLER_OIDC_DEVICE_CLIENT_ID",
-        "CONTROLLER_AUTH_MODE",
     ];
     for var in vars {
         // SAFETY: the crate-wide env lock is held for the whole test.
@@ -97,15 +80,10 @@ async fn the_registration_reads_off_the_environment_and_refuses_half_of_one() {
         OidcCfg::from_env()
             .expect("no issuer is not an error")
             .is_none(),
-        "no issuer configured is a proxy-mode or local deployment"
+        "no issuer configured is a local dev or machine-only deployment"
     );
-    assert_eq!(AuthMode::from_env(), AuthMode::Proxy);
 
-    unsafe {
-        std::env::set_var("CONTROLLER_OIDC_ISSUER", "https://idp.example.com/realms/r");
-        std::env::set_var("CONTROLLER_AUTH_MODE", " NATIVE ");
-    }
-    assert_eq!(AuthMode::from_env(), AuthMode::Native);
+    unsafe { std::env::set_var("CONTROLLER_OIDC_ISSUER", "https://idp.example.com/realms/r") };
     let refusal = OidcCfg::from_env().expect_err("a client id is required");
     assert!(format!("{refusal:#}").contains("CONTROLLER_OIDC_CLIENT_ID"));
 
@@ -126,10 +104,6 @@ async fn the_registration_reads_off_the_environment_and_refuses_half_of_one() {
         "the default scope set carries offline_access"
     );
     assert!(cfg.client_secret.is_none());
-    assert!(
-        cfg.device_client_id.is_none(),
-        "no device client, no JWT path"
-    );
 
     // The deploy's list wins verbatim, comma- or space-separated, because a scope the realm has
     // not registered breaks login outright.
@@ -213,7 +187,6 @@ fn a_forced_jwks_refresh_is_granted_once_per_interval() {
         client_secret: None,
         redirect_url: "https://controller.example.com/auth/callback".to_string(),
         scopes: vec!["openid".to_string()],
-        device_client_id: Some("cli".to_string()),
         post_logout_redirect: None,
     })
     .expect("provider");
@@ -249,7 +222,6 @@ pub(crate) fn provider_at(issuer: &str) -> Arc<OidcProvider> {
             client_secret: None,
             redirect_url: "http://localhost/auth/callback".to_string(),
             scopes: vec!["openid".to_string()],
-            device_client_id: None,
             post_logout_redirect: None,
         })
         .expect("provider"),
@@ -429,7 +401,6 @@ async fn the_callback_is_mounted_at_the_redirect_urls_path(pool: sqlx::PgPool) {
         client_secret: None,
         redirect_url: "https://controller.example.com/oauth2/callback".to_string(),
         scopes: vec!["openid".to_string()],
-        device_client_id: None,
         post_logout_redirect: None,
     })
     .expect("provider");
@@ -439,11 +410,9 @@ async fn the_callback_is_mounted_at_the_redirect_urls_path(pool: sqlx::PgPool) {
     );
 
     let app = routes::router(routes::AuthState {
-        mode: AuthMode::Native,
         oidc: Some(Arc::new(provider)),
         pool,
         credential_keys: None,
-        proxy_prefix: String::new(),
     });
     for path in ["/oauth2/callback", "/auth/callback"] {
         let res = app

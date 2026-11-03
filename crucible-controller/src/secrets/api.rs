@@ -269,7 +269,7 @@ const NO_VAULT: &str = "this deployment has no Vault client, so the secrets regi
 /// The secret `id` names, decided for `verb` against its owner. A caller who may not read it is
 /// told it does not exist (RFC-0003 C-READ-SCOPING).
 #[allow(clippy::result_large_err)]
-async fn owned(
+pub(crate) async fn owned(
     state: &ApiState,
     caller: &crate::authz::Caller,
     id: &str,
@@ -277,7 +277,7 @@ async fn owned(
 ) -> Result<SecretRow, Response> {
     let row = store::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?
+        .map_err(|e| ApiError::from(e).into_response())?
         .ok_or_else(|| not_found(format!("no secret {id:?}")))?;
     let resource = crate::authz::decision::Resource::new(
         crate::authz::action::ResourceType::Secret,
@@ -358,9 +358,19 @@ impl BindRefusal {
     }
 }
 
+impl From<BindRefusal> for ApiError {
+    fn from(refusal: BindRefusal) -> Self {
+        match refusal.status {
+            StatusCode::FORBIDDEN => ApiError::Forbidden(refusal.message),
+            StatusCode::SERVICE_UNAVAILABLE => ApiError::Unavailable(refusal.message),
+            _ => ApiError::Unprocessable(refusal.message),
+        }
+    }
+}
+
 impl IntoResponse for BindRefusal {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody::new(self.message))).into_response()
+        ApiError::from(self).into_response()
     }
 }
 
@@ -477,7 +487,7 @@ pub(crate) async fn register_secret(
     .await
     {
         Ok(owner) => owner,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     let name = match SecretName::parse(&body.name) {
         Ok(name) => name,
@@ -568,7 +578,7 @@ pub(crate) async fn register_secret(
     let id = uuid::Uuid::now_v7().to_string();
     let mut tx = match state.db.pool().begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let stored = store::insert(
         &mut tx,
@@ -589,7 +599,7 @@ pub(crate) async fn register_secret(
     let mut stored = match stored {
         Ok(row) => row,
         Err(e @ store::StoreError::Duplicate { .. }) => return conflict(e.to_string()),
-        Err(store::StoreError::Internal(e)) => return AppError::from(e).into_response(),
+        Err(store::StoreError::Internal(e)) => return ApiError::from(e).into_response(),
     };
 
     // The Vault write rides inside the transaction: a write that fails rolls the row back, so a
@@ -603,7 +613,7 @@ pub(crate) async fn register_secret(
         let version = match client.put(&path, &data).await.map(i64::try_from) {
             Ok(Ok(version)) => version,
             Ok(Err(e)) => {
-                return AppError::from(anyhow::anyhow!(
+                return ApiError::from(anyhow::anyhow!(
                     "Vault returned a version that does not fit the version column: {e}"
                 ))
                 .into_response();
@@ -611,7 +621,7 @@ pub(crate) async fn register_secret(
             Err(e) => return unavailable(format!("the value was not written to Vault: {e}")),
         };
         if let Err(e) = store::set_version(&mut tx, &id, version).await {
-            return AppError::from(e).into_response();
+            return ApiError::from(e).into_response();
         }
         stored.current_version = Some(version);
     }
@@ -630,10 +640,10 @@ pub(crate) async fn register_secret(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     (StatusCode::CREATED, Json(SecretDto::from(stored))).into_response()
 }
@@ -644,7 +654,10 @@ pub(crate) async fn register_secret(
 #[utoipa::path(
     get,
     path = "/api/secrets",
-    params(("all" = Option<bool>, Query, description = "Admins only: every secret, not just the caller's")),
+    params(
+        ("all" = Option<bool>, Query, description = "Admins only: every secret, not just the caller's"),
+        ("kind" = Option<crate::secrets::SecretKind>, Query, description = "Only secrets of this kind")
+    ),
     responses(
         (status = 200, description = "Secret metadata", body = Vec<SecretDto>),
         (status = 403, description = "Not an operator", body = ErrorBody)
@@ -654,19 +667,25 @@ pub(crate) async fn list_secrets(
     State(state): State<ApiState>,
     Query(q): Query<ListSecretsQuery>,
     caller: crate::authz::Caller,
-) -> Result<Json<Vec<SecretDto>>, AppError> {
+) -> Result<Json<Vec<SecretDto>>, ApiError> {
     let owners = if q.all.unwrap_or(false) && caller.principals.is_platform_admin() {
         None
     } else {
         Some(caller.principals.all())
     };
     let rows = store::list(state.db.pool(), owners.as_deref()).await?;
-    Ok(Json(rows.into_iter().map(SecretDto::from).collect()))
+    Ok(Json(
+        rows.into_iter()
+            .filter(|row| q.kind.is_none_or(|kind| row.kind == kind))
+            .map(SecretDto::from)
+            .collect(),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ListSecretsQuery {
     all: Option<bool>,
+    kind: Option<crate::secrets::SecretKind>,
 }
 
 /// `GET /api/secrets/{id}` — one secret's metadata and its bindings.
@@ -691,7 +710,7 @@ pub(crate) async fn get_secret(
     };
     let bindings = match store::bindings_for_secret(state.db.pool(), &id).await {
         Ok(bindings) => bindings,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     Json(SecretDetailDto {
         secret: SecretDto::from(row),
@@ -756,7 +775,7 @@ pub(crate) async fn rotate_secret(
     let version = match client.put(&path, &data).await.map(i64::try_from) {
         Ok(Ok(version)) => version,
         Ok(Err(e)) => {
-            return AppError::from(anyhow::anyhow!(
+            return ApiError::from(anyhow::anyhow!(
                 "Vault returned a version that does not fit the version column: {e}"
             ))
             .into_response();
@@ -766,10 +785,10 @@ pub(crate) async fn rotate_secret(
 
     let mut tx = match state.db.pool().begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     if let Err(e) = store::set_version(&mut tx, &id, version).await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = store::audit(
         &mut tx,
@@ -785,10 +804,10 @@ pub(crate) async fn rotate_secret(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     // A cached client built on the old bytes would keep working; drop it so the next dispatch
     // through this target picks the rotation up.
@@ -867,7 +886,7 @@ pub(crate) async fn transfer_secret(
             let version = match client.put(&to_path, &current.data).await.map(i64::try_from) {
                 Ok(Ok(version)) => version,
                 Ok(Err(e)) => {
-                    return AppError::from(anyhow::anyhow!(
+                    return ApiError::from(anyhow::anyhow!(
                         "Vault returned a version that does not fit the version column: {e}"
                     ))
                     .into_response();
@@ -885,7 +904,7 @@ pub(crate) async fn transfer_secret(
 
     let mut tx = match state.db.pool().begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let stored = store::transfer(
         &mut tx,
@@ -900,7 +919,7 @@ pub(crate) async fn transfer_secret(
     let stored = match stored {
         Ok(stored) => stored,
         Err(e @ store::StoreError::Duplicate { .. }) => return conflict(e.to_string()),
-        Err(store::StoreError::Internal(e)) => return AppError::from(e).into_response(),
+        Err(store::StoreError::Internal(e)) => return ApiError::from(e).into_response(),
     };
     if let Err(e) = store::audit(
         &mut tx,
@@ -916,10 +935,10 @@ pub(crate) async fn transfer_secret(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Some((client, from_path, _, _)) = moved
         && let Err(e) = client.delete_all(&from_path).await
@@ -955,7 +974,7 @@ pub(crate) async fn delete_secret(
     };
     let bindings = match store::bindings_for_secret(state.db.pool(), &id).await {
         Ok(bindings) => bindings,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     if !bindings.is_empty() {
         let scopes = bindings
@@ -970,10 +989,10 @@ pub(crate) async fn delete_secret(
     }
     let mut tx = match state.db.pool().begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     if let Err(e) = store::delete(&mut tx, &id).await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = store::audit(
         &mut tx,
@@ -989,7 +1008,7 @@ pub(crate) async fn delete_secret(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     // Managed bytes are the registry's to destroy; a reference's are not, and a minted has none.
     if row.mode == SecretMode::Managed {
@@ -1006,7 +1025,7 @@ pub(crate) async fn delete_secret(
         }
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     // The registry row was the target's only existence; drop the client it backed so a run cannot
     // be dispatched through credentials that are no longer registered.
@@ -1085,7 +1104,7 @@ pub(crate) async fn bind_secret(
                 ));
             }
             Ok(None) => {}
-            Err(e) => return AppError::from(e).into_response(),
+            Err(e) => return ApiError::from(e).into_response(),
         }
     }
     if let Err(refusal) = check_bindable(&state, &row, body.vault_token.as_deref()).await {
@@ -1115,7 +1134,7 @@ pub(crate) async fn bind_secret(
     let stored = match stored {
         Ok(stored) => stored,
         Err(e @ store::StoreError::Duplicate { .. }) => return conflict(e.to_string()),
-        Err(store::StoreError::Internal(e)) => return AppError::from(e).into_response(),
+        Err(store::StoreError::Internal(e)) => return ApiError::from(e).into_response(),
     };
     let carries = match stored.scope_kind {
         ScopeKind::Playbook => {
@@ -1124,7 +1143,7 @@ pub(crate) async fn bind_secret(
                     Some(crate::playbooks::blueprints::barred(&playbook, &stored, &row).is_none())
                 }
                 Ok(_) => None,
-                Err(e) => return AppError::from(e).into_response(),
+                Err(e) => return ApiError::from(e).into_response(),
             }
         }
         ScopeKind::Repo | ScopeKind::Domain => None,
@@ -1288,17 +1307,17 @@ pub(crate) async fn unbind_secret(
     let binding = match store::get_binding(state.db.pool(), &binding_id).await {
         Ok(Some(binding)) if binding.secret_id == id => binding,
         Ok(_) => return not_found(format!("no binding {binding_id:?} on secret {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     let mut tx = match state.db.pool().begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     match store::delete_binding(&mut tx, &binding_id).await {
         Ok(true) => {}
         Ok(false) => return not_found(format!("no binding {binding_id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     if let Err(e) = store::audit(
         &mut tx,
@@ -1318,10 +1337,10 @@ pub(crate) async fn unbind_secret(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -1352,7 +1371,7 @@ pub(crate) async fn list_secret_audit(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 

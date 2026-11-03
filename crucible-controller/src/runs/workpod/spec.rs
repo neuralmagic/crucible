@@ -11,7 +11,8 @@ use crate::config::ControllerCfg;
 use crate::issues::engine;
 use crate::runs::workpod::*;
 use anyhow::{Context, Result};
-use crucible::deploy::DigestResolver;
+use crucible::deploy::{DeployProfile, DigestResolver, render_turn};
+use k8s_openapi::api::core::v1::Pod;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -243,6 +244,7 @@ async fn collect<S: TurnSpec>(
             match book_turn_success(
                 db,
                 d,
+                cfg,
                 kind,
                 name,
                 cluster,
@@ -311,6 +313,7 @@ async fn collect<S: TurnSpec>(
 async fn book_turn_success(
     db: &Db,
     d: &dyn PodDispatcher,
+    cfg: &ControllerCfg,
     kind: WorkKind,
     name: &str,
     cluster: &str,
@@ -340,7 +343,7 @@ async fn book_turn_success(
         m.record_turn(kind.label_value(), succeeded_metric);
         m.observe_turn_duration(kind.label_value(), turn_age_secs(created_at));
     }
-    drain_freed_slot(db, kind).await;
+    drain_freed_slot(db, cfg.runtime.queue.as_ref(), kind).await;
     Ok(CasResult::Won)
 }
 
@@ -378,7 +381,7 @@ async fn fail_turn(
             m.observe_turn_duration(kind.label_value(), turn_age_secs(created_at));
         }
     }
-    drain_freed_slot(db, kind).await;
+    drain_freed_slot(db, cfg.runtime.queue.as_ref(), kind).await;
     tracing::warn!(
         kind = kind.label_value(),
         site = site.as_str(),
@@ -388,6 +391,20 @@ async fn fail_turn(
         "turn produced no usable result",
     );
     Ok(CasResult::Won)
+}
+
+/// Render one turn pod through the linked engine (`crucible::deploy::render_turn`, the library form
+/// of `deploy render-turn`), returning the parsed, unstamped [`Pod`]. Blocking (profile read, image
+/// pinning), so the caller runs it under `spawn_blocking`.
+pub(crate) fn render_turn_pod(
+    spec: &WorkPodSpec,
+    profile_path: &Path,
+    digests: Option<Arc<dyn DigestResolver>>,
+) -> Result<Pod> {
+    let opts = spec.turn_opts(digests)?;
+    let profile = DeployProfile::load(profile_path)?;
+    let yaml = render_turn(&profile, &opts)?;
+    serde_norway::from_str::<Pod>(&yaml).context("decoding the rendered turn Pod")
 }
 
 /// `spawn_blocking(render + stamp)` then `dispatcher.create`. Under isolated gateways the turn gets
@@ -643,9 +660,9 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
     let targets: Vec<_> = crate::runs::contract::profile_target(&profile)
         .into_iter()
         .collect();
-    if let Err(failure) = admit_contract(kind.into(), &targets).await {
+    if let Err(failure) = cfg.runtime.admit_contract(kind.into(), &targets).await {
         let rejection = failure.into_rejection()?;
-        crate::runs::contract::refuse(db, issue_key, &rejection).await?;
+        crate::issues::transitions::refuse(db, issue_key, &rejection).await?;
         return Ok(TurnDispatch::Failed {
             reason: rejection.to_string(),
         });
@@ -660,10 +677,10 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         let rejection = crate::runs::contract::ContractRejection::unsupported_option(
             kind.into(),
             target.reference(),
-            crate::runs::workpod::recorded_engine_version(target).await,
+            cfg.runtime.recorded_engine_version(target).await,
             unsupported.to_string(),
         );
-        crate::runs::contract::refuse(db, issue_key, &rejection).await?;
+        crate::issues::transitions::refuse(db, issue_key, &rejection).await?;
         return Ok(TurnDispatch::Failed {
             reason: rejection.to_string(),
         });
@@ -756,7 +773,7 @@ pub(crate) struct GroundedRankSpec;
 
 #[cfg(feature = "autoresearch")]
 impl TurnSpec for GroundedRankSpec {
-    type Result = engine::GroundedVerdict;
+    type Result = crucible_contract::verdict::Ruled;
 
     fn kind(&self) -> WorkKind {
         WorkKind::AgentTurn(TurnKind::GroundedRank)
@@ -799,7 +816,7 @@ impl TurnSpec for GroundedRankSpec {
         v.cost_usd
     }
     fn summary(&self, v: &Self::Result) -> String {
-        format!("{} (${:.4})", v.disposition.as_str(), v.cost_usd)
+        format!("{} (${:.4})", v.tier.as_str(), v.cost_usd)
     }
     fn success_metric(&self) -> &'static str {
         "verdict"
@@ -829,7 +846,7 @@ pub(crate) struct ScopeSpec;
 
 #[cfg(feature = "autoresearch")]
 impl TurnSpec for ScopeSpec {
-    type Result = engine::ScopeReport;
+    type Result = engine::Scraped;
 
     fn kind(&self) -> WorkKind {
         WorkKind::AgentTurn(TurnKind::Scope)

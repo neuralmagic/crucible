@@ -861,8 +861,7 @@ pub(crate) async fn fire_due_refreshing(
 
 #[cfg(test)]
 mod tests {
-    use crate::daemon::queue::DiscoverySource;
-    use crate::daemon::queue::{Enqueue, IssueKey};
+    use crate::daemon::queue::{DiscoverySource, WorkQueue};
     use crate::launches::model::{LaunchFilter, NewPlaybookLaunch};
     use crate::launches::schedules::*;
     use crate::launches::standing::{
@@ -1365,6 +1364,7 @@ mod tests {
             created_by: Some("wren"),
             launcher_groups: None,
             rerun: None,
+            dispatch: Default::default(),
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
         assert!(matches!(
@@ -1875,7 +1875,6 @@ mod tests {
                 client_secret: None,
                 redirect_url: "http://localhost/auth/callback".to_string(),
                 scopes: vec!["openid".to_string()],
-                device_client_id: None,
                 post_logout_redirect: None,
             })
             .expect("provider"),
@@ -2490,6 +2489,7 @@ mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                     rerun: None,
+                    dispatch: Default::default(),
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
@@ -2978,20 +2978,12 @@ mod tests {
     /// dispatches a scheduled run exactly like a manual one.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_sweep_enqueues_every_launch_it_fires(pool: PgPool) -> Result<()> {
-        #[derive(Default)]
-        struct Recorder(std::sync::Mutex<Vec<String>>);
-        impl Enqueue for Recorder {
-            fn enqueue(&self, key: IssueKey) {
-                self.0.lock().expect("lock").push(key.0);
-            }
-        }
-
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         schedule_due_at(&pool, "0 * * * *", Some("2020-01-01T00:00:00Z")).await;
         schedule_due_at(&pool, "0 * * * *", Some("2020-01-02T00:00:00Z")).await;
 
-        let recorder = Arc::new(Recorder::default());
+        let queue = WorkQueue::new();
         standing::TriggerSweep::new(
             db.clone(),
             vec![Arc::new(ScheduleTrigger::new(db, None))],
@@ -3000,10 +2992,10 @@ mod tests {
             None,
             None,
         )
-        .poll(recorder.clone())
+        .poll(queue.clone())
         .await?;
 
-        let keys = recorder.0.lock().expect("lock").clone();
+        let keys = queue.pending().urgent;
         assert_eq!(keys.len(), 2, "{keys:?}");
         assert!(
             keys.iter().all(|k| k.starts_with("playbook:survey:")),

@@ -15,6 +15,7 @@
 
 // rmcp's OWN schemars (1.x), the version its tool-arg schemas are built against; the crate also
 // depends on schemars 0.8, and deriving against that one fails the tool-router bound.
+use crucible_contract::distress::{self as wire, MARKER_FILE, NOTES_FILE, TURN_META_FILE};
 use rmcp::schemars;
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -29,13 +30,19 @@ pub enum Severity {
     Error,
 }
 
+impl From<Severity> for wire::Severity {
+    fn from(severity: Severity) -> Self {
+        match severity {
+            Severity::Info => wire::Severity::Info,
+            Severity::Warn => wire::Severity::Warn,
+            Severity::Error => wire::Severity::Error,
+        }
+    }
+}
+
 impl Severity {
     pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Severity::Info => "info",
-            Severity::Warn => "warn",
-            Severity::Error => "error",
-        }
+        wire::Severity::from(self).as_str()
     }
 
     /// Slack attachment color, matching Slack's own status palette.
@@ -78,18 +85,18 @@ fn decide(severity: Severity, already_suspended: bool) -> Action {
 
 /// The park marker the engine polls. Its presence suspends the run; deleting it resumes.
 fn marker_path() -> PathBuf {
-    forge::storage_root().join("distress")
+    forge::storage_root().join(MARKER_FILE)
 }
 
 /// Append-only info/warn notes, consumed by the engine at the next decided row.
 fn notes_path() -> PathBuf {
-    forge::storage_root().join("distress-notes.jsonl")
+    forge::storage_root().join(NOTES_FILE)
 }
 
 /// The engine's per-iteration stamp, best-effort: absent on an older driver or before the first
 /// iteration, in which case the page prints `?` rather than lying about an iteration.
 fn turn_meta_path() -> PathBuf {
-    forge::storage_root().join("turn-meta.json")
+    forge::storage_root().join(TURN_META_FILE)
 }
 
 fn now_ms() -> u64 {
@@ -106,13 +113,13 @@ fn write_marker(reason: &str, evidence: &[String]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let body = serde_json::json!({
-        "reason": reason,
-        "evidence": evidence,
-        "ts_ms": now_ms(),
-        "turn_token": crate::turn::current_token(),
+    let body = serde_json::to_string(&wire::Marker {
+        reason: reason.to_string(),
+        evidence: evidence.to_vec(),
+        ts_ms: now_ms(),
+        turn_token: crate::turn::current_token(),
     })
-    .to_string();
+    .map_err(std::io::Error::other)?;
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, &path)
@@ -124,12 +131,12 @@ fn append_note(severity: Severity, reason: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let line = serde_json::json!({
-        "severity": severity.as_str(),
-        "reason": reason,
-        "ts_ms": now_ms(),
+    let line = serde_json::to_string(&wire::Note {
+        severity: severity.into(),
+        reason: reason.to_string(),
+        ts_ms: now_ms(),
     })
-    .to_string();
+    .map_err(std::io::Error::other)?;
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -139,13 +146,9 @@ fn append_note(severity: Severity, reason: &str) -> std::io::Result<()> {
 
 /// The iteration the engine last stamped, as display text.
 fn iteration() -> String {
-    #[derive(Deserialize)]
-    struct TurnMeta {
-        iter: u32,
-    }
     std::fs::read_to_string(turn_meta_path())
         .ok()
-        .and_then(|s| serde_json::from_str::<TurnMeta>(&s).ok())
+        .and_then(|s| serde_json::from_str::<wire::TurnMeta>(&s).ok())
         .map(|m| m.iter.to_string())
         .unwrap_or_else(|| "?".to_string())
 }

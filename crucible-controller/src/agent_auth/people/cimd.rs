@@ -455,6 +455,10 @@ impl Cimd {
 #[cfg(test)]
 pub(crate) mod testing {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::TlsAcceptor;
+    use tokio_rustls::server::TlsStream;
 
     /// The host test documents are published on.
     pub const DOC_HOST: &str = "client.example";
@@ -466,33 +470,63 @@ pub(crate) mod testing {
     pub struct DocServer {
         pub addr: SocketAddr,
         root: Vec<u8>,
-        _dir: tempfile::TempDir,
+    }
+
+    /// Hands `axum::serve` connections whose handshake already finished. One client at a time is
+    /// all a test needs; a failed handshake is dropped and the next connection accepted.
+    struct TlsListener {
+        tcp: TcpListener,
+        acceptor: TlsAcceptor,
+    }
+
+    impl axum::serve::Listener for TlsListener {
+        type Io = TlsStream<TcpStream>;
+        type Addr = SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            loop {
+                let Ok((stream, peer)) = self.tcp.accept().await else {
+                    continue;
+                };
+                if let Ok(tls) = self.acceptor.accept(stream).await {
+                    return (tls, peer);
+                }
+            }
+        }
+
+        fn local_addr(&self) -> std::io::Result<Self::Addr> {
+            self.tcp.local_addr()
+        }
     }
 
     impl DocServer {
         pub async fn start(app: axum::Router) -> Self {
+            crate::install_crypto_provider();
             let issued =
                 rcgen::generate_simple_self_signed(vec![DOC_HOST.into(), OTHER_HOST.into()])
                     .unwrap();
-            let dir = tempfile::tempdir().unwrap();
-            let cert = dir.path().join("tls.crt");
-            let key = dir.path().join("tls.key");
-            std::fs::write(&cert, issued.cert.pem()).unwrap();
-            std::fs::write(&key, issued.signing_key.serialize_pem()).unwrap();
-            let front = crate::tls::TlsFront::new(
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-                cert,
-                key,
-            );
-            let listener = crate::tls::bind(&front).await.unwrap();
-            let addr = listener.addr();
+            let key =
+                rustls::pki_types::PrivateKeyDer::try_from(issued.signing_key.serialize_der())
+                    .unwrap();
+            let mut config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![issued.cert.der().clone()], key)
+                .unwrap();
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let tcp = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+                .await
+                .unwrap();
+            let addr = tcp.local_addr().unwrap();
+            let listener = TlsListener {
+                tcp,
+                acceptor: TlsAcceptor::from(Arc::new(config)),
+            };
             tokio::spawn(async move {
                 let _ = axum::serve(listener, app).await;
             });
             Self {
                 addr,
                 root: issued.cert.pem().into_bytes(),
-                _dir: dir,
             }
         }
 

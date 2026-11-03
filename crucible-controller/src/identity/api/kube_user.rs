@@ -2,7 +2,7 @@
 //! runs a person launches. People link their own per cluster through the cluster identity routes.
 
 use crate::api::dto::{bad_request, forbidden, not_found};
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 use crate::identity::kube_identity::{self, KubeUser};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
@@ -41,7 +41,7 @@ pub(crate) async fn override_kube_user(
     _admin: crate::authz::guard::AdminGuard,
     Path(login): Path<String>,
     Json(body): Json<OverrideBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let caller = identity.as_deref().map(|c| c.trim().to_lowercase());
     if caller.as_deref() == Some(login.trim().to_lowercase().as_str()) {
         return Ok(forbidden(
@@ -88,18 +88,12 @@ pub(crate) async fn override_kube_user(
 #[cfg(test)]
 mod tests {
     use crate::identity::auth::{AuthPath, Roles};
-    use crate::identity::session::{IdentitySource, Resolved};
+    use crate::identity::session::Resolved;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
     use sqlx::PgPool;
-    use std::sync::Arc;
     use tower::ServiceExt;
-
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
 
     /// The API router, with the identity routes on, as `require_auth` admitted `login` on `path`
     /// with issuer subject `sub`.
@@ -107,13 +101,12 @@ mod tests {
         let state = crate::api::state::ApiState {
             roles: Roles::new(vec!["admin".to_string()], vec![], vec![]),
             identities: true,
-            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
+            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()))
         };
         let resolved = Resolved {
             user: Some(login.to_string()),
             groups: Vec::new(),
             sub: sub.map(str::to_string),
-            source: IdentitySource::Native,
         };
         crate::api::router(state).layer(axum::middleware::from_fn(
             move |mut req: axum::extract::Request, next: axum::middleware::Next| {

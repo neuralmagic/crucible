@@ -14,14 +14,12 @@ const NO_FLAG: &str = "no autopilot flag is loaded on this controller";
         (status = 200, description = "Autopilot flag state: enabled/disabled plus audit trail", body = AutopilotDto)
     )
 )]
-pub(crate) async fn get_autopilot(State(state): State<ApiState>) -> Response {
-    let Some(flag) = state.autopilot.as_ref() else {
-        return unavailable(NO_FLAG);
-    };
-    match flag.read().await {
-        Ok(s) => Json(AutopilotDto::from(s)).into_response(),
-        Err(e) => AppError(e).into_response(),
-    }
+pub(crate) async fn get_autopilot(State(state): State<ApiState>) -> ApiResult<Response> {
+    let flag = state
+        .autopilot
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable(NO_FLAG.to_string()))?;
+    Ok(Json(AutopilotDto::from(flag.read().await?)).into_response())
 }
 
 #[utoipa::path(
@@ -38,14 +36,13 @@ pub(crate) async fn set_autopilot(
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<AutopilotSetBody>,
-) -> Response {
-    let Some(flag) = state.autopilot.as_ref() else {
-        return unavailable(NO_FLAG);
-    };
-    match set(&state, flag, identity.as_deref(), &body).await {
-        Ok(dto) => Json(dto).into_response(),
-        Err(e) => AppError(e).into_response(),
-    }
+) -> ApiResult<Response> {
+    let flag = state
+        .autopilot
+        .as_ref()
+        .ok_or_else(|| ApiError::Unavailable(NO_FLAG.to_string()))?;
+    let dto = set(&state, flag, identity.as_deref(), &body).await?;
+    Ok(Json(dto).into_response())
 }
 
 async fn set(

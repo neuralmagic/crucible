@@ -109,7 +109,7 @@ pub(crate) async fn put_config_overrides(
             .await
         {
             Ok(count) => count,
-            Err(e) => return AppError::from(e).into_response(),
+            Err(e) => return ApiError::from(e).into_response(),
         }
     } else {
         0
@@ -136,7 +136,7 @@ pub(crate) async fn put_config_overrides(
         )
         .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
 
     Json(config_dto(&state, &store, disabled)).into_response()

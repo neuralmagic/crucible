@@ -17,6 +17,7 @@ pub mod jwks;
 #[cfg(feature = "kube")]
 pub mod kube;
 pub mod metadata;
+pub mod mount;
 pub mod policy;
 pub mod principal;
 pub mod server;

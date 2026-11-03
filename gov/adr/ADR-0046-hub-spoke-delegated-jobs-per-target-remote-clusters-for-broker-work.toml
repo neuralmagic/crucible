@@ -8,9 +8,9 @@ date = "2026-07-30"
 
 [content]
 context = """
-Related: [ADR-0005](./0005-engine-side-builds.md), [ADR-0012](./0012-rendered-deployments.md)
-(secrets by name only), [ADR-0018](./0018-declarative-image-builds.md),
-[ADR-0020](./0020-candidate-build-modes.md), [ADR-0022](./0022-measure-task-dags.md).
+Related: [[ADR-0005]], [[ADR-0011]]
+(secrets by name only), [[ADR-0014]],
+[[ADR-0016]], [[ADR-0017]].
 
 Every delegated job the broker runs today lands on exactly one cluster: its own. The codegen
 measure/profile Jobs (`crucible-broker/src/codegen.rs`), forge's cluster builds

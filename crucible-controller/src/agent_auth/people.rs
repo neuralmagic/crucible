@@ -258,9 +258,8 @@ pub struct CodeGrant {
 pub struct People {
     pub config: PeopleConfig,
     pub clients: Clients,
-    pub grants: Arc<dyn grants::GrantStore>,
-    pub subjects: Arc<dyn directory::SubjectDirectory>,
-    pub links: Arc<dyn directory::LinkDirectory>,
+    pub grants: grants::PgGrantStore,
+    pub directory: Arc<directory::ControllerDirectory>,
 }
 
 /// A person's access token for `approved`, acting as `kube_user`.
@@ -809,7 +808,7 @@ pub(crate) async fn redeem_refresh(
         .await;
     }
     let person = people
-        .subjects
+        .directory
         .allowed(&family.sub)
         .await
         .map_err(|e| TokenError::Server(format!("{e:#}")))?;
@@ -858,7 +857,7 @@ async fn access(
         )));
     }
     let kube_user = match people
-        .links
+        .directory
         .kube_user(approved)
         .await
         .map_err(|e| TokenError::Server(format!("{e:#}")))?
@@ -1332,13 +1331,12 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             deploy_profile: Some(path),
             people_issuer: Some(auth.clone()),
             identities: true,
-            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
+            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()))
         };
         let signed_in = crate::identity::session::Resolved {
             user: Some("jordan".into()),
             groups: Vec::new(),
             sub: Some(SUB.into()),
-            source: crate::identity::session::IdentitySource::Native,
         };
         let api = crate::api::router(api_state).layer(axum::middleware::from_fn(
             move |mut req: axum::extract::Request, next: axum::middleware::Next| {
@@ -1362,11 +1360,6 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             app,
             _profile: dir,
         }
-    }
-
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
     }
 
     struct Reply {

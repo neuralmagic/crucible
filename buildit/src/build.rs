@@ -165,7 +165,7 @@ pub fn render(args: &BuildArgs) -> Result<()> {
                 cache: args.cache(),
                 node: args.node.as_deref(),
             };
-            let pod = args.backend.pod_spec(&name, &args.namespace, &opts)?;
+            let pod = args.backend.pod_spec(&name, &args.namespace, &opts);
             print!("{}", serde_norway::to_string(&pod)?);
         }
         Mode::Job => {
@@ -187,7 +187,7 @@ pub fn render(args: &BuildArgs) -> Result<()> {
                     cache: args.cache(),
                     node: args.node.as_deref(),
                 },
-            )?;
+            );
             tracing::info!("secret data redacted; a real run ships your registry token");
             tracing::info!("a real run pushes the context to {ctx_ref} first");
             let secret = job::secret_manifest(&name, &args.namespace, b"<redacted>", None);

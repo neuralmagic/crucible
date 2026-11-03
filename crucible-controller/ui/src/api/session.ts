@@ -1,10 +1,7 @@
 /// Expired-session handling, centralized. When the session lapses, API calls come back as a 401
-/// (native mode, and the proxy's api-routes) or — from a proxy without that config — as a followed
-/// 302 onto a sign-in page, whose HTML must never reach a component. Either way the only useful
-/// move is to send the browser through the sign-in flow and back to where it was.
-///
-/// The sign-in URL is the controller's own `/auth/login` in both auth modes: in proxy mode it
-/// redirects to the sidecar's `/oauth2/start`, so the SPA holds one set of URLs across the flip.
+/// or as a followed redirect onto the sign-in page, whose HTML must never reach a component. Either
+/// way the only useful move is to send the browser through the sign-in flow and back to where it
+/// was. The sign-in URL is the controller's own `/auth/login`.
 
 export function redirectToSignIn(): void {
   const here = window.location.pathname + window.location.search + window.location.hash;
@@ -12,12 +9,11 @@ export function redirectToSignIn(): void {
 }
 
 /// A response that means "session gone": a 401, or a fetch that silently followed the sign-in
-/// redirect (the final URL lands under /oauth2/ or /auth/).
+/// redirect (the final URL lands under /auth/).
 export function isSessionExpired(response: Response): boolean {
   if (response.status === 401) return true;
   if (!response.redirected) return false;
-  const path = new URL(response.url).pathname;
-  return path.startsWith('/oauth2/') || path.startsWith('/auth/');
+  return new URL(response.url).pathname.startsWith('/auth/');
 }
 
 let probe: Promise<void> | null = null;

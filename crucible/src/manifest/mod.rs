@@ -6,6 +6,7 @@ mod backend;
 mod broker;
 mod capability;
 mod deploy;
+pub mod edition;
 mod git_ref;
 mod judge;
 pub mod launch;
@@ -47,6 +48,7 @@ pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
+use crate::manifest::edition::Edition;
 use crate::manifest::variant::{VariantName, Variants};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -109,6 +111,11 @@ pub enum ManifestError {
     SandboxReservedEnv { secret: String, env: String },
     #[error("task {task:?} runs in sandbox {name:?}, which no [agent.sandbox.{name}] declares")]
     UnknownSandbox { task: String, name: String },
+    #[error(
+        "{table}.env needs `edition = 2` at the top of the manifest; an edition-1 pack's host \
+         commands inherit the engine's whole environment"
+    )]
+    EnvNeedsEdition { table: &'static str },
     #[error("manifest has no [judge] (task mode)")]
     NoJudge,
     #[error("{table} requires a [judge]: a task manifest has no scores to rank, grade, or seed")]
@@ -286,6 +293,9 @@ fn git_show_head(repo_dir: &Path, rel: &Path) -> Result<(String, String)> {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
+    /// The pack contract this manifest is written against.
+    #[serde(default)]
+    pub edition: Edition,
     #[serde(default)]
     pub repo: Repo,
     #[serde(default)]
@@ -636,10 +646,9 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Which agent harness runs the turn. `claude` is the default everywhere; `hermes` (Nous
-/// Research's hermes-agent) and `codex` (OpenAI's Codex CLI) are selected per-domain for harness
-/// ablations; `opencode` and `pi` are the harnesses that speak OpenAI Chat Completions to an
-/// endpoint that offers nothing else, which the newer claude and codex CLIs cannot.
+/// Which agent harness runs the turn. `claude` is the default everywhere; `codex` (OpenAI's
+/// Codex CLI) is selected per-domain for harness ablations; `opencode` and `pi` are the harnesses
+/// that speak either API family through a provider table.
 #[derive(
     Clone,
     Copy,
@@ -655,7 +664,6 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
 pub enum Harness {
     #[default]
     Claude,
-    Hermes,
     Codex,
     #[value(name = "opencode")]
     OpenCode,
@@ -665,19 +673,13 @@ pub enum Harness {
 impl Harness {
     /// The default model when neither the CLI nor the manifest names one.
     pub const fn default_model(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude-opus-4-6",
-            Harness::Hermes => "claude-opus-4-6",
-            Harness::Codex => "gpt-5.6-sol",
-            Harness::OpenCode | Harness::Pi => "claude-opus-4-6",
-        }
+        self.spec().default_model
     }
 
     /// The manifest and CLI spelling of the harness.
     pub const fn as_str(self) -> &'static str {
         match self {
             Harness::Claude => "claude",
-            Harness::Hermes => "hermes",
             Harness::Codex => "codex",
             Harness::OpenCode => "opencode",
             Harness::Pi => "pi",
@@ -720,14 +722,11 @@ impl ReasoningEffort {
 pub struct AgentCfg {
     #[serde(default = "default_model")]
     pub model: String,
-    /// The agent harness that runs each turn: `claude` (default) or `hermes`. Per-domain so a
-    /// harness swap is a manifest edit (and an ablation axis), not engine surgery; the CLI
-    /// `--harness` overrides it.
+    /// The agent harness that runs each turn: `claude` (default), `codex`, `opencode`, or `pi`.
+    /// Per-domain so a harness swap is a manifest edit (and an ablation axis), not engine surgery;
+    /// the CLI `--harness` overrides it.
     #[serde(default)]
     pub harness: Harness,
-    /// Hermes-harness tuning; ignored (and harmless) when `harness = "claude"`.
-    #[serde(default)]
-    pub hermes: HermesCfg,
     /// Codex-harness tuning; ignored (and harmless) when `harness = "claude"`.
     #[serde(default)]
     pub codex: CodexCfg,
@@ -925,16 +924,6 @@ fn default_model() -> String {
     Harness::default().default_model().to_string()
 }
 
-/// `[agent.hermes]`: hermes-harness tuning. Phase B grows this (auth, config.yaml knobs); for
-/// now only the model override, mapped to hermes's `anthropic/<model>` syntax at invocation.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct HermesCfg {
-    /// Model override for hermes turns; unset = the resolved `[agent].model`.
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
 /// `[agent.codex]`: codex-harness tuning. The shared `[agent].model` names a Claude model by
 /// default, so a codex domain sets its OpenAI model here rather than retuning every other arm.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -967,6 +956,8 @@ pub enum CodexAuthMode {
 /// broker-bin requirement plus the three sub-validators. Callers add their own shape-specific
 /// checks (composite component count/uniqueness) around this.
 struct CommonCfg<'a> {
+    edition: Edition,
+    world: &'a WorldCfg,
     workspace: &'a Workspace,
     agent: &'a AgentCfg,
     judge: Option<&'a JudgeCfg>,
@@ -985,6 +976,7 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     if c.agent.broker.enabled && c.agent.broker.bin.is_empty() {
         return Err(ManifestError::BrokerBinRequired.into());
     }
+    validate_edition(&c)?;
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
     validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
@@ -1032,6 +1024,25 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     outputs::validate_outputs(c.outputs)?;
     capability::validate_capabilities(c.capabilities)?;
     Ok(())
+}
+
+/// A declared `env` list narrows what host commands receive, which only edition 2 does.
+fn validate_edition(c: &CommonCfg<'_>) -> Result<(), ManifestError> {
+    if c.edition != Edition::One {
+        return Ok(());
+    }
+    let declared = [
+        ("[judge]", c.judge.map(|j| &j.env)),
+        ("[world]", Some(&c.world.env)),
+        ("[workflow]", c.workflow.as_ref().map(|w| &w.env)),
+    ];
+    match declared
+        .into_iter()
+        .find(|(_, env)| env.is_some_and(|env| !env.is_empty()))
+    {
+        Some((table, _)) => Err(ManifestError::EnvNeedsEdition { table }),
+        None => Ok(()),
+    }
 }
 
 /// `[workspace].carry_forward` entries name paths inside the workspace, so an absolute path or one
@@ -1113,8 +1124,7 @@ impl Manifest {
         let document: toml::Table = toml::from_str(text).with_context(parsing)?;
         if variant.is_none() && !document.contains_key(variant::VARIANT_TABLE) {
             let m: Self = toml::from_str(text).with_context(parsing)?;
-            m.validate()?;
-            return Ok(m);
+            return m.checked();
         }
         let variants = Variants::split(document).with_context(parsing)?;
         for name in variants.names() {
@@ -1131,8 +1141,17 @@ impl Manifest {
         let m: Self = toml::Value::Table(document)
             .try_into()
             .with_context(parsing)?;
-        m.validate()?;
-        Ok(m)
+        m.checked()
+    }
+
+    /// Hand the edition to the workflow, which carries it to where the graph runs, then
+    /// validate.
+    fn checked(mut self) -> Result<Self> {
+        if let Some(workflow) = &mut self.workflow {
+            workflow.edition = self.edition;
+        }
+        self.validate()?;
+        Ok(self)
     }
 
     /// Load a manifest for a run, freezing its content at the workspace repo's HEAD when the
@@ -1177,6 +1196,8 @@ impl Manifest {
     fn validate(&self) -> Result<()> {
         self.repo.validate(self.is_playbook(), &self.workspace)?;
         validate_common(CommonCfg {
+            edition: self.edition,
+            world: &self.world,
             workspace: &self.workspace,
             agent: &self.agent,
             judge: self.judge.as_ref(),
@@ -1250,6 +1271,8 @@ impl Manifest {
         }
         let mut resolved = compiled.workflow;
         resolved.resolved_from = Some(file);
+        resolved.edition = self.edition;
+        resolved.env = workflow.env.clone();
         launch.apply(&mut resolved.tasks, &self.agent.overrides)?;
         self.workflow = Some(resolved);
         if !launch.is_empty() {
@@ -1325,6 +1348,9 @@ impl Manifest {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositeManifest {
+    /// The pack contract this manifest is written against.
+    #[serde(default)]
+    pub edition: Edition,
     pub composite: CompositeCfg,
     /// The composite's base workspace dir (default `workspace`). Each component is checked out into a
     /// subdir of this, so all components co-locate in one tree, one agent cwd, one sandbox upload.
@@ -1431,8 +1457,16 @@ impl CompositeManifest {
             .with_context(|| format!("reading composite manifest {}", path.display()))?;
         let m: Self = toml::from_str(&text)
             .with_context(|| format!("parsing composite manifest {}", path.display()))?;
-        m.validate()?;
-        Ok(m)
+        m.checked()
+    }
+
+    /// Hand the edition to the workflow, then validate.
+    fn checked(mut self) -> Result<Self> {
+        if let Some(workflow) = &mut self.workflow {
+            workflow.edition = self.edition;
+        }
+        self.validate()?;
+        Ok(self)
     }
 
     /// Composite counterpart to [`Manifest::load_frozen`]: freezes at the base workspace repo's
@@ -1451,8 +1485,7 @@ impl CompositeManifest {
                     manifest_path.display()
                 )
             })?;
-            m.validate()?;
-            Ok(m)
+            m.checked()
         })
     }
 
@@ -1481,6 +1514,8 @@ impl CompositeManifest {
             }
         }
         validate_common(CommonCfg {
+            edition: self.edition,
+            world: &self.world,
             workspace: &self.workspace,
             agent: &self.agent,
             judge: Some(&self.judge),
@@ -1597,7 +1632,7 @@ pub fn manifest_dir(manifest_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::manifest::*;
 
     /// `[agent].model` defaults to the DEFAULT harness's model, not to whatever `[agent].harness`
     /// says: a codex domain names its model in `[agent.codex]` (or `[agent].model`), and the
@@ -1729,6 +1764,214 @@ mod tests {
         assert!(err.to_string().contains("requires a [judge]"), "{err:#}");
     }
 
+    /// A command outside the sandbox gets only what its table declares, so a declared name must
+    /// be one an environment can hold, and a declared variable the engine lacks refuses the run
+    /// rather than letting the command run without it.
+    #[test]
+    fn a_declared_host_variable_must_be_a_name_and_must_be_set() {
+        let judged = |env: &str| {
+            format!(
+                "edition = 2\n[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = {env}\n[world]\nrestore_cmd = \"r\"\nsnapshot_cmd = \"s\"\nenv = {env}\n"
+            )
+        };
+        let error = toml::from_str::<Manifest>(&judged("[\"KUBE-CONFIG\"]"))
+            .err()
+            .expect("a bad name parsed")
+            .to_string();
+        assert!(
+            error.contains("\"KUBE-CONFIG\" is not an environment variable name"),
+            "{error}"
+        );
+
+        let m: Manifest = toml::from_str(&judged("[\"CRUCIBLE_TEST_NEVER_SET\"]")).expect("parses");
+        let workspace = std::env::temp_dir();
+        let error = m
+            .build_judge(workspace.clone(), Vec::new())
+            .err()
+            .expect("a judge built without its declared variable")
+            .to_string();
+        assert_eq!(
+            error,
+            "[judge].env declares CRUCIBLE_TEST_NEVER_SET, which the engine's environment does \
+             not set"
+        );
+        let error = m
+            .build_world(workspace)
+            .err()
+            .expect("a world built without its declared variable")
+            .to_string();
+        assert!(
+            error.starts_with("[world].env declares CRUCIBLE_TEST_NEVER_SET"),
+            "{error}"
+        );
+    }
+
+    /// `NAME?` declares a variable the commands get only when the engine has it, so an unset
+    /// one builds the judge and the world; a required name beside it still refuses, alone.
+    #[test]
+    fn an_unset_optional_host_variable_does_not_refuse_and_a_required_one_still_does() {
+        let judged = |env: &str| {
+            format!(
+                "edition = 2\n[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = {env}\n[world]\nrestore_cmd = \"r\"\nsnapshot_cmd = \"s\"\nenv = {env}\n"
+            )
+        };
+        let workspace = std::env::temp_dir();
+        let m: Manifest =
+            toml::from_str(&judged("[\"CRUCIBLE_TEST_NEVER_SET?\"]")).expect("parses");
+        m.build_judge(workspace.clone(), Vec::new())
+            .expect("an unset optional variable does not refuse the judge");
+        m.build_world(workspace.clone())
+            .expect("an unset optional variable does not refuse the world");
+
+        let m: Manifest = toml::from_str(&judged(
+            "[\"CRUCIBLE_TEST_NEVER_SET?\", \"CRUCIBLE_TEST_ALSO_NEVER_SET\"]",
+        ))
+        .expect("parses");
+        let error = m
+            .build_judge(workspace.clone(), Vec::new())
+            .err()
+            .expect("a judge built without its required variable")
+            .to_string();
+        assert_eq!(
+            error,
+            "[judge].env declares CRUCIBLE_TEST_ALSO_NEVER_SET, which the engine's environment \
+             does not set"
+        );
+        let error = m
+            .build_world(workspace)
+            .err()
+            .expect("a world built without its required variable")
+            .to_string();
+        assert_eq!(
+            error,
+            "[world].env declares CRUCIBLE_TEST_ALSO_NEVER_SET, which the engine's environment \
+             does not set"
+        );
+    }
+
+    /// A malformed `env` entry fails the manifest's parse, naming the entry.
+    #[test]
+    fn a_malformed_optional_host_variable_fails_the_parse_naming_the_entry() {
+        let judged = |env: &str| {
+            format!(
+                "edition = 2\n[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = {env}\n"
+            )
+        };
+        for (env, expected) in [
+            ("[\"?\"]", "\"?\" marks no variable optional"),
+            ("[\"A??\"]", "\"A??\" ends in more than one \"?\""),
+            ("[\"A?B\"]", "\"A?B\" has a \"?\" inside the name"),
+            (
+                "[\"GPUS\", \"GPUS?\"]",
+                "env lists both \"GPUS\" and \"GPUS?\"",
+            ),
+        ] {
+            let error = toml::from_str::<Manifest>(&judged(env))
+                .err()
+                .unwrap_or_else(|| panic!("{env} parsed"))
+                .to_string();
+            assert!(error.contains(expected), "{env}: {error}");
+        }
+    }
+
+    /// Edition 1 runs host commands with the engine's environment, so a declared `env` list
+    /// there would claim a narrowing that never happens; the parse refuses it, naming the table
+    /// and the edition that reads it.
+    #[test]
+    fn an_env_list_on_an_edition_one_manifest_is_refused_at_parse() {
+        let base = "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \
+                    \"g\"\n";
+        for (tables, table) in [
+            (
+                "[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = [\"KUBECONFIG\"]\n",
+                "[judge]",
+            ),
+            (
+                "[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\n[world]\napply_cmd = \"a\"\nenv \
+                 = [\"KUBECONFIG?\"]\n",
+                "[world]",
+            ),
+            (
+                "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\nenv = [\"GPUS?\"]\n",
+                "[workflow]",
+            ),
+        ] {
+            for edition in ["", "edition = 1\n"] {
+                let text = format!("{edition}{base}{tables}");
+                let error = Manifest::parse_variant(&text, None, "manifest test")
+                    .err()
+                    .unwrap_or_else(|| panic!("{table}.env parsed at edition 1"))
+                    .to_string();
+                assert_eq!(
+                    error,
+                    format!(
+                        "{table}.env needs `edition = 2` at the top of the manifest; an edition-1 \
+                         pack's host commands inherit the engine's whole environment"
+                    )
+                );
+                let raised = format!("edition = 2\n{base}{tables}");
+                Manifest::parse_variant(&raised, None, "manifest test")
+                    .unwrap_or_else(|e| panic!("{table}.env at edition 2: {e:#}"));
+            }
+        }
+        let empty =
+            format!("{base}[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = []\n");
+        Manifest::parse_variant(&empty, None, "manifest test")
+            .expect("an empty list declares nothing to refuse");
+    }
+
+    /// A variant is a manifest of its own, so an `env` list it adds under an edition-1 base is
+    /// refused naming the variant.
+    #[test]
+    fn a_variant_env_list_under_an_edition_one_base_is_refused() {
+        let text = "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \
+                    \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\n[variant.cluster.judge]\n\
+                    measure_cmd = \"m\"\ndirection = \"higher\"\nenv = [\"KUBECONFIG\"]\n";
+        let error = Manifest::parse_variant(text, None, "manifest test")
+            .err()
+            .expect("the variant's env list parsed at edition 1");
+        let chain = format!("{error:#}");
+        assert!(chain.contains("[variant.cluster]"), "{chain}");
+        assert!(chain.contains("[judge].env needs `edition = 2`"), "{chain}");
+    }
+
+    /// An edition this engine does not know is refused at parse, naming what it runs, so an
+    /// older engine never runs a newer pack under the wrong rules.
+    #[test]
+    fn an_unknown_edition_is_refused_at_parse() {
+        let text = "edition = 3\n[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \
+                    \"x\"\ngoal = \"g\"\n";
+        let error = format!(
+            "{:#}",
+            Manifest::parse_variant(text, None, "manifest test")
+                .err()
+                .expect("edition 3 parsed")
+        );
+        assert!(
+            error.contains(
+                "edition = 3 is not an edition this engine supports; it supports 1 and 2"
+            ),
+            "{error}"
+        );
+    }
+
+    /// The edition is the manifest's, and the graph the manifest carries inline gets it at parse.
+    #[test]
+    fn an_inline_workflow_carries_the_manifests_edition() {
+        let table = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"t\"\nkind = \
+                     \"command\"\ncommand = \"true\"";
+        for (edition, expected) in [("", Edition::One), ("edition = 2\n", Edition::Two)] {
+            let m = Manifest::parse_variant(
+                &format!("{edition}{}", task_manifest(table)),
+                None,
+                "manifest test",
+            )
+            .expect("parses");
+            assert_eq!(m.edition, expected);
+            assert_eq!(m.workflow.as_ref().unwrap().edition, expected);
+        }
+    }
+
     /// A manifest may name its source instead of carrying its output. The graph is compiled
     /// on resolve and validated then, so an unresolved manifest is valid and an unreadable
     /// source fails where it is read rather than where it is used.
@@ -1743,8 +1986,14 @@ mod tests {
         )
         .unwrap();
 
-        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
-        let mut m: Manifest = toml::from_str(&task_manifest(table)).expect("parses");
+        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\nenv = [\"GH_TOKEN\", \"GPUS?\"]";
+        let mut m = Manifest::parse_variant(
+            &format!("edition = 2\n{}", task_manifest(table)),
+            None,
+            "test",
+        )
+        .expect("parses");
+        assert_eq!(m.workflow.as_ref().unwrap().edition, Edition::Two);
         m.validate().expect("an unresolved manifest is valid");
         assert!(
             m.workflow.as_ref().unwrap().is_unresolved(),
@@ -1755,6 +2004,24 @@ mod tests {
         assert!(!workflow.is_unresolved());
         assert_eq!(workflow.tasks.len(), 1);
         assert_eq!(workflow.tasks[0].name.0, "a");
+        assert_eq!(
+            workflow
+                .env
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["GH_TOKEN", "GPUS?"],
+            "the compiled graph keeps the manifest's declared variables"
+        );
+        assert_eq!(
+            workflow.edition,
+            Edition::Two,
+            "and the manifest's edition, which the source cannot state"
+        );
+        assert!(
+            workflow.host_env().is_err(),
+            "so its command tasks resolve GH_TOKEN, which nothing sets here"
+        );
 
         // Resolving again is a no-op, so a caller never has to ask whether it already ran.
         m.resolve_workflow(&dir).expect("idempotent");
@@ -2553,6 +2820,36 @@ mod tests {
         assert!(err.contains("[agent.overrides]"), "{err}");
     }
 
+    /// A composite's own `[judge]` and `[world]` commands run outside the sandbox too, so its
+    /// edition gates their env lists the way a single manifest's does, and its workflow carries
+    /// the edition.
+    #[test]
+    fn a_composite_env_list_needs_edition_two() {
+        let text = |edition: &str| {
+            format!(
+                "{edition}\n[composite]\nname = \"x\"\n[[component]]\ndomain = \"vllm\"\n\
+                 [[component]]\ndomain = \"kernels\"\n[agent]\ngoal = \"g\"\n[judge]\nmeasure_cmd \
+                 = \"m\"\ndirection = \"higher\"\n[world]\napply_cmd = \"a\"\nenv = \
+                 [\"KUBECONFIG\"]\n[workflow]\ntype = \"custom\"\nfile = \"graph.star\"\n"
+            )
+        };
+        let m: CompositeManifest = toml::from_str(&text("")).unwrap();
+        let err = m
+            .checked()
+            .err()
+            .expect("an edition-1 composite took an env list");
+        assert!(
+            err.to_string()
+                .starts_with("[world].env needs `edition = 2`"),
+            "{err}"
+        );
+
+        let m: CompositeManifest = toml::from_str(&text("edition = 2")).unwrap();
+        let m = m.checked().expect("an edition-2 composite declares env");
+        assert_eq!(m.edition, Edition::Two);
+        assert_eq!(m.workflow.as_ref().unwrap().edition, Edition::Two);
+    }
+
     fn launch(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
         pairs
             .iter()
@@ -2771,7 +3068,7 @@ mod tests {
             ),
             (
                 "a = agent(name = \"a\", prompt = \"p\", harness = \"gpt\")\nworkflow(type = \"playbook\", tasks = [a])\n",
-                "sets harness \"gpt\", which is not claude, hermes, codex, opencode or pi",
+                "sets harness \"gpt\", which is not claude, codex, opencode or pi",
             ),
             (
                 "s = session(name = \"s\", effort = \"hgih\")\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"playbook\", tasks = [a])\n",

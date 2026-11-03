@@ -18,7 +18,25 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// How the agent chose to spend the wait for a pending approval, the one field the engine
-/// branches on.
+/// branches on./// How an approval wait ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Granted,
+    Denied,
+    Timeout,
+}
+
+impl ApprovalOutcome {
+    /// The `approval_resolved` wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalOutcome::Granted => "granted",
+            ApprovalOutcome::Denied => "denied",
+            ApprovalOutcome::Timeout => "timeout",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitMode {

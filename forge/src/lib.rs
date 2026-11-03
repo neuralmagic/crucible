@@ -60,6 +60,9 @@ pub mod ndjson;
 /// work instead of repaying it.
 pub mod steps;
 
+/// What a rootless buildah needs from its pod.
+pub mod buildah;
+
 /// The declarative-build backends: the detached rootless-buildah cluster Job and the GithubActions
 /// dispatch, sharing one "build + push, crucible pins the digest" contract.
 pub mod build;

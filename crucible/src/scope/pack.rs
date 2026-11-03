@@ -437,7 +437,9 @@ pub(super) fn pack_marker_line(report: &ScopeReport, pack: &Path) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
-    use crate::scope::pack::{CONTROLS_DIR, strip_controls_and_selftest};
+    use crate::scope::pack::{
+        CONTROLS_DIR, normalize_frozen_manifest, strip_controls_and_selftest,
+    };
 
     #[test]
     fn de_prescribing_strips_control_injects_in_both_authoring_forms() {
@@ -484,6 +486,71 @@ dst = "fix.go"
         strip_controls_and_selftest(&manifest, &dir).unwrap();
         let text = std::fs::read_to_string(&manifest).unwrap();
         assert!(!text.contains("inject"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Freezing rewrites `[repo]`, `[agent]`, `[judge]`, and `[workspace]` in place, so the
+    /// edition and every table's `env` list, required and optional entries alike, survive it.
+    #[test]
+    fn freezing_keeps_the_edition_and_every_declared_env_list() {
+        let dir = std::env::temp_dir().join(format!(
+            "crucible-pack-freeze-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(dir.join(CONTROLS_DIR)).unwrap();
+        let manifest = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest,
+            r#"edition = 2
+[repo]
+path = "."
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "g"
+[judge]
+measure_cmd = "./m"
+direction = "higher"
+env = ["KUBECONFIG", "EPP_ENDPOINT?"]
+[judge.selftest]
+good_cmd = "cp _controls/fix.go ."
+bad_cmd = "true"
+[world]
+apply_cmd = "./a"
+env = ["REGISTRY_AUTH_FILE", "KUBE_NAMESPACE?"]
+[workflow]
+type = "custom"
+file = "workflow.star"
+env = ["GH_TOKEN", "GPUS?"]
+"#,
+        )
+        .unwrap();
+        normalize_frozen_manifest(
+            &manifest,
+            &dir.display().to_string(),
+            crate::manifest::AgentBackend::Openshell,
+            Some("ghcr.io/acme/sandbox@sha256:aa"),
+        )
+        .unwrap();
+        strip_controls_and_selftest(&manifest, &dir).unwrap();
+        let m = crate::manifest::Manifest::load(&manifest)
+            .unwrap_or_else(|e| panic!("{e:#}\n{}", std::fs::read_to_string(&manifest).unwrap()));
+        let env = |env: &crucible::host_env::DeclaredEnv| -> Vec<String> {
+            env.iter().map(ToString::to_string).collect()
+        };
+        assert_eq!(m.edition, crate::manifest::edition::Edition::Two);
+        let judge = m.judge.as_ref().unwrap();
+        assert!(judge.selftest.is_none());
+        assert_eq!(env(&judge.env), ["KUBECONFIG", "EPP_ENDPOINT?"]);
+        assert_eq!(env(&m.world.env), ["REGISTRY_AUTH_FILE", "KUBE_NAMESPACE?"]);
+        assert_eq!(
+            env(&m.workflow.as_ref().unwrap().env),
+            ["GH_TOKEN", "GPUS?"]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

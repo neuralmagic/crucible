@@ -10,20 +10,20 @@
 //! only an `openshell:resolve:env:` placeholder that the L7 egress proxy resolves, while Codex
 //! uses an L4 WebSocket tunnel. The real credential therefore has to be in the auth file.
 
-use crate::agent::harness::{
-    AuthProvider, Backend, HarnessSpec, McpServer, SandboxAuth, SeedFile, StreamDecoder,
-    TranscriptLocator, TurnArtifacts, json_str,
-};
+use crate::agent::harness::{Backend, McpServer, SandboxAuth, SeedFile, TurnArtifacts, json_str};
 use crate::agent::inference::InferenceEnv;
-use crate::args::Args;
+use crate::args::TurnAgent;
 use crate::manifest::{Harness, ReasoningEffort};
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
-use crucible_harness::{CodexJsonParser, LiveMeters};
+use crucible::harness::HarnessSpec;
+use crucible_harness::codex_json::CodexJsonParser;
+use crucible_harness::line::LineFormat;
+use crucible_harness::otel::LiveMeters;
 use jiff::Timestamp;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// Where the seeded access token lands; codex reads it at startup.
 pub(crate) const AUTH: &str = "/sandbox/.codex/auth.json";
@@ -31,38 +31,13 @@ pub(crate) const AUTH: &str = "/sandbox/.codex/auth.json";
 pub(crate) struct Codex;
 
 impl Codex {
-    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
-        name: "codex",
-        binaries: &[
-            "/usr/local/bin/codex",
-            "/usr/local/lib/node_modules/@openai/codex/**",
-        ],
-        // Codex has no skills discovery; the toolbox still lands where domain prompts reference it.
-        skills_dir: ".claude/skills",
-        // Relocates config, auth, and the rollout store off `~/.codex`.
-        home_var: "CODEX_HOME",
-        home: "/sandbox/.codex",
-        config: "/sandbox/.codex/config.toml",
-        sandbox_env: &[],
-        local_env: &[],
-        // `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`: three date segments, then the file.
-        transcript: TranscriptLocator::NewestJsonl {
-            sandbox_root: "/sandbox/.codex/sessions",
-            glob: "*/*/*/rollout-*.jsonl",
-        },
-        transcript_fetch_timeout: Duration::from_secs(30),
-        auth: AuthProvider::Codex,
-        otel_capable: false,
-        backfill_required: false,
-    };
-
     /// The shared invocation prefix: `codex exec --json --dangerously-bypass-approvals-and-sandbox
     /// --skip-git-repo-check --color never -m <model> [-c model_reasoning_effort=<tier>]`. Prompt
     /// delivery is appended by the caller. The bypass flag is what makes the run headless; the
     /// sandboxing crucible cares about is openshell's, not codex's own. `--skip-git-repo-check` keeps
     /// a workdir that is not a repo runnable, and `--color never` keeps ANSI escapes out of the
     /// captured stream.
-    fn base_args(args: &Args) -> Vec<String> {
+    fn base_args(agent: &TurnAgent<'_>) -> Vec<String> {
         let mut a = vec![
             "codex".to_string(),
             "exec".to_string(),
@@ -72,9 +47,9 @@ impl Codex {
             "--color".to_string(),
             "never".to_string(),
             "-m".to_string(),
-            Codex.model(args).to_string(),
+            Codex.model(agent).to_string(),
         ];
-        if let Some(effort) = args.reasoning_effort {
+        if let Some(effort) = agent.reasoning_effort {
             a.push("-c".to_string());
             a.push(format!(
                 "model_reasoning_effort={}",
@@ -165,7 +140,7 @@ fn config_toml(
                 // Codex's schema has no inline `bearer_token`; the choices are
                 // `bearer_token_env_var` (an env name) or static `http_headers`. The header keeps
                 // the token in the seeded file rather than the sandbox env, same posture as
-                // hermes's config.yaml.
+                // a provider table's.
                 let mut headers = toml::Table::new();
                 headers.insert("Authorization".into(), format!("Bearer {t}").into());
                 server.insert("http_headers".into(), headers.into());
@@ -179,24 +154,24 @@ fn config_toml(
 
 impl Backend for Codex {
     fn spec(&self) -> &'static HarnessSpec {
-        &Self::SPEC
+        Harness::Codex.spec()
     }
 
     /// `[agent.codex].model` overrides the shared `[agent].model`, and a Claude name in the shared
     /// slot falls back to the codex default. Both `--model` and the manifest's `[agent].model`
     /// default to a Claude model (the default harness owns that default), and the ChatGPT backend
     /// rejects an Anthropic model name with a 400.
-    fn model<'a>(&self, args: &'a Args) -> &'a str {
-        match args.codex.model.as_deref() {
+    fn model<'a>(&self, agent: &TurnAgent<'a>) -> &'a str {
+        match agent.codex.model.as_deref() {
             Some(m) => m,
-            None if args.model().starts_with("claude") => Harness::Codex.default_model(),
-            None => args.model(),
+            None if agent.model.starts_with("claude") => Harness::Codex.default_model(),
+            None => agent.model,
         }
     }
 
     /// The prompt rides inline as the trailing positional.
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
-        let mut a = Self::base_args(args);
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String> {
+        let mut a = Self::base_args(agent);
         a.push(prompt.to_string());
         a
     }
@@ -204,8 +179,8 @@ impl Backend for Codex {
     /// A trailing `-` reads the prompt from stdin, which the shared exec wrapper redirects from
     /// the uploaded prompt file. Codex reads MCP servers from its `config.toml`, not argv, so
     /// `mcp_seeded` is accepted and unused by design.
-    fn sandbox_argv(&self, args: &Args, _mcp_seeded: bool) -> Vec<String> {
-        let mut a = Self::base_args(args);
+    fn sandbox_argv(&self, agent: &TurnAgent<'_>, _mcp_seeded: bool) -> Vec<String> {
+        let mut a = Self::base_args(agent);
         a.push("-".to_string());
         a
     }
@@ -214,7 +189,7 @@ impl Backend for Codex {
     /// of the turn's streamable-HTTP MCP servers and its bearer token.
     fn config(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String> {
@@ -227,12 +202,12 @@ impl Backend for Codex {
                     .wire_api
                     .unwrap_or(crate::agent::inference::WireApi::Chat),
             });
-        Some(config_toml(self.model(args), servers, endpoint.as_ref()))
+        Some(config_toml(self.model(agent), servers, endpoint.as_ref()))
     }
 
     /// `auth.json` whenever Codex auth was resolved; the credential reaches Codex only through it,
     /// never the env script.
-    fn credential(&self, _args: &Args, auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(&self, _agent: &TurnAgent<'_>, auth: &SandboxAuth) -> Option<SeedFile> {
         auth.codex().map(|auth| SeedFile {
             content: auth_json(auth, &Timestamp::now().to_string()),
             dest: AUTH,
@@ -241,12 +216,12 @@ impl Backend for Codex {
 
     fn decoder(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         tool_io: bool,
-    ) -> Box<dyn StreamDecoder> {
+    ) -> Box<dyn LineFormat + Send> {
         Box::new(
-            CodexJsonParser::new(self.model(args))
+            CodexJsonParser::new(self.model(agent))
                 .with_price(crate::agent::event::estimate_cost)
                 .with_tool_io(tool_io),
         )
@@ -540,31 +515,34 @@ fn body(text: &str, redact: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::sandbox_env::SandboxEnv;
+    use crate::args::Args;
     use clap::Parser;
 
-    const CONFIG: &str = Codex::SPEC.config;
-    const DEFAULT_BINARIES: &[&str] = Codex::SPEC.binaries;
+    const CONFIG: &str = Harness::Codex.spec().config;
+    const DEFAULT_BINARIES: &[&str] = Harness::Codex.spec().binaries;
 
     fn args() -> Args {
         crate::cli::Cli::parse_from(["crucible"]).run
     }
 
     fn seed_files(
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         auth: Option<&CodexAuth>,
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
         let auth = auth.map_or(SandboxAuth::Gateway, |a| SandboxAuth::Codex(a.clone()));
-        Codex.seed_files(args, servers, &auth, inference)
+        Codex.seed_files(agent, servers, &auth, inference)
     }
 
-    fn sandbox_argv(args: &Args, mcp_seeded: bool) -> Vec<String> {
-        Codex.sandbox_argv(args, mcp_seeded)
+    fn sandbox_argv(agent: &TurnAgent<'_>, mcp_seeded: bool) -> Vec<String> {
+        Codex.sandbox_argv(agent, mcp_seeded)
     }
 
     fn env_script(env: &[(String, String)]) -> String {
-        Codex.env_script(env)
+        SandboxEnv::from_manifest(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .script(Harness::Codex.spec())
     }
 
     const PREFIX: &[&str] = &[
@@ -581,7 +559,7 @@ mod tests {
     fn invocation_is_headless_exec_with_the_model() {
         let mut a = args();
         a.codex.model = Some("gpt-5.6-sol".to_string());
-        let local = Codex.local_argv(&a, "do the thing");
+        let local = Codex.local_argv(&a.turn_agent(), "do the thing");
         assert_eq!(&local[..PREFIX.len()], PREFIX);
         assert_eq!(
             &local[PREFIX.len()..PREFIX.len() + 2],
@@ -589,7 +567,7 @@ mod tests {
         );
         assert_eq!(local.last().unwrap(), "do the thing");
 
-        let sandbox = sandbox_argv(&a, true);
+        let sandbox = sandbox_argv(&a.turn_agent(), true);
         assert_eq!(&sandbox[..PREFIX.len()], PREFIX);
         assert_eq!(sandbox.last().unwrap(), "-", "stdin marker stays last");
     }
@@ -601,7 +579,7 @@ mod tests {
         assert_eq!(Harness::Codex.default_model(), "gpt-5.6-sol");
         let mut a = args();
         a.model = Some("claude-opus-4-6".to_string());
-        let v = sandbox_argv(&a, false);
+        let v = sandbox_argv(&a.turn_agent(), false);
         assert!(
             v.windows(2)
                 .any(|w| w == ["-m", Harness::Codex.default_model()]),
@@ -609,7 +587,7 @@ mod tests {
         );
         a.model = Some("gpt-5.6-terra".to_string());
         assert!(
-            sandbox_argv(&a, false)
+            sandbox_argv(&a.turn_agent(), false)
                 .windows(2)
                 .any(|w| w == ["-m", "gpt-5.6-terra"]),
             "an OpenAI name in the shared slot is honored"
@@ -621,7 +599,7 @@ mod tests {
         let mut a = args();
         a.model = Some("claude-opus-4-6".to_string());
         a.codex.model = Some("gpt-5.6-terra".to_string());
-        let v = sandbox_argv(&a, false);
+        let v = sandbox_argv(&a.turn_agent(), false);
         assert!(v.windows(2).any(|w| w == ["-m", "gpt-5.6-terra"]));
         assert!(!v.iter().any(|s| s == "claude-opus-4-6"));
     }
@@ -639,7 +617,7 @@ mod tests {
     fn effort_rides_a_config_override_before_the_stdin_marker() {
         let mut a = args();
         a.reasoning_effort = Some(ReasoningEffort::Xhigh);
-        let v = sandbox_argv(&a, false);
+        let v = sandbox_argv(&a.turn_agent(), false);
         assert!(
             v.windows(2)
                 .any(|w| w == ["-c", "model_reasoning_effort=high"]),
@@ -650,7 +628,9 @@ mod tests {
         let mut a = args();
         a.reasoning_effort = None;
         assert!(
-            !sandbox_argv(&a, false).iter().any(|s| s == "-c"),
+            !sandbox_argv(&a.turn_agent(), false)
+                .iter()
+                .any(|s| s == "-c"),
             "no tier ⇒ no override"
         );
     }
@@ -690,7 +670,7 @@ mod tests {
     fn config_toml_always_seeds_model_and_approval_posture() {
         let mut a = args();
         a.codex.model = Some("gpt-5.6-sol".to_string());
-        let seeds = seed_files(&a, &[], None, &Default::default());
+        let seeds = seed_files(&a.turn_agent(), &[], None, &Default::default());
         assert_eq!(seeds.len(), 1, "config.toml is always seeded");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
@@ -707,7 +687,7 @@ mod tests {
     fn config_toml_lists_exactly_the_turns_servers() {
         let a = args();
         let seeds = seed_files(
-            &a,
+            &a.turn_agent(),
             &[
                 McpServer {
                     name: "epp-broker",
@@ -745,7 +725,7 @@ mod tests {
     fn a_quote_in_a_token_cannot_break_the_config() {
         let a = args();
         let seeds = seed_files(
-            &a,
+            &a.turn_agent(),
             &[McpServer {
                 name: "b",
                 url: "http://x/mcp",
@@ -793,12 +773,12 @@ mod tests {
     fn auth_json_is_seeded_only_when_the_turn_has_codex_auth() {
         let a = args();
         let auth = CodexAuth::ApiKey("sk-test".to_string());
-        let seeds = seed_files(&a, &[], Some(&auth), &Default::default());
+        let seeds = seed_files(&a.turn_agent(), &[], Some(&auth), &Default::default());
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[1].dest, AUTH);
         assert!(seeds[1].content.contains("sk-test"));
         assert!(
-            seed_files(&a, &[], None, &Default::default())
+            seed_files(&a.turn_agent(), &[], None, &Default::default())
                 .iter()
                 .all(|s| s.dest != AUTH)
         );
@@ -815,7 +795,7 @@ mod tests {
             wire_api: Some(crate::agent::inference::WireApi::Responses),
             ..Default::default()
         };
-        let seeds = seed_files(&a, &[], None, &inference);
+        let seeds = seed_files(&a.turn_agent(), &[], None, &inference);
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
         assert_eq!(v["model_provider"].as_str(), Some(CUSTOM_PROVIDER_ID));
         let provider = &v["model_providers"][CUSTOM_PROVIDER_ID];
@@ -826,7 +806,7 @@ mod tests {
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
         assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
 
-        let plain = seed_files(&a, &[], None, &Default::default());
+        let plain = seed_files(&a.turn_agent(), &[], None, &Default::default());
         let v: toml::Table = toml::from_str(&plain[0].content).expect("valid toml");
         assert!(v.get("model_provider").is_none());
         assert!(v.get("model_providers").is_none());

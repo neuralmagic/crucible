@@ -2,7 +2,8 @@
 //! modules depend on this and on [`crate::api::dto`]; only [`crate::api`] itself assembles the router.
 
 use crate::client::Db;
-use crate::daemon::queue::{Enqueue, OverrideSink};
+use crate::daemon::overrides::QueueOverrideSink;
+use crate::daemon::queue::WorkQueue;
 #[cfg(feature = "autoresearch")]
 use crate::issues::repo_ref::RepoWhitelist;
 use axum::extract::{FromRequest, Request};
@@ -53,8 +54,8 @@ pub struct Caps {
 pub struct ApiState {
     pub(crate) db: Db,
     pub(crate) schedules: crate::launches::schedules::ScheduleStore,
-    pub(crate) sink: Arc<dyn OverrideSink>,
-    pub(crate) queue: Arc<dyn Enqueue>,
+    pub(crate) sink: QueueOverrideSink,
+    pub(crate) queue: WorkQueue,
     pub(crate) caps: Option<Caps>,
     pub(crate) roles: crate::identity::auth::Roles,
     /// The daemon's autopilot flag; `None` where no daemon loaded one.
@@ -119,12 +120,12 @@ pub struct ApiState {
     /// `None` — local mode, a deployment with no Vault reach, tests — answers the registry's
     /// write routes with 503 instead of storing metadata that points at nothing.
     pub(crate) vault: Option<Arc<crate::secrets::vault::VaultClient>>,
+    /// Where a registered secret's bytes are read from, the same reader a dispatch uses.
+    /// `None` reads nothing.
+    pub(crate) secret_provider: Option<Arc<dyn crate::secrets::provider::SecretProvider>>,
     /// The environment variable names the deploy profile already fills from pre-created cluster
     /// Secrets. The preview gate warns when a pack declares a secret one of these also supplies.
     pub(crate) profile_secret_env: Arc<Vec<String>>,
-    /// Which identity model the human surface runs, reported by `GET /api/whoami` so the SPA knows
-    /// whose sign-in URLs to use.
-    pub(crate) auth_mode: crate::identity::auth::AuthMode,
     /// The chart-mounted key the offline credential is sealed under. `None` — no key mounted —
     /// answers the revoke route 503, because nothing was ever stored.
     pub(crate) credential_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
@@ -174,7 +175,7 @@ impl ApiState {
 
     /// The trackers a watch may sweep on this controller, built from the same Jira credentials
     /// the adopt path uses.
-    pub(crate) fn trackers(&self) -> crate::launches::tracker::Trackers {
+    pub(crate) fn trackers(&self) -> crate::launches::jira::Trackers {
         crate::launches::jira::trackers(self.jira.clone())
     }
 
@@ -183,8 +184,8 @@ impl ApiState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Db,
-        sink: Arc<dyn OverrideSink>,
-        queue: Arc<dyn Enqueue>,
+        sink: QueueOverrideSink,
+        queue: WorkQueue,
         clusters: Arc<crate::runs::clusters::ClusterClients>,
         config: Option<crate::daemon::overrides_store::ConfigStore>,
         reconcile_now: Arc<tokio::sync::Notify>,
@@ -251,13 +252,13 @@ impl ApiState {
             public_url: cfg.public_url.clone(),
             hooks_public_url: cfg.hooks_public_url.clone(),
             vault: None,
+            secret_provider: cfg.secret_provider.clone(),
             profile_secret_env: Arc::new(
                 cfg.deploy_profile
                     .as_deref()
                     .map(crate::secrets::manifest::profile_secret_env)
                     .unwrap_or_default(),
             ),
-            auth_mode: crate::identity::auth::AuthMode::from_env(),
             credential_keys: None,
             webhook_keys: None,
             oidc: None,
@@ -347,18 +348,22 @@ impl ApiState {
 #[cfg(test)]
 impl ApiState {
     /// Baseline router state for tests: guards off, stores absent, loopback defaults. Override the
-    /// few fields a test cares about with `..ApiState::test(db, sink)` struct-update syntax.
-    pub(crate) fn test(db: Db, sink: Arc<dyn OverrideSink>) -> Self {
+    /// few fields a test cares about with `..ApiState::test(db)` struct-update syntax.
+    pub(crate) fn test(db: Db) -> Self {
         let schedules = crate::launches::schedules::ScheduleStore::new(db.clone());
         #[cfg(feature = "autoresearch")]
         let autopilot =
             crate::daemon::autopilot_flag::AutopilotFlag::seeded(db.pool().clone(), true);
         let clusters = Arc::new(crate::runs::clusters::ClusterClients::new(None));
+        let queue = WorkQueue::new();
         Self {
             db,
             schedules,
-            sink,
-            queue: Arc::new(crate::daemon::queue::WorkQueue::new()),
+            sink: QueueOverrideSink::new(
+                Arc::new(crate::daemon::overrides::OverrideStore::new()),
+                queue.clone(),
+            ),
+            queue,
             caps: None,
             roles: crate::identity::auth::Roles::new(vec![], vec![], vec![]),
             #[cfg(feature = "autoresearch")]
@@ -396,8 +401,8 @@ impl ApiState {
             public_url: None,
             hooks_public_url: None,
             vault: None,
+            secret_provider: None,
             profile_secret_env: Arc::new(Vec::new()),
-            auth_mode: crate::identity::auth::AuthMode::Proxy,
             credential_keys: None,
             webhook_keys: None,
             oidc: None,
@@ -417,21 +422,129 @@ impl axum::extract::FromRef<ApiState> for crate::identity::auth::Roles {
     }
 }
 
-/// The error boundary: any `?`-propagated `anyhow::Error` becomes a 500 with its
-/// message. Expected outcomes (not found, bad query) are returned as explicit responses instead —
-/// this newtype exists only for "something we didn't plan for went wrong."
-pub struct AppError(pub(crate) anyhow::Error);
+/// The one error a handler answers with. Every variant is a status; the body is the same
+/// `{"error": …}` the routes have always sent, the field list for a refused form, the rule for a
+/// policy denial, and the bare message for a failure nobody planned for.
+#[derive(Debug)]
+pub enum ApiError {
+    BadRequest(String),
+    NotFound(String),
+    Forbidden(String),
+    Conflict(String),
+    Unprocessable(String),
+    /// A 422 naming the form inputs that were refused and why.
+    Invalid {
+        error: String,
+        fields: Vec<crate::playbooks::registry::FieldError>,
+    },
+    Unavailable(String),
+    BadGateway(String),
+    /// A policy denial (RFC-0003): who was refused, the action, and the decision that refused it.
+    Denied {
+        who: String,
+        action: crate::authz::action::Action,
+        decision: crate::authz::decision::Decision,
+    },
+    /// Something unplanned went wrong: a 500 with the error chain as its text.
+    Internal(anyhow::Error),
+}
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", self.0)).into_response()
+pub type ApiResult<T> = Result<T, ApiError>;
+
+impl ApiError {
+    /// A 422 with the schema-refusal headline and the refused fields.
+    pub(crate) fn invalid_fields(fields: Vec<crate::playbooks::registry::FieldError>) -> Self {
+        ApiError::Invalid {
+            error: "the supplied parameters do not satisfy the playbook's schema".to_string(),
+            fields,
+        }
     }
 }
 
-impl<E: Into<anyhow::Error>> From<E> for AppError {
-    fn from(err: E) -> Self {
-        AppError(err.into())
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            ApiError::Invalid { error, fields } => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(ValidationErrorBody { error, fields }),
+                )
+                    .into_response();
+            }
+            ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+            ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
+            ApiError::Denied {
+                who,
+                action,
+                decision,
+            } => {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(crate::authz::decision::DenialBody {
+                        error: format!("{who} may not {action} ({})", decision.reason()),
+                        rule: decision.reason(),
+                    }),
+                )
+                    .into_response();
+            }
+            ApiError::Internal(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+            }
+        };
+        (status, Json(ErrorBody::new(message))).into_response()
     }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(err: anyhow::Error) -> Self {
+        ApiError::Internal(err)
+    }
+}
+
+impl From<sqlx::Error> for ApiError {
+    fn from(err: sqlx::Error) -> Self {
+        ApiError::Internal(err.into())
+    }
+}
+
+impl From<std::io::Error> for ApiError {
+    fn from(err: std::io::Error) -> Self {
+        ApiError::Internal(err.into())
+    }
+}
+
+impl From<tower_sessions::session::Error> for ApiError {
+    fn from(err: tower_sessions::session::Error) -> Self {
+        ApiError::Internal(err.into())
+    }
+}
+
+impl From<crate::runs::dispatch_target::TargetRefusal> for ApiError {
+    fn from(refusal: crate::runs::dispatch_target::TargetRefusal) -> Self {
+        use crate::runs::dispatch_target::TargetRefusal;
+        let message = refusal.to_string();
+        match refusal {
+            TargetRefusal::Unknown { .. } => ApiError::NotFound(message),
+            TargetRefusal::Incompatible { .. } | TargetRefusal::NoneEligible { .. } => {
+                ApiError::Unprocessable(message)
+            }
+            TargetRefusal::NotAuthorized { .. } | TargetRefusal::Anonymous => {
+                ApiError::Forbidden(message)
+            }
+        }
+    }
+}
+
+/// The field-level rejection body: which form inputs the pack's schema refused, and why.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ValidationErrorBody {
+    pub error: String,
+    pub fields: Vec<crate::playbooks::registry::FieldError>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]

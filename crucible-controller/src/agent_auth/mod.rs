@@ -788,7 +788,7 @@ mod tests {
     /// its token names bob and carries bob's Kubernetes username, never alice's.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_run_another_user_redispatched_acts_for_that_user(pool: PgPool) {
-        use crate::daemon::queue::{IssueKey, Override, OverrideKind, OverrideSink, WorkQueue};
+        use crate::daemon::queue::{IssueKey, Override, OverrideKind, WorkQueue};
         let key = "owner/repo#1";
         let db = crate::Db::new(pool.clone());
         crate::issues::store::upsert_issue(

@@ -28,7 +28,7 @@ enum Grounded {
     /// pod arm books at collection — the single-booking invariant lives in [`crate::runs::workpod`]);
     /// the caller ledgers `rank-grounded` only when this is false (the local arm).
     Verdict {
-        verdict: engine::GroundedVerdict,
+        verdict: crucible_contract::verdict::Ruled,
         cost_ledgered: bool,
     },
     /// A turn pod was launched (non-blocking), or one was already in flight: no verdict exists yet.
@@ -65,13 +65,15 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
         GroundedExecutor::Disabled => Grounded::Skipped,
         GroundedExecutor::Local => {
             let bin = crate::runs::engine::resolve_bin();
-            if let Err(failure) = crate::runs::workpod::admit_contract(
-                crate::runs::contract::RequestKind::LocalGroundedRank,
-                &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
-            )
-            .await
+            if let Err(failure) = cfg
+                .runtime
+                .admit_contract(
+                    crate::runs::contract::RequestKind::LocalGroundedRank,
+                    &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
+                )
+                .await
             {
-                crate::runs::contract::refuse(db, key, &failure.into_rejection()?).await?;
+                crate::issues::transitions::refuse(db, key, &failure.into_rejection()?).await?;
                 return Ok(Grounded::Refused);
             }
             match run_grounded_local(cfg, key, repo, bin).await {
@@ -96,7 +98,7 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
             match crate::runs::workpod::dispatch_grounded_rank(
                 db,
                 cfg,
-                crate::runs::workpod::active_dispatcher(),
+                cfg.runtime.dispatcher.clone(),
                 key,
                 &repo_url,
                 issue.git_ref.as_deref(),
@@ -134,16 +136,17 @@ async fn run_grounded_local(
     key: &str,
     repo: &str,
     bin: std::path::PathBuf,
-) -> Result<engine::GroundedVerdict> {
+) -> Result<crucible_contract::verdict::Ruled> {
     let workspace = engine::checkout_dir(cfg.scratch_root(), repo);
     let repo_url = crate::runs::engine::repo_clone_url(repo);
     let max_cost = cfg.effective().per_reconcile_cost;
     let key = key.to_string();
-    let verdict = tokio::task::spawn_blocking(move || -> Result<engine::GroundedVerdict> {
-        engine::ensure_checkout(&repo_url, &workspace)?;
-        engine::rank_grounded(&bin, &key, &workspace, max_cost, None)
-    })
-    .await??;
+    let verdict =
+        tokio::task::spawn_blocking(move || -> Result<crucible_contract::verdict::Ruled> {
+            engine::ensure_checkout(&repo_url, &workspace)?;
+            engine::rank_grounded(&bin, &key, &workspace, max_cost, None)
+        })
+        .await??;
     Ok(verdict)
 }
 
@@ -264,7 +267,7 @@ pub(super) async fn apply_verdict(
     // What the grounded turn (if any) decided: a tier to proceed on, or `stale` — which is not a
     // tier and short-circuits everything below (park now, never touch `issues.tier`).
     let effective_tier = match &grounded {
-        Some(g) => match g.disposition {
+        Some(g) => match g.tier {
             Disposition::Stale => {
                 if crate::issues::transitions::park(
                     db.pool(),
@@ -462,10 +465,10 @@ pub(super) async fn apply_grounded_disposition(
     cfg: &ControllerCfg,
     issue: &Issue,
     content_hash: &str,
-    g: engine::GroundedVerdict,
+    g: crucible_contract::verdict::Ruled,
     cost_ledgered: bool,
 ) -> Result<PrescopeGate> {
-    let (park_reason, recorded_tier) = match g.disposition {
+    let (park_reason, recorded_tier) = match g.tier {
         Disposition::Stale => (
             Some(ParkReason::StaleAlreadyImplemented {
                 rationale: g.rationale.clone(),

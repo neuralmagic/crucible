@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0039"
 title = "Cedar as the embedded policy engine behind the RFC-0003 decision"
-status = "proposed"
+status = "accepted"
 date = "2026-09-13"
 refs = [
     "RFC-0003",

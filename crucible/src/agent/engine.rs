@@ -1,10 +1,7 @@
 //! The engine context: one multi-thread tokio runtime, created once at engine start, whose
-//! [`Handle`] every async call site reaches; plus the engine's own OTLP span exporter.
-//!
-//! [`EngineCtx::new`] publishes the runtime's `Handle` into a module-level `OnceLock` read back
-//! with [`handle`]; `EngineCtx` still OWNS the runtime and the OTLP guard, so the runtime shuts
-//! down and spans flush when the owning frame unwinds (the `Handle` clone does not keep it
-//! alive). Set-once, read-only, a deliberate exception to the no-globals rule.
+//! [`Handle`] rides on the run's `Args` to every async call site; plus the engine's own OTLP span
+//! exporter. `EngineCtx` owns the runtime and the OTLP guard, so the runtime shuts down and spans
+//! flush when the owning frame unwinds (a `Handle` clone does not keep it alive).
 //!
 //! Telemetry: when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` is set,
 //! a `tracing-opentelemetry` layer exports crucible's own spans (`service.name=crucible`) with
@@ -32,12 +29,8 @@ use tracing_subscriber::util::SubscriberInitExt as _;
 /// The `service.name` every exported span carries.
 const SERVICE_NAME: &str = "crucible";
 
-/// The published engine runtime handle. Set once by [`EngineCtx::new`]; read by [`handle`]. A
-/// `Handle` is a cheap clone that does not keep the runtime alive, the owning [`EngineCtx`] does.
-static HANDLE: OnceLock<Handle> = OnceLock::new();
-
-/// The installed tracer provider, published for [`flush`] (a best-effort flush before a
-/// `std::process::exit` that would skip [`EngineCtx`]'s `Drop`). `None` when no OTLP endpoint is set.
+/// The installed tracer provider, the handle on the process-global tracing subscriber the span
+/// helpers below read; `None` when no OTLP endpoint is set.
 static PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
 
 /// The opt-in GenAI content-logs provider (see [`install_logs`]); `None` on the default path.
@@ -45,25 +38,24 @@ static LOGS_PROVIDER: OnceLock<SdkLoggerProvider> = OnceLock::new();
 
 /// One engine-lifetime multi-thread tokio runtime plus the engine's OTLP span guard. Construct once
 /// per process on the arm that needs async (the loop path, `scope`, `rank-grounded`, and the swept
-/// controller/`fetch` calls); construction publishes the handle for [`handle`]. The autopilot
+/// controller/`fetch` calls) and hand its [`EngineCtx::handle`] to the run's `Args`. The autopilot
 /// daemon is deliberately *not* built through this, it keeps its own runtime and its own
 /// (`crucible-controller`) telemetry.
 pub(crate) struct EngineCtx {
     // Field order is drop order: the telemetry guard drops first (flushing spans while the
-    // runtime is still alive to drive the batch processor), then `_runtime`. Held, never read.
+    // runtime is still alive to drive the batch processor), then `runtime`. Held, never read.
     _telemetry: EngineTelemetry,
-    _runtime: Runtime,
+    runtime: Runtime,
 }
 
 impl EngineCtx {
-    /// Build the engine runtime, publish its handle, and install the OTLP layer (when configured).
-    /// `enable_all` turns on the I/O and time drivers the tonic channel and RPC timeouts need.
+    /// Build the engine runtime and install the OTLP layer (when configured). `enable_all` turns
+    /// on the I/O and time drivers the tonic channel and RPC timeouts need.
     pub(crate) fn new() -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .context("building the engine tokio runtime")?;
-        let _ = HANDLE.set(runtime.handle().clone());
         // Install within the runtime context so the OTLP batch span processor's background task
         // attaches to THIS runtime (the reason the exporter needs an engine-lifetime runtime).
         let telemetry = {
@@ -72,19 +64,15 @@ impl EngineCtx {
         };
         Ok(Self {
             _telemetry: telemetry,
-            _runtime: runtime,
+            runtime,
         })
     }
-}
 
-/// The published engine runtime handle, for async call sites downstream of [`EngineCtx::new`]
-/// (the openshell turn boundary, the swept controller/S3 calls). An error (never a panic) when
-/// no `EngineCtx` has been constructed yet, so a caller can surface it cleanly.
-pub(crate) fn handle() -> Result<&'static Handle> {
-    HANDLE.get().context(
-        "the engine runtime is not initialized (EngineCtx::new was not called before an async \
-         call site) — this is an engine wiring bug",
-    )
+    /// The runtime's handle, for the async call sites downstream (the openshell turn boundary,
+    /// the swept controller/S3 calls). A cheap clone that does not keep the runtime alive.
+    pub(crate) fn handle(&self) -> Handle {
+        self.runtime.handle().clone()
+    }
 }
 
 #[cfg(feature = "autoresearch")]
@@ -200,11 +188,11 @@ fn end_span_aborted(span: &tracing::Span, reason: &str) {
 /// A no-op when telemetry is off (`run_span` is `None`), and a no-op when the engine runtime is
 /// missing rather than a hard error: failing to install an abort handler must never be the thing
 /// that stops a run from starting.
-pub(crate) fn abort_on_signal(run_span: Option<tracing::Span>) {
+pub(crate) fn abort_on_signal(run_span: Option<tracing::Span>, engine: Option<&Handle>) {
     let Some(span) = run_span else {
         return;
     };
-    let Ok(handle) = handle() else {
+    let Some(handle) = engine else {
         return;
     };
     handle.spawn(async move {
@@ -435,6 +423,7 @@ fn content_logs_enabled() -> bool {
 pub(crate) fn emit_conversation_logs(
     parent: &tracing::Span,
     records: &[crate::turn_trace::GenAiRecord],
+    system: &'static str,
 ) {
     use opentelemetry::logs::LoggerProvider as _;
     use opentelemetry::trace::TraceContextExt as _;
@@ -451,7 +440,7 @@ pub(crate) fn emit_conversation_logs(
         return;
     }
     let logger = provider.logger(SERVICE_NAME);
-    emit_records(&logger, &sc, records);
+    emit_records(&logger, &sc, records, system);
 }
 
 /// The pure emission over a logger and a span context, split out so a test can drive it against an
@@ -461,6 +450,7 @@ fn emit_records<L>(
     logger: &L,
     sc: &opentelemetry::trace::SpanContext,
     records: &[crate::turn_trace::GenAiRecord],
+    system: &'static str,
 ) where
     L: opentelemetry::logs::Logger,
 {
@@ -473,8 +463,7 @@ fn emit_records<L>(
         let mut lr = logger.create_log_record();
         lr.set_severity_number(Severity::Info);
         lr.set_trace_context(sc.trace_id(), sc.span_id(), Some(sc.trace_flags()));
-        // Anthropic Claude is the only agent model behind these transcripts.
-        lr.add_attribute("gen_ai.system", "anthropic");
+        lr.add_attribute("gen_ai.system", system);
         map_record(&mut lr, rec, Some(i) == last_assistant);
         logger.emit(lr);
     }
@@ -984,7 +973,7 @@ mod tests {
                 model: None,
             },
         ];
-        emit_records(&logger, &sc, &records);
+        emit_records(&logger, &sc, &records, "openai");
         provider.force_flush().expect("flush");
 
         let logs = exporter.get_emitted_logs().expect("emitted logs");
@@ -1005,6 +994,16 @@ mod tests {
             let tc = l.record.trace_context().expect("trace context set");
             assert_eq!(tc.trace_id, sc.trace_id());
             assert_eq!(tc.span_id, sc.span_id());
+            let system = l
+                .record
+                .attributes_iter()
+                .find(|(key, _)| key.as_str() == "gen_ai.system")
+                .map(|(_, value)| value);
+            assert_eq!(
+                any_str(system),
+                Some("openai".into()),
+                "the provider passed in"
+            );
         }
 
         // The user body is the full prompt string.
@@ -1091,7 +1090,7 @@ mod tests {
     #[test]
     fn abort_on_signal_without_a_span_is_a_noop() {
         // Telemetry off means no run span, and installing a handler must not require a runtime.
-        abort_on_signal(None);
+        abort_on_signal(None, None);
     }
 
     #[cfg(feature = "autoresearch")]

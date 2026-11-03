@@ -694,11 +694,6 @@ mod tests {
         assert!(text.contains(r#"grounded="true""#));
     }
 
-    struct NoopSink;
-    impl crate::daemon::queue::OverrideSink for NoopSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
-
     /// The `/metrics` route returns 200, the Prometheus text content type, and a rendered family —
     /// with a DB-mirrored gauge (the ceiling) reflecting the caps on the state.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -715,7 +710,7 @@ mod tests {
                 max_scopes_per_day: 20,
                 daily_cost_ceiling: 50.0,
             }),
-            ..crate::api::state::ApiState::test(db, std::sync::Arc::new(NoopSink))
+            ..crate::api::state::ApiState::test(db)
         };
         let app = crate::api::metrics::router(state);
         let res = app

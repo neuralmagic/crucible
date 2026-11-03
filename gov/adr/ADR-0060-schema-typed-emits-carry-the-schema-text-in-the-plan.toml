@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0060"
 title = "Schema-typed emits carry the schema text in the plan"
-status = "proposed"
+status = "accepted"
 date = "2026-10-05"
 refs = [
     "RFC-0001:C-WORKFLOW",

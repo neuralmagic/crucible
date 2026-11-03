@@ -10,7 +10,7 @@
 //! trigger's transaction, so a claimed row can never end up without the launch it was claimed for.
 
 use crate::client::Db;
-use crate::daemon::queue::{BoxFuture, DiscoverySource, DueSource, Enqueue, IssueKey, Pass};
+use crate::daemon::queue::{BoxFuture, DiscoverySource, DueSource, IssueKey, Pass, WorkQueue};
 use crate::event_log::Event;
 use crate::launches::model::NewPlaybookLaunch;
 use crate::model::LaunchOrigin;
@@ -470,6 +470,11 @@ pub(crate) async fn fire(
             .or(core.created_by.as_deref()),
         launcher_groups: core.owner_groups.as_ref(),
         rerun: None,
+        dispatch: crate::launches::model::DispatchPin {
+            target: core.dispatch_target.as_deref(),
+            provider: core.agent_provider.as_deref(),
+            model: core.agent_model.as_deref(),
+        },
     };
     match crate::launches::store::insert_playbook_launch_with(tx, key, &launch, exposure).await {
         Ok(true) => {}
@@ -482,17 +487,6 @@ pub(crate) async fn fire(
         }
         Err(e) => return Err(format!("{noun} launch insert: {e:#}").into()),
     }
-    crate::issues::store::set_dispatch_target(&mut **tx, key, core.dispatch_target.as_deref())
-        .await
-        .map_err(|e| format!("{noun} dispatch target: {e:#}"))?;
-    crate::issues::store::set_agent_dispatch(
-        &mut **tx,
-        key,
-        core.agent_provider.as_deref(),
-        core.agent_model.as_deref(),
-    )
-    .await
-    .map_err(|e| format!("{noun} agent dispatch: {e:#}"))?;
     // `insert_playbook_launch_with` preserves its one shared path by initially copying the current
     // registry row. Replace that copy inside the same transaction with the revision this row
     // explicitly adopted, so a later registry repin cannot move an existing recurrence.
@@ -1349,8 +1343,8 @@ pub struct TriggerSweep {
     db: Db,
     triggers: Vec<Arc<dyn LaunchTrigger>>,
     cfg: SweepCfg,
-    /// The offline credential the owner's live groups are re-read through. `None` — proxy mode, no
-    /// issuer, no mounted key — leaves every firing on the stored snapshot alone.
+    /// The offline credential the owner's live groups are re-read through. `None` — no issuer, no
+    /// mounted key — leaves every firing on the stored snapshot alone.
     refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
     /// The policy set every firing is decided under. `None` only in harnesses that predate the
     /// decision.
@@ -1380,7 +1374,7 @@ impl TriggerSweep {
 
     /// Sweep every trigger once and enqueue what fired ahead of the backlog. One trigger's error
     /// is logged and the rest still run: a tracker outage must not stop the schedules.
-    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<Result<Pass>> {
+    fn pass(&self, queue: WorkQueue, held: Vec<String>) -> BoxFuture<Result<Pass>> {
         let db = self.db.clone();
         let triggers = self.triggers.clone();
         let cfg = self.cfg;
@@ -1403,7 +1397,7 @@ impl TriggerSweep {
                 {
                     Ok(swept) => {
                         for key in swept.fired {
-                            enqueue.enqueue_urgent(IssueKey(key));
+                            queue.enqueue_urgent(IssueKey(key));
                         }
                         pass.claimed += swept.claimed;
                         pass.held.extend(swept.skipped);
@@ -1421,8 +1415,8 @@ impl TriggerSweep {
 }
 
 impl DiscoverySource for TriggerSweep {
-    fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
-        let pass = self.pass(enqueue, Vec::new());
+    fn poll(&self, queue: WorkQueue) -> BoxFuture<Result<()>> {
+        let pass = self.pass(queue, Vec::new());
         Box::pin(async move { pass.await.map(|_| ()) })
     }
 }
@@ -1448,8 +1442,8 @@ impl DueSource for TriggerSweep {
         })
     }
 
-    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<Result<Pass>> {
-        TriggerSweep::pass(self, enqueue, held)
+    fn pass(&self, queue: WorkQueue, held: Vec<String>) -> BoxFuture<Result<Pass>> {
+        TriggerSweep::pass(self, queue, held)
     }
 }
 

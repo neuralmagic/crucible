@@ -5,7 +5,7 @@ domain. The engine implements it, and a domain satisfies it. A minimal fake doma
 (`examples/counter/`) tests it end to end without EPP and without a cluster.
 
 Concept: [The loop in one read](./crucible.md).
-Trust line (engine hands the agent a World, never a Judge): [ADR 0001](./adr/0001-adaptive-harness.md).
+Trust line (engine hands the agent a World, never a Judge): [ADR-0001](./adr/ADR-0001.md).
 
 > **Contract status: NORMATIVE.** Words like *must* / *exactly one* are binding. The engine
 > and every domain (EPP included) conform to this; tests assert it.
@@ -19,6 +19,8 @@ The engine reads exactly one manifest per run. Default path `./crucible.toml` (o
 config-relative paths below.
 
 ```toml
+edition = 2                                   # pack contract edition; absent = 1 (§3)
+
 [repo]
 # Exactly one of url|path. The upstream the agent edits a checkout of. A playbook may omit the
 # whole table: its workspace is then an empty dir the injects populate.
@@ -81,8 +83,9 @@ measure_cmd = "./measure.sh"                  # REQUIRED. §3. Any executable, a
 direction   = "lower"                         # lower | higher. REQUIRED.
 tiebreak_direction = "lower"                  # optional; direction of the `tiebreak` scalar (§4). default: direction
 objective   = "score"                         # display label (the old `gate` name). default "score"
+env         = ["KUBECONFIG", "EPP_ENDPOINT?"] # edition 2: engine env measure_cmd receives (§3); NAME? only when set
 
-[judge.selftest]                              # optional (ADR-0014 S1). Runs in `crucible check`, never in a loop iteration.
+[judge.selftest]                              # optional (ADR-0012). Runs in `crucible check`, never in a loop iteration.
 good_cmd = "..."                              # stages a known-good config in the workspace
 bad_cmd  = "..."                              # stages a known-bad config in the workspace
 runs     = 1                                  # measurements averaged per control. default 1
@@ -92,6 +95,7 @@ runs     = 1                                  # measurements averaged per contro
 apply_cmd    = "..."                          # optional. §3.
 snapshot_cmd = "..."                          # optional. §3.
 restore_cmd  = "..."                          # optional. §3.
+env          = ["KUBECONFIG"]                 # edition 2: engine env the three commands receive (§3); NAME? only when set
 
 [search]                                      # optional (ADR-0010). Absent or wide=0 → pure-deep, the default.
 wide       = 0                                # u32. N parallel propose turns before the deep loop. default 0
@@ -110,6 +114,9 @@ Rules:
   stages one side isn't a control); `runs` must be `>= 1`.
 - `[search]`, if present with `wide > 0`, requires `approaches.len() >= wide` (hard error,
   diversity is engineered, not auto-generated) and `policy_k` in `1..=wide`.
+- **Edition.** `edition` is 1 when absent; 1 and 2 are the editions this engine runs, and any
+  other value fails the parse naming them. An `env` list in `[judge]`, `[world]`, or
+  `[workflow]` needs edition 2 and fails the parse of an edition-1 manifest (§3).
 - Unknown keys are an error (typo protection), not silently ignored.
 - **Frozen loading (`load_frozen`).** When the manifest file lives *inside* the workspace it
   targets (the BYO on-ramp: `crucible init` scaffolds `[repo] path = "."`), the engine parses it
@@ -137,7 +144,7 @@ Rules:
   variant's graph, so a broken variant fails whichever one runs. A resume must name the variant
   the run started with. A composite manifest declares no variants.
 
-### 1.1 The gate self-test (`crucible check`, ADR-0014 S1)
+### 1.1 The gate self-test (`crucible check`, ADR-0012)
 
 `[judge.selftest]` declares two controls the gate must tell apart before it's trusted. `crucible
 check` (§9) runs it pre-loop, never inside a loop iteration:
@@ -325,8 +332,8 @@ completed-turn count. It never copies that cursor or Claude's native transcript 
 unchanged. Claude Code implements native start/resume for both the local and Vertex/OpenShell paths. Because OpenShell sandboxes are
 per-turn-fresh, Crucible saves Claude's native transcript as mode-0600 private engine state and
 restores it at the exact pinned config path in the next sandbox; that file is never included in the
-published run record. Hermes fails closed for a persistent binding until it has an equivalent
-continuation store; it never silently degrades the binding to a fresh prompt.
+published run record. The other harnesses have no equivalent continuation store, so they fail closed
+for a persistent binding; none silently degrades the binding to a fresh prompt.
 
 The first turn receives the complete method and goal prompt. A resumed proposer receives only the
 new authoritative delta: current regime, current-best status, and new steering. Its retained
@@ -532,7 +539,14 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
 - **cwd** = the agent workspace (`manifest_dir/[workspace].dir`).
 - **PATH inherited**, so a command may be a bare installed tool (`bench`) or a workspace-relative
   script (`./measure.sh`).
-- **env** = the engine's env + `[agent].env` (where relevant) + the injected variables below.
+- **env**, edition 2 = `PATH`, `HOME`, `LANG`, `TMPDIR`, the run's identity
+  (`CRUCIBLE_RUN_NAME`, `CRUCIBLE_RUN_DISPLAY_NAME`, `CRUCIBLE_UI_BASE_URL`) when the engine has
+  it, the injected variables below, and what the command's table declares in `env`: `[judge].env` for `measure_cmd`, `[world].env` for
+  `apply_cmd`, `snapshot_cmd`, and `restore_cmd`. A declared `NAME` the engine's environment
+  does not set refuses the run; a declared `NAME?` is passed when set and left out when not.
+- **env**, edition 1 = the engine's env plus the injected variables below. `crucible check` and
+  run start warn about it, and the capability disclosure states it.
+- `setup_cmd` gets the engine's env in every edition.
 
 ### `measure_cmd` (the Judge): REQUIRED
 - **Injected env:** `CRUCIBLE_BASELINE_SCORE`, `CRUCIBLE_BASELINE_TOTAL`, `CRUCIBLE_BEST_SCORE`
@@ -563,7 +577,7 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
 Between "the agent edited a file" and "`measure_cmd` read a score" sits a step whose shape you must
 choose when you design a pack. It differs **per component**, it is the dominant term in
 per-iteration wall-clock, and picking it wrong fails silently. Full rationale in
-[ADR-0020](./adr/0020-candidate-build-modes.md).
+[ADR-0016](./adr/ADR-0016.md).
 
 | Mode | When it applies | What `apply_cmd` does | Cost |
 | --- | --- | --- | --- |
@@ -738,7 +752,7 @@ binaries included. This is the only way to subtract a default, and it is require
   not be polluted by the open web has to drop that endpoint, and dropping it means opting out.
 
 The broker endpoint is **auto-appended** by the engine when `[agent.broker].enabled` is true
-(ADR-0019 P2). The engine first resolves the broker URL (an explicit `[agent.broker].url`
+(ADR-0015). The engine first resolves the broker URL (an explicit `[agent.broker].url`
 override, or derived from the active compute driver's hostname), then derives the egress
 `host:port:full` entry from that URL's authority. When no explicit port is present, the scheme
 default applies (`http` = 80, `https` = 443). Both values come from the same resolved URL, so
@@ -1035,13 +1049,13 @@ noted here tersely so this doc stays the map of what's authoritative:
   is reachable by the agent's own edits: a `measure_cmd` token pointing inside the workspace with
   no matching frozen inject). Exit nonzero with findings on failure; warnings never fail it.
 - **`crucible scope --pack <dir> [--issue owner/repo#N | --goal-file <f>] [--force] [--json]`**
-  (ADR-0014 S0): pipeline over a hand-written domain pack. **resolve** the goal (from `--issue`,
+  (ADR-0012): pipeline over a hand-written domain pack. **resolve** the goal (from `--issue`,
   fetched natively from the GitHub REST API (honors `GITHUB_TOKEN`/`GH_TOKEN` and
   `GITHUB_API_URL`), or `--goal-file`, or the pack's own `[agent].goal`/`goal_file`),
   then **validate** (`crucible check`, as a library call), then **freeze** (writes `SCOPE.md` in
   the pack dir with the goal, the check outcome, and the pack's `RunIdentity` digest). Stops at
   the first failing stage. `S2` (propose)/`S3` (preflight)/`S4` (approval) are listed in
-  `SCOPE.md` as pending, see [ADR 0014](./adr/0014-scoping-pipeline.md). A `--goal-file`'s text is
+  `SCOPE.md` as pending, see [ADR-0012](./adr/ADR-0012.md). A `--goal-file`'s text is
   goal framing under the same de-prescription rules as a `--issue`'s title/body: the problem for
   the pack-designing agent to solve, never a solution. §8's `_controls`/self-test strip at
   freeze applies identically regardless of which arm sourced the goal.

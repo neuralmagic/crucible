@@ -1038,7 +1038,7 @@ pass "[V] a launch is checked against the tree it froze, not the registry's newe
 stop_controller
 log "[V] storing the collected tree's legacy bytes again"
 seed_pack_row kind_e2e_vgc2 "$WORK/vgc.tar.gz"
-log "[V] booting without a dev identity, so callers assert their login"
+log "[V] booting without a dev identity, so callers present their own api keys"
 VHREPO="$WORK/vhrepo"
 small_pack "$VHREPO/pack" "echo vhook-$ID
 $OK_JSON"
@@ -1047,6 +1047,7 @@ echo '# the same commit, another tree' >>"$VHREPO/pack2/check.sh"
 git -C "$VHREPO" init -q
 git_commit "$VHREPO" hook
 VH_SOURCE="\"repo\":\"file://$VHREPO\",\"path\":\"pack\""
+export CONTROLLER_API_TOKEN="e2e-$(openssl rand -hex 16)"
 CONTROLLER_ENV=(CONTROLLER_DEV_IDENTITY=)
 start_controller
 read -r converted unconvertible <<<"$(conversion_report "$BOOT")"
@@ -1108,34 +1109,8 @@ cmp -s "$WORK/template-outsider-old.json" "$WORK/template-outsider-unknown.json"
     fail "[V] the reader got $(cat "$WORK/template-e2e-old.json") and $(cat "$WORK/template-e2e-unknown.json")"
 grep -q "$V_TREE" "$WORK/template-outsider-old.json" && fail "[V] the non-reader's answer names $V_TREE"
 pass "[V] a non-reader's answer for the pre-tree digest is byte-identical to the unknown digest's; a reader's names the replacement"
-
-# ---- scenario G ----------------------------------------------------------------------------
 stop_controller
-log "[G] migrating a legacy state dir"
-OLD="$WORK/oldstate/packs/kind_e2e_legacy"
-small_pack "$OLD" "echo migrated-$ID
-$OK_JSON"
-printf 'frozen guidance\n<!-- steer @1790812800 by control -->\nfirst\n<!-- steer @1790812900 by control -->\nsecond\n' >"$OLD/STEER.md"
-"$BIN/crucible-controller" db migrate-state --state-dir "$WORK/oldstate" --db "$DB" >"$WORK/migrate-G.log" 2>&1 ||
-    fail "[G] migrate-state failed: $(cat "$WORK/migrate-G.log")"
-if ! grep -Eq '^packs +1 +0 +0$' "$WORK/migrate-G.log" || ! grep -Eq '^steering +2 +0 +0$' "$WORK/migrate-G.log"; then
-    fail "[G] migrate-state reported: $(cat "$WORK/migrate-G.log")"
-fi
-G_TREE=$(launch_tree kind_e2e_legacy)
-is_tree "$G_TREE" || fail "[G] the migrated pack holds tree '$G_TREE'"
-[ "$(tree_file "$G_TREE" STEER.md)" = "frozen guidance" ] || fail "[G] the stored STEER.md is: $(tree_file "$G_TREE" STEER.md)"
-[ "$(sql -c "SELECT string_agg(body_md, ',' ORDER BY seq) FROM pack_steering WHERE issue_slug = 'kind_e2e_legacy'")" = "first,second" ] ||
-    fail "[G] the steering rows are: $(sql -c "SELECT seq, body_md FROM pack_steering WHERE issue_slug = 'kind_e2e_legacy'")"
-pass "[G] the legacy pack dir became a tree with its steering split into rows"
-"$BIN/crucible-controller" db migrate-state --state-dir "$WORK/oldstate" --db "$DB" >"$WORK/migrate-G2.log" 2>&1 ||
-    fail "[G] the second migrate-state failed: $(cat "$WORK/migrate-G2.log")"
-if ! grep -Eq '^packs +0 +1 +0$' "$WORK/migrate-G2.log" || ! grep -Eq '^steering +0 +2 +0$' "$WORK/migrate-G2.log"; then
-    fail "[G] the second migrate-state reported: $(cat "$WORK/migrate-G2.log")"
-fi
-[ "$(launch_tree kind_e2e_legacy)" = "$G_TREE" ] &&
-    [ "$(sql -c "SELECT count(*) FROM pack_steering WHERE issue_slug = 'kind_e2e_legacy'")" = 2 ] ||
-    fail "[G] the second migrate-state changed the migrated pack"
-pass "[G] a second migrate-state leaves the migrated pack as it was"
+unset CONTROLLER_API_TOKEN
 
 # ---- scenario M ----------------------------------------------------------------------------
 CONTROLLER_ENV=()
@@ -1151,21 +1126,4 @@ expect_parked M "contract rejection"
 [ "$(pods_seen M "$KEY")" = 0 ] || fail "[M] a pod was created for a rejected launch"
 pass "[M] no pod was created"
 
-# ---- scenario Z ----------------------------------------------------------------------------
 stop_controller
-log "[Z] rebuilding the ledger"
-PACK_STORE="SELECT 'row', issue_slug, tree_digest FROM pack_tarballs WHERE tree_digest IS NOT NULL
-UNION ALL SELECT 'files', digest, count(*)::TEXT FROM pack_tree_files
-    WHERE digest IN (SELECT tree_digest FROM pack_tarballs) GROUP BY digest
-UNION ALL SELECT 'alias', old_digest, coalesce(tree_digest, unconvertible_reason) FROM pack_digest_aliases
-ORDER BY 1, 2"
-sql -c "$PACK_STORE" >"$WORK/pack-store-before.txt"
-[ "$(grep -c '^row|' "$WORK/pack-store-before.txt")" -gt 10 ] || fail "[Z] too few pack rows to compare"
-DATABASE_URL="$DB" "$BIN/crucible-controller" db rebuild --state-dir "$WORK/state" >"$WORK/rebuild-Z.log" 2>&1 ||
-    fail "[Z] db rebuild failed: $(tail -n 20 "$WORK/rebuild-Z.log")"
-sql -c "$PACK_STORE" >"$WORK/pack-store-after.txt"
-diff "$WORK/pack-store-before.txt" "$WORK/pack-store-after.txt" >"$WORK/pack-store.diff" ||
-    fail "[Z] the rebuild changed the pack store:
-$(cat "$WORK/pack-store.diff")"
-pass "[Z] the rebuilt ledger holds every pack row's tree, its files, and every alias"
-

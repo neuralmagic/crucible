@@ -5,6 +5,7 @@
 use crate::command_judge::CommandJudge;
 use crate::command_world::{CommandWorld, CompositeWorld, GitWorld};
 use crate::crucible::{Judge, World};
+use crate::host_env::HostEnv;
 use crate::manifest::{CompositeManifest, Manifest};
 use crate::task_judge::TaskJudge;
 use anyhow::Result;
@@ -15,7 +16,7 @@ impl Manifest {
     /// `GitWorld` when no `[world]` commands are given at all (the 80% case), else
     /// `CommandWorld` (git memory plus any of apply/snapshot/restore). Boxed `+ Send` so a
     /// front-end can move the world onto a worker thread.
-    pub fn build_world(&self, workspace: PathBuf) -> Arc<dyn World> {
+    pub fn build_world(&self, workspace: PathBuf) -> Result<Arc<dyn World>> {
         let carry_forward = self.workspace.carried_paths();
         let excludes: Vec<String> = carry_forward
             .iter()
@@ -25,18 +26,19 @@ impl Manifest {
         crucible_vcs::git_memory::install_harness_excludes(&workspace, &excludes);
         let w = &self.world;
         if w.apply_cmd.is_none() && w.snapshot_cmd.is_none() && w.restore_cmd.is_none() {
-            Arc::new(GitWorld {
+            Ok(Arc::new(GitWorld {
                 workspace,
                 carry_forward,
-            })
+            }))
         } else {
-            Arc::new(CommandWorld {
+            Ok(Arc::new(CommandWorld {
                 workspace,
                 apply_cmd: w.apply_cmd.clone(),
                 snapshot_cmd: w.snapshot_cmd.clone(),
                 restore_cmd: w.restore_cmd.clone(),
                 carry_forward,
-            })
+                env: HostEnv::resolve(self.edition, "[world]", &w.env)?,
+            }))
         }
     }
 
@@ -57,6 +59,7 @@ impl Manifest {
             tiebreak_direction: self.tiebreak_direction()?,
             objective: judge.objective.clone(),
             frozen_injects,
+            env: HostEnv::resolve(self.edition, "[judge]", &judge.env)?,
         }))
     }
 }
@@ -80,6 +83,7 @@ impl CompositeManifest {
             snapshot_cmd: self.world.snapshot_cmd.clone(),
             restore_cmd: self.world.restore_cmd.clone(),
             carry_forward: Vec::new(),
+            env: HostEnv::resolve(self.edition, "[world]", &self.world.env)?,
         }))
     }
 
@@ -93,6 +97,7 @@ impl CompositeManifest {
             tiebreak_direction: self.tiebreak_direction()?,
             objective: self.judge.objective.clone(),
             frozen_injects: vec![],
+            env: HostEnv::resolve(self.edition, "[judge]", &self.judge.env)?,
         }))
     }
 }

@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MANIFEST: &str = r#"
+edition = 2
 [repo]
 path = "."
 [workspace]
@@ -14,6 +15,7 @@ goal = "sweep the queue"
 [workflow]
 type = "playbook"
 file = "workflow.star"
+env = ["FORGE_STORAGE_ROOT"]
 "#;
 
 fn workflow(check: &str) -> String {

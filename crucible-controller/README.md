@@ -2,31 +2,27 @@
 
 The outer loop's ledger and daemon core ([ADR-0043](../gov/adr/ADR-0043-the-outer-loop-discovery-and-scheduling-crucible-triage-crucible-autopilot.toml) /
 [ADR-0044](../gov/adr/ADR-0044-orchestration-state-model-the-controllers-ledger.toml)). This is the workspace's **one async
-island**: sqlx (and, later, kube + axum) share a tokio runtime here and nowhere else. The
-`crucible` binary's `triage` / `autopilot` / `db` subcommands build a runtime and `block_on` into
-this library (the `crucible/src/publish.rs` pattern), so no other crate grows an async dependency.
+island**: sqlx, kube, and axum share a tokio runtime here and nowhere else. The
+`crucible-controller` binary's `autopilot` / `db` subcommands (and `triage`, behind the
+`autoresearch` feature) build that runtime and run this library; `Surface::bind` in `lib.rs`
+mounts the HTTP API and the React SPA on it.
 
 ## Layout
 
-- `migrations/0001_baseline.sql` — the ADR-0044 schema, up-only, squashed to a Postgres baseline
-  at the cutover. One shared `MIGRATOR` static in `lib.rs`; every test references it via
+- `migrations/` — the ADR-0044 schema, up-only, from a squashed Postgres baseline. One shared
+  `MIGRATOR` static in `lib.rs`; every test references it via
   `#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]`.
-- `operations.rs` — raw SQL as free functions over `impl sqlx::PgExecutor<'_>` (the same
-  query runs on the pool or in a transaction).
-- `client.rs` — the `Db` domain-verb facade over `operations`, plus `connect()` (create-if-missing
-  + migrate-on-open over `DATABASE_URL`) and `transition()` (claim + event-log append in lockstep).
-- `event_log.rs` — the append-only NDJSON history at `<state>/controller-events.jsonl`.
+- Each slice (`issues/`, `runs/`, `launches/`, `playbooks/`, `secrets/`, `authz/`, `identity/`)
+  keeps its SQL in a `store` module: free functions over `impl sqlx::PgExecutor<'_>`, so the
+  same query runs on the pool or in a transaction.
+- `client.rs` — the `Db` handle (pool, event log, metrics) and `connect()` (create-if-missing +
+  migrate-on-open over `DATABASE_URL`).
+- `event_log.rs` — the append-only `events` table, exported as NDJSON by `db export-events`.
 - `config.rs` — `ControllerCfg` (clap + env fallbacks) and the `Profile` caps (deploy-profile TOML,
   `deny_unknown_fields`).
 - `model.rs` — the strong types: `Status`, `ParkedBy`, and the row shapes.
-
-## Cutting over a sqlite-era ledger
-
-`crucible-controller db import-sqlite --from <state-dir>/outer.sqlite` streams every row of a
-pre-Postgres ledger file into the (empty) database at `--db`/`DATABASE_URL`, one transaction,
-preserving explicit ids and insertion order. Run it in-cluster with the daemon stopped — the pod
-is what can reach both the state PVC and the database server. It refuses a non-empty target, so
-re-running it is safe.
+- `daemon/` — the work queue, the resident loop, and the launch loop; `api/` — the axum routes
+  and the OpenAPI document.
 
 ## sqlx offline metadata — the regen ritual
 

@@ -8,12 +8,12 @@ date = "2026-06-30"
 
 [content]
 context = """
-Related: [ADR-0012](./0012-rendered-deployments.md) (rendered deployments — this generalizes the rig
-half into a pluggable backend), [ADR-0009](./0009-composite-domains.md) (the composite rig that needs
-standing up), [ADR-0005](./0005-engine-side-builds.md) (forge builds the candidate the backend applies),
-[ADR-0004](./0004-core-loop-state-model.md) (park/resume — the loop must survive a preempted/recreated
-rig), [ADR-0002](./0002-mediated-provisioning-mcp.md) (the broker still holds the privileged approvals),
-[ADR-0001](./0001-adaptive-harness.md) (the rig is the frozen workload, out of the loop's reach).
+Related: [[ADR-0011]] (rendered deployments — this generalizes the rig
+half into a pluggable backend), [[ADR-0009]] (the composite rig that needs
+standing up), [[ADR-0005]] (forge builds the candidate the backend applies),
+[[ADR-0004]] (park/resume — the loop must survive a preempted/recreated
+rig), [[ADR-0002]] (the broker still holds the privileged approvals),
+[[ADR-0001]] (the rig is the frozen workload, out of the loop's reach).
 
 Standing up a crucible loop on a cluster today is a six-step, personal-credential runbook
 (see [Getting started, Act 3](../getting-started.md)), and it doesn't scale to a team:
@@ -148,7 +148,7 @@ cohort keeps both predictable rather than racing.
 ## 7. The loop pod stays crucible's; the backend provides only the rig
 
 `crucible run` creates the lightweight (CPU) loop pod into the run namespace; the backend provides the
-GPU rig. (How the loop pod itself is rendered, reuse ADR-0012 or create it directly, is an
+GPU rig. (How the loop pod itself is rendered, reuse [[ADR-0011]] or create it directly, is an
 implementation detail under `crucible run`, not a fork in this decision.)
 
 ## 8. Credentials (W4) are a separate later phase

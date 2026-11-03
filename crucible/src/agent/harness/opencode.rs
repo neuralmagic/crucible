@@ -15,21 +15,22 @@
 //! reaches the metadata emulator like claude's does.
 
 use crate::agent::harness::{
-    ApiEndpoint, AuthProvider, Backend, CRUCIBLE_PROVIDER_ID, HarnessSpec, McpServer,
-    StreamDecoder, TranscriptLocator, TurnArtifacts, api_endpoint, json_servers, json_str,
+    ApiEndpoint, Backend, CRUCIBLE_PROVIDER_ID, McpServer, TurnArtifacts, api_endpoint,
+    json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, WireApi};
-use crate::args::Args;
+use crate::args::TurnAgent;
+use crate::manifest::Harness;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
+use crucible::harness::{HarnessSpec, OPENCODE_EXPORT as EXPORT};
+use crucible_harness::line::LineFormat;
+use crucible_harness::opencode_json::OpenCodeJsonParser;
+use crucible_harness::otel::LiveMeters;
 use crucible_harness::tool_summary::summarize;
-use crucible_harness::{LiveMeters, OpenCodeJsonParser};
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) struct OpenCode;
-
-/// Where the sandbox wrapper leaves the session export; the transcript the turn is read from.
-pub(crate) const EXPORT: &str = "/sandbox/.local/share/opencode/crucible-export.json";
 
 /// The in-sandbox wrapper around `opencode run`: mirror the stream to stdout while keeping a
 /// copy, then export the session it opened to `$1`. Exits with `run`'s status.
@@ -47,40 +48,6 @@ exit "$rc"
 "#;
 
 impl OpenCode {
-    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
-        name: "opencode",
-        binaries: &[
-            "/usr/local/bin/opencode",
-            "/usr/local/lib/node_modules/opencode-ai/**",
-        ],
-        // OpenCode discovers Claude Code's skills tree, so the toolbox lands where claude's does.
-        skills_dir: ".claude/skills",
-        // Relocates the session store (and the export) off `~/.local/share`.
-        home_var: "XDG_DATA_HOME",
-        home: "/sandbox/.local/share",
-        config: "/sandbox/.config/opencode/opencode.json",
-        sandbox_env: &[
-            ("XDG_CONFIG_HOME", "/sandbox/.config"),
-            ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
-            ("OPENCODE_DISABLE_MODELS_FETCH", "1"),
-            ("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1"),
-            ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1"),
-            ("OPENCODE_DISABLE_SHARE", "1"),
-            ("OPENCODE_DISABLE_PRUNE", "1"),
-        ],
-        local_env: &[
-            ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
-            ("OPENCODE_DISABLE_SHARE", "1"),
-        ],
-        transcript: TranscriptLocator::File {
-            sandbox_path: EXPORT,
-        },
-        transcript_fetch_timeout: Duration::from_secs(60),
-        auth: AuthProvider::ApiKey,
-        otel_capable: false,
-        backfill_required: true,
-    };
-
     /// The wrapper invocation up to and including `opencode run`'s flags: `bash -c <wrapper>
     /// crucible-opencode <export> run --format json --auto`. The model comes from the seeded
     /// config (which provider it rides on depends on the endpoint) and prompt delivery is
@@ -189,16 +156,16 @@ fn config_json(model: &str, endpoint: &ApiEndpoint, servers: &[McpServer<'_>]) -
 
 impl Backend for OpenCode {
     fn spec(&self) -> &'static HarnessSpec {
-        &Self::SPEC
+        Harness::OpenCode.spec()
     }
 
     /// A local turn has no seeded config, so the model is named on the command line under the
     /// `crucible` provider this machine's own opencode config is expected to carry. The prompt
     /// rides as the message positional after `--`, so one starting with `-` is still a message.
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String> {
         let mut a = Self::base_args(&local_export_path().to_string_lossy());
         a.push("--model".to_string());
-        a.push(format!("{CRUCIBLE_PROVIDER_ID}/{}", args.model()));
+        a.push(format!("{CRUCIBLE_PROVIDER_ID}/{}", agent.model));
         a.push("--".to_string());
         a.push(prompt.to_string());
         a
@@ -207,32 +174,32 @@ impl Backend for OpenCode {
     /// No message positional: `run` reads a piped stdin as the message, which the shared exec
     /// wrapper redirects from the uploaded prompt file. The model and the MCP servers come from
     /// the seeded config, not argv, so `args` and `mcp_seeded` are accepted and unused by design.
-    fn sandbox_argv(&self, _args: &Args, _mcp_seeded: bool) -> Vec<String> {
+    fn sandbox_argv(&self, _agent: &TurnAgent<'_>, _mcp_seeded: bool) -> Vec<String> {
         Self::base_args(EXPORT)
     }
 
     /// `opencode.json`, ALWAYS (it carries the model, the provider, and the permission posture).
     fn config(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String> {
         Some(config_json(
-            args.model(),
-            &api_endpoint(args.model(), inference, &args.env),
+            agent.model,
+            &api_endpoint(agent.model, inference, agent.env),
             servers,
         ))
     }
 
     fn decoder(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         tool_io: bool,
-    ) -> Box<dyn StreamDecoder> {
+    ) -> Box<dyn LineFormat + Send> {
         Box::new(
-            OpenCodeJsonParser::new(args.model())
+            OpenCodeJsonParser::new(agent.model)
                 .with_price(crate::agent::event::estimate_cost)
                 .with_tool_io(tool_io),
         )
@@ -453,21 +420,23 @@ fn export_records(content: &[u8]) -> Vec<GenAiRecord> {
 mod tests {
     use super::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::agent::sandbox_env::SandboxEnv;
+    use crate::args::Args;
     use clap::Parser;
     use crucible_contract::event::AgentEvent;
 
-    const CONFIG: &str = OpenCode::SPEC.config;
+    const CONFIG: &str = Harness::OpenCode.spec().config;
 
     fn args() -> Args {
         crate::cli::Cli::parse_from(["crucible"]).run
     }
 
     fn seed_files(
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
-        OpenCode.seed_files(args, servers, &SandboxAuth::ApiKey, inference)
+        OpenCode.seed_files(agent, servers, &SandboxAuth::ApiKey, inference)
     }
 
     fn custom_endpoint() -> InferenceEnv {
@@ -487,14 +456,14 @@ mod tests {
     fn invocation_is_the_export_wrapper_around_headless_run() {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
-        let sandbox = OpenCode.sandbox_argv(&a, true);
+        let sandbox = OpenCode.sandbox_argv(&a.turn_agent(), true);
         assert_eq!(&sandbox[..2], &["bash", "-c"]);
         assert_eq!(sandbox[2], WRAPPER);
         assert_eq!(sandbox[3], "crucible-opencode");
         assert_eq!(sandbox[4], EXPORT);
         assert_eq!(&sandbox[5..], RUN_FLAGS, "no model, no message positional");
 
-        let local = OpenCode.local_argv(&a, "--- looks like a flag");
+        let local = OpenCode.local_argv(&a.turn_agent(), "--- looks like a flag");
         assert_eq!(&local[..4], &sandbox[..4]);
         assert!(
             local[4].ends_with("opencode/crucible-export.json"),
@@ -516,7 +485,12 @@ mod tests {
             ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
             ("CLOUD_ML_REGION".into(), "us-east5".into()),
         ];
-        let seeds = OpenCode.seed_files(&a, &[], &SandboxAuth::Gateway, &InferenceEnv::default());
+        let seeds = OpenCode.seed_files(
+            &a.turn_agent(),
+            &[],
+            &SandboxAuth::Gateway,
+            &InferenceEnv::default(),
+        );
         assert_eq!(seeds.len(), 1);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         assert_eq!(v["model"], "google-vertex-anthropic/claude-sonnet-5");
@@ -578,7 +552,7 @@ mod tests {
 
     #[test]
     fn env_script_relocates_the_data_home_and_carries_no_credential() {
-        let s = OpenCode.env_script(&[("FOO".into(), "bar".into())]);
+        let s = SandboxEnv::from_manifest([("FOO", "bar")]).script(Harness::OpenCode.spec());
         assert!(s.contains("export AGENT_TOOL=opencode"));
         assert!(s.contains("export XDG_DATA_HOME=/sandbox/.local/share"));
         assert!(s.contains("export XDG_CONFIG_HOME=/sandbox/.config"));
@@ -597,7 +571,7 @@ mod tests {
     fn config_registers_a_custom_endpoint_as_the_crucible_provider() {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
-        let seeds = seed_files(&a, &[], &custom_endpoint());
+        let seeds = seed_files(&a.turn_agent(), &[], &custom_endpoint());
         assert_eq!(
             seeds.len(),
             1,
@@ -625,7 +599,7 @@ mod tests {
             openai_key: Some("sk-oa".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, &[], &key_only);
+        let seeds = seed_files(&a.turn_agent(), &[], &key_only);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["provider"]["crucible"];
         assert_eq!(
@@ -643,7 +617,7 @@ mod tests {
             anthropic_key: Some("sk-ant".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, &[], &inference);
+        let seeds = seed_files(&a.turn_agent(), &[], &inference);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["provider"]["crucible"];
         assert_eq!(p["npm"], "@ai-sdk/anthropic");
@@ -656,7 +630,7 @@ mod tests {
     fn config_lists_exactly_the_turns_servers_as_remote_mcp_servers() {
         let a = args();
         let seeds = seed_files(
-            &a,
+            &a.turn_agent(),
             &[
                 McpServer {
                     name: "broker",

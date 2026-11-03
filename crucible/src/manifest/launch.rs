@@ -194,7 +194,7 @@ pub fn parse_effort(raw: &str) -> Option<ReasoningEffort> {
     <ReasoningEffort as clap::ValueEnum>::from_str(raw, true).ok()
 }
 
-const HARNESS_NAMES: &str = "claude, hermes, codex, opencode or pi";
+const HARNESS_NAMES: &str = "claude, codex, opencode or pi";
 const EFFORT_NAMES: &str = "low, medium, high, xhigh or max";
 
 /// A harness or effort an agent task sets that no turn could read.
@@ -816,7 +816,10 @@ mod tests {
         };
         assert_eq!(
             check_agent_knobs(&tasks("harness = \"gpt\"")).map_err(|e| e.to_string()),
-            Err("task \"a\" sets harness \"gpt\", which is not claude, hermes, codex, opencode or pi".into())
+            Err(
+                "task \"a\" sets harness \"gpt\", which is not claude, codex, opencode or pi"
+                    .into()
+            )
         );
         assert_eq!(
             check_agent_knobs(&tasks("effort = \"extreme\"")).map_err(|e| e.to_string()),

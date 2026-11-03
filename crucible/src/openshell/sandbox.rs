@@ -7,11 +7,16 @@
 //! The per-turn targeted upload (`upload <name> <local> <dest>`) places a rendered cluster cred
 //! straight at its sandbox path, never through the workspace/repo.
 
-/// One random identity for this engine process. Kubernetes containers commonly reuse the same
-/// small PID, so a PID cannot distinguish a relaunched run from the sandbox it left behind.
-fn run_id() -> &'static str {
-    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ID.get_or_init(|| uuid::Uuid::now_v7().simple().to_string())
+/// One random identity for a run's sandboxes, minted when the run's broker starts. Kubernetes
+/// containers commonly reuse the same small PID, so a PID cannot distinguish a relaunched run
+/// from the sandbox it left behind.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunId(String);
+
+impl RunId {
+    pub fn mint() -> Self {
+        RunId(uuid::Uuid::now_v7().simple().to_string())
+    }
 }
 
 /// The gateway's cap on a sandbox name: three routable names and two `--` delimiters have to fit
@@ -20,12 +25,12 @@ pub const MAX_NAME_LEN: usize = 19;
 const _: () = assert!("ci-".len() + 16 == MAX_NAME_LEN);
 
 /// The per-workspace sandbox name: `ci-` plus a 64-bit hash of the run id and the workspace,
-/// exactly [`MAX_NAME_LEN`] long. Stable across turns within one loop instance (the process
-/// identity and workspace are fixed), unique across parallel candidates and relaunched processes
-/// sharing a gateway. The broker gets this exact string at spawn (`BROKER_SANDBOX_NAME`) rather
-/// than re-deriving it; neither component is a durable ID.
-pub fn name_for(workspace: &std::path::Path) -> String {
-    name_for_identity(workspace, run_id())
+/// exactly [`MAX_NAME_LEN`] long. Stable across turns within one loop instance (the run id and
+/// workspace are fixed), unique across parallel candidates and relaunched processes sharing a
+/// gateway. The broker gets this exact string at spawn (`BROKER_SANDBOX_NAME`) rather than
+/// re-deriving it; neither component is a durable ID.
+pub fn name_for(workspace: &std::path::Path, run: &RunId) -> String {
+    name_for_identity(workspace, &run.0)
 }
 
 /// An invocation-specific sandbox identity within the gateway's DNS limit.
@@ -86,13 +91,19 @@ mod tests {
     #[test]
     fn name_for_is_per_workspace_and_run() {
         use std::path::Path;
-        let a = name_for(Path::new("/state/worktrees/lane-a"));
-        let b = name_for(Path::new("/state/worktrees/lane-b"));
+        let run = RunId::mint();
+        let a = name_for(Path::new("/state/worktrees/lane-a"), &run);
+        let b = name_for(Path::new("/state/worktrees/lane-b"), &run);
         assert_ne!(a, b, "wide-round lanes get distinct sandboxes");
         assert_eq!(
             a,
-            name_for(Path::new("/state/worktrees/lane-a")),
+            name_for(Path::new("/state/worktrees/lane-a"), &run),
             "stable across turns within a lane"
+        );
+        assert_ne!(
+            a,
+            name_for(Path::new("/state/worktrees/lane-a"), &RunId::mint()),
+            "a relaunched run never reuses a sandbox name"
         );
         assert!(a.starts_with("ci-"));
         assert_eq!(
@@ -113,7 +124,7 @@ mod tests {
         let retry = fresh_name_for(workspace);
 
         assert_ne!(first, retry);
-        assert_ne!(retry, name_for(workspace));
+        assert_ne!(retry, name_for(workspace, &RunId::mint()));
         assert_eq!(first.len(), MAX_NAME_LEN);
         assert_eq!(retry.len(), MAX_NAME_LEN);
         assert!(retry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));

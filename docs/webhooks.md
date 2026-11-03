@@ -325,6 +325,6 @@ curl -X POST -H "X-GitHub-Event: release" -H "X-Hub-Signature-256: $sig" --data 
 | `duplicate` | The dedupe key already launched a run. Use `delivery` if each delivery is a separate event. |
 | The save rejects `hmac_sha256` | The controller has no webhook key. |
 
-[ADR-0055](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0055-webhook-triggers-verified-deliveries-land-in-an-inbox-and-cel-maps-them-to-a-launch.toml)
+[ADR-0055](./adr/ADR-0055.md)
 records the design. The webhook clauses of [RFC-0003](./rfc/RFC-0003.md) give the
 requirements.

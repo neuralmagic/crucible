@@ -10,8 +10,8 @@ refs = ["ADR-0043", "ADR-0042"]
 [content]
 context = """
 Related: [[ADR-0043]] (the controller this ledger serves),
-[ADR-0004](./0004-core-loop-state-model.md) (the precedent: state model as its own record),
-[ADR-0010](./0010-candidate-portfolios-and-search.md) (the candidates this tracks),
+[[ADR-0004]] (the precedent: state model as its own record),
+[[ADR-0010]] (the candidates this tracks),
 [[ADR-0042]] (rig leases, the named deferral),
 `session.rs` (the versioned append-only log discipline this leans on, and never replaces).
 

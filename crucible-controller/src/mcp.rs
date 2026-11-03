@@ -195,12 +195,6 @@ async fn carry_caller(
 mod tests {
     use crate::mcp::*;
 
-    struct NoSink;
-
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
-
     /// Bind a new secret owned by `owner` to playbook scope `scope` as `declared`.
     async fn bind(pool: &sqlx::PgPool, owner: &str, scope: &str, declared: &str) {
         let owner = crate::authz::model::Principal::parse(owner).expect("owner");
@@ -247,22 +241,21 @@ mod tests {
     /// client, DTOs and renderers over the real handlers and database.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn crux_renames_and_clones_a_draft(pool: sqlx::PgPool) {
-        let api = crate::api::router(crate::api::state::ApiState::test(
-            crate::client::Db::new(pool.clone()),
-            Arc::new(NoSink),
-        ));
+        let api = crate::api::router(crate::api::state::ApiState::test(crate::client::Db::new(
+            pool.clone(),
+        )));
         let client = crux::Client::new(Arc::new(RouterTransport {
             api,
-            caller: Resolved::named(crate::identity::session::IdentitySource::Proxy, "alice"),
+            caller: Resolved::named("alice"),
             base: "https://crucible.example.com".to_string(),
         }));
-        crux::ops::draft_create(&client, "studio", "a drafted pack", None, false)
+        crux::ops::drafts::draft_create(&client, "studio", "a drafted pack", None, false)
             .await
             .expect("create");
         bind(&pool, "user:alice", "studio", "gh-token").await;
         bind(&pool, "user:bob", "studio", "bob-token").await;
 
-        let renamed = crux::ops::draft_rename(&client, "studio", "survey-v2", false)
+        let renamed = crux::ops::drafts::draft_rename(&client, "studio", "survey-v2", false)
             .await
             .expect("rename");
         assert_eq!(
@@ -272,7 +265,7 @@ mod tests {
              studio: https://crucible.example.com/playbooks/drafts/survey-v2\n"
         );
 
-        let cloned = crux::ops::draft_clone(&client, "survey-v2", "copy", None, false)
+        let cloned = crux::ops::drafts::draft_clone(&client, "survey-v2", "copy", None, false)
             .await
             .expect("clone");
         assert_eq!(
@@ -291,7 +284,7 @@ mod tests {
             "defaults to the source's"
         );
 
-        let taken = crux::ops::draft_rename(&client, "survey-v2", "copy", false)
+        let taken = crux::ops::drafts::draft_rename(&client, "survey-v2", "copy", false)
             .await
             .expect_err("the id is taken");
         assert!(taken.to_string().contains("409"), "{taken:#}");
@@ -303,7 +296,7 @@ mod tests {
         );
 
         assert_eq!(
-            crux::ops::draft_delete(&client, "copy")
+            crux::ops::drafts::draft_delete(&client, "copy")
                 .await
                 .expect("delete"),
             "deleted draft copy\n"
@@ -332,14 +325,19 @@ mod tests {
     /// nobody binds; `zed` is in no team.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn crux_marks_lists_and_uses_a_blueprint(pool: sqlx::PgPool) {
-        let api = crate::api::router(crate::api::state::ApiState::test(
-            crate::client::Db::new(pool.clone()),
-            Arc::new(NoSink),
-        ));
+        use crux::ops::Operation;
+        use crux::ops::blueprints::{
+            BlueprintMark, BlueprintPrivate, BlueprintPublic, BlueprintUnmark, BlueprintUse,
+            Blueprints,
+        };
+        use crux::ops::drafts::{DraftPublish, DraftSaveFiles};
+        let api = crate::api::router(crate::api::state::ApiState::test(crate::client::Db::new(
+            pool.clone(),
+        )));
         let as_user = |login: &str| {
             crux::Client::new(Arc::new(RouterTransport {
                 api: api.clone(),
-                caller: Resolved::named(crate::identity::session::IdentitySource::Proxy, login),
+                caller: Resolved::named(login),
                 base: "https://crucible.example.com".to_string(),
             }))
         };
@@ -373,47 +371,66 @@ mod tests {
             ("crucible.toml".to_string(), BLUEPRINT_MANIFEST.to_string()),
             ("workflow.star".to_string(), BLUEPRINT_WORKFLOW.to_string()),
         ]);
-        crux::ops::draft_save(&reed, "studio", 1, &files, false)
-            .await
-            .expect("save");
-        crux::ops::draft_publish(&reed, "studio", Some("mlr-pack"), false)
-            .await
-            .expect("publish");
+        DraftSaveFiles {
+            draft_id: "studio".into(),
+            base_version: 1,
+            files,
+            json: false,
+        }
+        .run(&reed)
+        .await
+        .expect("save");
+        DraftPublish {
+            draft_id: "studio".into(),
+            playbook: Some("mlr-pack".into()),
+            json: false,
+        }
+        .run(&reed)
+        .await
+        .expect("publish");
         bind(&pool, "team:mlr", "mlr-pack", "gh_token").await;
         bind(&pool, "user:reed", "mlr-pack", "personal_key").await;
+        let mark = BlueprintMark {
+            id: "mlr-pack".into(),
+            json: false,
+        };
+        let list = Blueprints { json: false };
+        let use_as = |to: &str, description: Option<&str>, json: bool| BlueprintUse {
+            id: "mlr-pack".into(),
+            to: to.into(),
+            description: description.map(str::to_string),
+            json,
+        };
 
         assert!(
-            crux::ops::blueprint_mark(&kim, "mlr-pack", true, false)
+            mark.run(&kim)
                 .await
                 .expect_err("a member may not update the team's playbook")
                 .to_string()
                 .contains("403")
         );
         assert_eq!(
-            crux::ops::blueprint_mark(&reed, "mlr-pack", true, false)
-                .await
-                .expect("mark"),
+            mark.run(&reed).await.expect("mark"),
             "mlr-pack is a private blueprint\n"
         );
 
-        let catalog = crux::ops::blueprints(&kim, false).await.expect("catalog");
+        let catalog = list.run(&kim).await.expect("catalog");
         assert!(catalog.starts_with("1 blueprints\n"), "{catalog}");
         for column in ["mlr-pack", "team:mlr", "1 carried, 2 to bind", "mlr sweep"] {
             assert!(catalog.contains(column), "{column} missing: {catalog}");
         }
         assert_eq!(
-            crux::ops::blueprints(&zed, false).await.expect("catalog"),
+            list.run(&zed).await.expect("catalog"),
             "no blueprints you can read\n"
         );
         assert!(
-            crux::ops::blueprint_use(&zed, "mlr-pack", "zed-copy", None, false)
-                .await
-                .is_err(),
+            use_as("zed-copy", None, false).run(&zed).await.is_err(),
             "a private blueprint is not zed's to use"
         );
 
         assert_eq!(
-            crux::ops::blueprint_use(&kim, "mlr-pack", "kim-copy", None, false)
+            use_as("kim-copy", None, false)
+                .run(&kim)
                 .await
                 .expect("use"),
             "started draft kim-copy from blueprint mlr-pack at version 1\n\
@@ -431,23 +448,29 @@ mod tests {
         .expect("bindings");
         assert_eq!(carried.len(), 1, "{carried:?}");
         assert_eq!(carried[0].0.origin.as_deref(), Some("mlr-pack"));
-        let taken = crux::ops::blueprint_use(&kim, "mlr-pack", "kim-copy", None, false)
+        let taken = use_as("kim-copy", None, false)
+            .run(&kim)
             .await
             .expect_err("the id is taken");
         assert!(taken.to_string().contains("409"), "{taken:#}");
 
         assert_eq!(
-            crux::ops::blueprint_public(&reed, "mlr-pack", true, false)
-                .await
-                .expect("public"),
+            BlueprintPublic {
+                id: "mlr-pack".into(),
+                json: false,
+            }
+            .run(&reed)
+            .await
+            .expect("public"),
             "mlr-pack is a public blueprint\n"
         );
-        let catalog = crux::ops::blueprints(&zed, false).await.expect("catalog");
+        let catalog = list.run(&zed).await.expect("catalog");
         for column in ["mlr-pack", "public", "0 carried, 3 to bind"] {
             assert!(catalog.contains(column), "{column} missing: {catalog}");
         }
         let used: serde_json::Value = serde_json::from_str(
-            &crux::ops::blueprint_use(&zed, "mlr-pack", "zed-copy", Some("mine"), true)
+            &use_as("zed-copy", Some("mine"), true)
+                .run(&zed)
                 .await
                 .expect("use"),
         )
@@ -475,19 +498,27 @@ mod tests {
         );
 
         assert_eq!(
-            crux::ops::blueprint_public(&reed, "mlr-pack", false, false)
-                .await
-                .expect("private"),
+            BlueprintPrivate {
+                id: "mlr-pack".into(),
+                json: false,
+            }
+            .run(&reed)
+            .await
+            .expect("private"),
             "mlr-pack is a private blueprint\n"
         );
         assert_eq!(
-            crux::ops::blueprint_mark(&reed, "mlr-pack", false, false)
-                .await
-                .expect("unmark"),
+            BlueprintUnmark {
+                id: "mlr-pack".into(),
+                json: false,
+            }
+            .run(&reed)
+            .await
+            .expect("unmark"),
             "mlr-pack is not a blueprint\n"
         );
         assert_eq!(
-            crux::ops::blueprints(&kim, false).await.expect("catalog"),
+            list.run(&kim).await.expect("catalog"),
             "no blueprints you can read\n"
         );
     }

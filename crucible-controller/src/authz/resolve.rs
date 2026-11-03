@@ -183,12 +183,11 @@ pub async fn recorded_principals(
 /// A launch's principals at dispatch: the groups it recorded that its launcher still holds, and the
 /// teams those reach now. What the launcher holds is their stored groups, re-read through their
 /// offline credential as a session's are; an issuer that cannot be asked is the inner error. A
-/// launcher with no `users` row keeps the recorded groups behind the edge, and in native mode only
-/// while the launch is younger than the session group refresh window.
+/// launcher with no `users` row keeps the recorded groups only while the launch is younger than the
+/// session group refresh window.
 pub async fn dispatch_principals(
     pool: &sqlx::PgPool,
     refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
-    mode: crate::identity::auth::AuthMode,
     login: Option<&str>,
     recorded: &[String],
     launched_at: &str,
@@ -207,15 +206,12 @@ pub async fn dispatch_principals(
                 Err(unavailable) => return Ok(Err(unavailable)),
             }
         }
-        None => match mode {
-            crate::identity::auth::AuthMode::Proxy => None,
-            crate::identity::auth::AuthMode::Native => users::stale(
-                launched_at,
-                jiff::Timestamp::now(),
-                users::session_group_refresh_interval(),
-            )
-            .then(Vec::new),
-        },
+        None => users::stale(
+            launched_at,
+            jiff::Timestamp::now(),
+            users::session_group_refresh_interval(),
+        )
+        .then(Vec::new),
     };
     let held = held_groups(recorded, current.as_deref());
     recorded_principals(pool, login, &held).await.map(Ok)
@@ -300,7 +296,7 @@ mod tests {
         assert!(!held.contains_key(&slug("ops")));
     }
 
-    /// A static token, a cluster token, or a downgraded session: only the login counts, and
+    /// A static token or a downgraded session: only the login counts, and
     /// nothing a group or rule would have conferred leaks through a nested team.
     #[test]
     fn a_credential_without_groups_holds_only_login_derived_memberships() {

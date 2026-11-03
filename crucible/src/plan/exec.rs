@@ -20,10 +20,12 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
-use crate::plan::admission::{Admission, BatchLane, Refusal, Settled};
+use crate::plan::admission::{Admission, Refusal};
+use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure};
+use crate::plan::files::CapturedFiles;
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
-    COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
+    COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, ItemKey, Join, OUTCOME_INPUT,
     PARAMS_INPUT, REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName,
     ValidPlan, aligned, declared_questions,
 };
@@ -36,7 +38,7 @@ use crucible_contract::decision::{
 };
 use crucible_contract::decision_request::{OpenRequest, RunEvidence};
 use crucible_contract::inference::{InferenceRole, ResolvedInference};
-use crucible_contract::session::TaskRepair;
+use crucible_contract::session::{TaskRepair, TaskStatus};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -56,152 +58,6 @@ impl Substrate {
     fn supports(&self, needs: &str) -> bool {
         needs == "any" || self.caps.contains(needs)
     }
-}
-
-/// One attempt's result, as reported by the runner.
-#[derive(Debug)]
-pub enum AttemptOutcome {
-    /// Measured success with the task's structured output (the edge payload).
-    Pass(Value),
-    /// Measured failure. Never retried: a task that failed, failed. `output` is the object this
-    /// attempt itself produced (a graded evaluation record, a nonzero exit's JSON line), and
-    /// `None` when it produced nothing readable.
-    Fail { note: String, output: Option<Value> },
-    /// The task ran and found its check inapplicable: no evidence either way, and nobody accused.
-    /// Declared by the task itself via `"status": "skipped"` in its output — distinct from the
-    /// walker's own skip (a task filtered out by substrate caps, which never ran at all).
-    Skipped(Value, String),
-    /// Transport failure (infra, not the work). Retried, bounded, every attempt visible.
-    Transport(TransportFailure),
-    /// The runner killed the attempt at its deadline. Settles as a measured failure naming the
-    /// limit and is never retried: a rerun would spend the same time again.
-    TimedOut(Deadline),
-}
-
-/// What an attempt died on before the task could be judged, and the engine's account of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TransportFailure {
-    pub cause: TransportCause,
-    pub note: String,
-}
-
-impl TransportFailure {
-    pub fn new(cause: TransportCause, note: impl Into<String>) -> Self {
-        Self {
-            cause,
-            note: note.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for TransportFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.note)
-    }
-}
-
-impl AttemptOutcome {
-    /// A measured failure that produced no readable output.
-    pub fn fail(note: impl Into<String>) -> Self {
-        AttemptOutcome::Fail {
-            note: note.into(),
-            output: None,
-        }
-    }
-
-    /// The terminal outcome a task's own reserved `status` field declares, or this outcome
-    /// unchanged. A runner that acts on an attempt before returning it — capturing declared
-    /// files, discarding a workspace — settles the declared status first, or it acts on a
-    /// veto as if it were a pass.
-    pub fn settle_declared(self) -> Self {
-        let value = match self {
-            AttemptOutcome::Pass(value) => value,
-            other => return other,
-        };
-        match DeclaredStatus::of(&value) {
-            Some(DeclaredStatus::Skipped) => {
-                let note = declared_note(&value, DeclaredStatus::Skipped);
-                AttemptOutcome::Skipped(value, note)
-            }
-            Some(DeclaredStatus::Fail) => {
-                let note = declared_note(&value, DeclaredStatus::Fail);
-                AttemptOutcome::Fail {
-                    note,
-                    output: Some(value),
-                }
-            }
-            Some(DeclaredStatus::Pass) | None => AttemptOutcome::Pass(value),
-        }
-    }
-
-    /// A failure the runner measured on the task's own result, as that result's declared `status`
-    /// settles it: `"skipped"` skips it, and no value passes it.
-    pub fn failed_as_declared(note: String, output: Option<Value>) -> Self {
-        match output {
-            Some(value) if DeclaredStatus::of(&value) == Some(DeclaredStatus::Skipped) => {
-                AttemptOutcome::Skipped(value, note)
-            }
-            output => AttemptOutcome::Fail { note, output },
-        }
-    }
-}
-
-pub struct Attempt {
-    pub outcome: AttemptOutcome,
-    /// What the attempt cost, its repair turns included.
-    pub cost_usd: f64,
-    /// The repair turns this attempt took, in order.
-    pub repairs: Vec<TaskRepair>,
-}
-
-impl Settled for Attempt {
-    fn cost_usd(&self) -> f64 {
-        self.cost_usd
-    }
-
-    fn panicked() -> Self {
-        Attempt::failed(0.0, "task thread panicked".to_string())
-    }
-}
-
-impl BatchLane for BatchItem<'_> {
-    fn task(&self) -> &Task {
-        self.task
-    }
-}
-
-impl Attempt {
-    pub fn failed(cost_usd: f64, note: String) -> Self {
-        Self {
-            outcome: AttemptOutcome::fail(note),
-            cost_usd,
-            repairs: Vec::new(),
-        }
-    }
-
-    pub fn transport(cause: TransportCause, note: impl Into<String>) -> Self {
-        Self {
-            outcome: AttemptOutcome::Transport(TransportFailure::new(cause, note)),
-            cost_usd: 0.0,
-            repairs: Vec::new(),
-        }
-    }
-
-    pub fn timed_out(cost_usd: f64, deadline: Deadline) -> Self {
-        Self {
-            outcome: AttemptOutcome::TimedOut(deadline),
-            cost_usd,
-            repairs: Vec::new(),
-        }
-    }
-}
-
-/// One task of a concurrent dispatch batch (see [`TaskRunner::run_many`]). Its deadline is its
-/// lane's, stamped when the lane is admitted.
-pub struct BatchItem<'a> {
-    pub task: &'a Task,
-    pub attempt: u32,
-    pub inputs: BTreeMap<TaskName, Value>,
 }
 
 /// Runs one attempt of an `Agent` or `Command` task. The engine implements this against the
@@ -232,21 +88,6 @@ pub trait TaskRunner {
     /// default keeps nothing, which is what a stateless runner wants.
     fn settled(&mut self, _task: &Task, _passed: bool) {}
 
-    /// Whether a complete declared file set captured in this run is there to stage for `task`.
-    /// A runner that keeps no durable state has captured nothing, so the default is `false`.
-    fn has_captured_files(&self, _task: &Task) -> bool {
-        false
-    }
-
-    /// The bytes of one declared file captured under `producer`'s name in this run, if any.
-    fn captured_file(&self, _producer: &TaskName, _path: &str) -> Option<Vec<u8>> {
-        None
-    }
-
-    /// Discard any file set published under `task`'s name. Called when a task settles without
-    /// producing evidence, so a set from an earlier run cannot outlive its producer's silence.
-    fn drop_captured(&mut self, _task: &Task) {}
-
     /// What the run may still spend, called before each dispatch. A runner that takes repair
     /// turns starts none once an attempt's own spend reaches it; the default takes none.
     fn budget_left(&mut self, _usd: f64) {}
@@ -264,7 +105,7 @@ pub trait TaskRunner {
         batch
             .iter()
             .map(|b| {
-                admission.run(b.task, |lane| {
+                admission.run(b, |lane| {
                     self.run(b.task, b.attempt, &b.inputs, lane.deadline())
                 })
             })
@@ -272,7 +113,7 @@ pub trait TaskRunner {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ExecCfg<'a> {
     /// Bounded auto-retry for transport failures (measured failures never retry).
     pub transport_retries: u32,
@@ -292,6 +133,15 @@ pub struct ExecCfg<'a> {
     /// How many lanes of one dispatch run at once. It bounds what lanes already in flight can
     /// spend past the cost ceiling.
     pub width: NonZeroUsize,
+    /// The session log each attempt is recorded in before it runs. `None` records nothing, which
+    /// a run that cannot resume wants.
+    pub journal: Option<&'a std::fs::File>,
+    /// The declared files this run's tasks captured. `None` is a run with no state directory:
+    /// nothing is staged and nothing is dropped.
+    pub files: Option<&'a CapturedFiles>,
+    /// What every task reads besides its dependencies' outputs. The loop's epilogue passes the
+    /// kept candidate under [`crate::plan::ir::KEPT_INPUT`].
+    pub run_inputs: Option<&'a BTreeMap<TaskName, Value>>,
 }
 
 impl Default for ExecCfg<'_> {
@@ -304,6 +154,9 @@ impl Default for ExecCfg<'_> {
             prior: None,
             decisions: None,
             width: crate::plan::admission::DEFAULT_WIDTH,
+            journal: None,
+            files: None,
+            run_inputs: None,
         }
     }
 }
@@ -325,6 +178,9 @@ pub struct Prior {
     /// The rows a rerun reused, each with the run that settled it. Their spend was charged to
     /// that run, not this one.
     pub reused: BTreeMap<TaskName, String>,
+    /// What the attempts that started and never settled are charged, since their process died
+    /// before it could say what they spent.
+    pub reserved_usd: f64,
 }
 
 impl Prior {
@@ -336,21 +192,22 @@ impl Prior {
             .collect()
     }
 
-    /// What the settled rows cost. A mapped node's row and a revise loop's rows already total
-    /// their items and rounds, so a task counts its own row only when none of its items or rounds
-    /// were logged.
+    /// What the settled rows cost, plus what attempts that never settled are charged. A mapped
+    /// node's row and a revise loop's rows already total their items and rounds, so a task counts
+    /// its own row only when none of its items or rounds were logged.
     pub fn spent_usd(&self) -> f64 {
         let parents: BTreeSet<&str> = self
             .results
             .keys()
-            .filter_map(|name| name.0.split_once('[').map(|(node, _)| node))
+            .filter_map(|name| name.instance_of().map(|(node, _)| node))
             .collect();
         self.results
             .iter()
-            .filter(|(name, _)| name.0.contains('[') || !parents.contains(name.0.as_str()))
+            .filter(|(name, _)| name.instance_of().is_some() || !parents.contains(name.as_str()))
             .filter(|(name, _)| !self.reused.contains_key(*name))
             .map(|(_, r)| r.cost_usd)
-            .sum()
+            .sum::<f64>()
+            + self.reserved_usd
     }
 
     /// What the rows a rerun reused had cost the runs that settled them.
@@ -388,75 +245,23 @@ impl Clock {
 }
 
 impl ExecCfg<'_> {
-    /// Write the reserved history input for a task that declares a depth.
-    fn add_history(&self, t: &Task, inputs: &mut BTreeMap<TaskName, Value>) {
+    /// Write what the run hands `t` besides its dependencies' outputs: the run inputs, and the
+    /// reserved history input when the task declares a depth.
+    fn add_run_inputs(&self, t: &Task, inputs: &mut BTreeMap<TaskName, Value>) {
+        if let Some(run_inputs) = self.run_inputs {
+            inputs.extend(run_inputs.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
         let Some(depth) = t.history else { return };
         let history = match self.history {
             Some(history) => history.input(depth),
             None => crate::plan::history::empty_input(),
         };
-        inputs.insert(TaskName(HISTORY_INPUT.to_string()), history);
-    }
-}
-
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("task status must be pass|fail|transport|skipped|not_taken|blocked|truncated, got {got:?}")]
-pub struct UnknownTaskStatus {
-    pub got: String,
-}
-
-/// Terminal task states.
-///
-/// A `task_result` line carries one of these, and a consumer reading a session log decodes it back
-/// through this type rather than matching the token itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pass,
-    Fail,
-    Transport,
-    Skipped,
-    NotTaken,
-    Blocked,
-    Truncated,
-}
-
-impl TaskStatus {
-    /// The stable wire token (`SessionEvent::TaskResult.status`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TaskStatus::Pass => "pass",
-            TaskStatus::Fail => "fail",
-            TaskStatus::Transport => "transport",
-            TaskStatus::Skipped => "skipped",
-            TaskStatus::NotTaken => "not_taken",
-            TaskStatus::Blocked => "blocked",
-            TaskStatus::Truncated => "truncated",
-        }
+        inputs.insert(TaskName::reserved(HISTORY_INPUT), history);
     }
 
-    /// Whether this status is the task having done what it was asked. Everything else is a
-    /// failure of some kind, and none of them may read as a pass.
-    pub fn passed(self) -> bool {
-        self == TaskStatus::Pass
-    }
-}
-
-impl std::str::FromStr for TaskStatus {
-    type Err = UnknownTaskStatus;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pass" => Ok(TaskStatus::Pass),
-            "fail" => Ok(TaskStatus::Fail),
-            "transport" => Ok(TaskStatus::Transport),
-            "skipped" => Ok(TaskStatus::Skipped),
-            "not_taken" => Ok(TaskStatus::NotTaken),
-            "blocked" => Ok(TaskStatus::Blocked),
-            "truncated" => Ok(TaskStatus::Truncated),
-            other => Err(UnknownTaskStatus {
-                got: other.to_owned(),
-            }),
+    fn drop_captured(&self, t: &Task) {
+        if let Some(files) = self.files {
+            files.drop(t);
         }
     }
 }
@@ -476,12 +281,6 @@ impl TaskState {
                 return None;
             }
         })
-    }
-}
-
-impl std::fmt::Display for TaskStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 
@@ -686,27 +485,42 @@ pub fn execute(
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> Result<PlanOutcome, IllegalTransition> {
     let runnable = runnable_set(plan, substrate);
-    let mut plan_machine = PlanMachine::new();
-    let mut machines: BTreeMap<TaskName, TaskMachine> = BTreeMap::new();
+    let clock = Clock {
+        started: Instant::now(),
+        before: cfg.prior.map_or(Duration::ZERO, |prior| prior.elapsed),
+    };
+    let mut ledger = Ledger {
+        results: BTreeMap::new(),
+        machines: BTreeMap::new(),
+        plan: PlanMachine::new(),
+        halted: None,
+        completed: None,
+        spent: 0.0,
+        budget: plan.plan().budget.usd,
+        clock,
+        run_ceiling: cfg
+            .wall_clock
+            .and_then(|ceiling| RunCeiling::after(clock.started, ceiling, clock.before)),
+        files: cfg.files,
+        on_result: &mut on_result,
+    };
     if let Some(t) = plan
         .tasks_topo()
         .find(|t| t.required && t.stage == Stage::Iteration && !runnable.contains(&t.name))
     {
         // A truncated DAG can never produce an honest pass: fail fast, dispatch nothing.
-        plan_machine.advance(PlanEvent::RequiredTaskUnrunnable)?;
-        let mut results = BTreeMap::new();
+        ledger.plan.advance(PlanEvent::RequiredTaskUnrunnable)?;
         for task in plan.tasks_topo() {
-            machines
-                .entry(task.name.clone())
-                .or_default()
+            ledger
+                .machine(&task.name)
                 .advance(TaskEvent::PlanTruncated)?;
             let r = TaskResult::undispatched(
                 TaskStatus::Truncated,
                 format!("required task {} unrunnable on this substrate", t.name),
             );
-            runner.drop_captured(task);
-            on_result(task, &r);
-            results.insert(task.name.clone(), r);
+            cfg.drop_captured(task);
+            (ledger.on_result)(task, &r);
+            ledger.results.insert(task.name.clone(), r);
         }
         return Ok(PlanOutcome {
             valid: false,
@@ -714,10 +528,10 @@ pub fn execute(
                 task: t.name.clone(),
             },
             spent_usd: 0.0,
-            results,
+            results: ledger.results,
         });
     }
-    plan_machine.advance(PlanEvent::Started)?;
+    ledger.plan.advance(PlanEvent::Started)?;
 
     let loops: Vec<ReviseLoop<'_>> = plan
         .revise_loops()
@@ -733,31 +547,12 @@ pub fn execute(
             .get(&t.name)
             .map_or(t.task.spends(), |body| body.spends())
     };
-    let clock = Clock {
-        started: Instant::now(),
-        before: cfg.prior.map_or(Duration::ZERO, |prior| prior.elapsed),
-    };
-    let run_ceiling = cfg
-        .wall_clock
-        .and_then(|ceiling| RunCeiling::after(clock.started, ceiling, clock.before));
-    let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
-    let mut spent = 0.0f64;
-    let budget = plan.plan().budget.usd;
-    let mut halted: Option<Halt> = None;
-    let mut completed: Option<Completion> = None;
     if let Some(prior) = cfg.prior {
-        results = prior.results.clone();
-        spent = prior.spent_usd();
-        replay(
-            plan,
-            prior,
-            cfg.early_completion,
-            &mut halted,
-            &mut completed,
-            &mut plan_machine,
-        )?;
-        if spent > budget {
-            halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+        ledger.results = prior.results.clone();
+        ledger.spent = prior.spent_usd();
+        replay(plan, prior, cfg.early_completion, &mut ledger)?;
+        if ledger.spent > ledger.budget {
+            ledger.halt(Halt::Budget)?;
         }
     }
 
@@ -766,94 +561,58 @@ pub fn execute(
     // the first ready task and restarts, or, when the first ready task is
     // isolation-marked, the whole simultaneously-ready isolated set as one batch. For a
     // plan with no isolated tasks this reproduces the serial topo walk exactly.
-    // `gates` is false for one mapped instance: an instance is not a node of the graph, so its
-    // failure is folded into the node's result and it is the node that short-circuits or does
-    // not. Reporting still happens, because a reader wants the row per item.
-    let mut record = |runner: &mut dyn TaskRunner,
-                      t: &Task,
-                      r: TaskResult,
-                      event: TaskEvent,
-                      results: &mut BTreeMap<TaskName, TaskResult>,
-                      machines: &mut BTreeMap<TaskName, TaskMachine>,
-                      halted: &mut Option<Halt>,
-                      plan_machine: &mut PlanMachine,
-                      gates: bool|
-     -> Result<(), IllegalTransition> {
-        settle(machines.entry(t.name.clone()).or_default(), &r, event)?;
-        let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
-        if matches!(
-            r.status,
-            TaskStatus::Skipped
-                | TaskStatus::NotTaken
-                | TaskStatus::Transport
-                | TaskStatus::Blocked
-        ) {
-            runner.drop_captured(t);
-        }
-        on_result(t, &r);
-        results.insert(t.name.clone(), r);
-        if gates && failed && t.required && t.stage == Stage::Iteration {
-            halt(halted, plan_machine, Halt::ShortCircuit(t.name.clone()))?;
-        }
-        Ok(())
-    };
     // Human-decided routes waiting on their requests, by route: request id and when it was last
     // polled. A parked route is neither dispatchable nor settled, so its dependents wait while
     // everything independent of it keeps dispatching.
     let mut parked: BTreeMap<TaskName, Parked> = BTreeMap::new();
     loop {
-        let settled_before = results.len();
+        let settled_before = ledger.results.len();
         let mut dispatch: Vec<&Task> = Vec::new();
         for t in plan.tasks_topo() {
-            if results.contains_key(&t.name) || parked.contains_key(&t.name) {
+            if ledger.results.contains_key(&t.name) || parked.contains_key(&t.name) {
                 continue;
             }
-            if completed.is_some() && t.stage == Stage::Iteration {
+            if ledger.completed.is_some() && t.stage == Stage::Iteration {
                 continue;
             }
             // An epilogue observes the settled main graph. Declaration order is not an
             // ordering primitive, so an independent epilogue task must not race ahead of it.
             if t.stage == Stage::Epilogue
-                && completed.is_none()
-                && plan
-                    .tasks_topo()
-                    .any(|main| main.stage == Stage::Iteration && !results.contains_key(&main.name))
+                && ledger.completed.is_none()
+                && plan.tasks_topo().any(|main| {
+                    main.stage == Stage::Iteration && !ledger.results.contains_key(&main.name)
+                })
             {
                 continue;
             }
             let spends = unit_spends(t);
-            if let Some(halt) = &halted
+            if let Some(halt) = &ledger.halted
                 && halt.stops(t.stage, spends)
             {
                 let reason = halt.blocked();
                 // A node whose lanes an interrupted run partly settled folds them as the live
                 // run did.
-                let partial = fanout_items(t, &results).ok().filter(|keys| {
-                    keys.iter()
-                        .any(|key| results.contains_key(&instance_name(&t.name, key)))
+                let partial = fanout_items(t, &ledger.results).ok().filter(|keys| {
+                    keys.iter().any(|key| {
+                        ledger
+                            .results
+                            .contains_key(&TaskName::instance(&t.name, key))
+                    })
                 });
                 if let Some(keys) = partial {
-                    machines
-                        .entry(t.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::FannedOut)?;
+                    ledger.machine(&t.name).advance(TaskEvent::FannedOut)?;
                     let mut settled = Vec::new();
                     for key in keys {
                         let instance = instance_task(t, &key);
-                        let r = match results.get(&instance.name) {
+                        let r = match ledger.results.get(&instance.name) {
                             Some(r) => r.clone(),
                             None => {
                                 let r = TaskResult::blocked(&reason);
-                                record(
-                                    &mut *runner,
+                                ledger.record(
                                     &instance,
                                     r.clone(),
                                     reason.event(),
-                                    &mut results,
-                                    &mut machines,
-                                    &mut halted,
-                                    &mut plan_machine,
-                                    false,
+                                    Settles::Item,
                                 )?;
                                 r
                             }
@@ -862,47 +621,17 @@ pub fn execute(
                     }
                     let folded = fold_instances(settled);
                     let event = fold_event(folded.status);
-                    record(
-                        &mut *runner,
-                        t,
-                        folded,
-                        event,
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        true,
-                    )?;
+                    ledger.record(t, folded, event, Settles::Node)?;
                     continue;
                 }
                 let r = TaskResult::blocked(&reason);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(t, r, reason.event(), Settles::Node)?;
                 continue;
             }
             if !runnable.contains(&t.name) {
                 let r =
                     TaskResult::undispatched(TaskStatus::Skipped, "unrunnable on this substrate");
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    TaskEvent::Unrunnable,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(t, r, TaskEvent::Unrunnable, Settles::Node)?;
                 continue;
             }
             if let Some(body) = loop_of.get(&t.name) {
@@ -911,12 +640,12 @@ pub fn execute(
                 let ready = body
                     .body
                     .iter()
-                    .find(|b| !results.contains_key(&b.name))
+                    .find(|b| !ledger.results.contains_key(&b.name))
                     .is_some_and(|first| first.name == t.name)
                     && body.body.iter().all(|b| {
                         b.depends_on
                             .iter()
-                            .all(|d| body.contains(d) || results.contains_key(d))
+                            .all(|d| body.contains(d) || ledger.results.contains_key(d))
                     });
                 if !ready {
                     continue;
@@ -926,77 +655,31 @@ pub fn execute(
                 }
                 break;
             }
-            if t.depends_on.iter().any(|d| !results.contains_key(d)) {
+            if t.depends_on.iter().any(|d| !ledger.results.contains_key(d)) {
                 continue;
             }
             let per_element = per_element_deps(plan, t);
-            if let Some((event, note)) = not_taken(t, &results, &per_element) {
+            if let Some((event, note)) = not_taken(t, &ledger.results, &per_element) {
                 let r = TaskResult::undispatched(TaskStatus::NotTaken, note);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    event,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(t, r, event, Settles::Node)?;
                 continue;
             }
-            if !dependencies_allow(t, &results, &per_element) {
+            if !dependencies_allow(t, &ledger.results, &per_element) {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
                 // their dependents even though they never gate validity.
-                let reason = BlockedReason::DependencyDidNotPass;
-                let r = TaskResult::blocked(&reason);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.blocked(t, BlockedReason::DependencyDidNotPass, Settles::Node)?;
                 continue;
             }
-            if spends && spent >= budget {
-                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                let reason = BlockedReason::BudgetCeiling;
-                let r = TaskResult::blocked(&reason);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+            if spends && ledger.spent >= ledger.budget {
+                ledger.halt(Halt::Budget)?;
+                ledger.blocked(t, BlockedReason::BudgetCeiling, Settles::Node)?;
                 continue;
             }
             // Elapsed time is known continuously, unlike a cost total, so the ceiling is
             // checked before every dispatch rather than after an attempt settles.
-            if clock.past(cfg.wall_clock) {
-                halt(&mut halted, &mut plan_machine, Halt::Time)?;
-                let reason = BlockedReason::WallClockCeiling;
-                let r = TaskResult::blocked(&reason);
-                record(
-                    &mut *runner,
-                    t,
-                    r,
-                    reason.event(),
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+            if ledger.clock.past(cfg.wall_clock) {
+                ledger.halt(Halt::Time)?;
+                ledger.blocked(t, BlockedReason::WallClockCeiling, Settles::Node)?;
                 continue;
             }
             if let TaskKind::Route {
@@ -1004,14 +687,11 @@ pub fn execute(
                 decider: Decider::Human { review },
             } = &t.task
             {
-                machines
-                    .entry(t.name.clone())
-                    .or_default()
-                    .advance(TaskEvent::Dispatched)?;
+                ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                 let run = RunEvidence {
-                    spent_usd: spent,
-                    elapsed_secs: clock.elapsed().as_secs(),
-                    max_cost_usd: budget,
+                    spent_usd: ledger.spent,
+                    elapsed_secs: ledger.clock.elapsed().as_secs(),
+                    max_cost_usd: ledger.budget,
                     max_time_secs: cfg.wall_clock.map(|d| d.as_secs()),
                 };
                 match open_decision(
@@ -1019,10 +699,9 @@ pub fn execute(
                     t,
                     questions,
                     review.as_deref(),
-                    &results,
-                    &*runner,
+                    &ledger.results,
                     run,
-                    &clock,
+                    &ledger.clock,
                     cfg,
                 ) {
                     Opened::Parked(p) => {
@@ -1030,17 +709,7 @@ pub fn execute(
                     }
                     Opened::Settled(r) => {
                         let event = settled_event(&r);
-                        record(
-                            &mut *runner,
-                            t,
-                            r,
-                            event,
-                            &mut results,
-                            &mut machines,
-                            &mut halted,
-                            &mut plan_machine,
-                            true,
-                        )?;
+                        ledger.record(t, r, event, Settles::Node)?;
                     }
                 }
                 continue;
@@ -1063,14 +732,14 @@ pub fn execute(
                 break;
             }
         }
-        if let Some(halt) = &halted {
+        if let Some(halt) = &ledger.halted {
             dispatch.retain(|t| !halt.stops(t.stage, unit_spends(t)));
         }
         if !parked.is_empty() {
             // A run that halted, or whose wall-clock ceiling fell while a request was open, fails
             // the waiting routes rather than answering them.
-            if halted.is_none() && clock.past(cfg.wall_clock) {
-                halt(&mut halted, &mut plan_machine, Halt::Time)?;
+            if ledger.halted.is_none() && ledger.clock.past(cfg.wall_clock) {
+                ledger.halt(Halt::Time)?;
             }
             let interval = cfg
                 .decisions
@@ -1078,7 +747,7 @@ pub fn execute(
             let names: Vec<TaskName> = parked.keys().cloned().collect();
             for name in names {
                 let Some(t) = plan.get(&name) else { continue };
-                let settled = match &halted {
+                let settled = match &ledger.halted {
                     // The route is in flight, so it settles as a failure naming the halt, as
                     // an attempt the ceiling terminates does.
                     Some(halt) => Some((
@@ -1095,27 +764,17 @@ pub fn execute(
                 };
                 if let Some((r, event)) = settled {
                     parked.remove(&name);
-                    record(
-                        &mut *runner,
-                        t,
-                        r,
-                        event,
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        true,
-                    )?;
+                    ledger.record(t, r, event, Settles::Node)?;
                 }
             }
-            if dispatch.is_empty() && results.len() == settled_before && !parked.is_empty() {
+            if dispatch.is_empty() && ledger.results.len() == settled_before && !parked.is_empty() {
                 // Every runnable task waits on a request: wait for the next poll.
                 std::thread::sleep(interval);
                 continue;
             }
         }
         let Some(first) = dispatch.first() else {
-            if results.len() > settled_before {
+            if ledger.results.len() > settled_before {
                 continue;
             }
             // Nothing dispatchable and nothing left to settle: done.
@@ -1123,24 +782,7 @@ pub fn execute(
         };
 
         if let Some(body) = loop_of.get(&first.name).copied() {
-            run_loop(
-                body,
-                plan,
-                cfg,
-                runner,
-                &mut record,
-                &mut Ledger {
-                    results: &mut results,
-                    machines: &mut machines,
-                    halted: &mut halted,
-                    plan_machine: &mut plan_machine,
-                    spent: &mut spent,
-                    budget,
-                    clock,
-                    run_ceiling,
-                    completed: &mut completed,
-                },
-            )?;
+            run_loop(body, plan, cfg, runner, &mut ledger)?;
             continue;
         }
 
@@ -1154,18 +796,13 @@ pub fn execute(
         let mut inputs_for_dispatch: BTreeMap<TaskName, BTreeMap<TaskName, Value>> =
             BTreeMap::new();
         for t in &dispatch {
-            let producers = file_producers(plan, t, &results, &*runner);
-            let mut inputs = inputs_for(plan, t, &results, &producers);
-            cfg.add_history(t, &mut inputs);
+            let producers = file_producers(plan, t, &ledger.results, cfg.files);
+            let mut inputs = inputs_for(plan, t, &ledger.results, &producers);
+            cfg.add_run_inputs(t, &mut inputs);
             if t.stage == Stage::Epilogue {
                 inputs.insert(
-                    TaskName(OUTCOME_INPUT.to_string()),
-                    main_graph_outcome(
-                        plan,
-                        &results,
-                        &exit_of(halted.as_ref(), completed.as_ref()),
-                        &producers,
-                    ),
+                    TaskName::reserved(OUTCOME_INPUT),
+                    main_graph_outcome(plan, &ledger.results, &ledger.exit(), &producers),
                 );
             }
             inputs_for_dispatch.insert(t.name.clone(), inputs);
@@ -1177,26 +814,14 @@ pub fn execute(
             producers_for.insert(t.name.clone(), producers);
         }
         if let Some((t, why)) = refused {
-            let reason = BlockedReason::StagingRefused(why);
-            let r = TaskResult::blocked(&reason);
-            record(
-                &mut *runner,
-                t,
-                r,
-                reason.event(),
-                &mut results,
-                &mut machines,
-                &mut halted,
-                &mut plan_machine,
-                true,
-            )?;
+            ledger.blocked(t, BlockedReason::StagingRefused(why), Settles::Node)?;
             continue;
         }
 
         if let Some(node) = dispatch.first().filter(|t| t.over.is_some()) {
             let node = *node;
             let base = inputs_for_dispatch.remove(&node.name).unwrap_or_default();
-            match fanout_items(node, &results) {
+            match fanout_items(node, &ledger.results) {
                 Err(why) => {
                     let r = TaskResult {
                         status: TaskStatus::Fail,
@@ -1209,17 +834,7 @@ pub fn execute(
                         transport: None,
                         repairs: Vec::new(),
                     };
-                    record(
-                        &mut *runner,
-                        node,
-                        r,
-                        TaskEvent::FanoutItemsInvalid,
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        true,
-                    )?;
+                    ledger.record(node, r, TaskEvent::FanoutItemsInvalid, Settles::Node)?;
                 }
                 Ok(keys) => {
                     let instances: Vec<Task> =
@@ -1229,7 +844,7 @@ pub fn execute(
                     let mut folded: BTreeMap<&TaskName, TaskResult> = instances
                         .iter()
                         .filter_map(|instance| {
-                            Some((&instance.name, results.get(&instance.name)?.clone()))
+                            Some((&instance.name, ledger.results.get(&instance.name)?.clone()))
                         })
                         .collect();
                     // An instance is staged under its own name: it runs in its own root, and
@@ -1249,33 +864,18 @@ pub fn execute(
                                 .copied()
                                 .filter(|p| {
                                     aligned_deps.iter().all(|d| {
-                                        !is_instance_of(d, &p.name)
-                                            || p.name == instance_name(d, key)
+                                        !p.name.is_instance_of(d)
+                                            || p.name == TaskName::instance(d, key)
                                     })
                                 })
                                 .collect();
                             runner.stage(instance, &own).err()
                         });
                     if let Some(why) = refused {
-                        let reason = BlockedReason::StagingRefused(why);
-                        let r = TaskResult::blocked(&reason);
-                        record(
-                            &mut *runner,
-                            node,
-                            r,
-                            reason.event(),
-                            &mut results,
-                            &mut machines,
-                            &mut halted,
-                            &mut plan_machine,
-                            true,
-                        )?;
+                        ledger.blocked(node, BlockedReason::StagingRefused(why), Settles::Node)?;
                         continue;
                     }
-                    machines
-                        .entry(node.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::FannedOut)?;
+                    ledger.machine(&node.name).advance(TaskEvent::FannedOut)?;
                     let per_element = aligned_deps;
                     let staged: &[Task] = producers_for
                         .get(&node.name)
@@ -1290,80 +890,72 @@ pub fn execute(
                         if folded.contains_key(&instance.name) {
                             continue;
                         }
-                        let settled_here = match instance_gate(node, key, &results, &per_element) {
-                            Some(gated) => Some(gated),
-                            None => match instance_inputs(
-                                node,
-                                key,
-                                &base,
-                                &results,
-                                &per_element,
-                                staged,
-                            ) {
-                                Err(note) => Some((measured_failure(note), TaskEvent::Failed)),
-                                Ok(mut inputs) => match &node.task {
-                                    TaskKind::Route {
-                                        questions,
-                                        decider: Decider::Output { task: source },
-                                    } => {
-                                        let read = if per_element.contains(source) {
-                                            &inputs
-                                        } else {
-                                            &base
-                                        };
-                                        let r = match declared_questions(&node.name, questions) {
-                                            Ok(questions) => decide_instance(
-                                                &questions,
-                                                source,
-                                                key,
-                                                read,
-                                                &per_element,
-                                                node.join,
-                                            ),
-                                            Err(e) => measured_failure(e.to_string()),
-                                        };
-                                        let event = if r.status == TaskStatus::Pass {
-                                            TaskEvent::Passed
-                                        } else {
-                                            TaskEvent::Failed
-                                        };
-                                        Some((r, event))
-                                    }
-                                    _ => {
-                                        if let Some((files, bad)) = route_files(
-                                            node,
-                                            Some(key),
-                                            &per_element,
-                                            staged,
-                                            &*runner,
-                                        ) {
-                                            inputs.insert(TaskName(FILES_INPUT.to_string()), files);
-                                            unparsed.insert(instance.name.clone(), bad);
+                        let settled_here =
+                            match instance_gate(node, key, &ledger.results, &per_element) {
+                                Some(gated) => Some(gated),
+                                None => match instance_inputs(
+                                    node,
+                                    key,
+                                    &base,
+                                    &ledger.results,
+                                    &per_element,
+                                    staged,
+                                ) {
+                                    Err(note) => Some((measured_failure(note), TaskEvent::Failed)),
+                                    Ok(mut inputs) => match &node.task {
+                                        TaskKind::Route {
+                                            questions,
+                                            decider: Decider::Output { task: source },
+                                        } => {
+                                            let read = if per_element.contains(source) {
+                                                &inputs
+                                            } else {
+                                                &base
+                                            };
+                                            let r = match declared_questions(&node.name, questions)
+                                            {
+                                                Ok(questions) => decide_instance(
+                                                    &questions,
+                                                    source,
+                                                    key,
+                                                    read,
+                                                    &per_element,
+                                                    node.join,
+                                                ),
+                                                Err(e) => measured_failure(e.to_string()),
+                                            };
+                                            let event = if r.status == TaskStatus::Pass {
+                                                TaskEvent::Passed
+                                            } else {
+                                                TaskEvent::Failed
+                                            };
+                                            Some((r, event))
                                         }
-                                        prepared.insert(instance.name.clone(), inputs);
-                                        None
-                                    }
+                                        _ => {
+                                            if let Some((files, bad)) = route_files(
+                                                node,
+                                                Some(key),
+                                                &per_element,
+                                                staged,
+                                                cfg.files,
+                                            ) {
+                                                inputs
+                                                    .insert(TaskName::reserved(FILES_INPUT), files);
+                                                unparsed.insert(instance.name.clone(), bad);
+                                            }
+                                            prepared.insert(instance.name.clone(), inputs);
+                                            None
+                                        }
+                                    },
                                 },
-                            },
-                        };
+                            };
                         if let Some((r, event)) = settled_here {
                             if r.attempts > 0 {
-                                machines
-                                    .entry(instance.name.clone())
-                                    .or_default()
+                                ledger
+                                    .machine(&instance.name)
                                     .advance(TaskEvent::Dispatched)?;
                             }
-                            record(
-                                &mut *runner,
-                                instance,
-                                r.clone(),
-                                event,
-                                &mut results,
-                                &mut machines,
-                                &mut halted,
-                                &mut plan_machine,
-                                false,
-                            )?;
+                            ledger.record(instance, r.clone(), event, Settles::Item)?;
                             folded.insert(&instance.name, r);
                         }
                     }
@@ -1378,7 +970,7 @@ pub fn execute(
                     };
                     // Each instance settles in its own right, so a reader sees one row per item
                     // rather than one row standing for all of them.
-                    let mut settled: Vec<(String, TaskResult)> = Vec::new();
+                    let mut settled: Vec<(ItemKey, TaskResult)> = Vec::new();
                     if node.isolation.is_some() {
                         let batch: Vec<BatchItem<'_>> = instances
                             .iter()
@@ -1390,15 +982,9 @@ pub fn execute(
                                 inputs: item_inputs(&task.name),
                             })
                             .collect();
-                        let (batch_results, overrun) = run_batch_with_retries(
-                            batch,
-                            cfg,
-                            run_ceiling,
-                            runner,
-                            &mut spent,
-                            budget,
-                        );
-                        overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
+                        let (batch_results, overrun) =
+                            run_batch_with_retries(batch, cfg, runner, &mut ledger);
+                        ledger.overrun(node.stage, overrun)?;
                         let mut live = batch_results.into_iter();
                         for (instance, key) in instances.iter().zip(&keys) {
                             if let Some(result) = folded.get(&instance.name) {
@@ -1409,10 +995,7 @@ pub fn execute(
                                 break;
                             };
                             let result = if result.attempts > 0 {
-                                machines
-                                    .entry(task.name.clone())
-                                    .or_default()
-                                    .advance(TaskEvent::Dispatched)?;
+                                ledger.machine(&task.name).advance(TaskEvent::Dispatched)?;
                                 let result = noted(&task.name, result);
                                 runner.settled(task, result.status == TaskStatus::Pass);
                                 result
@@ -1420,17 +1003,7 @@ pub fn execute(
                                 result
                             };
                             settled.push((key.clone(), result.clone()));
-                            record(
-                                &mut *runner,
-                                task,
-                                result,
-                                event,
-                                &mut results,
-                                &mut machines,
-                                &mut halted,
-                                &mut plan_machine,
-                                false,
-                            )?;
+                            ledger.record(task, result, event, Settles::Item)?;
                         }
                     } else {
                         // Instances of a shared-workspace node are one serial task each: they
@@ -1442,74 +1015,47 @@ pub fn execute(
                                 continue;
                             }
                             let spends = node.task.spends();
-                            if spends && spent >= budget {
-                                halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                            } else if clock.past(cfg.wall_clock) {
-                                halt(&mut halted, &mut plan_machine, Halt::Time)?;
+                            if spends && ledger.spent >= ledger.budget {
+                                ledger.halt(Halt::Budget)?;
+                            } else if ledger.clock.past(cfg.wall_clock) {
+                                ledger.halt(Halt::Time)?;
                             }
-                            if let Some(halt) = halted
+                            if let Some(halt) = ledger
+                                .halted
                                 .as_ref()
                                 .filter(|halt| halt.stops(node.stage, spends))
                             {
                                 let reason = halt.blocked();
                                 let r = TaskResult::blocked(&reason);
                                 settled.push((key.clone(), r.clone()));
-                                record(
-                                    &mut *runner,
-                                    instance,
-                                    r,
-                                    reason.event(),
-                                    &mut results,
-                                    &mut machines,
-                                    &mut halted,
-                                    &mut plan_machine,
-                                    false,
-                                )?;
+                                ledger.record(instance, r, reason.event(), Settles::Item)?;
                                 continue;
                             }
-                            machines
-                                .entry(instance.name.clone())
-                                .or_default()
-                                .advance(TaskEvent::Dispatched)?;
-                            let (result, event, overrun) = run_with_retries(
+                            let (result, event, overrun) = run_one(
                                 instance,
-                                &item_inputs(&instance.name),
+                                item_inputs(&instance.name),
                                 cfg,
-                                run_ceiling,
                                 runner,
-                                &mut spent,
-                                budget,
+                                &mut ledger,
                             );
-                            let result = noted(&instance.name, result);
-                            overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
-                            runner.settled(instance, result.status == TaskStatus::Pass);
+                            ledger.overrun(node.stage, overrun)?;
+                            let result = if result.attempts > 0 {
+                                ledger
+                                    .machine(&instance.name)
+                                    .advance(TaskEvent::Dispatched)?;
+                                let result = noted(&instance.name, result);
+                                runner.settled(instance, result.status == TaskStatus::Pass);
+                                result
+                            } else {
+                                result
+                            };
                             settled.push((key.clone(), result.clone()));
-                            record(
-                                &mut *runner,
-                                instance,
-                                result,
-                                event,
-                                &mut results,
-                                &mut machines,
-                                &mut halted,
-                                &mut plan_machine,
-                                false,
-                            )?;
+                            ledger.record(instance, result, event, Settles::Item)?;
                         }
                     }
                     let folded = fold_instances(settled);
                     let event = fold_event(folded.status);
-                    record(
-                        &mut *runner,
-                        node,
-                        folded,
-                        event,
-                        &mut results,
-                        &mut machines,
-                        &mut halted,
-                        &mut plan_machine,
-                        true,
-                    )?;
+                    ledger.record(node, folded, event, Settles::Node)?;
                 }
             }
         } else if dispatch.len() == 1 {
@@ -1519,19 +1065,16 @@ pub fn execute(
                 .get(&t.name)
                 .map(Vec::as_slice)
                 .unwrap_or_default();
-            let unparsed = match route_files(t, None, &BTreeSet::new(), staged, &*runner) {
+            let unparsed = match route_files(t, None, &BTreeSet::new(), staged, cfg.files) {
                 Some((files, unparsed)) => {
-                    inputs.insert(TaskName(FILES_INPUT.to_string()), files);
+                    inputs.insert(TaskName::reserved(FILES_INPUT), files);
                     unparsed
                 }
                 None => Vec::new(),
             };
-            machines
-                .entry(t.name.clone())
-                .or_default()
-                .advance(TaskEvent::Dispatched)?;
             let (result, event, overrun) = match &t.task {
                 TaskKind::TopK { k, direction } => {
+                    ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                     let reduced = reduce_top_k(&inputs, *k, *direction);
                     let event = if reduced.status == TaskStatus::Pass {
                         TaskEvent::Passed
@@ -1544,6 +1087,7 @@ pub fn execute(
                     questions,
                     decider: Decider::Output { task: source },
                 } => {
+                    ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                     let decided = match declared_questions(&t.name, questions) {
                         Ok(questions) => decide_from_output(&inputs, &questions, source),
                         Err(e) => measured_failure(e.to_string()),
@@ -1564,24 +1108,28 @@ pub fn execute(
                 | TaskKind::Evaluate { .. }
                 | TaskKind::Report { .. }
                 | TaskKind::Engine { .. } => {
-                    run_with_retries(t, &inputs, cfg, run_ceiling, runner, &mut spent, budget)
+                    let dispatched = run_one(t, inputs, cfg, runner, &mut ledger);
+                    if dispatched.0.attempts > 0 {
+                        ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
+                    }
+                    dispatched
                 }
             };
             let mut result = result;
             note_unparsed(&mut result, &unparsed);
-            overrun.halt(t.stage, &mut halted, &mut plan_machine)?;
-            runner.settled(t, result.status == TaskStatus::Pass);
-            record(
-                &mut *runner,
-                t,
-                result,
-                event,
-                &mut results,
-                &mut machines,
-                &mut halted,
-                &mut plan_machine,
-                true,
-            )?;
+            ledger.overrun(t.stage, overrun)?;
+            let engine_settled = matches!(
+                t.task,
+                TaskKind::TopK { .. }
+                    | TaskKind::Route {
+                        decider: Decider::Output { .. },
+                        ..
+                    }
+            );
+            if engine_settled || result.attempts > 0 {
+                runner.settled(t, result.status == TaskStatus::Pass);
+            }
+            ledger.record(t, result, event, Settles::Node)?;
         } else {
             // A concurrent batch of independent isolated tasks; results are recorded in
             // declaration order regardless of completion order, so the event stream
@@ -1594,58 +1142,50 @@ pub fn execute(
                     inputs: inputs_for_dispatch.remove(&t.name).unwrap_or_default(),
                 })
                 .collect();
-            let (batch_results, overrun) =
-                run_batch_with_retries(batch, cfg, run_ceiling, runner, &mut spent, budget);
-            overrun.halt(first.stage, &mut halted, &mut plan_machine)?;
+            let (batch_results, overrun) = run_batch_with_retries(batch, cfg, runner, &mut ledger);
+            ledger.overrun(first.stage, overrun)?;
             for (t, result, event) in batch_results {
                 if result.attempts > 0 {
-                    machines
-                        .entry(t.name.clone())
-                        .or_default()
-                        .advance(TaskEvent::Dispatched)?;
+                    ledger.machine(&t.name).advance(TaskEvent::Dispatched)?;
                     runner.settled(t, result.status == TaskStatus::Pass);
                 }
-                record(
-                    &mut *runner,
-                    t,
-                    result,
-                    event,
-                    &mut results,
-                    &mut machines,
-                    &mut halted,
-                    &mut plan_machine,
-                    true,
-                )?;
+                ledger.record(t, result, event, Settles::Node)?;
             }
         }
-        if cfg.early_completion && completed.is_none() {
-            let mut settled_now: Vec<&TaskName> = Vec::new();
+        if cfg.early_completion && ledger.completed.is_none() {
+            let mut settled_now: Vec<(&Task, &TaskName)> = Vec::new();
             for t in dispatch.iter().filter(|t| t.stage == Stage::Iteration) {
                 if t.over.is_some() {
-                    settled_now.extend(results.keys().filter(|n| is_instance_of(&t.name, n)));
+                    settled_now.extend(
+                        ledger
+                            .results
+                            .keys()
+                            .filter(|n| n.is_instance_of(&t.name))
+                            .map(|n| (*t, n)),
+                    );
                 }
-                settled_now.push(&t.name);
+                settled_now.push((*t, &t.name));
             }
-            if let Some(completion) = completion_among(&results, &settled_now) {
-                complete(&mut completed, &mut plan_machine, completion)?;
+            if let Some(completion) = completion_among(&ledger.results, &settled_now) {
+                ledger.complete(completion)?;
             }
         }
     }
 
-    plan_machine.advance(PlanEvent::Settled)?;
-    let exit = exit_of(halted.as_ref(), completed.as_ref());
-    let ceiling = matches!(halted, Some(Halt::Budget | Halt::Time));
+    ledger.plan.advance(PlanEvent::Settled)?;
+    let exit = ledger.exit();
+    let ceiling = matches!(ledger.halted, Some(Halt::Budget | Halt::Time));
     let valid = !ceiling
         && matches!(exit, PlanExit::Completed | PlanExit::CompletedEarly { .. })
-        && required_tasks_held(plan, |name| match results.get(name) {
+        && required_tasks_held(plan, |name| match ledger.results.get(name) {
             Some(r) => Some(r.status),
-            None => completed.is_some().then_some(TaskStatus::NotTaken),
+            None => ledger.completed.is_some().then_some(TaskStatus::NotTaken),
         });
     Ok(PlanOutcome {
         valid,
         exit,
-        spent_usd: spent,
-        results,
+        spent_usd: ledger.spent,
+        results: ledger.results,
     })
 }
 
@@ -1694,21 +1234,6 @@ impl Overrun {
             Refusal::WallClockCeiling => self.time = true,
         }
     }
-
-    fn halt(
-        self,
-        stage: Stage,
-        halted: &mut Option<Halt>,
-        plan_machine: &mut PlanMachine,
-    ) -> Result<(), IllegalTransition> {
-        if self.budget {
-            halt(halted, plan_machine, Halt::Budget)?;
-        }
-        if self.time && stage == Stage::Iteration {
-            halt(halted, plan_machine, Halt::Time)?;
-        }
-        Ok(())
-    }
 }
 
 struct Completion {
@@ -1716,8 +1241,10 @@ struct Completion {
     reason: Option<String>,
 }
 
-pub fn declared_completion(r: &TaskResult) -> Option<Option<String>> {
-    if r.status != TaskStatus::Pass {
+/// The reason `task` gave for ending the run early, when its passing result declares
+/// completion and its kind may end a run ([`TaskKind::may_complete_early`]).
+pub fn declared_completion(task: &Task, r: &TaskResult) -> Option<Option<String>> {
+    if r.status != TaskStatus::Pass || !task.task.may_complete_early() {
         return None;
     }
     let output = r.output.as_ref()?.as_object()?;
@@ -1729,12 +1256,14 @@ pub fn declared_completion(r: &TaskResult) -> Option<Option<String>> {
     })
 }
 
+/// The first of `settled` whose result declares completion. Each row is named with the task
+/// whose kind decides whether it may.
 fn completion_among(
     results: &BTreeMap<TaskName, TaskResult>,
-    names: &[&TaskName],
+    settled: &[(&Task, &TaskName)],
 ) -> Option<Completion> {
-    names.iter().find_map(|name| {
-        let reason = declared_completion(results.get(*name)?)?;
+    settled.iter().find_map(|(task, name)| {
+        let reason = declared_completion(task, results.get(*name)?)?;
         Some(Completion {
             task: (*name).clone(),
             reason,
@@ -1742,39 +1271,30 @@ fn completion_among(
     })
 }
 
-fn complete(
-    completed: &mut Option<Completion>,
-    plan_machine: &mut PlanMachine,
-    completion: Completion,
-) -> Result<(), IllegalTransition> {
-    plan_machine.advance(PlanEvent::EarlyCompletion)?;
-    *completed = Some(completion);
-    Ok(())
+/// The note a passing result carries when its task declared completion and its kind may not end
+/// a run. The run continues as if it had not.
+fn refused_completion(task: &Task, r: &TaskResult) -> Option<String> {
+    let declared = r.status == TaskStatus::Pass
+        && !task.task.may_complete_early()
+        && r.output.as_ref().and_then(|o| o.get(COMPLETE_FIELD)) == Some(&Value::Bool(true));
+    declared.then(|| {
+        format!(
+            "{} task {} declared \"{COMPLETE_FIELD}\": true, which only a command or evaluate task \
+             may do; the run continues",
+            task.task.label(),
+            task.name
+        )
+    })
 }
 
-fn exit_of(halted: Option<&Halt>, completed: Option<&Completion>) -> PlanExit {
-    match (completed, halted) {
-        (Some(c), _) => PlanExit::CompletedEarly {
-            task: c.task.clone(),
-            reason: c.reason.clone(),
-        },
-        (None, Some(halt)) => halt.exit(),
-        (None, None) => PlanExit::Completed,
+/// Record on `r` that `task` declared a completion its kind may not, when the run honours early
+/// completion at all.
+fn note_refused_completion(cfg: ExecCfg<'_>, task: &Task, r: &mut TaskResult) {
+    if cfg.early_completion
+        && let Some(note) = refused_completion(task, r)
+    {
+        r.note = Some(note);
     }
-}
-
-/// Fix the plan's exit on its first halt; later ceilings do not change how it ended.
-fn halt(
-    halted: &mut Option<Halt>,
-    plan_machine: &mut PlanMachine,
-    halt: Halt,
-) -> Result<(), IllegalTransition> {
-    if halted.is_some() {
-        return Ok(());
-    }
-    plan_machine.advance(halt.event())?;
-    *halted = Some(halt);
-    Ok(())
 }
 
 /// Settle one task's machine on its result: the retries its attempts imply, then the event
@@ -1798,30 +1318,6 @@ fn settle(
     Ok(())
 }
 
-/// One instance's name, `node[key]`. The key is the item, never its position: a list that comes
-/// back reordered or shorter still names the same work the same way, which is what makes a
-/// folded result on resume safe to match. Airflow's mapped tasks key on the index, and clearing
-/// one after its input shifted reprocesses the wrong item.
-fn instance_name(node: &TaskName, key: &str) -> TaskName {
-    TaskName(format!("{}[{}]", node.0, key))
-}
-
-/// The item key `name` carries when it is an instance of the mapped node `node`. Declared names
-/// may not contain a bracket ([`crate::plan::ir::PlanError::BracketInTaskName`]), so the match is
-/// exact.
-fn instance_key<'a>(node: &TaskName, name: &'a TaskName) -> Option<&'a str> {
-    name.0
-        .strip_prefix(&node.0)
-        .and_then(|rest| rest.strip_prefix('['))
-        .and_then(|rest| rest.strip_suffix(']'))
-}
-
-/// Whether `name` is an instance of the mapped node `node`. A declared task name may not
-/// contain a bracket, so an instance name can never be mistaken for a task of its own.
-pub fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
-    instance_key(node, name).is_some()
-}
-
 /// Which producers' declared files are staged into `t` for this dispatch.
 ///
 /// A passing ancestor contributes, as it always has. A direct dependency that settled failing
@@ -1835,7 +1331,7 @@ fn file_producers(
     plan: &ValidPlan,
     t: &Task,
     results: &BTreeMap<TaskName, TaskResult>,
-    runner: &dyn TaskRunner,
+    files: Option<&CapturedFiles>,
 ) -> Vec<Task> {
     let epilogue = t.stage == Stage::Epilogue;
     let contributes = |node: &Task, candidate: &Task, r: &TaskResult| match r.status {
@@ -1843,7 +1339,7 @@ fn file_producers(
         TaskStatus::Fail => {
             let reads_failures = (t.join == Join::Settled && t.depends_on.contains(&node.name))
                 || (epilogue && node.stage == Stage::Iteration);
-            reads_failures && runner.has_captured_files(candidate)
+            reads_failures && files.is_some_and(|files| files.has(&candidate.name))
         }
         _ => false,
     };
@@ -1858,7 +1354,7 @@ fn file_producers(
         if p.over.is_some() {
             for (name, r) in results
                 .iter()
-                .filter(|(name, _)| is_instance_of(&p.name, name))
+                .filter(|(name, _)| name.is_instance_of(&p.name))
             {
                 let instance = Task {
                     name: name.clone(),
@@ -1897,7 +1393,7 @@ fn inputs_for(
             .iter()
             .map(|(name, value)| (name.clone(), value.json()))
             .collect();
-        inputs.insert(TaskName(PARAMS_INPUT.to_string()), Value::Object(params));
+        inputs.insert(TaskName::reserved(PARAMS_INPUT), Value::Object(params));
     }
     inputs
 }
@@ -1956,7 +1452,7 @@ fn settled_node_entry(
         let per_instance: serde_json::Map<String, Value> = results
             .iter()
             .filter_map(|(name, r)| {
-                let key = instance_key(node, name)?;
+                let (_, key) = name.instance_of().filter(|(n, _)| *n == node.0)?;
                 let files = staged.iter().any(|p| &p.name == name);
                 Some((key.to_owned(), Value::Object(settled_entry(r, files))))
             })
@@ -1969,7 +1465,7 @@ fn settled_node_entry(
 fn node_staged(staged: &[Task], node: &TaskName) -> bool {
     staged
         .iter()
-        .any(|p| &p.name == node || is_instance_of(node, &p.name))
+        .any(|p| &p.name == node || p.name.is_instance_of(node))
 }
 
 /// One dependency's entry in a settled join's inputs. The entry carries the output rather than
@@ -2017,7 +1513,7 @@ fn main_graph_outcome(
 fn fanout_items(
     node: &Task,
     results: &BTreeMap<TaskName, TaskResult>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ItemKey>, String> {
     let Some(reference) = node.over.as_ref() else {
         return Err("not a mapped task".to_string());
     };
@@ -2040,36 +1536,145 @@ fn fanout_items(
             list.len()
         ));
     }
-    let mut keys: Vec<String> = Vec::with_capacity(list.len());
+    let mut keys: Vec<ItemKey> = Vec::with_capacity(list.len());
     for (position, item) in list.iter().enumerate() {
         let key = item.as_str().ok_or_else(|| {
             format!("{reference}[{position}] is not a string; a mapped item is its own key")
         })?;
-        if key.is_empty() || key.contains(['[', ']']) {
+        let key = ItemKey::new(key).map_err(|why| {
+            format!("{reference}[{position}] = {key:?} cannot name an instance: {why}")
+        })?;
+        if keys.contains(&key) {
             return Err(format!(
-                "{reference}[{position}] = {key:?} cannot name an instance"
+                "{reference} repeats {:?}; two instances cannot share a key",
+                key.as_str()
             ));
         }
-        if keys.iter().any(|seen| seen == key) {
-            return Err(format!(
-                "{reference} repeats {key:?}; two instances cannot share a key"
-            ));
-        }
-        keys.push(key.to_owned());
+        keys.push(key);
     }
     Ok(keys)
 }
 
-struct Ledger<'r> {
-    results: &'r mut BTreeMap<TaskName, TaskResult>,
-    machines: &'r mut BTreeMap<TaskName, TaskMachine>,
-    halted: &'r mut Option<Halt>,
-    plan_machine: &'r mut PlanMachine,
-    spent: &'r mut f64,
+/// Everything the executor settles as it walks the plan: each task's result and cursor, the
+/// plan's cursor, the halt and early completion fixed so far, and what the run has spent.
+struct Ledger<'a> {
+    results: BTreeMap<TaskName, TaskResult>,
+    machines: BTreeMap<TaskName, TaskMachine>,
+    plan: PlanMachine,
+    halted: Option<Halt>,
+    completed: Option<Completion>,
+    spent: f64,
     budget: f64,
     clock: Clock,
     run_ceiling: Option<RunCeiling>,
-    completed: &'r mut Option<Completion>,
+    files: Option<&'a CapturedFiles>,
+    on_result: &'a mut dyn FnMut(&Task, &TaskResult),
+}
+
+/// What a recorded result settles: a node of the graph, whose failure can short-circuit the
+/// plan, or one item of a node (a mapped instance, a revise round), whose failure folds into the
+/// node's result and gates nothing by itself. Both are reported: a reader wants the row per item.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settles {
+    Node,
+    Item,
+}
+
+impl Ledger<'_> {
+    fn machine(&mut self, name: &TaskName) -> &mut TaskMachine {
+        self.machines.entry(name.clone()).or_default()
+    }
+
+    /// Settle `t` on `r`: advance its cursor, drop a file set it did not earn, report it, and
+    /// short-circuit the plan when a required node failed.
+    fn record(
+        &mut self,
+        t: &Task,
+        r: TaskResult,
+        event: TaskEvent,
+        settles: Settles,
+    ) -> Result<(), IllegalTransition> {
+        settle(self.machine(&t.name), &r, event)?;
+        let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
+        if matches!(
+            r.status,
+            TaskStatus::Skipped
+                | TaskStatus::NotTaken
+                | TaskStatus::Transport
+                | TaskStatus::Blocked
+        ) && let Some(files) = self.files
+        {
+            files.drop(t);
+        }
+        (self.on_result)(t, &r);
+        self.results.insert(t.name.clone(), r);
+        if settles == Settles::Node && failed && t.required && t.stage == Stage::Iteration {
+            self.halt(Halt::ShortCircuit(t.name.clone()))?;
+        }
+        Ok(())
+    }
+
+    /// Settle `t` blocked on `reason`, undispatched.
+    fn blocked(
+        &mut self,
+        t: &Task,
+        reason: BlockedReason,
+        settles: Settles,
+    ) -> Result<(), IllegalTransition> {
+        let event = reason.event();
+        self.record(t, TaskResult::blocked(&reason), event, settles)
+    }
+
+    /// Fix the plan's exit on its first halt; later ceilings do not change how it ended.
+    fn halt(&mut self, halt: Halt) -> Result<(), IllegalTransition> {
+        if self.halted.is_some() {
+            return Ok(());
+        }
+        self.plan.advance(halt.event())?;
+        self.halted = Some(halt);
+        Ok(())
+    }
+
+    /// Halt on the ceilings one dispatch of `stage` ran past.
+    fn overrun(&mut self, stage: Stage, overrun: Overrun) -> Result<(), IllegalTransition> {
+        if overrun.budget {
+            self.halt(Halt::Budget)?;
+        }
+        if overrun.time && stage == Stage::Iteration {
+            self.halt(Halt::Time)?;
+        }
+        Ok(())
+    }
+
+    fn complete(&mut self, completion: Completion) -> Result<(), IllegalTransition> {
+        self.plan.advance(PlanEvent::EarlyCompletion)?;
+        self.completed = Some(completion);
+        Ok(())
+    }
+
+    /// The ceiling a unit about to dispatch has reached. Only a unit that can spend is held to
+    /// the cost ceiling.
+    fn ceiling_reached(&self, wall_clock: Option<Duration>, spends: bool) -> Option<Halt> {
+        if spends && self.spent >= self.budget {
+            Some(Halt::Budget)
+        } else if self.clock.past(wall_clock) {
+            Some(Halt::Time)
+        } else {
+            None
+        }
+    }
+
+    /// How the plan ended, as fixed so far.
+    fn exit(&self) -> PlanExit {
+        match (&self.completed, &self.halted) {
+            (Some(c), _) => PlanExit::CompletedEarly {
+                task: c.task.clone(),
+                reason: c.reason.clone(),
+            },
+            (None, Some(halt)) => halt.exit(),
+            (None, None) => PlanExit::Completed,
+        }
+    }
 }
 
 struct RoundRow<'a> {
@@ -2078,27 +1683,13 @@ struct RoundRow<'a> {
     event: TaskEvent,
 }
 
-fn run_loop<R>(
+fn run_loop(
     body: &ReviseLoop<'_>,
     plan: &ValidPlan,
     cfg: ExecCfg<'_>,
     runner: &mut dyn TaskRunner,
-    record: &mut R,
     ledger: &mut Ledger<'_>,
-) -> Result<(), IllegalTransition>
-where
-    R: FnMut(
-        &mut dyn TaskRunner,
-        &Task,
-        TaskResult,
-        TaskEvent,
-        &mut BTreeMap<TaskName, TaskResult>,
-        &mut BTreeMap<TaskName, TaskMachine>,
-        &mut Option<Halt>,
-        &mut PlanMachine,
-        bool,
-    ) -> Result<(), IllegalTransition>,
-{
+) -> Result<(), IllegalTransition> {
     let reviewer = body.reviewer;
     let spends = body.spends();
     let mut view = ledger.results.clone();
@@ -2134,8 +1725,8 @@ where
             {
                 break;
             }
-            if let Some(halt) = ceiling_reached(cfg, ledger, spends) {
-                halt_on(ledger, halt)?;
+            if let Some(halt) = ledger.ceiling_reached(cfg.wall_clock, spends) {
+                ledger.halt(halt)?;
                 break;
             }
         }
@@ -2147,7 +1738,7 @@ where
                 stopped |= cfg.early_completion
                     && t.stage == Stage::Iteration
                     && t.name != reviewer.name
-                    && declared_completion(&result).is_some();
+                    && declared_completion(t, &result).is_some();
                 view.insert(t.name.clone(), result.clone());
                 rows.push(RoundRow {
                     task: t,
@@ -2171,9 +1762,9 @@ where
             } else if !dependencies_allow(t, &view, &BTreeSet::new()) {
                 let reason = BlockedReason::DependencyDidNotPass;
                 Err((TaskResult::blocked(&reason), reason.event()))
-            } else if let Some(halt) = ceiling_reached(cfg, ledger, spends) {
+            } else if let Some(halt) = ledger.ceiling_reached(cfg.wall_clock, spends) {
                 let reason = halt.blocked();
-                halt_on(ledger, halt)?;
+                ledger.halt(halt)?;
                 Err((TaskResult::blocked(&reason), reason.event()))
             } else {
                 Ok(())
@@ -2182,9 +1773,10 @@ where
                 Err((result, event)) => (result, event),
                 Ok(()) => {
                     let is_target = t.name != reviewer.name;
-                    let mut producers = file_producers(plan, t, &view, &*runner);
-                    let review_files =
-                        is_target && verdict.is_some() && runner.has_captured_files(reviewer);
+                    let mut producers = file_producers(plan, t, &view, ledger.files);
+                    let review_files = is_target
+                        && verdict.is_some()
+                        && ledger.files.is_some_and(|files| files.has(&reviewer.name));
                     if review_files {
                         producers.push(reviewer.clone());
                     }
@@ -2196,21 +1788,16 @@ where
                         }
                         Ok(()) => {
                             let mut inputs = inputs_for(plan, t, &view, &producers);
-                            cfg.add_history(t, &mut inputs);
+                            cfg.add_run_inputs(t, &mut inputs);
                             if t.stage == Stage::Epilogue {
                                 inputs.insert(
-                                    TaskName(OUTCOME_INPUT.to_string()),
-                                    main_graph_outcome(
-                                        plan,
-                                        &view,
-                                        &exit_of(ledger.halted.as_ref(), ledger.completed.as_ref()),
-                                        &producers,
-                                    ),
+                                    TaskName::reserved(OUTCOME_INPUT),
+                                    main_graph_outcome(plan, &view, &ledger.exit(), &producers),
                                 );
                             }
                             if let Some(verdict) = verdict.as_ref().filter(|_| is_target) {
                                 inputs.insert(
-                                    TaskName(REVISION_INPUT.to_string()),
+                                    TaskName::reserved(REVISION_INPUT),
                                     serde_json::json!({
                                         "round": round,
                                         "max_rounds": body.max_rounds,
@@ -2229,40 +1816,29 @@ where
                                         .advance(TaskEvent::RoundsStarted)?;
                                 }
                                 for row in pending.drain(..).map(|i| &rows[i]) {
-                                    record(
-                                        &mut *runner,
+                                    ledger.record(
                                         &round_task(row.task, round),
                                         row.result.clone(),
                                         row.event,
-                                        ledger.results,
-                                        ledger.machines,
-                                        ledger.halted,
-                                        ledger.plan_machine,
-                                        false,
+                                        Settles::Item,
                                     )?;
                                 }
                             }
                             let name = round_task(t, round);
-                            ledger
-                                .machines
-                                .entry(name.name.clone())
-                                .or_default()
-                                .advance(TaskEvent::Dispatched)?;
-                            let (result, event, overrun) = run_with_retries(
-                                t,
-                                &inputs,
-                                cfg,
-                                ledger.run_ceiling,
-                                runner,
-                                ledger.spent,
-                                ledger.budget,
-                            );
-                            overrun.halt(t.stage, ledger.halted, ledger.plan_machine)?;
-                            runner.settled(t, result.status == TaskStatus::Pass);
+                            let (result, event, overrun) = run_one(t, inputs, cfg, runner, ledger);
+                            ledger.overrun(t.stage, overrun)?;
+                            if result.attempts > 0 {
+                                ledger
+                                    .machines
+                                    .entry(name.name.clone())
+                                    .or_default()
+                                    .advance(TaskEvent::Dispatched)?;
+                                runner.settled(t, result.status == TaskStatus::Pass);
+                            }
                             if cfg.early_completion
                                 && t.stage == Stage::Iteration
                                 && t.name != reviewer.name
-                                && declared_completion(&result).is_some()
+                                && declared_completion(t, &result).is_some()
                             {
                                 stopped = true;
                             }
@@ -2273,17 +1849,7 @@ where
             };
             view.insert(t.name.clone(), result.clone());
             if entered {
-                record(
-                    &mut *runner,
-                    &round_task(t, round),
-                    result.clone(),
-                    event,
-                    ledger.results,
-                    ledger.machines,
-                    ledger.halted,
-                    ledger.plan_machine,
-                    false,
-                )?;
+                ledger.record(&round_task(t, round), result.clone(), event, Settles::Item)?;
             } else {
                 pending.push(rows.len());
             }
@@ -2328,59 +1894,28 @@ where
         } else {
             (row.result.clone(), row.event)
         };
-        record(
-            &mut *runner,
-            row.task,
-            result,
-            event,
-            ledger.results,
-            ledger.machines,
-            ledger.halted,
-            ledger.plan_machine,
-            true,
-        )?;
+        ledger.record(row.task, result, event, Settles::Node)?;
     }
     if cfg.early_completion && ledger.completed.is_none() {
-        let names: Vec<&TaskName> = last
+        let names: Vec<(&Task, &TaskName)> = last
             .iter()
             .filter(|row| row.task.stage == Stage::Iteration)
-            .map(|row| &row.task.name)
+            .map(|row| (row.task, &row.task.name))
             .collect();
-        if let Some(completion) = completion_among(ledger.results, &names) {
-            complete(ledger.completed, ledger.plan_machine, completion)?;
+        if let Some(completion) = completion_among(&ledger.results, &names) {
+            ledger.complete(completion)?;
         }
     }
     Ok(())
 }
 
-/// The ceiling a unit about to dispatch has reached. Only a unit that can spend is held to the
-/// cost ceiling.
-fn ceiling_reached(cfg: ExecCfg<'_>, ledger: &Ledger<'_>, spends: bool) -> Option<Halt> {
-    if spends && *ledger.spent >= ledger.budget {
-        Some(Halt::Budget)
-    } else if ledger.clock.past(cfg.wall_clock) {
-        Some(Halt::Time)
-    } else {
-        None
-    }
-}
-
-fn halt_on(ledger: &mut Ledger<'_>, why: Halt) -> Result<(), IllegalTransition> {
-    halt(ledger.halted, ledger.plan_machine, why)
-}
-
-/// One round of a revise loop, `task[round-N]`. It shares the instance naming, so a reader groups
-/// rounds under their task the way it groups a fan-out's items.
+/// One round of a revise loop, as the task it runs as.
 fn round_task(t: &Task, round: u32) -> Task {
     Task {
-        name: round_name(&t.name, round),
+        name: TaskName::round(&t.name, round),
         revise: None,
         ..t.clone()
     }
-}
-
-fn round_name(task: &TaskName, round: u32) -> TaskName {
-    instance_name(task, &format!("round-{round}"))
 }
 
 fn ledger_round(
@@ -2388,13 +1923,13 @@ fn ledger_round(
     t: &Task,
     round: u32,
 ) -> Option<TaskResult> {
-    results.get(&round_name(&t.name, round)).cloned()
+    results.get(&TaskName::round(&t.name, round)).cloned()
 }
 
 /// One item of a mapped node, as the task it runs as.
-fn instance_task(node: &Task, key: &str) -> Task {
+fn instance_task(node: &Task, key: &ItemKey) -> Task {
     Task {
-        name: instance_name(&node.name, key),
+        name: TaskName::instance(&node.name, key),
         emits_files: node.emits_files.clone(),
         over: None,
         max_fanout: None,
@@ -2410,8 +1945,8 @@ pub fn row_task(plan: &ValidPlan, name: &TaskName) -> Option<Task> {
     if let Some(task) = plan.get(name) {
         return Some(task.clone());
     }
-    let (node, key) = name.0.strip_suffix(']')?.split_once('[')?;
-    let node = plan.get(&TaskName(node.to_string()))?;
+    let (_, key) = name.instance_of()?;
+    let node = plan.get(&name.node())?;
     let round = key
         .strip_prefix("round-")
         .and_then(|round| round.parse::<u32>().ok())
@@ -2423,7 +1958,7 @@ pub fn row_task(plan: &ValidPlan, name: &TaskName) -> Option<Task> {
         .map(|l| l.max_rounds);
     match (round, in_loop, &node.over) {
         (Some(round), Some(max_rounds), _) if round <= max_rounds => Some(round_task(node, round)),
-        (_, None, Some(_)) => Some(instance_task(node, key)),
+        (_, None, Some(_)) => Some(instance_task(node, &ItemKey::new(key).ok()?)),
         _ => None,
     }
 }
@@ -2435,9 +1970,7 @@ fn replay(
     plan: &ValidPlan,
     prior: &Prior,
     early_completion: bool,
-    halted: &mut Option<Halt>,
-    completed: &mut Option<Completion>,
-    plan_machine: &mut PlanMachine,
+    ledger: &mut Ledger<'_>,
 ) -> Result<(), IllegalTransition> {
     let settled: Vec<(&Task, &TaskResult)> = prior
         .order
@@ -2449,8 +1982,8 @@ fn replay(
             continue;
         };
         match r.blocked {
-            Some(BlockedReason::BudgetCeiling) => halt(halted, plan_machine, Halt::Budget)?,
-            Some(BlockedReason::WallClockCeiling) => halt(halted, plan_machine, Halt::Time)?,
+            Some(BlockedReason::BudgetCeiling) => ledger.halt(Halt::Budget)?,
+            Some(BlockedReason::WallClockCeiling) => ledger.halt(Halt::Time)?,
             _ => {}
         }
         let Some(t) = plan.get(name) else {
@@ -2458,7 +1991,7 @@ fn replay(
         };
         let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
         if failed && t.required && t.stage == Stage::Iteration {
-            halt(halted, plan_machine, Halt::ShortCircuit(t.name.clone()))?;
+            ledger.halt(Halt::ShortCircuit(t.name.clone()))?;
         }
     }
     if !early_completion {
@@ -2468,11 +2001,11 @@ fn replay(
         (t.stage == Stage::Iteration).then_some(())?;
         Some(Completion {
             task: t.name.clone(),
-            reason: declared_completion(r)?,
+            reason: declared_completion(t, r)?,
         })
     });
     match completion {
-        Some(completion) => complete(completed, plan_machine, completion),
+        Some(completion) => ledger.complete(completion),
         None => Ok(()),
     }
 }
@@ -2541,7 +2074,7 @@ fn fold_event(status: TaskStatus) -> TaskEvent {
 /// The node is required or advisory as a whole, so every instance has to pass for it to pass. A
 /// dependent that wants whatever survived says so with `join = "passed"`, which is the vocabulary
 /// that already exists; a fan-out needs no join of its own.
-fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
+fn fold_instances(settled: Vec<(ItemKey, TaskResult)>) -> TaskResult {
     let count = |status: TaskStatus| settled.iter().filter(|(_, r)| r.status == status).count();
     let passed = count(TaskStatus::Pass);
     let not_taken = count(TaskStatus::NotTaken);
@@ -2552,7 +2085,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
     let outputs: serde_json::Map<String, Value> = settled
         .iter()
         .filter(|(_, r)| r.status == TaskStatus::Pass)
-        .map(|(key, r)| (key.clone(), r.output.clone().unwrap_or(Value::Null)))
+        .map(|(key, r)| (key.to_string(), r.output.clone().unwrap_or(Value::Null)))
         .collect();
     let note = (failed > 0).then(|| {
         let names: Vec<&str> = settled
@@ -2599,63 +2132,6 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
 
 /// Declared-output check: a passing attempt whose JSON lacks a promised field is a
 /// measured failure at the producing task, not a mystery downstream.
-/// A task's self-declared `status`, which wins over the boolean `pass` when present.
-///
-/// Without this a task that RAN could only report pass or fail, so a rung whose check turned out to
-/// be inapplicable had to pick between claiming success and accusing the candidate. The GLM A/B rung
-/// picked success, and six hours of GPU reported a green attribution rung with no attribution behind
-/// it. `skipped` is the honest third answer: ran, measured nothing, blames nobody. `fail` is how a
-/// task with no exit code and no `pass` grading vetoes itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeclaredStatus {
-    Pass,
-    Fail,
-    Skipped,
-}
-
-impl DeclaredStatus {
-    /// Every value the engine acts on. Any other value of the field is ignored.
-    pub const ALL: [DeclaredStatus; 3] = [
-        DeclaredStatus::Pass,
-        DeclaredStatus::Fail,
-        DeclaredStatus::Skipped,
-    ];
-
-    /// The token a task writes into its output's reserved `status` field.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DeclaredStatus::Pass => "pass",
-            DeclaredStatus::Fail => "fail",
-            DeclaredStatus::Skipped => "skipped",
-        }
-    }
-
-    fn of(value: &Value) -> Option<Self> {
-        match value.get("status").and_then(Value::as_str)? {
-            "pass" => Some(DeclaredStatus::Pass),
-            "fail" => Some(DeclaredStatus::Fail),
-            "skipped" => Some(DeclaredStatus::Skipped),
-            _ => None,
-        }
-    }
-}
-
-/// The reason a task's result states in its `note` field, when that is a non-blank string.
-pub fn own_note(value: &Value) -> Option<&str> {
-    value
-        .get(crate::plan::ir::NOTE_FIELD)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|note| !note.is_empty())
-}
-
-/// The note a self-declaring task gave, or a stand-in naming what it declared.
-fn declared_note(value: &Value, declared: DeclaredStatus) -> String {
-    own_note(value)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("task declared status={}", declared.as_str()))
-}
-
 fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
     // Declared fields are owed by a passing attempt only, so a task that settled itself skipped or
     // failed is read before they are checked: checking them would turn an honest skip into a
@@ -2816,72 +2292,44 @@ fn transport_result(
     )
 }
 
-/// Run one task, retrying transport-class failures up to `cfg.transport_retries` times while
-/// the budget allows. Every attempt runs under its own deadline.
-fn run_with_retries(
+/// Run one task as a batch of one through [`run_batch_with_retries`].
+fn run_one(
     t: &Task,
-    inputs: &BTreeMap<TaskName, Value>,
+    inputs: BTreeMap<TaskName, Value>,
     cfg: ExecCfg<'_>,
-    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
-    spent: &mut f64,
-    budget: f64,
+    ledger: &mut Ledger<'_>,
 ) -> (TaskResult, TaskEvent, Overrun) {
-    let max_attempts = 1 + cfg.transport_retries;
-    let mut attempts = 0;
-    let mut cost = 0.0;
-    let mut last_transport = TransportFailure::new(TransportCause::Other, String::new());
-    while attempts < max_attempts {
-        attempts += 1;
-        let deadline = Deadline::for_attempt(Instant::now(), t.timeout, run_ceiling);
-        runner.budget_left(budget - *spent);
-        let a = runner.run(t, attempts, inputs, deadline);
-        cost += a.cost_usd;
-        *spent += a.cost_usd;
-        let outcome = enforce_emits(t, a.outcome);
-        let mut overrun = Overrun::of(&outcome);
-        overrun.budget = *spent > budget;
-        match settle_attempt(outcome, attempts, cost, a.repairs) {
-            Ok((result, event)) => return (result, event, overrun),
-            Err(failure) => {
-                if t.task.spends()
-                    && (*spent > budget || (*spent >= budget && attempts < max_attempts))
-                {
-                    let (result, event) = transport_result(
-                        attempts,
-                        max_attempts,
-                        cost,
-                        &failure,
-                        Some(Refusal::CostCeiling),
-                    );
-                    overrun.budget = true;
-                    return (result, event, overrun);
-                }
-                last_transport = failure;
-            }
+    let item = BatchItem {
+        task: t,
+        attempt: 1,
+        inputs,
+    };
+    let (mut settled, overrun) = run_batch_with_retries(vec![item], cfg, runner, ledger);
+    match settled.pop() {
+        Some((_, result, event)) => (result, event, overrun),
+        None => {
+            let note = format!("dispatching {} returned no result", t.name);
+            let (result, event) = settle_attempt(AttemptOutcome::fail(note), 0, 0.0, Vec::new())
+                .unwrap_or_else(|failure| transport_result(0, 0, 0.0, &failure, None));
+            (result, event, overrun)
         }
     }
-    let (result, event) = transport_result(attempts, max_attempts, cost, &last_transport, None);
-    let overrun = Overrun {
-        budget: *spent > budget,
-        time: false,
-    };
-    (result, event, overrun)
 }
 
-/// Run a batch of isolated tasks through the runner's parallel path, retrying the transport
-/// failures as a smaller wave until every task has a result or retries run out. Every lane of a
+/// Run a batch of tasks, retrying the transport failures as a smaller wave until every task has
+/// a result or retries run out. A batch of one runs through [`TaskRunner::run`], a wider one
+/// through the runner's parallel path. Every lane of a
 /// wave is admitted against the run's ceilings as it starts, under its own deadline; a lane the
 /// ceilings refuse settles blocked, or, on a retry, as the transport failure it already had.
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
     cfg: ExecCfg<'_>,
-    run_ceiling: Option<RunCeiling>,
     runner: &mut dyn TaskRunner,
-    spent: &mut f64,
-    budget: f64,
+    ledger: &mut Ledger<'_>,
 ) -> (Vec<(&'a Task, TaskResult, TaskEvent)>, Overrun) {
     let max_attempts = 1 + cfg.transport_retries;
+    let single = batch.len() == 1;
     let mut done: BTreeMap<usize, (TaskResult, TaskEvent)> = BTreeMap::new();
     let mut cost_so_far: Vec<f64> = vec![0.0; batch.len()];
     let order: Vec<&'a Task> = batch.iter().map(|b| b.task).collect();
@@ -2901,9 +2349,15 @@ fn run_batch_with_retries<'a>(
                 inputs: b.inputs.clone(),
             })
             .collect();
-        runner.budget_left(budget - *spent);
-        let admission = Admission::new(budget, *spent, run_ceiling, cfg.width);
-        let attempts = runner.run_many(&items, &admission);
+        runner.budget_left(ledger.budget - ledger.spent);
+        let admission = Admission::new(ledger.budget, ledger.spent, ledger.run_ceiling, cfg.width)
+            .journaled(cfg.journal);
+        let attempts = match items.as_slice() {
+            [only] if single => vec![admission.run(only, |lane| {
+                runner.run(only.task, only.attempt, &only.inputs, lane.deadline())
+            })],
+            _ => runner.run_many(&items, &admission),
+        };
         let mut attempted = Vec::new();
         for ((idx, item, previous), a) in wave.into_iter().zip(attempts) {
             match a {
@@ -2925,7 +2379,7 @@ fn run_batch_with_retries<'a>(
                     done.insert(idx, settled);
                 }
                 Ok(a) => {
-                    *spent += a.cost_usd;
+                    ledger.spent += a.cost_usd;
                     cost_so_far[idx] += a.cost_usd;
                     let outcome = enforce_emits(item.task, a.outcome);
                     overrun.time |= Overrun::of(&outcome).time;
@@ -2933,13 +2387,14 @@ fn run_batch_with_retries<'a>(
                 }
             }
         }
-        let retry_budget_blocked = *spent >= budget;
-        overrun.budget |= *spent > budget;
+        let retry_budget_blocked = ledger.spent >= ledger.budget;
+        overrun.budget |= ledger.spent > ledger.budget;
         let mut next: Vec<(usize, BatchItem<'a>, Option<TransportFailure>)> = Vec::new();
         for (idx, item, outcome, repairs) in attempted {
             match settle_attempt(outcome, item.attempt, cost_so_far[idx], repairs) {
-                Ok(settled) => {
-                    done.insert(idx, settled);
+                Ok((mut result, event)) => {
+                    note_refused_completion(cfg, item.task, &mut result);
+                    done.insert(idx, (result, event));
                 }
                 Err(failure) => {
                     let cut_by_budget = item.task.task.spends() && retry_budget_blocked;
@@ -3090,7 +2545,6 @@ fn open_decision(
     questions: &BTreeMap<QuestionId, CompiledQuestion>,
     review: Option<&str>,
     results: &BTreeMap<TaskName, TaskResult>,
-    runner: &dyn TaskRunner,
     run: RunEvidence,
     clock: &Clock,
     cfg: ExecCfg<'_>,
@@ -3100,7 +2554,7 @@ fn open_decision(
             "no orchestrator takes answers for this run".to_owned(),
         ));
     };
-    let producers = file_producers(plan, t, results, runner);
+    let producers = file_producers(plan, t, results, cfg.files);
     let inputs = inputs_for(plan, t, results, &producers);
     let (questions, resolved) = match crate::plan::options::asked_questions(t, questions, &inputs) {
         Ok(asked) => asked,
@@ -3121,7 +2575,8 @@ fn open_decision(
             ))
         })
         .collect();
-    let captured = |task: &Task, declared: &str| runner.captured_file(&task.name, declared);
+    let captured =
+        |task: &Task, declared: &str| cfg.files.and_then(|files| files.read(&task.name, declared));
     let evidence = match crate::plan::decide::build_evidence(crate::plan::decide::EvidenceInputs {
         plan,
         route: t,
@@ -3258,7 +2713,7 @@ fn per_element_deps(plan: &ValidPlan, t: &Task) -> BTreeSet<TaskName> {
 /// instance for the same key, read as blocked when it has none unless its node was not taken.
 fn status_for_instance(
     d: &TaskName,
-    key: &str,
+    key: &ItemKey,
     results: &BTreeMap<TaskName, TaskResult>,
     per_element: &BTreeSet<TaskName>,
 ) -> TaskStatus {
@@ -3266,7 +2721,7 @@ fn status_for_instance(
     if !per_element.contains(d) {
         return node.unwrap_or(TaskStatus::Blocked);
     }
-    match results.get(&instance_name(d, key)) {
+    match results.get(&TaskName::instance(d, key)) {
         Some(r) => r.status,
         None if node == Some(TaskStatus::NotTaken) => TaskStatus::NotTaken,
         None => TaskStatus::Blocked,
@@ -3277,7 +2732,7 @@ fn status_for_instance(
 /// its aligned dependencies for the same key. `None` when it runs.
 fn instance_gate(
     t: &Task,
-    key: &str,
+    key: &ItemKey,
     results: &BTreeMap<TaskName, TaskResult>,
     per_element: &BTreeSet<TaskName>,
 ) -> Option<(TaskResult, TaskEvent)> {
@@ -3288,7 +2743,7 @@ fn instance_gate(
     let not_taken =
         |event, note: String| Some((TaskResult::undispatched(TaskStatus::NotTaken, note), event));
     if let Some(when) = t.when.as_ref().filter(|w| per_element.contains(&w.task)) {
-        let route = instance_name(&when.task, key);
+        let route = TaskName::instance(&when.task, key);
         match status(&when.task) {
             TaskStatus::NotTaken => {
                 return not_taken(
@@ -3334,7 +2789,7 @@ fn instance_gate(
             {
                 return not_taken(
                     TaskEvent::BranchNotTaken,
-                    format!("dependency {} was not taken", instance_name(d, key)),
+                    format!("dependency {} was not taken", TaskName::instance(d, key)),
                 );
             }
             if per_element.iter().any(|d| !satisfies_all(t, d, status(d))) {
@@ -3363,7 +2818,7 @@ fn instance_gate(
 /// the key itself under [`ITEM_INPUT`].
 fn instance_inputs(
     node: &Task,
-    key: &str,
+    key: &ItemKey,
     base: &BTreeMap<TaskName, Value>,
     results: &BTreeMap<TaskName, TaskResult>,
     per_element: &BTreeSet<TaskName>,
@@ -3371,7 +2826,7 @@ fn instance_inputs(
 ) -> Result<BTreeMap<TaskName, Value>, String> {
     let mut inputs = base.clone();
     for d in per_element {
-        let instance = instance_name(d, key);
+        let instance = TaskName::instance(d, key);
         inputs.remove(d);
         let absent;
         let r = match results.get(&instance) {
@@ -3379,7 +2834,7 @@ fn instance_inputs(
             None => {
                 absent = TaskResult::undispatched(
                     status_for_instance(d, key, results, per_element),
-                    format!("{d} has no instance for {key:?}"),
+                    format!("{d} has no instance for {:?}", key.as_str()),
                 );
                 &absent
             }
@@ -3420,14 +2875,17 @@ fn instance_inputs(
                 "keyed {reference} is not an object keyed by element"
             ));
         };
-        let Some(narrowed) = by_key.remove(key) else {
-            return Err(format!("keyed {reference} has no entry for {key:?}"));
+        let Some(narrowed) = by_key.remove(key.as_str()) else {
+            return Err(format!(
+                "keyed {reference} has no entry for {:?}",
+                key.as_str()
+            ));
         };
         *field = narrowed;
     }
     inputs.insert(
-        TaskName(ITEM_INPUT.to_string()),
-        Value::String(key.to_owned()),
+        TaskName::reserved(ITEM_INPUT),
+        Value::String(key.to_string()),
     );
     Ok(inputs)
 }
@@ -3436,10 +2894,10 @@ fn instance_inputs(
 /// staged for it, and the files that did not parse. `None` for a task that reads no files.
 fn route_files(
     t: &Task,
-    key: Option<&str>,
+    key: Option<&ItemKey>,
     per_element: &BTreeSet<TaskName>,
     staged: &[Task],
-    runner: &dyn TaskRunner,
+    captured: Option<&CapturedFiles>,
 ) -> Option<(Value, Vec<String>)> {
     let TaskKind::Route {
         decider: Decider::Model { files, .. },
@@ -3455,7 +2913,7 @@ fn route_files(
     let mut unparsed = Vec::new();
     for d in &t.depends_on {
         let producer = match key {
-            Some(key) if per_element.contains(d) => instance_name(d, key),
+            Some(key) if per_element.contains(d) => TaskName::instance(d, key),
             _ => d.clone(),
         };
         let Some(staged_task) = staged.iter().find(|p| p.name == producer) else {
@@ -3466,7 +2924,7 @@ fn route_files(
             .iter()
             .filter(|path| staged_task.emits_files.iter().any(|f| &f.path == *path))
         {
-            let Some(bytes) = runner.captured_file(&producer, path) else {
+            let Some(bytes) = captured.and_then(|captured| captured.read(&producer, path)) else {
                 continue;
             };
             let value = serde_json::from_slice(&bytes).unwrap_or_else(|_| {
@@ -3514,7 +2972,7 @@ fn measured_failure(note: String) -> TaskResult {
 fn decide_instance(
     questions: &BTreeMap<QuestionId, Question>,
     source: &TaskName,
-    key: &str,
+    key: &ItemKey,
     inputs: &BTreeMap<TaskName, Value>,
     per_element: &BTreeSet<TaskName>,
     join: Join,
@@ -3536,12 +2994,15 @@ fn decide_instance(
     let mut answers = serde_json::Map::new();
     for id in questions.keys() {
         match output.get(id.as_str()) {
-            Some(Value::Object(by_key)) => match by_key.get(key) {
+            Some(Value::Object(by_key)) => match by_key.get(key.as_str()) {
                 Some(answer) => {
                     answers.insert(id.to_string(), answer.clone());
                 }
                 None => {
-                    return measured_failure(format!("{source}.{id} has no entry for {key:?}"));
+                    return measured_failure(format!(
+                        "{source}.{id} has no entry for {:?}",
+                        key.as_str()
+                    ));
                 }
             },
             Some(other) => {
@@ -3740,9 +3201,8 @@ mod tests {
         seen_inputs: BTreeMap<String, Vec<String>>,
         seen_values: BTreeMap<String, BTreeMap<TaskName, Value>>,
         staged: BTreeMap<String, Vec<String>>,
-        /// Producers this runner claims to hold a complete captured set for.
-        captured: BTreeSet<String>,
-        dropped: Vec<String>,
+        /// Where this run's captured files are published.
+        state: tempfile::TempDir,
         /// Outcomes consumed one per dispatch of a task, ahead of `script`: a revise loop runs
         /// the same task and attempt number once per round.
         rounds: BTreeMap<String, std::collections::VecDeque<fn() -> AttemptOutcome>>,
@@ -3752,8 +3212,6 @@ mod tests {
         outputs: BTreeMap<String, Value>,
         /// The deadline every dispatch was handed, in order.
         deadlines: Vec<(String, Option<Deadline>)>,
-        /// Captured declared files by producer and path.
-        files: BTreeMap<(String, String), Vec<u8>>,
     }
 
     impl ScriptRunner {
@@ -3765,14 +3223,24 @@ mod tests {
                 seen_inputs: BTreeMap::new(),
                 seen_values: BTreeMap::new(),
                 staged: BTreeMap::new(),
-                captured: BTreeSet::new(),
-                dropped: Vec::new(),
+                state: tempfile::tempdir().unwrap(),
                 rounds: BTreeMap::new(),
                 runs: Vec::new(),
                 outputs: BTreeMap::new(),
                 deadlines: Vec::new(),
-                files: BTreeMap::new(),
             }
+        }
+        /// The run's captured files, under this runner's own state directory.
+        fn files(&self) -> CapturedFiles {
+            CapturedFiles::new(self.state.path())
+        }
+        /// Publish a complete set under `producer`'s name, as an earlier run would have.
+        fn capture(&self, producer: &str) {
+            std::fs::create_dir_all(self.files().dir(&producer.into())).unwrap();
+        }
+        fn capture_file(&self, producer: &str, declared: &str, bytes: &[u8]) {
+            self.capture(producer);
+            std::fs::write(self.files().path(&producer.into(), declared), bytes).unwrap();
         }
         fn rounds(&mut self, task: &str, outcomes: &[fn() -> AttemptOutcome]) {
             self.rounds
@@ -3794,20 +3262,6 @@ mod tests {
                 producers.iter().map(|p| p.name.0.clone()).collect(),
             );
             Ok(())
-        }
-
-        fn has_captured_files(&self, task: &Task) -> bool {
-            self.captured.contains(&task.name.0)
-        }
-
-        fn captured_file(&self, producer: &TaskName, path: &str) -> Option<Vec<u8>> {
-            self.files
-                .get(&(producer.0.clone(), path.to_string()))
-                .cloned()
-        }
-
-        fn drop_captured(&mut self, task: &Task) {
-            self.dropped.push(task.name.0.clone());
         }
 
         fn run(
@@ -4842,7 +4296,7 @@ mod tests {
                 batch
                     .iter()
                     .map(|b| {
-                        admission.run(b.task, |_| Attempt {
+                        admission.run(b, |_| Attempt {
                             outcome: AttemptOutcome::Pass(serde_json::json!({})),
                             cost_usd: 0.0,
                             repairs: Vec::new(),
@@ -5123,7 +4577,7 @@ mod tests {
                 batch
                     .iter()
                     .map(|x| {
-                        admission.run(x.task, |_| Attempt {
+                        admission.run(x, |_| Attempt {
                             outcome: if x.task.name.0 == "iso-a" {
                                 AttemptOutcome::Pass(serde_json::json!({}))
                             } else {
@@ -6307,10 +5761,15 @@ mod tests {
     fn run_branching(classify: fn() -> AttemptOutcome) -> (PlanOutcome, ScriptRunner) {
         let mut r = ScriptRunner::new();
         r.on("classify", 1, classify, 0.1);
+        r.capture("punt");
+        let files = r.files();
         let out = execute(
             &branching(),
             &any_substrate(),
-            ExecCfg::default(),
+            ExecCfg {
+                files: Some(&files),
+                ..ExecCfg::default()
+            },
             &mut r,
             |_, _| {},
         );
@@ -6335,7 +5794,10 @@ mod tests {
         );
         assert!(out.valid, "an untaken required task does not invalidate");
         assert_eq!(out.exit, PlanExit::Completed);
-        assert!(r.dropped.contains(&"punt".to_string()));
+        assert!(
+            !r.files().has(&"punt".into()),
+            "an untaken task's set from an earlier run is dropped"
+        );
     }
 
     #[test]
@@ -6751,8 +6213,8 @@ mod tests {
         log: Vec<String>,
         staged: BTreeMap<String, Vec<String>>,
         seen_inputs: BTreeMap<String, BTreeMap<TaskName, Value>>,
-        /// Producers this runner claims to hold a complete captured set for.
-        captured: BTreeSet<String>,
+        /// Where this run's captured files are published.
+        state: tempfile::TempDir,
     }
 
     impl FanoutRunner {
@@ -6764,8 +6226,14 @@ mod tests {
                 log: Vec::new(),
                 staged: BTreeMap::new(),
                 seen_inputs: BTreeMap::new(),
-                captured: BTreeSet::new(),
+                state: tempfile::tempdir().unwrap(),
             }
+        }
+        fn files(&self) -> CapturedFiles {
+            CapturedFiles::new(self.state.path())
+        }
+        fn capture(&self, producer: &str) {
+            std::fs::create_dir_all(self.files().dir(&producer.into())).unwrap();
         }
     }
 
@@ -6814,7 +6282,7 @@ mod tests {
             batch
                 .iter()
                 .map(|b| {
-                    admission.run(b.task, |lane| {
+                    admission.run(b, |lane| {
                         self.run(b.task, b.attempt, &b.inputs, lane.deadline())
                     })
                 })
@@ -6827,10 +6295,6 @@ mod tests {
                 producers.iter().map(|p| p.name.0.clone()).collect(),
             );
             Ok(())
-        }
-
-        fn has_captured_files(&self, task: &Task) -> bool {
-            self.captured.contains(&task.name.0)
         }
 
         fn settled(&mut self, task: &Task, passed: bool) {
@@ -7014,7 +6478,7 @@ mod tests {
                 return Vec::new();
             };
             let mut later = Vec::new();
-            let head = admission.run(first.task, |lane| {
+            let head = admission.run(first, |lane| {
                 self.ran.push(first.task.name.0.clone());
                 lane.spent_so_far(self.reported);
                 later = self.overlap(rest, admission);
@@ -7464,7 +6928,10 @@ mod tests {
         }
         let results =
             BTreeMap::from([(TaskName("discover".to_string()), source(TaskStatus::Pass))]);
-        assert_eq!(fanout_items(&node, &results), Ok(vec!["alpha".to_string()]));
+        assert_eq!(
+            fanout_items(&node, &results),
+            Ok(vec![ItemKey::new("alpha").unwrap()])
+        );
     }
 
     fn epilogue(name: &str, deps: &[&str], required: bool) -> Task {
@@ -7473,12 +6940,16 @@ mod tests {
         t
     }
 
-    fn run_plan(plan: &ValidPlan, runner: &mut dyn TaskRunner) -> PlanOutcome {
+    fn run_plan(plan: &ValidPlan, r: &mut ScriptRunner) -> PlanOutcome {
+        let files = r.files();
         execute(
             plan,
             &any_substrate(),
-            ExecCfg::default(),
-            runner,
+            ExecCfg {
+                files: Some(&files),
+                ..ExecCfg::default()
+            },
+            r,
             |_, _| {},
         )
     }
@@ -8133,7 +7604,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.captured.insert("probe".to_string());
+        r.capture("probe");
         r.on(
             "probe",
             1,
@@ -8204,11 +7675,15 @@ mod tests {
         let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
         runner.fail.insert("audit[beta]".to_string());
         runner.fail.insert("audit[gamma]".to_string());
-        runner.captured.insert("audit[beta]".to_string());
+        runner.capture("audit[beta]");
+        let files = runner.files();
         let out = execute(
             &plan,
             &any_substrate(),
-            ExecCfg::default(),
+            ExecCfg {
+                files: Some(&files),
+                ..ExecCfg::default()
+            },
             &mut runner,
             |_, _| {},
         );
@@ -8276,6 +7751,9 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
+        for name in ["gone", "flaky", "upstream", "blocked", "kept"] {
+            r.capture(name);
+        }
         for attempt in 1..=3 {
             r.on(
                 "flaky",
@@ -8297,14 +7775,19 @@ mod tests {
         );
         run_plan(&plan, &mut r);
 
-        assert_eq!(
-            r.dropped,
-            vec![
-                "gone".to_string(),
-                "flaky".to_string(),
-                "blocked".to_string()
-            ]
-        );
+        let files = r.files();
+        for name in ["gone", "flaky", "blocked"] {
+            assert!(
+                !files.has(&name.into()),
+                "{name} settled without evidence and kept an earlier run's set"
+            );
+        }
+        for name in ["upstream", "kept"] {
+            assert!(
+                files.has(&name.into()),
+                "{name} settled on its own evidence and lost its set"
+            );
+        }
     }
 
     /// A truncated graph dispatches nothing at all, so every task in it settles without evidence
@@ -8319,10 +7802,13 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
+        r.capture("gpu");
+        r.capture("report");
         let out = run_plan(&plan, &mut r);
 
         assert_eq!(out.exit, PlanExit::Truncated { task: "gpu".into() });
-        assert_eq!(r.dropped, vec!["gpu".to_string(), "report".to_string()]);
+        assert!(!r.files().has(&"gpu".into()));
+        assert!(!r.files().has(&"report".into()));
     }
 
     /// A settled join is refused a halt exemption, and an epilogue task is granted one. Where a
@@ -8376,11 +7862,15 @@ mod tests {
         );
         let mut runner = FanoutRunner::new(&["alpha"]);
         runner.fail.insert("audit[alpha]".to_string());
-        runner.captured.insert("audit[alpha]".to_string());
+        runner.capture("audit[alpha]");
+        let files = runner.files();
         let out = execute(
             &plan,
             &any_substrate(),
-            ExecCfg::default(),
+            ExecCfg {
+                files: Some(&files),
+                ..ExecCfg::default()
+            },
             &mut runner,
             |_, _| {},
         );
@@ -8404,7 +7894,7 @@ mod tests {
         roundup.join = Join::Passed;
         let plan = valid(vec![probe, task("other", &[], "any", false), roundup], 10.0);
         let mut r = ScriptRunner::new();
-        r.captured.insert("probe".to_string());
+        r.capture("probe");
         r.on(
             "probe",
             1,
@@ -8493,7 +7983,7 @@ mod tests {
     }
 
     fn outcome_of(r: &ScriptRunner, task: &str) -> Value {
-        r.seen_values[task][&TaskName(OUTCOME_INPUT.to_string())].clone()
+        r.seen_values[task][&TaskName::reserved(OUTCOME_INPUT)].clone()
     }
 
     /// An epilogue task has no dependencies to read, so the run's outcome is the only channel
@@ -8590,7 +8080,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.captured.insert("probe".to_string());
+        r.capture("probe");
         r.on(
             "probe",
             1,
@@ -8642,8 +8132,8 @@ mod tests {
         flaky.emits_files = vec!["evidence/flaky.json".into()];
         let plan = valid(vec![quiet, flaky, epilogue("report", &[], true)], 10.0);
         let mut r = ScriptRunner::new();
-        r.captured.insert("quiet".to_string());
-        r.captured.insert("flaky".to_string());
+        r.capture("quiet");
+        r.capture("flaky");
         r.on(
             "quiet",
             1,
@@ -8687,11 +8177,15 @@ mod tests {
         let mut runner = FanoutRunner::new(&["alpha", "beta", "gamma"]);
         runner.fail.insert("audit[beta]".to_string());
         runner.fail.insert("audit[gamma]".to_string());
-        runner.captured.insert("audit[beta]".to_string());
+        runner.capture("audit[beta]");
+        let files = runner.files();
         execute(
             &plan,
             &any_substrate(),
-            ExecCfg::default(),
+            ExecCfg {
+                files: Some(&files),
+                ..ExecCfg::default()
+            },
             &mut runner,
             |_, _| {},
         );
@@ -8700,7 +8194,7 @@ mod tests {
             runner.staged["report"],
             vec!["audit[alpha]".to_string(), "audit[beta]".to_string()]
         );
-        let outcome = &runner.seen_inputs["report"][&TaskName(OUTCOME_INPUT.to_string())];
+        let outcome = &runner.seen_inputs["report"][&TaskName::reserved(OUTCOME_INPUT)];
         assert_eq!(outcome["tasks"]["audit"]["files"], true);
         assert_eq!(outcome["tasks"]["discover"]["files"], false);
     }
@@ -8721,7 +8215,7 @@ mod tests {
             10.0,
         );
         let mut r = ScriptRunner::new();
-        r.captured.insert("probe".to_string());
+        r.capture("probe");
         r.on(
             "probe",
             1,
@@ -8767,10 +8261,14 @@ mod tests {
 
     fn rows_of(plan: &ValidPlan, r: &mut ScriptRunner) -> (PlanOutcome, Vec<(String, TaskStatus)>) {
         let mut rows = Vec::new();
+        let files = r.files();
         let out = execute(
             plan,
             &any_substrate(),
-            ExecCfg::default(),
+            ExecCfg {
+                files: Some(&files),
+                ..ExecCfg::default()
+            },
             r,
             |t, result| rows.push((t.name.0.clone(), result.status)),
         );
@@ -9174,7 +8672,7 @@ mod tests {
         }
         let plan = valid(plan_tasks, 10.0);
         let mut r = ScriptRunner::new();
-        r.captured.insert("repro".into());
+        r.capture("repro");
         r.rounds("repro", &[rejected, approved]);
         let (out, _) = rows_of(&plan, &mut r);
 
@@ -9473,7 +8971,7 @@ mod tests {
         }
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
-        r.captured.insert("confirm".into());
+        r.capture("confirm");
         r.rounds("confirm", &[rejected, approved]);
         let (out, _) = rows_of(&plan, &mut r);
 
@@ -9851,12 +9349,6 @@ mod tests {
             Ok(())
         }
 
-        fn has_captured_files(&self, _task: &Task) -> bool {
-            false
-        }
-
-        fn drop_captured(&mut self, _task: &Task) {}
-
         fn run(
             &mut self,
             task: &Task,
@@ -9889,7 +9381,7 @@ mod tests {
             let attempts = batch
                 .iter()
                 .map(|b| {
-                    admission.run(b.task, |lane| {
+                    admission.run(b, |lane| {
                         assert_eq!(
                             lane.deadline().map(|d| d.bound),
                             b.task.timeout.map(Bound::Task),
@@ -10678,6 +10170,52 @@ mod tests {
         }
     }
 
+    /// An agent's output is written by the model in its sandbox, so a `"complete": true` there
+    /// would let whatever steered the model skip every task after it, a reviewer among them.
+    /// The run refuses it on the row and dispatches the rest; the shared and the isolated
+    /// dispatch paths both do.
+    #[test]
+    fn an_agents_completion_is_refused_on_its_row_and_the_run_continues() {
+        for isolated in [false, true] {
+            let mut drafted = spending(task("draft", &[], "any", true));
+            if isolated {
+                drafted.isolation = Some(crate::plan::ir::Isolation::Worktree);
+            }
+            let plan = valid(vec![drafted, task("review", &["draft"], "any", true)], 10.0);
+            let mut r = ScriptRunner::new();
+            r.rounds("draft", &[completes]);
+            let (out, rows) = run_completing(&plan, &mut r);
+
+            assert_eq!(out.exit, PlanExit::Completed, "isolated: {isolated}");
+            assert!(out.valid);
+            assert_eq!(rows, ["draft", "review"]);
+            let draft = &out.results[&"draft".into()];
+            assert_eq!(draft.status, TaskStatus::Pass);
+            let note = draft.note.as_deref().unwrap_or_default();
+            assert!(
+                note.contains("agent task draft declared \"complete\": true")
+                    && note.contains("only a command or evaluate task may do"),
+                "{note}"
+            );
+        }
+
+        let plan = valid(
+            vec![
+                spending(task("draft", &[], "any", true)),
+                task("review", &["draft"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("draft", &[completes]);
+        let (out, _) = rows_of(&plan, &mut r);
+        assert_eq!(
+            out.results[&"draft".into()].note,
+            None,
+            "the scored loop has no early completion to refuse"
+        );
+    }
+
     #[test]
     fn the_scored_loop_ignores_a_completion_field() {
         let plan = valid(
@@ -10795,16 +10333,31 @@ mod tests {
         assert!(!out.results.contains_key(&"after".into()));
     }
 
+    /// A revised command that declares completion ends its loop without another review. A
+    /// revised agent may not end the run, so its reviewer sees the round as it would any other.
     #[test]
-    fn a_revised_task_declaring_completion_ends_its_loop_unreviewed() {
-        let plan = valid(
-            vec![
-                agent("author", &[], "any", true),
-                spending(reviewing("repro", &["author"], "author", 3)),
-                agent("after", &["repro"], "any", true),
-            ],
-            10.0,
+    fn a_revised_command_declaring_completion_ends_its_loop_unreviewed() {
+        let reviewed = |author: Task| {
+            valid(
+                vec![
+                    author,
+                    spending(reviewing("repro", &["author"], "author", 3)),
+                    agent("after", &["repro"], "any", true),
+                ],
+                10.0,
+            )
+        };
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, completes]);
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = run_completing(&reviewed(agent("author", &[], "any", true)), &mut r);
+        assert_eq!(out.exit, PlanExit::Completed, "{:?}", out.results);
+        assert_eq!(
+            dispatches(&r),
+            ["author", "repro", "author", "repro", "after"]
         );
+
+        let plan = reviewed(task("author", &[], "any", true));
         let mut r = ScriptRunner::new();
         r.rounds("author", &[drafted, completes]);
         r.rounds("repro", &[rejected]);
@@ -10822,7 +10375,11 @@ mod tests {
                 "author"
             ]
         );
-        assert!((out.results[&"author".into()].cost_usd - 0.2).abs() < 1e-9);
+        let rounds: f64 = ["author[round-1]", "author[round-2]"]
+            .iter()
+            .map(|round| out.results[&(*round).into()].cost_usd)
+            .sum();
+        assert!((out.results[&"author".into()].cost_usd - rounds).abs() < 1e-9);
         assert!(!out.results.contains_key(&"repro".into()));
     }
 
@@ -11819,15 +11376,23 @@ mod tests {
         );
         let mut r = ScriptRunner::new();
         r.outputs.insert("gate".into(), decided("depth", "quick"));
-        r.files.insert(
-            ("analyze".into(), "RESULT.json".into()),
-            br#"{"verdict": "fixed", "evidence": ["go.mod"]}"#.to_vec(),
+        r.capture_file(
+            "analyze",
+            "RESULT.json",
+            br#"{"verdict": "fixed", "evidence": ["go.mod"]}"#,
         );
-        r.files.insert(
-            ("analyze".into(), "NOTES.json".into()),
-            b"not json".to_vec(),
+        r.capture_file("analyze", "NOTES.json", b"not json");
+        let files = r.files();
+        let out = execute(
+            &plan,
+            &deciding(),
+            ExecCfg {
+                files: Some(&files),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
         );
-        let out = execute(&plan, &deciding(), ExecCfg::default(), &mut r, |_, _| {});
         assert_eq!(
             r.seen_values["gate"][&TaskName(FILES_INPUT.into())],
             serde_json::json!({"analyze": {

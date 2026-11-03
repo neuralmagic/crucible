@@ -19,23 +19,23 @@ use crate::args::{Args, Paths, Prepared};
 use crate::agent;
 use crate::control;
 use crate::plan::admission::{Admission, Refusal};
-use crate::plan::exec::TransportFailure;
-use crate::plan::exec::{
-    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
-};
+use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
+use crate::plan::exec::{ExecCfg, Substrate, TaskRunner, execute};
+use crate::plan::harness::CandidateEvent;
 use crate::plan::ir::{
     EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,
 };
 use crate::plan::workflow::{WorkflowCaps, WorkflowCfg};
 use crate::process::STOP;
-use crate::report::reporter::{Reporter, TurnBudget};
+use crate::report::reporter::Reporter;
 use crate::report::session::Row;
+use crate::report::session::SessionEvent;
 use crate::report::session::{EvidenceDisposition, EvidenceEntry};
 use crate::runloop::step::{Decided, IterStep, Measured, TurnVerdict};
 use crucible::crucible::Direction;
 use crucible::crucible::{Judge, MeasureCtx, Reading, World};
 use crucible::deadline::Deadline;
-use crucible_contract::TransportCause;
+use crucible_contract::session::TaskStatus;
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph iteration ended with neither a decision nor a control signal (exit: {exit})")]
@@ -74,13 +74,16 @@ pub(crate) struct IterCtx<'a> {
     /// Run spend before this iteration, so the runner reports the same cumulative budget
     /// the typestate path would after the turn.
     pub spent_before: f64,
+    /// What is left of the run's wall-clock ceiling; every task of the iteration, the
+    /// candidate turn included, is cut off when it runs out.
+    pub time_left: Option<std::time::Duration>,
     pub workflow: Option<&'a WorkflowCfg>,
 }
 
 /// Run one admitted autoresearch iteration and return its step and cost.
-pub(crate) fn run_iteration<R: Reporter>(
+pub(crate) fn run_iteration(
     cx: IterCtx<'_>,
-    runner: &mut LoopTaskRunner<R>,
+    runner: &mut LoopTaskRunner<'_>,
 ) -> Result<(IterStep, f64)> {
     let mut caps = WorkflowCaps::for_lane(
         cx.workflow
@@ -105,13 +108,18 @@ pub(crate) fn run_iteration<R: Reporter>(
     // here and append them after the executor returns (they're additive either way).
     let mut task_events = Vec::new();
     let agent_args = runner.args.clone();
+    let files = crate::plan::files::CapturedFiles::new(&runner.p.state);
     let outcome = execute(
         &plan,
         &Substrate::detecting(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            wall_clock: cx.time_left,
+            files: Some(&files),
+            ..ExecCfg::default()
+        },
         &mut *runner,
         |task, result| {
             states_of(&task_states).insert(task.name.clone(), (result.status, result.note.clone()));
@@ -132,10 +140,7 @@ pub(crate) fn run_iteration<R: Reporter>(
         return Err(e);
     }
     let step = match runner.signal.take() {
-        Some(Signal::Discard(reason)) => IterStep::Discarded { reason },
-        Some(Signal::Escalate) => IterStep::Escalated,
-        Some(Signal::Park(pp)) => IterStep::Parked(pp),
-        Some(Signal::Stop) => IterStep::Stopped,
+        Some(step) => step,
         None => match runner.decided.remove(&result_task) {
             Some(d) => IterStep::Decided(Box::new(d)),
             // A pre-gate rejection discards the candidate.
@@ -173,6 +178,15 @@ pub(crate) fn run_iteration<R: Reporter>(
                         IterStep::Discarded {
                             reason: format!("{task} rejected the candidate: {why}"),
                         }
+                    }
+                }
+                crate::plan::exec::PlanExit::TimeExceeded => {
+                    runner.r.note(&format!(
+                        "the run's wall-clock ceiling ended iter {} before it decided",
+                        cx.it
+                    ));
+                    IterStep::Discarded {
+                        reason: "the run's wall-clock ceiling ended the iteration".to_string(),
                     }
                 }
                 exit => {
@@ -233,12 +247,12 @@ impl KeptContext {
 /// Run the epilogue subgraph once, against the kept candidate live in the workspace.
 /// Advisory by contract: the returned rows and the notes make a failure loud, but nothing
 /// here can un-keep the candidate. Returns the advisory rows and the subgraph's cost.
-pub(crate) fn run_epilogue<R: Reporter>(
+pub(crate) fn run_epilogue(
     args: &Args,
     p: &Paths,
     workflow: &WorkflowCfg,
     kept: &KeptContext,
-    r: &mut R,
+    r: &mut dyn Reporter,
 ) -> Result<(Vec<Row>, f64)> {
     let Some(plan) = epilogue_template(workflow)? else {
         return Ok((Vec::new(), 0.0));
@@ -250,17 +264,14 @@ pub(crate) fn run_epilogue<R: Reporter>(
     ));
     r.plan_event(&crate::plan::events::plan_admitted_event(&plan, None));
 
-    let mut runner = EpilogueRunner {
-        inner: crate::plan::harness::HarnessRunner {
-            args: args.clone(),
-            paths: p.clone(),
-            commit_per_task: false,
-            captured_bytes: std::sync::atomic::AtomicU64::new(0),
-            staged: Default::default(),
-            budget_left: f64::INFINITY,
-        },
-        kept: kept.to_value(),
-    };
+    // The executor derives inputs from dependencies, and the epilogue's roots have none, so the
+    // kept context rides in as a run input on every task.
+    let mut runner = harness_runner(args, p);
+    let files = crate::plan::files::CapturedFiles::new(&p.state);
+    let run_inputs = BTreeMap::from([(
+        TaskName::reserved(crate::plan::ir::KEPT_INPUT),
+        kept.to_value(),
+    )]);
     let mut task_events = Vec::new();
     let outcome = execute(
         &plan,
@@ -268,7 +279,11 @@ pub(crate) fn run_epilogue<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            files: Some(&files),
+            run_inputs: Some(&run_inputs),
+            ..ExecCfg::default()
+        },
         &mut runner,
         |task, result| {
             task_events.push(crate::plan::events::task_result_event(
@@ -329,82 +344,8 @@ pub(crate) fn run_epilogue<R: Reporter>(
     Ok((rows, outcome.spent_usd))
 }
 
-/// [`crate::plan::harness::HarnessRunner`] plus the kept-candidate input: the executor
-/// derives inputs from dependencies, and the epilogue's roots have none, so the kept
-/// context rides in here on every task.
-struct EpilogueRunner {
-    inner: crate::plan::harness::HarnessRunner,
-    kept: Value,
-}
-
-impl EpilogueRunner {
-    fn with_kept(&self, inputs: &BTreeMap<TaskName, Value>) -> BTreeMap<TaskName, Value> {
-        let mut inputs = inputs.clone();
-        inputs.insert(crate::plan::ir::KEPT_INPUT.into(), self.kept.clone());
-        inputs
-    }
-}
-
-impl TaskRunner for EpilogueRunner {
-    fn run(
-        &mut self,
-        task: &Task,
-        attempt: u32,
-        inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
-    ) -> Attempt {
-        let inputs = self.with_kept(inputs);
-        self.inner.run(task, attempt, &inputs, deadline)
-    }
-
-    fn run_many(
-        &mut self,
-        batch: &[BatchItem<'_>],
-        admission: &Admission,
-    ) -> Vec<Result<Attempt, Refusal>> {
-        let batch: Vec<BatchItem<'_>> = batch
-            .iter()
-            .map(|b| BatchItem {
-                task: b.task,
-                attempt: b.attempt,
-                inputs: self.with_kept(&b.inputs),
-            })
-            .collect();
-        self.inner.run_many(&batch, admission)
-    }
-
-    fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
-        self.inner.stage(task, producers)
-    }
-
-    fn settled(&mut self, task: &Task, passed: bool) {
-        self.inner.settled(task, passed);
-    }
-
-    fn has_captured_files(&self, task: &Task) -> bool {
-        self.inner.has_captured_files(task)
-    }
-
-    fn drop_captured(&mut self, task: &Task) {
-        self.inner.drop_captured(task);
-    }
-
-    fn budget_left(&mut self, usd: f64) {
-        self.inner.budget_left(usd);
-    }
-}
-
-/// What the propose task's post-turn drains decided, parked here for the driver: the
-/// executor only sees pass/fail, the loop control travels out of band.
-enum Signal {
-    Discard(String),
-    Escalate,
-    Park(crate::control::provisioning::PendingProvisioning),
-    Stop,
-}
-
 /// [`TaskRunner`] over the driver's trait objects, armed once per iteration.
-pub(crate) struct LoopTaskRunner<R: Reporter> {
+pub(crate) struct LoopTaskRunner<'a> {
     args: Args,
     p: Paths,
     world: Arc<dyn World>,
@@ -412,7 +353,7 @@ pub(crate) struct LoopTaskRunner<R: Reporter> {
     control: Option<Arc<control::bridge::ControlState>>,
     heartbeat: Option<Arc<crate::control::heartbeat::Heartbeat>>,
     pub(crate) started: Instant,
-    pub(crate) r: R,
+    pub(crate) r: &'a mut (dyn Reporter + Send),
     it: u32,
     prompt: String,
     resume_prompt: String,
@@ -421,7 +362,9 @@ pub(crate) struct LoopTaskRunner<R: Reporter> {
     best_score: f64,
     best_tiebreak: Option<f64>,
     spent_before: f64,
-    signal: Option<Signal>,
+    /// What the propose task's post-turn drains or a failed apply decided, parked here for the
+    /// driver: the executor only sees pass/fail, the loop control travels out of band.
+    signal: Option<IterStep>,
     measured: BTreeMap<TaskName, Measured>,
     decided: BTreeMap<TaskName, Decided>,
     fatal: Option<anyhow::Error>,
@@ -442,14 +385,14 @@ fn harness_runner(args: &Args, p: &Paths) -> crate::plan::harness::HarnessRunner
     }
 }
 
-impl<R: Reporter> LoopTaskRunner<R> {
+impl<'a> LoopTaskRunner<'a> {
     /// One runner per run. It owns the reporter for the run's whole life: the driver borrows
     /// the runner between iterations and the executor borrows it during one, so the two can
     /// never touch the reporter at the same time.
     pub(crate) fn new(
         args: &Args,
         p: &Paths,
-        r: R,
+        r: &'a mut (dyn Reporter + Send),
         world: Arc<dyn World>,
         judge: Arc<dyn Judge>,
         control: Option<Arc<control::bridge::ControlState>>,
@@ -509,65 +452,118 @@ impl<R: Reporter> LoopTaskRunner<R> {
         self.workflow_runner = harness_runner(&self.args, &self.p);
     }
 
-    fn propose(&mut self, task: &Task, prompt: &str) -> Attempt {
-        let turn = self.r.run_agent(
-            &self.args,
-            &self.p,
-            self.it,
+    /// The candidate turn, run by the workflow runner under `deadline`. Its session events and
+    /// provisional spend go to the reporter as it streams, and the agent is stopped once that
+    /// spend reaches the cost cap.
+    fn candidate(&mut self, task: &Task, deadline: Option<Deadline>) -> Attempt {
+        let Self {
+            args,
+            r,
+            it,
+            spent_before,
+            started,
+            heartbeat,
+            control,
             prompt,
-            Some(&self.resume_prompt),
-            task.session.as_deref(),
-            TurnBudget {
-                spent_before: self.spent_before,
-                started: self.started,
-                max_cost: crate::runloop::step::live_max_cost(&self.args, self.control.as_deref()),
-                heartbeat: self.heartbeat.clone(),
-            },
-        );
-        let cost = turn.cost;
+            resume_prompt,
+            workflow_runner,
+            ..
+        } = self;
+        let max_cost = crate::runloop::step::live_max_cost(args, control.as_deref());
+        let pricing = args.pricing();
+        let mut stopped = false;
+        let attempt =
+            workflow_runner.candidate_turn(task, prompt, resume_prompt, deadline, &mut |event| {
+                match event {
+                    CandidateEvent::Starting(session) => {
+                        r.agent_starting(*it, args.model(), session);
+                        if let Some(turn) = session {
+                            r.plan_event(&SessionEvent::AgentSession {
+                                session: turn.logical_name.clone(),
+                                action: turn.action(),
+                                turn: turn.completed_turns + 1,
+                            });
+                        }
+                        r.plan_event(&SessionEvent::AgentStart { iter: *it });
+                    }
+                    CandidateEvent::Line(line, stream, ev) => {
+                        r.agent_line(line, stream);
+                        let Some(ev) = ev else {
+                            return;
+                        };
+                        if let crate::agent::event::AgentEvent::Tokens(t) = ev {
+                            let spent = *spent_before + pricing.provisional(t);
+                            if let Some(heartbeat) = heartbeat {
+                                heartbeat.record(*it, spent);
+                            }
+                            r.plan_event(&SessionEvent::Budget {
+                                spent,
+                                elapsed_secs: started.elapsed().as_secs(),
+                            });
+                            if max_cost > 0.0 && spent >= max_cost && !stopped {
+                                stopped = true;
+                                r.note(&format!(
+                                "budget: provisional spend ${spent:.4} reached cap ${max_cost:.2} \
+                                 mid-turn — stopping the agent"
+                            ));
+                                crucible::deadline::terminate_live_children();
+                            }
+                        }
+                        r.plan_event(&SessionEvent::Agent { event: ev.clone() });
+                    }
+                }
+            });
+        r.plan_event(&SessionEvent::AgentDone);
+        attempt
+    }
+
+    /// Record what the candidate turn cost and read the markers it left. A turn whose transport
+    /// failed goes back to the executor to retry; one that passed is held by its markers.
+    fn after_turn(&mut self, attempt: Attempt) -> Attempt {
+        let cost = attempt.cost_usd;
         if let Some(control) = self.control.as_ref() {
             control.set_spend(self.spent_before + cost);
         }
         self.r
             .budget(self.spent_before + cost, self.started.elapsed());
-        let turn_verdict = crate::runloop::step::drain_turn_markers(
-            &mut self.r,
+        match &attempt.outcome {
+            AttemptOutcome::Pass(_) => {}
+            AttemptOutcome::Transport(failure) => {
+                self.r.note(&format!(
+                    "agent turn hit a transport error (retrying): {}",
+                    failure.note
+                ));
+                return attempt;
+            }
+            AttemptOutcome::Fail { note, .. } => {
+                self.r.note(&format!(
+                    "agent turn failed (discarding iter {}): {note}",
+                    self.it
+                ));
+                self.signal = Some(IterStep::Discarded {
+                    reason: "turn failed".to_string(),
+                });
+                return Attempt::failed(cost, "turn failed; iteration discarded".to_string());
+            }
+            _ => return attempt,
+        }
+        match crate::runloop::step::drain_turn_markers(
+            &mut *self.r,
             &self.p,
             self.control.as_deref(),
-            self.it,
-            &turn,
             &self.rows,
-        );
-        match turn_verdict {
-            TurnVerdict::Proceed => Attempt {
-                outcome: AttemptOutcome::Pass(serde_json::json!({ "cost_usd": cost })),
-                cost_usd: cost,
-                repairs: Vec::new(),
-            },
-            TurnVerdict::Discard => {
-                self.signal = Some(Signal::Discard("turn failed".to_string()));
-                Attempt::failed(cost, "turn failed; iteration discarded".to_string())
-            }
-            // Transport-class turn death: hand the executor a Transport outcome so
-            // `run_with_retries` re-runs the turn (the session resumes where it died).
-            TurnVerdict::Retry(why) => Attempt {
-                outcome: AttemptOutcome::Transport(TransportFailure::new(
-                    TransportCause::Provider,
-                    why,
-                )),
-                cost_usd: cost,
-                repairs: Vec::new(),
-            },
+        ) {
+            TurnVerdict::Proceed => attempt,
             TurnVerdict::Escalate => {
-                self.signal = Some(Signal::Escalate);
+                self.signal = Some(IterStep::Escalated);
                 Attempt::failed(cost, "agent escalated".to_string())
             }
             TurnVerdict::Park(pp) => {
-                self.signal = Some(Signal::Park(pp));
+                self.signal = Some(IterStep::Parked(pp));
                 Attempt::failed(cost, "parked on a pending approval".to_string())
             }
             TurnVerdict::Stop => {
-                self.signal = Some(Signal::Stop);
+                self.signal = Some(IterStep::Stopped);
                 Attempt::failed(cost, "stop signal".to_string())
             }
         }
@@ -582,7 +578,9 @@ impl<R: Reporter> LoopTaskRunner<R> {
                     "apply failed (discarding iter {}): {e:#}",
                     self.it
                 ));
-                self.signal = Some(Signal::Discard(format!("apply failed: {e:#}")));
+                self.signal = Some(IterStep::Discarded {
+                    reason: format!("apply failed: {e:#}"),
+                });
                 Attempt::failed(0.0, format!("apply failed: {e:#}"))
             }
         }
@@ -728,7 +726,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
     }
 }
 
-impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
+impl TaskRunner for LoopTaskRunner<'_> {
     fn run(
         &mut self,
         task: &Task,
@@ -746,8 +744,8 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
                 op: EngineOp::Propose,
                 ..
             } => {
-                let prompt = self.prompt.clone();
-                self.propose(task, &prompt)
+                let attempt = self.candidate(task, deadline);
+                self.after_turn(attempt)
             }
             TaskKind::Engine {
                 op: EngineOp::Apply,
@@ -795,14 +793,6 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
 
     fn settled(&mut self, task: &Task, passed: bool) {
         self.workflow_runner.settled(task, passed);
-    }
-
-    fn has_captured_files(&self, task: &Task) -> bool {
-        self.workflow_runner.has_captured_files(task)
-    }
-
-    fn drop_captured(&mut self, task: &Task) {
-        self.workflow_runner.drop_captured(task);
     }
 
     fn budget_left(&mut self, usd: f64) {
@@ -886,15 +876,16 @@ pub(crate) struct WideOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_wide_tournament<R: Reporter>(
+pub(crate) fn run_wide_tournament(
     cfg: &WideConfig,
     args: &Args,
     p: &Paths,
     prep: &Prepared,
-    r: &mut R,
+    r: &mut dyn Reporter,
     world: &Arc<dyn World>,
     judge: &Arc<dyn Judge>,
     baseline_score: f64,
+    time_left: Option<std::time::Duration>,
 ) -> Result<WideOutcome> {
     r.note(&format!(
         "wide round: fanning out {} candidates (top-{} advance)",
@@ -935,7 +926,10 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
             Default::default(),
             &crucible::inference::from_process_env()?,
         ),
-        ExecCfg::default(),
+        ExecCfg {
+            wall_clock: time_left,
+            ..ExecCfg::default()
+        },
         &mut runner,
         |task, result| {
             task_events.push(crate::plan::events::task_result_event(
@@ -1111,12 +1105,12 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
 
 /// [`TaskRunner`] for the wide template. Propose batches run threaded (one worktree per
 /// candidate); MeasureDiff serializes on the main workspace.
-struct WideRunner<'a, R: Reporter> {
+struct WideRunner<'a> {
     args: &'a Args,
     p: &'a Paths,
     world: Arc<dyn World>,
     judge: Arc<dyn Judge>,
-    r: &'a mut R,
+    r: &'a mut dyn Reporter,
     wide_dir: PathBuf,
     baseline_score: f64,
     approaches: BTreeMap<u32, String>,
@@ -1128,7 +1122,7 @@ struct WideRunner<'a, R: Reporter> {
     fatal: Option<anyhow::Error>,
 }
 
-impl<R: Reporter> WideRunner<'_, R> {
+impl WideRunner<'_> {
     fn restore_or_fatal(&mut self) -> bool {
         match self.world.restore(&self.snap) {
             Ok(()) => true,
@@ -1262,13 +1256,13 @@ impl<R: Reporter> WideRunner<'_, R> {
     }
 }
 
-impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
+impl TaskRunner for WideRunner<'_> {
     fn run(
         &mut self,
         task: &Task,
         _attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        _deadline: Option<Deadline>,
+        deadline: Option<Deadline>,
     ) -> Attempt {
         match &task.task {
             TaskKind::Agent { prompt, .. } => {
@@ -1290,8 +1284,11 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
                     &self.p.workspace,
                     &self.wide_dir,
                     self.p.skills.clone(),
-                    id,
-                    prompt,
+                    WideCandidate {
+                        id,
+                        prompt,
+                        deadline,
+                    },
                     &pending,
                 )
             }
@@ -1328,15 +1325,18 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
         };
         let (args, workspace, wide_dir, skills) =
             (self.args, &self.p.workspace, &self.wide_dir, &self.p.skills);
-        admission.run_all(batch, |b, _lane| {
+        admission.run_all(batch, |b, lane| {
             match (&b.task.task, candidate_id(&b.task.name)) {
                 (TaskKind::Agent { prompt, .. }, Some(id)) => wide_propose(
                     args,
                     workspace,
                     wide_dir,
                     skills.clone(),
-                    id,
-                    prompt,
+                    WideCandidate {
+                        id,
+                        prompt,
+                        deadline: lane.deadline(),
+                    },
                     &pending,
                 ),
                 _ => Attempt::failed(0.0, "non-agent task in a propose batch".to_string()),
@@ -1349,15 +1349,26 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
 /// staged diff as the task output, clean up. The diff text is the only thing that leaves
 /// the worktree. Wide turns are not streamed and their cost is not booked against the run
 /// budget.
+/// One wide candidate: its id, the prompt that biases it, and when its turn must be over by.
+struct WideCandidate<'a> {
+    id: u32,
+    prompt: &'a str,
+    deadline: Option<Deadline>,
+}
+
 fn wide_propose(
     args: &Args,
     workspace: &Path,
     wide_dir: &Path,
     skills: Option<PathBuf>,
-    id: u32,
-    prompt: &str,
+    candidate: WideCandidate<'_>,
     pending: &str,
 ) -> Attempt {
+    let WideCandidate {
+        id,
+        prompt,
+        deadline,
+    } = candidate;
     if STOP.load(Ordering::SeqCst) {
         return pass(serde_json::json!({ "diff": "" }));
     }
@@ -1367,7 +1378,19 @@ fn wide_propose(
     }
     let cand_paths = Paths::for_worktree(worktree.clone(), skills);
     let _ = std::fs::create_dir_all(&cand_paths.state);
-    let turn = agent::run_turn(args, &cand_paths, prompt, false, |_line, _stream, _ev| {});
+    let turn = agent::run_turn_with_session(
+        args,
+        &cand_paths,
+        prompt,
+        false,
+        None,
+        deadline,
+        |_line, _stream, _ev| {},
+    );
+    if let Some(crate::agent::turn::TurnFailure::DeadlineExceeded(deadline)) = turn.failure() {
+        let _ = std::fs::remove_dir_all(&worktree);
+        return Attempt::timed_out(turn.cost_usd, *deadline);
+    }
     if let Some(failure) = turn.failure() {
         let _ = std::fs::remove_dir_all(&worktree);
         return Attempt::failed(turn.cost_usd, failure.to_string());
@@ -1416,65 +1439,9 @@ mod tests {
     /// The point of the ownership lift: an executor can hold the runner without borrowing the
     /// driver's frame, so the loop's graph is no longer welded to the process that started it.
     #[test]
-    fn the_loop_task_runner_is_send_and_static() {
-        const fn assert_send_static<T: Send + 'static>() {}
-        assert_send_static::<LoopTaskRunner<crate::report::console::ConsoleReporter>>();
-    }
-
-    /// The one-task plan the forwarding tests pull a `Task` out of.
-    fn task_named(name: &str) -> Task {
-        let plan: crate::plan::ir::Plan = toml::from_str(&format!(
-            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"{name}\"\nkind = \"command\"\ncommand = \"true\"\nemits_files = [\"out.txt\"]\n"
-        ))
-        .unwrap();
-        plan.validate()
-            .unwrap()
-            .tasks_topo()
-            .find(|t| t.name.0 == name)
-            .unwrap()
-            .clone()
-    }
-
-    fn harness_runner(state: &Path) -> crate::plan::harness::HarnessRunner {
-        crate::plan::harness::HarnessRunner {
-            args: <crate::cli::Cli as Parser>::try_parse_from(["crucible"])
-                .unwrap()
-                .run,
-            paths: crate::args::Paths::for_manifest(
-                state.to_path_buf(),
-                state.to_path_buf(),
-                state,
-                None,
-            ),
-            commit_per_task: false,
-            captured_bytes: std::sync::atomic::AtomicU64::new(0),
-            staged: Default::default(),
-            budget_left: f64::INFINITY,
-        }
-    }
-
-    /// An epilogue task consumes what the main graph declared, so the wrapper has to answer
-    /// from the runner that did the capturing. Inheriting the trait default reports `false`
-    /// for a set that is on disk, and the executor then stages nothing into `inputs/`.
-    #[test]
-    fn an_epilogue_runner_answers_captured_files_from_its_inner_runner() {
-        let dir = tempfile::tempdir().unwrap();
-        let task = task_named("probe");
-        std::fs::create_dir_all(dir.path().join("files").join("probe")).unwrap();
-
-        let runner = EpilogueRunner {
-            inner: harness_runner(dir.path()),
-            kept: Value::Null,
-        };
-
-        assert!(
-            runner.has_captured_files(&task),
-            "the epilogue wrapper reported no captured set for a task whose files are on disk"
-        );
-        assert!(
-            !runner.has_captured_files(&task_named("never-ran")),
-            "the wrapper claimed a captured set for a task that captured nothing"
-        );
+    fn the_loop_task_runner_is_send() {
+        const fn assert_send<T: Send>() {}
+        assert_send::<LoopTaskRunner<'static>>();
     }
 
     /// Epilogue tasks stay out of the per-iteration plan entirely (legacy splice and
@@ -1849,6 +1816,16 @@ mod tests {
         wide: bool,
         workflow: Option<&str>,
     ) -> RunTrace {
+        run_counter_within(iterations, bump, wide, workflow, "")
+    }
+
+    fn run_counter_within(
+        iterations: u32,
+        bump: &str,
+        wide: bool,
+        workflow: Option<&str>,
+        max_time: &str,
+    ) -> RunTrace {
         // A counter, not a timestamp: two tests starting in the same microsecond would get
         // the same name, and the first thing this does is remove_dir_all.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1921,6 +1898,7 @@ mod tests {
         args.agent_backend = manifest::AgentBackend::Command;
         args.agent_cmd = m.agent.agent_cmd.clone();
         args.iterations = iterations;
+        args.max_time = max_time.into();
         args.search = m.search.clone();
         args.workflow = m.workflow.clone();
 
@@ -1944,13 +1922,13 @@ mod tests {
                 digest: "v2:0".into(),
             },
         };
-        let world = m.build_world(workspace.clone());
+        let world = m.build_world(workspace.clone()).unwrap();
         let judge = m.build_judge(workspace.clone(), Vec::new()).unwrap();
         let r = stream::SessionReporter::stream(&p, report::reporter::RunMeta::from_args(&args))
             .unwrap();
         let (_r, outcome) = run_loop(&args, &p, &prep, r, &world, &judge, LoopRuntime::default());
         let outcome = outcome.unwrap();
-        if workflow.is_none() {
+        if workflow.is_none() && max_time.is_empty() {
             assert!(outcome.improved, "the counter bump must be kept");
         }
 
@@ -2059,6 +2037,17 @@ mod tests {
             4,
             "one terminal result per template task"
         );
+        let bracket: Vec<&str> = t
+            .kinds
+            .iter()
+            .map(String::as_str)
+            .filter(|k| matches!(*k, "agent_start" | "agent_done"))
+            .collect();
+        assert_eq!(
+            bracket,
+            ["agent_start", "agent_done"],
+            "the candidate turn is bracketed for the recovery classifier"
+        );
     }
 
     #[test]
@@ -2106,6 +2095,29 @@ mod tests {
             7 + 4,
             "3 proposes + 3 measures + pick, then the 4 deep-round tasks"
         );
+    }
+
+    /// The wide round's candidate turns run under what is left of the run's wall clock, like
+    /// the deep loop's: a candidate that hangs is killed when it runs out, and the run stops on
+    /// its time cap instead of waiting on the turn.
+    #[test]
+    fn a_hung_wide_candidate_is_killed_when_the_runs_wall_clock_runs_out() {
+        let started = std::time::Instant::now();
+        let t = run_counter_within(
+            1,
+            "#!/bin/sh
+sleep 60
+",
+            true,
+            None,
+            "3s",
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(40),
+            "the hung candidates held the run for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(t.shutdown, "budget", "{}", describe(&t));
     }
 
     #[test]

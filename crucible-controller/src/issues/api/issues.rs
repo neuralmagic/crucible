@@ -95,7 +95,7 @@ impl IssuesQuery {
 pub(crate) async fn list_issues(
     State(state): State<ApiState>,
     Query(q): Query<IssuesQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let q = match q.into_model() {
         Ok(q) => q,
         Err(msg) => {
@@ -153,7 +153,7 @@ fn tally(values: impl Iterator<Item = String>) -> Vec<FacetCount> {
 pub(crate) async fn issue_facets(
     State(state): State<ApiState>,
     Query(q): Query<IssuesQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let base = match q.into_model() {
         Ok(q) => q,
         Err(msg) => {
@@ -246,7 +246,7 @@ pub(crate) async fn issue_facets(
 pub(crate) async fn get_issue(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     match issue_detail(&state.db, &key, state.agent_tools).await? {
         Some(detail) => Ok(Json(detail).into_response()),
         None => Ok(not_found(format!("issue not found: {key}"))),
@@ -271,7 +271,7 @@ pub(crate) async fn get_issue(
 pub(crate) async fn get_issue_journey(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     match crate::issues::journey::assemble_journey(&state.db, &key).await? {
         Some(journey) => Ok(Json(journey).into_response()),
         None => Ok(not_found(format!("issue not found: {key}"))),

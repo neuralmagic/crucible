@@ -279,6 +279,27 @@ pub(crate) fn issue_from_row(row: &sqlx::postgres::PgRow) -> Result<Issue> {
     })
 }
 
+/// Point a parked issue that was parked from `parked_from` back at `to` for its unpark: the
+/// dispatch it was parked during never started.
+pub(crate) async fn rewind_pre_park(
+    ex: impl PgExecutor<'_>,
+    key: &str,
+    parked_from: Status,
+    to: Status,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE issues SET pre_park_status = $3 \
+          WHERE key = $1 AND status = 'parked' AND pre_park_status = $2",
+    )
+    .bind(key)
+    .bind(parked_from.as_str())
+    .bind(to.as_str())
+    .execute(ex)
+    .await
+    .context("rewind_pre_park")?;
+    Ok(())
+}
+
 /// Record the cluster this issue's work dispatches onto. Written by the launch that chose it,
 /// from the set that launcher was authorized for; NULL means the controller's configured default.
 #[tracing::instrument(name = "db.set_dispatch_target", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]
@@ -2072,6 +2093,7 @@ pub(crate) mod tests {
             created_by: Some("wren"),
             launcher_groups: None,
             rerun: None,
+            dispatch: Default::default(),
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-2";
         assert!(matches!(
@@ -2097,6 +2119,65 @@ pub(crate) mod tests {
             .await?,
             AdoptPlaybookOutcome::UnknownPlaybook
         ));
+        Ok(())
+    }
+
+    /// The launch's issue is dispatchable from the adopt's commit on, so the cluster and model it
+    /// was launched with are written in that same transaction: no dispatch can read the row
+    /// without them and fall back to the configured default.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_adopted_launch_carries_its_dispatch_pin_from_its_first_commit(
+        pool: PgPool,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz,
+                                      tar_digest, tar_bytes, params_schema, schema_digest,
+                                      core_rev, created_by, created_at, updated_at)
+               VALUES ('survey', 'reads a paper', 'owner/packs', 'main', 'abc123', '', $1,
+                       'sha256:tar', 3, '{"type":"object"}'::jsonb, 'sha256:form', 'core1',
+                       'wren', '2026-08-23T00:00:00Z', '2026-08-23T00:00:00Z')"#,
+        )
+        .bind(vec![1u8, 2, 3])
+        .execute(&pool)
+        .await?;
+        let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+        let params = serde_json::json!({});
+        let key = "playbook:survey:0199c0de-7c2c-71a5-8000-4";
+        assert!(matches!(
+            adopt_playbook_launch(
+                &pool,
+                key,
+                &NewPlaybookLaunch {
+                    playbook: "survey",
+                    repo: "owner/packs",
+                    title: "reads a paper",
+                    params: &params,
+                    schema_digest: "sha256:form",
+                    max_cost: 1.0,
+                    max_time: &max_time,
+                    advance_dedupe: false,
+                    dedupe_schedule: None,
+                    origin: crate::model::LaunchOrigin::Manual,
+                    draft_version: None,
+                    created_by: Some("wren"),
+                    launcher_groups: None,
+                    rerun: None,
+                    dispatch: crate::launches::model::DispatchPin {
+                        target: Some("wharf"),
+                        provider: Some("openai"),
+                        model: Some("gpt-5"),
+                    },
+                },
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+            )
+            .await?,
+            AdoptPlaybookOutcome::Adopted
+        ));
+        let issue = get_issue(&pool, key).await?.expect("row");
+        assert_eq!(issue.status, Status::New);
+        assert_eq!(issue.dispatch_target.as_deref(), Some("wharf"));
+        assert_eq!(issue.agent_provider.as_deref(), Some("openai"));
+        assert_eq!(issue.agent_model.as_deref(), Some("gpt-5"));
         Ok(())
     }
 
@@ -2200,6 +2281,7 @@ pub(crate) mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                     rerun: None,
+                    dispatch: Default::default(),
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )

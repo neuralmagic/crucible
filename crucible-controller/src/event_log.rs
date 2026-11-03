@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 /// One transition line. `reason`/`evidence`/`actor` are always present (null when absent) so the
 /// shape is stable for a reader; `ts` is RFC3339 (jiff), matching the session log's stamp format.
 /// `actor` (an additive v1 field — older lines simply lack the key) is the human a transition
-/// traces back to: the oauth2-proxy identity on an override, null for the machine's own moves.
+/// traces back to: the caller's identity on an override, null for the machine's own moves.
 #[derive(Debug, Serialize)]
 pub struct Event<'a> {
     pub(crate) v: i64,

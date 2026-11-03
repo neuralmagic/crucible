@@ -21,7 +21,7 @@ use std::path::Path;
 pub struct PackAgent {
     pub backend: String,
     pub sandbox_image: Option<String>,
-    /// The `[agent]` harness as written (`claude`, `hermes`, `codex`), when the manifest names one.
+    /// The `[agent]` harness as written (`claude`, `codex`, `opencode`, `pi`), when the manifest names one.
     pub harness: Option<String>,
     /// `[agent.requires]`: predicate -> version range the sandbox image must satisfy.
     pub requires: BTreeMap<String, String>,

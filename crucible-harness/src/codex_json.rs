@@ -6,8 +6,9 @@
 //! function its owner installs. Lines with an unmodeled `type`, and non-JSON lines, pass through as
 //! [`AgentEvent::Raw`] so a viewer never loses output to schema drift.
 
+use crate::line::{LineFormat, lines_of, raw};
 use crate::stream_json::{TOOL_IO_LIMIT, bounded_input, str_field, truncate_chars, u64_field};
-use crucible_contract::event::{AgentEvent, RawStream, Tokens};
+use crucible_contract::event::{AgentEvent, Tokens};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -60,22 +61,13 @@ impl CodexJsonParser {
     pub fn thread_id(&self) -> Option<&str> {
         self.thread_id.as_deref()
     }
+}
 
-    /// Decode one line of `codex exec --json`, returning every [`AgentEvent`] it completed.
-    pub fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        let mut out = Vec::new();
-        let line = line.trim();
-        if line.is_empty() {
-            return out;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            out.push(raw(line));
-            return out;
-        };
-
+impl LineFormat for CodexJsonParser {
+    fn line(&mut self, msg: &Value, text: &str, out: &mut Vec<AgentEvent>) {
         match msg.get("type").and_then(Value::as_str) {
             Some("thread.started") => {
-                let id = str_field(&msg, "thread_id");
+                let id = str_field(msg, "thread_id");
                 self.thread_id = (!id.is_empty()).then_some(id);
                 out.push(AgentEvent::Init {
                     model: self.model.clone(),
@@ -96,24 +88,25 @@ impl CodexJsonParser {
             }
             Some("item.completed") => {
                 if let Some(item) = msg.get("item") {
-                    self.item(item, &mut out);
+                    self.item(item, out);
                 }
             }
-            Some("turn.completed") => self.turn_completed(&msg, &mut out),
+            Some("turn.completed") => self.turn_completed(msg, out),
             Some("turn.failed") => {
                 let message = error_message(msg.get("error").unwrap_or(&Value::Null));
-                self.fail(message, &mut out);
-                self.turn_completed(&msg, &mut out);
+                self.fail(message, out);
+                self.turn_completed(msg, out);
             }
             Some("error") => {
                 let message = error_message(msg.get("error").unwrap_or(&Value::Null));
-                self.fail(message, &mut out);
+                self.fail(message, out);
             }
-            _ => out.push(raw(line)),
+            _ => out.push(raw(text)),
         }
-        out
     }
+}
 
+impl CodexJsonParser {
     /// A completed work item: assistant text, reasoning, or a tool call.
     fn item(&mut self, item: &Value, out: &mut Vec<AgentEvent>) {
         let kind = str_field(item, "type");
@@ -355,18 +348,6 @@ fn error_message(v: &Value) -> String {
     }
 }
 
-/// Split a block of assistant text into one event per line, dropping a trailing newline's
-/// empty tail so one line is one event.
-fn lines_of(text: &str) -> Vec<String> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    text.trim_end_matches('\n')
-        .split('\n')
-        .map(str::to_string)
-        .collect()
-}
-
 /// A JSON value rendered for a summary line: strings bare, everything else serialized.
 fn compact(v: &Value) -> String {
     match v {
@@ -375,16 +356,10 @@ fn compact(v: &Value) -> String {
     }
 }
 
-fn raw(line: &str) -> AgentEvent {
-    AgentEvent::Raw {
-        text: line.to_string(),
-        stream: RawStream::Stdout,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crucible_contract::event::RawStream;
 
     /// Pricing stand-in: $1/MTok in, $10/MTok out, cached reads a tenth of input.
     fn price(_model: &str, t: &Tokens) -> f64 {

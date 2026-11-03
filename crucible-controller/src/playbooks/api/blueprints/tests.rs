@@ -8,7 +8,6 @@
 use crate::api::router;
 use crate::api::state::ApiState;
 use crate::client::Db;
-use crate::daemon::queue::{Override, OverrideSink};
 use crate::secrets::store;
 use crate::secrets::vault::dev::{DevVault, uniq};
 use crate::testing::call;
@@ -19,17 +18,11 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-struct NoSink;
-
-impl OverrideSink for NoSink {
-    fn submit(&self, _ov: Override) {}
-}
-
 fn app(pool: PgPool, vault: Option<Arc<crate::secrets::vault::VaultClient>>) -> Router {
     router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["root".into()], vec![], vec![]),
         vault,
-        ..ApiState::test(Db::new(pool), Arc::new(NoSink))
+        ..ApiState::test(Db::new(pool))
     })
 }
 

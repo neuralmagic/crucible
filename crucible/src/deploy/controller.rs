@@ -11,9 +11,9 @@
 //! `ControllerCfg` (env-fallback) reads.
 
 use crate::deploy::profile::{ControllerCfg, DeployProfile};
-use crate::deploy::render::{
-    MANAGED_BY_LABEL, RenderOpts, node_avoid_affinity, pin_image, role_binding,
-};
+use crate::deploy::render::kube::resources;
+use crate::deploy::render::pod::ProfilePod;
+use crate::deploy::render::{MANAGED_BY_LABEL, RenderOpts, pin_image, role_binding};
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1 as apps;
 use k8s_openapi::api::core::v1 as core;
@@ -165,33 +165,26 @@ fn deployment(profile: &DeployProfile, cfg: &ControllerCfg, image: &str) -> apps
                 match_labels: Some(labels()),
                 ..Default::default()
             },
-            template: core::PodTemplateSpec {
-                metadata: Some(ObjectMeta {
-                    labels: Some(labels()),
-                    annotations: Some(BTreeMap::from([(
-                        "sidecar.istio.io/inject".to_string(),
-                        "false".to_string(),
-                    )])),
-                    ..Default::default()
-                }),
-                spec: Some(core::PodSpec {
-                    image_pull_secrets: Some(vec![core::LocalObjectReference {
-                        name: profile.image.pull_secret.clone(),
-                    }]),
-                    service_account_name: Some(profile.cluster.service_account.clone()),
-                    affinity: node_avoid_affinity(profile),
-                    containers: vec![container],
-                    volumes: Some(vec![core::Volume {
-                        name: "state".to_string(),
-                        persistent_volume_claim: Some(core::PersistentVolumeClaimVolumeSource {
-                            claim_name: format!("{NAME}-state"),
-                            ..Default::default()
-                        }),
+            template: ProfilePod {
+                profile,
+                labels: labels(),
+                service_account: profile.cluster.service_account.clone(),
+                automount_token: None,
+                restart: None,
+                host_aliases: None,
+            }
+            .template(
+                vec![container],
+                None,
+                Some(vec![core::Volume {
+                    name: "state".to_string(),
+                    persistent_volume_claim: Some(core::PersistentVolumeClaimVolumeSource {
+                        claim_name: format!("{NAME}-state"),
                         ..Default::default()
-                    }]),
+                    }),
                     ..Default::default()
-                }),
-            },
+                }]),
+            ),
             ..Default::default()
         }),
         ..Default::default()
@@ -233,21 +226,6 @@ fn env(cfg: &ControllerCfg, pod_namespace: &str) -> Vec<core::EnvVar> {
             cfg.caps.daily_cost_ceiling_usd.to_string(),
         ),
     ]
-}
-
-fn resources(profile: &DeployProfile) -> core::ResourceRequirements {
-    let r = &profile.resources;
-    core::ResourceRequirements {
-        requests: Some(BTreeMap::from([
-            ("cpu".to_string(), Quantity(r.cpu_request.clone())),
-            ("memory".to_string(), Quantity(r.mem_request.clone())),
-        ])),
-        limits: Some(BTreeMap::from([
-            ("cpu".to_string(), Quantity(r.cpu_limit.clone())),
-            ("memory".to_string(), Quantity(r.mem_limit.clone())),
-        ])),
-        ..Default::default()
-    }
 }
 
 /// Cluster-internal `Service` fronting the controller's HTTP API/debug UI (the listener isn't

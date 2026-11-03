@@ -1,11 +1,11 @@
 use crate::agent::activity::ActivityFeed;
 use crate::agent::event::{AgentEvent, RawStream};
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv, process_env};
 use crate::agent::turn::TurnOutcome;
 use crate::agent::{self};
 use crate::args::Paths;
 use crate::cli::check::{self, CheckOutcome};
 use crate::cli::init::MANIFEST_FILE;
-use crate::deploy::ProposeTier;
 use crate::identity::{self, RunIdentity};
 use crate::manifest;
 use crate::manifest::AgentBackend;
@@ -18,6 +18,7 @@ use crate::scope::refine::{self, MIN_PROPOSED_SELFTEST_RUNS};
 use crate::scope::transcript::{transcript_event, transcript_note, write_seed_context};
 use anyhow::{Context, Result};
 use clap::Parser;
+use crucible_contract::Tier;
 use crucible_contract::refine::{
     Attack, FailureEvidence, RoundKind, RoundOutcome, RoundRecord, render_rounds_json,
 };
@@ -204,7 +205,7 @@ pub struct ProposeOpts {
     pub gaming_refine_rounds: u32,
     /// The ranker's confirmed tier for this issue, rendered into the prompt's
     /// `{{TIER}}` slot. Defaults to `T0` (back-compat) when the caller doesn't set it.
-    pub tier: ProposeTier,
+    pub tier: Tier,
     /// The real agent backend for the propose/refine/adversary turns (`--agent-backend`):
     /// `local` on a laptop, `openshell` in a turn pod whose sandbox image carries the claude
     /// CLI. `agent_cmd_override` wins over this, same precedence as `rank-grounded`.
@@ -221,6 +222,8 @@ pub struct ProposeOpts {
     /// The goal is an authoritative brief (`--authoritative`): the propose/refine prompts tell
     /// the agent to carry its prescriptions into `goal.md` intact instead of de-prescribing them.
     pub authoritative: bool,
+    /// The engine runtime an openshell turn runs on.
+    pub engine: Option<tokio::runtime::Handle>,
 }
 
 /// Stage 2 (`--propose` only): one agent turn drafts the pack into `ctx.pack`. Runs after
@@ -888,7 +891,7 @@ fn render_propose_prompt(
     goal: &str,
     out_dir: &Path,
     repo: &str,
-    tier: ProposeTier,
+    tier: Tier,
     authoritative: bool,
 ) -> String {
     let contract = if authoritative {
@@ -918,9 +921,16 @@ fn turn_args(opts: &ProposeOpts) -> crate::args::Args {
     }
     args.sandbox_image = opts.sandbox_image.clone();
     args.compute_driver = opts.compute_driver;
+    args.engine = opts.engine.clone();
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead.
-    crate::openshell::run::relay_vertex_env(&mut args.env);
+    let mut env = SandboxEnv::default();
+    env.relay(
+        EnvSource::VertexRelay,
+        crate::openshell::policy::VERTEX_RELAY_KEYS.iter().copied(),
+        process_env,
+    );
+    args.env = env.into_vars();
     args
 }
 
@@ -1568,12 +1578,13 @@ mod tests {
             refine_rounds: 3,
             skip_gaming_review: true,
             gaming_refine_rounds: 1,
-            tier: ProposeTier::T0,
+            tier: Tier::T0,
             agent_backend: AgentBackend::Local,
             sandbox_image: None,
             progress: false,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
             authoritative: false,
+            engine: None,
         }
     }
 
@@ -2049,7 +2060,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, score, trace, measurem
         let manifest_path = dir.join(MANIFEST_FILE);
         let manifest = fs::read_to_string(&manifest_path).unwrap().replace(
             "backend = \"command\"",
-            "backend = \"local\"\n            harness = \"hermes\"",
+            "backend = \"local\"\n            harness = \"codex\"",
         );
         fs::write(&manifest_path, manifest).unwrap();
         fs::write(
@@ -2070,7 +2081,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             .iter()
             .find(|stage| stage.name == StageName::Validate)
             .expect("validate stage");
-        assert!(!validate.passed, "Hermes cannot resume Claude sessions");
+        assert!(!validate.passed, "Codex cannot resume Claude sessions");
         assert!(
             validate.detail.contains("agent.session.persist"),
             "{validate:?}"
@@ -3705,7 +3716,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         write_exec(&script, &t1_proposer());
 
         let mut opts = propose_opts(&repo, &script);
-        opts.tier = ProposeTier::T1;
+        opts.tier = Tier::T1;
         let report = execute(&out, None, Some(&goal_file), None, false, Some(opts));
         assert!(
             report.stages.iter().all(|s| s.passed),
@@ -3731,7 +3742,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "fix it",
             &out,
             "https://example.invalid/x.git",
-            ProposeTier::T0,
+            Tier::T0,
             false,
         );
         assert!(t0.contains("Confirmed tier: T0"), "{t0}");
@@ -3739,7 +3750,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "fix it",
             &out,
             "https://example.invalid/x.git",
-            ProposeTier::T1,
+            Tier::T1,
             false,
         );
         assert!(t1.contains("Confirmed tier: T1"), "{t1}");
@@ -3747,8 +3758,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
-        let refine_t1 =
-            refine::render_refine_prompt("fix it", &out, &evidence, 2, ProposeTier::T1, false);
+        let refine_t1 = refine::render_refine_prompt("fix it", &out, &evidence, 2, Tier::T1, false);
         assert!(refine_t1.contains("Confirmed tier: T1"), "{refine_t1}");
     }
 
@@ -3772,7 +3782,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             panic!("expected Scope");
         };
         assert_eq!(args.tier, None, "no --tier flag on the CLI");
-        assert_eq!(args.tier.unwrap_or_default(), ProposeTier::T0);
+        assert_eq!(args.tier.unwrap_or(Tier::T0), Tier::T0);
     }
 
     /// Like [`git_repo_fixture`] but with an `origin` remote set, mirroring a turn pod's
@@ -4149,13 +4159,8 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     #[test]
     fn scope_prompts_forbid_prescribing_the_fix() {
         let out = PathBuf::from("/tmp/does-not-need-to-exist-for-rendering");
-        let propose = render_propose_prompt(
-            "fix it",
-            &out,
-            "https://x.invalid/x.git",
-            ProposeTier::T0,
-            false,
-        );
+        let propose =
+            render_propose_prompt("fix it", &out, "https://x.invalid/x.git", Tier::T0, false);
         assert!(
             propose.contains("frame the problem, NEVER the fix"),
             "propose prompt keeps the de-prescribe contract"
@@ -4167,8 +4172,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
-        let refine =
-            refine::render_refine_prompt("fix it", &out, &evidence, 2, ProposeTier::T0, false);
+        let refine = refine::render_refine_prompt("fix it", &out, &evidence, 2, Tier::T0, false);
         assert!(
             refine.contains("Keep `goal.md` de-prescribed"),
             "refine prompt keeps the de-prescribe guardrail"
@@ -4181,8 +4185,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     fn authoritative_prompts_preserve_the_briefs_prescriptions() {
         let out = PathBuf::from("/tmp/does-not-need-to-exist-for-rendering");
         let goal = "swap the lookup path's allocator for a pooled arena";
-        let propose =
-            render_propose_prompt(goal, &out, "https://x.invalid/x.git", ProposeTier::T1, true);
+        let propose = render_propose_prompt(goal, &out, "https://x.invalid/x.git", Tier::T1, true);
         assert!(propose.contains(goal), "the brief rides verbatim");
         assert!(
             propose.contains("authoritative brief"),
@@ -4205,7 +4208,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let evidence = crucible_contract::refine::FailureEvidence::Structure {
             detail: "no [judge.selftest] table".to_string(),
         };
-        let refine = refine::render_refine_prompt(goal, &out, &evidence, 2, ProposeTier::T1, true);
+        let refine = refine::render_refine_prompt(goal, &out, &evidence, 2, Tier::T1, true);
         assert!(
             refine.contains("carries an authoritative brief"),
             "refine prompt keeps the brief intact across rounds: {refine}"

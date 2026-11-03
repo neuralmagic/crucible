@@ -31,13 +31,17 @@ fn free_addr() -> Result<SocketAddr> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?)
 }
 
+/// The open dev guard every surface test runs behind.
+const DEV: &[(&str, &str)] = &[("CONTROLLER_DEV_IDENTITY", "surface")];
+
 /// The autopilot on `db`, with its http and webhook surfaces at `api` and `hooks`, its state under
-/// `dir`, its log in `dir/controller.log`, and no cluster to reach.
+/// `dir`, its log in `dir/controller.log`, no cluster to reach, and `env` on top.
 fn autopilot(
     db: &str,
     api: SocketAddr,
     hooks: SocketAddr,
     dir: &Path,
+    env: &[(&str, &str)],
 ) -> Result<tokio::process::Child> {
     let log = std::fs::File::create(dir.join("controller.log"))?;
     tokio::process::Command::new(env!("CARGO_BIN_EXE_crucible-controller"))
@@ -51,6 +55,7 @@ fn autopilot(
         .env("CONTROLLER_HOOKS_ADDR", hooks.to_string())
         .env("CONTROLLER_STATE_DIR", dir.join("state"))
         .env("CONTROLLER_SCRATCH_DIR", dir.join("scratch"))
+        .envs(env.iter().copied())
         .env("RUST_LOG", "info")
         .env("NO_COLOR", "1")
         .stdin(Stdio::null())
@@ -78,7 +83,7 @@ async fn a_taken_webhook_port_fails_startup_with_a_nonzero_exit() -> Result<()> 
     let dir = tempfile::tempdir()?;
     let taken = TcpListener::bind("127.0.0.1:0")?;
     let hooks = taken.local_addr()?;
-    let mut child = autopilot(&db, free_addr()?, hooks, dir.path())?;
+    let mut child = autopilot(&db, free_addr()?, hooks, dir.path(), DEV)?;
     let status = exit_of(&mut child, STARTUP).await?;
     let log = log_of(dir.path());
     assert!(!status.success(), "exited {status}:\n{log}");
@@ -95,7 +100,7 @@ async fn a_taken_api_port_fails_startup_with_a_nonzero_exit() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let taken = TcpListener::bind("127.0.0.1:0")?;
     let api = taken.local_addr()?;
-    let mut child = autopilot(&db, api, free_addr()?, dir.path())?;
+    let mut child = autopilot(&db, api, free_addr()?, dir.path(), DEV)?;
     let status = exit_of(&mut child, STARTUP).await?;
     let log = log_of(dir.path());
     assert!(!status.success(), "exited {status}:\n{log}");
@@ -113,7 +118,7 @@ async fn sigterm_stops_the_autopilot_cleanly_and_frees_its_ports() -> Result<()>
     let db = ledger("surface_sigterm").await?;
     let dir = tempfile::tempdir()?;
     let (api, hooks) = (free_addr()?, free_addr()?);
-    let mut child = autopilot(&db, api, hooks, dir.path())?;
+    let mut child = autopilot(&db, api, hooks, dir.path(), DEV)?;
     let http = reqwest::Client::new();
     let deadline = tokio::time::Instant::now() + STARTUP;
     loop {
@@ -152,5 +157,43 @@ async fn sigterm_stops_the_autopilot_cleanly_and_frees_its_ports() -> Result<()>
     );
     TcpListener::bind(api).context("the http port is free after the exit")?;
     TcpListener::bind(hooks).context("the webhook port is free after the exit")?;
+    Ok(())
+}
+
+/// A controller with no way to name anyone (no issuer, no static token, no dev identity) and one
+/// still configured for a removed auth path both refuse to start, and the exit says why.
+#[tokio::test]
+async fn an_unconfigured_or_retired_auth_setup_refuses_to_start() -> Result<()> {
+    for (name, env, refusal) in [
+        ("surface_no_identity", &[][..], "no identity is configured"),
+        (
+            "surface_proxy_mode",
+            &[
+                ("CONTROLLER_DEV_IDENTITY", "surface"),
+                ("CONTROLLER_AUTH_MODE", "proxy"),
+            ][..],
+            "CONTROLLER_AUTH_MODE is set, but proxy auth mode was removed",
+        ),
+        (
+            "surface_proxy_token",
+            &[
+                ("CONTROLLER_API_TOKEN", "machine"),
+                ("CONTROLLER_PROXY_TOKEN", "edge-secret"),
+            ][..],
+            "CONTROLLER_PROXY_TOKEN is set",
+        ),
+    ] {
+        let db = ledger(name).await?;
+        let dir = tempfile::tempdir()?;
+        let mut child = autopilot(&db, free_addr()?, free_addr()?, dir.path(), env)?;
+        let status = exit_of(&mut child, STARTUP).await?;
+        let log = log_of(dir.path());
+        assert!(!status.success(), "{name} exited {status}:\n{log}");
+        assert!(log.contains(refusal), "{name}:\n{log}");
+        assert!(
+            !log.contains("edge-secret"),
+            "{name} logged the token:\n{log}"
+        );
+    }
     Ok(())
 }

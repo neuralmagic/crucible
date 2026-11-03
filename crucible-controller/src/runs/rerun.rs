@@ -33,6 +33,17 @@ pub(crate) enum RerunRefusal {
     Internal(#[from] anyhow::Error),
 }
 
+impl From<RerunRefusal> for crate::api::state::ApiError {
+    fn from(refusal: RerunRefusal) -> Self {
+        use crate::api::state::ApiError;
+        match refusal {
+            RerunRefusal::NoRun(_) => ApiError::NotFound(refusal.to_string()),
+            RerunRefusal::Internal(e) => ApiError::Internal(e),
+            other => ApiError::Unprocessable(other.to_string()),
+        }
+    }
+}
+
 /// One task a rerun reuses, as the parent settled it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct ReusedTaskDto {
@@ -553,10 +564,7 @@ mod tests {
         pin(&pool, WORKFLOW).await;
         crate::testing::launch_playbook(&pool, "playbook:survey:1").await;
         finished_run(&pool, "run-parent", "playbook:survey:1", &session(WORKFLOW)).await;
-        let app = crate::api::router(crate::api::state::ApiState::test(
-            Db::new(pool.clone()),
-            std::sync::Arc::new(NoSink),
-        ));
+        let app = crate::api::router(crate::api::state::ApiState::test(Db::new(pool.clone())));
         let get = |uri: &'static str| {
             let app = app.clone();
             async move {
@@ -592,12 +600,6 @@ mod tests {
         );
         let (status, _) = get("/api/runs/%2E%2E/rerun").await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    struct NoSink;
-
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
     }
 
     fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {

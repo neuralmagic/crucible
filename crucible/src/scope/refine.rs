@@ -115,7 +115,7 @@ pub fn render_refine_prompt(
     out_dir: &std::path::Path,
     evidence: &FailureEvidence,
     round: u32,
-    tier: crate::deploy::ProposeTier,
+    tier: crucible_contract::Tier,
     authoritative: bool,
 ) -> String {
     let guard = if authoritative {

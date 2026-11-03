@@ -1,16 +1,20 @@
-//! An in-process gateway on a loopback port serving the provider and provider-profile RPCs the
-//! way the OpenShell gateway does: import is create-only and reports a taken id as an
+//! An in-process gateway on a loopback port serving the provider, provider-profile, and sandbox
+//! RPCs the way the OpenShell gateway does: import is create-only and reports a taken id as an
 //! `already exists` diagnostic, update is guarded by the stored resource version and answers a
-//! stale one with `Aborted`, `CreateProvider` answers a taken name with `AlreadyExists`, and a
-//! profile is stored the way the gateway's import normalizes it.
+//! stale one with `Aborted`, `CreateProvider` answers a taken name with `AlreadyExists`, a
+//! profile is stored the way the gateway's import normalizes it, and a sandbox is created,
+//! reported, and deleted as the test configures.
 
 use crate::openshell::grpc::Gateway;
+use openshell_core::proto::datamodel::v1::ObjectMeta;
 use openshell_core::proto::{
-    CreateProviderRequest, GetProviderProfileRequest, GetProviderRequest,
+    CreateProviderRequest, CreateSandboxRequest, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeletionOutcome, GetProviderProfileRequest, GetProviderRequest, GetSandboxRequest,
     ImportProviderProfilesRequest, ImportProviderProfilesResponse, Provider,
     ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileDiagnostic,
-    ProviderProfileResponse, ProviderResponse, UpdateProviderProfilesRequest,
-    UpdateProviderProfilesResponse, UpdateProviderRequest,
+    ProviderProfileResponse, ProviderResponse, Sandbox, SandboxPhase, SandboxResponse,
+    SandboxStatus, UpdateProviderProfilesRequest, UpdateProviderProfilesResponse,
+    UpdateProviderRequest,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,8 +67,8 @@ struct Store {
     writes: Writes,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct ProfileGateway {
+#[derive(Clone)]
+pub(crate) struct FakeGateway {
     store: Arc<Mutex<Store>>,
     /// Profile reads still to be held until this many are in flight together.
     held_reads: Arc<AtomicUsize>,
@@ -73,11 +77,52 @@ pub(crate) struct ProfileGateway {
     rival: bool,
     /// Imports fail validation and write nothing.
     reject_imports: bool,
+    /// What `CreateSandbox` answers: the new sandbox's id, or a refusal.
+    create: Result<&'static str, tonic::Code>,
+    /// The phase every `GetSandbox` reports.
+    phase: SandboxPhase,
+    /// Every name `DeleteSandbox` was asked for, in order.
+    deleted: Arc<Mutex<Vec<String>>>,
 }
 
-impl ProfileGateway {
+impl Default for FakeGateway {
+    fn default() -> Self {
+        Self {
+            store: Arc::default(),
+            held_reads: Arc::default(),
+            read_barrier: None,
+            rival: false,
+            reject_imports: false,
+            create: Ok(""),
+            phase: SandboxPhase::Ready,
+            deleted: Arc::default(),
+        }
+    }
+}
+
+impl FakeGateway {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    /// Answer `CreateSandbox` with `create` instead of an id-less sandbox.
+    pub(crate) fn creating(mut self, create: Result<&'static str, tonic::Code>) -> Self {
+        self.create = create;
+        self
+    }
+
+    /// Report every sandbox in `phase`.
+    pub(crate) fn in_phase(mut self, phase: SandboxPhase) -> Self {
+        self.phase = phase;
+        self
+    }
+
+    /// The sandbox names deleted so far.
+    pub(crate) fn deleted(&self) -> Vec<String> {
+        self.deleted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Hold the first `n` profile reads until all `n` are in flight, so `n` concurrent callers
@@ -320,11 +365,11 @@ fn response_form(mut stored: ProviderProfile) -> ProviderProfile {
     stored
 }
 
-impl tonic::server::NamedService for ProfileGateway {
+impl tonic::server::NamedService for FakeGateway {
     const NAME: &'static str = "openshell.v1.OpenShell";
 }
 
-impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for ProfileGateway {
+impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for FakeGateway {
     type Response = tonic::codegen::http::Response<tonic::body::Body>;
     type Error = std::convert::Infallible;
     type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
@@ -399,6 +444,67 @@ impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> f
                         Unary(move |r: tonic::Request<UpdateProviderRequest>| {
                             let resp = this.update_provider(r.into_inner());
                             async move { resp.map(tonic::Response::new) }
+                        }),
+                        req,
+                    )
+                    .await
+                }
+                "/openshell.v1.OpenShell/CreateSandbox" => {
+                    let create = this.create;
+                    unary(
+                        Unary(move |_: tonic::Request<CreateSandboxRequest>| async move {
+                            create
+                                .map(|id| {
+                                    tonic::Response::new(SandboxResponse {
+                                        sandbox: Some(Sandbox {
+                                            metadata: Some(ObjectMeta {
+                                                id: id.to_string(),
+                                                ..Default::default()
+                                            }),
+                                            ..Sandbox::default()
+                                        }),
+                                        ..SandboxResponse::default()
+                                    })
+                                })
+                                .map_err(|code| tonic::Status::new(code, "create refused"))
+                        }),
+                        req,
+                    )
+                    .await
+                }
+                "/openshell.v1.OpenShell/GetSandbox" => {
+                    let phase = this.phase;
+                    unary(
+                        Unary(move |_: tonic::Request<GetSandboxRequest>| async move {
+                            Ok(tonic::Response::new(SandboxResponse {
+                                sandbox: Some(Sandbox {
+                                    status: Some(SandboxStatus {
+                                        phase: phase.into(),
+                                        ..SandboxStatus::default()
+                                    }),
+                                    ..Sandbox::default()
+                                }),
+                                ..SandboxResponse::default()
+                            }))
+                        }),
+                        req,
+                    )
+                    .await
+                }
+                "/openshell.v1.OpenShell/DeleteSandbox" => {
+                    unary(
+                        Unary(move |r: tonic::Request<DeleteSandboxRequest>| {
+                            let deleted = this.deleted.clone();
+                            async move {
+                                deleted
+                                    .lock()
+                                    .map_err(|e| tonic::Status::internal(e.to_string()))?
+                                    .push(r.into_inner().name);
+                                Ok(tonic::Response::new(DeleteSandboxResponse {
+                                    outcome: DeletionOutcome::Completed.into(),
+                                    ..DeleteSandboxResponse::default()
+                                }))
+                            }
                         }),
                         req,
                     )

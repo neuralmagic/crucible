@@ -5,7 +5,6 @@ use crate::issues::model::{AwaitingApproval, InputKind, Issue, KeptPr, RepoHealt
 use crate::model::LedgerDay;
 use crate::runs::model::{Candidate, Run, TaskName};
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -844,7 +843,7 @@ pub async fn funnel_dto(db: &Db) -> anyhow::Result<FunnelDto> {
     path = "/api/funnel",
     responses((status = 200, description = "Fleet-wide pipeline funnel stage counts", body = FunnelDto))
 )]
-pub(crate) async fn funnel(State(state): State<ApiState>) -> Result<Json<FunnelDto>, AppError> {
+pub(crate) async fn funnel(State(state): State<ApiState>) -> Result<Json<FunnelDto>, ApiError> {
     let dto = funnel_dto(&state.db).await?;
     Ok(Json(dto))
 }
@@ -1060,36 +1059,28 @@ pub async fn overview_dto(db: &Db, caps: Option<&Caps>) -> anyhow::Result<Overvi
 }
 
 pub(crate) fn not_found(msg: impl Into<String>) -> Response {
-    (StatusCode::NOT_FOUND, Json(ErrorBody { error: msg.into() })).into_response()
+    ApiError::NotFound(msg.into()).into_response()
 }
 
 pub(crate) fn forbidden(msg: impl Into<String>) -> Response {
-    (StatusCode::FORBIDDEN, Json(ErrorBody::new(msg.into()))).into_response()
+    ApiError::Forbidden(msg.into()).into_response()
 }
 
 pub(crate) fn conflict(msg: impl Into<String>) -> Response {
-    (StatusCode::CONFLICT, Json(ErrorBody::new(msg.into()))).into_response()
+    ApiError::Conflict(msg.into()).into_response()
 }
 
 pub(crate) fn bad_gateway(msg: impl Into<String>) -> Response {
-    (StatusCode::BAD_GATEWAY, Json(ErrorBody::new(msg.into()))).into_response()
+    ApiError::BadGateway(msg.into()).into_response()
 }
 
 pub(crate) fn unavailable(msg: impl Into<String>) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(ErrorBody::new(msg.into())),
-    )
-        .into_response()
+    ApiError::Unavailable(msg.into()).into_response()
 }
 
 /// A refusal of what the caller sent, in the same shape as [`not_found`].
 pub(crate) fn bad_request(msg: impl Into<String>) -> Response {
-    (
-        StatusCode::BAD_REQUEST,
-        Json(ErrorBody { error: msg.into() }),
-    )
-        .into_response()
+    ApiError::BadRequest(msg.into()).into_response()
 }
 
 #[cfg(feature = "autoresearch")]
@@ -1111,11 +1102,7 @@ pub struct AutopilotSetBody {
 }
 
 pub(crate) fn unprocessable(msg: impl Into<String>) -> Response {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(ErrorBody::new(msg.into())),
-    )
-        .into_response()
+    ApiError::Unprocessable(msg.into()).into_response()
 }
 
 /// Reduce a pasted GitHub URL to the `owner/repo` slug the rest of the controller keys on
@@ -1194,18 +1181,8 @@ pub(crate) fn require_non_empty(fields: &[(&str, &str)]) -> Option<String> {
     }
 }
 
-/// The field-level rejection body: which form inputs the pack's schema refused, and why.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct ValidationErrorBody {
-    pub error: String,
-    pub fields: Vec<crate::playbooks::registry::FieldError>,
-}
-
 pub(crate) fn invalid_fields(fields: Vec<crate::playbooks::registry::FieldError>) -> Response {
-    refused(
-        "the supplied parameters do not satisfy the playbook's schema",
-        fields,
-    )
+    ApiError::invalid_fields(fields).into_response()
 }
 
 /// A 422 with its own headline. The field list carries the detail either way; the headline names
@@ -1215,14 +1192,11 @@ pub(crate) fn refused(
     error: &str,
     fields: Vec<crate::playbooks::registry::FieldError>,
 ) -> Response {
-    (
-        StatusCode::UNPROCESSABLE_ENTITY,
-        Json(ValidationErrorBody {
-            error: error.to_string(),
-            fields,
-        }),
-    )
-        .into_response()
+    ApiError::Invalid {
+        error: error.to_string(),
+        fields,
+    }
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1470,7 +1444,7 @@ mod tests {
     /// to the field that produced it.
     #[test]
     fn playbook_validation_errors_carry_a_field_and_a_message() {
-        let body = crate::api::dto::ValidationErrorBody {
+        let body = crate::api::state::ValidationErrorBody {
             error: "the supplied parameters do not satisfy the playbook's schema".to_string(),
             fields: vec![crate::playbooks::registry::FieldError {
                 field: "topic".to_string(),

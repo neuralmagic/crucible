@@ -7,7 +7,7 @@ use crucible_contract::TransportCause;
 use crucible_contract::decision::{CompiledQuestion, QuestionId};
 use serde_json::Value;
 
-use crate::plan::exec::{Attempt, AttemptOutcome};
+use crate::plan::attempt::{Attempt, AttemptOutcome};
 use crate::plan::ir::{Task, TaskName};
 use crate::plan::options::asked_questions;
 

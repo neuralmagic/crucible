@@ -10,7 +10,7 @@
 //!        └────────▶ sleep min(until due, probe interval), or until woken ──────┘
 //! ```
 
-use crate::daemon::queue::{DueSource, Enqueue};
+use crate::daemon::queue::{DueSource, WorkQueue};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +32,7 @@ pub struct LaunchLoopCfg {
 /// every held row.
 pub async fn run(
     source: Arc<dyn DueSource>,
-    enqueue: Arc<dyn Enqueue>,
+    queue: WorkQueue,
     cfg: LaunchLoopCfg,
     wake: Arc<Notify>,
 ) {
@@ -43,7 +43,7 @@ pub async fn run(
         let ids: Vec<String> = held.keys().cloned().collect();
         let sleep = match source.next_due(ids.clone()).await {
             Ok(Some(due)) if due <= jiff::Timestamp::now() => {
-                match source.pass(enqueue.clone(), ids).await {
+                match source.pass(queue.clone(), ids).await {
                     Ok(pass) => {
                         let until = Instant::now() + (cfg.hold)();
                         held.extend(pass.held.into_iter().map(|id| (id, until)));
@@ -80,7 +80,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use crate::daemon::launch_loop::{LaunchLoopCfg, run};
-    use crate::daemon::queue::{BoxFuture, DueSource, Enqueue, IssueKey, Pass};
+    use crate::daemon::queue::{BoxFuture, DueSource, Pass, WorkQueue};
     use jiff::{SignedDuration, Timestamp};
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
@@ -142,18 +142,12 @@ mod tests {
             Box::pin(async move { Ok(answer.map(|offset| Timestamp::now() + offset)) })
         }
 
-        fn pass(&self, _: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<anyhow::Result<Pass>> {
+        fn pass(&self, _: WorkQueue, held: Vec<String>) -> BoxFuture<anyhow::Result<Pass>> {
             self.passed.lock().unwrap().push(held);
             self.passed_notify.notify_waiters();
             let pass = self.passes.lock().unwrap().pop_front().unwrap_or_default();
             Box::pin(async move { Ok(pass) })
         }
-    }
-
-    struct NoQueue;
-
-    impl Enqueue for NoQueue {
-        fn enqueue(&self, _: IssueKey) {}
     }
 
     fn spawn(
@@ -164,7 +158,7 @@ mod tests {
         let wake = Arc::new(Notify::new());
         let handle = tokio::spawn(run(
             script.clone(),
-            Arc::new(NoQueue),
+            WorkQueue::new(),
             LaunchLoopCfg {
                 probe,
                 hold: Arc::new(move || hold),

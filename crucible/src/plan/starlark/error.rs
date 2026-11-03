@@ -433,11 +433,8 @@ pub enum CompileError {
          them interleaves a single transcript."
     )]
     OverWithSession { task: String, session: String },
-    #[error(
-        "task name {task:?} contains `[` or `]`. Those are reserved for a mapped node's \
-         instances, which are named `node[item]`."
-    )]
-    BracketInTaskName { task: String },
+    #[error(transparent)]
+    TaskName(#[from] crate::plan::ir::TaskNameError),
     #[error("task {task:?} declares max_fanout without \"over\"; there is nothing to bound")]
     FanoutWithoutOver { task: String },
     #[error("\"max_rounds\" must be an integer")]

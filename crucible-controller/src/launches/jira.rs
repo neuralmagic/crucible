@@ -16,7 +16,7 @@ use crate::daemon::queue::BoxFuture;
 #[cfg(feature = "autoresearch")]
 use crate::launches::tracker::TrackerIssue;
 use crate::launches::tracker::{
-    EmittedKind, IssueEmitter, NewTrackerIssue, TrackerHit, TrackerQueryError,
+    EmittedKind, IssueEmitter, NewTrackerIssue, TrackerHit, TrackerKind, TrackerQueryError,
 };
 use anyhow::{Context, Result, bail};
 use std::time::Duration;
@@ -238,10 +238,11 @@ fn render_watermark(raw: &str) -> Result<String> {
     Ok(slacked.strftime("%Y-%m-%d %H:%M").to_string())
 }
 
-/// The impl owns ordering (the trait promises oldest-first), so a stored query bringing its own
-/// ORDER BY would nest invalidly inside the parens — reject it up front.
-impl crate::launches::tracker::TrackerSearch for JiraTracker {
-    fn check_query(&self, query: &str) -> std::result::Result<(), TrackerQueryError> {
+impl JiraTracker {
+    /// Refuse a query the sweep could never run before it is stored. The search owns ordering
+    /// (hits come oldest-first), so a query bringing its own ORDER BY would nest invalidly inside
+    /// the parens.
+    pub(crate) fn check_query(&self, query: &str) -> std::result::Result<(), TrackerQueryError> {
         if query.trim().is_empty() {
             return Err(TrackerQueryError::Empty);
         }
@@ -251,19 +252,6 @@ impl crate::launches::tracker::TrackerSearch for JiraTracker {
         Ok(())
     }
 
-    fn search(
-        &self,
-        query: &str,
-        watermark: Option<&str>,
-    ) -> crate::daemon::queue::BoxFuture<Result<Vec<TrackerHit>>> {
-        let this = self.clone();
-        let query = query.to_string();
-        let watermark = watermark.map(str::to_string);
-        Box::pin(async move { this.search(&query, watermark.as_deref()).await })
-    }
-}
-
-impl JiraTracker {
     pub(crate) fn new(cfg: JiraConfig) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent("crucible-controller-jira")
@@ -337,9 +325,14 @@ impl JiraTracker {
         })
     }
 
-    /// The watch trigger's page walk: oldest-first hits at or after the watermark.
-    async fn search(&self, query: &str, watermark: Option<&str>) -> Result<Vec<TrackerHit>> {
-        <Self as crate::launches::tracker::TrackerSearch>::check_query(self, query)?;
+    /// The watch trigger's page walk: hits at or after `watermark` (the tracker's native
+    /// update-time string, or RFC 3339), oldest-first; the whole query when `None`.
+    pub(crate) async fn search(
+        &self,
+        query: &str,
+        watermark: Option<&str>,
+    ) -> Result<Vec<TrackerHit>> {
+        self.check_query(query)?;
         let jql = match watermark {
             Some(w) => format!(
                 "({query}) AND updated >= \"{}\" ORDER BY updated ASC",
@@ -556,27 +549,40 @@ impl IssueEmitter for JiraEmitter {
     }
 }
 
-/// The trackers the controller config carries credentials for: Jira when the `jira_*` trio is
-/// set. Nothing else exists yet.
-pub fn trackers(jira: Option<JiraConfig>) -> crate::launches::tracker::Trackers {
-    let mut trackers = crate::launches::tracker::Trackers::default();
-    if let Some(cfg) = jira {
-        match JiraTracker::new(cfg) {
-            Ok(tracker) => {
-                trackers = trackers.with(
-                    crate::launches::tracker::TrackerKind::Jira,
-                    std::sync::Arc::new(tracker),
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = format!("{e:#}"),
-                    "trackers: Jira client build failed"
-                );
-            }
+/// The trackers this deployment holds credentials for. A watch save refuses a kind that is not
+/// here, and the sweep skips one that went away.
+#[derive(Clone, Default)]
+pub struct Trackers {
+    pub(crate) jira: Option<JiraTracker>,
+}
+
+impl Trackers {
+    pub(crate) fn get(&self, kind: TrackerKind) -> Option<&JiraTracker> {
+        match kind {
+            TrackerKind::Jira => self.jira.as_ref(),
         }
     }
-    trackers
+
+    /// The kinds a watch may name here.
+    pub(crate) fn configured(&self) -> Vec<TrackerKind> {
+        self.jira.iter().map(|_| TrackerKind::Jira).collect()
+    }
+}
+
+/// The trackers the controller config carries credentials for: Jira when the `jira_*` trio is
+/// set. Nothing else exists yet.
+pub fn trackers(jira: Option<JiraConfig>) -> Trackers {
+    let jira = jira.and_then(|cfg| match JiraTracker::new(cfg) {
+        Ok(tracker) => Some(tracker),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "trackers: Jira client build failed"
+            );
+            None
+        }
+    });
+    Trackers { jira }
 }
 
 #[cfg(test)]
@@ -584,7 +590,7 @@ mod tests {
     #[cfg(feature = "autoresearch")]
     use crate::issues::model::InputKind;
     use crate::launches::jira::*;
-    use crate::launches::tracker::{TrackerQueryError, TrackerSearch};
+    use crate::launches::tracker::TrackerQueryError;
     use std::sync::{Arc, Mutex};
 
     /// Serve canned JSON bodies over real HTTP, one per connection, capturing each raw request.

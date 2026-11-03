@@ -518,6 +518,12 @@ pub enum MaterializeError {
         #[source]
         cause: toml_edit::TomlError,
     },
+    #[error("reading [workflow].env from manifest {}", .path.display())]
+    DeclaredEnv {
+        path: PathBuf,
+        #[source]
+        cause: toml::de::Error,
+    },
     #[error("serializing the workflow block")]
     Serialize(#[from] toml::ser::Error),
     #[error(
@@ -764,7 +770,9 @@ fn constructor(
             tasks,
             file: None,
             resolved_from: None,
+            edition: Default::default(),
             params: BTreeMap::new(),
+            env: crate::host_env::DeclaredEnv::default(),
             history_record,
         };
         workflow.validate()?;
@@ -1253,7 +1261,9 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         tasks,
         file: None,
         resolved_from: None,
+        edition: Default::default(),
         params: BTreeMap::new(),
+        env: crate::host_env::DeclaredEnv::default(),
         history_record: None,
     };
     workflow.validate()?;
@@ -1900,15 +1910,10 @@ fn take_value(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Value> 
         })
 }
 
-/// A task's name as the author wrote it. Brackets are reserved for a mapped node's synthesized
-/// instance names, so a declared name carrying one is refused here, where the diagnostic can
-/// point at the constructor.
+/// A task's name as the author wrote it, refused here so the diagnostic points at the
+/// constructor rather than at the assembled graph.
 fn take_declared_name(named: &mut BTreeMap<String, Value>, key: &str) -> Result<TaskName> {
-    let raw = take_string(named, key)?;
-    if raw.contains(['[', ']']) {
-        return Err(CompileError::BracketInTaskName { task: raw });
-    }
-    Ok(TaskName(raw))
+    Ok(TaskName::declared(&take_string(named, key)?)?)
 }
 
 fn take_string(named: &mut BTreeMap<String, Value>, name: &str) -> Result<String> {
@@ -2335,12 +2340,45 @@ pub fn materialize_manifest(
         #[serde(rename = "type")]
         workflow_type: WorkflowType,
         file: &'a str,
+        #[serde(skip_serializing_if = "crate::host_env::DeclaredEnv::is_empty")]
+        env: &'a crate::host_env::DeclaredEnv,
     }
 
     #[derive(serde::Serialize)]
     struct ManifestWorkflowReference<'a> {
         workflow: WorkflowReference<'a>,
     }
+
+    /// The `[workflow]` key a compiled graph cannot state, which the manifest keeps.
+    #[derive(serde::Deserialize)]
+    struct DeclaredWorkflow {
+        #[serde(default)]
+        workflow: Option<DeclaredWorkflowEnv>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DeclaredWorkflowEnv {
+        #[serde(default)]
+        env: crate::host_env::DeclaredEnv,
+    }
+
+    let manifest = std::fs::read_to_string(manifest_path)
+        .map_err(FileError::at("reading manifest", manifest_path))?;
+    let mut document: DocumentMut =
+        manifest
+            .parse()
+            .map_err(|cause| MaterializeError::ParseManifest {
+                path: manifest_path.to_path_buf(),
+                cause,
+            })?;
+    let env = toml::from_str::<DeclaredWorkflow>(&manifest)
+        .map_err(|cause| MaterializeError::DeclaredEnv {
+            path: manifest_path.to_path_buf(),
+            cause,
+        })?
+        .workflow
+        .map(|workflow| workflow.env)
+        .unwrap_or_default();
 
     let manifest_dir = parent_or_cwd(manifest_path);
     let compiled = compile_file_with(source_path, manifest_dir, params)?;
@@ -2352,6 +2390,7 @@ pub fn materialize_manifest(
                 workflow: WorkflowReference {
                     workflow_type: compiled.workflow.workflow_type,
                     file: &file,
+                    env: &env,
                 },
             })?,
         )
@@ -2359,19 +2398,13 @@ pub fn materialize_manifest(
         (
             "\n# Generated from workflow.star. Edit the Starlark source; scope recompiles it.\n",
             toml::to_string(&ManifestWorkflow {
-                workflow: &compiled.workflow,
+                workflow: &WorkflowCfg {
+                    env,
+                    ..compiled.workflow.clone()
+                },
             })?,
         )
     };
-    let manifest = std::fs::read_to_string(manifest_path)
-        .map_err(FileError::at("reading manifest", manifest_path))?;
-    let mut document: DocumentMut =
-        manifest
-            .parse()
-            .map_err(|cause| MaterializeError::ParseManifest {
-                path: manifest_path.to_path_buf(),
-                cause,
-            })?;
     document.remove("workflow");
     let mut materialized = document.to_string();
     if !materialized.ends_with('\n') {
@@ -5566,6 +5599,29 @@ workflow(type = "playbook", tasks = [discover, audit])
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    /// A task name becomes a directory under `state/files/` and `inputs/`, so a name that climbs
+    /// out of either is refused at the constructor that declared it, with its location.
+    #[test]
+    fn a_task_name_that_escapes_its_directory_is_refused_where_it_is_declared() {
+        let pack = temp_pack("escaping-name");
+        for (name, expect) in [
+            ("..", "relative path component"),
+            ("/etc", "(try \"-etc\")"),
+            ("a/b", "(try \"a-b\")"),
+            ("", "empty name"),
+        ] {
+            let source = format!(
+                "\nlint = command(\n    name = {name:?},\n    run = \"./f.sh\",\n)\nworkflow(type = \"playbook\", tasks = [lint])\n"
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack).expect_err(name),
+            );
+            assert!(error.contains("workflow.star:2:8"), "{name:?}: {error}");
+            assert!(error.contains(expect), "{name:?}: {error}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
     /// A fan-out reads its items from a dependency, and says how wide it may get before it runs.
     #[test]
     fn a_fanout_must_depend_on_its_producer_and_declare_its_width() {
@@ -6087,6 +6143,134 @@ workflow(type = "playbook", tasks = [a])
             assert!(error.contains(expected), "{decl}: {error}");
             assert!(error.contains("parameter \"x\""), "{decl}: {error}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// An edition-2 manifest that declares host env in all three tables, required and optional.
+    const EDITION_TWO_MANIFEST: &str = r#"# kept
+edition = 2
+
+[repo]
+path = "."
+
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "g"
+
+[judge]
+measure_cmd = "./m"
+direction = "higher"
+env = ["KUBECONFIG", "EPP_ENDPOINT?"]
+
+[world]
+apply_cmd = "./a"
+env = ["REGISTRY_AUTH_FILE", "KUBE_NAMESPACE?"]
+
+[workflow]
+type = "custom"
+file = "workflow.star"
+env = ["GH_TOKEN", "GPUS?"]
+"#;
+
+    fn declared_env(env: &crate::host_env::DeclaredEnv) -> Vec<String> {
+        env.iter().map(ToString::to_string).collect()
+    }
+
+    /// The `[workflow]` table is rewritten from the compiled graph, and its `env` list is a
+    /// manifest key the graph cannot state, so materializing keeps it, as it keeps the edition
+    /// and the other tables' lists. Losing it would hand the workflow's commands the base alone.
+    #[test]
+    fn materializing_keeps_the_edition_and_every_declared_env_list() {
+        let constant = "t = command(name = \"t\", run = \"true\")\nworkflow(type = \"custom\", result = \"t\", tasks = [t])\n";
+        let parameterised = "params = {\"g\": {\"type\": \"string\", \"default\": \"hi\"}}\nt = command(name = \"t\", run = \"echo \" + param(\"g\"))\nworkflow(type = \"custom\", result = \"t\", tasks = [t])\n";
+        for (tag, source, declares_params) in [
+            ("materialize-env-constant", constant, false),
+            ("materialize-env-params", parameterised, true),
+        ] {
+            let pack = temp_pack(tag);
+            std::fs::write(pack.join("workflow.star"), source).unwrap();
+            let manifest_path = pack.join("crucible.toml");
+            std::fs::write(&manifest_path, EDITION_TWO_MANIFEST).unwrap();
+
+            let compiled = materialize_manifest(
+                &pack.join("workflow.star"),
+                &manifest_path,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(compiled.declares_params, declares_params);
+            let text = std::fs::read_to_string(&manifest_path).unwrap();
+            assert!(text.starts_with("# kept\nedition = 2\n"), "{text}");
+
+            let mut m = crate::manifest::Manifest::load(&manifest_path)
+                .unwrap_or_else(|e| panic!("{tag}: {e:#}\n{text}"));
+            assert_eq!(m.edition, crate::manifest::edition::Edition::Two, "{tag}");
+            let judge = m.judge.as_ref().unwrap();
+            assert_eq!(
+                declared_env(&judge.env),
+                ["KUBECONFIG", "EPP_ENDPOINT?"],
+                "{tag}"
+            );
+            assert_eq!(
+                declared_env(&m.world.env),
+                ["REGISTRY_AUTH_FILE", "KUBE_NAMESPACE?"],
+                "{tag}"
+            );
+            m.resolve_workflow(&pack).unwrap();
+            let workflow = m.workflow.as_ref().unwrap();
+            assert_eq!(
+                declared_env(&workflow.env),
+                ["GH_TOKEN", "GPUS?"],
+                "{tag}\n{text}"
+            );
+            assert_eq!(
+                workflow.edition,
+                crate::manifest::edition::Edition::Two,
+                "{tag}"
+            );
+            assert_eq!(workflow.tasks.len(), 1, "{tag}");
+
+            materialize_manifest(
+                &pack.join("workflow.star"),
+                &manifest_path,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&manifest_path).unwrap(),
+                text,
+                "{tag}: materializing again changes nothing"
+            );
+            let _ = std::fs::remove_dir_all(&pack);
+        }
+    }
+
+    /// A manifest whose `[workflow].env` would not load is refused before anything is written.
+    #[test]
+    fn a_malformed_workflow_env_refuses_materialization_and_writes_nothing() {
+        let pack = temp_pack("materialize-env-bad");
+        std::fs::write(
+            pack.join("workflow.star"),
+            "workflow(type = \"playbook\", tasks = [command(name = \"a\", run = \"true\")])\n",
+        )
+        .unwrap();
+        let manifest = "edition = 2\n[workflow]\ntype = \"playbook\"\nenv = [\"A??\"]\n";
+        std::fs::write(pack.join("crucible.toml"), manifest).unwrap();
+        let error = crate::errors::report(
+            &materialize_manifest(
+                &pack.join("workflow.star"),
+                &pack.join("crucible.toml"),
+                &BTreeMap::new(),
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("reading [workflow].env"), "{error}");
+        assert!(error.contains("\"A??\" ends in more than one"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(pack.join("crucible.toml")).unwrap(),
+            manifest
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

@@ -1,17 +1,18 @@
-//! `crux` — the crucible controller as a CLI. Every subcommand is one operation over
-//! [`crate::ops`], the same code the controller's hosted MCP tools run.
+//! `crux` — the crucible controller as a CLI. Every subcommand is one [`crate::ops`] operation,
+//! the same struct the controller's hosted MCP tools decode.
 //!
 //! Start with a minted key: `export CONTROLLER_API_TOKEN=crk_…`, or `api_token` in the config
 //! file.
 
 #![allow(clippy::disallowed_macros)]
 
-use crate::client::{AdoptBody, Client};
+use crate::client::Client;
 use crate::config::ConnectArgs;
-use crate::ops;
+use crate::ops::{self, Operation};
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::io::Read;
+use std::time::Duration;
 
 /// A token-frugal CLI for the crucible controller.
 #[derive(Parser)]
@@ -27,1112 +28,484 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Who the controller thinks you are, and how you got there.
-    Whoami,
+    Whoami(ops::Whoami),
 
     /// List registered playbooks: what `launch` can start.
-    Playbooks {
-        #[arg(long)]
-        json: bool,
-    },
+    Playbooks(ops::playbooks::Playbooks),
 
     /// The admin caps on `--max-cost` and `--max-time`. Read before `launch` or `draft-launch`.
-    PlaybookCaps {
-        #[arg(long)]
-        json: bool,
-    },
+    PlaybookCaps(ops::playbooks::PlaybookCaps),
 
     /// The JSON Schema a playbook's params are validated against. Read before `launch`.
-    PlaybookSchema {
-        /// Playbook id.
-        id: String,
-    },
+    PlaybookSchema(ops::playbooks::PlaybookSchema),
 
     /// Launch a playbook. Costs money against --max-cost.
-    Launch {
-        /// Playbook id.
-        id: String,
-        /// The params object its schema accepts, as JSON.
-        #[arg(long, default_value = "{}")]
-        params: String,
-        /// Dollar ceiling for this launch.
-        #[arg(long)]
-        max_cost: f64,
-        /// Wall-clock ceiling, e.g. 30m, 2h.
-        #[arg(long)]
-        max_time: String,
-        /// Cluster to dispatch onto. Omit for the controller's default.
-        #[arg(long)]
-        dispatch_target: Option<String>,
-        /// Registered inference provider the run's agent talks to, replacing the pack manifest's
-        /// `[agent]` harness. Omit to resolve through the configured defaults.
-        #[arg(long)]
-        provider: Option<String>,
-        /// The model to ask that provider for. Needs --provider; omit for its default.
-        #[arg(long, requires = "provider")]
-        model: Option<String>,
-        /// Rerun this finished run of the same pack instead of starting afresh: every task it
-        /// passed is reused, and the tasks --from names run again with everything after them.
-        #[arg(long, value_name = "RUN")]
-        rerun_of: Option<String>,
-        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
-        #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
-        from: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Launch(ops::playbooks::Launch),
 
     /// Playbook launches: key, playbook, status, count, cost against cap, and what stopped one.
-    PlaybookRuns {
-        #[arg(long)]
-        status: Option<String>,
-        #[arg(long)]
-        playbook: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    PlaybookRuns(ops::playbooks::PlaybookRuns),
 
     /// One playbook launch whole, as JSON.
-    PlaybookRun {
-        /// Issue key the launch became.
-        key: String,
-    },
+    PlaybookRun(ops::playbooks::PlaybookRun),
 
     /// The runs leaderboard.
-    Runs {
-        #[arg(long)]
-        status: Option<String>,
-        /// Repository, owner/repo.
-        #[arg(long)]
-        repo: Option<String>,
-        /// Only runs dispatched to this cluster target.
-        #[arg(long)]
-        dispatch_target: Option<String>,
-        #[arg(long)]
-        limit: Option<i64>,
-        #[arg(long)]
-        json: bool,
-    },
+    Runs(ops::runs::Runs),
 
     /// One run with its candidates, as JSON.
-    Run {
-        run_id: String,
-    },
+    Run(ops::runs::Run),
 
     /// Recurrences: what fires when, and what is blocked on an owner signing in.
-    Schedules {
-        #[arg(long)]
-        json: bool,
-    },
+    Schedules(ops::launches::Schedules),
 
     /// Tracker watches: what each sweeps, and what is blocked on an owner signing in.
-    Watches {
-        #[arg(long)]
-        json: bool,
-    },
+    Watches(ops::launches::Watches),
 
     /// One tracker watch, as JSON.
-    Watch {
-        id: String,
-    },
+    Watch(ops::launches::Watch),
 
     /// Webhooks: what each launches, how it verifies, and when it last took a delivery.
-    Webhooks {
-        #[arg(long)]
-        json: bool,
-    },
+    Webhooks(ops::launches::Webhooks),
 
     /// One webhook, as JSON.
-    Webhook {
-        id: String,
-    },
+    Webhook(ops::launches::Webhook),
 
     /// A webhook's recorded deliveries, newest first, with how each settled.
-    WebhookDeliveries {
-        id: String,
-        /// Only deliveries recorded before this delivery id: the last id of the previous page.
-        #[arg(long)]
-        before: Option<String>,
-        /// Page size, at most 200.
-        #[arg(long)]
-        limit: Option<i64>,
-        #[arg(long)]
-        json: bool,
-    },
+    WebhookDeliveries(ops::launches::WebhookDeliveries),
 
     /// Register a provider from a JSON body (`POST /api/providers`).
-    ProviderCreate {
-        #[arg(long)]
-        file: std::path::PathBuf,
-    },
+    ProviderCreate(ops::providers::ProviderCreate),
 
     /// Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`).
-    ProviderUpdate {
-        id: String,
-        #[arg(long)]
-        file: std::path::PathBuf,
-    },
+    ProviderUpdate(ops::providers::ProviderUpdate),
 
     /// Deregister a provider and every default naming it. Refused while issues or schedules pin
     /// it; `provider-update` with `"enabled": false` retires one that work still names.
-    ProviderDelete {
-        id: String,
-    },
+    ProviderDelete(ops::providers::ProviderDelete),
 
     /// The provider each scope's unpinned dispatches take, per workload class, and its fallback.
-    DispatchDefaults {
-        #[arg(long)]
-        json: bool,
-    },
+    DispatchDefaults(ops::providers::DispatchDefaults),
 
     /// Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only.
-    DispatchDefaultSet {
-        #[arg(long)]
-        file: std::path::PathBuf,
-    },
+    DispatchDefaultSet(ops::providers::DispatchDefaultSet),
 
     /// Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save
     /// does. Prints `ok`, or fails with one `field:line:col: message` per refusal.
-    WebhookCheck {
-        #[arg(long)]
-        file: std::path::PathBuf,
-    },
+    WebhookCheck(ops::launches::WebhookCheck),
 
     /// Starting points for a webhook body: a sender's verifier and a transform, as JSON.
-    WebhookPresets,
+    WebhookPresets(ops::launches::WebhookPresets),
 
     /// Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once.
-    WebhookCreate {
-        #[arg(long)]
-        file: std::path::PathBuf,
-    },
+    WebhookCreate(ops::launches::WebhookCreate),
 
     /// Replace a webhook from a JSON body. Its verifier and secret stay as created.
-    WebhookUpdate {
-        id: String,
-        #[arg(long)]
-        file: std::path::PathBuf,
-    },
+    WebhookUpdate(ops::launches::WebhookUpdate),
 
     /// Resume a paused webhook: its address takes deliveries again.
-    WebhookResume {
-        id: String,
-    },
+    WebhookResume(ops::launches::WebhookResume),
 
     /// Pause a webhook: its address answers not found and its queued deliveries fail.
-    WebhookPause {
-        id: String,
-    },
+    WebhookPause(ops::launches::WebhookPause),
 
     /// Replace a webhook's secret and print the new one, once.
-    WebhookRotate {
-        id: String,
-    },
+    WebhookRotate(ops::launches::WebhookRotate),
 
-    WebhookDelete {
-        id: String,
-    },
+    WebhookDelete(ops::launches::WebhookDelete),
 
     /// Run a transform on a sample delivery from a JSON body; nothing is stored.
-    WebhookPreview {
-        #[arg(long)]
-        file: std::path::PathBuf,
-    },
+    WebhookPreview(ops::launches::WebhookPreview),
 
     /// List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title.
-    Issues {
-        /// Input kind: github | scenario | jira.
-        #[arg(long)]
-        kind: Option<String>,
-        /// Status: new | scoped | awaiting-approval | building | running | pr-open | parked | done.
-        #[arg(long)]
-        status: Option<String>,
-        /// Max rows. Default 50, applied client-side.
-        #[arg(long)]
-        limit: Option<i64>,
-        #[arg(long)]
-        json: bool,
-    },
+    Issues(ops::issues::Issues),
 
     /// One issue in full: provenance, the whole park reason, scopes, runs, and the event trail.
-    Issue {
-        /// Issue key, e.g. owner/repo#12 or scenario:<uuid>. Encoding is handled for you.
-        key: String,
-        /// Cut the issue body at this many chars.
-        #[arg(long, default_value_t = 6000)]
-        body_max: usize,
-        #[arg(long)]
-        json: bool,
-    },
+    Issue(ops::issues::Issue),
 
     /// Adopt a scenario: a controller issue with no upstream.
-    Adopt {
-        #[arg(long)]
-        title: String,
-        /// The ask, as prose. `-` reads stdin; otherwise it is a path to read.
-        #[arg(long, conflicts_with = "body_text")]
-        body: Option<String>,
-        /// The ask, inline. Use --body for anything longer than a sentence.
-        #[arg(long)]
-        body_text: Option<String>,
-        /// A repo this touches. Repeat for several; the first is the clone target.
-        #[arg(long = "repo", required = true)]
-        repos: Vec<String>,
-        /// Why the controller should spend money on this.
-        #[arg(long)]
-        justification: String,
-        /// Treat the body as authoritative (skips grounded ranking).
-        #[arg(long)]
-        authoritative: bool,
-        /// Branch or tag to clone. Omit for the repo's default branch.
-        #[arg(long)]
-        git_ref: Option<String>,
-        /// A configured broker contract (see `contracts`). Omit for local measure.
-        #[arg(long)]
-        codegen_contract: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Adopt(AdoptArgs),
 
     /// Park an issue: stop working it, and record why.
-    Park {
-        key: String,
-        #[arg(long)]
-        reason: String,
-        #[arg(long)]
-        json: bool,
-    },
+    Park(ops::issues::Park),
 
     /// Unpark an issue so the controller picks it up again.
-    Unpark {
-        key: String,
-        #[arg(long)]
-        reason: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Unpark(ops::issues::Unpark),
 
     /// Change an issue's priority. Higher runs sooner.
-    Bump {
-        key: String,
-        #[arg(long, default_value_t = 100)]
-        priority: i64,
-        #[arg(long)]
-        reason: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Bump(ops::issues::Bump),
 
     /// Wake the controller's reconcile loop. A full pass, not one issue.
-    Reconcile {
-        #[arg(long)]
-        json: bool,
-    },
+    Reconcile(ops::issues::Reconcile),
 
     /// Re-dispatch an issue's run. Costs money.
-    Redispatch {
-        key: String,
-        #[arg(long)]
-        justification: String,
-        #[arg(long)]
-        json: bool,
-    },
+    Redispatch(ops::issues::Redispatch),
 
     /// List work-pod turns.
-    Turns {
-        /// Only turns for this issue key.
-        #[arg(long)]
-        issue: Option<String>,
-        /// Work kind: grounded-rank | scope | run.
-        #[arg(long)]
-        kind: Option<String>,
-        /// Lifecycle state: queued | running | succeeded | failed | collected | swept.
-        #[arg(long)]
-        state: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Turns(ops::issues::Turns),
 
     /// One turn, with its result and error text intact.
-    Turn {
-        /// The turn's pod name.
-        pod: String,
-        #[arg(long)]
-        json: bool,
-    },
+    Turn(ops::issues::Turn),
 
     /// A run's task graph in dependency order, each task with its latest status.
-    Graph {
-        run_id: String,
-        /// Emit a mermaid flowchart instead of the ASCII table.
-        #[arg(long)]
-        mermaid: bool,
-        #[arg(long)]
-        json: bool,
-    },
+    Graph(ops::runs::Graph),
 
     /// Which build the controller is running, and whether it is the commit you expected.
     ///
     /// With --expect it is a gate: exits non-zero when the commit you named is not the one
     /// answering, so a deploy step can stop instead of reporting success it did not verify.
     /// Pass a full sha, e.g. `crux deployed --expect $(git rev-parse HEAD)`.
-    Deployed {
-        /// The commit you expect to be running. Compared by prefix, so a short sha works.
-        #[arg(long)]
-        expect: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    Deployed(ops::runs::Deployed),
 
     /// One window of a run's engine output, resumable by cursor.
-    RunLog {
-        run_id: String,
-        /// Line to resume from, as the previous window's `cursor=` line reported it.
-        #[arg(long, default_value_t = 0)]
-        cursor: usize,
-        /// Lines in this window. Capped at 200, which is also the default.
-        #[arg(long, conflicts_with = "follow")]
-        limit: Option<usize>,
-        /// Keep printing new lines until the run is no longer running.
-        #[arg(long, short = 'f', conflicts_with = "json")]
-        follow: bool,
-        /// Seconds between polls under --follow.
-        #[arg(long, default_value_t = 5, requires = "follow")]
-        interval: u64,
-        #[arg(long)]
-        json: bool,
-    },
+    RunLog(ops::runs::RunLog),
 
     /// The files a run's tasks captured: what the run produced, as opposed to what it narrated.
-    RunFiles {
-        run_id: String,
-        #[arg(long)]
-        json: bool,
-    },
+    RunFiles(ops::runs::RunFiles),
 
     /// One captured file's content, by the key `run-files` listed it under.
-    RunFile {
-        run_id: String,
-        /// `<task>/<declared path>`, fan-out brackets included.
-        key: String,
-        /// Write the content here instead of to stdout. Required for a file that is not text.
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
-    },
+    RunFile(ops::runs::RunFile),
 
     /// The broker contract names this controller accepts.
-    Contracts {
-        #[arg(long)]
-        json: bool,
-    },
+    Contracts(ops::issues::Contracts),
 
     /// Approve a scenario or jira issue's scope pack.
-    Approve {
-        key: String,
-        #[arg(long)]
-        json: bool,
-    },
+    Approve(ops::issues::Approve),
 
     /// One issue's approval gate: the PR to act on and the pack digest under it.
-    ApprovalDetail {
-        key: String,
-        #[arg(long)]
-        json: bool,
-    },
+    ApprovalDetail(ops::issues::ApprovalDetail),
 
     /// Every scope currently awaiting approval, plus the PRs already kept.
-    Approvals {
-        #[arg(long)]
-        json: bool,
-    },
+    Approvals(ops::issues::Approvals),
 
     /// Propose a playbook pack import: fetch, compile, and store the preview an admin registers.
-    PlaybookImport {
-        /// owner/repo or a clone URL.
-        repo: String,
-        /// Branch or tag. Omit for the repo's default branch.
-        #[arg(long)]
-        git_ref: Option<String>,
-        /// The pack directory inside the repo. Omit for the repo root.
-        #[arg(long)]
-        path: Option<String>,
-        /// The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the
-        /// base manifest.
-        #[arg(long)]
-        variant: Option<String>,
-        /// The registry id to propose registering under; prefills the review page.
-        #[arg(long)]
-        id: Option<String>,
-        /// The description to propose; prefills the review page.
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    PlaybookImport(ops::playbooks::PlaybookImport),
 
     /// A draft pack's files at one save, with the version a save must be based on.
-    DraftFiles {
-        draft_id: String,
-        /// Which save to read. Omit for the newest.
-        #[arg(long)]
-        version: Option<i64>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftFiles(ops::drafts::DraftFiles),
 
     /// Create a draft pack in the authoring studio, from a template or a skeleton.
-    DraftCreate {
-        draft_id: String,
-        #[arg(long)]
-        description: String,
-        /// A registered playbook id to seed version 1 from.
-        #[arg(long)]
-        template: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftCreate(ops::drafts::DraftCreate),
 
     /// Save a draft pack version from a `{path: content}` JSON map.
-    DraftSave {
-        draft_id: String,
-        /// The version these edits were made against (see `draft-files`).
-        #[arg(long)]
-        base_version: i64,
-        /// The whole pack as a JSON object of path to content. `-` reads stdin.
-        #[arg(long)]
-        files: String,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftSave(DraftSaveArgs),
 
     /// Write a draft pack into a directory, to edit it in your own editor.
-    DraftPull {
-        draft_id: String,
-        /// The directory to write the pack into. Created if it does not exist.
-        dir: std::path::PathBuf,
-        /// Which save to pull. Omit for the newest.
-        #[arg(long)]
-        version: Option<i64>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftPull(ops::drafts::DraftPull),
 
     /// Save a directory back as the next draft version. The whole tree is the save.
-    DraftPush {
-        draft_id: String,
-        /// The directory holding the pack.
-        dir: std::path::PathBuf,
-        /// The version these edits were made against (what `draft-pull` printed).
-        #[arg(long = "base-version")]
-        base_version: i64,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftPush(ops::drafts::DraftPush),
 
     /// List the inference providers you may read: id, kind, default model, harness, the price per
     /// million tokens a run on it is charged, and whether launches may pick it.
-    Providers {
-        #[arg(long)]
-        json: bool,
-    },
+    Providers(ops::providers::Providers),
 
     /// List the secrets you own: id, name, kind, visibility, mode, owner. Never a value.
-    Secrets {
-        #[arg(long)]
-        json: bool,
-    },
+    Secrets(ops::secrets::Secrets),
 
     /// Register a secret. The value is read from piped stdin, never from an argument or a
     /// terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value.
-    SecretCreate {
-        /// The name a pack's `[[secret]] name` refers to. Unique per owner.
-        name: String,
-        #[arg(long, value_enum)]
-        kind: ops::SecretKind,
-        /// Omit for `broker-only`: the run gets it, the agent in the sandbox does not.
-        #[arg(long, value_enum)]
-        visibility: Option<ops::Visibility>,
-        /// `user:<login>` or a `group:` in your claims. Omit to own it yourself.
-        #[arg(long)]
-        owner: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    SecretCreate(SecretCreateArgs),
 
     /// Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it.
     /// One scope flag and one projection flag.
-    SecretBind {
-        /// The secret's id, as `secrets` lists it.
-        secret_id: String,
-        /// Scope: a draft or registered playbook id.
-        #[arg(long, group = "scope")]
-        playbook: Option<String>,
-        /// Scope: an `owner/name` repo.
-        #[arg(long, group = "scope")]
-        repo: Option<String>,
-        /// Scope: a domain id.
-        #[arg(long, group = "scope")]
-        domain: Option<String>,
-        /// Projection: the environment variable the value arrives in.
-        #[arg(long, group = "projection")]
-        env: Option<String>,
-        /// Projection: the absolute path the value is written to.
-        #[arg(long, group = "projection")]
-        file: Option<String>,
-        /// The manifest's `[[secret]] name` this binding satisfies. Defaults to the secret's name.
-        #[arg(long)]
-        declared_name: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    SecretBind(SecretBindArgs),
 
     /// What a draft version compiled to: its schema digest and diagnostics, without launching it.
-    DraftPreview {
-        draft_id: String,
-        /// Which save to compile. Omit for the newest.
-        #[arg(long)]
-        version: Option<i64>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftPreview(ops::drafts::DraftPreview),
 
     /// Test-fire a draft's newest save. Costs money against --max-cost.
-    DraftLaunch {
-        draft_id: String,
-        /// The form values its schema accepts, as a JSON object of string to string.
-        #[arg(long, default_value = "{}")]
-        params: String,
-        /// Dollar ceiling for this launch.
-        #[arg(long)]
-        max_cost: f64,
-        /// Wall-clock ceiling, e.g. 30m, 2h.
-        #[arg(long)]
-        max_time: String,
-        /// The schema digest these values were filled against (see `draft-preview`). A save that
-        /// landed since is refused instead of launched.
-        #[arg(long)]
-        schema_digest: Option<String>,
-        /// Cluster to dispatch onto. Omit for the controller's default.
-        #[arg(long)]
-        dispatch_target: Option<String>,
-        /// Registered inference provider the run's agent talks to, replacing the pack manifest's
-        /// `[agent]` harness. Omit to resolve through the configured defaults.
-        #[arg(long)]
-        provider: Option<String>,
-        /// The model to ask that provider for. Needs --provider; omit for its default.
-        #[arg(long, requires = "provider")]
-        model: Option<String>,
-        /// Rerun this finished run of the same pack instead of starting afresh: every task it
-        /// passed is reused, and the tasks --from names run again with everything after them.
-        #[arg(long, value_name = "RUN")]
-        rerun_of: Option<String>,
-        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
-        #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
-        from: Vec<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftLaunch(ops::drafts::DraftLaunch),
 
     /// Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin
     /// only; the id is free to create again.
-    DraftDelete {
-        draft_id: String,
-    },
+    DraftDelete(ops::drafts::DraftDelete),
 
     /// Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow.
-    DraftRename {
-        draft_id: String,
-        /// The new id.
-        to: String,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftRename(ops::drafts::DraftRename),
 
     /// Copy a draft's newest save into a new draft, with the bindings you could make yourself.
-    DraftClone {
-        draft_id: String,
-        /// The copy's id.
-        to: String,
-        /// Defaults to the source draft's.
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftClone(ops::drafts::DraftClone),
 
     /// List the blueprints you can read, with what each would carry for you and leave to bind.
-    Blueprints {
-        #[arg(long)]
-        json: bool,
-    },
+    Blueprints(ops::blueprints::Blueprints),
 
     /// Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are
     /// in that team; every other declared secret is a placeholder to bind with `secret-bind`.
-    BlueprintUse {
-        /// The blueprint's id, as `blueprints` lists it.
-        id: String,
-        /// The new draft's id.
-        to: String,
-        /// Defaults to the blueprint's.
-        #[arg(long)]
-        description: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    BlueprintUse(ops::blueprints::BlueprintUse),
 
     /// Offer a registered playbook as a blueprint. Refused unless you may bind every secret
     /// whose binding would carry.
-    BlueprintMark {
-        /// Playbook id.
-        id: String,
-        #[arg(long)]
-        json: bool,
-    },
+    BlueprintMark(ops::blueprints::BlueprintMark),
 
     /// Withdraw a blueprint, public or not. Drafts started from it keep what they carried.
-    BlueprintUnmark {
-        /// Playbook id.
-        id: String,
-        #[arg(long)]
-        json: bool,
-    },
+    BlueprintUnmark(ops::blueprints::BlueprintUnmark),
 
     /// Let every user read and use a blueprint. Only its owning team's members get its secrets.
-    BlueprintPublic {
-        /// Playbook id.
-        id: String,
-        #[arg(long)]
-        json: bool,
-    },
+    BlueprintPublic(ops::blueprints::BlueprintPublic),
 
     /// Make a public blueprint private again.
-    BlueprintPrivate {
-        /// Playbook id.
-        id: String,
-        #[arg(long)]
-        json: bool,
-    },
+    BlueprintPrivate(ops::blueprints::BlueprintPrivate),
 
     /// Publish a draft: register its newest compiling version as a playbook, with no review.
-    DraftPublish {
-        draft_id: String,
-        /// The playbook to publish into. Omit to re-pin the one this draft last published into,
-        /// else the one it was seeded from.
-        #[arg(long)]
-        playbook: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftPublish(ops::drafts::DraftPublish),
 
     /// Graduate a draft: push its newest compiling version and open the export PR.
-    DraftGraduate {
-        draft_id: String,
-        /// `owner/repo` the export PR opens against.
-        #[arg(long)]
-        repo: String,
-        /// The pack directory inside that repo. Omit for the repo root.
-        #[arg(long)]
-        path: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
+    DraftGraduate(ops::drafts::DraftGraduate),
+}
+
+/// The flags of `adopt`. The body comes from a file or stdin rather than an argument by default:
+/// a scenario body is the prose a paid agent turn will read, and anything worth adopting is
+/// longer than a shell argument wants to be.
+#[derive(Debug, clap::Args)]
+pub struct AdoptArgs {
+    #[arg(long)]
+    title: String,
+    /// The ask, as prose. `-` reads stdin; otherwise it is a path to read.
+    #[arg(long, conflicts_with = "body_text")]
+    body: Option<String>,
+    /// The ask, inline. Use --body for anything longer than a sentence.
+    #[arg(long)]
+    body_text: Option<String>,
+    /// A repo this touches. Repeat for several; the first is the clone target.
+    #[arg(long = "repo", required = true)]
+    repos: Vec<String>,
+    /// Why the controller should spend money on this.
+    #[arg(long)]
+    justification: String,
+    /// Treat the body as authoritative (skips grounded ranking).
+    #[arg(long)]
+    authoritative: bool,
+    /// Branch or tag to clone. Omit for the repo's default branch.
+    #[arg(long)]
+    git_ref: Option<String>,
+    /// A configured broker contract (see `contracts`). Omit for local measure.
+    #[arg(long)]
+    codegen_contract: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+impl AdoptArgs {
+    fn into_op(self) -> Result<ops::issues::Adopt> {
+        Ok(ops::issues::Adopt {
+            title: self.title,
+            body: read_body(self.body, self.body_text)?,
+            affected_repos: self.repos,
+            justification: self.justification,
+            authoritative: self.authoritative,
+            git_ref: self.git_ref,
+            codegen_contract: self.codegen_contract,
+            json: self.json,
+        })
+    }
+}
+
+/// The flags of `draft-save`: the file map comes from a file or stdin, since a save is the whole
+/// pack and a shell cannot be asked to assemble it flag by flag.
+#[derive(Debug, clap::Args)]
+pub struct DraftSaveArgs {
+    draft_id: String,
+    /// The version these edits were made against (see `draft-files`).
+    #[arg(long)]
+    base_version: i64,
+    /// The whole pack as a JSON object of path to content. `-` reads stdin.
+    #[arg(long)]
+    files: String,
+    #[arg(long)]
+    json: bool,
+}
+
+impl DraftSaveArgs {
+    fn into_op(self) -> Result<ops::drafts::DraftSaveFiles> {
+        Ok(ops::drafts::DraftSaveFiles {
+            draft_id: self.draft_id,
+            base_version: self.base_version,
+            files: read_files(&self.files)?,
+            json: self.json,
+        })
+    }
+}
+
+/// The flags of `secret-create`. The value never appears here: it is read from piped stdin.
+#[derive(Debug, clap::Args)]
+pub struct SecretCreateArgs {
+    /// The name a pack's `[[secret]] name` refers to. Unique per owner.
+    name: String,
+    #[arg(long, value_enum)]
+    kind: ops::secrets::SecretKind,
+    /// Omit for `broker-only`: the run gets it, the agent in the sandbox does not.
+    #[arg(long, value_enum)]
+    visibility: Option<ops::secrets::Visibility>,
+    /// `user:<login>` or a `group:` in your claims. Omit to own it yourself.
+    #[arg(long)]
+    owner: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+impl SecretCreateArgs {
+    fn into_op(self, value: ops::secrets::SecretValue) -> ops::secrets::SecretCreate {
+        ops::secrets::SecretCreate {
+            name: self.name,
+            kind: self.kind,
+            visibility: self.visibility,
+            owner: self.owner,
+            value,
+            json: self.json,
+        }
+    }
+}
+
+/// The flags of `secret-bind`: one scope flag and one projection flag, which the operation
+/// carries as a kind and a value.
+#[derive(Debug, clap::Args)]
+pub struct SecretBindArgs {
+    /// The secret's id, as `secrets` lists it.
+    secret_id: String,
+    /// Scope: a draft or registered playbook id.
+    #[arg(long, group = "scope")]
+    playbook: Option<String>,
+    /// Scope: an `owner/name` repo.
+    #[arg(long, group = "scope")]
+    repo: Option<String>,
+    /// Scope: a domain id.
+    #[arg(long, group = "scope")]
+    domain: Option<String>,
+    /// Projection: the environment variable the value arrives in.
+    #[arg(long, group = "projection")]
+    env: Option<String>,
+    /// Projection: the absolute path the value is written to.
+    #[arg(long, group = "projection")]
+    file: Option<String>,
+    /// The manifest's `[[secret]] name` this binding satisfies. Defaults to the secret's name.
+    #[arg(long)]
+    declared_name: Option<String>,
+    #[arg(long)]
+    json: bool,
+}
+
+impl SecretBindArgs {
+    fn into_op(self) -> Result<ops::secrets::SecretBind> {
+        let (scope_kind, scope_id) = match (self.playbook, self.repo, self.domain) {
+            (Some(id), None, None) => ("playbook", id),
+            (None, Some(id), None) => ("repo", id),
+            (None, None, Some(id)) => ("domain", id),
+            _ => bail!("secret-bind needs exactly one of --playbook, --repo, --domain"),
+        };
+        let (projection_kind, projection) = match (self.env, self.file) {
+            (Some(name), None) => ("env", name),
+            (None, Some(path)) => ("file", path),
+            _ => bail!("secret-bind needs exactly one of --env, --file"),
+        };
+        Ok(ops::secrets::SecretBind {
+            secret_id: self.secret_id,
+            scope_kind: scope_kind.to_string(),
+            scope_id,
+            projection_kind: projection_kind.to_string(),
+            projection,
+            declared_name: self.declared_name,
+            json: self.json,
+        })
+    }
+}
+
+/// The CLI definition, for the surface fixture test.
+pub fn command() -> clap::Command {
+    <Cli as clap::CommandFactory>::command()
 }
 
 pub async fn run() -> Result<()> {
     let cli = Cli::parse();
     let cfg = cli.connect.resolve()?;
-    let client = Client::connect(&cfg)?;
+    let c = Client::connect(&cfg)?;
 
     let out = match cli.command {
-        Command::Whoami => ops::whoami(&client).await?,
-        Command::Playbooks { json } => ops::playbooks(&client, json).await?,
-        Command::PlaybookCaps { json } => ops::playbook_caps(&client, json).await?,
-        Command::PlaybookSchema { id } => ops::playbook_schema(&client, &id).await?,
-        Command::Launch {
-            id,
-            params,
-            max_cost,
-            max_time,
-            dispatch_target,
-            provider,
-            model,
-            rerun_of,
-            from,
-            json,
-        } => {
-            let params: serde_json::Value =
-                serde_json::from_str(&params).context("--params is not valid JSON")?;
-            ops::launch(
-                &client,
-                &id,
-                ops::Launch {
-                    params,
-                    max_cost,
-                    max_time,
-                    dispatch_target,
-                    provider,
-                    model,
-                    rerun: rerun_of.map(|of| ops::Rerun { of, from }),
-                },
-                json,
-            )
-            .await?
-        }
-        Command::PlaybookRuns {
-            status,
-            playbook,
-            json,
-        } => ops::playbook_runs(&client, status.as_deref(), playbook.as_deref(), json).await?,
-        Command::PlaybookRun { key } => ops::playbook_run(&client, &key).await?,
-        Command::Runs {
-            status,
-            repo,
-            dispatch_target,
-            limit,
-            json,
-        } => {
-            ops::runs(
-                &client,
-                status.as_deref(),
-                repo.as_deref(),
-                dispatch_target.as_deref(),
-                limit,
-                json,
-            )
-            .await?
-        }
-        Command::Run { run_id } => ops::run(&client, &run_id).await?,
-        Command::Schedules { json } => ops::schedules(&client, json).await?,
-        Command::Watches { json } => ops::watches(&client, json).await?,
-        Command::Watch { id } => ops::watch(&client, &id).await?,
-        Command::Webhooks { json } => ops::webhooks(&client, json).await?,
-        Command::Webhook { id } => ops::webhook(&client, &id).await?,
-        Command::WebhookDeliveries {
-            id,
-            before,
-            limit,
-            json,
-        } => ops::webhook_deliveries(&client, &id, before.as_deref(), limit, json).await?,
-        Command::ProviderCreate { file } => ops::provider_create(&client, &file).await?,
-        Command::ProviderUpdate { id, file } => ops::provider_update(&client, &id, &file).await?,
-        Command::ProviderDelete { id } => ops::provider_delete(&client, &id).await?,
-        Command::DispatchDefaults { json } => ops::dispatch_defaults(&client, json).await?,
-        Command::DispatchDefaultSet { file } => ops::dispatch_default_set(&client, &file).await?,
-        Command::WebhookCheck { file } => ops::webhook_check(&client, &file).await?,
-        Command::WebhookPresets => ops::webhook_presets(&client).await?,
-        Command::WebhookCreate { file } => ops::webhook_create(&client, &file).await?,
-        Command::WebhookUpdate { id, file } => ops::webhook_update(&client, &id, &file).await?,
-        Command::WebhookResume { id } => ops::webhook_set_enabled(&client, &id, true).await?,
-        Command::WebhookPause { id } => ops::webhook_set_enabled(&client, &id, false).await?,
-        Command::WebhookRotate { id } => ops::webhook_rotate(&client, &id).await?,
-        Command::WebhookDelete { id } => ops::webhook_delete(&client, &id).await?,
-        Command::WebhookPreview { file } => ops::webhook_preview(&client, &file).await?,
-        Command::Issues {
-            kind,
-            status,
-            limit,
-            json,
-        } => ops::issues(&client, kind.as_deref(), status.as_deref(), limit, json).await?,
-        Command::Issue {
-            key,
-            body_max,
-            json,
-        } => ops::issue(&client, &key, body_max, json).await?,
-        Command::Adopt {
-            title,
-            body,
-            body_text,
-            repos,
-            justification,
-            authoritative,
-            git_ref,
-            codegen_contract,
-            json,
-        } => {
-            ops::adopt(
-                &client,
-                &AdoptBody {
-                    title,
-                    body: read_body(body, body_text)?,
-                    affected_repos: repos,
-                    justification,
-                    authoritative,
-                    git_ref,
-                    codegen_contract,
-                },
-                json,
-            )
-            .await?
-        }
-        Command::Park { key, reason, json } => ops::park(&client, &key, &reason, json).await?,
-        Command::Unpark { key, reason, json } => {
-            ops::unpark(&client, &key, reason.as_deref(), json).await?
-        }
-        Command::Bump {
-            key,
-            priority,
-            reason,
-            json,
-        } => ops::bump(&client, &key, priority, reason.as_deref(), json).await?,
-        Command::Reconcile { json } => ops::reconcile(&client, json).await?,
-        Command::Redispatch {
-            key,
-            justification,
-            json,
-        } => ops::redispatch(&client, &key, &justification, json).await?,
-        Command::Turns {
-            issue,
-            kind,
-            state,
-            json,
-        } => {
-            ops::turns(
-                &client,
-                issue.as_deref(),
-                kind.as_deref(),
-                state.as_deref(),
-                json,
-            )
-            .await?
-        }
-        Command::Turn { pod, json } => ops::turn(&client, &pod, json).await?,
-        Command::Graph {
-            run_id,
-            mermaid,
-            json,
-        } => ops::graph(&client, &run_id, mermaid, json).await?,
-        Command::Deployed { expect, json } => {
-            ops::deployed(&client, expect.as_deref(), json).await?
-        }
-        Command::RunLog {
-            run_id,
-            cursor,
-            follow: true,
-            interval,
-            ..
-        } => {
+        Command::Whoami(op) => op.run(&c).await?,
+        Command::Playbooks(op) => op.run(&c).await?,
+        Command::PlaybookCaps(op) => op.run(&c).await?,
+        Command::PlaybookSchema(op) => op.run(&c).await?,
+        Command::Launch(op) => op.run(&c).await?,
+        Command::PlaybookRuns(op) => op.run(&c).await?,
+        Command::PlaybookRun(op) => op.run(&c).await?,
+        Command::Runs(op) => op.run(&c).await?,
+        Command::Run(op) => op.run(&c).await?,
+        Command::Schedules(op) => op.run(&c).await?,
+        Command::Watches(op) => op.run(&c).await?,
+        Command::Watch(op) => op.run(&c).await?,
+        Command::Webhooks(op) => op.run(&c).await?,
+        Command::Webhook(op) => op.run(&c).await?,
+        Command::WebhookDeliveries(op) => op.run(&c).await?,
+        Command::ProviderCreate(op) => op.run(&c).await?,
+        Command::ProviderUpdate(op) => op.run(&c).await?,
+        Command::ProviderDelete(op) => op.run(&c).await?,
+        Command::DispatchDefaults(op) => op.run(&c).await?,
+        Command::DispatchDefaultSet(op) => op.run(&c).await?,
+        Command::WebhookCheck(op) => op.run(&c).await?,
+        Command::WebhookPresets(op) => op.run(&c).await?,
+        Command::WebhookCreate(op) => op.run(&c).await?,
+        Command::WebhookUpdate(op) => op.run(&c).await?,
+        Command::WebhookResume(op) => op.run(&c).await?,
+        Command::WebhookPause(op) => op.run(&c).await?,
+        Command::WebhookRotate(op) => op.run(&c).await?,
+        Command::WebhookDelete(op) => op.run(&c).await?,
+        Command::WebhookPreview(op) => op.run(&c).await?,
+        Command::Issues(op) => op.run(&c).await?,
+        Command::Issue(op) => op.run(&c).await?,
+        Command::Adopt(args) => args.into_op()?.run(&c).await?,
+        Command::Park(op) => op.run(&c).await?,
+        Command::Unpark(op) => op.run(&c).await?,
+        Command::Bump(op) => op.run(&c).await?,
+        Command::Reconcile(op) => op.run(&c).await?,
+        Command::Redispatch(op) => op.run(&c).await?,
+        Command::Turns(op) => op.run(&c).await?,
+        Command::Turn(op) => op.run(&c).await?,
+        Command::Graph(op) => op.run(&c).await?,
+        Command::Deployed(op) => op.run(&c).await?,
+        Command::RunLog(op) if op.follow => {
             let mut stdout = std::io::stdout().lock();
-            ops::run_log_follow(
-                &client,
-                &run_id,
-                cursor,
-                std::time::Duration::from_secs(interval.max(1)),
-                &mut stdout,
-            )
-            .await?
+            op.follow(&c, Duration::from_secs(op.interval.max(1)), &mut stdout)
+                .await?
         }
-        Command::RunLog {
-            run_id,
-            cursor,
-            limit,
-            json,
-            ..
-        } => ops::run_log(&client, &run_id, cursor, limit, json).await?,
-        Command::RunFiles { run_id, json } => ops::run_files(&client, &run_id, json).await?,
-        Command::RunFile { run_id, key, out } => {
-            ops::run_file(&client, &run_id, &key, out.as_deref()).await?
-        }
-        Command::Contracts { json } => ops::contracts(&client, json).await?,
-        Command::Approve { key, json } => ops::approve(&client, &key, json).await?,
-        Command::ApprovalDetail { key, json } => ops::approval_detail(&client, &key, json).await?,
-        Command::Approvals { json } => ops::approvals(&client, json).await?,
-        Command::PlaybookImport {
-            repo,
-            git_ref,
-            path,
-            variant,
-            id,
-            description,
-            json,
-        } => {
-            ops::playbook_import(
-                &client,
-                &crate::client::PackImportSource {
-                    repo: &repo,
-                    git_ref: git_ref.as_deref(),
-                    path: path.as_deref(),
-                    variant: variant.as_deref(),
-                },
-                id.as_deref(),
-                description.as_deref(),
-                json,
-            )
-            .await?
-        }
-        Command::DraftFiles {
-            draft_id,
-            version,
-            json,
-        } => ops::draft_files(&client, &draft_id, version, json).await?,
-        Command::DraftCreate {
-            draft_id,
-            description,
-            template,
-            json,
-        } => ops::draft_create(&client, &draft_id, &description, template.as_deref(), json).await?,
-        Command::DraftSave {
-            draft_id,
-            base_version,
-            files,
-            json,
-        } => ops::draft_save(&client, &draft_id, base_version, &read_files(&files)?, json).await?,
-        Command::DraftPull {
-            draft_id,
-            dir,
-            version,
-            json,
-        } => ops::draft_pull(&client, &draft_id, &dir, version, json).await?,
-        Command::DraftPush {
-            draft_id,
-            dir,
-            base_version,
-            json,
-        } => ops::draft_push(&client, &draft_id, &dir, base_version, json).await?,
-        Command::Providers { json } => ops::providers(&client, json).await?,
-        Command::Secrets { json } => ops::secrets(&client, json).await?,
-        Command::SecretCreate {
-            name,
-            kind,
-            visibility,
-            owner,
-            json,
-        } => {
+        Command::RunLog(op) => op.run(&c).await?,
+        Command::RunFiles(op) => op.run(&c).await?,
+        Command::RunFile(op) => op.run(&c).await?,
+        Command::Contracts(op) => op.run(&c).await?,
+        Command::Approve(op) => op.run(&c).await?,
+        Command::ApprovalDetail(op) => op.run(&c).await?,
+        Command::Approvals(op) => op.run(&c).await?,
+        Command::PlaybookImport(op) => op.run(&c).await?,
+        Command::DraftFiles(op) => op.run(&c).await?,
+        Command::DraftCreate(op) => op.run(&c).await?,
+        Command::DraftSave(args) => args.into_op()?.run(&c).await?,
+        Command::DraftPull(op) => op.run(&c).await?,
+        Command::DraftPush(op) => op.run(&c).await?,
+        Command::Providers(op) => op.run(&c).await?,
+        Command::Secrets(op) => op.run(&c).await?,
+        Command::SecretCreate(args) => {
             let stdin = std::io::stdin();
             let value = read_secret_value(&stdin, std::io::IsTerminal::is_terminal(&stdin))?;
-            ops::secret_create(
-                &client,
-                ops::SecretCreate {
-                    name: &name,
-                    kind,
-                    visibility,
-                    owner: owner.as_deref(),
-                    value,
-                },
-                json,
-            )
-            .await?
+            args.into_op(value).run(&c).await?
         }
-        Command::SecretBind {
-            secret_id,
-            playbook,
-            repo,
-            domain,
-            env,
-            file,
-            declared_name,
-            json,
-        } => {
-            let (scope_kind, scope_id) = match (&playbook, &repo, &domain) {
-                (Some(id), None, None) => ("playbook", id.as_str()),
-                (None, Some(id), None) => ("repo", id.as_str()),
-                (None, None, Some(id)) => ("domain", id.as_str()),
-                _ => bail!("secret-bind needs exactly one of --playbook, --repo, --domain"),
-            };
-            let (projection_kind, projection) = match (&env, &file) {
-                (Some(name), None) => ("env", name.as_str()),
-                (None, Some(path)) => ("file", path.as_str()),
-                _ => bail!("secret-bind needs exactly one of --env, --file"),
-            };
-            ops::secret_bind(
-                &client,
-                ops::SecretBind {
-                    secret_id: &secret_id,
-                    scope_kind,
-                    scope_id,
-                    projection_kind,
-                    projection,
-                    declared_name: declared_name.as_deref(),
-                },
-                json,
-            )
-            .await?
-        }
-        Command::DraftPreview {
-            draft_id,
-            version,
-            json,
-        } => ops::draft_preview(&client, &draft_id, version, json).await?,
-        Command::DraftLaunch {
-            draft_id,
-            params,
-            max_cost,
-            max_time,
-            schema_digest,
-            dispatch_target,
-            provider,
-            model,
-            rerun_of,
-            from,
-            json,
-        } => {
-            let params: std::collections::BTreeMap<String, String> = serde_json::from_str(&params)
-                .context(
-                    "--params is not a JSON object of string to string; a draft launch takes form \
-                     values as strings",
-                )?;
-            ops::draft_launch(
-                &client,
-                &draft_id,
-                ops::DraftLaunch {
-                    params,
-                    max_cost,
-                    max_time,
-                    schema_digest,
-                    dispatch_target,
-                    provider,
-                    model,
-                    rerun: rerun_of.map(|of| ops::Rerun { of, from }),
-                },
-                json,
-            )
-            .await?
-        }
-        Command::DraftDelete { draft_id } => ops::draft_delete(&client, &draft_id).await?,
-        Command::DraftRename { draft_id, to, json } => {
-            ops::draft_rename(&client, &draft_id, &to, json).await?
-        }
-        Command::DraftClone {
-            draft_id,
-            to,
-            description,
-            json,
-        } => ops::draft_clone(&client, &draft_id, &to, description.as_deref(), json).await?,
-        Command::Blueprints { json } => ops::blueprints(&client, json).await?,
-        Command::BlueprintUse {
-            id,
-            to,
-            description,
-            json,
-        } => ops::blueprint_use(&client, &id, &to, description.as_deref(), json).await?,
-        Command::BlueprintMark { id, json } => {
-            ops::blueprint_mark(&client, &id, true, json).await?
-        }
-        Command::BlueprintUnmark { id, json } => {
-            ops::blueprint_mark(&client, &id, false, json).await?
-        }
-        Command::BlueprintPublic { id, json } => {
-            ops::blueprint_public(&client, &id, true, json).await?
-        }
-        Command::BlueprintPrivate { id, json } => {
-            ops::blueprint_public(&client, &id, false, json).await?
-        }
-        Command::DraftGraduate {
-            draft_id,
-            repo,
-            path,
-            json,
-        } => ops::draft_graduate(&client, &draft_id, &repo, path.as_deref(), json).await?,
-        Command::DraftPublish {
-            draft_id,
-            playbook,
-            json,
-        } => ops::draft_publish(&client, &draft_id, playbook.as_deref(), json).await?,
+        Command::SecretBind(args) => args.into_op()?.run(&c).await?,
+        Command::DraftPreview(op) => op.run(&c).await?,
+        Command::DraftLaunch(op) => op.run(&c).await?,
+        Command::DraftDelete(op) => op.run(&c).await?,
+        Command::DraftRename(op) => op.run(&c).await?,
+        Command::DraftClone(op) => op.run(&c).await?,
+        Command::Blueprints(op) => op.run(&c).await?,
+        Command::BlueprintUse(op) => op.run(&c).await?,
+        Command::BlueprintMark(op) => op.run(&c).await?,
+        Command::BlueprintUnmark(op) => op.run(&c).await?,
+        Command::BlueprintPublic(op) => op.run(&c).await?,
+        Command::BlueprintPrivate(op) => op.run(&c).await?,
+        Command::DraftPublish(op) => op.run(&c).await?,
+        Command::DraftGraduate(op) => op.run(&c).await?,
     };
     println!("{}", out.trim_end());
     Ok(())
 }
 
 /// A secret value arrives on piped stdin only. A terminal would echo it as it is typed.
-fn read_secret_value(mut input: impl Read, terminal: bool) -> Result<ops::SecretValue> {
+fn read_secret_value(mut input: impl Read, terminal: bool) -> Result<ops::secrets::SecretValue> {
     if terminal {
         bail!(
             "pipe the secret value on stdin, e.g. `pbpaste | crux secret-create NAME --kind opaque`"
@@ -1142,13 +515,10 @@ fn read_secret_value(mut input: impl Read, terminal: bool) -> Result<ops::Secret
     input
         .read_to_string(&mut raw)
         .context("reading the secret value from stdin")?;
-    ops::SecretValue::new(raw)
+    ops::secrets::SecretValue::new(raw)
 }
 
 /// `--body -` reads stdin, `--body PATH` reads a file, `--body-text` is inline.
-///
-/// A file or stdin rather than an argument by default: a scenario body is the prose a paid agent
-/// turn will read, and anything worth adopting is longer than a shell argument wants to be.
 fn read_body(path: Option<String>, inline: Option<String>) -> Result<String> {
     if let Some(text) = inline {
         return Ok(text);
@@ -1173,7 +543,7 @@ fn read_body(path: Option<String>, inline: Option<String>) -> Result<String> {
 }
 
 /// `--files -` reads stdin, `--files PATH` reads a file. Either way it is one JSON object of path
-/// to content: a save is the whole pack, so a shell cannot be asked to assemble it flag by flag.
+/// to content.
 fn read_files(source: &str) -> Result<std::collections::BTreeMap<String, String>> {
     let raw = if source == "-" {
         let mut buf = String::new();
@@ -1224,16 +594,11 @@ mod tests {
             Some("https://crucible.example.com")
         );
         match cli.command {
-            Command::Issues {
-                kind,
-                status,
-                limit,
-                json,
-            } => {
-                assert_eq!(kind.as_deref(), Some("scenario"));
-                assert_eq!(status, None);
-                assert_eq!(limit, None);
-                assert!(!json);
+            Command::Issues(op) => {
+                assert_eq!(op.kind.as_deref(), Some("scenario"));
+                assert_eq!(op.status, None);
+                assert_eq!(op.limit, None);
+                assert!(!op.json);
             }
             _ => panic!("expected issues"),
         }
@@ -1245,9 +610,9 @@ mod tests {
     fn an_issue_key_survives_the_parser_verbatim() {
         let cli = Cli::try_parse_from(["crux", "issue", "owner/repo#12"]).expect("parses");
         match cli.command {
-            Command::Issue { key, body_max, .. } => {
-                assert_eq!(key, "owner/repo#12");
-                assert_eq!(body_max, 6000);
+            Command::Issue(op) => {
+                assert_eq!(op.key, "owner/repo#12");
+                assert_eq!(op.body_max, 6000);
             }
             _ => panic!("expected issue"),
         }
@@ -1261,7 +626,7 @@ mod tests {
         );
         let cli = Cli::try_parse_from(["crux", "bump", "owner/repo#1"]).expect("parses");
         match cli.command {
-            Command::Bump { priority, .. } => assert_eq!(priority, 100),
+            Command::Bump(op) => assert_eq!(op.priority, 100),
             _ => panic!("expected bump"),
         }
     }
@@ -1271,11 +636,10 @@ mod tests {
         let cli = Cli::try_parse_from(["crux", "run-log", "r1", "-f", "--interval", "2"])
             .expect("parses");
         match cli.command {
-            Command::RunLog {
-                follow, interval, ..
-            } => {
-                assert!(follow);
-                assert_eq!(interval, 2);
+            Command::RunLog(op) => {
+                assert!(op.follow);
+                assert_eq!(op.interval, 2);
+                assert_eq!(op.cursor, Some(0));
             }
             _ => panic!("expected run-log"),
         }
@@ -1300,17 +664,11 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Command::SecretCreate {
-                name,
-                kind,
-                visibility,
-                owner,
-                ..
-            } => {
-                assert_eq!(name, "bugwatch-label-token");
-                assert_eq!(kind, ops::SecretKind::Opaque);
-                assert_eq!(visibility, Some(ops::Visibility::BrokerOnly));
-                assert_eq!(owner, None);
+            Command::SecretCreate(args) => {
+                assert_eq!(args.name, "bugwatch-label-token");
+                assert_eq!(args.kind, ops::secrets::SecretKind::Opaque);
+                assert_eq!(args.visibility, Some(ops::secrets::Visibility::BrokerOnly));
+                assert_eq!(args.owner, None);
             }
             _ => panic!("expected secret-create"),
         }
@@ -1368,17 +726,18 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Command::SecretBind {
-                secret_id,
-                playbook,
-                env,
-                declared_name,
-                ..
-            } => {
-                assert_eq!(secret_id, "01a0");
-                assert_eq!(playbook.as_deref(), Some("docs-drift"));
-                assert_eq!(env.as_deref(), Some("GH_TOKEN"));
-                assert_eq!(declared_name, None);
+            Command::SecretBind(args) => {
+                let op = args.into_op().expect("one scope, one projection");
+                assert_eq!(op.secret_id, "01a0");
+                assert_eq!(
+                    (op.scope_kind.as_str(), op.scope_id.as_str()),
+                    ("playbook", "docs-drift")
+                );
+                assert_eq!(
+                    (op.projection_kind.as_str(), op.projection.as_str()),
+                    ("env", "GH_TOKEN")
+                );
+                assert_eq!(op.declared_name, None);
             }
             _ => panic!("expected secret-bind"),
         }
@@ -1440,15 +799,12 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Command::Adopt {
-                repos,
-                git_ref,
-                authoritative,
-                ..
-            } => {
-                assert_eq!(repos, vec!["owner/one", "owner/two"]);
-                assert_eq!(git_ref.as_deref(), Some("nv_dev"));
-                assert!(!authoritative);
+            Command::Adopt(args) => {
+                let op = args.into_op().expect("an inline body");
+                assert_eq!(op.affected_repos, vec!["owner/one", "owner/two"]);
+                assert_eq!(op.git_ref.as_deref(), Some("nv_dev"));
+                assert!(!op.authoritative);
+                assert_eq!(op.body, "b");
             }
             _ => panic!("expected adopt"),
         }
@@ -1514,11 +870,9 @@ mod tests {
     fn graph_takes_a_mermaid_flag() {
         let cli = Cli::try_parse_from(["crux", "graph", "0192run", "--mermaid"]).expect("parses");
         match cli.command {
-            Command::Graph {
-                run_id, mermaid, ..
-            } => {
-                assert_eq!(run_id, "0192run");
-                assert!(mermaid);
+            Command::Graph(op) => {
+                assert_eq!(op.run_id, "0192run");
+                assert!(op.mermaid);
             }
             _ => panic!("expected graph"),
         }
@@ -1541,19 +895,12 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Command::PlaybookImport {
-                repo,
-                git_ref,
-                path,
-                id,
-                description,
-                ..
-            } => {
-                assert_eq!(repo, "owner/packs");
-                assert_eq!(git_ref.as_deref(), Some("main"));
-                assert_eq!(path.as_deref(), Some("packs/calibrate"));
-                assert_eq!(id.as_deref(), Some("calibrate"));
-                assert_eq!(description.as_deref(), Some("EPP calibration"));
+            Command::PlaybookImport(op) => {
+                assert_eq!(op.repo, "owner/packs");
+                assert_eq!(op.git_ref.as_deref(), Some("main"));
+                assert_eq!(op.path.as_deref(), Some("packs/calibrate"));
+                assert_eq!(op.id.as_deref(), Some("calibrate"));
+                assert_eq!(op.description.as_deref(), Some("EPP calibration"));
             }
             _ => panic!("expected playbook-import"),
         }
@@ -1579,15 +926,10 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Command::DraftSave {
-                draft_id,
-                base_version,
-                files,
-                ..
-            } => {
-                assert_eq!(draft_id, "calibrate");
-                assert_eq!(base_version, 7);
-                assert_eq!(files, "-");
+            Command::DraftSave(args) => {
+                assert_eq!(args.draft_id, "calibrate");
+                assert_eq!(args.base_version, 7);
+                assert_eq!(args.files, "-");
             }
             _ => panic!("expected draft-save"),
         }
@@ -1606,16 +948,11 @@ mod tests {
         ])
         .expect("parses");
         match cli.command {
-            Command::BlueprintUse {
-                id,
-                to,
-                description,
-                json,
-            } => {
-                assert_eq!(id, "mlr-pack");
-                assert_eq!(to, "kim-copy");
-                assert_eq!(description.as_deref(), Some("mine"));
-                assert!(!json);
+            Command::BlueprintUse(op) => {
+                assert_eq!(op.id, "mlr-pack");
+                assert_eq!(op.to, "kim-copy");
+                assert_eq!(op.description.as_deref(), Some("mine"));
+                assert!(!op.json);
             }
             _ => panic!("expected blueprint-use"),
         }
@@ -1676,15 +1013,10 @@ mod tests {
         .expect("parses")
         .command
         {
-            Command::DraftPush {
-                draft_id,
-                dir,
-                base_version,
-                ..
-            } => {
-                assert_eq!(draft_id, "calibrate");
-                assert_eq!(dir, std::path::PathBuf::from("./pack"));
-                assert_eq!(base_version, 4);
+            Command::DraftPush(op) => {
+                assert_eq!(op.draft_id, "calibrate");
+                assert_eq!(op.dir, std::path::PathBuf::from("./pack"));
+                assert_eq!(op.base_version, 4);
             }
             _ => panic!("expected draft-push"),
         }
@@ -1692,9 +1024,9 @@ mod tests {
             .expect("parses")
             .command
         {
-            Command::DraftPull { version, dir, .. } => {
-                assert_eq!(version, None, "a pull defaults to the newest save");
-                assert_eq!(dir, std::path::PathBuf::from("./pack"));
+            Command::DraftPull(op) => {
+                assert_eq!(op.version, None, "a pull defaults to the newest save");
+                assert_eq!(op.dir, std::path::PathBuf::from("./pack"));
             }
             _ => panic!("expected draft-pull"),
         }
@@ -1704,11 +1036,9 @@ mod tests {
     fn draft_files_defaults_to_the_newest_version() {
         let cli = Cli::try_parse_from(["crux", "draft-files", "calibrate"]).expect("parses");
         match cli.command {
-            Command::DraftFiles {
-                draft_id, version, ..
-            } => {
-                assert_eq!(draft_id, "calibrate");
-                assert_eq!(version, None);
+            Command::DraftFiles(op) => {
+                assert_eq!(op.draft_id, "calibrate");
+                assert_eq!(op.version, None);
             }
             _ => panic!("expected draft-files"),
         }
@@ -1738,22 +1068,33 @@ mod tests {
         .expect("parses")
         .command
         {
-            Command::DraftLaunch {
-                draft_id,
-                params,
-                max_cost,
-                max_time,
-                schema_digest,
-                ..
-            } => {
-                assert_eq!(draft_id, "calibrate");
-                assert_eq!(params, r#"{"repo":"o/r"}"#);
-                assert_eq!(max_cost, 4.0);
-                assert_eq!(max_time, "30m");
-                assert_eq!(schema_digest.as_deref(), Some("sha256:bb"));
+            Command::DraftLaunch(op) => {
+                assert_eq!(op.draft_id, "calibrate");
+                assert_eq!(
+                    op.params,
+                    std::collections::BTreeMap::from([("repo".to_string(), "o/r".to_string())])
+                );
+                assert_eq!(op.max_cost, 4.0);
+                assert_eq!(op.max_time, "30m");
+                assert_eq!(op.schema_digest.as_deref(), Some("sha256:bb"));
             }
             _ => panic!("expected draft-launch"),
         }
+        assert!(
+            Cli::try_parse_from([
+                "crux",
+                "draft-launch",
+                "calibrate",
+                "--params",
+                r#"{"n": 1}"#,
+                "--max-cost",
+                "4",
+                "--max-time",
+                "30m",
+            ])
+            .is_err(),
+            "a draft launch takes form values as strings"
+        );
 
         match Cli::try_parse_from([
             "crux",
@@ -1773,9 +1114,9 @@ mod tests {
         .expect("parses")
         .command
         {
-            Command::DraftLaunch { rerun_of, from, .. } => {
-                assert_eq!(rerun_of.as_deref(), Some("run-7"));
-                assert_eq!(from, ["check", "report"]);
+            Command::DraftLaunch(op) => {
+                assert_eq!(op.rerun_of.as_deref(), Some("run-7"));
+                assert_eq!(op.from, ["check", "report"]);
             }
             _ => panic!("expected draft-launch"),
         }
@@ -1809,9 +1150,9 @@ mod tests {
         .expect("parses")
         .command
         {
-            Command::DraftGraduate { repo, path, .. } => {
-                assert_eq!(repo, "wren/packs");
-                assert_eq!(path, None);
+            Command::DraftGraduate(op) => {
+                assert_eq!(op.repo, "wren/packs");
+                assert_eq!(op.path, None);
             }
             _ => panic!("expected draft-graduate"),
         }
@@ -1837,17 +1178,16 @@ mod tests {
         .expect("parses")
         .command
         {
-            Command::Launch {
-                id,
-                provider,
-                model,
-                dispatch_target,
-                ..
-            } => {
-                assert_eq!(id, "survey");
-                assert_eq!(provider.as_deref(), Some("openai"));
-                assert_eq!(model.as_deref(), Some("gpt-5.6-luna"));
-                assert_eq!(dispatch_target, None);
+            Command::Launch(op) => {
+                assert_eq!(op.id, "survey");
+                assert_eq!(op.provider.as_deref(), Some("openai"));
+                assert_eq!(op.model.as_deref(), Some("gpt-5.6-luna"));
+                assert_eq!(op.dispatch_target, None);
+                assert_eq!(
+                    op.params,
+                    serde_json::json!({}),
+                    "the default params object"
+                );
             }
             _ => panic!("expected launch"),
         }
@@ -1865,14 +1205,27 @@ mod tests {
         .expect("parses")
         .command
         {
-            Command::Launch {
-                provider, model, ..
-            } => {
-                assert_eq!(provider.as_deref(), Some("openai"));
-                assert_eq!(model, None, "the provider's default model");
+            Command::Launch(op) => {
+                assert_eq!(op.provider.as_deref(), Some("openai"));
+                assert_eq!(op.model, None, "the provider's default model");
             }
             _ => panic!("expected launch"),
         }
+        assert!(
+            Cli::try_parse_from([
+                "crux",
+                "launch",
+                "survey",
+                "--params",
+                "{not json",
+                "--max-cost",
+                "4",
+                "--max-time",
+                "30m",
+            ])
+            .is_err(),
+            "--params must be JSON"
+        );
         for surface in ["launch", "draft-launch"] {
             let Err(err) = Cli::try_parse_from([
                 "crux",

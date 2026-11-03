@@ -8,11 +8,9 @@
 //! It forwards only `Some(event)` from the run_turn sink, so a replay of the log folds
 //! into identical run state.
 
-use crate::agent;
-use crate::agent::event::AgentEvent;
-use crate::args::{Args, Paths};
+use crate::args::Paths;
 use crate::process::STOP;
-use crate::report::reporter::{AgentTurn, Reporter, RunMeta, Stop, TurnBudget};
+use crate::report::reporter::{Reporter, RunMeta, Stop};
 use crate::report::session::{self, Row, RowWire, SessionEvent};
 use anyhow::{Context, Result};
 use crucible_contract::LoopPhase;
@@ -135,112 +133,6 @@ impl Reporter for SessionReporter {
         });
     }
 
-    fn run_agent(
-        &mut self,
-        args: &Args,
-        p: &Paths,
-        it: u32,
-        prompt: &str,
-        resume_prompt: Option<&str>,
-        session: Option<&str>,
-        budget: TurnBudget,
-    ) -> AgentTurn {
-        let prepared = match crate::agent::agent_session::prepare_named(&p.state, session) {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return AgentTurn {
-                    cost: 0.0,
-                    is_error: true,
-                    error: Some(error),
-                };
-            }
-        };
-        if let Some(turn) = &prepared {
-            self.emit(&SessionEvent::AgentSession {
-                session: turn.logical_name.clone(),
-                action: turn.action(),
-                turn: turn.completed_turns + 1,
-            });
-        }
-        self.emit(&SessionEvent::AgentStart { iter: it });
-        // Borrow the sink directly so the closure can append without re-borrowing self.
-        let sink = &mut self.sink;
-        // The result event's is_error rides through into session.jsonl (and the
-        // controller relay) via the emitted Agent event; capture it here too so the
-        // loop can discard a failed turn.
-        let mut is_error = false;
-        let mut error = None;
-        // Stop the agent at most once per turn when provisional spend crosses the cap.
-        let mut over_cap_stopped = false;
-        let turn = agent::run_turn_with_session(
-            args,
-            p,
-            crate::agent::agent_session::effective_prompt(prepared.as_ref(), prompt, resume_prompt),
-            true,
-            prepared.as_ref(),
-            None,
-            |_raw, _stream, ev| {
-                if let Some(ev) = ev {
-                    if let AgentEvent::Result {
-                        is_error: e,
-                        error: text,
-                        ..
-                    } = ev
-                    {
-                        is_error = *e;
-                        error = text.clone();
-                    }
-                    if let AgentEvent::Error { message, .. } = ev {
-                        is_error = true;
-                        error = Some(message.clone());
-                    }
-                    if let AgentEvent::Tokens(t) = ev {
-                        // Provisional mid-turn budget line; the loop's turn-end
-                        // budget call reconciles it with the authoritative cost.
-                        let spent = budget.spent_before + args.pricing().provisional(t);
-                        budget.record_provisional(it, spent);
-                        sink.write_event(&SessionEvent::Budget {
-                            spent,
-                            elapsed_secs: budget.started.elapsed().as_secs(),
-                        });
-                        if budget.over_cap(spent) && !over_cap_stopped {
-                            over_cap_stopped = true;
-                            sink.write_event(&SessionEvent::Note {
-                                msg: format!(
-                                    "budget: provisional spend ${spent:.4} reached cap ${:.2} mid-turn — stopping the agent",
-                                    budget.max_cost
-                                ),
-                            });
-                            // Ends a local agent child; a sandboxed turn has no
-                            // local pid, so there the loop's post-turn guard stops
-                            // the run instead.
-                            crate::process::pid_registry::kill_all();
-                        }
-                    }
-                    sink.write_event(&SessionEvent::Agent { event: ev.clone() });
-                }
-            },
-        );
-        // The turn's own failure channel: a transport that never produced a turn is an error
-        // even when no event carried one.
-        if let Some(failure) = turn.failure() {
-            is_error = true;
-            error = Some(failure.to_string());
-        }
-        if let Some(note) =
-            crate::agent::agent_session::commit_if_ok(&p.state, prepared.as_ref(), !is_error)
-        {
-            is_error = true;
-            error = Some(note);
-        }
-        self.emit(&SessionEvent::AgentDone);
-        AgentTurn {
-            cost: turn.cost_usd,
-            is_error,
-            error,
-        }
-    }
-
     fn budget(&mut self, spent: f64, elapsed: Duration) {
         self.emit(&SessionEvent::Budget {
             spent,
@@ -258,7 +150,7 @@ impl Reporter for SessionReporter {
         if let Some(control) = &self.control
             && crate::control::bridge::stop_file_says_stop(control)
         {
-            crate::process::pid_registry::kill_all();
+            crucible::deadline::terminate_live_children();
             return Stop::Quit;
         }
         Stop::Continue
@@ -311,9 +203,13 @@ impl Reporter for SessionReporter {
         });
     }
 
-    fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+    fn approval_resolved(
+        &mut self,
+        outcome: crate::control::provisioning::ApprovalOutcome,
+        reason: &str,
+    ) {
         self.emit(&SessionEvent::ApprovalResolved {
-            outcome: outcome.to_string(),
+            outcome: outcome.as_str().to_string(),
             reason: reason.to_string(),
         });
     }

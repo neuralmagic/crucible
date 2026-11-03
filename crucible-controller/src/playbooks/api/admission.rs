@@ -143,7 +143,7 @@ impl<'a> LaunchTarget<'a> {
                 match crate::playbooks::registry::schema(pool, &pack.id).await {
                     Ok(Some(schema)) => Ok(schema),
                     Ok(None) => Err(not_found(format!("no playbook {:?}", pack.id))),
-                    Err(e) => Err(AppError::from(e).into_response()),
+                    Err(e) => Err(ApiError::from(e).into_response()),
                 }
             }
             Self::Draft(head) => Ok(head.schema.clone()),
@@ -353,7 +353,7 @@ async fn check_plan(
     {
         Ok(Ok(())) => Ok(()),
         Ok(Err(field)) => Err(invalid_fields(vec![field])),
-        Err(e) => Err(AppError::from(e).into_response()),
+        Err(e) => Err(ApiError::from(e).into_response()),
     }
 }
 
@@ -366,7 +366,7 @@ fn unreadable_tree(e: anyhow::Error) -> Response {
             message: format!("{e:#}"),
         }]);
     }
-    AppError::from(e).into_response()
+    ApiError::from(e).into_response()
 }
 
 /// Decide `launch` on a pack against its owner, for every surface that fires it: the form POST,

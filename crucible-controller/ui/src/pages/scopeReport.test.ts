@@ -9,7 +9,11 @@ import {
   type ScopeStage,
 } from './scopeReport';
 
-const stage = (name: string, passed: boolean, detail = ''): ScopeStage => ({ name, passed, detail });
+const stage = (name: ScopeStage['name'], passed: boolean, detail = ''): ScopeStage => ({
+  name,
+  passed,
+  detail,
+});
 
 const report = (over: Partial<ScopeReport>): ScopeReport => ({
   issue_key: 'o/r#1',

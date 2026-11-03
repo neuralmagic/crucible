@@ -9,15 +9,15 @@ use std::process::Command;
 /// JSON record is handed back verbatim (the agent reads `valid` / `score` / the detail fields, the
 /// same shape the loop's RESULTS table records); failures come back as `{"status":"error",...}`.
 pub(crate) fn measure() -> String {
-    let cmd = match std::env::var("BROKER_MEASURE_CMD")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
+    let cmd = match crate::build::run_env().measure_cmd {
         Some(c) => c,
         None => {
             return json!({
                 "status": "error",
-                "error": "measurement not configured for this run (BROKER_MEASURE_CMD unset)"
+                "error": format!(
+                    "measurement not configured for this run ({} unset)",
+                    crucible_contract::driver_env::BROKER_MEASURE_CMD
+                )
             })
             .to_string();
         }
@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn unconfigured_measure_is_a_clean_error() {
         // Guard against a stray env in the test runner.
-        if std::env::var("BROKER_MEASURE_CMD").is_ok() {
+        if std::env::var(crucible_contract::driver_env::BROKER_MEASURE_CMD).is_ok() {
             return;
         }
         let out = measure();

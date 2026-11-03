@@ -7,7 +7,7 @@ pub(crate) mod watches;
 pub(crate) mod webhooks;
 
 use crate::api::dto::{conflict, not_found};
-use crate::api::state::{ApiState, AppError};
+use crate::api::state::{ApiError, ApiState};
 use crate::authz::action::{ResourceType, Verb};
 use crate::authz::decision::Resource;
 use crate::authz::model::Principal;
@@ -20,7 +20,7 @@ pub(crate) fn save_failed(e: anyhow::Error) -> Response {
     match e.downcast_ref::<Unadoptable>() {
         Some(gone @ Unadoptable::Gone { .. }) => not_found(gone.to_string()),
         Some(moved @ Unadoptable::Repinned { .. }) => conflict(moved.to_string()),
-        None => AppError::from(e).into_response(),
+        None => ApiError::from(e).into_response(),
     }
 }
 
@@ -36,7 +36,7 @@ pub(crate) async fn authorize_standing(
     let snapshot = match standing::owner_snapshot(state.db.pool(), id).await {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => return Err(not_found(missing)),
-        Err(e) => return Err(AppError::from(e).into_response()),
+        Err(e) => return Err(ApiError::from(e).into_response()),
     };
     let existing = Resource::new(
         ResourceType::StandingLaunch,

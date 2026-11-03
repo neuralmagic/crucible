@@ -8,8 +8,8 @@ through crucible. It covers these parts:
 - the controller as the OAuth issuer;
 - the per-run gateway isolation that makes agent identities trustworthy.
 
-The audience is engineers who maintain or extend this code, and reviewers of the branch that
-adds it. The text follows ASD-STE100 Simplified Technical English. Code names appear exactly as
+The audience is engineers who maintain or extend this code, and reviewers of changes
+to it. The text follows ASD-STE100 Simplified Technical English. Code names appear exactly as
 in the source, in backticks. Code references use `path:line` from the repository root.
 
 Note: Every part of this stack is off unless you configure it. Section 9 lists what stays inert

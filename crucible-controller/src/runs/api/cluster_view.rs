@@ -40,7 +40,7 @@ pub(crate) async fn target_context<'a>(
     rules: &'a (dyn Fn(&crate::authz::decision::Resource) -> bool + Sync),
     connected: &'a mut Vec<String>,
     personal: &'a mut Vec<crate::runs::dispatch_target::PersonalTarget>,
-) -> Result<crate::runs::dispatch_target::TargetContext<'a>, AppError> {
+) -> Result<crate::runs::dispatch_target::TargetContext<'a>, ApiError> {
     *connected = state.clusters.names();
     *personal =
         crate::runs::dispatch_target::personal_targets(state.db.pool(), &caller.principals).await?;
@@ -88,7 +88,7 @@ pub(crate) async fn list_dispatch_targets(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
     Query(q): Query<DispatchTargetsQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     // The pack's substrate, when the form names one: a pack the deployment cannot dispatch has no
     // eligible target, and saying so on the form beats refusing at the POST.
     let agent = match q.playbook.as_deref() {

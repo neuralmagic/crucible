@@ -349,7 +349,7 @@ fn save_refusal(e: SaveError) -> Response {
             invalid_fields(vec![field_error("verifier", e.to_string())])
         }
         SaveError::Internal(e) => crate::launches::api::save_failed(e),
-        other => AppError::from(anyhow::Error::new(other)).into_response(),
+        other => ApiError::from(anyhow::Error::new(other)).into_response(),
     }
 }
 
@@ -547,7 +547,7 @@ async fn audit(
             .by(actor),
         )
         .await
-        .map_err(|e| AppError::from(e).into_response())
+        .map_err(|e| ApiError::from(e).into_response())
 }
 
 fn state_of(enabled: bool) -> &'static str {
@@ -594,7 +594,7 @@ pub(crate) async fn create_webhook(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Err(denied) = crate::authz::owner::decide_create(
         &state,
@@ -659,7 +659,7 @@ pub(crate) async fn create_webhook(
 pub(crate) async fn list_webhooks(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
-) -> Result<Json<Vec<WebhookDto>>, AppError> {
+) -> Result<Json<Vec<WebhookDto>>, ApiError> {
     let rows =
         crate::launches::webhooks::list(state.db.pool(), crate::launches::webhooks::LIST_LIMIT)
             .await?;
@@ -710,7 +710,7 @@ async fn readable_webhook(
 ) -> Result<Webhook, Response> {
     let row = crate::launches::webhooks::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     crate::authz::owner::decide_row(
         state,
         caller,
@@ -782,7 +782,7 @@ pub(crate) async fn update_webhook(
     let prior = match crate::launches::webhooks::get(state.db.pool(), &id).await {
         Ok(Some(prior)) => prior,
         Ok(None) => return not_found(format!("no webhook {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let authorized = match authorize_webhook(&state, &caller, &body).await {
         Ok(ok) => ok,
@@ -806,7 +806,7 @@ pub(crate) async fn update_webhook(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     let firing_changed = prior.core.playbook != authorized.launch.pack.id
         || !prior.core.adopts(&authorized.launch.pack)
@@ -842,7 +842,7 @@ pub(crate) async fn update_webhook(
             tracing::info!(webhook = %id, expired = expired.len(), "webhooks: re-save expired stale-owner parks");
         }
         Ok(_) => {}
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     if !webhook.core.enabled
         && let Err(e) = crate::launches::webhooks::settle_pending(
@@ -852,7 +852,7 @@ pub(crate) async fn update_webhook(
         )
         .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     let reason = format!(
         "playbook {} on {} deliveries as {}",
@@ -899,12 +899,12 @@ pub(crate) async fn delete_webhook(
         crate::launches::webhooks::settle_pending(state.db.pool(), &id, "the webhook is deleted")
             .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     match crate::launches::standing::delete(state.db.pool(), &id).await {
         Ok(true) => {}
         Ok(false) => return not_found(format!("no webhook {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     if let Err(refusal) = audit(
         &state,
@@ -948,7 +948,7 @@ pub(crate) async fn set_webhook_enabled(
         match crate::launches::standing::set_enabled(state.db.pool(), &id, body.enabled).await {
             Ok(Some(prior)) => prior,
             Ok(None) => return not_found(format!("no webhook {id:?}")),
-            Err(e) => return AppError::from(e).into_response(),
+            Err(e) => return ApiError::from(e).into_response(),
         };
     if !body.enabled
         && let Err(e) = crate::launches::webhooks::settle_pending(
@@ -958,7 +958,7 @@ pub(crate) async fn set_webhook_enabled(
         )
         .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if prior != body.enabled
         && let Err(refusal) = audit(
@@ -976,7 +976,7 @@ pub(crate) async fn set_webhook_enabled(
     match crate::launches::webhooks::get(state.db.pool(), &id).await {
         Ok(Some(w)) => Json(dto(&state, w)).into_response(),
         Ok(None) => not_found(format!("no webhook {id:?}")),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -1036,7 +1036,7 @@ pub(crate) async fn rotate_webhook_secret(
             .into_response()
         }
         Ok(None) => not_found(format!("no webhook {id:?}")),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -1085,7 +1085,7 @@ pub(crate) async fn list_webhook_deliveries(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 

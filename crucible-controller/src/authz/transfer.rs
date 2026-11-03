@@ -94,7 +94,7 @@ pub async fn transfer(
     let prior = match owner_of(pool, owned, id).await {
         Ok(Some(owner)) => owner,
         Ok(None) => return not_found(format!("no {} {id:?}", owned.rtype.as_str())),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let action = Action {
         resource: owned.rtype,
@@ -125,7 +125,7 @@ pub async fn transfer(
     let now = crate::clock::now_rfc3339();
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let done = match sqlx::query(sqlx::AssertSqlSafe(format!(
         "UPDATE {} SET owner = $2 WHERE {} = $1",
@@ -137,7 +137,7 @@ pub async fn transfer(
     .await
     {
         Ok(done) => done,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     if done.rows_affected() != 1 {
         return not_found(format!("no {} {id:?}", owned.rtype.as_str()));
@@ -146,10 +146,10 @@ pub async fn transfer(
     event.prior = Some(serde_json::json!({"owner": prior.to_string()}));
     event.result = Some(serde_json::json!({"owner": next.to_string()}));
     if let Err(e) = store::audit(&mut tx, &event, &now).await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     Json(TransferDto {
         id: id.to_string(),

@@ -13,6 +13,8 @@ pub mod buildit;
 pub mod cluster_link;
 pub mod decision;
 pub mod decision_request;
+pub mod distress;
+pub mod driver_env;
 pub mod emits;
 pub mod envelope;
 pub mod event;
@@ -20,10 +22,10 @@ pub mod history;
 pub mod identity;
 pub mod inference;
 pub mod json;
-pub mod kueue;
 pub mod link;
 pub mod markers;
 pub mod mcp;
+pub mod oauth;
 pub mod outputs;
 pub mod pack_tree;
 pub mod refine;
@@ -58,7 +60,7 @@ pub use link::{
 };
 pub use markers::{
     ENV_CONTROLLER_URL, ENV_POD_NAME, ENV_POD_TOKEN, ENV_RUN_DISPLAY_NAME, ENV_RUN_NAME,
-    MANAGED_BY_KEY, MANAGED_BY_SELECTOR, MANAGED_BY_VALUE, RANK_ACTIVITY_MARKER,
+    ENV_UI_BASE_URL, MANAGED_BY_KEY, MANAGED_BY_SELECTOR, MANAGED_BY_VALUE, RANK_ACTIVITY_MARKER,
     RUN_SESSION_DELIMITER, RUN_SESSION_UNDELIVERED, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER,
     SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
 };

@@ -189,9 +189,9 @@ pub(crate) struct ToolChain {
 }
 
 impl ToolChain {
-    /// The chain `args` declares, or the default chain when it declares none.
-    pub(crate) fn for_args(args: &crate::args::Args) -> Self {
-        match &args.tool_plugins {
+    /// The chain a manifest declares, or the default chain when it declares none.
+    pub(crate) fn declared(specs: Option<&[ToolPluginSpec]>) -> Self {
+        match specs {
             Some(specs) => Self::new(specs),
             None => Self::new(&crate::manifest::default_chain()),
         }

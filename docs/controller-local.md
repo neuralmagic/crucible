@@ -43,8 +43,8 @@ crux draft-launch notes --max-cost 1 --max-time 5m
 | `CONTROLLER_HOOKS_PUBLIC_URL` | `http://127.0.0.1:8871` | The base of the delivery URL of each new webhook. |
 | `CONTROLLER_WEBHOOK_KEY_FILE` | `$CONTROLLER_STATE_DIR/webhook.key`, generated once | Seals `hmac_sha256` webhook secrets. |
 
-The recipe unsets `CONTROLLER_API_TOKEN`, `CONTROLLER_PROXY_TOKEN`, `CONTROLLER_OIDC_ISSUER`,
-and `VAULT_ADDR` for the process, also if your shell exports them.
+The recipe unsets `CONTROLLER_API_TOKEN`, `CONTROLLER_OIDC_ISSUER`, and `VAULT_ADDR` for the
+process, also if your shell exports them.
 
 ## The embedded database
 
@@ -65,12 +65,13 @@ rejects the value at boot.
 
 ## The dev identity
 
-Without `CONTROLLER_API_TOKEN` and `CONTROLLER_OIDC_ISSUER`, the guard is open. It admits
-every request and binds loopback, whatever `CONTROLLER_API_ADDR` is. An open request has no
-identity, so it is a viewer. `CONTROLLER_DEV_IDENTITY` gives it an identity. It also removes
-any `X-Auth-Request-*` header from the client, so a browser and curl get the same identity.
-The controller does not boot if this variable is set on a guarded deployment, because it would
-give every caller that identity.
+Without `CONTROLLER_API_TOKEN` and `CONTROLLER_OIDC_ISSUER`, the controller starts only with
+`CONTROLLER_DEV_IDENTITY`. The guard is then open: it admits every request as that login, and
+binds loopback, whatever `CONTROLLER_API_ADDR` is. The controller removes any
+`X-Auth-Request-*` header from the client, so a browser and curl get the same identity. The
+controller does not boot if this variable is set on a guarded deployment, because it would
+give every caller that identity, and it does not boot with none of the three, because an open
+controller without a login is never what a deployment meant.
 
 ## Agent turns
 

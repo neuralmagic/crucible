@@ -2906,6 +2906,7 @@ mod tests {
                 created_by: Some("alice"),
                 launcher_groups: None,
                 rerun: None,
+                dispatch: Default::default(),
             },
             &crate::playbooks::exposure::Extraction::Absent,
         )
