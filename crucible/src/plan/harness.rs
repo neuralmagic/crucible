@@ -15,7 +15,6 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use crate::agent::event::{AgentEvent, RawStream};
-use crate::agent::harness::HarnessRuntime;
 use crate::agent::turn::TurnFailure;
 use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
@@ -785,7 +784,7 @@ pub(crate) fn resolved_agent(
         _ => return None,
     };
     let args = agent_knobs(args, knobs.0, knobs.1, knobs.2).ok()?;
-    let backend = crate::agent::harness::HarnessRuntime::backend(args.harness());
+    let backend = crate::agent::harness::backend(args.harness());
     Some(crucible_contract::session::TaskAgent {
         harness: args.harness().as_str().to_string(),
         model: backend.model(&args.turn_agent()).to_string(),

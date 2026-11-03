@@ -384,16 +384,6 @@ pub(crate) fn backend(harness: Harness) -> &'static dyn Backend {
     }
 }
 
-pub(crate) trait HarnessRuntime {
-    fn backend(self) -> &'static dyn Backend;
-}
-
-impl HarnessRuntime for Harness {
-    fn backend(self) -> &'static dyn Backend {
-        backend(self)
-    }
-}
-
 /// The `bash -c` exec wrapper: cd into the workdir, source the env, exec the agent with the
 /// prompt redirected from its file (openshell exec rejects newlines in argv, so the prompt
 /// can't be an argument). Validated in-pod. Shared by both harnesses (hermes uses the same
@@ -731,14 +721,12 @@ mod tests {
             completed_turns: 0,
         };
         assert!(
-            Harness::Codex
-                .backend()
+            crate::agent::harness::backend(Harness::Codex)
                 .local_session_argv(&args.turn_agent(), "p", &session)
                 .is_err()
         );
         assert!(
-            Harness::Codex
-                .backend()
+            crate::agent::harness::backend(Harness::Codex)
                 .sandbox_session_argv(&args.turn_agent(), false, &session)
                 .is_err()
         );
@@ -753,21 +741,19 @@ mod tests {
     #[test]
     fn each_harness_decodes_its_own_stdout() {
         let mut args = crate::cli::Cli::parse_from(["crucible"]).run;
-        let claude = Harness::Claude.backend().decoder(&args.turn_agent(), None, false).push(
+        let claude = crate::agent::harness::backend(Harness::Claude).decoder(&args.turn_agent(), None, false).push(
             r#"{"type":"system","subtype":"init","model":"claude-opus-4-8","tools":[],"agents":[]}"#,
         );
         assert!(
             matches!(&claude[0], AgentEvent::Init { model, .. } if model == "claude-opus-4-8"),
             "{claude:?}"
         );
-        let hermes = Harness::Hermes
-            .backend()
+        let hermes = crate::agent::harness::backend(Harness::Hermes)
             .decoder(&args.turn_agent(), None, false)
             .push("plain text");
         assert!(matches!(&hermes[0], AgentEvent::Raw { .. }), "{hermes:?}");
         args.codex.model = Some("gpt-5.6-terra".to_string());
-        let events = Harness::Codex
-            .backend()
+        let events = crate::agent::harness::backend(Harness::Codex)
             .decoder(&args.turn_agent(), None, false)
             .push("{\"type\":\"thread.started\",\"thread_id\":\"t1\"}");
         assert!(
@@ -775,16 +761,14 @@ mod tests {
             "{events:?}"
         );
         args.model = Some("qwen-3-8-27b".to_string());
-        let events = Harness::OpenCode
-            .backend()
+        let events = crate::agent::harness::backend(Harness::OpenCode)
             .decoder(&args.turn_agent(), None, false)
             .push(r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#);
         assert!(
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "qwen-3-8-27b"),
             "{events:?}"
         );
-        let events = Harness::Pi
-            .backend()
+        let events = crate::agent::harness::backend(Harness::Pi)
             .decoder(&args.turn_agent(), None, false)
             .push(r#"{"type":"session","version":3,"id":"u","timestamp":"t","cwd":"/w"}"#);
         assert!(
@@ -847,7 +831,7 @@ mod tests {
             assert_eq!(lines[1], format!("export {}={}", spec.home_var, spec.home));
             assert_eq!(lines.len(), 3 + spec.sandbox_env.len(), "{script}");
             assert_eq!(lines[lines.len() - 1], "export K='v w'");
-            let local = harness.backend().local_env();
+            let local = crate::agent::harness::backend(harness).local_env();
             assert_eq!(local[0], ("AGENT_TOOL", spec.name));
             assert_eq!(&local[1..], spec.local_env);
             assert!(spec.home.starts_with(SandboxLayout::HOME), "{harness:?}");
