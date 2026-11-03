@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0068"
 title = "Agents get identity-only tokens from the controller, bound to their run's own gateway"
-status = "proposed"
+status = "accepted"
 date = "2026-10-08"
 refs = [
     "ADR-0067",

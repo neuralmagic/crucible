@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0066"
 title = "A provider's price, not the harness, costs a model no vendor bills"
-status = "proposed"
+status = "accepted"
 date = "2026-10-22"
 refs = [
     "RFC-0001:C-INFERENCE",
@@ -51,9 +51,7 @@ cons = [
 [[content.alternatives]]
 text = "Keep the harness's reported cost authoritative and only fix the default"
 status = "rejected"
-cons = [
-    "The harness's number for a non-vendor model is a guess at a rate nobody charges, so it would keep overriding the table.",
-]
+cons = ["The harness's number for a non-vendor model is a guess at a rate nobody charges, so it would keep overriding the table."]
 
 [[content.alternatives]]
 text = "Extend the engine's vendor table with self-hosted model names and rates"

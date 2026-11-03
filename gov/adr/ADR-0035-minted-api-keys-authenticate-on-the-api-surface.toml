@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0035"
 title = "Minted API keys authenticate on the API surface"
-status = "proposed"
+status = "accepted"
 date = "2026-08-29"
 refs = [
     "ADR-0048",

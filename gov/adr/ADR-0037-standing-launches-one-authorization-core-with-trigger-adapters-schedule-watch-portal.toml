@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0037"
 title = "Standing launches: one authorization core with trigger adapters (schedule, watch, portal)"
-status = "proposed"
+status = "accepted"
 date = "2026-09-02"
 refs = [
     "RFC-0001",
@@ -48,35 +48,60 @@ consequences = """
 text = "Daemon singleton configured by environment variables (PR 479's shape)"
 status = "rejected"
 pros = ["Smallest diff; no API, SPA, or MCP surface."]
-cons = ["One watch per deployment.", "Launches carry no owner or groups, so bound secrets cannot be redeemed.", "Five values threaded through the controller config and every test fixture.", "A second launch-minting path beside the schedule's."]
+cons = [
+    "One watch per deployment.",
+    "Launches carry no owner or groups, so bound secrets cannot be redeemed.",
+    "Five values threaded through the controller config and every test fixture.",
+    "A second launch-minting path beside the schedule's.",
+]
 rejection_reason = "Cannot own a run, cannot host more than one watch, and duplicates the launch path instead of composing with it."
 
 [[content.alternatives]]
 text = "A watches table that copies the schedule's authorization columns, sharing only a Rust type and the fire builder"
 status = "rejected"
-pros = ["Leaves playbook_schedules untouched.", "Smaller migration."]
-cons = ["Every authorization column exists twice, three times once the portal lands.", "Owner refresh, sign-in state, and auto-disable are queried per table."]
+pros = [
+    "Leaves playbook_schedules untouched.",
+    "Smaller migration.",
+]
+cons = [
+    "Every authorization column exists twice, three times once the portal lands.",
+    "Owner refresh, sign-in state, and auto-disable are queried per table.",
+]
 rejection_reason = "Copies the columns the design is trying to share; the third trigger would make it a triplication."
 
 [[content.alternatives]]
 text = "One table with a trigger_kind discriminator and nullable trigger columns"
 status = "rejected"
-pros = ["No join on any read or claim.", "One migration, one row type."]
-cons = ["Every trigger's columns are nullable on every row, so a schedule's cron and a watch's watermark are enforced by CHECK constraints per kind rather than by the table.", "Adding a trigger widens a table every other trigger reads.", "The claim statements (a due window, an unseen hit) are unrelated queries that would share one hot table."]
+pros = [
+    "No join on any read or claim.",
+    "One migration, one row type.",
+]
+cons = [
+    "Every trigger's columns are nullable on every row, so a schedule's cron and a watch's watermark are enforced by CHECK constraints per kind rather than by the table.",
+    "Adding a trigger widens a table every other trigger reads.",
+    "The claim statements (a due window, an unseen hit) are unrelated queries that would share one hot table.",
+]
 rejection_reason = "Per-kind constraints and per-kind claims want per-kind tables; the join is the cheaper cost."
 
 [[content.alternatives]]
 text = "Tracker-side handshake: the launch flips a label or status so the query stops matching, no seen-set"
 status = "rejected"
 pros = ["The tracker is the single source of truth; no controller state to reset."]
-cons = ["Needs write access to every watched tracker.", "A pack or the controller must know the handshake convention per tracker.", "A human who removes the label by hand relaunches the ticket silently."]
+cons = [
+    "Needs write access to every watched tracker.",
+    "A pack or the controller must know the handshake convention per tracker.",
+    "A human who removes the label by hand relaunches the ticket silently.",
+]
 rejection_reason = "Couples the watch to tracker write access and to a per-project labeling convention the controller cannot verify."
 
 [[content.alternatives]]
 text = "Relaunch on update, suppressing updates caused by the controller's own comments"
 status = "rejected"
 pros = ["An amended ticket relaunches without human action."]
-cons = ["Distinguishing self-updates from real ones needs comment-author tracking across every tracker.", "Any missed self-update loops the pipeline on its own output."]
+cons = [
+    "Distinguishing self-updates from real ones needs comment-author tracking across every tracker.",
+    "Any missed self-update loops the pipeline on its own output.",
+]
 rejection_reason = "The self-retrigger loop is the failure mode this feature must be immune to; the suppression logic is fragile per tracker and the reset covers the round trip."
 
 [[content.alternatives]]
@@ -89,5 +114,13 @@ rejection_reason = "The tracker boundary already normalizes hits; the only track
 [[content.alternatives]]
 text = "One standing-launch authorization table with 1:1 trigger sidecars (schedule, watch, portal) and a single fire builder"
 status = "accepted"
-pros = ["Authorization columns and the fire path exist once and are already tested.", "A new trigger is a sidecar, a claim, and an overlay.", "Ownership cannot regress per trigger.", "Immune to the self-retrigger loop by construction."]
-cons = ["Migrates playbook_schedules in place and refactors its sweep.", "Once-per-item needs a reset for the amended-ticket case."]
+pros = [
+    "Authorization columns and the fire path exist once and are already tested.",
+    "A new trigger is a sidecar, a claim, and an overlay.",
+    "Ownership cannot regress per trigger.",
+    "Immune to the self-retrigger loop by construction.",
+]
+cons = [
+    "Migrates playbook_schedules in place and refactors its sweep.",
+    "Once-per-item needs a reset for the amended-ticket case.",
+]
