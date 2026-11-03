@@ -221,6 +221,13 @@ jobs:
           ./tools/check-dep-dups.sh
           ./tools/check-heavy-dep-allowlist.sh
 
+      - name: No personal-namespace images in Containerfiles
+        run: |
+          if git grep -nE 'quay\.io/wseaton/' -- '*Containerfile*' '*Dockerfile*'; then
+            echo "a Containerfile references a personal-namespace image; publish it under ghcr.io/neuralmagic" >&2
+            exit 1
+          fi
+
       # The crucible crate's module graph is a DAG: `cargo xtask modgraph` prints it and
       # `--check` fails on any cycle, so a module cannot quietly grow a dependency on one of
       # its own dependents.
@@ -436,9 +443,8 @@ jobs:
           bun run test
           bun run build
 
-  # Supply-chain checks, independent of the build: known-vulnerability audit over Cargo.lock
-  # (policy in .cargo/audit.toml) plus the cargo-deny policy (licenses, sources, advisories;
-  # see deny.toml, the two ignore lists mirror each other).
+  # Supply-chain checks, independent of the build: the cargo-deny policy in deny.toml
+  # (licenses, sources, and RustSec advisories over Cargo.lock).
   audit:
     timeout-minutes: 15
     runs-on: ubuntu-latest
@@ -446,11 +452,9 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - name: Install cargo-audit + cargo-deny
+      - name: Install cargo-deny
         uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
-          tool: cargo-audit,cargo-deny
-      - name: cargo audit
-        run: cargo audit
+          tool: cargo-deny
       - name: cargo deny
         run: cargo deny check
