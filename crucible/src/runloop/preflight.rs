@@ -69,7 +69,7 @@ pub(crate) fn run(
     cfg: &PreflightCfg,
     modes: &[String],
     workspace: &Path,
-    r: &mut impl Reporter,
+    r: &mut dyn Reporter,
 ) -> Result<Option<PreflightBaseline>> {
     let mut digest: Option<String> = None;
     for command in &cfg.commands {
@@ -116,7 +116,7 @@ fn run_rung(
     command: &str,
     digest: &mut Option<String>,
     workspace: &Path,
-    r: &mut impl Reporter,
+    r: &mut dyn Reporter,
 ) -> Result<Capture> {
     if STOP.load(Ordering::SeqCst) {
         return Err(PreflightStopped.into());

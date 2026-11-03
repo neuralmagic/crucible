@@ -203,9 +203,13 @@ impl Reporter for SessionReporter {
         });
     }
 
-    fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+    fn approval_resolved(
+        &mut self,
+        outcome: crate::control::provisioning::ApprovalOutcome,
+        reason: &str,
+    ) {
         self.emit(&SessionEvent::ApprovalResolved {
-            outcome: outcome.to_string(),
+            outcome: outcome.as_str().to_string(),
             reason: reason.to_string(),
         });
     }

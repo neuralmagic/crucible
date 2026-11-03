@@ -154,7 +154,7 @@ pub struct Record<'a> {
 /// Returns whatever draft PRs opened (empty when nothing was kept, no PR repo is
 /// configured, or the open failed), the caller uses these to auto-spawn a feedback
 /// watcher (`--watch-feedback`).
-pub fn publish<R: Reporter>(r: &mut R, rec: &Record<'_>, tally: &mut OutputTally) -> Vec<PrLink> {
+pub fn publish(r: &mut dyn Reporter, rec: &Record<'_>, tally: &mut OutputTally) -> Vec<PrLink> {
     // PRs open BEFORE the S3 record so their URLs land in `summary.json` (the report deep-links to
     // them). S3 still runs unconditionally afterwards, so the "the run happened" record ships even
     // when the PR step is skipped or fails, only now it's enriched with whatever PRs opened.
@@ -174,7 +174,7 @@ pub fn publish<R: Reporter>(r: &mut R, rec: &Record<'_>, tally: &mut OutputTally
 /// Open the draft PR(s) for a kept run and return their links (for the record). Best-effort: a push/
 /// open failure logs through `r` and yields no link, never aborting the publish. Empty when nothing
 /// was kept or no PR repo is configured.
-fn open_prs<R: Reporter>(r: &mut R, rec: &Record<'_>, tally: &mut OutputTally) -> Vec<PrLink> {
+fn open_prs(r: &mut dyn Reporter, rec: &Record<'_>, tally: &mut OutputTally) -> Vec<PrLink> {
     // Gate on any kept row (not on this session's `kept_shas`), so a resumed run whose keeps happened
     // earlier still ships the deliverable.
     let kept_any = rec.rows.iter().any(|row| row.decision == "keep");
@@ -223,7 +223,7 @@ fn open_prs<R: Reporter>(r: &mut R, rec: &Record<'_>, tally: &mut OutputTally) -
 /// `publish` only runs on a clean exit, so a `kubectl delete pod` (SIGKILL) publishes nothing and the
 /// next run seeds empty. No git push here, the branch is the end-of-run deliverable, not a per-iter
 /// cost, and best-effort like the rest of publishing: a hiccup logs and the loop keeps going.
-pub fn publish_progress<R: Reporter>(r: &mut R, rec: &Record<'_>) {
+pub fn publish_progress(r: &mut dyn Reporter, rec: &Record<'_>) {
     if rec.args.results_bucket.is_empty() {
         return;
     }
@@ -858,8 +858,8 @@ pub(crate) fn head_branch_for_test(goal: &str, run_id: &str, kept_shas: &[String
 /// branch-to-branch, not SHA-to-SHA, so git reconstructs the delta, no hand-rolled base+delta. On
 /// resume the base SHA is absent (it lived in the original run), so that PR opens against the repo's
 /// default branch.
-fn open_single_repo_prs<R: Reporter>(
-    r: &mut R,
+fn open_single_repo_prs(
+    r: &mut dyn Reporter,
     rec: &Record<'_>,
     tally: &mut OutputTally,
 ) -> Result<Vec<PrLink>> {
@@ -933,8 +933,8 @@ fn push_url(repo: &str, token: &str) -> String {
 /// parsing. Returns the opened PR links (for the
 /// run record). A per-component push/open failure aborts (the caller logs it best-effort); the kept
 /// work stays in git memory + S3, recoverable.
-fn open_composite_prs<R: Reporter>(
-    r: &mut R,
+fn open_composite_prs(
+    r: &mut dyn Reporter,
     rec: &Record<'_>,
     tally: &mut OutputTally,
 ) -> Result<Vec<PrLink>> {

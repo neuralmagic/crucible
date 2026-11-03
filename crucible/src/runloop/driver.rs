@@ -166,36 +166,38 @@ const MAX_DEAD_TURN_ATTEMPTS: u32 = 3;
 /// call before the reporter (and its owning process) tears down. A clean exit reports it
 /// once at the tail of `run_loop_body` itself (it knows the [`LoopExit`] reason); an error
 /// exit is the only case the wrapper needs to catch.
-pub(crate) fn run_loop<R: Reporter>(
+pub(crate) fn run_loop<R: Reporter + Send>(
     args: &Args,
     p: &Paths,
     prep: &Prepared,
-    reporter: R,
+    mut reporter: R,
     world: &Arc<dyn World>,
     judge: &Arc<dyn Judge>,
     runtime: LoopRuntime,
 ) -> (R, Result<Outcome>) {
-    let mut runner = crate::runloop::graph::LoopTaskRunner::new(
-        args,
-        p,
-        reporter,
-        Arc::clone(world),
-        Arc::clone(judge),
-        runtime.control.clone(),
-        runtime.heartbeat.clone(),
-    );
-    let outcome = run_loop_body(args, p, prep, &mut runner, world, judge, runtime);
+    let outcome = {
+        let mut runner = crate::runloop::graph::LoopTaskRunner::new(
+            args,
+            p,
+            &mut reporter,
+            Arc::clone(world),
+            Arc::clone(judge),
+            runtime.control.clone(),
+            runtime.heartbeat.clone(),
+        );
+        run_loop_body(args, p, prep, &mut runner, world, judge, runtime)
+    };
     if let Err(e) = &outcome {
-        runner.r.shutdown("error", &format!("{e:#}"));
+        reporter.shutdown("error", &format!("{e:#}"));
     }
-    (runner.r, outcome)
+    (reporter, outcome)
 }
 
-fn run_loop_body<R: Reporter>(
+fn run_loop_body(
     args: &Args,
     p: &Paths,
     prep: &Prepared,
-    runner: &mut crate::runloop::graph::LoopTaskRunner<R>,
+    runner: &mut crate::runloop::graph::LoopTaskRunner<'_>,
     world: &Arc<dyn World>,
     judge: &Arc<dyn Judge>,
     runtime: LoopRuntime,
@@ -280,7 +282,7 @@ fn run_loop_body<R: Reporter>(
             run.pending_block = approval.repark;
         }
         if let (Some(ledger), Some(replay)) = (ledger, replay) {
-            replay_admissions(ledger, control.as_deref(), replay, &mut runner.r);
+            replay_admissions(ledger, control.as_deref(), replay, &mut *runner.r);
         }
         // Recompute the identity fresh (from the live manifest/workspace) and hard-warn, never
         // abort, when it differs from what the original run recorded. Scores across this resume
@@ -303,7 +305,7 @@ fn run_loop_body<R: Reporter>(
             && let Some(cfg) = &prep.preflight
             && !run.segment.baseline_score.is_finite()
         {
-            machine.advance(Event::PreflightStarted, &mut runner.r)?;
+            machine.advance(Event::PreflightStarted, &mut *runner.r)?;
             update_control_progress(
                 control.as_deref(),
                 start_iter.saturating_sub(1),
@@ -314,18 +316,18 @@ fn run_loop_body<R: Reporter>(
                 cfg,
                 &prep.preflight_modes,
                 &p.workspace,
-                &mut runner.r,
+                &mut *runner.r,
             );
             match preflight {
                 Ok(seeded) => {
-                    machine.advance(Event::PreflightPassed, &mut runner.r)?;
+                    machine.advance(Event::PreflightPassed, &mut *runner.r)?;
                     preflight_baseline = seeded;
                 }
                 Err(e)
                     if e.downcast_ref::<crate::runloop::preflight::PreflightStopped>()
                         .is_some() =>
                 {
-                    machine.advance(Event::Stopped, &mut runner.r)?;
+                    machine.advance(Event::Stopped, &mut *runner.r)?;
                     let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
                     runner.r.shutdown(outcome, reason);
                     return Ok(Outcome::default());
@@ -369,7 +371,7 @@ fn run_loop_body<R: Reporter>(
         }
 
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-        machine.advance(Event::Resumed, &mut runner.r)?;
+        machine.advance(Event::Resumed, &mut *runner.r)?;
         run
     } else {
         runner.r.start(&prep.goal, &judge.objective());
@@ -377,24 +379,24 @@ fn run_loop_body<R: Reporter>(
         start_iter = 1;
 
         if let Some(cfg) = &prep.preflight {
-            machine.advance(Event::PreflightStarted, &mut runner.r)?;
+            machine.advance(Event::PreflightStarted, &mut *runner.r)?;
             update_control_progress(control.as_deref(), 0, f64::INFINITY, 0.0);
             let preflight = crate::runloop::preflight::run(
                 cfg,
                 &prep.preflight_modes,
                 &p.workspace,
-                &mut runner.r,
+                &mut *runner.r,
             );
             match preflight {
                 Ok(seeded) => {
-                    machine.advance(Event::PreflightPassed, &mut runner.r)?;
+                    machine.advance(Event::PreflightPassed, &mut *runner.r)?;
                     preflight_baseline = seeded;
                 }
                 Err(e)
                     if e.downcast_ref::<crate::runloop::preflight::PreflightStopped>()
                         .is_some() =>
                 {
-                    machine.advance(Event::Stopped, &mut runner.r)?;
+                    machine.advance(Event::Stopped, &mut *runner.r)?;
                     let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
                     runner.r.shutdown(outcome, reason);
                     return Ok(Outcome::default());
@@ -416,7 +418,7 @@ fn run_loop_body<R: Reporter>(
         }
 
         if machine.state() == State::Setup {
-            machine.advance(Event::BaselineStarted, &mut runner.r)?;
+            machine.advance(Event::BaselineStarted, &mut *runner.r)?;
         }
         update_control_progress(control.as_deref(), 0, f64::INFINITY, 0.0);
         let (segment, base_row) = Segment::baseline(
@@ -450,7 +452,7 @@ fn run_loop_body<R: Reporter>(
         run.rows.push(base_row);
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
         update_control_progress(control.as_deref(), 0, run.segment.best_score, run.spent);
-        machine.advance(Event::BaselineMeasured, &mut runner.r)?;
+        machine.advance(Event::BaselineMeasured, &mut *runner.r)?;
         run
     };
 
@@ -473,13 +475,13 @@ fn run_loop_body<R: Reporter>(
         // serial diff scoring, engine top_k) on both loop paths. The winner diff travels
         // as text: the candidate worktrees are removed before seed time, so re-deriving a
         // diff from one silently yields nothing.
-        machine.advance(Event::WideStarted, &mut runner.r)?;
+        machine.advance(Event::WideStarted, &mut *runner.r)?;
         let result = crate::runloop::graph::run_wide_tournament(
             &wide_cfg,
             args,
             p,
             prep,
-            &mut runner.r,
+            &mut *runner.r,
             world,
             judge,
             run.segment.baseline_score,
@@ -527,7 +529,7 @@ fn run_loop_body<R: Reporter>(
                 .r
                 .note("wide round produced no winners — deep loop starts from baseline");
         }
-        machine.advance(Event::WideDone, &mut runner.r)?;
+        machine.advance(Event::WideDone, &mut *runner.r)?;
     }
 
     // How this run ends. Each early exit sets it before breaking; a loop that runs out of
@@ -543,29 +545,29 @@ fn run_loop_body<R: Reporter>(
     let mut bad_marker_seen: Option<Option<std::time::SystemTime>> = None;
     let mut it = start_iter;
     while it <= args.iterations {
-        machine.set_iter(it, &mut runner.r);
+        machine.set_iter(it, &mut *runner.r);
         if control.as_deref().is_some_and(|c| c.is_paused()) {
-            machine.advance(Event::Paused, &mut runner.r)?;
-            wait_if_paused(control.as_deref(), &mut runner.r);
-            machine.advance(Event::Unpaused, &mut runner.r)?;
+            machine.advance(Event::Paused, &mut *runner.r)?;
+            wait_if_paused(control.as_deref(), &mut *runner.r);
+            machine.advance(Event::Unpaused, &mut *runner.r)?;
         }
         // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
         // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
         // fires it over the control bridge) or we're told to stop. The drain below then
         // re-baselines into the granted regime.
         if let Some(pp) = run.pending_block.take() {
-            machine.advance(Event::ApprovalPending, &mut runner.r)?;
+            machine.advance(Event::ApprovalPending, &mut *runner.r)?;
             let parked = park_for_approval(
                 control.as_deref(),
                 ledger,
-                &mut runner.r,
+                &mut *runner.r,
                 &mut run.parked_total,
                 args.max_park(),
             );
             match parked {
                 // The re-scope drain below re-baselines.
                 ParkOutcome::Resumed => {
-                    machine.advance(Event::ApprovalGranted, &mut runner.r)?;
+                    machine.advance(Event::ApprovalGranted, &mut *runner.r)?;
                 }
                 ParkOutcome::Denied(why) => {
                     // `block` means the agent had no frozen-regime fallback, a denial leaves
@@ -581,11 +583,11 @@ fn run_loop_body<R: Reporter>(
                         run.spent,
                     );
                     world.restore(run.segment.best_snap.as_str())?;
-                    machine.advance(Event::ApprovalDenied, &mut runner.r)?;
+                    machine.advance(Event::ApprovalDenied, &mut *runner.r)?;
                     break;
                 }
                 ParkOutcome::Stopped => {
-                    machine.advance(Event::Stopped, &mut runner.r)?;
+                    machine.advance(Event::Stopped, &mut *runner.r)?;
                     break;
                 }
             }
@@ -593,10 +595,12 @@ fn run_loop_body<R: Reporter>(
         // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
         // into the new regime and open a fresh segment before this iteration measures.
         if let Some((rescope_key, new_regime)) = control.as_ref().and_then(|c| c.take_rescope()) {
-            machine.advance(Event::Rescoped, &mut runner.r)?;
+            machine.advance(Event::Rescoped, &mut *runner.r)?;
             // Close any open approval bracket: a rescope IS the grant. Harmless when no
             // wait was open (the classifier treats an unmatched resolve as a no-op).
-            runner.r.approval_resolved("granted", &new_regime);
+            runner
+                .r
+                .approval_resolved(provisioning::ApprovalOutcome::Granted, &new_regime);
             runner.r.note(&format!(
                 "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
             ));
@@ -628,7 +632,9 @@ fn run_loop_body<R: Reporter>(
         // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
         // parked) just means the regime change won't happen; note it and stay in the frozen regime.
         if let Some((deny_key, reason)) = control.as_ref().and_then(|c| c.take_deny()) {
-            runner.r.approval_resolved("denied", &reason);
+            runner
+                .r
+                .approval_resolved(provisioning::ApprovalOutcome::Denied, &reason);
             runner.r.note(&format!(
                 "approval not granted ({reason}) — staying in the frozen regime"
             ));
@@ -679,33 +685,34 @@ fn run_loop_body<R: Reporter>(
                     crate::control::distress::HANDLE,
                     provisioning::WaitMode::Block,
                 );
-                machine.advance(Event::DistressMarked, &mut runner.r)?;
+                machine.advance(Event::DistressMarked, &mut *runner.r)?;
                 let parked = park_for_distress(
                     p,
                     &run.rows,
-                    &mut runner.r,
+                    &mut *runner.r,
                     &mut run.parked_total,
                     args.max_park(),
                 );
                 match parked {
                     DistressOutcome::Cleared => {
-                        machine.advance(Event::DistressCleared, &mut runner.r)?;
-                        runner
-                            .r
-                            .approval_resolved("granted", "distress cleared by operator");
+                        machine.advance(Event::DistressCleared, &mut *runner.r)?;
+                        runner.r.approval_resolved(
+                            provisioning::ApprovalOutcome::Granted,
+                            "distress cleared by operator",
+                        );
                         runner.r.note("distress cleared, resuming");
                         // The head re-checks budget/interrupts before the next turn runs.
                         continue;
                     }
                     DistressOutcome::Stopped => {
-                        machine.advance(Event::Stopped, &mut runner.r)?;
+                        machine.advance(Event::Stopped, &mut *runner.r)?;
                         break;
                     }
                     DistressOutcome::TimedOut => {
                         runner
                             .r
                             .note("distress park timed out, stopping with state preserved");
-                        machine.advance(Event::ParkTimedOut, &mut runner.r)?;
+                        machine.advance(Event::ParkTimedOut, &mut *runner.r)?;
                         break;
                     }
                 }
@@ -724,7 +731,7 @@ fn run_loop_body<R: Reporter>(
             _ => {}
         }
         if matches!(runner.r.check_interrupt(p, &run.rows), Stop::Quit) {
-            machine.advance(Event::Interrupted, &mut runner.r)?;
+            machine.advance(Event::Interrupted, &mut *runner.r)?;
             break;
         }
         if over_budget(
@@ -733,12 +740,12 @@ fn run_loop_body<R: Reporter>(
             run.spent,
             started,
             run.parked_total,
-            &mut runner.r,
+            &mut *runner.r,
         ) {
-            machine.advance(Event::OverBudget, &mut runner.r)?;
+            machine.advance(Event::OverBudget, &mut *runner.r)?;
             break;
         }
-        machine.advance(Event::TurnStarted, &mut runner.r)?;
+        machine.advance(Event::TurnStarted, &mut *runner.r)?;
         // One span per loop round, entered for the iteration's whole body on this thread: the
         // turn span, gate evaluations, and broker traceparent files all nest under it, so a trace
         // groups by iteration and `iter` is queryable directly.
@@ -827,19 +834,19 @@ fn run_loop_body<R: Reporter>(
                     } else {
                         Event::Discarded
                     },
-                    &mut runner.r,
+                    &mut *runner.r,
                 )?;
                 *d
             }
             IterStep::Discarded { reason } => {
-                machine.advance(Event::Discarded, &mut runner.r)?;
+                machine.advance(Event::Discarded, &mut *runner.r)?;
                 let mut row = Row {
                     iter: it,
                     decision: "discarded".to_string(),
                     note: reason,
                     ..Default::default()
                 };
-                fold_distress_notes(&mut runner.r, &mut row.note);
+                fold_distress_notes(&mut *runner.r, &mut row.note);
                 runner.r.row(&row, false);
                 run.rows.push(row);
                 world.restore(run.segment.best_snap.as_str())?;
@@ -867,23 +874,23 @@ fn run_loop_body<R: Reporter>(
                     runner.r.note(&format!(
                         "{dead_turns} consecutive turns died before starting — the run is stalled"
                     ));
-                    machine.advance(Event::Stalled, &mut runner.r)?;
+                    machine.advance(Event::Stalled, &mut *runner.r)?;
                     break;
                 }
                 runner.r.note(&format!(
                     "turn never started (attempt {dead_turns}/{MAX_DEAD_TURN_ATTEMPTS}) — re-running iter {it} without consuming it"
                 ));
-                machine.advance(Event::TurnNeverStarted, &mut runner.r)?;
+                machine.advance(Event::TurnNeverStarted, &mut *runner.r)?;
                 continue;
             }
             IterStep::Escalated => {
                 update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
                 world.restore(run.segment.best_snap.as_str())?;
-                machine.advance(Event::Escalated, &mut runner.r)?;
+                machine.advance(Event::Escalated, &mut *runner.r)?;
                 break;
             }
             IterStep::Parked(pp) => {
-                machine.advance(Event::Parked, &mut runner.r)?;
+                machine.advance(Event::Parked, &mut *runner.r)?;
                 update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
                 run.pending_block = Some(pp);
                 write_results(p, &prep.goal, &prep.prior, &run.rows)?;
@@ -891,11 +898,11 @@ fn run_loop_body<R: Reporter>(
                 continue;
             }
             IterStep::Stopped => {
-                machine.advance(Event::Stopped, &mut runner.r)?;
+                machine.advance(Event::Stopped, &mut *runner.r)?;
                 break;
             }
         };
-        fold_distress_notes(&mut runner.r, &mut row.note);
+        fold_distress_notes(&mut *runner.r, &mut row.note);
 
         if verdict.keep {
             if let Some(s) = reading.score {
@@ -933,7 +940,7 @@ fn run_loop_body<R: Reporter>(
         // Snapshot durable state per decided iteration so cross-run memory survives a killed pod
         // (the end-of-run publish below only fires on a clean exit). No branch push mid-run.
         publish::publish_progress(
-            &mut runner.r,
+            &mut *runner.r,
             &publish::Record {
                 args,
                 paths: p,
@@ -967,19 +974,19 @@ fn run_loop_body<R: Reporter>(
             run.spent,
             started,
             run.parked_total,
-            &mut runner.r,
+            &mut *runner.r,
         ) {
-            machine.advance(Event::OverBudget, &mut runner.r)?;
+            machine.advance(Event::OverBudget, &mut *runner.r)?;
             break;
         }
         if verdict.keep && verdict.solved && !args.no_early_stop {
-            machine.advance(Event::Solved, &mut runner.r)?;
+            machine.advance(Event::Solved, &mut *runner.r)?;
             break;
         }
         it += 1;
     }
     if machine.state() == State::Head {
-        machine.advance(Event::IterationsExhausted, &mut runner.r)?;
+        machine.advance(Event::IterationsExhausted, &mut *runner.r)?;
     }
     let exit = machine.exit()?;
 
@@ -993,7 +1000,7 @@ fn run_loop_body<R: Reporter>(
         LoopExit::Finished | LoopExit::Budget | LoopExit::Solved
     ) && let Some(workflow) = args.workflow.as_ref().filter(|w| w.has_epilogue())
     {
-        machine.advance(Event::EpilogueStarted, &mut runner.r)?;
+        machine.advance(Event::EpilogueStarted, &mut *runner.r)?;
         let kept = run
             .rows
             .iter()
@@ -1022,7 +1029,7 @@ fn run_loop_body<R: Reporter>(
                         p,
                         workflow,
                         &kept,
-                        &mut runner.r,
+                        &mut *runner.r,
                     );
                     match epilogue {
                         Ok((rows, cost)) => {
@@ -1042,7 +1049,7 @@ fn run_loop_body<R: Reporter>(
                 }
             }
         }
-        machine.advance(Event::EpilogueDone, &mut runner.r)?;
+        machine.advance(Event::EpilogueDone, &mut *runner.r)?;
     }
 
     runner
@@ -1073,9 +1080,9 @@ fn run_loop_body<R: Reporter>(
         .and_then(|base| world.publish_components(base, run.segment.best_snap.as_str()))
         .map(|pc| publish::composite_targets(pc, &args.component_pr_repos))
         .unwrap_or_default();
-    machine.advance(Event::PublishStarted, &mut runner.r)?;
+    machine.advance(Event::PublishStarted, &mut *runner.r)?;
     let prs = publish::publish(
-        &mut runner.r,
+        &mut *runner.r,
         &publish::Record {
             args,
             paths: p,
@@ -1112,12 +1119,12 @@ fn run_loop_body<R: Reporter>(
         .collect();
     runner.r.pr_links(&pr_links);
     if args.watch_feedback {
-        spawn_feedback_watcher(&mut runner.r, &prs, p);
+        spawn_feedback_watcher(&mut *runner.r, &prs, p);
     }
 
     let (shutdown_outcome, shutdown_reason) = exit.shutdown_reason();
     runner.r.shutdown(shutdown_outcome, shutdown_reason);
-    machine.advance(Event::Shutdown, &mut runner.r)?;
+    machine.advance(Event::Shutdown, &mut *runner.r)?;
 
     Ok(Outcome {
         improved,
@@ -1134,7 +1141,7 @@ fn run_loop_body<R: Reporter>(
 /// Best-effort: a spawn failure only logs (the PR still opened; a human can always run
 /// `watch-pr` themselves). Known limitation: in a container the child dies with the pod
 /// unless the runtime keeps orphaned processes around.
-fn spawn_feedback_watcher<R: Reporter>(r: &mut R, prs: &[publish::PrLink], p: &Paths) {
+fn spawn_feedback_watcher(r: &mut dyn Reporter, prs: &[publish::PrLink], p: &Paths) {
     if prs.is_empty() {
         return;
     }
@@ -1237,7 +1244,7 @@ fn restore_kept_best(
     }
 }
 
-fn wait_if_paused<R: Reporter>(control: Option<&control::bridge::ControlState>, r: &mut R) {
+fn wait_if_paused(control: Option<&control::bridge::ControlState>, r: &mut dyn Reporter) {
     let Some(control) = control else {
         return;
     };
@@ -1272,13 +1279,13 @@ fn update_control_progress(
     }
 }
 
-fn over_budget<R: Reporter>(
+fn over_budget(
     args: &Args,
     control: Option<&control::bridge::ControlState>,
     spent: f64,
     started: Instant,
     parked_total: Duration,
-    r: &mut R,
+    r: &mut dyn Reporter,
 ) -> bool {
     let max_cost = live_max_cost(args, control);
     if max_cost > 0.0 && spent >= max_cost {
@@ -1319,10 +1326,10 @@ enum ParkOutcome {
 /// budget-paused (the caller accumulates `parked_total` to exclude it from the time cap). The
 /// broker drives the approval+capture and sends the terminal `rescope`/`deny` over the control
 /// bridge. With no control bridge nothing could deliver an outcome, so we note and proceed.
-fn park_for_approval<R: Reporter>(
+fn park_for_approval(
     control: Option<&control::bridge::ControlState>,
     ledger: Option<&crate::control::admission::AdmissionLedger>,
-    r: &mut R,
+    r: &mut dyn Reporter,
     parked_total: &mut Duration,
     timeout: Option<Duration>,
 ) -> ParkOutcome {
@@ -1340,7 +1347,7 @@ fn park_for_approval<R: Reporter>(
             break ParkOutcome::Resumed;
         }
         if let Some((deny_key, reason)) = control.take_deny() {
-            r.approval_resolved("denied", &reason);
+            r.approval_resolved(provisioning::ApprovalOutcome::Denied, &reason);
             if let Some(ledger) = ledger {
                 let _ = ledger.settle(&deny_key, AdmissionOutcome::Applied, "drained by the park");
             }
@@ -1351,7 +1358,7 @@ fn park_for_approval<R: Reporter>(
         }
         if timeout.is_some_and(|cap| start.elapsed() >= cap) {
             let why = "park timed out waiting for approval";
-            r.approval_resolved("timeout", why);
+            r.approval_resolved(provisioning::ApprovalOutcome::Timeout, why);
             break ParkOutcome::Denied(why.into());
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -1368,7 +1375,7 @@ fn park_for_approval<R: Reporter>(
 /// Fold the turn's info/warn distress notes onto the row being written: they are per-turn signals,
 /// so RESULTS.md carries them next to the outcome they happened during. Consumed on read, hence
 /// one call per row-emitting path.
-fn fold_distress_notes<R: Reporter>(r: &mut R, note: &mut String) {
+fn fold_distress_notes(r: &mut dyn Reporter, note: &mut String) {
     for (severity, reason) in crate::control::distress::drain_notes() {
         r.note(&format!("distress[{severity}]: {reason}"));
         note.push_str(&format!("; distress[{severity}]: {reason}"));
@@ -1389,10 +1396,10 @@ enum DistressOutcome {
 /// Suspend the loop while the broker's distress marker exists. Idle and budget-paused: the caller
 /// folds the elapsed time into `parked_total`, so suspended wall-clock burns no time budget. The
 /// engine never deletes the marker: the operator's `rm` is the resume grant.
-fn park_for_distress<R: Reporter>(
+fn park_for_distress(
     p: &Paths,
     rows: &[Row],
-    r: &mut R,
+    r: &mut dyn Reporter,
     parked_total: &mut Duration,
     timeout: Option<Duration>,
 ) -> DistressOutcome {
@@ -1598,11 +1605,11 @@ fn fingerprint(goal: &str, objective: &str, regime: &str) -> String {
 /// Re-arm what a resumed run still owes: the budget and pause levels the in-memory
 /// `ControlState` lost, plus any re-scope or denial granted but never drained. Stale
 /// stops and un-granted approves are closed out.
-fn replay_admissions<R: Reporter>(
+fn replay_admissions(
     ledger: &crate::control::admission::AdmissionLedger,
     control: Option<&control::bridge::ControlState>,
     replay: crate::control::admission::ResumeReplay,
-    r: &mut R,
+    r: &mut dyn Reporter,
 ) {
     if replay.skipped_lines > 0 {
         r.note(&format!(
@@ -2255,9 +2262,9 @@ mod tests {
             self.waits
                 .push((handle.to_string(), trace_id.to_string(), mode));
         }
-        fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+        fn approval_resolved(&mut self, outcome: provisioning::ApprovalOutcome, reason: &str) {
             self.resolved
-                .push((outcome.to_string(), reason.to_string()));
+                .push((outcome.as_str().to_string(), reason.to_string()));
         }
     }
 
@@ -2886,9 +2893,9 @@ mod tests {
             self.waits
                 .push((handle.to_string(), trace_id.to_string(), mode));
         }
-        fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+        fn approval_resolved(&mut self, outcome: provisioning::ApprovalOutcome, reason: &str) {
             self.resolved
-                .push((outcome.to_string(), reason.to_string()));
+                .push((outcome.as_str().to_string(), reason.to_string()));
         }
         fn segment(&mut self, fingerprint: &str, baseline_score: f64, regime: &str) {
             self.segments

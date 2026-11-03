@@ -150,8 +150,12 @@ pub trait Reporter {
     /// The wait reached a terminal outcome (`granted`/`denied`/`timeout`), closing the
     /// bracket. Deliberately NOT called on a stop-while-parked: a stop doesn't resolve
     /// the ask, and the still-open bracket makes a resume re-park on it.
-    fn approval_resolved(&mut self, outcome: &str, reason: &str) {
-        self.note(&format!("approval {outcome}: {reason}"));
+    fn approval_resolved(
+        &mut self,
+        outcome: crate::control::provisioning::ApprovalOutcome,
+        reason: &str,
+    ) {
+        self.note(&format!("approval {}: {reason}", outcome.as_str()));
     }
     /// The draft PR(s) publish-on-keep opened, reported once after publish so the durable session
     /// log carries them (the controller's pull-ingest folds them onto the kept candidates' `pr_url`).

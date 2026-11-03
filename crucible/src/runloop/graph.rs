@@ -81,9 +81,9 @@ pub(crate) struct IterCtx<'a> {
 }
 
 /// Run one admitted autoresearch iteration and return its step and cost.
-pub(crate) fn run_iteration<R: Reporter>(
+pub(crate) fn run_iteration(
     cx: IterCtx<'_>,
-    runner: &mut LoopTaskRunner<R>,
+    runner: &mut LoopTaskRunner<'_>,
 ) -> Result<(IterStep, f64)> {
     let mut caps = WorkflowCaps::for_lane(
         cx.workflow
@@ -250,12 +250,12 @@ impl KeptContext {
 /// Run the epilogue subgraph once, against the kept candidate live in the workspace.
 /// Advisory by contract: the returned rows and the notes make a failure loud, but nothing
 /// here can un-keep the candidate. Returns the advisory rows and the subgraph's cost.
-pub(crate) fn run_epilogue<R: Reporter>(
+pub(crate) fn run_epilogue(
     args: &Args,
     p: &Paths,
     workflow: &WorkflowCfg,
     kept: &KeptContext,
-    r: &mut R,
+    r: &mut dyn Reporter,
 ) -> Result<(Vec<Row>, f64)> {
     let Some(plan) = epilogue_template(workflow)? else {
         return Ok((Vec::new(), 0.0));
@@ -357,7 +357,7 @@ enum Signal {
 }
 
 /// [`TaskRunner`] over the driver's trait objects, armed once per iteration.
-pub(crate) struct LoopTaskRunner<R: Reporter> {
+pub(crate) struct LoopTaskRunner<'a> {
     args: Args,
     p: Paths,
     world: Arc<dyn World>,
@@ -365,7 +365,7 @@ pub(crate) struct LoopTaskRunner<R: Reporter> {
     control: Option<Arc<control::bridge::ControlState>>,
     heartbeat: Option<Arc<crate::control::heartbeat::Heartbeat>>,
     pub(crate) started: Instant,
-    pub(crate) r: R,
+    pub(crate) r: &'a mut (dyn Reporter + Send),
     it: u32,
     prompt: String,
     resume_prompt: String,
@@ -395,14 +395,14 @@ fn harness_runner(args: &Args, p: &Paths) -> crate::plan::harness::HarnessRunner
     }
 }
 
-impl<R: Reporter> LoopTaskRunner<R> {
+impl<'a> LoopTaskRunner<'a> {
     /// One runner per run. It owns the reporter for the run's whole life: the driver borrows
     /// the runner between iterations and the executor borrows it during one, so the two can
     /// never touch the reporter at the same time.
     pub(crate) fn new(
         args: &Args,
         p: &Paths,
-        r: R,
+        r: &'a mut (dyn Reporter + Send),
         world: Arc<dyn World>,
         judge: Arc<dyn Judge>,
         control: Option<Arc<control::bridge::ControlState>>,
@@ -556,7 +556,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
             _ => return attempt,
         }
         match crate::runloop::step::drain_turn_markers(
-            &mut self.r,
+            &mut *self.r,
             &self.p,
             self.control.as_deref(),
             &self.rows,
@@ -732,7 +732,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
     }
 }
 
-impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
+impl TaskRunner for LoopTaskRunner<'_> {
     fn run(
         &mut self,
         task: &Task,
@@ -882,12 +882,12 @@ pub(crate) struct WideOutcome {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn run_wide_tournament<R: Reporter>(
+pub(crate) fn run_wide_tournament(
     cfg: &WideConfig,
     args: &Args,
     p: &Paths,
     prep: &Prepared,
-    r: &mut R,
+    r: &mut dyn Reporter,
     world: &Arc<dyn World>,
     judge: &Arc<dyn Judge>,
     baseline_score: f64,
@@ -1111,12 +1111,12 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
 
 /// [`TaskRunner`] for the wide template. Propose batches run threaded (one worktree per
 /// candidate); MeasureDiff serializes on the main workspace.
-struct WideRunner<'a, R: Reporter> {
+struct WideRunner<'a> {
     args: &'a Args,
     p: &'a Paths,
     world: Arc<dyn World>,
     judge: Arc<dyn Judge>,
-    r: &'a mut R,
+    r: &'a mut dyn Reporter,
     wide_dir: PathBuf,
     baseline_score: f64,
     approaches: BTreeMap<u32, String>,
@@ -1128,7 +1128,7 @@ struct WideRunner<'a, R: Reporter> {
     fatal: Option<anyhow::Error>,
 }
 
-impl<R: Reporter> WideRunner<'_, R> {
+impl WideRunner<'_> {
     fn restore_or_fatal(&mut self) -> bool {
         match self.world.restore(&self.snap) {
             Ok(()) => true,
@@ -1262,7 +1262,7 @@ impl<R: Reporter> WideRunner<'_, R> {
     }
 }
 
-impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
+impl TaskRunner for WideRunner<'_> {
     fn run(
         &mut self,
         task: &Task,
@@ -1445,9 +1445,9 @@ mod tests {
     /// The point of the ownership lift: an executor can hold the runner without borrowing the
     /// driver's frame, so the loop's graph is no longer welded to the process that started it.
     #[test]
-    fn the_loop_task_runner_is_send_and_static() {
-        const fn assert_send_static<T: Send + 'static>() {}
-        assert_send_static::<LoopTaskRunner<crate::report::console::ConsoleReporter>>();
+    fn the_loop_task_runner_is_send() {
+        const fn assert_send<T: Send>() {}
+        assert_send::<LoopTaskRunner<'static>>();
     }
 
     /// Epilogue tasks stay out of the per-iteration plan entirely (legacy splice and

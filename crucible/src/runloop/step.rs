@@ -78,8 +78,8 @@ pub(crate) enum TurnVerdict {
 }
 
 /// Read the markers a turn whose transport held left behind.
-pub(crate) fn drain_turn_markers<R: Reporter>(
-    r: &mut R,
+pub(crate) fn drain_turn_markers(
+    r: &mut dyn Reporter,
     p: &Paths,
     control: Option<&control::bridge::ControlState>,
     rows: &[Row],
