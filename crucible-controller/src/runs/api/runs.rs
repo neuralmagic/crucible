@@ -15,8 +15,8 @@ const RUNS_LIST_DEFAULT: i64 = 50;
 
 const RUNS_LIST_MAX: i64 = 500;
 
-/// One leaderboard row: a run joined to the issue key + repo it ran for, with the creation stamp
-/// derived from the run id. The parity target for the SSG's `index.html` leaderboard table.
+/// One leaderboard row: a run joined to the issue key + repo it ran for. The parity target for the
+/// SSG's `index.html` leaderboard table.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunRowDto {
     pub run_id: String,
@@ -31,8 +31,8 @@ pub struct RunRowDto {
     /// The kept-candidate PR url for this run, or null when the run kept no PR — the runs
     /// leaderboard renders it as an out-link to the opened draft.
     pub pr_url: Option<String>,
-    /// RFC3339 UTC creation time parsed off the run id's leading stamp; null for a non-stamped id.
-    pub created: Option<String>,
+    /// When the run was recorded, RFC3339 UTC.
+    pub created: String,
     /// Every measured candidate score in iteration order. Empty when the run has measured nothing
     /// yet. The first element is the run's baseline, so the list page charts a run without a
     /// per-run request.
@@ -53,7 +53,7 @@ impl RunRowDto {
             best_score: r.best_score,
             cost_usd: r.cost_usd,
             pr_url: r.pr_url,
-            created: r.created,
+            created: r.created_at,
             score_series,
         }
     }

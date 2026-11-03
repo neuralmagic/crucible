@@ -275,6 +275,29 @@ impl CursorSpec {
     }
 }
 
+/// Which launches the runs surface reads. Every set field must match exactly; the default is every
+/// launch.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct LaunchFilter {
+    pub key: Option<String>,
+    pub status: Option<Status>,
+    pub playbook: Option<String>,
+    pub origin: Option<LaunchOrigin>,
+    /// The schedule the launch belongs to: the one that fired it, or the one whose cursor it was
+    /// opted into advancing.
+    pub schedule: Option<String>,
+}
+
+impl LaunchFilter {
+    /// The one launch filed under `key`, whatever its origin.
+    pub(crate) fn key(key: &str) -> Self {
+        LaunchFilter {
+            key: Some(key.to_string()),
+            ..LaunchFilter::default()
+        }
+    }
+}
+
 /// One launch as the runs surface reads it: the frozen authorization a relaunch prefills from,
 /// joined to what the run did (the issue's status, the spend its runs booked).
 #[derive(Debug, Clone, PartialEq)]
@@ -321,7 +344,7 @@ crate::wire_enum::wire_enum!(OneShotStatus, "one-shot status", both, {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::launches::model::*;
 
     /// The cursor's path grammar is a closed subset, and everything outside it is refused at write
     /// time rather than stored as a cursor that never resolves.

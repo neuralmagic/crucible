@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT pl.key AS \"key!\", pl.playbook AS \"playbook!\", p.description AS \"description?\",\n               pl.params AS \"params!\", pl.schema_digest AS \"schema_digest!\",\n               p.schema_digest AS \"current_schema_digest?\", pl.max_cost AS \"max_cost!\",\n               pl.max_time AS \"max_time!\", pl.advance_dedupe AS \"advance_dedupe!\",\n               pl.origin AS \"origin!\", pl.draft_version, pl.dedupe_schedule,\n               i.status AS \"status!\", i.parked_reason, i.agent_provider, i.agent_model,\n               c.cost_usd AS \"cost_usd?\", c.runs AS \"runs!: i64\",\n               c.transport_losses AS \"transport_losses!: i64\",\n               pl.created_by, pl.created_at AS \"created_at!\"\n        FROM playbook_launches pl\n        JOIN issues i ON i.key = pl.key\n        LEFT JOIN playbooks p ON p.id = pl.playbook\n        LEFT JOIN LATERAL (\n            SELECT SUM(r.cost_usd) AS cost_usd, COUNT(*) AS runs,\n                   COALESCE(SUM((SELECT COUNT(*) FROM run_task_results t\n                                 WHERE t.run_id = r.run_id AND t.status = 'transport')), 0)::bigint\n                       AS transport_losses\n            FROM runs r\n            WHERE r.issue = pl.key\n        ) c ON TRUE\n        WHERE ($1::text IS NULL AND pl.origin <> 'schedule') OR pl.key = $1\n        ORDER BY pl.created_at DESC, pl.key DESC\n        LIMIT $2\n        ",
+  "query": "\n        SELECT pl.key AS \"key!\", pl.playbook AS \"playbook!\", p.description AS \"description?\",\n               pl.params AS \"params!\", pl.schema_digest AS \"schema_digest!\",\n               p.schema_digest AS \"current_schema_digest?\", pl.max_cost AS \"max_cost!\",\n               pl.max_time AS \"max_time!\", pl.advance_dedupe AS \"advance_dedupe!\",\n               pl.origin AS \"origin!\", pl.draft_version, pl.dedupe_schedule,\n               i.status AS \"status!\", i.parked_reason, i.agent_provider, i.agent_model,\n               c.cost_usd AS \"cost_usd?\", c.runs AS \"runs!: i64\",\n               c.transport_losses AS \"transport_losses!: i64\",\n               pl.created_by, pl.created_at AS \"created_at!\"\n        FROM playbook_launches pl\n        JOIN issues i ON i.key = pl.key\n        LEFT JOIN playbooks p ON p.id = pl.playbook\n        LEFT JOIN LATERAL (\n            SELECT SUM(r.cost_usd) AS cost_usd, COUNT(*) AS runs,\n                   COALESCE(SUM((SELECT COUNT(*) FROM run_task_results t\n                                 WHERE t.run_id = r.run_id AND t.status = 'transport')), 0)::bigint\n                       AS transport_losses\n            FROM runs r\n            WHERE r.issue = pl.key\n        ) c ON TRUE\n        WHERE ($1::text IS NULL OR pl.key = $1)\n          AND ($2::text IS NULL OR i.status = $2)\n          AND ($3::text IS NULL OR pl.playbook = $3)\n          AND ($4::text IS NULL OR pl.origin = $4)\n          AND ($5::text IS NULL OR pl.dedupe_schedule = $5)\n        ORDER BY pl.created_at DESC, pl.key DESC\n        LIMIT $6\n        ",
   "describe": {
     "columns": [
       {
@@ -223,6 +223,10 @@
     "parameters": {
       "Left": [
         "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
         "Int8"
       ]
     },
@@ -250,5 +254,5 @@
       false
     ]
   },
-  "hash": "503c26a5edcea9a729c2a48b0662058e3e060d63f0caeffacd0471083b9f1f36"
+  "hash": "4faa0f6c6110101344b359920b83650cf19b8dc46e864cdb81131fda7967f4cc"
 }

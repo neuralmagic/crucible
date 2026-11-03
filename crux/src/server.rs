@@ -6,6 +6,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use crate::client::Client;
+use crate::ops::blueprints::{BlueprintUse, Blueprints};
 use crate::ops::drafts::{
     DraftCreate, DraftDelete, DraftFiles, DraftGraduate, DraftLaunch, DraftPreview, DraftPublish,
     DraftPull, DraftPush, DraftSaveFiles,
@@ -299,6 +300,26 @@ impl CrucibleMcp {
     }
 
     #[tool(
+        description = "List the blueprints you can read: ID OWNER REV PUBLIC SECRETS DESCRIPTION. \
+        A blueprint is a registered playbook offered as a starting point; SECRETS counts what \
+        crucible_blueprint_use would carry for you and what it would leave to bind."
+    )]
+    async fn crucible_blueprints(&self, Parameters(a): Parameters<Blueprints>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
+        description = "Start a draft from a blueprint: version 1 is its pack. Bindings of the \
+        owning team's secrets carry when you are in that team; every other declared secret comes \
+        back as a placeholder with its reason. Bind each with crucible_secret_bind at scope_kind \
+        `playbook`, scope_id = draft_id; a launch with one unbound is refused. Author it from \
+        there like any draft, starting with crucible_draft_pull."
+    )]
+    async fn crucible_blueprint_use(&self, Parameters(a): Parameters<BlueprintUse>) -> String {
+        self.run(&a).await
+    }
+
+    #[tool(
         description = "List registered playbooks: ID REPO REV BY DESCRIPTION. These are what \
         crucible_launch can start."
     )]
@@ -460,7 +481,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 44, "tools: {names:?}");
+        assert_eq!(names.len(), 46, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -495,6 +516,8 @@ mod tests {
             "crucible_draft_launch",
             "crucible_draft_graduate",
             "crucible_draft_publish",
+            "crucible_blueprints",
+            "crucible_blueprint_use",
             "crucible_playbooks",
             "crucible_playbook_schema",
             "crucible_launch",
@@ -598,6 +621,22 @@ mod tests {
         let (publish_schema, publish) = tool_of("crucible_draft_publish");
         assert!(publish_schema.contains("playbook"), "{publish_schema}");
         assert!(publish.contains("playbook_draft:publish"), "{publish}");
+    }
+
+    /// A model that starts from a blueprint has to learn from the tools alone where the catalog
+    /// leads and how to fill what did not carry.
+    #[test]
+    fn the_blueprint_tools_lead_to_a_use_and_to_filling_its_placeholders() {
+        let (_, catalog) = tool_of("crucible_blueprints");
+        assert!(catalog.contains("crucible_blueprint_use"), "{catalog}");
+
+        let (schema, using) = tool_of("crucible_blueprint_use");
+        for field in ["\"id\"", "\"draft_id\"", "\"description\""] {
+            assert!(schema.contains(field), "{field} missing: {schema}");
+        }
+        assert!(using.contains("placeholder"), "{using}");
+        assert!(using.contains("crucible_secret_bind"), "{using}");
+        assert!(using.contains("crucible_draft_pull"), "{using}");
     }
 
     /// An error must arrive as readable text, not as an MCP fault the model can't see into.

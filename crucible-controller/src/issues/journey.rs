@@ -232,20 +232,19 @@ pub(crate) async fn assemble_journey(db: &Db, key: &str) -> Result<Option<Journe
         });
     }
 
-    // 7. Runs + their kept PRs. Gather every run across the issue's scopes, ordered by run_id (the
-    //    time-first stamp makes lexical order chronological), and emit each run followed by the
-    //    distinct kept-candidate PRs it opened.
+    // 7. Runs + their kept PRs. Gather every run across the issue's scopes, oldest first, and emit
+    //    each run followed by the distinct kept-candidate PRs it opened.
     let mut runs = Vec::new();
     for scope in &scopes {
         for run in crate::runs::store::list_runs_for_scope(db.pool(), scope.id).await? {
             runs.push(run);
         }
     }
-    runs.sort_by(|a, b| a.run_id.cmp(&b.run_id));
+    runs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     for run in &runs {
         let live = run.status == "running";
         steps.push(JourneyStep::Run {
-            at: crate::runs::model::run_id_created(&run.run_id),
+            at: Some(run.created_at.clone()),
             run_id: run.run_id.clone(),
             name: run.name.clone(),
             status: run.status.clone(),
@@ -261,7 +260,7 @@ pub(crate) async fn assemble_journey(db: &Db, key: &str) -> Result<Option<Journe
                 && seen.insert(url.clone())
             {
                 steps.push(JourneyStep::Pr {
-                    at: crate::runs::model::run_id_created(&run.run_id),
+                    at: Some(run.created_at.clone()),
                     url,
                     repo: issue.repo.clone(),
                 });
@@ -293,9 +292,9 @@ pub(crate) async fn assemble_journey(db: &Db, key: &str) -> Result<Option<Journe
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::client::Db;
     use crate::event_log::Event;
+    use crate::issues::journey::*;
     use crate::issues::model::{NewIssue, NewScope};
     use crate::model::{ParkedBy, Status};
     use crate::runs::model::{NewCandidate, NewRun};

@@ -7,6 +7,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
+pub mod blueprints;
 pub mod drafts;
 pub mod issues;
 pub mod launches;

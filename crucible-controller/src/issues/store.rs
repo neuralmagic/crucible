@@ -1416,8 +1416,8 @@ pub(crate) async fn awaiting_approval_scopes(
 }
 
 /// The latest kept-candidate PR per issue (issue key → pr_url), for the issue surfaces' PR chips.
-/// Rows come back ordered by run_id ascending (lexical = chronological, the run-id stamp), so the
-/// map fold leaves each issue holding the PR from its newest run.
+/// Rows come back oldest run first, so the map fold leaves each issue holding the PR from its
+/// newest run.
 #[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.latest_kept_pr_urls", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub(crate) async fn latest_kept_pr_urls(
@@ -1430,7 +1430,7 @@ pub(crate) async fn latest_kept_pr_urls(
         JOIN runs r ON r.run_id = c.run_id
         JOIN scopes s ON s.id = r.scope
         WHERE c.pr_url IS NOT NULL AND c.decision = 'keep'
-        ORDER BY c.run_id ASC
+        ORDER BY r.created_at, r.seq, c.seq
         "#,
     )
     .fetch_all(ex)
@@ -1722,7 +1722,7 @@ pub async fn request_dispatch(ex: impl PgExecutor<'_>, key: &str, actor: &str) -
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
+    use crate::issues::store::*;
     use crate::launches::model::NewPlaybookLaunch;
     use crate::launches::store::{AdoptPlaybookOutcome, adopt_playbook_launch};
 

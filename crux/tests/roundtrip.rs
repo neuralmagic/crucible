@@ -366,6 +366,25 @@ fn draft_publish() {
 }
 
 #[test]
+fn blueprints() {
+    same::<ops::blueprints::Blueprints>(&["--json"], json!({"json": true}));
+    same::<ops::blueprints::Blueprints>(&[], json!({}));
+}
+
+#[test]
+fn blueprint_use() {
+    let op = same::<ops::blueprints::BlueprintUse>(
+        &["mlr-pack", "kim-copy", "--description", "mine"],
+        json!({"id": "mlr-pack", "draft_id": "kim-copy", "description": "mine"}),
+    );
+    assert_eq!(op.to, "kim-copy");
+    same::<ops::blueprints::BlueprintUse>(
+        &["mlr-pack", "kim-copy"],
+        json!({"id": "mlr-pack", "draft_id": "kim-copy"}),
+    );
+}
+
+#[test]
 fn draft_graduate() {
     same::<ops::drafts::DraftGraduate>(
         &["cal", "--repo", "o/packs", "--path", "p"],

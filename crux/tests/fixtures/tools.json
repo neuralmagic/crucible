@@ -116,6 +116,54 @@
     }
   },
   {
+    "name": "crucible_blueprint_use",
+    "description": "Start a draft from a blueprint: version 1 is its pack. Bindings of the owning team's secrets carry when you are in that team; every other declared secret comes back as a placeholder with its reason. Bind each with crucible_secret_bind at scope_kind `playbook`, scope_id = draft_id; a launch with one unbound is refused. Author it from there like any draft, starting with crucible_draft_pull.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "description": {
+          "default": null,
+          "description": "Omit for the blueprint's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "draft_id": {
+          "description": "The new draft's id: a lowercase slug no draft or playbook holds.",
+          "type": "string"
+        },
+        "id": {
+          "description": "The blueprint's id, as crucible_blueprints lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "draft_id"
+      ],
+      "type": "object"
+    }
+  },
+  {
+    "name": "crucible_blueprints",
+    "description": "List the blueprints you can read: ID OWNER REV PUBLIC SECRETS DESCRIPTION. A blueprint is a registered playbook offered as a starting point; SECRETS counts what crucible_blueprint_use would carry for you and what it would leave to bind.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
     "name": "crucible_bump",
     "description": "Change an issue's priority. Higher runs sooner.",
     "inputSchema": {

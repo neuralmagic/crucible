@@ -37,6 +37,7 @@
 - [Hand-rolled codegen pipelines](./hand-rolled-pipelines.md)
 - [The codex harness](./codex-harness.md)
 - [The opencode and pi harnesses](./opencode-pi-harnesses.md)
+- [Agent tool plugins](./tool-plugins.md)
 - [The OpenShell fork](./openshell-fork.md)
 - [JIRA tools (mediated)](./jira-proxy.md)
 
@@ -47,6 +48,7 @@
 - [RFC-0003: Teams, ownership, and policy-based authorization](./rfc/RFC-0003.md)
 - [RFC-0004: Linked controller/engine boundary](./rfc/RFC-0004.md)
 - [RFC-0005: Run supervisor services](./rfc/RFC-0005.md)
+- [RFC-0006: Blueprints](./rfc/RFC-0006.md)
 
 # Architecture decisions
 
@@ -116,3 +118,5 @@
   - [ADR-0066: A provider's price, not the harness, costs a model no vendor bills](./adr/ADR-0066.md)
   - [ADR-0067: Sandboxed agents reach Kueue through a per-cluster MCP server with controller-minted per-run tokens](./adr/ADR-0067.md)
   - [ADR-0068: Agents get identity-only tokens from the controller, bound to their run's own gateway](./adr/ADR-0068.md)
+  - [ADR-0069: A launch sets agent settings per task and the checkout ref, within bounds the manifest declares](./adr/ADR-0069.md)
+  - [ADR-0070: A dynamic choice reads its options from a dependency field, bounded and recorded](./adr/ADR-0070.md)

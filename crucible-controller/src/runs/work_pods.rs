@@ -614,7 +614,7 @@ pub(crate) async fn clear_redispatch(ex: impl PgExecutor<'_>, key: &str) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::work_pods::*;
     use sqlx::PgPool;
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

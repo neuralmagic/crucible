@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 /// The studio page a draft is edited on.
-fn studio_url(c: &Client, draft_id: &str) -> String {
+pub(crate) fn studio_url(c: &Client, draft_id: &str) -> String {
     c.web_url(&format!("/playbooks/drafts/{}", encode(draft_id)))
 }
 

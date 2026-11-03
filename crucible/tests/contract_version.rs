@@ -48,7 +48,7 @@ fn wire_versions_are_pinned_to_contract_version() {
     );
     assert_eq!(
         (CONTRACT_VERSION, wire),
-        ("1.20.0", (1, 1, 1, "v2", 1, 1, 1)),
+        ("1.22.0", (1, 1, 1, "v2", 1, 1, 1)),
         "a wire version changed without bumping CONTRACT_VERSION"
     );
 }

@@ -14,9 +14,11 @@ use crate::launches::webhooks::verify::{MintError, Verifier, VerifierKind};
 
 use crate::launches::webhooks::{Delivery, SaveError, Webhook};
 
-use crate::playbooks::api::registry::{AuthorizedLaunch, authorize_pack};
+use crate::playbooks::api::admission::{
+    Admissible, AuthorizedLaunch, LaunchRequest, admit_pack, decide_launch,
+};
 
-use crate::playbooks::registry::FieldError;
+use crate::playbooks::registry::{FieldError, PlaybookRow};
 
 use axum::extract::{Path, State};
 
@@ -353,7 +355,7 @@ fn save_refusal(e: SaveError) -> Response {
 
 /// Everything a save stores besides ownership, validated.
 struct AuthorizedWebhook {
-    launch: AuthorizedLaunch,
+    launch: AuthorizedLaunch<PlaybookRow>,
     verifier: Verifier,
     derive: serde_json::Map<String, serde_json::Value>,
 }
@@ -391,7 +393,7 @@ fn check_verifier(body: &WebhookBody) -> Result<Verifier, Vec<FieldError>> {
 }
 
 /// Validate a webhook body: the verifier, the bounds, and the transform here, the launch half
-/// through the same [`authorize_pack`] a form POST, a schedule, and a watch use.
+/// through the same [`admit_pack`] a form POST, a schedule, and a watch use.
 #[allow(clippy::result_large_err)]
 async fn authorize_webhook(
     state: &ApiState,
@@ -430,13 +432,22 @@ async fn authorize_webhook(
             ));
         }
     }
-    let (pack, schema, max_time) = authorize_pack(
+    let pack = crate::playbooks::api::registry::readable_playbook(
         state,
         caller,
         &body.playbook,
-        body.max_cost,
-        &body.max_time,
-        body.schema_digest.as_deref(),
+        crate::authz::action::Verb::Read,
+    )
+    .await?;
+    let (schema, max_time) = admit_pack(
+        state,
+        pack.target(),
+        LaunchRequest {
+            params: &body.params,
+            max_cost: body.max_cost,
+            max_time: &body.max_time,
+            schema_digest: body.schema_digest.as_deref(),
+        },
     )
     .await?;
     let mut relaxed = schema.clone();
@@ -595,10 +606,7 @@ pub(crate) async fn create_webhook(
     {
         return denied.into_response();
     }
-    if let Err(denied) =
-        crate::playbooks::api::registry::decide_launch(&state, &caller, &authorized.launch.pack)
-            .await
-    {
+    if let Err(denied) = decide_launch(&state, &caller, authorized.launch.pack.target()).await {
         return denied;
     }
     let created = match crate::launches::webhooks::create(
@@ -811,9 +819,7 @@ pub(crate) async fn update_webhook(
         || prior.derive != serde_json::Value::Object(authorized.derive.clone())
         || prior.max_launches_per_hour != body.max_launches_per_hour;
     if firing_changed
-        && let Err(denied) =
-            crate::playbooks::api::registry::decide_launch(&state, &caller, &authorized.launch.pack)
-                .await
+        && let Err(denied) = decide_launch(&state, &caller, authorized.launch.pack.target()).await
     {
         return denied;
     }

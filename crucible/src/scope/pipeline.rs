@@ -2584,6 +2584,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             subagent: false,
             input: None,
             result: None,
+            failed: false,
         }
     }
 

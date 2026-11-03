@@ -117,6 +117,10 @@ pub(crate) struct Args {
     /// The `[mcp]` keys the turn about to run reaches. No CLI flag.
     #[arg(skip)]
     pub mcp_scope: Vec<String>,
+    /// The tool plugin chain (from `[[agent.tool_plugins]]`); `None` runs the default chain. No
+    /// CLI flag.
+    #[arg(skip)]
+    pub tool_plugins: Option<Vec<manifest::ToolPluginSpec>>,
     /// The named sandboxes a task may run in (from `[agent.sandbox]`). No CLI flag.
     #[arg(skip)]
     pub sandboxes: std::collections::BTreeMap<String, manifest::SandboxProfile>,
@@ -220,6 +224,10 @@ pub(crate) struct Args {
     /// What `[workflow].env` passes to `command` and `evaluate` tasks.
     #[arg(skip)]
     pub workflow_env: crucible::host_env::HostEnv,
+    /// Where the run's buildit serves the run's own command and evaluate tasks, fixed from the
+    /// run's top-level paths so every task and turn starts it the same way.
+    #[arg(skip)]
+    pub buildit_socket: Option<crate::openshell::buildit::RunSocket>,
     /// Opt-in: when publish-on-keep opens draft PR(s), spawn a detached `crucible watch-pr` pointed
     /// at them, reseeding this run's `STEER.md` from review comments so the NEXT run picks up feedback
     /// without a human running `watch-pr` by hand. Best-effort: spawn failure only logs (the PR still
@@ -309,6 +317,8 @@ impl Args {
             run_id: self.sandbox_run_id.as_ref(),
             gateway_boot: &self.gateway_boot,
             engine: self.engine.as_ref(),
+            tool_plugins: self.tool_plugins.as_deref(),
+            buildit_socket: self.buildit_socket.as_ref(),
         }
     }
 }
@@ -354,6 +364,9 @@ pub(crate) struct SandboxTurn<'a> {
     pub gateway_boot: &'a crucible::openshell::gateway::BootLock,
     /// The engine runtime the turn runs on; `None` fails the turn as an orchestration error.
     pub engine: Option<&'a tokio::runtime::Handle>,
+    /// The declared tool plugin chain; `None` runs the default chain.
+    pub tool_plugins: Option<&'a [manifest::ToolPluginSpec]>,
+    pub buildit_socket: Option<&'a crate::openshell::buildit::RunSocket>,
 }
 
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit
@@ -425,6 +438,14 @@ impl Paths {
             escalation: worktree.join("ESCALATION.json"),
             provisioning: worktree.join("PROVISIONING_PENDING.json"),
             workspace: worktree,
+        }
+    }
+
+    /// The run's buildit socket: in its state dir, building from its workspace.
+    pub(crate) fn buildit_socket(&self) -> crate::openshell::buildit::RunSocket {
+        crate::openshell::buildit::RunSocket {
+            path: self.state.join("buildit.sock"),
+            workdir: self.workspace.clone(),
         }
     }
 }

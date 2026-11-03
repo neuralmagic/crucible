@@ -310,4 +310,216 @@ mod tests {
         .expect("bindings");
         assert!(left.is_empty(), "{left:?}");
     }
+
+    const BLUEPRINT_MANIFEST: &str = "[repo]\npath = \".\"\n\n[agent]\n\n[workflow]\n\
+        type = \"playbook\"\nfile = \"workflow.star\"\n\n\
+        [[secret]]\nname = \"gh_token\"\nenv = \"GH_TOKEN\"\n\n\
+        [[secret]]\nname = \"personal_key\"\nenv = \"PERSONAL_KEY\"\n\n\
+        [[secret]]\nname = \"unbound_key\"\nenv = \"UNBOUND_KEY\"\n";
+
+    const BLUEPRINT_WORKFLOW: &str = "params = {}\nhello = command(name = \"hello\", run = \
+        \"echo hello\")\nworkflow(type = \"playbook\", tasks = [hello], result = hello)\n";
+
+    /// The blueprint commands against this controller's own router. Team `mlr` (`reed` owns it,
+    /// `kim` is in it) publishes `mlr-pack`, which declares a team secret, a personal one, and one
+    /// nobody binds; `zed` is in no team.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn crux_marks_lists_and_uses_a_blueprint(pool: sqlx::PgPool) {
+        use crux::ops::Operation;
+        use crux::ops::blueprints::{
+            BlueprintMark, BlueprintPrivate, BlueprintPublic, BlueprintUnmark, BlueprintUse,
+            Blueprints,
+        };
+        use crux::ops::drafts::{DraftPublish, DraftSaveFiles};
+        let api = crate::api::router(crate::api::state::ApiState::test(crate::client::Db::new(
+            pool.clone(),
+        )));
+        let as_user = |login: &str| {
+            crux::Client::new(Arc::new(RouterTransport {
+                api: api.clone(),
+                caller: Resolved::named(login),
+                base: "https://crucible.example.com".to_string(),
+            }))
+        };
+        let (reed, kim, zed) = (as_user("reed"), as_user("kim"), as_user("zed"));
+
+        crate::authz::bootstrap::seed_playbook_publishers(&pool, &["reed".to_string()])
+            .await
+            .expect("seed publishers");
+        reed.post::<serde_json::Value>(
+            "/api/teams",
+            Some(&serde_json::json!({
+                "slug": "mlr",
+                "display_name": "MLR",
+                "members": [
+                    {"kind": "user", "member": "reed", "role": "owner"},
+                    {"kind": "user", "member": "kim", "role": "member"},
+                ],
+            })),
+        )
+        .await
+        .expect("team");
+        reed.post::<serde_json::Value>(
+            "/api/playbook-drafts",
+            Some(&serde_json::json!({
+                "id": "studio", "description": "mlr sweep", "owner": "team:mlr",
+            })),
+        )
+        .await
+        .expect("draft");
+        let files = std::collections::BTreeMap::from([
+            ("crucible.toml".to_string(), BLUEPRINT_MANIFEST.to_string()),
+            ("workflow.star".to_string(), BLUEPRINT_WORKFLOW.to_string()),
+        ]);
+        DraftSaveFiles {
+            draft_id: "studio".into(),
+            base_version: 1,
+            files,
+            json: false,
+        }
+        .run(&reed)
+        .await
+        .expect("save");
+        DraftPublish {
+            draft_id: "studio".into(),
+            playbook: Some("mlr-pack".into()),
+            json: false,
+        }
+        .run(&reed)
+        .await
+        .expect("publish");
+        bind(&pool, "team:mlr", "mlr-pack", "gh_token").await;
+        bind(&pool, "user:reed", "mlr-pack", "personal_key").await;
+        let mark = BlueprintMark {
+            id: "mlr-pack".into(),
+            json: false,
+        };
+        let list = Blueprints { json: false };
+        let use_as = |to: &str, description: Option<&str>, json: bool| BlueprintUse {
+            id: "mlr-pack".into(),
+            to: to.into(),
+            description: description.map(str::to_string),
+            json,
+        };
+
+        assert!(
+            mark.run(&kim)
+                .await
+                .expect_err("a member may not update the team's playbook")
+                .to_string()
+                .contains("403")
+        );
+        assert_eq!(
+            mark.run(&reed).await.expect("mark"),
+            "mlr-pack is a private blueprint\n"
+        );
+
+        let catalog = list.run(&kim).await.expect("catalog");
+        assert!(catalog.starts_with("1 blueprints\n"), "{catalog}");
+        for column in ["mlr-pack", "team:mlr", "1 carried, 2 to bind", "mlr sweep"] {
+            assert!(catalog.contains(column), "{column} missing: {catalog}");
+        }
+        assert_eq!(
+            list.run(&zed).await.expect("catalog"),
+            "no blueprints you can read\n"
+        );
+        assert!(
+            use_as("zed-copy", None, false).run(&zed).await.is_err(),
+            "a private blueprint is not zed's to use"
+        );
+
+        assert_eq!(
+            use_as("kim-copy", None, false)
+                .run(&kim)
+                .await
+                .expect("use"),
+            "started draft kim-copy from blueprint mlr-pack at version 1\n\
+             carried: gh_token\n\
+             to bind:\n  personal_key as env PERSONAL_KEY: personal_secret\n  \
+             unbound_key as env UNBOUND_KEY: unbound\n\
+             studio: https://crucible.example.com/playbooks/drafts/kim-copy\n"
+        );
+        let carried = crate::secrets::store::bindings_for_scope(
+            &pool,
+            crate::secrets::ScopeKind::Playbook,
+            "kim-copy",
+        )
+        .await
+        .expect("bindings");
+        assert_eq!(carried.len(), 1, "{carried:?}");
+        assert_eq!(carried[0].0.origin.as_deref(), Some("mlr-pack"));
+        let taken = use_as("kim-copy", None, false)
+            .run(&kim)
+            .await
+            .expect_err("the id is taken");
+        assert!(taken.to_string().contains("409"), "{taken:#}");
+
+        assert_eq!(
+            BlueprintPublic {
+                id: "mlr-pack".into(),
+                json: false,
+            }
+            .run(&reed)
+            .await
+            .expect("public"),
+            "mlr-pack is a public blueprint\n"
+        );
+        let catalog = list.run(&zed).await.expect("catalog");
+        for column in ["mlr-pack", "public", "0 carried, 3 to bind"] {
+            assert!(catalog.contains(column), "{column} missing: {catalog}");
+        }
+        let used: serde_json::Value = serde_json::from_str(
+            &use_as("zed-copy", Some("mine"), true)
+                .run(&zed)
+                .await
+                .expect("use"),
+        )
+        .expect("json");
+        assert_eq!(used["id"], "zed-copy");
+        assert_eq!(used["bindings"], serde_json::json!([]));
+        let reasons: Vec<(&str, &str)> = used["placeholders"]
+            .as_array()
+            .expect("placeholders")
+            .iter()
+            .map(|p| {
+                (
+                    p["declared_name"].as_str().expect("name"),
+                    p["reason"].as_str().expect("reason"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                ("gh_token", "not_in_team"),
+                ("personal_key", "personal_secret"),
+                ("unbound_key", "unbound"),
+            ]
+        );
+
+        assert_eq!(
+            BlueprintPrivate {
+                id: "mlr-pack".into(),
+                json: false,
+            }
+            .run(&reed)
+            .await
+            .expect("private"),
+            "mlr-pack is a private blueprint\n"
+        );
+        assert_eq!(
+            BlueprintUnmark {
+                id: "mlr-pack".into(),
+                json: false,
+            }
+            .run(&reed)
+            .await
+            .expect("unmark"),
+            "mlr-pack is not a blueprint\n"
+        );
+        assert_eq!(
+            list.run(&kim).await.expect("catalog"),
+            "no blueprints you can read\n"
+        );
+    }
 }

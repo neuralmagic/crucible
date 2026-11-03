@@ -1242,6 +1242,8 @@ mod tests {
             created_at: "2026-08-22T00:00:00Z".to_string(),
             updated_at: "2026-08-22T00:00:00Z".to_string(),
             variant: None,
+            blueprint: true,
+            public: false,
         };
         let v = serde_json::to_value(&dto).expect("serialize");
         assert_eq!(v["id"], "survey");
@@ -1266,6 +1268,8 @@ mod tests {
         );
         assert_eq!(v["schema_digest"], "sha256:cafe");
         assert_eq!(v["core_rev"], "7c2c1a563813ce952dd4039745730397cf2295c2");
+        assert_eq!(v["blueprint"], true);
+        assert_eq!(v["public"], false);
         assert_eq!(v["dispatch"]["backend"], "openshell");
         assert_eq!(v["dispatch"]["sandbox_image"], "quay.io/x/sandbox:dev");
         assert_eq!(v["dispatch"]["dispatchable"], false);

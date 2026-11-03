@@ -11,11 +11,13 @@ export interface RunFilters {
   status: string;
   playbook: string;
   origin: string;
+  /// The schedule whose launches the list is read for; the controller applies it.
+  schedule: string;
   /// Launches fired from the draft studio are test runs, hidden unless asked for.
   drafts: boolean;
 }
 
-export const DEFAULT_FILTERS: RunFilters = { status: '', playbook: '', origin: '', drafts: false };
+export const DEFAULT_FILTERS: RunFilters = { status: '', playbook: '', origin: '', schedule: '', drafts: false };
 
 const DRAFT = 'draft';
 
@@ -29,6 +31,7 @@ export function parseRunFilters(params: URLSearchParams): RunFilters {
     status: params.get('status') ?? '',
     playbook: params.get('playbook') ?? '',
     origin: params.get('origin') ?? '',
+    schedule: params.get('schedule') ?? '',
     drafts: params.get('drafts') === 'shown',
   };
 }
@@ -39,8 +42,14 @@ export function runFilterParams(filters: RunFilters): URLSearchParams {
   if (filters.status) params.set('status', filters.status);
   if (filters.playbook) params.set('playbook', filters.playbook);
   if (filters.origin) params.set('origin', filters.origin);
+  if (filters.schedule) params.set('schedule', filters.schedule);
   if (filters.drafts) params.set('drafts', 'shown');
   return params;
+}
+
+/// The runs list narrowed to what one schedule fired.
+export function scheduleFiringsPath(schedule: string): string {
+  return `/playbook-runs?${runFilterParams({ ...DEFAULT_FILTERS, origin: 'schedule', schedule }).toString()}`;
 }
 
 /// Whether a run belongs to the owner context. A launch carries no owner: in a user's context it is

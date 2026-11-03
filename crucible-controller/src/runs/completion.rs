@@ -34,6 +34,7 @@ pub async fn complete_run(
     session: &str,
     emission: Option<&crate::launches::emission::EmissionCtx>,
 ) -> Result<RunDisposition> {
+    crate::decisions::run_ended(db, run_id).await;
     let session_uri = crate::runs::blob_store::run_session_uri(run_id);
     let parsed = match ingest::ingest_session(
         db,

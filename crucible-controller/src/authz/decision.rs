@@ -149,6 +149,10 @@ pub struct Resource {
     pub share: Option<ShareRole>,
     /// The run id this resource belongs to, when it is a run or a child of one.
     pub run: Option<String>,
+    /// A public blueprint (RFC-0006 C-PUBLIC).
+    pub public: bool,
+    /// The owner of the blueprint a bind on this secret comes from (RFC-0006 C-CARRY).
+    pub origin_owner: Option<Principal>,
 }
 
 impl Resource {
@@ -159,6 +163,8 @@ impl Resource {
             owner,
             share: None,
             run: None,
+            public: false,
+            origin_owner: None,
         }
     }
 

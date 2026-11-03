@@ -72,6 +72,10 @@ agent_cmd     = "..."                          # command backend only (§6)
 [agent.env]                                   # injected into the agent process (creds, Vertex, etc.)
 ANTHROPIC_VERTEX_PROJECT_ID = "my-gcp-project"
 
+[[agent.tool_plugins]]                        # optional; absent = repeat_guard(25), classify, tool_stats
+plugin = "repeat_guard"                       # see tool-plugins.md
+limit  = 25
+
 [judge]
 measure_cmd = "./measure.sh"                  # REQUIRED. §3. Any executable, any language.
 direction   = "lower"                         # lower | higher. REQUIRED.
@@ -822,6 +826,18 @@ reader that predates it reads the count as zero. A route may declare `over`, and
 settle as `route[K]`, each with the decision for item `K` as its output. A score question's answer
 carries `score`, its expected level position in [0, 1], and `asked_as`, `score` or `choice`, the form
 the decision API was asked in.
+
+A route question may be a `dynamic_choice` (contract 1.22.0), whose `options_from = {task, field}`
+names a dependency field the options are read from at each decision: the list itself, or for a
+route with `over` the item's entry in an object keyed by item. Each entry is a label or
+`{value, description}`, at most 64, a repeated label keeps its first entry, and fewer than two
+fails that decision before it is asked. A model-decided route asks it as a `choice`; a
+human-decided route opens its request with the resolved `choice` in `questions`. Its answer
+carries `options`, the
+`{label, description?}` list it was asked over, whatever the label; no other answer carries it.
+A `when` on such a question may carry `any_option = true`, satisfied by any label but
+`uncertain`, and a `plan_admitted` task's `when` string spells it `*`, as in
+`match.package in *|uncertain`.
 
 A `plan_admitted` task carries `emits_files` (contract 1.14.0): each declared path, as a string,
 or `{path, schema}` when the declaration gave a schema. A field typed by a schema carries

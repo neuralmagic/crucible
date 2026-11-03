@@ -164,6 +164,7 @@ impl OpenCodeJsonParser {
             subagent: false,
             input,
             result,
+            failed: status == "error",
         }
     }
 
@@ -248,14 +249,18 @@ mod tests {
                     subagent,
                     input,
                     result,
+                    failed: ok_failed,
                 },
                 AgentEvent::Tool {
-                    summary: failed, ..
+                    summary: failed,
+                    failed: bad_failed,
+                    ..
                 },
                 AgentEvent::Tool {
                     summary: titled, ..
                 },
             ] => {
+                assert!(!ok_failed && *bad_failed, "an error state is a failed call");
                 assert_eq!(name, "bash");
                 assert_eq!(summary, "$ cargo test  # Run tests");
                 assert!(!subagent);

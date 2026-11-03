@@ -67,6 +67,12 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
+  blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
+  blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
+  blueprint-unmark      Withdraw a blueprint, public or not. Drafts started from it keep what they carried
+  blueprint-public      Let every user read and use a blueprint. Only its owning team's members get its secrets
+  blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
   draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)
@@ -161,6 +167,12 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
+  blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
+  blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
+  blueprint-unmark      Withdraw a blueprint, public or not. Drafts started from it keep what they carried
+  blueprint-public      Let every user read and use a blueprint. Only its owning team's members get its secrets
+  blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
   draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)
@@ -3098,6 +3110,271 @@ Options:
       --url <URL>                  Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
       --api-token <API_TOKEN>      The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
   -h, --help                       Print help
+==== crux blueprints --help ====
+List the blueprints you can read, with what each would carry for you and leave to bind
+
+Usage: crux blueprints [OPTIONS]
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux blueprints -h ====
+List the blueprints you can read, with what each would carry for you and leave to bind
+
+Usage: crux blueprints [OPTIONS]
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux blueprint-use --help ====
+Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
+
+Usage: crux blueprint-use [OPTIONS] <ID> <TO>
+
+Arguments:
+  <ID>
+          The blueprint's id, as `blueprints` lists it
+
+  <TO>
+          The new draft's id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --description <DESCRIPTION>
+          Defaults to the blueprint's
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux blueprint-use -h ====
+Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
+
+Usage: crux blueprint-use [OPTIONS] <ID> <TO>
+
+Arguments:
+  <ID>  The blueprint's id, as `blueprints` lists it
+  <TO>  The new draft's id
+
+Options:
+      --config <CONFIG>            Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --description <DESCRIPTION>  Defaults to the blueprint's
+      --json                       
+      --url <URL>                  Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>      The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                       Print help
+==== crux blueprint-mark --help ====
+Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
+
+Usage: crux blueprint-mark [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Playbook id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux blueprint-mark -h ====
+Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
+
+Usage: crux blueprint-mark [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Playbook id
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux blueprint-unmark --help ====
+Withdraw a blueprint, public or not. Drafts started from it keep what they carried
+
+Usage: crux blueprint-unmark [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Playbook id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux blueprint-unmark -h ====
+Withdraw a blueprint, public or not. Drafts started from it keep what they carried
+
+Usage: crux blueprint-unmark [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Playbook id
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux blueprint-public --help ====
+Let every user read and use a blueprint. Only its owning team's members get its secrets
+
+Usage: crux blueprint-public [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Playbook id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux blueprint-public -h ====
+Let every user read and use a blueprint. Only its owning team's members get its secrets
+
+Usage: crux blueprint-public [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Playbook id
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
+==== crux blueprint-private --help ====
+Make a public blueprint private again
+
+Usage: crux blueprint-private [OPTIONS] <ID>
+
+Arguments:
+  <ID>
+          Playbook id
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux blueprint-private -h ====
+Make a public blueprint private again
+
+Usage: crux blueprint-private [OPTIONS] <ID>
+
+Arguments:
+  <ID>  Playbook id
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
 ==== crux draft-publish --help ====
 Publish a draft: register its newest compiling version as a playbook, with no review
 
@@ -3267,6 +3544,12 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
+  blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
+  blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
+  blueprint-unmark      Withdraw a blueprint, public or not. Drafts started from it keep what they carried
+  blueprint-public      Let every user read and use a blueprint. Only its owning team's members get its secrets
+  blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
   draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)
@@ -3339,6 +3622,12 @@ Commands:
   draft-delete          Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only; the id is free to create again
   draft-rename          Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow
   draft-clone           Copy a draft's newest save into a new draft, with the bindings you could make yourself
+  blueprints            List the blueprints you can read, with what each would carry for you and leave to bind
+  blueprint-use         Start a draft from a blueprint. Bindings of the owning team's secrets carry when you are in that team; every other declared secret is a placeholder to bind with `secret-bind`
+  blueprint-mark        Offer a registered playbook as a blueprint. Refused unless you may bind every secret whose binding would carry
+  blueprint-unmark      Withdraw a blueprint, public or not. Drafts started from it keep what they carried
+  blueprint-public      Let every user read and use a blueprint. Only its owning team's members get its secrets
+  blueprint-private     Make a public blueprint private again
   draft-publish         Publish a draft: register its newest compiling version as a playbook, with no review
   draft-graduate        Graduate a draft: push its newest compiling version and open the export PR
   help                  Print this message or the help of the given subcommand(s)

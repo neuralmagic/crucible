@@ -6,8 +6,10 @@ use crate::duration::TaskTimeout;
 use crate::plan::param::ParamValue;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{
-    Label, Question, QuestionError, QuestionId, QuestionKind, UNCERTAIN,
+    CompiledQuestion, Label, OptionSource, Question, QuestionError, QuestionId, QuestionKind,
+    UNCERTAIN,
 };
+use crucible_contract::decision_request::DECISION_KEY;
 use crucible_contract::emits::{DeclaredFile, FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
 
@@ -473,7 +475,7 @@ pub enum TaskKind {
     TopK { k: u32, direction: Direction },
     /// Engine-owned call to a decision model; the output is one typed answer per question.
     Route {
-        questions: BTreeMap<QuestionId, Question>,
+        questions: BTreeMap<QuestionId, CompiledQuestion>,
         decider: Decider,
     },
     /// A capability-owned engine operation.
@@ -533,7 +535,7 @@ impl TaskKind {
             | TaskKind::Report { .. }
             | TaskKind::TopK { .. }
             | TaskKind::Route {
-                decider: Decider::Output { .. },
+                decider: Decider::Output { .. } | Decider::Human { .. },
                 ..
             }
             | TaskKind::Engine {
@@ -583,6 +585,12 @@ pub enum Decider {
     },
     /// A dependency's output, which carries one declared label per question id.
     Output { task: TaskName },
+    /// A person allowed to approve the run, answering a decision request the run opens.
+    Human {
+        /// A pack template rendered into the review shown above the evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
 }
 
 /// Run a task only when one question of a route it depends on resolved to a listed label.
@@ -591,11 +599,39 @@ pub struct When {
     pub task: TaskName,
     pub question: QuestionId,
     pub is: Vec<Label>,
+    /// Also satisfied by any option a dynamic choice resolves to, `uncertain` excepted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub any_option: bool,
+}
+
+/// How a `when` string spells [`When::any_option`].
+pub const ANY_OPTION: &str = "*";
+
+impl When {
+    /// Whether a route that recorded `label` for this question satisfies the condition.
+    pub fn admits(&self, label: &str) -> bool {
+        self.is.iter().any(|l| l.as_str() == label)
+            || (self.any_option && Label::new(label).is_ok_and(|l| !l.is_uncertain()))
+    }
+
+    /// Whether a route's recorded `answer` satisfies the condition: any label it chose does.
+    pub fn admitted_by(&self, answer: &crucible_contract::decision::Answer) -> bool {
+        if answer.labels.is_empty() {
+            self.admits(answer.label.as_str())
+        } else {
+            answer.labels.iter().any(|l| self.admits(l.as_str()))
+        }
+    }
 }
 
 impl fmt::Display for When {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let labels: Vec<&str> = self.is.iter().map(Label::as_str).collect();
+        let labels: Vec<&str> = self
+            .any_option
+            .then_some(ANY_OPTION)
+            .into_iter()
+            .chain(self.is.iter().map(Label::as_str))
+            .collect();
         write!(f, "{}.{} in {}", self.task, self.question, labels.join("|"))
     }
 }
@@ -620,6 +656,9 @@ fn reads_keyed_source<'a>(route: &Task, lookup: impl Fn(&TaskName) -> Option<&'a
 
 /// The capability a model-decided route task needs.
 pub const NEEDS_DECISION: &str = "decision";
+
+/// The capability a human-decided route task needs: an orchestrator that takes answers.
+pub const NEEDS_HUMAN: &str = "human";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -1094,10 +1133,13 @@ pub enum PlanError {
     },
     #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
     MinConfidenceOutOfRange { task: String, got: f64 },
-    #[error(
-        "model-decided route task {task:?} must declare needs = \"{NEEDS_DECISION}\", got {got:?}"
-    )]
-    RouteNeeds { task: String, got: String },
+    #[error("{decider}-decided route task {task:?} must declare needs = \"{want}\", got {got:?}")]
+    RouteNeeds {
+        task: String,
+        decider: &'static str,
+        want: &'static str,
+        got: String,
+    },
     #[error(
         "route task {task:?} decides from {source_task:?}, which is not one of its dependencies"
     )]
@@ -1226,6 +1268,70 @@ pub enum PlanError {
         question: String,
         declared: Box<FieldType>,
     },
+    #[error(
+        "human-decided route task {task:?} declares `over`; a person answers one request per \
+         route, not one per element"
+    )]
+    HumanRouteWithOver { task: String },
+    #[error(
+        "human-decided route task {task:?} declares question {question:?}; the route files its \
+         answer record under that key"
+    )]
+    ReservedQuestion { task: String, question: String },
+    #[error("route task {task:?}, question {question:?}: only a person answers a {what} question")]
+    HumanOnlyQuestion {
+        task: String,
+        question: String,
+        what: &'static str,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, but does not depend on \
+         its producer"
+    )]
+    PickNotADependency {
+        task: String,
+        question: String,
+        field: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which its producer's \
+         emits omits"
+    )]
+    PickFieldOmitted {
+        task: String,
+        question: String,
+        field: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which is declared \
+         {declared}; a pick needs a list of strings"
+    )]
+    PickNotAList {
+        task: String,
+        question: String,
+        field: String,
+        declared: Box<FieldType>,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which is declared \
+         {declared}, but {why}; a pick needs a list of strings"
+    )]
+    PickItemsNotStrings {
+        task: String,
+        question: String,
+        field: String,
+        declared: Box<FieldType>,
+        why: String,
+    },
+    #[error(
+        "task {task:?}: when names {route}.{question}, a pick question; a pick has no labels to \
+         route on"
+    )]
+    WhenOnPick {
+        task: String,
+        route: String,
+        question: String,
+    },
     #[error("task {task:?}: when names {route:?}, which is not one of its dependencies")]
     WhenNotADependency { task: String, route: String },
     #[error("task {task:?}: when names {route:?}, which is a {kind} task, not a route")]
@@ -1277,6 +1383,78 @@ pub enum PlanError {
         route: String,
         question: String,
         labels: Vec<String>,
+    },
+    #[error(
+        "route {route:?}, question {question:?} is a dynamic choice and no task runs on its \
+         options. Add a task with when = {route}.{question} and otherwise = True"
+    )]
+    UnroutedOptions { route: String, question: String },
+    #[error(
+        "task {task:?}: when on {route}.{question} lists {label:?}, but that question's options \
+         arrive at run time; list only \"uncertain\", or use otherwise = True"
+    )]
+    WhenNamesDynamicOption {
+        task: String,
+        route: String,
+        question: String,
+        label: String,
+    },
+    #[error(
+        "task {task:?}: when on {route}.{question} stands for any option, but that question \
+         declares its options; list them"
+    )]
+    WhenAnyOptionOnDeclared {
+        task: String,
+        route: String,
+        question: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?}: options = {reference} needs a decision \
+         model; a route with a source reads its answers, it does not choose among options"
+    )]
+    DynamicOptionsOnOutputRoute {
+        task: String,
+        question: String,
+        reference: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?}: options = {reference} is not read from one \
+         of its dependencies"
+    )]
+    DynamicOptionsNotADependency {
+        task: String,
+        question: String,
+        reference: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?}: options = {reference} reads a mapped task; \
+         options come from an unmapped dependency's field"
+    )]
+    DynamicOptionsFromMapped {
+        task: String,
+        question: String,
+        reference: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?}: options = {producer}.{field}, but \
+         {producer:?} does not declare {field:?} in emits"
+    )]
+    DynamicOptionsUndeclared {
+        task: String,
+        question: String,
+        producer: String,
+        field: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?}: options = {reference} is declared \
+         {declared}; {expected}"
+    )]
+    DynamicOptionsWrongType {
+        task: String,
+        question: String,
+        reference: String,
+        declared: Box<FieldType>,
+        expected: &'static str,
     },
     #[error("task {task:?} declares revise but names no task")]
     ReviseNamesNoTask { task: String },
@@ -1412,7 +1590,7 @@ pub(crate) fn typed_answers<'a>(
     else {
         return None;
     };
-    let asked = questions.get(question)?;
+    let asked = questions.get(question)?.declared()?;
     let source = find(source)?;
     let Declared::Typed(declared) = source.emits.field(question.as_str()) else {
         return None;
@@ -1434,11 +1612,94 @@ fn answerable_types(question: &Question) -> String {
     let labels = format!("labels from {}", labels.join("|"));
     match question.kind {
         QuestionKind::Noul => format!("\"boolean\" or {labels}"),
-        QuestionKind::Choice { .. } | QuestionKind::Score { .. } => labels,
+        QuestionKind::Choice { .. } | QuestionKind::Score { .. } | QuestionKind::Pick { .. } => {
+            labels
+        }
     }
 }
 
+/// An output-decided route's questions as asked. Validation admits a dynamic choice only on a
+/// model-decided route, and refuses one here.
+pub fn declared_questions(
+    task: &TaskName,
+    questions: &BTreeMap<QuestionId, CompiledQuestion>,
+) -> Result<BTreeMap<QuestionId, Question>, PlanError> {
+    questions
+        .iter()
+        .map(|(id, question)| match question {
+            CompiledQuestion::Declared(question) => Ok((id.clone(), question.clone())),
+            CompiledQuestion::Dynamic(dynamic) => Err(PlanError::DynamicOptionsOnOutputRoute {
+                task: task.0.clone(),
+                question: id.to_string(),
+                reference: dynamic.options_from.to_string(),
+            }),
+        })
+        .collect()
+}
+
 impl Plan {
+    /// A dynamic choice's `options_from`: a field of an unmapped dependency, typed as a list, or
+    /// for a mapped route as an object keyed by element.
+    fn validate_options_from(
+        &self,
+        route: &Task,
+        question: &QuestionId,
+        source: &OptionSource,
+        index: &BTreeMap<&TaskName, usize>,
+    ) -> Result<(), PlanError> {
+        let task = || route.name.0.clone();
+        let question = || question.to_string();
+        let reference = || source.to_string();
+        let Some(producer) = route
+            .depends_on
+            .iter()
+            .find(|d| d.0 == source.task)
+            .and_then(|d| index.get(d))
+            .map(|&i| &self.tasks[i])
+        else {
+            return Err(PlanError::DynamicOptionsNotADependency {
+                task: task(),
+                question: question(),
+                reference: reference(),
+            });
+        };
+        if producer.over.is_some() {
+            return Err(PlanError::DynamicOptionsFromMapped {
+                task: task(),
+                question: question(),
+                reference: reference(),
+            });
+        }
+        let (fits, expected): (fn(&FieldType) -> bool, &'static str) = if route.over.is_some() {
+            (
+                FieldType::is_object,
+                "a mapped route reads each element's options from an object keyed by element",
+            )
+        } else {
+            (
+                FieldType::is_list,
+                "an unmapped route reads its options from a list",
+            )
+        };
+        match producer.emits.field(&source.field) {
+            Declared::Unchecked | Declared::Untyped => Ok(()),
+            Declared::Omitted => Err(PlanError::DynamicOptionsUndeclared {
+                task: task(),
+                question: question(),
+                producer: producer.name.0.clone(),
+                field: source.field.clone(),
+            }),
+            Declared::Typed(declared) if fits(declared) => Ok(()),
+            Declared::Typed(declared) => Err(PlanError::DynamicOptionsWrongType {
+                task: task(),
+                question: question(),
+                reference: reference(),
+                declared: Box::new(declared.clone()),
+                expected,
+            }),
+        }
+    }
+
     /// Parse JSON without validating it.
     pub fn from_json_str(s: &str) -> Result<Plan> {
         serde_json::from_str(s).context("PLAN.json does not parse as a plan")
@@ -1619,7 +1880,13 @@ impl Plan {
             if t.timeout.is_some()
                 && !matches!(
                     t.task,
-                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                    TaskKind::Agent { .. }
+                        | TaskKind::Command { .. }
+                        | TaskKind::Evaluate { .. }
+                        | TaskKind::Route {
+                            decider: Decider::Human { .. },
+                            ..
+                        }
                 )
             {
                 return Err(PlanError::TimeoutOnUntimedTask {
@@ -1701,6 +1968,71 @@ impl Plan {
                             question: id.to_string(),
                             error,
                         })?;
+                    let human = matches!(decider, Decider::Human { .. });
+                    if human && id.as_str() == DECISION_KEY {
+                        return Err(PlanError::ReservedQuestion {
+                            task: task(),
+                            question: id.to_string(),
+                        });
+                    }
+                    if let Some(what) = match question.declared().map(|q| &q.kind) {
+                        Some(QuestionKind::Pick { .. }) => Some("pick"),
+                        Some(QuestionKind::Choice { multiple: true, .. }) => {
+                            Some("multiple choice")
+                        }
+                        _ => None,
+                    }
+                    .filter(|_| !human)
+                    {
+                        return Err(PlanError::HumanOnlyQuestion {
+                            task: task(),
+                            question: id.to_string(),
+                            what,
+                        });
+                    }
+                    if let Some(source) = question.pick_source() {
+                        let reference = format!("{}.{}", source.task, source.field);
+                        let producer = TaskName(source.task.clone());
+                        if !t.depends_on.contains(&producer) {
+                            return Err(PlanError::PickNotADependency {
+                                task: task(),
+                                question: id.to_string(),
+                                field: reference,
+                            });
+                        }
+                        match self.tasks[index[&producer]].emits.field(&source.field) {
+                            Declared::Unchecked | Declared::Untyped => {}
+                            Declared::Typed(declared) if declared.is_list() => {
+                                if let Some(why) = declared.item_refusal() {
+                                    return Err(PlanError::PickItemsNotStrings {
+                                        task: task(),
+                                        question: id.to_string(),
+                                        field: reference,
+                                        declared: Box::new(declared.clone()),
+                                        why,
+                                    });
+                                }
+                            }
+                            Declared::Omitted => {
+                                return Err(PlanError::PickFieldOmitted {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    field: reference,
+                                });
+                            }
+                            Declared::Typed(declared) => {
+                                return Err(PlanError::PickNotAList {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    field: reference,
+                                    declared: Box::new(declared.clone()),
+                                });
+                            }
+                        }
+                    }
+                    if let Some(source) = question.options_from() {
+                        self.validate_options_from(t, id, source, &index)?;
+                    }
                 }
                 match decider {
                     Decider::Model { min_confidence, .. } => {
@@ -1713,8 +2045,23 @@ impl Plan {
                         if t.needs != NEEDS_DECISION {
                             return Err(PlanError::RouteNeeds {
                                 task: task(),
+                                decider: "model",
+                                want: NEEDS_DECISION,
                                 got: t.needs.clone(),
                             });
+                        }
+                    }
+                    Decider::Human { .. } => {
+                        if t.needs != NEEDS_HUMAN {
+                            return Err(PlanError::RouteNeeds {
+                                task: task(),
+                                decider: "human",
+                                want: NEEDS_HUMAN,
+                                got: t.needs.clone(),
+                            });
+                        }
+                        if t.over.is_some() {
+                            return Err(PlanError::HumanRouteWithOver { task: task() });
                         }
                     }
                     Decider::Output { task: source } => {
@@ -1733,7 +2080,7 @@ impl Plan {
                                 source_task: source.0.clone(),
                             });
                         }
-                        for (id, question) in questions {
+                        for (id, question) in &declared_questions(&t.name, questions)? {
                             if keyed_source {
                                 if let Declared::Typed(declared) = emits.field(id.as_str())
                                     && !declared.is_object()
@@ -1852,11 +2199,34 @@ impl Plan {
                         declared: questions.keys().map(ToString::to_string).collect(),
                     });
                 };
-                if when.is.is_empty() {
+                if asked.pick_source().is_some() {
+                    return Err(PlanError::WhenOnPick {
+                        task: task(),
+                        route: route(),
+                        question: question(),
+                    });
+                }
+                if when.is.is_empty() && !when.any_option {
                     return Err(PlanError::WhenWithoutLabels {
                         task: task(),
                         route: route(),
                         question: question(),
+                    });
+                }
+                let dynamic = asked.options_from().is_some();
+                if when.any_option && !dynamic {
+                    return Err(PlanError::WhenAnyOptionOnDeclared {
+                        task: task(),
+                        route: route(),
+                        question: question(),
+                    });
+                }
+                if dynamic && let Some(label) = when.is.iter().find(|l| !l.is_uncertain()) {
+                    return Err(PlanError::WhenNamesDynamicOption {
+                        task: task(),
+                        route: route(),
+                        question: question(),
+                        label: label.to_string(),
                     });
                 }
                 let lookup = |name: &TaskName| index.get(name).map(|&i| &self.tasks[i]);
@@ -2185,16 +2555,16 @@ impl Plan {
                 });
             }
         }
-        let mut handled: BTreeMap<(&TaskName, &QuestionId), BTreeSet<&Label>> = BTreeMap::new();
+        let mut handled: BTreeMap<(&TaskName, &QuestionId), (BTreeSet<&Label>, bool)> =
+            BTreeMap::new();
         for t in &self.tasks {
             if let Some(when) = &t.when {
-                handled
-                    .entry((&when.task, &when.question))
-                    .or_default()
-                    .extend(&when.is);
+                let (labels, any_option) = handled.entry((&when.task, &when.question)).or_default();
+                labels.extend(&when.is);
+                *any_option |= when.any_option;
             }
         }
-        for ((route, question), listed) in &handled {
+        for ((route, question), (listed, any_option)) in &handled {
             let route_task = &self.tasks[index[route]];
             let TaskKind::Route { questions, .. } = &route_task.task else {
                 continue;
@@ -2202,6 +2572,12 @@ impl Plan {
             let Some(asked) = questions.get(question) else {
                 continue;
             };
+            if asked.options_from().is_some() && !any_option {
+                return Err(PlanError::UnroutedOptions {
+                    route: route.0.clone(),
+                    question: question.to_string(),
+                });
+            }
             let lookup = |name: &TaskName| index.get(name).map(|&i| &self.tasks[i]);
             let possible = typed_answers(route_task, question, lookup)
                 .filter(|_| !reads_keyed_source(route_task, lookup))
@@ -2215,7 +2591,7 @@ impl Plan {
                         .as_ref()
                         .is_none_or(|possible| possible.contains(l))
                 })
-                .filter(|l| !listed.contains(l) && !asked.drop.contains(l))
+                .filter(|l| !listed.contains(l) && !asked.drop().contains(l))
                 .map(|l| l.to_string())
                 .collect();
             if !unrouted.is_empty() {
@@ -2426,6 +2802,7 @@ mod tests {
                         description: None,
                     })
                     .collect(),
+                multiple: false,
             },
             drop: drop.iter().map(|l| label(l)).collect(),
         }
@@ -2434,7 +2811,7 @@ mod tests {
     fn model_route(name: &str, deps: &[&str], drop: &[&str]) -> Task {
         Task {
             task: TaskKind::Route {
-                questions: BTreeMap::from([(qid("area"), area_question(drop))]),
+                questions: BTreeMap::from([(qid("area"), area_question(drop).into())]),
                 decider: Decider::Model {
                     min_confidence: 0.8,
                     files: Vec::new(),
@@ -2448,7 +2825,7 @@ mod tests {
     fn output_route(name: &str, source: &str, drop: &[&str]) -> Task {
         Task {
             task: TaskKind::Route {
-                questions: BTreeMap::from([(qid("area"), area_question(drop))]),
+                questions: BTreeMap::from([(qid("area"), area_question(drop).into())]),
                 decider: Decider::Output {
                     task: source.into(),
                 },
@@ -2462,6 +2839,7 @@ mod tests {
             task: route.into(),
             question: qid(question),
             is: is.iter().map(|l| label(l)).collect(),
+            any_option: false,
         });
         task
     }
@@ -2595,7 +2973,7 @@ mod tests {
             let TaskKind::Route { questions, decider } = &back.tasks[1].task else {
                 panic!("gate is not a route");
             };
-            assert_eq!(questions[&qid("area")], area_question(&[]));
+            assert_eq!(questions[&qid("area")], area_question(&[]).into());
             assert_eq!(
                 *decider,
                 Decider::Model {
@@ -2682,7 +3060,9 @@ mod tests {
             }
         );
         if let TaskKind::Route { questions, .. } = &mut gate.task {
-            let q = questions.get_mut(&qid("area")).unwrap();
+            let Some(CompiledQuestion::Declared(q)) = questions.get_mut(&qid("area")) else {
+                panic!("area is declared");
+            };
             q.drop.clear();
             q.instructions = String::new();
         }
@@ -2731,6 +3111,8 @@ mod tests {
             plan(vec![gate]).validate().unwrap_err(),
             PlanError::RouteNeeds {
                 task: "gate".into(),
+                decider: "model",
+                want: NEEDS_DECISION,
                 got: "any".into()
             }
         );
@@ -2740,6 +3122,267 @@ mod tests {
         ])
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn a_human_route_must_need_human() {
+        let mut gate = model_route("gate", &[], &[]);
+        if let TaskKind::Route { decider, .. } = &mut gate.task {
+            *decider = Decider::Human { review: None };
+        }
+        gate.needs = NEEDS_DECISION.into();
+        assert_eq!(
+            plan(vec![gate.clone()]).validate().unwrap_err(),
+            PlanError::RouteNeeds {
+                task: "gate".into(),
+                decider: "human",
+                want: NEEDS_HUMAN,
+                got: NEEDS_DECISION.into()
+            }
+        );
+        gate.needs = NEEDS_HUMAN.into();
+        plan(vec![gate]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_human_route_round_trips_through_toml_with_its_review() {
+        let decider = Decider::Human {
+            review: Some("reviews/gate.md.j2".into()),
+        };
+        let text = toml::to_string(&decider).unwrap();
+        assert_eq!(toml::from_str::<Decider>(&text).unwrap(), decider);
+        let bare = toml::to_string(&Decider::Human { review: None }).unwrap();
+        assert!(!bare.contains("review"), "{bare}");
+    }
+
+    #[test]
+    fn a_human_route_does_not_spend() {
+        let gate = human_route("gate", &[], &[("pick", pick_question("a", "items", false))]);
+        assert!(!gate.task.spends());
+    }
+
+    fn human_route(name: &str, deps: &[&str], questions: &[(&str, Question)]) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: questions
+                    .iter()
+                    .map(|(id, q)| (qid(id), q.clone().into()))
+                    .collect(),
+                decider: Decider::Human { review: None },
+            },
+            needs: NEEDS_HUMAN.into(),
+            ..agent(name, deps)
+        }
+    }
+
+    fn pick_question(task: &str, field: &str, multiple: bool) -> Question {
+        Question {
+            instructions: "which?".into(),
+            kind: QuestionKind::Pick {
+                source: crucible_contract::decision::OptionSource {
+                    task: task.into(),
+                    field: field.into(),
+                },
+                multiple,
+            },
+            drop: Vec::new(),
+        }
+    }
+
+    fn multiple_area() -> Question {
+        let mut q = area_question(&[]);
+        if let QuestionKind::Choice { multiple, .. } = &mut q.kind {
+            *multiple = true;
+        }
+        q
+    }
+
+    #[test]
+    fn only_a_human_route_takes_a_pick_or_a_multiple_choice() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        for (question, what) in [
+            (pick_question("scan", "nodes", false), "pick"),
+            (multiple_area(), "multiple choice"),
+        ] {
+            let mut gate = model_route("gate", &["scan"], &[]);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                questions.insert(qid("area"), question.clone().into());
+            }
+            assert_eq!(
+                plan(vec![scan.clone(), gate]).validate().unwrap_err(),
+                PlanError::HumanOnlyQuestion {
+                    task: "gate".into(),
+                    question: "area".into(),
+                    what,
+                }
+            );
+            let mut gate = output_route("gate", "scan", &[]);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                questions.insert(qid("area"), question.clone().into());
+            }
+            assert!(matches!(
+                plan(vec![scan.clone(), gate]).validate().unwrap_err(),
+                PlanError::HumanOnlyQuestion { .. }
+            ));
+            let gate = human_route("gate", &["scan"], &[("area", question)]);
+            let routed = on(
+                agent("go", &["gate"]),
+                "gate",
+                "area",
+                &["frontend", "scheduler", "uncertain"],
+            );
+            let tasks = if what == "pick" {
+                vec![scan.clone(), gate]
+            } else {
+                vec![scan.clone(), gate, routed]
+            };
+            plan(tasks).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_human_route_may_not_map_over_a_list() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("items", FieldType::List)]);
+        let mut gate = human_route("gate", &["scan"], &[("area", area_question(&[]))]);
+        gate.over = Some(OutputRef {
+            task: "scan".into(),
+            field: OutputField("items".into()),
+        });
+        gate.max_fanout = Some(4);
+        assert_eq!(
+            plan(vec![scan, gate]).validate().unwrap_err(),
+            PlanError::HumanRouteWithOver {
+                task: "gate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_human_route_may_not_ask_a_question_named_decision() {
+        let gate = human_route("gate", &[], &[("decision", area_question(&[]))]);
+        assert_eq!(
+            plan(vec![gate]).validate().unwrap_err(),
+            PlanError::ReservedQuestion {
+                task: "gate".into(),
+                question: "decision".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pick_reads_a_list_of_strings_from_a_dependency() {
+        let gate = |deps: &[&str]| {
+            human_route(
+                "gate",
+                deps,
+                &[("nodes", pick_question("scan", "nodes", true))],
+            )
+        };
+        let scan = |emits: Emits| Task {
+            emits,
+            ..agent("scan", &[])
+        };
+        assert!(matches!(
+            plan(vec![scan(Emits::default()), gate(&[])])
+                .validate()
+                .unwrap_err(),
+            PlanError::PickNotADependency { .. }
+        ));
+        assert!(matches!(
+            plan(vec![scan(fields(&["other"])), gate(&["scan"])])
+                .validate()
+                .unwrap_err(),
+            PlanError::PickFieldOmitted { .. }
+        ));
+        assert!(matches!(
+            plan(vec![
+                scan(typed(&[("nodes", FieldType::String)])),
+                gate(&["scan"])
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::PickNotAList { .. }
+        ));
+        let numbers = crucible_contract::emits::JsonSchema::new(
+            serde_json::json!({"type": "array", "items": {"type": "integer"}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan(vec![
+                scan(typed(&[("nodes", FieldType::Schema(numbers))])),
+                gate(&["scan"])
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::PickItemsNotStrings { .. }
+        ));
+        for emits in [
+            Emits::default(),
+            fields(&["nodes"]),
+            typed(&[("nodes", FieldType::List)]),
+        ] {
+            plan(vec![scan(emits), gate(&["scan"])]).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn no_when_routes_on_a_pick() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        let gate = human_route(
+            "gate",
+            &["scan"],
+            &[("nodes", pick_question("scan", "nodes", false))],
+        );
+        let go = on(agent("go", &["gate"]), "gate", "nodes", &["uncertain"]);
+        assert_eq!(
+            plan(vec![scan, gate, go]).validate().unwrap_err(),
+            PlanError::WhenOnPick {
+                task: "go".into(),
+                route: "gate".into(),
+                question: "nodes".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pick_question_round_trips_through_toml() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        let gate = human_route(
+            "gate",
+            &["scan"],
+            &[
+                ("nodes", pick_question("scan", "nodes", true)),
+                ("area", multiple_area()),
+            ],
+        );
+        let original = plan(vec![
+            scan,
+            gate,
+            on(
+                agent("go", &["gate"]),
+                "gate",
+                "area",
+                &["frontend", "scheduler", "uncertain"],
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        assert!(text.contains("multiple = true"), "{text}");
+        let back = Plan::from_toml_str(&text).unwrap();
+        let (
+            TaskKind::Route { questions: got, .. },
+            TaskKind::Route {
+                questions: want, ..
+            },
+        ) = (&back.tasks[1].task, &original.tasks[1].task)
+        else {
+            panic!("gate is not a route");
+        };
+        assert_eq!(got, want);
+        back.validate().unwrap();
     }
 
     #[test]
@@ -3655,7 +4298,8 @@ emits = ["lines"]
                         instructions: "Urgent?".into(),
                         kind: QuestionKind::Noul,
                         drop: Vec::new(),
-                    },
+                    }
+                    .into(),
                 )]),
                 decider: Decider::Output {
                     task: source.into(),
@@ -5357,7 +6001,8 @@ emits = ["lines"]
                                 .collect(),
                         },
                         drop: Vec::new(),
-                    },
+                    }
+                    .into(),
                 )]),
                 decider: Decider::Output {
                     task: "classify".into(),
@@ -5428,5 +6073,308 @@ emits = ["lines"]
                 source_task: "facts".into(),
             }
         );
+    }
+
+    fn package_question(field: &str, drop: &[&str]) -> CompiledQuestion {
+        use crucible_contract::decision::{DynamicChoice, OptionSource};
+        CompiledQuestion::Dynamic(DynamicChoice {
+            instructions: "Which shipped package does the flaw affect?".into(),
+            options_from: OptionSource {
+                task: "prepare".into(),
+                field: field.into(),
+            },
+            drop: drop.iter().map(|l| label(l)).collect(),
+        })
+    }
+
+    fn dynamic_route(question: CompiledQuestion) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(qid("package"), question)]),
+                decider: Decider::Model {
+                    min_confidence: 0.8,
+                    files: Vec::new(),
+                },
+            },
+            needs: NEEDS_DECISION.into(),
+            ..agent("match", &["prepare"])
+        }
+    }
+
+    fn any_option(mut task: Task, is: &[&str]) -> Task {
+        task = on(task, "match", "package", is);
+        if let Some(when) = &mut task.when {
+            when.any_option = true;
+        }
+        task
+    }
+
+    /// prepare -> match[k] -> analyze[k] (any option) | review[k] (uncertain)
+    fn dynamic_routing(prepare: Task) -> Vec<Task> {
+        vec![
+            prepare,
+            mapped(
+                dynamic_route(package_question("packages", &[])),
+                "prepare",
+                "members",
+            ),
+            any_option(
+                mapped(
+                    agent("analyze", &["prepare", "match"]),
+                    "prepare",
+                    "members",
+                ),
+                &[],
+            ),
+            on(
+                mapped(agent("review", &["prepare", "match"]), "prepare", "members"),
+                "match",
+                "package",
+                &["uncertain"],
+            ),
+        ]
+    }
+
+    fn packages_producer(packages: FieldType) -> Task {
+        Task {
+            emits: typed(&[("members", FieldType::List), ("packages", packages)]),
+            ..agent("prepare", &[])
+        }
+    }
+
+    #[test]
+    fn a_dynamic_choice_routed_by_any_option_and_uncertain_validates_and_round_trips() {
+        let original = plan(dynamic_routing(packages_producer(FieldType::Object)));
+        original.clone().validate().unwrap();
+        let text = toml::to_string(&original).unwrap();
+        assert!(text.contains("type = \"dynamic_choice\""), "{text}");
+        assert!(text.contains("any_option = true"), "{text}");
+        let back = Plan::from_toml_str(&text).unwrap();
+        assert_eq!(back.tasks[2].when, original.tasks[2].when);
+        assert_eq!(back.tasks[3].when, original.tasks[3].when);
+        let TaskKind::Route { questions, .. } = &back.tasks[1].task else {
+            panic!("match is not a route");
+        };
+        assert_eq!(
+            questions[&qid("package")],
+            package_question("packages", &[])
+        );
+        back.validate().unwrap();
+        let unchanged = toml::to_string(&plan(routed())).unwrap();
+        assert!(!unchanged.contains("any_option"), "{unchanged}");
+    }
+
+    #[test]
+    fn an_unmapped_dynamic_choice_reads_a_list_and_a_mapped_one_an_object() {
+        let unmapped = |packages: FieldType| {
+            plan(vec![
+                packages_producer(packages),
+                dynamic_route(package_question("packages", &[])),
+            ])
+            .validate()
+        };
+        unmapped(FieldType::List).unwrap();
+        assert_eq!(
+            unmapped(FieldType::Object).unwrap_err(),
+            PlanError::DynamicOptionsWrongType {
+                task: "match".into(),
+                question: "package".into(),
+                reference: "prepare.packages".into(),
+                declared: Box::new(FieldType::Object),
+                expected: "an unmapped route reads its options from a list",
+            }
+        );
+        assert_eq!(
+            plan(dynamic_routing(packages_producer(FieldType::List)))
+                .validate()
+                .unwrap_err(),
+            PlanError::DynamicOptionsWrongType {
+                task: "match".into(),
+                question: "package".into(),
+                reference: "prepare.packages".into(),
+                declared: Box::new(FieldType::List),
+                expected: "a mapped route reads each element's options from an object keyed by \
+                           element",
+            }
+        );
+        let untyped = Task {
+            emits: Emits::default(),
+            ..agent("prepare", &[])
+        };
+        plan(dynamic_routing(untyped)).validate().unwrap();
+    }
+
+    #[test]
+    fn a_dynamic_choice_reference_is_checked_the_way_keyed_is() {
+        let reject = |tasks: Vec<Task>| plan(tasks).validate().unwrap_err();
+        let mut routing = dynamic_routing(packages_producer(FieldType::Object));
+        routing[1] = mapped(
+            dynamic_route(package_question("nope", &[])),
+            "prepare",
+            "members",
+        );
+        assert_eq!(
+            reject(routing),
+            PlanError::DynamicOptionsUndeclared {
+                task: "match".into(),
+                question: "package".into(),
+                producer: "prepare".into(),
+                field: "nope".into(),
+            }
+        );
+
+        assert_eq!(
+            reject(vec![
+                packages_producer(FieldType::List),
+                agent("other", &[]),
+                Task {
+                    depends_on: vec!["other".into()],
+                    ..dynamic_route(package_question("packages", &[]))
+                },
+            ]),
+            PlanError::DynamicOptionsNotADependency {
+                task: "match".into(),
+                question: "package".into(),
+                reference: "prepare.packages".into(),
+            }
+        );
+
+        let mapped_prepare = Task {
+            depends_on: vec!["seed".into()],
+            ..mapped(packages_producer(FieldType::Object), "seed", "members")
+        };
+        assert_eq!(
+            reject(vec![
+                emitting("seed", &[], &["members"]),
+                mapped_prepare,
+                dynamic_route(package_question("packages", &[])),
+            ]),
+            PlanError::DynamicOptionsFromMapped {
+                task: "match".into(),
+                question: "package".into(),
+                reference: "prepare.packages".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_dynamic_choice_needs_a_decision_model() {
+        let route = Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(qid("package"), package_question("packages", &[]))]),
+                decider: Decider::Output {
+                    task: "prepare".into(),
+                },
+            },
+            ..agent("match", &["prepare"])
+        };
+        assert_eq!(
+            plan(vec![packages_producer(FieldType::List), route])
+                .validate()
+                .unwrap_err(),
+            PlanError::DynamicOptionsOnOutputRoute {
+                task: "match".into(),
+                question: "package".into(),
+                reference: "prepare.packages".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_when_on_a_dynamic_choice_lists_only_uncertain_and_any_option() {
+        let mut routing = dynamic_routing(packages_producer(FieldType::Object));
+        routing[3] = on(
+            mapped(agent("review", &["prepare", "match"]), "prepare", "members"),
+            "match",
+            "package",
+            &["uncertain", "p1"],
+        );
+        assert_eq!(
+            plan(routing).validate().unwrap_err(),
+            PlanError::WhenNamesDynamicOption {
+                task: "review".into(),
+                route: "match".into(),
+                question: "package".into(),
+                label: "p1".into(),
+            }
+        );
+
+        let mut tasks = routed();
+        tasks[2] = any_option(agent("fix", &["gate"]), &["scheduler"]);
+        if let Some(when) = &mut tasks[2].when {
+            when.task = "gate".into();
+            when.question = qid("area");
+        }
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::WhenAnyOptionOnDeclared {
+                task: "fix".into(),
+                route: "gate".into(),
+                question: "area".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_dynamic_choice_drops_only_uncertain() {
+        let mut routing = dynamic_routing(packages_producer(FieldType::Object));
+        routing[1] = mapped(
+            dynamic_route(package_question("packages", &["none"])),
+            "prepare",
+            "members",
+        );
+        assert!(matches!(
+            plan(routing).validate().unwrap_err(),
+            PlanError::InvalidQuestion { .. }
+        ));
+    }
+
+    #[test]
+    fn a_routed_dynamic_choice_needs_a_when_for_its_options() {
+        let mut routing = dynamic_routing(packages_producer(FieldType::Object));
+        routing.remove(2);
+        assert_eq!(
+            plan(routing.clone()).validate().unwrap_err(),
+            PlanError::UnroutedOptions {
+                route: "match".into(),
+                question: "package".into(),
+            }
+        );
+        let mut routing = dynamic_routing(packages_producer(FieldType::Object));
+        routing.remove(3);
+        assert_eq!(
+            plan(routing.clone()).validate().unwrap_err(),
+            PlanError::UnroutedLabels {
+                route: "match".into(),
+                question: "package".into(),
+                labels: vec!["uncertain".into()],
+            }
+        );
+        routing[1] = mapped(
+            dynamic_route(package_question("packages", &["uncertain"])),
+            "prepare",
+            "members",
+        );
+        plan(routing).validate().unwrap();
+    }
+
+    #[test]
+    fn an_any_option_when_admits_every_label_but_uncertain() {
+        let when = any_option(agent("analyze", &["match"]), &[]).when.unwrap();
+        assert!(when.admits("p1"));
+        assert!(when.admits("none"));
+        assert!(!when.admits("uncertain"));
+        assert!(!when.admits("not a label"));
+        assert_eq!(when.to_string(), "match.package in *");
+        let both = any_option(agent("analyze", &["match"]), &["uncertain"])
+            .when
+            .unwrap();
+        assert!(both.admits("uncertain"));
+        assert_eq!(both.to_string(), "match.package in *|uncertain");
+        let listed = on(agent("fix", &["gate"]), "gate", "area", &["scheduler"])
+            .when
+            .unwrap();
+        assert!(listed.admits("scheduler"));
+        assert!(!listed.admits("frontend"));
     }
 }

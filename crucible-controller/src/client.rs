@@ -501,16 +501,28 @@ mod tests {
                 "820c18c5010b64c2c133de3afc5833ab9b689a574848a4097bee3bc39ba64b95",
             ),
             (
-                "0073_github_token_secret_kind.sql",
-                "6f3e8fef73c64ce84ac99360bfb00dfe52c1c073065204526256c1e5eba2884b",
+                "0073_blueprints.sql",
+                "64a282e389b035b4db082c9bc094797b3aeb54cf634e370e6dfa37df6c6734a8",
             ),
             (
-                "0074_drop_mlflow_exports_and_secret_grants.sql",
-                "fd1398bba4a22a81191df88ad25654570f869629e3e8f1a51f71067a34e30d73",
+                "0074_decision_requests.sql",
+                "f8570a13c3269c667da6add411d8927e4b8e4dccc3a629378970528f03f6baff",
             ),
             (
-                "0075_refuse_hermes_harness.sql",
-                "103726c625d02acb81954455efe62263b2549cecc87bdf1cf6900961f7646d49",
+                "0075_run_created_at.sql",
+                "02e7fec4d2a7d484c499104de824c36274f508c86bcea83941db70f7e5336baa",
+            ),
+            (
+                "0076_github_token_secret_kind.sql",
+                "1b841656f210de28f57d322a754ee89ab29101d40f2e2b25da83e4387bd6fa70",
+            ),
+            (
+                "0077_drop_mlflow_exports_and_secret_grants.sql",
+                "c7429c0e875da70444c1a88458da62c8659c3aa5f09df8ffe7af6b91b3b09b00",
+            ),
+            (
+                "0078_refuse_hermes_harness.sql",
+                "85922563a7efb6175c11d71a04ccb99119382931d79204e58b49d1d1b02766c6",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
