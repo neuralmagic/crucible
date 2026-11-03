@@ -40,8 +40,14 @@ pub enum Capability {
     /// Whether the pack runs commands outside the sandbox, which hold their executor's reach.
     ExternalCommands { present: bool },
     /// Variables of the engine's environment a manifest table passes to its commands outside
-    /// the sandbox, beyond the base every such command gets.
-    HostEnv { table: String, names: Vec<String> },
+    /// the sandbox, beyond the base every such command gets: `names` are required, `optional`
+    /// ones are passed when the engine has them.
+    HostEnv {
+        table: String,
+        names: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        optional: Vec<String>,
+    },
     /// A named `[agent.sandbox]` and what it provisions: its image, the declared secrets and
     /// relay files passed in, broker reach, and the egress it adds after the pack's deny list.
     Sandbox {
@@ -316,23 +322,26 @@ fn runs_external_commands(m: &Manifest) -> bool {
 /// What each manifest table passes to its commands from the engine's environment, for the
 /// tables that declare anything.
 fn host_env(m: &Manifest) -> impl Iterator<Item = Capability> + '_ {
-    let empty: &[crate::host_env::EnvName] = &[];
     [
-        (
-            "[judge]",
-            m.judge.as_ref().map_or(empty, |j| j.env.as_slice()),
-        ),
-        ("[world]", m.world.env.as_slice()),
-        (
-            "[workflow]",
-            m.workflow.as_ref().map_or(empty, |w| w.env.as_slice()),
-        ),
+        ("[judge]", m.judge.as_ref().map(|j| &j.env)),
+        ("[world]", Some(&m.world.env)),
+        ("[workflow]", m.workflow.as_ref().map(|w| &w.env)),
     ]
     .into_iter()
-    .filter(|(_, names)| !names.is_empty())
-    .map(|(table, names)| Capability::HostEnv {
-        table: table.to_owned(),
-        names: names.iter().map(ToString::to_string).collect(),
+    .filter_map(|(table, env)| Some((table, env?)))
+    .filter(|(_, env)| !env.is_empty())
+    .map(|(table, env)| {
+        let names = |required: bool| {
+            env.iter()
+                .filter(|decl| decl.required == required)
+                .map(|decl| decl.name.to_string())
+                .collect()
+        };
+        Capability::HostEnv {
+            table: table.to_owned(),
+            names: names(true),
+            optional: names(false),
+        }
     })
 }
 
@@ -475,10 +484,19 @@ fn render_capability(cap: &Capability) -> String {
         Capability::ExternalCommands { present: false } => {
             "external    no commands run outside the sandbox".to_string()
         }
-        Capability::HostEnv { table, names } => {
+        Capability::HostEnv {
+            table,
+            names,
+            optional,
+        } => {
+            let declared: Vec<String> = names
+                .iter()
+                .cloned()
+                .chain(optional.iter().map(|name| format!("{name} (optional)")))
+                .collect();
             format!(
                 "host-env    {table} commands receive {} besides {}",
-                names.join(", "),
+                declared.join(", "),
                 crate::host_env::BASE.join(", ")
             )
         }
@@ -748,12 +766,69 @@ mod tests {
             [Capability::HostEnv {
                 table: "[world]".into(),
                 names: vec!["KUBECONFIG".into(), "KUBE_NAMESPACE".into()],
+                optional: vec![],
             }]
         );
         assert_eq!(
             render_capability(&declared[0]),
             "host-env    [world] commands receive KUBECONFIG, KUBE_NAMESPACE besides PATH, HOME, \
              LANG, TMPDIR"
+        );
+        assert_eq!(
+            serde_json::to_value(&declared[0]).unwrap(),
+            serde_json::json!({
+                "kind": "host-env",
+                "table": "[world]",
+                "names": ["KUBECONFIG", "KUBE_NAMESPACE"],
+            })
+        );
+    }
+
+    /// A variable passed only when the engine has it is still reach the commands may hold, so
+    /// it is disclosed beside the required ones and marked optional.
+    #[test]
+    fn optional_host_variables_are_disclosed_and_marked_optional() {
+        let m = manifest(&format!(
+            "{OPENSHELL}\nenv = [\"KUBECONFIG\", \"EPP_ENDPOINT?\"]\n[workflow]\ntype = \
+             \"playbook\"\nfile = \"graph.star\"\nenv = [\"GPUS?\"]\n"
+        ));
+        let declared: Vec<Capability> = capabilities(&m)
+            .into_iter()
+            .filter(|c| matches!(c, Capability::HostEnv { .. }))
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                Capability::HostEnv {
+                    table: "[judge]".into(),
+                    names: vec!["KUBECONFIG".into()],
+                    optional: vec!["EPP_ENDPOINT".into()],
+                },
+                Capability::HostEnv {
+                    table: "[workflow]".into(),
+                    names: vec![],
+                    optional: vec!["GPUS".into()],
+                },
+            ]
+        );
+        assert_eq!(
+            render_capability(&declared[0]),
+            "host-env    [judge] commands receive KUBECONFIG, EPP_ENDPOINT (optional) besides \
+             PATH, HOME, LANG, TMPDIR"
+        );
+        assert_eq!(
+            render_capability(&declared[1]),
+            "host-env    [workflow] commands receive GPUS (optional) besides PATH, HOME, LANG, \
+             TMPDIR"
+        );
+        assert_eq!(
+            serde_json::to_value(&declared[0]).unwrap(),
+            serde_json::json!({
+                "kind": "host-env",
+                "table": "[judge]",
+                "names": ["KUBECONFIG"],
+                "optional": ["EPP_ENDPOINT"],
+            })
         );
     }
 

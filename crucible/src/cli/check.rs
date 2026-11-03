@@ -559,7 +559,7 @@ fn check_referenced_files(m: &Manifest, manifest_dir: &Path, out: &mut CheckOutc
 /// collapsing into one opaque `valid: false`.
 fn check_measure_once(
     measure_cmd: &str,
-    declared: &[crucible::host_env::EnvName],
+    declared: &crucible::host_env::DeclaredEnv,
     workspace: &Path,
     out: &mut CheckOutcome,
 ) {
@@ -778,8 +778,14 @@ mod tests {
     /// A minimal counter-shaped domain: repo path=".", explicit setup_cmd copying just the
     /// measure script in, so the workspace never needs a real git remote.
     fn scaffold_domain(dir: &Path, measure_body: &str) {
+        scaffold_domain_declaring(dir, measure_body, "[]");
+    }
+
+    /// [`scaffold_domain`] with `[judge].env = <env>`.
+    fn scaffold_domain_declaring(dir: &Path, measure_body: &str, env: &str) {
         write_exec(&dir.join("measure.sh"), measure_body);
-        let manifest = r#"
+        let manifest = format!(
+            r#"
             [repo]
             path = "."
             [workspace]
@@ -793,7 +799,9 @@ mod tests {
             measure_cmd = "./measure.sh"
             direction = "higher"
             objective = "score"
-            "#;
+            env = {env}
+            "#
+        );
         fs::write(dir.join(MANIFEST), manifest).expect("write manifest");
     }
 
@@ -998,6 +1006,37 @@ mod tests {
             "{:?}",
             outcome.findings
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The probe runs `measure_cmd` under the run's environment: an optional variable the
+    /// engine lacks is left out and the probe passes, a required one refuses it by name.
+    #[test]
+    fn check_passes_without_an_optional_variable_and_refuses_without_a_required_one() {
+        let measure = "#!/bin/sh\ntest -z \"${CRUCIBLE_TEST_NEVER_SET+set}\" || exit 1\necho '{\"valid\": true, \"score\": 1.0}'\n";
+        let dir = tempdir("optional-env");
+        scaffold_domain_declaring(&dir, measure, "[\"CRUCIBLE_TEST_NEVER_SET?\"]");
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        assert!(outcome.ok(), "findings: {:?}", outcome.findings);
+        let disclosed = "  host-env    [judge] commands receive CRUCIBLE_TEST_NEVER_SET (optional) \
+                         besides PATH, HOME, LANG, TMPDIR";
+        assert!(
+            outcome.exposure.iter().any(|l| l == disclosed),
+            "{:?}",
+            outcome.exposure
+        );
+        let _ = fs::remove_dir_all(&dir);
+
+        let dir = tempdir("required-env");
+        scaffold_domain_declaring(
+            &dir,
+            measure,
+            "[\"CRUCIBLE_TEST_NEVER_SET?\", \"CRUCIBLE_TEST_ALSO_NEVER_SET\"]",
+        );
+        let outcome = run(&dir.join(MANIFEST), None).expect("check runs");
+        let missing = "[judge].env declares CRUCIBLE_TEST_ALSO_NEVER_SET, which the engine's \
+                       environment does not set";
+        assert_eq!(outcome.findings, [missing]);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -303,7 +303,7 @@ fn call<'v>(
                         file: None,
                         resolved_from: None,
                         params: BTreeMap::new(),
-                        env: Vec::new(),
+                        env: crate::host_env::DeclaredEnv::default(),
                         history_record: None,
                     };
                     workflow.validate()?;

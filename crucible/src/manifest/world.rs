@@ -11,5 +11,5 @@ pub struct WorldCfg {
     pub restore_cmd: Option<String>,
     /// Variables of the engine's environment these commands receive besides the base.
     #[serde(default)]
-    pub env: Vec<crate::host_env::EnvName>,
+    pub env: crate::host_env::DeclaredEnv,
 }

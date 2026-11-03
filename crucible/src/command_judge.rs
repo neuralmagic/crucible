@@ -209,8 +209,8 @@ mod tests {
             std::env::set_var("CRUCIBLE_TEST_UNDECLARED", "leaked");
             std::env::set_var("CRUCIBLE_TEST_DECLARED", "passed");
         }
-        let declared =
-            [crate::host_env::EnvName::try_from("CRUCIBLE_TEST_DECLARED".to_owned()).unwrap()];
+        let declared: crate::host_env::DeclaredEnv =
+            serde_json::from_value(serde_json::json!(["CRUCIBLE_TEST_DECLARED"])).unwrap();
         let judge = CommandJudge {
             workspace: std::env::temp_dir(),
             measure_cmd: r#"test -z "$CRUCIBLE_TEST_UNDECLARED" && test "$CRUCIBLE_TEST_DECLARED" = passed && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
@@ -229,6 +229,41 @@ mod tests {
         let reading = reading.unwrap();
         assert!(reading.valid, "{}", reading.note);
         assert_eq!(reading.score, Some(3.0));
+    }
+
+    /// An optional variable reaches `measure_cmd` when the engine has it; one the engine lacks
+    /// is absent rather than empty, and the measure still runs.
+    #[test]
+    fn measure_sees_an_optional_variable_the_engine_has_and_runs_without_one_it_lacks() {
+        let _guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("CRUCIBLE_TEST_OPTIONAL_SET", "passed");
+            std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_UNSET");
+        }
+        let declared: crate::host_env::DeclaredEnv = serde_json::from_value(serde_json::json!([
+            "CRUCIBLE_TEST_OPTIONAL_SET?",
+            "CRUCIBLE_TEST_OPTIONAL_UNSET?"
+        ]))
+        .unwrap();
+        let env = crate::host_env::HostEnv::resolve("[judge]", &declared);
+        unsafe {
+            std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_SET");
+        }
+        let judge = CommandJudge {
+            workspace: std::env::temp_dir(),
+            measure_cmd: r#"test "$CRUCIBLE_TEST_OPTIONAL_SET" = passed && test -z "${CRUCIBLE_TEST_OPTIONAL_UNSET+set}" && echo '{"valid": true, "score": 1}'"#.into(),
+            env: env.unwrap(),
+            ..judge(Direction::Higher)
+        };
+        let reading = judge
+            .measure(&MeasureCtx {
+                baseline_score: None,
+                baseline_total: None,
+                best_score: None,
+            })
+            .unwrap();
+        assert!(reading.valid, "{}", reading.note);
+        assert_eq!(reading.score, Some(1.0));
     }
 
     #[test]

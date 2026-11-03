@@ -95,7 +95,7 @@ pub(crate) fn iteration_template(
         file: None,
         resolved_from: None,
         params: std::collections::BTreeMap::new(),
-        env: Vec::new(),
+        env: Default::default(),
         history_record: None,
     };
     workflow

@@ -269,8 +269,11 @@ pub struct WorkflowCfg {
     pub params: BTreeMap<String, ParamValue>,
     /// Variables of the engine's environment `command` and `evaluate` tasks receive besides the
     /// base. Manifest-only: a compiled source carries the manifest's across.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub env: Vec<crate::host_env::EnvName>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::host_env::DeclaredEnv::is_empty"
+    )]
+    pub env: crate::host_env::DeclaredEnv,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }

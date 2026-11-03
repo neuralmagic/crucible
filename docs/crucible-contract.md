@@ -81,6 +81,7 @@ measure_cmd = "./measure.sh"                  # REQUIRED. §3. Any executable, a
 direction   = "lower"                         # lower | higher. REQUIRED.
 tiebreak_direction = "lower"                  # optional; direction of the `tiebreak` scalar (§4). default: direction
 objective   = "score"                         # display label (the old `gate` name). default "score"
+env         = ["KUBECONFIG", "EPP_ENDPOINT?"] # engine env measure_cmd receives (§3); NAME? only when set
 
 [judge.selftest]                              # optional (ADR-0012). Runs in `crucible check`, never in a loop iteration.
 good_cmd = "..."                              # stages a known-good config in the workspace
@@ -92,6 +93,7 @@ runs     = 1                                  # measurements averaged per contro
 apply_cmd    = "..."                          # optional. §3.
 snapshot_cmd = "..."                          # optional. §3.
 restore_cmd  = "..."                          # optional. §3.
+env          = ["KUBECONFIG"]                 # engine env the three commands receive (§3); NAME? only when set
 
 [search]                                      # optional (ADR-0010). Absent or wide=0 → pure-deep, the default.
 wide       = 0                                # u32. N parallel propose turns before the deep loop. default 0
@@ -532,7 +534,11 @@ Every command (`measure_cmd`, `apply_cmd`, `snapshot_cmd`, `restore_cmd`, `setup
 - **cwd** = the agent workspace (`manifest_dir/[workspace].dir`).
 - **PATH inherited**, so a command may be a bare installed tool (`bench`) or a workspace-relative
   script (`./measure.sh`).
-- **env** = the engine's env + `[agent].env` (where relevant) + the injected variables below.
+- **env** = `PATH`, `HOME`, `LANG`, `TMPDIR`, the injected variables below, and what the
+  command's table declares in `env`: `[judge].env` for `measure_cmd`, `[world].env` for
+  `apply_cmd`, `snapshot_cmd`, and `restore_cmd`. A declared `NAME` the engine's environment
+  does not set refuses the run; a declared `NAME?` is passed when set and left out when not.
+  `setup_cmd` gets the engine's env.
 
 ### `measure_cmd` (the Judge): REQUIRED
 - **Injected env:** `CRUCIBLE_BASELINE_SCORE`, `CRUCIBLE_BASELINE_TOTAL`, `CRUCIBLE_BEST_SCORE`

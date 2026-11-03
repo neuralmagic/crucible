@@ -112,8 +112,9 @@ The output of a task is JSON. It becomes the input of the task's dependents.
   same JSON is also in `CRUCIBLE_INPUTS` if it is 64 KiB or smaller. If it is larger, the
   variable is not set, because Linux rejects an environment string larger than 128 KiB. Read
   the file. Besides these, the command gets only `PATH`, `HOME`, `LANG`, `TMPDIR`, and the
-  variables `[workflow].env` names in the manifest (`env = ["GH_TOKEN"]`); a named variable the
-  engine does not have refuses the run.
+  variables `[workflow].env` names in the manifest (`env = ["GH_TOKEN", "GPUS?"]`). A named
+  variable the engine does not have refuses the run, unless its name ends in `?`: an optional
+  variable is passed when the engine has it and left out when it does not.
 - `agent` with `--manifest`: the turn writes one JSON object to `PLAN_TASK_RESULT.json` in the
   workspace root. If the file is missing after a normal turn, this is a measured failure. An
   explicit spawn, harness, or stream error is a transport failure and follows the retry policy.

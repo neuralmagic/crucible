@@ -31,7 +31,7 @@ pub struct JudgeCfg {
     pub skip_baseline: bool,
     /// Variables of the engine's environment `measure_cmd` receives besides the base.
     #[serde(default)]
-    pub env: Vec<crate::host_env::EnvName>,
+    pub env: crate::host_env::DeclaredEnv,
 }
 
 fn default_objective() -> String {

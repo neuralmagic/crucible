@@ -765,7 +765,7 @@ fn constructor(
             file: None,
             resolved_from: None,
             params: BTreeMap::new(),
-            env: Vec::new(),
+            env: crate::host_env::DeclaredEnv::default(),
             history_record,
         };
         workflow.validate()?;
@@ -1255,7 +1255,7 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         file: None,
         resolved_from: None,
         params: BTreeMap::new(),
-        env: Vec::new(),
+        env: crate::host_env::DeclaredEnv::default(),
         history_record: None,
     };
     workflow.validate()?;

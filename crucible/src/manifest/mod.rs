@@ -1751,6 +1751,74 @@ mod tests {
         );
     }
 
+    /// `NAME?` declares a variable the commands get only when the engine has it, so an unset
+    /// one builds the judge and the world; a required name beside it still refuses, alone.
+    #[test]
+    fn an_unset_optional_host_variable_does_not_refuse_and_a_required_one_still_does() {
+        let judged = |env: &str| {
+            format!(
+                "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = {env}\n[world]\nrestore_cmd = \"r\"\nsnapshot_cmd = \"s\"\nenv = {env}\n"
+            )
+        };
+        let workspace = std::env::temp_dir();
+        let m: Manifest =
+            toml::from_str(&judged("[\"CRUCIBLE_TEST_NEVER_SET?\"]")).expect("parses");
+        m.build_judge(workspace.clone(), Vec::new())
+            .expect("an unset optional variable does not refuse the judge");
+        m.build_world(workspace.clone())
+            .expect("an unset optional variable does not refuse the world");
+
+        let m: Manifest = toml::from_str(&judged(
+            "[\"CRUCIBLE_TEST_NEVER_SET?\", \"CRUCIBLE_TEST_ALSO_NEVER_SET\"]",
+        ))
+        .expect("parses");
+        let error = m
+            .build_judge(workspace.clone(), Vec::new())
+            .err()
+            .expect("a judge built without its required variable")
+            .to_string();
+        assert_eq!(
+            error,
+            "[judge].env declares CRUCIBLE_TEST_ALSO_NEVER_SET, which the engine's environment \
+             does not set"
+        );
+        let error = m
+            .build_world(workspace)
+            .err()
+            .expect("a world built without its required variable")
+            .to_string();
+        assert_eq!(
+            error,
+            "[world].env declares CRUCIBLE_TEST_ALSO_NEVER_SET, which the engine's environment \
+             does not set"
+        );
+    }
+
+    /// A malformed `env` entry fails the manifest's parse, naming the entry.
+    #[test]
+    fn a_malformed_optional_host_variable_fails_the_parse_naming_the_entry() {
+        let judged = |env: &str| {
+            format!(
+                "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \"g\"\n[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = {env}\n"
+            )
+        };
+        for (env, expected) in [
+            ("[\"?\"]", "\"?\" marks no variable optional"),
+            ("[\"A??\"]", "\"A??\" ends in more than one \"?\""),
+            ("[\"A?B\"]", "\"A?B\" has a \"?\" inside the name"),
+            (
+                "[\"GPUS\", \"GPUS?\"]",
+                "env lists both \"GPUS\" and \"GPUS?\"",
+            ),
+        ] {
+            let error = toml::from_str::<Manifest>(&judged(env))
+                .err()
+                .unwrap_or_else(|| panic!("{env} parsed"))
+                .to_string();
+            assert!(error.contains(expected), "{env}: {error}");
+        }
+    }
+
     /// A manifest may name its source instead of carrying its output. The graph is compiled
     /// on resolve and validated then, so an unresolved manifest is valid and an unreadable
     /// source fails where it is read rather than where it is used.
@@ -1765,7 +1833,7 @@ mod tests {
         )
         .unwrap();
 
-        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\nenv = [\"GH_TOKEN\"]";
+        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\nenv = [\"GH_TOKEN\", \"GPUS?\"]";
         let mut m: Manifest = toml::from_str(&task_manifest(table)).expect("parses");
         m.validate().expect("an unresolved manifest is valid");
         assert!(
@@ -1778,8 +1846,12 @@ mod tests {
         assert_eq!(workflow.tasks.len(), 1);
         assert_eq!(workflow.tasks[0].name.0, "a");
         assert_eq!(
-            workflow.env.iter().map(|n| n.as_str()).collect::<Vec<_>>(),
-            ["GH_TOKEN"],
+            workflow
+                .env
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["GH_TOKEN", "GPUS?"],
             "the compiled graph keeps the manifest's declared variables"
         );
 

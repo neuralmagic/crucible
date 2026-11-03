@@ -82,7 +82,7 @@ reaches it: no kubeconfig, registry authfile, broker token, or provider key unle
 [judge]
 measure_cmd = "./measure.sh"
 direction = "lower"
-env = ["KUBECONFIG"]        # measure_cmd only
+env = ["KUBECONFIG", "EPP_ENDPOINT?"]        # measure_cmd only
 
 [world]
 apply_cmd = "./deploy.sh"
@@ -90,11 +90,15 @@ env = ["KUBECONFIG", "REGISTRY_AUTH_FILE"]   # apply, snapshot, and restore
 ```
 
 `[workflow].env` does the same for a workflow's `command` and `evaluate` tasks. A name is a
-letter or underscore followed by letters, digits, and underscores. A declared variable that the
+letter or underscore followed by letters, digits, and underscores. A required variable that the
 engine's environment does not set refuses the run before any of these commands runs, naming
-every missing one; `crucible check` reports it as a finding. `crucible check` lists each
-table's declared variables in the capability disclosure as `host-env`. `setup` runs with the
-engine's environment.
+every missing one; `crucible check` reports it as a finding. A name with a trailing `?` is
+optional: the command gets it when the engine's environment sets it and runs without it
+otherwise, so a script can keep a shell default (`${EPP_ENDPOINT:-127.0.0.1:8000}`) that a
+deployment overrides. Only the trailing `?` is allowed (`?` alone, `A??`, and `A?B` fail the
+parse), and a name is either required or optional, not both. `crucible check` lists each
+table's declared variables in the capability disclosure as `host-env`, the optional ones marked
+`(optional)`. `setup` runs with the engine's environment.
 
 The accept policy is the same for all domains. The engine keeps a candidate if it is `valid`
 and its `score` is better than the best score in the `direction`. The run is solved only if

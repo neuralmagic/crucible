@@ -611,8 +611,8 @@ mod tests {
             std::env::set_var("CRUCIBLE_TEST_UNDECLARED", "leaked");
             std::env::set_var("CRUCIBLE_TEST_DECLARED", "passed");
         }
-        let declared =
-            [crate::host_env::EnvName::try_from("CRUCIBLE_TEST_DECLARED".to_owned()).unwrap()];
+        let declared: crate::host_env::DeclaredEnv =
+            serde_json::from_value(serde_json::json!(["CRUCIBLE_TEST_DECLARED"])).unwrap();
         let env = crate::host_env::HostEnv::resolve("[workflow]", &declared).unwrap();
         let plan = Plan {
             version: 1,
@@ -644,6 +644,53 @@ mod tests {
         assert_eq!(probe["declared"], "passed", "{probe}");
         assert_eq!(probe["task"], "probe", "{probe}");
         assert_ne!(probe["path"], "", "{probe}");
+    }
+
+    /// `[workflow].env = ["NAME?"]` passes a variable the engine has to a command task, and one
+    /// it lacks is absent, not empty, while the task still runs.
+    #[test]
+    fn a_command_task_sees_an_optional_variable_the_engine_has_and_runs_without_one_it_lacks() {
+        let _guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("CRUCIBLE_TEST_OPTIONAL_SET", "passed");
+            std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_UNSET");
+        }
+        let declared: crate::host_env::DeclaredEnv = serde_json::from_value(serde_json::json!([
+            "CRUCIBLE_TEST_OPTIONAL_SET?",
+            "CRUCIBLE_TEST_OPTIONAL_UNSET?"
+        ]))
+        .unwrap();
+        let env = crate::host_env::HostEnv::resolve("[workflow]", &declared);
+        unsafe {
+            std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_SET");
+        }
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
+            tasks: vec![command(
+                "probe",
+                r#"printf '{"set":"%s","unset":"%s"}\n' "$CRUCIBLE_TEST_OPTIONAL_SET" "${CRUCIBLE_TEST_OPTIONAL_UNSET-absent}""#,
+                &[],
+            )],
+        }
+        .validate()
+        .unwrap();
+        let mut r = ShellRunner {
+            env: env.unwrap(),
+            ..runner()
+        };
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let probe = out.results[&"probe".into()].output.clone().unwrap();
+        assert_eq!(probe["set"], "passed", "{probe}");
+        assert_eq!(probe["unset"], "absent", "{probe}");
     }
 
     #[test]
