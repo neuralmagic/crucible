@@ -3,7 +3,6 @@ use crate::client::Db;
 use crate::config::ControllerCfg;
 use crate::runs::workpod::*;
 use anyhow::{Context, Result};
-#[cfg(feature = "autoresearch")]
 use std::time::Duration;
 
 /// The retained-terminal pod names past the count cap: rows sorted newest-terminal first, everything
