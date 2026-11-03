@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-USE"
+title = "Using a blueprint"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Using a blueprint MUST create a new draft, and MUST require `read` on the blueprint and `create` of a draft for the chosen owner under [[RFC-0003:C-OWNERSHIP]]. The request MUST name the new draft's id and MAY name the blueprint revision it expects; a request whose expected revision is not the current one MUST be refused. The draft MUST be seeded from the blueprint's current revision and MUST record the blueprint id and revision as its origin. The response MUST list each binding carried and each placeholder created, with the placeholder's reason. A refused use MUST leave no draft and no binding."""

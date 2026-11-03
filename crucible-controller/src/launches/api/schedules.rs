@@ -358,6 +358,8 @@ async fn authorize_schedule(
         created_by: draft.created_by,
         created_at: draft.created_at,
         updated_at: draft.updated_at,
+        blueprint: false,
+        public: false,
         variant: None,
     };
     Ok((

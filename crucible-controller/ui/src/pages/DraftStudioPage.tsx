@@ -43,6 +43,7 @@ import { readSandboxImage, setSandboxImage } from './imagePicker';
 import { ProviderModelField } from './ProviderModelField';
 import { NO_AGENT_PICK, type AgentPick } from './agentPick';
 import { WorkflowGraph } from './WorkflowGraph';
+import { projectionLabel, reasonLabel } from './blueprints';
 import {
   clampCeiling,
   initialValues,
@@ -89,6 +90,7 @@ const DEFAULT_MAX_COST = 5;
 const DEFAULT_MAX_TIME = '30m';
 const MANIFEST = 'crucible.toml';
 const NO_ERRORS: ReadonlyMap<string, string> = new Map();
+const NO_PLACEHOLDERS: readonly components['schemas']['PlaceholderDto'][] = [];
 
 /// The studio: the pack's text on the left, what the pinned engine makes of it on the right. One
 /// save answers with all three — the diagnostics anchored to their lines, the launch form the
@@ -105,6 +107,7 @@ function DraftStudio({ id }: { id: string }) {
   const queryClient = useQueryClient();
   const wide = useMediaQuery(WIDE);
   const draft = $api.useQuery('get', '/api/playbook-drafts/{id}', { params: { path: { id } } });
+  const placeholders = draft.data?.placeholders ?? NO_PLACEHOLDERS;
   const files = $api.useQuery('get', '/api/playbook-drafts/{id}/files', {
     params: { path: { id } },
   });
@@ -549,6 +552,32 @@ function DraftStudio({ id }: { id: string }) {
                 too; copying across is the rebase.
               </Note>
             </div>
+          </SectionBody>
+        </Section>
+      )}
+
+      {placeholders.length === 0 ? null : (
+        <Section>
+          <SectionHeader
+            title="Placeholders"
+            actions={
+              <Button className="uppercase" render={<Link to="/secrets" />}>
+                Bind
+              </Button>
+            }
+          />
+          <SectionBody>
+            <ul className="m-0 grid list-none gap-1 p-0" data-testid="draft-placeholders">
+              {placeholders.map((placeholder) => (
+                <li key={placeholder.declared_name} className="flex flex-wrap gap-x-3">
+                  <Mono size="data">{placeholder.declared_name}</Mono>
+                  <Mono size="data" tone="ink-3">
+                    {projectionLabel(placeholder)}
+                  </Mono>
+                  <span className="text-ink-2">{reasonLabel(placeholder.reason)}</span>
+                </li>
+              ))}
+            </ul>
           </SectionBody>
         </Section>
       )}

@@ -185,6 +185,20 @@ clone copies only the bindings you could make yourself and lists the rest; a ref
 needs your Vault token, which `crux` never sends, so bind those from the UI.
 `skills/draft-a-playbook/SKILL.md` is the full authoring workflow.
 
+### Blueprints: `blueprints` / `blueprint-use` / `blueprint-mark` / `blueprint-unmark` / `blueprint-public` / `blueprint-private`
+
+```
+$ crux blueprints                                # what each would carry for you, and leave to bind
+$ crux blueprint-use mlr-pack my-sweep           # a draft at version 1, plus its placeholders
+$ crux blueprint-mark mlr-pack                   # offer a registered playbook as a blueprint
+$ crux blueprint-public mlr-pack                 # every user may read and use it
+```
+
+A use carries the bindings of secrets the blueprint's owning team owns, when you are in that team.
+Every other declared secret is a placeholder naming why it did not carry; fill it with
+`secret-bind --playbook <draft>`. A reference-mode secret needs your Vault token, which `crux`
+never sends, so it stays a placeholder.
+
 ### `providers`
 
 ```

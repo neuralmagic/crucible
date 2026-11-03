@@ -719,6 +719,54 @@ pub struct LeftBinding {
     pub reason: String,
 }
 
+/// One `GET /api/blueprints` entry, with how each secret it declares would reach the caller.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Blueprint {
+    pub id: String,
+    #[serde(default)]
+    pub description: String,
+    pub owner: String,
+    pub rev: String,
+    #[serde(default)]
+    pub public: bool,
+    #[serde(default)]
+    pub secrets: Vec<BlueprintSecret>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlueprintSecret {
+    pub declared_name: String,
+    pub carries: bool,
+}
+
+/// What marking, unmarking or publishing a blueprint left it as.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlueprintState {
+    pub id: String,
+    pub blueprint: bool,
+    pub public: bool,
+}
+
+/// `POST /api/blueprints/{id}/use`: the new draft, what it carried, and what it still has to bind.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlueprintUsed {
+    pub id: String,
+    pub version: i64,
+    pub bindings: Vec<SecretBinding>,
+    pub placeholders: Vec<Placeholder>,
+}
+
+/// A declared secret a draft started from a blueprint has to bind, and why it did not carry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Placeholder {
+    pub declared_name: String,
+    #[serde(default)]
+    pub projection_kind: Option<String>,
+    #[serde(default)]
+    pub projection: Option<String>,
+    pub reason: String,
+}
+
 /// `POST /api/playbook-drafts/{id}/graduate`: the export PR the draft was pushed to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraduateAck {
