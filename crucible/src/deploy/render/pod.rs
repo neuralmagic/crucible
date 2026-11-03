@@ -3,7 +3,6 @@
 //! init containers, and volumes.
 
 use crate::deploy::profile::DeployProfile;
-use crate::deploy::render::kube::node_avoid_affinity;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
@@ -124,4 +123,31 @@ pub(in crate::deploy) fn downward(name: &str, field_path: &str) -> core::EnvVar 
             ..Default::default()
         }),
     }
+}
+
+/// The profile's node avoid-list as a required nodeAffinity `NotIn` on `kubernetes.io/hostname`
+/// (nodes the operator marked bad, e.g. broken CNI). `None` when the list is empty, so a profile
+/// without one renders byte-identically to before. Shared by every pod the profile renders: the
+/// loop pod, the turn pods, and the controller Deployment's template.
+fn node_avoid_affinity(profile: &DeployProfile) -> Option<core::Affinity> {
+    let avoid = &profile.cluster.avoid_nodes;
+    if avoid.is_empty() {
+        return None;
+    }
+    Some(core::Affinity {
+        node_affinity: Some(core::NodeAffinity {
+            required_during_scheduling_ignored_during_execution: Some(core::NodeSelector {
+                node_selector_terms: vec![core::NodeSelectorTerm {
+                    match_expressions: Some(vec![core::NodeSelectorRequirement {
+                        key: "kubernetes.io/hostname".to_string(),
+                        operator: "NotIn".to_string(),
+                        values: Some(avoid.clone()),
+                    }]),
+                    ..Default::default()
+                }],
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }

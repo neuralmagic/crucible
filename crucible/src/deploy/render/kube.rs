@@ -2158,33 +2158,6 @@ fn driver_env(profile: &DeployProfile, sandbox_image: Option<&str>) -> Result<Sa
     })
 }
 
-/// The profile's node avoid-list as a required nodeAffinity `NotIn` on `kubernetes.io/hostname`
-/// (nodes the operator marked bad, e.g. broken CNI). `None` when the list is empty, so a profile
-/// without one renders byte-identically to before. Shared by every pod the profile renders: the
-/// loop pod, the turn pods, and the controller Deployment's template.
-pub(in crate::deploy) fn node_avoid_affinity(profile: &DeployProfile) -> Option<core::Affinity> {
-    let avoid = &profile.cluster.avoid_nodes;
-    if avoid.is_empty() {
-        return None;
-    }
-    Some(core::Affinity {
-        node_affinity: Some(core::NodeAffinity {
-            required_during_scheduling_ignored_during_execution: Some(core::NodeSelector {
-                node_selector_terms: vec![core::NodeSelectorTerm {
-                    match_expressions: Some(vec![core::NodeSelectorRequirement {
-                        key: "kubernetes.io/hostname".to_string(),
-                        operator: "NotIn".to_string(),
-                        values: Some(avoid.clone()),
-                    }]),
-                    ..Default::default()
-                }],
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    })
-}
-
 /// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
 /// the string the wrapper emits is by construction the one the in-pod CLI parses back.
 fn harness_flag(harness: Option<crate::manifest::Harness>, sep: char) -> String {
