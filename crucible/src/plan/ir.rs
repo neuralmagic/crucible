@@ -73,28 +73,98 @@ impl TaskName {
     /// under `state/files/<name>` and are staged under `inputs/<name>`, and free of the brackets
     /// a mapped node's instance names are made of.
     pub fn declared(raw: &str) -> Result<TaskName, TaskNameError> {
-        if raw.trim().is_empty() {
-            return Err(TaskNameError::Empty);
-        }
-        if raw.contains(['[', ']']) {
-            return Err(TaskNameError::Bracket {
-                name: raw.to_owned(),
-            });
-        }
-        if matches!(raw, "." | "..") {
-            return Err(TaskNameError::DotComponent {
-                name: raw.to_owned(),
-            });
-        }
-        if let Some(separator) = raw.chars().find(|c| matches!(c, '/' | '\\')) {
-            return Err(TaskNameError::Separator {
-                name: raw.to_owned(),
-                separator,
-                suggest: raw.replace(['/', '\\'], "-"),
-            });
-        }
+        path_component(raw)?;
         Ok(TaskName(raw.to_owned()))
     }
+
+    /// One item of the mapped node `node`, named `node[key]`. The key is the item, never its
+    /// position: a list that comes back reordered or shorter still names the same work the same
+    /// way, which is what makes a folded result on resume safe to match.
+    pub fn instance(node: &TaskName, key: &ItemKey) -> TaskName {
+        TaskName(format!("{}[{}]", node.0, key.0))
+    }
+
+    /// One round of a revise loop, `task[round-N]`. It shares the instance naming, so a reader
+    /// groups rounds under their task the way it groups a fan-out's items.
+    pub fn round(task: &TaskName, round: u32) -> TaskName {
+        TaskName(format!("{}[round-{round}]", task.0))
+    }
+
+    /// One of the executor's reserved input keys ([`RESERVED_INPUTS`], [`FILES_INPUT`]), which
+    /// no declared task may be named after.
+    pub fn reserved(key: &'static str) -> TaskName {
+        TaskName(key.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The node and bracketed key this name is an instance or round of; `None` for a declared
+    /// name. A declared name may not contain a bracket, so the split is exact.
+    pub fn instance_of(&self) -> Option<(&str, &str)> {
+        let (node, rest) = self.0.split_once('[')?;
+        Some((node, rest.strip_suffix(']')?))
+    }
+
+    pub fn is_instance_of(&self, node: &TaskName) -> bool {
+        self.instance_of().is_some_and(|(n, _)| n == node.0)
+    }
+
+    /// The node a settled row belongs to: a mapped instance `x[key]` and a revise round
+    /// `x[round-N]` both belong to `x`; a declared name belongs to itself.
+    pub fn node(&self) -> TaskName {
+        match self.instance_of() {
+            Some((node, _)) => TaskName(node.to_owned()),
+            None => self.clone(),
+        }
+    }
+}
+
+/// One item of a mapped node's list, as the key its instance is named with. Checked as a path
+/// component like a declared name: the instance's files live under `state/files/node[key]`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ItemKey(String);
+
+impl ItemKey {
+    pub fn new(raw: &str) -> Result<ItemKey, TaskNameError> {
+        path_component(raw)?;
+        Ok(ItemKey(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ItemKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+fn path_component(raw: &str) -> Result<(), TaskNameError> {
+    if raw.trim().is_empty() {
+        return Err(TaskNameError::Empty);
+    }
+    if raw.contains(['[', ']']) {
+        return Err(TaskNameError::Bracket {
+            name: raw.to_owned(),
+        });
+    }
+    if matches!(raw, "." | "..") {
+        return Err(TaskNameError::DotComponent {
+            name: raw.to_owned(),
+        });
+    }
+    if let Some(separator) = raw.chars().find(|c| matches!(c, '/' | '\\')) {
+        return Err(TaskNameError::Separator {
+            name: raw.to_owned(),
+            separator,
+            suggest: raw.replace(['/', '\\'], "-"),
+        });
+    }
+    Ok(())
 }
 
 /// Why [`TaskName::declared`] refused a name.

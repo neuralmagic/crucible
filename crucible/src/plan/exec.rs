@@ -23,7 +23,7 @@ use crate::diagram::IllegalTransition;
 use crate::plan::admission::{Admission, Refusal};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
-    COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
+    COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, ItemKey, Join, OUTCOME_INPUT,
     PARAMS_INPUT, REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName,
     ValidPlan, aligned,
 };
@@ -330,11 +330,11 @@ impl Prior {
         let parents: BTreeSet<&str> = self
             .results
             .keys()
-            .filter_map(|name| name.0.split_once('[').map(|(node, _)| node))
+            .filter_map(|name| name.instance_of().map(|(node, _)| node))
             .collect();
         self.results
             .iter()
-            .filter(|(name, _)| name.0.contains('[') || !parents.contains(name.0.as_str()))
+            .filter(|(name, _)| name.instance_of().is_some() || !parents.contains(name.as_str()))
             .filter(|(name, _)| !self.reused.contains_key(*name))
             .map(|(_, r)| r.cost_usd)
             .sum::<f64>()
@@ -383,7 +383,7 @@ impl ExecCfg<'_> {
             Some(history) => history.input(depth),
             None => crate::plan::history::empty_input(),
         };
-        inputs.insert(TaskName(HISTORY_INPUT.to_string()), history);
+        inputs.insert(TaskName::reserved(HISTORY_INPUT), history);
     }
 }
 
@@ -814,7 +814,7 @@ pub fn execute(
                 // run did.
                 let partial = fanout_items(t, &results).ok().filter(|keys| {
                     keys.iter()
-                        .any(|key| results.contains_key(&instance_name(&t.name, key)))
+                        .any(|key| results.contains_key(&TaskName::instance(&t.name, key)))
                 });
                 if let Some(keys) = partial {
                     machines
@@ -1049,7 +1049,7 @@ pub fn execute(
             cfg.add_history(t, &mut inputs);
             if t.stage == Stage::Epilogue {
                 inputs.insert(
-                    TaskName(OUTCOME_INPUT.to_string()),
+                    TaskName::reserved(OUTCOME_INPUT),
                     main_graph_outcome(
                         plan,
                         &results,
@@ -1139,8 +1139,8 @@ pub fn execute(
                                 .copied()
                                 .filter(|p| {
                                     aligned_deps.iter().all(|d| {
-                                        !is_instance_of(d, &p.name)
-                                            || p.name == instance_name(d, key)
+                                        !p.name.is_instance_of(d)
+                                            || p.name == TaskName::instance(d, key)
                                     })
                                 })
                                 .collect();
@@ -1224,7 +1224,7 @@ pub fn execute(
                                             staged,
                                             &*runner,
                                         ) {
-                                            inputs.insert(TaskName(FILES_INPUT.to_string()), files);
+                                            inputs.insert(TaskName::reserved(FILES_INPUT), files);
                                             unparsed.insert(instance.name.clone(), bad);
                                         }
                                         prepared.insert(instance.name.clone(), inputs);
@@ -1265,7 +1265,7 @@ pub fn execute(
                     };
                     // Each instance settles in its own right, so a reader sees one row per item
                     // rather than one row standing for all of them.
-                    let mut settled: Vec<(String, TaskResult)> = Vec::new();
+                    let mut settled: Vec<(ItemKey, TaskResult)> = Vec::new();
                     if node.isolation.is_some() {
                         let batch: Vec<BatchItem<'_>> = instances
                             .iter()
@@ -1413,7 +1413,7 @@ pub fn execute(
                 .unwrap_or_default();
             let unparsed = match route_files(t, None, &BTreeSet::new(), staged, &*runner) {
                 Some((files, unparsed)) => {
-                    inputs.insert(TaskName(FILES_INPUT.to_string()), files);
+                    inputs.insert(TaskName::reserved(FILES_INPUT), files);
                     unparsed
                 }
                 None => Vec::new(),
@@ -1536,7 +1536,7 @@ pub fn execute(
                     settled_now.extend(
                         results
                             .keys()
-                            .filter(|n| is_instance_of(&t.name, n))
+                            .filter(|n| n.is_instance_of(&t.name))
                             .map(|n| (*t, n)),
                     );
                 }
@@ -1744,30 +1744,6 @@ fn settle(
     Ok(())
 }
 
-/// One instance's name, `node[key]`. The key is the item, never its position: a list that comes
-/// back reordered or shorter still names the same work the same way, which is what makes a
-/// folded result on resume safe to match. Airflow's mapped tasks key on the index, and clearing
-/// one after its input shifted reprocesses the wrong item.
-fn instance_name(node: &TaskName, key: &str) -> TaskName {
-    TaskName(format!("{}[{}]", node.0, key))
-}
-
-/// The item key `name` carries when it is an instance of the mapped node `node`. Declared names
-/// may not contain a bracket ([`crate::plan::ir::TaskNameError::Bracket`]), so the match is
-/// exact.
-fn instance_key<'a>(node: &TaskName, name: &'a TaskName) -> Option<&'a str> {
-    name.0
-        .strip_prefix(&node.0)
-        .and_then(|rest| rest.strip_prefix('['))
-        .and_then(|rest| rest.strip_suffix(']'))
-}
-
-/// Whether `name` is an instance of the mapped node `node`. A declared task name may not
-/// contain a bracket, so an instance name can never be mistaken for a task of its own.
-pub fn is_instance_of(node: &TaskName, name: &TaskName) -> bool {
-    instance_key(node, name).is_some()
-}
-
 /// Which producers' declared files are staged into `t` for this dispatch.
 ///
 /// A passing ancestor contributes, as it always has. A direct dependency that settled failing
@@ -1804,7 +1780,7 @@ fn file_producers(
         if p.over.is_some() {
             for (name, r) in results
                 .iter()
-                .filter(|(name, _)| is_instance_of(&p.name, name))
+                .filter(|(name, _)| name.is_instance_of(&p.name))
             {
                 let instance = Task {
                     name: name.clone(),
@@ -1843,7 +1819,7 @@ fn inputs_for(
             .iter()
             .map(|(name, value)| (name.clone(), value.json()))
             .collect();
-        inputs.insert(TaskName(PARAMS_INPUT.to_string()), Value::Object(params));
+        inputs.insert(TaskName::reserved(PARAMS_INPUT), Value::Object(params));
     }
     inputs
 }
@@ -1902,7 +1878,7 @@ fn settled_node_entry(
         let per_instance: serde_json::Map<String, Value> = results
             .iter()
             .filter_map(|(name, r)| {
-                let key = instance_key(node, name)?;
+                let (_, key) = name.instance_of().filter(|(n, _)| *n == node.0)?;
                 let files = staged.iter().any(|p| &p.name == name);
                 Some((key.to_owned(), Value::Object(settled_entry(r, files))))
             })
@@ -1915,7 +1891,7 @@ fn settled_node_entry(
 fn node_staged(staged: &[Task], node: &TaskName) -> bool {
     staged
         .iter()
-        .any(|p| &p.name == node || is_instance_of(node, &p.name))
+        .any(|p| &p.name == node || p.name.is_instance_of(node))
 }
 
 /// One dependency's entry in a settled join's inputs. The entry carries the output rather than
@@ -1963,7 +1939,7 @@ fn main_graph_outcome(
 fn fanout_items(
     node: &Task,
     results: &BTreeMap<TaskName, TaskResult>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<ItemKey>, String> {
     let Some(reference) = node.over.as_ref() else {
         return Err("not a mapped task".to_string());
     };
@@ -1986,22 +1962,21 @@ fn fanout_items(
             list.len()
         ));
     }
-    let mut keys: Vec<String> = Vec::with_capacity(list.len());
+    let mut keys: Vec<ItemKey> = Vec::with_capacity(list.len());
     for (position, item) in list.iter().enumerate() {
         let key = item.as_str().ok_or_else(|| {
             format!("{reference}[{position}] is not a string; a mapped item is its own key")
         })?;
-        if key.is_empty() || key.contains(['[', ']']) {
+        let key = ItemKey::new(key).map_err(|why| {
+            format!("{reference}[{position}] = {key:?} cannot name an instance: {why}")
+        })?;
+        if keys.contains(&key) {
             return Err(format!(
-                "{reference}[{position}] = {key:?} cannot name an instance"
+                "{reference} repeats {:?}; two instances cannot share a key",
+                key.as_str()
             ));
         }
-        if keys.iter().any(|seen| seen == key) {
-            return Err(format!(
-                "{reference} repeats {key:?}; two instances cannot share a key"
-            ));
-        }
-        keys.push(key.to_owned());
+        keys.push(key);
     }
     Ok(keys)
 }
@@ -2145,7 +2120,7 @@ where
                             cfg.add_history(t, &mut inputs);
                             if t.stage == Stage::Epilogue {
                                 inputs.insert(
-                                    TaskName(OUTCOME_INPUT.to_string()),
+                                    TaskName::reserved(OUTCOME_INPUT),
                                     main_graph_outcome(
                                         plan,
                                         &view,
@@ -2156,7 +2131,7 @@ where
                             }
                             if let Some(verdict) = verdict.as_ref().filter(|_| is_target) {
                                 inputs.insert(
-                                    TaskName(REVISION_INPUT.to_string()),
+                                    TaskName::reserved(REVISION_INPUT),
                                     serde_json::json!({
                                         "round": round,
                                         "max_rounds": body.max_rounds,
@@ -2317,18 +2292,13 @@ fn halt_on(ledger: &mut Ledger<'_>, why: Halt) -> Result<(), IllegalTransition> 
     halt(ledger.halted, ledger.plan_machine, why)
 }
 
-/// One round of a revise loop, `task[round-N]`. It shares the instance naming, so a reader groups
-/// rounds under their task the way it groups a fan-out's items.
+/// One round of a revise loop, as the task it runs as.
 fn round_task(t: &Task, round: u32) -> Task {
     Task {
-        name: round_name(&t.name, round),
+        name: TaskName::round(&t.name, round),
         revise: None,
         ..t.clone()
     }
-}
-
-fn round_name(task: &TaskName, round: u32) -> TaskName {
-    instance_name(task, &format!("round-{round}"))
 }
 
 fn ledger_round(
@@ -2336,13 +2306,13 @@ fn ledger_round(
     t: &Task,
     round: u32,
 ) -> Option<TaskResult> {
-    results.get(&round_name(&t.name, round)).cloned()
+    results.get(&TaskName::round(&t.name, round)).cloned()
 }
 
 /// One item of a mapped node, as the task it runs as.
-fn instance_task(node: &Task, key: &str) -> Task {
+fn instance_task(node: &Task, key: &ItemKey) -> Task {
     Task {
-        name: instance_name(&node.name, key),
+        name: TaskName::instance(&node.name, key),
         emits_files: node.emits_files.clone(),
         over: None,
         max_fanout: None,
@@ -2358,8 +2328,8 @@ pub fn row_task(plan: &ValidPlan, name: &TaskName) -> Option<Task> {
     if let Some(task) = plan.get(name) {
         return Some(task.clone());
     }
-    let (node, key) = name.0.strip_suffix(']')?.split_once('[')?;
-    let node = plan.get(&TaskName(node.to_string()))?;
+    let (_, key) = name.instance_of()?;
+    let node = plan.get(&name.node())?;
     let round = key
         .strip_prefix("round-")
         .and_then(|round| round.parse::<u32>().ok())
@@ -2371,7 +2341,7 @@ pub fn row_task(plan: &ValidPlan, name: &TaskName) -> Option<Task> {
         .map(|l| l.max_rounds);
     match (round, in_loop, &node.over) {
         (Some(round), Some(max_rounds), _) if round <= max_rounds => Some(round_task(node, round)),
-        (_, None, Some(_)) => Some(instance_task(node, key)),
+        (_, None, Some(_)) => Some(instance_task(node, &ItemKey::new(key).ok()?)),
         _ => None,
     }
 }
@@ -2489,7 +2459,7 @@ fn fold_event(status: TaskStatus) -> TaskEvent {
 /// The node is required or advisory as a whole, so every instance has to pass for it to pass. A
 /// dependent that wants whatever survived says so with `join = "passed"`, which is the vocabulary
 /// that already exists; a fan-out needs no join of its own.
-fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
+fn fold_instances(settled: Vec<(ItemKey, TaskResult)>) -> TaskResult {
     let count = |status: TaskStatus| settled.iter().filter(|(_, r)| r.status == status).count();
     let passed = count(TaskStatus::Pass);
     let not_taken = count(TaskStatus::NotTaken);
@@ -2500,7 +2470,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
     let outputs: serde_json::Map<String, Value> = settled
         .iter()
         .filter(|(_, r)| r.status == TaskStatus::Pass)
-        .map(|(key, r)| (key.clone(), r.output.clone().unwrap_or(Value::Null)))
+        .map(|(key, r)| (key.to_string(), r.output.clone().unwrap_or(Value::Null)))
         .collect();
     let note = (failed > 0).then(|| {
         let names: Vec<&str> = settled
@@ -2992,7 +2962,7 @@ fn per_element_deps(plan: &ValidPlan, t: &Task) -> BTreeSet<TaskName> {
 /// instance for the same key, read as blocked when it has none unless its node was not taken.
 fn status_for_instance(
     d: &TaskName,
-    key: &str,
+    key: &ItemKey,
     results: &BTreeMap<TaskName, TaskResult>,
     per_element: &BTreeSet<TaskName>,
 ) -> TaskStatus {
@@ -3000,7 +2970,7 @@ fn status_for_instance(
     if !per_element.contains(d) {
         return node.unwrap_or(TaskStatus::Blocked);
     }
-    match results.get(&instance_name(d, key)) {
+    match results.get(&TaskName::instance(d, key)) {
         Some(r) => r.status,
         None if node == Some(TaskStatus::NotTaken) => TaskStatus::NotTaken,
         None => TaskStatus::Blocked,
@@ -3011,7 +2981,7 @@ fn status_for_instance(
 /// its aligned dependencies for the same key. `None` when it runs.
 fn instance_gate(
     t: &Task,
-    key: &str,
+    key: &ItemKey,
     results: &BTreeMap<TaskName, TaskResult>,
     per_element: &BTreeSet<TaskName>,
 ) -> Option<(TaskResult, TaskEvent)> {
@@ -3022,7 +2992,7 @@ fn instance_gate(
     let not_taken =
         |event, note: String| Some((TaskResult::undispatched(TaskStatus::NotTaken, note), event));
     if let Some(when) = t.when.as_ref().filter(|w| per_element.contains(&w.task)) {
-        let route = instance_name(&when.task, key);
+        let route = TaskName::instance(&when.task, key);
         match status(&when.task) {
             TaskStatus::NotTaken => {
                 return not_taken(
@@ -3069,7 +3039,7 @@ fn instance_gate(
             {
                 return not_taken(
                     TaskEvent::BranchNotTaken,
-                    format!("dependency {} was not taken", instance_name(d, key)),
+                    format!("dependency {} was not taken", TaskName::instance(d, key)),
                 );
             }
             if per_element.iter().any(|d| !satisfies_all(t, d, status(d))) {
@@ -3098,7 +3068,7 @@ fn instance_gate(
 /// the key itself under [`ITEM_INPUT`].
 fn instance_inputs(
     node: &Task,
-    key: &str,
+    key: &ItemKey,
     base: &BTreeMap<TaskName, Value>,
     results: &BTreeMap<TaskName, TaskResult>,
     per_element: &BTreeSet<TaskName>,
@@ -3106,7 +3076,7 @@ fn instance_inputs(
 ) -> Result<BTreeMap<TaskName, Value>, String> {
     let mut inputs = base.clone();
     for d in per_element {
-        let instance = instance_name(d, key);
+        let instance = TaskName::instance(d, key);
         inputs.remove(d);
         let absent;
         let r = match results.get(&instance) {
@@ -3114,7 +3084,7 @@ fn instance_inputs(
             None => {
                 absent = TaskResult::undispatched(
                     status_for_instance(d, key, results, per_element),
-                    format!("{d} has no instance for {key:?}"),
+                    format!("{d} has no instance for {:?}", key.as_str()),
                 );
                 &absent
             }
@@ -3155,14 +3125,17 @@ fn instance_inputs(
                 "keyed {reference} is not an object keyed by element"
             ));
         };
-        let Some(narrowed) = by_key.remove(key) else {
-            return Err(format!("keyed {reference} has no entry for {key:?}"));
+        let Some(narrowed) = by_key.remove(key.as_str()) else {
+            return Err(format!(
+                "keyed {reference} has no entry for {:?}",
+                key.as_str()
+            ));
         };
         *field = narrowed;
     }
     inputs.insert(
-        TaskName(ITEM_INPUT.to_string()),
-        Value::String(key.to_owned()),
+        TaskName::reserved(ITEM_INPUT),
+        Value::String(key.to_string()),
     );
     Ok(inputs)
 }
@@ -3171,7 +3144,7 @@ fn instance_inputs(
 /// staged for it, and the files that did not parse. `None` for a task that reads no files.
 fn route_files(
     t: &Task,
-    key: Option<&str>,
+    key: Option<&ItemKey>,
     per_element: &BTreeSet<TaskName>,
     staged: &[Task],
     runner: &dyn TaskRunner,
@@ -3190,7 +3163,7 @@ fn route_files(
     let mut unparsed = Vec::new();
     for d in &t.depends_on {
         let producer = match key {
-            Some(key) if per_element.contains(d) => instance_name(d, key),
+            Some(key) if per_element.contains(d) => TaskName::instance(d, key),
             _ => d.clone(),
         };
         let Some(staged_task) = staged.iter().find(|p| p.name == producer) else {
@@ -3249,7 +3222,7 @@ fn measured_failure(note: String) -> TaskResult {
 fn decide_instance(
     questions: &BTreeMap<QuestionId, Question>,
     source: &TaskName,
-    key: &str,
+    key: &ItemKey,
     inputs: &BTreeMap<TaskName, Value>,
     per_element: &BTreeSet<TaskName>,
     join: Join,
@@ -3271,12 +3244,15 @@ fn decide_instance(
     let mut answers = serde_json::Map::new();
     for id in questions.keys() {
         match output.get(id.as_str()) {
-            Some(Value::Object(by_key)) => match by_key.get(key) {
+            Some(Value::Object(by_key)) => match by_key.get(key.as_str()) {
                 Some(answer) => {
                     answers.insert(id.to_string(), answer.clone());
                 }
                 None => {
-                    return measured_failure(format!("{source}.{id} has no entry for {key:?}"));
+                    return measured_failure(format!(
+                        "{source}.{id} has no entry for {:?}",
+                        key.as_str()
+                    ));
                 }
             },
             Some(other) => {
@@ -6542,7 +6518,10 @@ mod tests {
         }
         let results =
             BTreeMap::from([(TaskName("discover".to_string()), source(TaskStatus::Pass))]);
-        assert_eq!(fanout_items(&node, &results), Ok(vec!["alpha".to_string()]));
+        assert_eq!(
+            fanout_items(&node, &results),
+            Ok(vec![ItemKey::new("alpha").unwrap()])
+        );
     }
 
     fn epilogue(name: &str, deps: &[&str], required: bool) -> Task {
@@ -7571,7 +7550,7 @@ mod tests {
     }
 
     fn outcome_of(r: &ScriptRunner, task: &str) -> Value {
-        r.seen_values[task][&TaskName(OUTCOME_INPUT.to_string())].clone()
+        r.seen_values[task][&TaskName::reserved(OUTCOME_INPUT)].clone()
     }
 
     /// An epilogue task has no dependencies to read, so the run's outcome is the only channel
@@ -7778,7 +7757,7 @@ mod tests {
             runner.staged["report"],
             vec!["audit[alpha]".to_string(), "audit[beta]".to_string()]
         );
-        let outcome = &runner.seen_inputs["report"][&TaskName(OUTCOME_INPUT.to_string())];
+        let outcome = &runner.seen_inputs["report"][&TaskName::reserved(OUTCOME_INPUT)];
         assert_eq!(outcome["tasks"]["audit"]["files"], true);
         assert_eq!(outcome["tasks"]["discover"]["files"], false);
     }

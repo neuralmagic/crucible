@@ -220,7 +220,7 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
                     return Err(ResumeError::NotAdmitted { task: task.clone() });
                 }
                 held.remove(task);
-                if let Some((node, _)) = task.split_once('[') {
+                if let Some((node, _)) = TaskName(task.clone()).instance_of() {
                     held.remove(node);
                 }
                 let Some(row) = settled_row(plan, event)? else {

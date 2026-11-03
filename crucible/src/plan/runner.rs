@@ -98,7 +98,7 @@ impl ShellRunner {
         let mut env_inputs = inputs.clone();
         let history = match task.task {
             TaskKind::Agent { .. } => {
-                env_inputs.remove(&TaskName(crate::plan::ir::HISTORY_INPUT.to_string()))
+                env_inputs.remove(&TaskName::reserved(crate::plan::ir::HISTORY_INPUT))
             }
             _ => None,
         };

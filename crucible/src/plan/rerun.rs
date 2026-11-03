@@ -69,12 +69,6 @@ pub fn definition_digests(plan: &ValidPlan) -> BTreeMap<TaskName, String> {
     out
 }
 
-/// The node a settled row belongs to: a mapped instance `x[key]` and a revise round
-/// `x[round-N]` both belong to `x`.
-fn node_of(name: &str) -> &str {
-    name.split_once('[').map_or(name, |(node, _)| node)
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum RerunError {
     #[error("reading the parent run: {0}")]
@@ -146,7 +140,9 @@ impl Parent {
         self.rows
             .iter()
             .filter_map(|event| match event {
-                SessionEvent::TaskResult { task, status, .. } if !task.contains('[') => {
+                SessionEvent::TaskResult { task, status, .. }
+                    if TaskName(task.clone()).instance_of().is_none() =>
+                {
                     Some((task.clone(), status.clone()))
                 }
                 _ => None,
@@ -221,10 +217,7 @@ impl Rerun {
         }
         Ok(read_git_memory(&parent.dir)?
             .into_iter()
-            .filter(|c| {
-                self.reused
-                    .contains(&TaskName(node_of(&c.task).to_string()))
-            })
+            .filter(|c| self.reused.contains(&TaskName(c.task.clone()).node()))
             .collect())
     }
 
@@ -317,7 +310,7 @@ pub fn plan(plan: &ValidPlan, parent: &Parent, from: &[TaskName]) -> Result<Reru
         let SessionEvent::TaskResult { task, .. } = event else {
             continue;
         };
-        if !reused.contains(&TaskName(node_of(task).to_string())) {
+        if !reused.contains(&TaskName(task.clone()).node()) {
             continue;
         }
         let Some(row) = settled_row(plan, event.clone())? else {

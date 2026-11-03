@@ -297,7 +297,7 @@ impl TaskRunner for HarnessRunner {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if crate::plan::exec::is_instance_of(&task.name, &TaskName(name.to_string())) {
+            if TaskName(name.to_string()).is_instance_of(&task.name) {
                 let _ = std::fs::remove_dir_all(entry.path());
             }
         }
@@ -623,7 +623,7 @@ fn agent_prompt(
     inputs: &BTreeMap<TaskName, Value>,
     workspace: &Path,
 ) -> anyhow::Result<String> {
-    let history_key = TaskName(crate::plan::ir::HISTORY_INPUT.to_string());
+    let history_key = TaskName::reserved(crate::plan::ir::HISTORY_INPUT);
     let mut upstream = inputs.clone();
     let history = upstream.remove(&history_key);
     let inputs_json =
