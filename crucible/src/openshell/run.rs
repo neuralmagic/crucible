@@ -15,6 +15,7 @@
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::{McpServer, SandboxAuth, SandboxLayout, TurnArtifacts, backend};
 use crate::agent::relay;
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv, process_env};
 use crate::agent::turn::{TurnFailure, TurnOutcome};
 use crate::args::{Paths, SandboxTurn};
 use crate::manifest::Harness;
@@ -672,14 +673,15 @@ async fn try_turn(
         // 7. Upload the env script and the prompt to absolute /tmp paths. The collector's OTEL_*
         //    matrix appends after the manifest env (so a later `export` wins), pointing the agent's
         //    exporter at the driver-resolved host.
-        let mut turn_env = turn.agent.env.to_vec();
+        let mut turn_env =
+            SandboxEnv::from_manifest(turn.agent.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if let Some(c) = &collector {
-            turn_env.extend(crucible_harness::otel_env(
-                &c.sandbox_endpoint(driver.broker_host()),
-            ));
+            for (k, v) in crucible_harness::otel_env(&c.sandbox_endpoint(driver.broker_host())) {
+                turn_env.set(EnvSource::Otel, &k, &v);
+            }
         }
         inference_env(&mut turn_env, harness, auth, &inference, &sandbox_auth);
-        let env_tmp = write_temp("env", &backend.env_script(&turn_env)).await?;
+        let env_tmp = write_temp("env", &turn_env.script(harness.spec())).await?;
         run_os(
             &sandbox::file_upload_args(
                 &name,
@@ -1271,18 +1273,17 @@ async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path
 /// in that case. A key-authenticated harness (opencode, pi) gets every key and base URL the env
 /// carries: its seeded provider table names which variable it reads.
 pub(crate) fn inference_env(
-    env: &mut Vec<(String, String)>,
+    env: &mut SandboxEnv,
     harness: Harness,
     auth: AuthProvider,
     inference: &crate::agent::inference::InferenceEnv,
     sandbox_auth: &SandboxAuth,
 ) {
-    let set = |env: &mut Vec<(String, String)>, key: &str, value: &str| {
-        env.retain(|(k, _)| k != key);
-        env.push((key.to_string(), value.to_string()));
+    let set = |env: &mut SandboxEnv, key: &str, value: &str| {
+        env.set(EnvSource::Inference, key, value);
     };
     if auth == AuthProvider::AnthropicKey {
-        env.retain(|(k, _)| !crate::agent::inference::VERTEX_SELECTORS.contains(&k.as_str()));
+        env.remove(crate::agent::inference::VERTEX_SELECTORS);
         if let Some(key) = inference.anthropic_key.as_deref() {
             set(env, crate::agent::inference::ANTHROPIC_API_KEY, key);
         }
@@ -1731,75 +1732,20 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
     .context("temp-file task panicked")?
 }
 
-/// The env var naming the projections a run's agent may receive, comma-separated. The controller
-/// sets it from the registry, which is the only place visibility is known.
-pub const AGENT_VISIBLE_ENV: &str = "CRUCIBLE_AGENT_VISIBLE_ENV";
-
-/// Seed `env` with the declared secrets the agent may hold: those the manifest declares an `env`
-/// projection for AND [`AGENT_VISIBLE_ENV`] names. An unset or empty list relays nothing. A
-/// manifest-provided value wins, as with the Vertex keys. Returns what it relayed, as
-/// `[[secret]].name -> env var`.
-pub fn relay_agent_visible_secrets(
-    secrets: &[crate::manifest::SecretDecl],
-    env: &mut Vec<(String, String)>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut relayed = std::collections::BTreeMap::new();
-    let Ok(allowed) = std::env::var(AGENT_VISIBLE_ENV) else {
-        return relayed;
-    };
-    let allowed: Vec<&str> = allowed
-        .split(',')
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .collect();
-    for secret in secrets {
-        let Some(key) = secret
-            .env
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-        else {
-            continue;
-        };
-        if !allowed.contains(&key) || env.iter().any(|(k, _)| k == key) {
-            continue;
-        }
-        if let Ok(v) = std::env::var(key)
-            && !v.is_empty()
-        {
-            env.push((key.to_string(), v));
-            relayed.insert(secret.name.clone(), key.to_string());
-        }
-    }
-    relayed
-}
-
-/// Seed `env` with the process values of [`crate::openshell::policy::VERTEX_RELAY_KEYS`]: only keys that are set and
-/// non-empty relay, and an existing entry (a manifest-provided value) always wins.
+/// Seed `env` with the process values of [`crate::openshell::policy::VERTEX_RELAY_KEYS`], on the
+/// terms of [`SandboxEnv::relay`]: a manifest-provided value wins.
 pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
-    relay_keys(crate::openshell::policy::VERTEX_RELAY_KEYS, env);
+    relay_keys(
+        EnvSource::VertexRelay,
+        crate::openshell::policy::VERTEX_RELAY_KEYS,
+        env,
+    );
 }
 
-/// Seed `env` with the process values of [`crate::openshell::policy::IDENTITY_RELAY_KEYS`], on the same terms. Without this
-/// the agent commits under whatever the pack's `setup_cmd` hardcoded, and the pull request that
-/// carries the commit is attributed to nobody.
-pub fn relay_identity_env(env: &mut Vec<(String, String)>) {
-    relay_keys(crate::openshell::policy::IDENTITY_RELAY_KEYS, env);
-}
-
-/// The shared relay: only keys that are set and non-empty cross, and an existing entry (a
-/// manifest-provided value) always wins.
-fn relay_keys(keys: &[&str], env: &mut Vec<(String, String)>) {
-    for key in keys {
-        if env.iter().any(|(k, _)| k == key) {
-            continue;
-        }
-        if let Ok(v) = std::env::var(key)
-            && !v.is_empty()
-        {
-            env.push((key.to_string(), v));
-        }
-    }
+fn relay_keys(source: EnvSource, keys: &[&str], env: &mut Vec<(String, String)>) {
+    let mut sandbox = SandboxEnv::from_manifest(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+    sandbox.relay(source, keys.iter().copied(), process_env);
+    *env = sandbox.into_vars();
 }
 
 #[cfg(test)]
@@ -2070,14 +2016,11 @@ mod tests {
 
     #[test]
     fn a_direct_key_turn_drops_the_vertex_selectors_and_carries_the_key() {
-        let mut env = vec![
-            ("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string()),
-            (
-                "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-                "proj".to_string(),
-            ),
-            ("KEEP_ME".to_string(), "yes".to_string()),
-        ];
+        let mut env = SandboxEnv::from_manifest([
+            ("CLAUDE_CODE_USE_VERTEX", "1"),
+            ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+            ("KEEP_ME", "yes"),
+        ]);
         let inference = crate::agent::inference::InferenceEnv {
             anthropic_key: Some("sk-ant".into()),
             anthropic_base_url: Some("https://claude.corp/v1".into()),
@@ -2090,11 +2033,7 @@ mod tests {
             &inference,
             &SandboxAuth::AnthropicKey,
         );
-        let get = |k: &str| {
-            env.iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-        };
+        let get = |k: &str| env.get(k);
         assert_eq!(get("CLAUDE_CODE_USE_VERTEX"), None);
         assert_eq!(get("ANTHROPIC_VERTEX_PROJECT_ID"), None);
         assert_eq!(get("KEEP_ME"), Some("yes"));
@@ -2107,7 +2046,7 @@ mod tests {
     #[test]
     fn codex_exports_its_key_only_for_a_custom_endpoint() {
         let auth = SandboxAuth::Codex(provider::CodexAuth::ApiKey("sk-oa".to_string()));
-        let mut plain = Vec::new();
+        let mut plain = SandboxEnv::default();
         inference_env(
             &mut plain,
             Harness::Codex,
@@ -2115,9 +2054,9 @@ mod tests {
             &Default::default(),
             &auth,
         );
-        assert!(plain.is_empty(), "{plain:?}");
+        assert_eq!(plain.vars().count(), 0, "{plain:?}");
 
-        let mut custom = Vec::new();
+        let mut custom = SandboxEnv::default();
         let inference = crate::agent::inference::InferenceEnv {
             openai_base_url: Some("http://vllm.internal:8000/v1".into()),
             ..Default::default()
@@ -2129,11 +2068,11 @@ mod tests {
             &inference,
             &auth,
         );
-        assert!(custom.contains(&(
-            "OPENAI_BASE_URL".to_string(),
-            "http://vllm.internal:8000/v1".to_string()
-        )));
-        assert!(custom.contains(&("OPENAI_API_KEY".to_string(), "sk-oa".to_string())));
+        assert_eq!(
+            custom.get("OPENAI_BASE_URL"),
+            Some("http://vllm.internal:8000/v1")
+        );
+        assert_eq!(custom.get("OPENAI_API_KEY"), Some("sk-oa"));
     }
 
     #[test]
@@ -2207,186 +2146,6 @@ mod tests {
         assert_eq!(label_value("my workspace/v2"), "my-workspace-v2");
         assert_eq!(label_value("-.trimmed.-"), "trimmed");
         assert_eq!(label_value("vllm"), "vllm");
-    }
-
-    fn decl(name: &str, env: Option<&str>) -> crate::manifest::SecretDecl {
-        let toml = match env {
-            Some(e) => format!("name = \"{name}\"\nenv = \"{e}\"\n"),
-            None => format!("name = \"{name}\"\npath = \"/tmp/{name}\"\n"),
-        };
-        toml::from_str(&toml).expect("a secret declaration")
-    }
-
-    /// The whole point of the allowlist: what the registry did not name does not cross, and a
-    /// controller that sends no list withholds everything rather than leaking each secret.
-    #[test]
-    fn only_the_named_projections_reach_the_agent() {
-        let _guard = crucible::test_support::env_lock();
-        let secrets = [
-            decl("pr", Some("GH_TOKEN")),
-            decl("push", Some("REG_TOKEN")),
-        ];
-        unsafe {
-            std::env::set_var("GH_TOKEN", "t-gh");
-            std::env::set_var("REG_TOKEN", "t-reg");
-        }
-
-        // No list at all: nothing crosses.
-        unsafe { std::env::remove_var(AGENT_VISIBLE_ENV) };
-        let mut env = Vec::new();
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert!(env.is_empty(), "an absent allowlist must relay nothing");
-
-        // An empty list: still nothing.
-        unsafe { std::env::set_var(AGENT_VISIBLE_ENV, "") };
-        let mut env = Vec::new();
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert!(env.is_empty(), "an empty allowlist must relay nothing");
-
-        // One named: only that one, and the broker-only sibling stays behind.
-        unsafe { std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN") };
-        let mut env = Vec::new();
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert_eq!(env, vec![("GH_TOKEN".to_string(), "t-gh".to_string())]);
-
-        unsafe {
-            std::env::remove_var("GH_TOKEN");
-            std::env::remove_var("REG_TOKEN");
-            std::env::remove_var(AGENT_VISIBLE_ENV);
-        }
-    }
-
-    /// The identity the controller named for the run reaches the agent that does the committing.
-    /// Unset relays nothing, so a deploy that names no identity is unchanged.
-    #[test]
-    fn the_run_identity_reaches_the_agent_and_a_manifest_value_wins() {
-        let _guard = crucible::test_support::env_lock();
-        for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
-            unsafe { std::env::remove_var(key) };
-        }
-        let mut env = Vec::new();
-        relay_identity_env(&mut env);
-        assert!(env.is_empty(), "no identity named, nothing relayed");
-
-        unsafe {
-            std::env::set_var("GIT_AUTHOR_NAME", "crucible-bot[bot]");
-            std::env::set_var(
-                "GIT_AUTHOR_EMAIL",
-                "299632118+crucible-bot[bot]@users.noreply.github.com",
-            );
-            std::env::set_var("GIT_COMMITTER_NAME", "crucible-bot[bot]");
-            std::env::set_var("GIT_COMMITTER_EMAIL", "");
-        }
-        // A manifest that named its own author keeps it; the empty committer email does not cross.
-        let mut env = vec![("GIT_AUTHOR_NAME".to_string(), "from-manifest".to_string())];
-        relay_identity_env(&mut env);
-        assert_eq!(
-            env,
-            vec![
-                ("GIT_AUTHOR_NAME".to_string(), "from-manifest".to_string()),
-                (
-                    "GIT_AUTHOR_EMAIL".to_string(),
-                    "299632118+crucible-bot[bot]@users.noreply.github.com".to_string()
-                ),
-                (
-                    "GIT_COMMITTER_NAME".to_string(),
-                    "crucible-bot[bot]".to_string()
-                ),
-            ]
-        );
-
-        for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
-            unsafe { std::env::remove_var(key) };
-        }
-    }
-
-    /// A file projection has no env name to relay, and a manifest value is not overwritten.
-    #[test]
-    fn a_file_projection_relays_nothing_and_a_manifest_value_wins() {
-        let _guard = crucible::test_support::env_lock();
-        let secrets = [decl("kube", None), decl("pr", Some("GH_TOKEN"))];
-        unsafe {
-            std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN");
-            std::env::set_var("GH_TOKEN", "from-pod");
-        }
-        let mut env = vec![("GH_TOKEN".to_string(), "from-manifest".to_string())];
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert_eq!(
-            env,
-            vec![("GH_TOKEN".to_string(), "from-manifest".to_string())]
-        );
-        unsafe {
-            std::env::remove_var("GH_TOKEN");
-            std::env::remove_var(AGENT_VISIBLE_ENV);
-        }
-    }
-
-    fn clear_relay_keys() {
-        for k in crate::openshell::policy::VERTEX_RELAY_KEYS {
-            unsafe {
-                std::env::remove_var(k);
-            }
-        }
-    }
-
-    #[test]
-    fn relay_copies_set_nonempty_keys_and_skips_empty_and_unset() {
-        let _guard = crucible::test_support::env_lock();
-        clear_relay_keys();
-        unsafe {
-            std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
-        }
-        unsafe {
-            std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "proj-x");
-        }
-        unsafe {
-            std::env::set_var("CLOUD_ML_REGION", "");
-        }
-
-        let mut env = Vec::new();
-        relay_vertex_env(&mut env);
-        clear_relay_keys();
-
-        assert_eq!(
-            env,
-            vec![
-                ("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string()),
-                (
-                    "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-                    "proj-x".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn manifest_provided_values_win_over_the_process_env() {
-        let _guard = crucible::test_support::env_lock();
-        clear_relay_keys();
-        unsafe {
-            std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "from-process");
-        }
-        unsafe {
-            std::env::set_var("VERTEX_LOCATION", "us-east5");
-        }
-
-        let mut env = vec![(
-            "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-            "from-manifest".to_string(),
-        )];
-        relay_vertex_env(&mut env);
-        clear_relay_keys();
-
-        assert_eq!(
-            env,
-            vec![
-                (
-                    "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-                    "from-manifest".to_string()
-                ),
-                ("VERTEX_LOCATION".to_string(), "us-east5".to_string()),
-            ]
-        );
     }
 
     #[tokio::test]

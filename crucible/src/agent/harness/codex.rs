@@ -515,6 +515,7 @@ fn body(text: &str, redact: bool) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::sandbox_env::SandboxEnv;
     use crate::args::Args;
     use clap::Parser;
 
@@ -540,7 +541,8 @@ mod tests {
     }
 
     fn env_script(env: &[(String, String)]) -> String {
-        Codex.env_script(env)
+        SandboxEnv::from_manifest(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .script(Harness::Codex.spec())
     }
 
     const PREFIX: &[&str] = &[

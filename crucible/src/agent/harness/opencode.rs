@@ -418,6 +418,7 @@ fn export_records(content: &[u8]) -> Vec<GenAiRecord> {
 mod tests {
     use super::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::agent::sandbox_env::SandboxEnv;
     use crate::args::Args;
     use clap::Parser;
     use crucible_contract::event::AgentEvent;
@@ -549,7 +550,7 @@ mod tests {
 
     #[test]
     fn env_script_relocates_the_data_home_and_carries_no_credential() {
-        let s = OpenCode.env_script(&[("FOO".into(), "bar".into())]);
+        let s = SandboxEnv::from_manifest([("FOO", "bar")]).script(Harness::OpenCode.spec());
         assert!(s.contains("export AGENT_TOOL=opencode"));
         assert!(s.contains("export XDG_DATA_HOME=/sandbox/.local/share"));
         assert!(s.contains("export XDG_CONFIG_HOME=/sandbox/.config"));

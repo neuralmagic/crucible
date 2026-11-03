@@ -1,6 +1,7 @@
 //! Resolving a run from its manifest: the agent config folded onto the CLI args, the frozen
 //! projection the broker sees, and a plan runner over the same workspace a loop run would use.
 
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv, agent_visible, process_env};
 use crate::args::Args;
 use crate::control::broker;
 use crate::manifest;
@@ -169,33 +170,36 @@ pub(crate) fn apply_agent_cfg(
     if args.sandbox_image.is_none() {
         args.sandbox_image = agent.sandbox_image.clone();
     }
-    args.env = agent
-        .env
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    // Openshell turns run claude inside the sandbox, whose env is built ONLY from `args.env`
-    // (`openshell::run::env_script` / `vertex_config`, the sandbox never sees the pod's env).
-    // A manifest without `[agent.env]` (a controller-drafted pack) would launch claude with no
-    // Vertex config at all: it emits a synthetic "Not logged in" result claiming subtype=success,
-    // turns=1, $0, a silent no-op run. Relay the standard Vertex keys from the pod env (the
-    // deploy profile's `[env]`), exactly like the scope/rank turn paths; manifest values win.
-    // Only for a Vertex-authenticated harness; codex authenticates against the ChatGPT backend.
+    // The sandbox's env is built ONLY from `args.env`; it never sees the pod's. A manifest without
+    // `[agent.env]` (a controller-drafted pack) would launch claude with no Vertex config at all,
+    // which it reports as a $0 success, so a Vertex-authenticated openshell turn relays the
+    // standard Vertex keys from the pod env (the deploy profile's `[env]`); the pack's declared
+    // secrets the registry lets this agent hold and the identity the controller named for the
+    // run's commits cross the same way. A manifest value wins over every relay.
+    let mut env =
+        SandboxEnv::from_manifest(agent.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
     if args.agent_backend == manifest::AgentBackend::Openshell
         && crate::agent::harness::resolve_auth(
             args.harness(),
             &crate::agent::inference::InferenceEnv::from_process_env()?,
         ) == crucible::harness::AuthProvider::Vertex
     {
-        crate::openshell::run::relay_vertex_env(&mut args.env);
+        env.relay(
+            EnvSource::VertexRelay,
+            crate::openshell::policy::VERTEX_RELAY_KEYS.iter().copied(),
+            process_env,
+        );
     }
-    // The pack's declared secrets, for the ones the registry says this agent may hold. The kubelet
-    // put them in this process's environment; without this the sandbox never sees them.
-    args.relayed_secrets =
-        crate::openshell::run::relay_agent_visible_secrets(secrets, &mut args.env);
-    // Who the agent's commits are attributed to. Same reason: the sandbox never sees the pod's env,
-    // so the identity the controller named for this run has to be relayed like everything else.
-    crate::openshell::run::relay_identity_env(&mut args.env);
+    env.relay_secrets(secrets, &agent_visible(process_env), process_env);
+    env.relay(
+        EnvSource::IdentityRelay,
+        crate::openshell::policy::IDENTITY_RELAY_KEYS
+            .iter()
+            .copied(),
+        process_env,
+    );
+    args.relayed_secrets = env.relayed_secrets();
+    args.env = env.into_vars();
     args.sandboxes = agent.sandbox.clone();
     args.relay = agent.relay.clone();
     args.disclosure = frozen.disclosure.clone();
@@ -956,7 +960,7 @@ mod tests {
             std::env::set_var("JIRA_TOKEN", "jira-value");
             std::env::set_var("REGISTRY_TOKEN", "registry-value");
             std::env::set_var(
-                crate::openshell::run::AGENT_VISIBLE_ENV,
+                crate::agent::sandbox_env::AGENT_VISIBLE_ENV,
                 "JIRA_TOKEN,REGISTRY_TOKEN",
             );
         }
@@ -994,7 +998,7 @@ mod tests {
         unsafe {
             std::env::remove_var("JIRA_TOKEN");
             std::env::remove_var("REGISTRY_TOKEN");
-            std::env::remove_var(crate::openshell::run::AGENT_VISIBLE_ENV);
+            std::env::remove_var(crate::agent::sandbox_env::AGENT_VISIBLE_ENV);
         }
         result.unwrap();
         let script = |sandbox: Option<&str>| {
@@ -1002,7 +1006,8 @@ mod tests {
             if let Some(name) = sandbox {
                 crate::plan::harness::enter_sandbox(&mut turn, name).unwrap();
             }
-            crate::agent::harness::backend(turn.harness()).env_script(&turn.env)
+            SandboxEnv::from_manifest(turn.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .script(turn.harness().spec())
         };
 
         let default = script(None);

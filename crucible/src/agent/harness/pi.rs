@@ -480,6 +480,7 @@ fn session_records(content: &[u8]) -> Vec<GenAiRecord> {
 mod tests {
     use crate::agent::harness::pi::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::agent::sandbox_env::SandboxEnv;
     use crate::args::Args;
     use clap::Parser;
 
@@ -595,7 +596,7 @@ mod tests {
 
     #[test]
     fn env_script_relocates_the_agent_dir_offline_with_no_credential() {
-        let s = Pi.env_script(&[("FOO".into(), "bar".into())]);
+        let s = SandboxEnv::from_manifest([("FOO", "bar")]).script(Harness::Pi.spec());
         assert!(s.contains("export AGENT_TOOL=pi"));
         assert!(s.contains("export PI_CODING_AGENT_DIR=/sandbox/.pi/agent"));
         assert!(s.contains("export PI_OFFLINE=1"));

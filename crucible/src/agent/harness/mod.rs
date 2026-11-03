@@ -16,6 +16,7 @@ pub(crate) mod pi;
 
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::inference::{InferenceEnv, WireApi};
+use crate::agent::sandbox_env::sh_quote;
 use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::openshell::provider::CodexAuth;
@@ -338,22 +339,6 @@ pub(crate) trait Backend: Sync {
         env
     }
 
-    /// The agent's env script (sourced before the agent runs in the sandbox): `AGENT_TOOL`, the
-    /// home var, the spec's further exports, then the manifest's `[agent].env`.
-    fn env_script(&self, env: &[(String, String)]) -> String {
-        let spec = self.spec();
-        let mut lines = vec![
-            format!("export AGENT_TOOL={}", spec.name),
-            format!("export {}={}", spec.home_var, spec.home),
-        ];
-        lines.extend(
-            spec.sandbox_env
-                .iter()
-                .map(|(k, v)| format!("export {k}={v}")),
-        );
-        append_manifest_env(lines, env)
-    }
-
     /// Files uploaded into the sandbox before the agent execs: the config at the spec's path when
     /// the backend renders one, then its credential file, then the MCP config. `servers` are
     /// exactly the ones in the turn's scope, each token the raw value or the provider placeholder
@@ -430,27 +415,11 @@ pub(crate) fn exec_wrapper(workdir_basename: &str, agent_args: &[String]) -> Vec
     v
 }
 
-/// Single-quote a value for `sh` (wrap in `'…'`, escaping embedded single quotes), like
-/// `shlex.quote`.
-pub(crate) fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Append the manifest's `[agent].env` as `export k='v'` lines onto a harness's env script, then a
-/// trailing blank line, and join with newlines. Shared tail of every harness's `env_script`, the
-/// harness supplies its own defaults, this stamps the manifest overrides on top.
-pub(crate) fn append_manifest_env(mut lines: Vec<String>, env: &[(String, String)]) -> String {
-    for (k, v) in env {
-        lines.push(format!("export {k}={}", sh_quote(v)));
-    }
-    lines.push(String::new()); // trailing newline
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::event::AgentEvent;
+    use crate::agent::sandbox_env::SandboxEnv;
     use clap::Parser;
     use crucible::harness::TranscriptLocator;
 
@@ -495,12 +464,6 @@ mod tests {
             &["claude", "-p"],
             "agent args after the separator"
         );
-    }
-
-    #[test]
-    fn sh_quote_wraps_and_escapes() {
-        assert_eq!(sh_quote("plain"), "'plain'");
-        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]
@@ -878,7 +841,7 @@ mod tests {
             Harness::Pi,
         ] {
             let spec = harness.spec();
-            let script = harness.backend().env_script(&[("K".into(), "v w".into())]);
+            let script = SandboxEnv::from_manifest([("K", "v w")]).script(spec);
             let lines: Vec<&str> = script.lines().collect();
             assert_eq!(lines[0], format!("export AGENT_TOOL={}", spec.name));
             assert_eq!(lines[1], format!("export {}={}", spec.home_var, spec.home));

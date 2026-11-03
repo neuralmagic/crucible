@@ -181,6 +181,7 @@ impl Backend for Claude {
 mod tests {
     use super::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::agent::sandbox_env::SandboxEnv;
     use crate::args::Args;
     use clap::Parser;
 
@@ -329,13 +330,11 @@ mod tests {
 
     #[test]
     fn env_script_has_claude_defaults_and_manifest_env() {
-        let s = Claude.env_script(&[
-            ("CLAUDE_CODE_USE_VERTEX".into(), "1".into()),
-            (
-                "ANTHROPIC_VERTEX_PROJECT_ID".into(),
-                "example-project".into(),
-            ),
-        ]);
+        let s = SandboxEnv::from_manifest([
+            ("CLAUDE_CODE_USE_VERTEX", "1"),
+            ("ANTHROPIC_VERTEX_PROJECT_ID", "example-project"),
+        ])
+        .script(Harness::Claude.spec());
         assert!(s.contains("export AGENT_TOOL=claude"));
         assert!(s.contains("export CLAUDE_CODE_MAX_RETRIES=20"));
         assert!(s.contains("export CLAUDE_CONFIG_DIR=/sandbox/.claude"));

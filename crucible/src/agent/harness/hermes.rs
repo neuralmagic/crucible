@@ -161,6 +161,7 @@ impl Backend for Hermes {
 mod tests {
     use super::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::agent::sandbox_env::SandboxEnv;
     use crate::args::Args;
     use clap::Parser;
 
@@ -203,7 +204,8 @@ mod tests {
 
     #[test]
     fn env_script_relocates_hermes_home_with_no_api_key() {
-        let s = Hermes.env_script(&[("CLAUDE_CODE_USE_VERTEX".into(), "1".into())]);
+        let s = SandboxEnv::from_manifest([("CLAUDE_CODE_USE_VERTEX", "1")])
+            .script(Harness::Hermes.spec());
         assert!(s.contains("export AGENT_TOOL=hermes"));
         assert!(s.contains("export HERMES_HOME=/sandbox/.hermes"));
         assert!(s.contains("export CLAUDE_CODE_USE_VERTEX='1'"));

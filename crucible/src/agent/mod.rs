@@ -26,6 +26,7 @@ pub(crate) mod harness;
 pub(crate) mod hermes_trace;
 pub(crate) mod inference;
 pub(crate) mod relay;
+pub(crate) mod sandbox_env;
 pub(crate) mod turn;
 
 use crate::agent::event::{AgentEvent, Pricing, RawStream};
