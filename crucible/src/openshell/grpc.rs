@@ -146,6 +146,14 @@ fn record_poll_summary(attempts: u64, started: Instant, outcome: &str) {
     span.record("outcome", outcome);
 }
 
+/// The first and the longest gap between `GetSandboxPolicyStatus` polls; each gap doubles.
+const POLICY_POLL_FIRST: Duration = Duration::from_millis(100);
+const POLICY_POLL_MAX: Duration = Duration::from_secs(1);
+
+fn next_policy_poll(delay: Duration) -> Duration {
+    (delay * 2).min(POLICY_POLL_MAX)
+}
+
 /// How long a sandbox gets to reach `Ready` once its image is pulled (mirrors the CLI's
 /// `OPENSHELL_PROVISION_TIMEOUT`, default 300s).
 fn provision_timeout() -> Duration {
@@ -308,12 +316,12 @@ impl HealthProbe {
 }
 
 /// The minimum gateway semver triple this client is known to work against. Bump it whenever
-/// crucible starts calling an RPC an older gateway lacks: protobuf itself never versions, so an
-/// old gateway doesn't fail the handshake, it returns UNIMPLEMENTED mid-turn. This constant is
-/// the "minimum protocol version" that turns that late surprise into an upfront, actionable
-/// failure. Comparison is on the numeric triple only (pre-release/`-dev` suffixes ignored):
-/// `0.0.82-dev.11` counts as 0.0.82.
-pub const MIN_GATEWAY_VERSION: (u64, u64, u64) = (0, 1, 2);
+/// crucible starts calling an RPC, or rendering a `gateway.toml` key, that an older gateway
+/// lacks: protobuf itself never versions, so an old gateway doesn't fail the handshake, it
+/// returns UNIMPLEMENTED mid-turn. This constant is the "minimum protocol version" that turns
+/// that late surprise into an upfront, actionable failure. Comparison is on the numeric triple
+/// only (pre-release/`-dev` suffixes ignored): `0.0.82-dev.11` counts as 0.0.82.
+pub const MIN_GATEWAY_VERSION: (u64, u64, u64) = (0, 1, 5);
 
 /// The openshell-core git rev this binary compiled against, embedded from Cargo.lock by
 /// crucible's build script ("unknown" when the dep is not a git source).
@@ -964,6 +972,7 @@ impl Gateway {
         let deadline = started + Duration::from_secs(60);
         let mut client = self.poll_client();
         let mut attempts: u64 = 0;
+        let mut delay = POLICY_POLL_FIRST;
 
         let (outcome, result) = loop {
             attempts += 1;
@@ -1015,7 +1024,8 @@ impl Gateway {
                     .into()),
                 );
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::time::sleep(delay).await;
+            delay = next_policy_poll(delay);
         };
 
         record_poll_summary(attempts, started, outcome);
@@ -2556,6 +2566,16 @@ pYBZ
         )));
     }
 
+    #[test]
+    fn policy_poll_doubles_from_100ms_and_caps_at_1s() {
+        let schedule: Vec<u128> =
+            std::iter::successors(Some(POLICY_POLL_FIRST), |d| Some(next_policy_poll(*d)))
+                .take(7)
+                .map(|d| d.as_millis())
+                .collect();
+        assert_eq!(schedule, [100, 200, 400, 800, 1000, 1000, 1000]);
+    }
+
     // --- gateway version gate ---
 
     const REV: &str = "bc8342bb53730f43bd9e27fc2f890745fbcb607f";
@@ -2631,6 +2651,22 @@ pYBZ
                 reported: "0.0.55-dev.9+gaada3da8".into()
             },
             "the old Copr build must be rejected"
+        );
+    }
+
+    #[test]
+    fn minimum_rejects_gateways_that_cannot_parse_config_delivery_mode() {
+        assert_eq!(
+            check_gateway_version("0.1.4"),
+            VersionGate::TooOld {
+                reported: "0.1.4".into()
+            }
+        );
+        assert_ne!(
+            check_gateway_version("0.1.5"),
+            VersionGate::TooOld {
+                reported: "0.1.5".into()
+            }
         );
     }
 

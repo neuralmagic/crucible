@@ -6,7 +6,7 @@
 # skew is impossible by construction (crucible additionally gates the version at runtime).
 #
 # Built and pushed by .github/workflows/openshell-gateway.yml, which stages the release
-# binaries into bin/ (glibc, bundled-z3 — self-contained on the UBI10 loop base) and uses
+# binaries into bin/ (glibc, vendored-z3 — self-contained on the UBI10 loop base) and uses
 # that staging dir as the build context.
 FROM scratch
 COPY openshell-gateway openshell /usr/local/bin/
