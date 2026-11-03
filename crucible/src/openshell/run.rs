@@ -84,7 +84,7 @@ pub enum OpenshellCliError {
     )]
     NoApiKey { harness: &'static str },
 }
-use crucible_harness::OtelCollector;
+use crucible_harness::otel::OtelCollector;
 use std::sync::atomic::Ordering;
 use tokio::fs;
 use tokio::process::Command;
@@ -675,7 +675,9 @@ async fn try_turn(
         let mut turn_env =
             SandboxEnv::from_manifest(turn.agent.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if let Some(c) = &collector {
-            for (k, v) in crucible_harness::otel_env(&c.sandbox_endpoint(driver.broker_host())) {
+            for (k, v) in
+                crucible_harness::otel::otel_env(&c.sandbox_endpoint(driver.broker_host()))
+            {
                 turn_env.set(EnvSource::Otel, &k, &v);
             }
         }

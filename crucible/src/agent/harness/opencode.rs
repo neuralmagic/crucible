@@ -23,8 +23,9 @@ use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::{HarnessSpec, OPENCODE_EXPORT as EXPORT};
+use crucible_harness::opencode_json::OpenCodeJsonParser;
+use crucible_harness::otel::LiveMeters;
 use crucible_harness::tool_summary::summarize;
-use crucible_harness::{LiveMeters, OpenCodeJsonParser};
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

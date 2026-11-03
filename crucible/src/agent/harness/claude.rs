@@ -8,7 +8,7 @@ use crate::manifest::Harness;
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::GenAiRecord;
 use crucible::harness::HarnessSpec;
-use crucible_harness::LiveMeters;
+use crucible_harness::otel::LiveMeters;
 
 pub(crate) struct Claude;
 

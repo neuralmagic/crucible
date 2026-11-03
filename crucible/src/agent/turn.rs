@@ -86,7 +86,9 @@ pub(crate) fn otel_enabled(env: &[(String, String)]) -> bool {
 /// Spans are re-parented onto the turn span before they leave, so the agent's `llm_request` spans
 /// nest under the run instead of forming an orphan trace: the agent's exporter cannot adopt a
 /// parent itself, since the OTel JS SDK does not read `TRACEPARENT` from the environment.
-pub(crate) fn otel_forward(env: &[(String, String)]) -> Option<crucible_harness::OtelForward> {
+pub(crate) fn otel_forward(
+    env: &[(String, String)],
+) -> Option<crucible_harness::otel::OtelForward> {
     let endpoint = match env.iter().find(|(k, _)| k == "CRUCIBLE_OTEL_FORWARD") {
         Some((_, v)) => v.clone(),
         None => std::env::var("CRUCIBLE_OTEL_FORWARD").ok()?,
@@ -95,7 +97,10 @@ pub(crate) fn otel_forward(env: &[(String, String)]) -> Option<crucible_harness:
         return None;
     }
     let tp = crate::agent::engine::current_trace_env().map(|(tp, _)| tp);
-    Some(crucible_harness::OtelForward::new(endpoint, tp.as_deref()))
+    Some(crucible_harness::otel::OtelForward::new(
+        endpoint,
+        tp.as_deref(),
+    ))
 }
 
 /// Whether session-log tool events carry full inputs and result excerpts

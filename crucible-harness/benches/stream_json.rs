@@ -6,8 +6,8 @@
 //! reorders, or reshapes events is reported invalid rather than fast. `--print-hash` prints the
 //! hash and exits, for re-baking after an intentional event-shape change.
 
-use crucible_harness::StreamJsonParser;
 use crucible_harness::line::LineFormat as _;
+use crucible_harness::stream_json::StreamJsonParser;
 use std::fmt::Write as _;
 use std::time::Instant;
 

@@ -824,7 +824,7 @@ mod tests {
     /// to replay. Driven through the real parser, not a hand-built event.
     #[test]
     fn undecodable_agent_stdout_reaches_the_verdict_buffer() {
-        let mut parser = crucible_harness::StreamJsonParser::default();
+        let mut parser = crucible_harness::stream_json::StreamJsonParser::default();
         let mut buf = String::new();
         for ev in parser.push("Error: could not fetch an access token") {
             accumulate(Some(&ev), &mut buf);

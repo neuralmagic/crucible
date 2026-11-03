@@ -19,7 +19,7 @@ use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::turn_trace::GenAiRecord;
 use crucible::harness::HarnessSpec;
-use crucible_harness::LiveMeters;
+use crucible_harness::otel::LiveMeters;
 
 /// The provider named in hermes's `config.yaml`: the `vertex-anthropic` provider from the
 /// hermes-agent fork (github.com/wseaton/hermes-agent, branch `anthropic-vertex`). It speaks the

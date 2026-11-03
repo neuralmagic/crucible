@@ -22,7 +22,7 @@ use crate::manifest::Harness;
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
 use crucible::harness::{AuthProvider, HarnessSpec};
-use crucible_harness::LiveMeters;
+use crucible_harness::otel::LiveMeters;
 
 /// Which credential this turn runs on: the harness's default, unless the environment carries a
 /// direct Anthropic key for a Claude-speaking harness, or nothing at all for a key-authenticated

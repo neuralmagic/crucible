@@ -35,7 +35,7 @@ use crate::args::{Args, Paths};
 #[cfg(feature = "autoresearch")]
 use crate::manifest::AgentBackend;
 use crucible::deadline::{Deadline, Supervised};
-use crucible_harness::OtelCollector;
+use crucible_harness::otel::OtelCollector;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -303,7 +303,7 @@ fn run_turn_with(
     };
     let extra_env = collector
         .as_ref()
-        .map(|c| crucible_harness::otel_env(&c.local_endpoint()))
+        .map(|c| crucible_harness::otel::otel_env(&c.local_endpoint()))
         .unwrap_or_default();
     let meters = collector.as_ref().map(OtelCollector::meters);
 
