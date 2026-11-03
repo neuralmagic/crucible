@@ -6,6 +6,7 @@ import {
   runFilterParams,
   runInContext,
   runsView,
+  scheduleFiringsPath,
   type RunFilters,
   type RunRow,
 } from './playbookRunsView';
@@ -89,8 +90,20 @@ describe('runsView', () => {
 
 describe('filter params', () => {
   it('round-trips through the query string', () => {
-    const filters: RunFilters = { status: 'parked', playbook: 'triage', origin: 'manual', drafts: true };
+    const filters: RunFilters = {
+      status: 'parked',
+      playbook: 'triage',
+      origin: 'schedule',
+      schedule: '0199-sched',
+      drafts: true,
+    };
     expect(parseRunFilters(runFilterParams(filters))).toEqual(filters);
+  });
+
+  it('links a schedule to the launches it fired', () => {
+    expect(scheduleFiringsPath('0199 sched/1')).toBe('/playbook-runs?origin=schedule&schedule=0199+sched%2F1');
+    const params = new URL(scheduleFiringsPath('0199 sched/1'), 'http://x').searchParams;
+    expect(parseRunFilters(params)).toEqual({ ...DEFAULT_FILTERS, origin: 'schedule', schedule: '0199 sched/1' });
   });
 
   it('leaves defaults out of the query string', () => {

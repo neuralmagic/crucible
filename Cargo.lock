@@ -1915,6 +1915,7 @@ dependencies = [
  "glob",
  "jiff",
  "k8s-openapi",
+ "minijinja",
  "nix 0.31.3",
  "openshell-core",
  "openshell-policy",

@@ -86,7 +86,9 @@ working registry. Set `VAULT_SECRET_ID` directly, not as a file.
    it.
 2. **Bind.** A binding attaches a secret to a scope (a playbook, a schedule) with a
    projection: an environment variable or a file. To bind, you need `bind` on the secret and
-   `launch` on the scope. The policy set decides both.
+   `launch` on the scope. The policy set decides both. A draft started from a team's blueprint
+   gets that team's bindings for members of the team, and a placeholder for every other secret
+   the pack declares.
 3. **Redeem.** When the controller dispatches a bound launch, it reads the current version
    and writes a Kubernetes Secret in the namespace of the run, owner-referenced to the pod of
    the run. The pod spec projects it as the binding specifies. When the pod is deleted,

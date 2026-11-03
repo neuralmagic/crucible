@@ -1,0 +1,15 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-BLUEPRINT"
+title = "Blueprints"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A blueprint MUST be a registered playbook its owner has marked as a blueprint; a draft, a pack import, or an unregistered pack MUST NOT be one. Marking and unmarking MUST be the `update` action on the playbook. Marking MUST be refused unless the caller holds `bind` on every secret whose binding on the playbook would carry under [[RFC-0006:C-CARRY]], and the refusal MUST name those secrets the caller may read and count the rest. A blueprint's revision MUST be the playbook's registered revision. Unmarking MUST NOT change a draft already created from the blueprint or a binding already carried.
+
+
+
+Marking is checked against `bind` because it makes bindings already on the playbook carry. A binding added after marking is made by someone who holds `bind` and is told it carries."""

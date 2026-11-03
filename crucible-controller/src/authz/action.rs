@@ -125,7 +125,7 @@ impl ResourceType {
             ResourceType::PackImport | ResourceType::Scope => &[Verb::Approve],
             ResourceType::Secret => &[Verb::Bind, Verb::Rotate],
             ResourceType::DispatchTarget => &[Verb::Dispatch],
-            ResourceType::Run => &[Verb::Publish],
+            ResourceType::Run => &[Verb::Publish, Verb::Approve],
             ResourceType::PolicySet => &[Verb::Activate],
             ResourceType::Team => &[Verb::ManageMembers],
             ResourceType::Platform => &[Verb::Impersonate],
@@ -312,7 +312,7 @@ mod tests {
             Err(ActionError::Malformed { .. })
         ));
         let all = Action::all();
-        assert_eq!(all.len(), 18 * 6 + 16 + 1);
+        assert_eq!(all.len(), 18 * 6 + 17 + 1);
         let mut sorted = all.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());

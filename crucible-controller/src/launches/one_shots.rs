@@ -369,9 +369,10 @@ pub(crate) async fn fire_due(db: &Db, now: &str, cap: usize) -> Result<Vec<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::daemon::queue::DiscoverySource;
     use crate::daemon::queue::{Enqueue, IssueKey};
+    use crate::launches::model::LaunchFilter;
+    use crate::launches::one_shots::*;
     use crate::model::LaunchOrigin;
     use crate::model::Status;
     use std::sync::Arc;
@@ -466,7 +467,8 @@ mod tests {
         assert_eq!(fired.fired_key.as_deref(), Some(first[0].as_str()));
         assert_eq!(fired.fired_at.as_deref(), Some("2026-08-23T12:00:00Z"));
 
-        let launched = crate::launches::store::list_playbook_runs(&pool, None, 10).await?;
+        let launched =
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::default(), 10).await?;
         assert_eq!(launched.len(), 1, "one launch, not two");
         assert_eq!(launched[0].key, first[0]);
         assert_eq!(launched[0].origin, LaunchOrigin::Deferred);
@@ -502,7 +504,7 @@ mod tests {
         let fired = first??.len() + second??.len();
         assert_eq!(fired, 1, "one sweep wins the claim");
         assert_eq!(
-            crate::launches::store::list_playbook_runs(&pool, None, 10)
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::default(), 10)
                 .await?
                 .len(),
             1
@@ -542,7 +544,7 @@ mod tests {
         assert_eq!(cancel(&pool, "nope").await?, CancelOutcome::Unknown);
         assert!(fire_due(&db, "2026-08-23T12:00:00Z", 8).await?.is_empty());
         assert!(
-            crate::launches::store::list_playbook_runs(&pool, None, 10)
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::default(), 10)
                 .await?
                 .is_empty()
         );
@@ -574,7 +576,7 @@ mod tests {
         assert_eq!(row.status, OneShotStatus::Failed);
         assert!(row.fired_key.is_none());
         assert!(
-            crate::launches::store::list_playbook_runs(&pool, None, 10)
+            crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::default(), 10)
                 .await?
                 .is_empty(),
             "no half-written launch"
