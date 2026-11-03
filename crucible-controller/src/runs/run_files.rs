@@ -22,8 +22,8 @@ use std::path::Path;
 pub struct RunFile {
     /// The declaring task's name, fan-out brackets stripped.
     pub task: String,
-    /// The fan-out instance key, for a file captured by an instance of a mapped task; null for a
-    /// plain task, whose captures are the task's own.
+    /// The fan-out instance key as the run named it, for a file captured by an instance of a mapped
+    /// task; null for a plain task, whose captures are the task's own.
     pub instance: Option<String>,
     /// The path the task declared, relative to its capture directory.
     pub path: String,
@@ -32,16 +32,14 @@ pub struct RunFile {
     pub key: String,
 }
 
-/// Split a capture directory name into the task and, for a fan-out instance, its key. The engine
-/// names an instance `task[key]` (`plan::exec::instance_name`), and a key may itself contain
-/// brackets, so the split is on the FIRST `[` with a trailing `]`.
+/// Split a capture directory name into the task and, for a fan-out instance, its raw key. The
+/// engine names an instance `task[key]` and escapes the key where it forms the directory, so the
+/// directory decodes back to the name the session log carries.
 fn split_instance(dir: &str) -> (String, Option<String>) {
-    match dir.find('[') {
-        Some(open) if dir.ends_with(']') => (
-            dir[..open].to_string(),
-            Some(dir[open + 1..dir.len() - 1].to_string()),
-        ),
-        _ => (dir.to_string(), None),
+    let name = crucible::plan::ir::TaskName::from_dir_name(dir);
+    match name.instance_of() {
+        Some((task, key)) => (task.to_string(), Some(key.to_string())),
+        None => (dir.to_string(), None),
     }
 }
 
@@ -350,6 +348,52 @@ mod tests {
         );
         assert_eq!(
             read_bundle(&gz, "check[docs/SUMMARY.md]/BROKEN.json").expect("read"),
+            Some(b"[]".to_vec())
+        );
+    }
+
+    /// The engine escapes an instance's key where it forms the capture directory, so a key that is
+    /// a path is one directory in the bundle. The listing reports the key the run named, and the
+    /// file is served by the key the listing handed out.
+    #[test]
+    fn an_escaped_instance_directory_lists_its_raw_key() {
+        let gz = bundle(&[
+            ("check[docs%2FSUMMARY.md]/BROKEN.json", b"[]"),
+            ("check[%2E.%2F..%2Fetc]/CHECK.md", b"# x"),
+            ("check[50%25]/CHECK.md", b"# y"),
+        ]);
+        let files = list_bundle(&gz).expect("list");
+        let seen: Vec<(&str, Option<&str>, &str, &str)> = files
+            .iter()
+            .map(|f| {
+                (
+                    f.task.as_str(),
+                    f.instance.as_deref(),
+                    f.path.as_str(),
+                    f.key.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (
+                    "check",
+                    Some("../../etc"),
+                    "CHECK.md",
+                    "check[%2E.%2F..%2Fetc]/CHECK.md"
+                ),
+                ("check", Some("50%"), "CHECK.md", "check[50%25]/CHECK.md"),
+                (
+                    "check",
+                    Some("docs/SUMMARY.md"),
+                    "BROKEN.json",
+                    "check[docs%2FSUMMARY.md]/BROKEN.json"
+                ),
+            ]
+        );
+        assert_eq!(
+            read_bundle(&gz, "check[docs%2FSUMMARY.md]/BROKEN.json").expect("read"),
             Some(b"[]".to_vec())
         );
     }

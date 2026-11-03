@@ -127,6 +127,15 @@ impl TaskName {
         }
     }
 
+    /// The task whose files live under directory `dir`: the inverse of [`TaskName::dir_name`].
+    /// A `%` that starts none of [`escape_key`]'s escapes is kept as written.
+    pub fn from_dir_name(dir: &str) -> TaskName {
+        match TaskName(dir.to_owned()).instance_of() {
+            Some((node, key)) => TaskName(format!("{node}[{}]", unescape_key(key))),
+            None => TaskName(dir.to_owned()),
+        }
+    }
+
     /// The node a settled row belongs to: a mapped instance `x[key]` and a revise round
     /// `x[round-N]` both belong to `x`; a declared name belongs to itself.
     pub fn node(&self) -> TaskName {
@@ -179,6 +188,15 @@ pub enum ItemKeyError {
     Bracket { key: String },
 }
 
+/// What [`escape_key`] writes for each character it escapes; `.` only where it leads the key.
+const KEY_ESCAPES: [(char, &str); 5] = [
+    ('%', "%25"),
+    ('/', "%2F"),
+    ('\\', "%5C"),
+    ('\0', "%00"),
+    ('.', "%2E"),
+];
+
 /// A fan-out key as part of one path component. `%`, `/`, `\`, NUL, and a leading `.` become
 /// `%25`, `%2F`, `%5C`, `%00`, and `%2E`; every other character is kept. Every `%` in the result
 /// starts an escape, so two keys never escape to the same text.
@@ -188,16 +206,41 @@ fn escape_key(key: &str) -> Cow<'_, str> {
     }
     let mut escaped = String::with_capacity(key.len() + 6);
     for (at, c) in key.char_indices() {
-        match c {
-            '%' => escaped.push_str("%25"),
-            '/' => escaped.push_str("%2F"),
-            '\\' => escaped.push_str("%5C"),
-            '\0' => escaped.push_str("%00"),
-            '.' if at == 0 => escaped.push_str("%2E"),
-            c => escaped.push(c),
+        match KEY_ESCAPES.iter().find(|(raw, _)| *raw == c) {
+            Some((_, escape)) if c != '.' || at == 0 => escaped.push_str(escape),
+            _ => escaped.push(c),
         }
     }
     Cow::Owned(escaped)
+}
+
+/// Undo [`escape_key`]. Every `%` it wrote starts one of [`KEY_ESCAPES`], so reading them left to
+/// right recovers the key exactly.
+fn unescape_key(escaped: &str) -> Cow<'_, str> {
+    if !escaped.contains('%') {
+        return Cow::Borrowed(escaped);
+    }
+    let mut key = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some(at) = rest.find('%') {
+        key.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        match KEY_ESCAPES
+            .iter()
+            .find(|(_, escape)| tail.starts_with(escape))
+        {
+            Some((raw, escape)) => {
+                key.push(*raw);
+                rest = &tail[escape.len()..];
+            }
+            None => {
+                key.push('%');
+                rest = &tail[1..];
+            }
+        }
+    }
+    key.push_str(rest);
+    Cow::Owned(key)
 }
 
 fn path_component(raw: &str) -> Result<(), TaskNameError> {
@@ -5089,25 +5132,9 @@ emits = ["lines"]
     /// out of the one it is joined onto.
     #[test]
     fn distinct_keys_escape_to_distinct_directories_and_back() {
-        fn unescape(escaped: &str) -> String {
-            let mut out = Vec::new();
-            let bytes = escaped.as_bytes();
-            let mut at = 0;
-            while at < bytes.len() {
-                if bytes[at] == b'%' {
-                    let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).unwrap();
-                    out.push(u8::from_str_radix(hex, 16).unwrap());
-                    at += 3;
-                } else {
-                    out.push(bytes[at]);
-                    at += 1;
-                }
-            }
-            String::from_utf8(out).unwrap()
-        }
         let keys = [
             "a/b", "a%2Fb", "a%252Fb", "%2Fa", "/a", ".a", "%2Ea", "a\\b", "a%5Cb", "a\0", "a%00",
-            "..", "%2E.", ".", "%", "%%", "plain",
+            "..", "%2E.", ".", "%", "%%", "%zz", "plain",
         ];
         let mut dirs = std::collections::BTreeSet::new();
         for key in keys {
@@ -5116,7 +5143,11 @@ emits = ["lines"]
                 .strip_prefix("audit[")
                 .and_then(|d| d.strip_suffix(']'))
                 .unwrap();
-            assert_eq!(unescape(escaped), key, "{dir}");
+            assert_eq!(
+                TaskName::from_dir_name(&dir),
+                TaskName::instance(&"audit".into(), &ItemKey::new(key).unwrap()),
+                "{dir}"
+            );
             assert!(!escaped.contains(['/', '\\', '\0']), "{dir}");
             assert!(!escaped.starts_with('.'), "{dir}");
             assert!(dirs.insert(dir.clone()), "{key:?} shares {dir}");
@@ -5127,6 +5158,14 @@ emits = ["lines"]
                 "{dir} is one component"
             );
         }
+        for name in ["audit", "fix[round-2]", "audit[plain]"] {
+            assert_eq!(TaskName::from_dir_name(name), TaskName::from(name));
+        }
+        assert_eq!(
+            TaskName::from_dir_name("audit[50%zz]"),
+            TaskName::from("audit[50%zz]"),
+            "a % that starts no escape is kept as written"
+        );
     }
 
     #[test]

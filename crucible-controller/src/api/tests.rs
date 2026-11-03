@@ -10719,6 +10719,172 @@ async fn a_run_lists_and_serves_the_files_its_tasks_captured(pool: PgPool) -> Re
     Ok(())
 }
 
+/// The human surface exactly as `serve` mounts it, run evidence routes included, over `scratch`.
+async fn human_app_over(db: Db, pool: PgPool, scratch: &std::path::Path) -> Router {
+    let store = crate::identity::session::store(&pool)
+        .await
+        .expect("session store");
+    crate::human_router(
+        ApiState {
+            scratch_dir: scratch.to_path_buf(),
+            ..ApiState::test(db)
+        },
+        store,
+        true,
+        crate::HumanAuth {
+            guard: Arc::new(crate::identity::auth::BearerGuard::default()),
+            routes: crate::identity::oidc::routes::AuthState {
+                oidc: None,
+                pool,
+                credential_keys: None,
+            },
+            issuer: None,
+        },
+        crate::spa::Source::Embedded,
+    )
+}
+
+/// A finished run with one fan-out instance named by a key that holds a `/`: its result row and its
+/// session line both carry the raw name.
+async fn slash_instance_run(db: &Db, run_id: &str, pod: Option<&str>) -> Result<()> {
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: run_id.to_string(),
+            scope: None,
+            issue: None,
+            identity_digest: None,
+            status: "succeeded".to_string(),
+            pod: pod.map(str::to_string),
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    if pod.is_none() {
+        crate::runs::store::set_run_dispatch(
+            db.pool(),
+            run_id,
+            crate::runs::model::RunDispatch::Local,
+        )
+        .await?;
+    }
+    crate::runs::task_results::upsert_task_result(
+        db.pool(),
+        run_id,
+        &crate::runs::model::TaskResult {
+            iter: 0,
+            task: "review[llm-d/llm-d-router]".to_string(),
+            status: "pass".to_string(),
+            note: "reviewed".to_string(),
+            cost_usd: None,
+            secs: Some(1.0),
+            blocked: None,
+            links: Vec::new(),
+            agent: None,
+            repairs: Vec::new(),
+            output: None,
+        },
+    )
+    .await?;
+    let session = concat!(
+        "{\"v\":1,\"kind\":\"task_result\",\"task\":\"review[llm-d/llm-d-router]\",",
+        "\"status\":\"pass\",\"iter\":0,\"attempts\":1,\"output\":{\"verdict\":\"ok\"}}\n",
+    );
+    crate::runs::blob_store::put_run_session(db.pool(), run_id, session.as_bytes()).await?;
+    Ok(())
+}
+
+/// A fan-out over repo slugs names each instance by its slug, `/` included, and the engine escapes
+/// the key where it forms the capture directory. Through the surface `serve` mounts, the run's pod
+/// uploads that tree, a client lists each file under the raw instance key, fetches it by the key
+/// the listing handed out, and reads the instance's evidence by its raw name sent as one encoded
+/// segment, for a pod run and for a local one.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_instance_whose_key_holds_a_slash_uploads_lists_and_serves_its_evidence(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    slash_instance_run(&db, "run-pod", Some("loop-abc")).await?;
+    slash_instance_run(&db, "run-local", None).await?;
+    let app = human_app_over(db, pool.clone(), dir.path()).await;
+
+    let token = crate::runs::pod_token::mint(
+        &pool,
+        &crate::runs::pod_token::Subject::Run("run-pod".to_string()),
+        None,
+        std::time::Duration::from_secs(3600),
+    )
+    .await?;
+    let upload = HttpRequest::put("/api/evidence/runs/run-pod/run-files")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::from(run_files_bundle(&[(
+            "review[llm-d%2Fllm-d-router]/REVIEW.md",
+            b"# router\n",
+        )])))?;
+    let (status, body) = crate::testing::oneshot_bytes(&app, upload).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+    let (status, listed) = get_json_value(&app, "/api/runs/run-pod/files").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    let files = listed["files"].as_array().expect("files");
+    assert_eq!(files.len(), 1, "{listed}");
+    assert_eq!(files[0]["task"], "review");
+    assert_eq!(files[0]["instance"], "llm-d/llm-d-router", "the raw key");
+    assert_eq!(files[0]["path"], "REVIEW.md");
+    let key = files[0]["key"].as_str().expect("key");
+    assert_eq!(key, "review[llm-d%2Fllm-d-router]/REVIEW.md");
+    let encoded: Vec<String> = key
+        .split('/')
+        .map(crucible_contract::artifact::path_segment)
+        .collect();
+    let (status, bytes) = get_bytes(
+        &app,
+        &format!("/api/runs/run-pod/files/{}", encoded.join("/")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert_eq!(bytes, b"# router\n");
+
+    let task = crucible_contract::artifact::path_segment("review[llm-d/llm-d-router]");
+    assert_eq!(task, "review%5Bllm-d%2Fllm-d-router%5D");
+    let (status, ev) =
+        get_json_value(&app, &format!("/api/runs/run-pod/tasks/{task}/evidence")).await;
+    assert_eq!(status, StatusCode::OK, "{ev}");
+    assert_eq!(ev["task"], "review[llm-d/llm-d-router]");
+    assert_eq!(ev["status"], "pass");
+    assert_eq!(ev["payload"]["verdict"], "ok");
+
+    let captured = dir
+        .path()
+        .join("local-runs/run-local/pack/state/files/review[llm-d%2Fllm-d-router]");
+    std::fs::create_dir_all(&captured)?;
+    std::fs::write(captured.join("REVIEW.md"), "# local\n")?;
+    let (status, ev) =
+        get_json_value(&app, &format!("/api/runs/run-local/tasks/{task}/evidence")).await;
+    assert_eq!(status, StatusCode::OK, "{ev}");
+    assert_eq!(ev["files"][0]["name"], "REVIEW.md", "{ev}");
+    assert_eq!(ev["files"][0]["content"], "# local\n");
+    let (status, local) = get_json_value(&app, "/api/runs/run-local/files").await;
+    assert_eq!(status, StatusCode::OK, "{local}");
+    assert_eq!(local["files"][0]["instance"], "llm-d/llm-d-router");
+
+    for climbing in [
+        "/api/runs/run-pod/tasks/..%2F..%2Fetc/evidence",
+        "/api/runs/run-pod/tasks/a%2Fb%5Bc%5D/evidence",
+    ] {
+        let (status, body) = get_json_value(&app, climbing).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{climbing}: {body}");
+    }
+    Ok(())
+}
+
 /// The run log is the local supervisor's engine output. A pod run's output lives in its pod, so it
 /// says where instead of 404ing on a run that exists.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

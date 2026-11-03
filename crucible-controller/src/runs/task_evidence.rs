@@ -59,17 +59,24 @@ pub(crate) fn files_root(scratch_root: &Path, run_id: &str) -> PathBuf {
     state_dir(scratch_root, run_id).join("files")
 }
 
+/// The one path segment `task`'s captured files live under, as the engine names it: a fan-out
+/// instance's key may hold a `/` and is escaped there. `None` when even that is no single segment.
+pub fn task_segment(task: &str) -> Option<String> {
+    let segment = crucible::plan::ir::TaskName(task.to_owned())
+        .dir_name()
+        .into_owned();
+    safe_segment(&segment).then_some(segment)
+}
+
 /// Resolve one task's captured-files directory, or `None` when it does not exist or resolves
-/// outside the run's own files root. `task` is the name the session log carries; an instance's
-/// directory escapes its key the way the engine does.
+/// outside the run's own files root. `task` is the name the session log carries.
 fn task_files_dir(scratch_root: &Path, run_id: &str, task: &str) -> Option<PathBuf> {
-    let task = crucible::plan::ir::TaskName(task.to_owned());
-    let dir_name = task.dir_name();
-    if !safe_segment(run_id) || !safe_segment(&dir_name) {
+    if !safe_segment(run_id) {
         return None;
     }
+    let segment = task_segment(task)?;
     let root = files_root(scratch_root, run_id).canonicalize().ok()?;
-    let dir = root.join(dir_name.as_ref()).canonicalize().ok()?;
+    let dir = root.join(segment).canonicalize().ok()?;
     dir.starts_with(&root).then_some(dir)
 }
 
@@ -324,6 +331,27 @@ mod tests {
         // A line with no status at all is not evidence of a pass either.
         let no_status = "{\"kind\":\"task_result\",\"task\":\"a\",\"attempts\":1}";
         assert!(!session_result(no_status, "a").expect("reported").passed());
+    }
+
+    /// A raw instance name may hold a `/` in its key, which the engine escaped where it formed the
+    /// directory; a name that climbs anywhere else still has no segment.
+    #[test]
+    fn a_task_segment_escapes_an_instance_key_and_refuses_a_climbing_name() {
+        assert_eq!(
+            task_segment("review[llm-d/llm-d-router]").as_deref(),
+            Some("review[llm-d%2Fllm-d-router]")
+        );
+        assert_eq!(
+            task_segment("review[../..]").as_deref(),
+            Some("review[%2E.%2F..]")
+        );
+        assert_eq!(
+            task_segment("triage[1027]").as_deref(),
+            Some("triage[1027]")
+        );
+        for bad in ["..", ".", "", "a/b", "../../etc", "a/b[c]"] {
+            assert_eq!(task_segment(bad), None, "{bad:?}");
+        }
     }
 
     #[test]

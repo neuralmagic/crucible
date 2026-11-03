@@ -56,17 +56,18 @@ pub struct TaskEvidenceDto {
 /// captured files. The files are read out of the local run's own `state/files/<task>/` and nowhere
 /// else; a pod run's files never reach this machine, so it answers with the result alone. A task
 /// the run neither planned nor reported on is a 404, and a run id or task name that could leave the
-/// run's directory is a 400.
+/// run's directory is a 400. A fan-out instance is named by its raw key, `/` included, and arrives
+/// percent-encoded as one segment.
 #[utoipa::path(
     get,
     path = "/api/runs/{run_id}/tasks/{task}/evidence",
     params(
         ("run_id" = String, Path, description = "Run identifier"),
-        ("task" = String, Path, description = "Task name, fan-out instance brackets included")
+        ("task" = String, Path, description = "Task name as the session log carries it, a fan-out instance's raw key included, percent-encoded as one segment")
     ),
     responses(
         (status = 200, description = "The task's evidence", body = TaskEvidenceDto),
-        (status = 400, description = "The run id or task name is not a single path segment", body = ErrorBody),
+        (status = 400, description = "The run id is not a single path segment, or the task name names no directory of one", body = ErrorBody),
         (status = 404, description = "No such run, or no such task in it", body = ErrorBody)
     )
 )]
@@ -74,9 +75,9 @@ pub(crate) async fn get_task_evidence(
     State(state): State<ApiState>,
     Path((run_id, task)): Path<(String, String)>,
 ) -> ApiResult<Response> {
-    if !task_evidence::safe_segment(&run_id) || !task_evidence::safe_segment(&task) {
+    if !task_evidence::safe_segment(&run_id) || task_evidence::task_segment(&task).is_none() {
         return Ok(bad_request(
-            "a run id and a task name are each one path segment",
+            "a run id is one path segment, and a task name names a directory of one",
         ));
     }
     let Some(run) = crate::runs::store::get_run(state.db.pool(), &run_id).await? else {
