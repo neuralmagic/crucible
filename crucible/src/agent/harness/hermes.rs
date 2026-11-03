@@ -15,7 +15,7 @@ use crate::agent::harness::{
     Backend, McpServer, RawLines, StreamDecoder, TurnArtifacts, json_servers,
 };
 use crate::agent::inference::InferenceEnv;
-use crate::args::Args;
+use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::turn_trace::GenAiRecord;
 use crucible::harness::HarnessSpec;
@@ -33,13 +33,13 @@ impl Hermes {
     /// The shared invocation prefix: `hermes chat --yolo --model <model>`; prompt delivery is
     /// appended by the caller. `--yolo` bypasses approval prompts (headless); `[agent.hermes].model`
     /// overrides the shared `[agent].model`.
-    fn base_args(args: &Args) -> Vec<String> {
+    fn base_args(agent: &TurnAgent<'_>) -> Vec<String> {
         vec![
             "hermes".to_string(),
             "chat".to_string(),
             "--yolo".to_string(),
             "--model".to_string(),
-            Hermes.model(args).to_string(),
+            Hermes.model(agent).to_string(),
         ]
     }
 }
@@ -80,14 +80,14 @@ impl Backend for Hermes {
     }
 
     /// `[agent.hermes].model` overrides the shared `[agent].model`.
-    fn model<'a>(&self, args: &'a Args) -> &'a str {
-        args.hermes.model.as_deref().unwrap_or_else(|| args.model())
+    fn model<'a>(&self, agent: &TurnAgent<'a>) -> &'a str {
+        agent.hermes.model.as_deref().unwrap_or(agent.model)
     }
 
     /// The prompt rides inline as the `-q` value (a local spawn feeds argv directly, no stdin
     /// redirect).
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
-        let mut a = Self::base_args(args);
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String> {
+        let mut a = Self::base_args(agent);
         a.push("-q".to_string());
         a.push(prompt.to_string());
         a
@@ -96,8 +96,8 @@ impl Backend for Hermes {
     /// `-q -` reads the prompt from stdin, which the shared exec wrapper redirects from the
     /// uploaded prompt file (same pattern as claude's print mode). Hermes reads MCP servers from
     /// its `config.yaml`, not argv, so `mcp_seeded` is accepted and unused by design.
-    fn sandbox_argv(&self, args: &Args, _mcp_seeded: bool) -> Vec<String> {
-        let mut a = Self::base_args(args);
+    fn sandbox_argv(&self, agent: &TurnAgent<'_>, _mcp_seeded: bool) -> Vec<String> {
+        let mut a = Self::base_args(agent);
         a.push("-q".to_string());
         a.push("-".to_string());
         a
@@ -107,16 +107,16 @@ impl Backend for Hermes {
     /// turn's remote HTTP MCP servers and its bearer header.
     fn config(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         _inference: &InferenceEnv,
     ) -> Option<String> {
-        Some(config_yaml(self.model(args), servers))
+        Some(config_yaml(self.model(agent), servers))
     }
 
     fn decoder(
         &self,
-        _args: &Args,
+        _agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         _tool_io: bool,
     ) -> Box<dyn StreamDecoder> {
@@ -161,6 +161,7 @@ impl Backend for Hermes {
 mod tests {
     use super::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::args::Args;
     use clap::Parser;
 
     const CONFIG: &str = Harness::Hermes.spec().config;
@@ -170,20 +171,20 @@ mod tests {
         crate::cli::Cli::parse_from(["crucible"]).run
     }
 
-    fn seed_files(args: &Args, servers: &[McpServer<'_>]) -> Vec<SeedFile> {
-        Hermes.seed_files(args, servers, &SandboxAuth::Gateway, &Default::default())
+    fn seed_files(agent: &TurnAgent<'_>, servers: &[McpServer<'_>]) -> Vec<SeedFile> {
+        Hermes.seed_files(agent, servers, &SandboxAuth::Gateway, &Default::default())
     }
 
     #[test]
     fn invocation_is_headless_chat_with_the_model() {
         let a = args();
-        let local = Hermes.local_argv(&a, "do the thing");
+        let local = Hermes.local_argv(&a.turn_agent(), "do the thing");
         assert_eq!(&local[0..3], &["hermes", "chat", "--yolo"]);
         assert!(local.windows(2).any(|w| w[0] == "--model"));
         // Local delivers the prompt inline as the `-q` value.
         assert_eq!(&local[local.len() - 2..], &["-q", "do the thing"]);
 
-        let sandbox = Hermes.sandbox_argv(&a, true);
+        let sandbox = Hermes.sandbox_argv(&a.turn_agent(), true);
         assert_eq!(&sandbox[0..3], &["hermes", "chat", "--yolo"]);
         // Sandbox reads the prompt from stdin (`-q -`), redirected by the shared exec wrapper.
         assert_eq!(&sandbox[sandbox.len() - 2..], &["-q", "-"]);
@@ -193,7 +194,7 @@ mod tests {
     fn hermes_model_override_beats_the_shared_agent_model() {
         let mut a = args();
         a.hermes.model = Some("anthropic/claude-haiku-4-5".to_string());
-        let v = Hermes.sandbox_argv(&a, false);
+        let v = Hermes.sandbox_argv(&a.turn_agent(), false);
         assert!(
             v.windows(2)
                 .any(|w| w == ["--model", "anthropic/claude-haiku-4-5"])
@@ -213,7 +214,7 @@ mod tests {
     #[test]
     fn config_yaml_always_seeds_model_and_display() {
         let a = args();
-        let seeds = seed_files(&a, &[]);
+        let seeds = seed_files(&a.turn_agent(), &[]);
         assert_eq!(seeds.len(), 1, "config.yaml is always seeded");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
@@ -230,7 +231,7 @@ mod tests {
     fn config_yaml_lists_exactly_the_turns_servers() {
         let a = args();
         let seeds = seed_files(
-            &a,
+            &a.turn_agent(),
             &[
                 McpServer {
                     name: "epp-broker",

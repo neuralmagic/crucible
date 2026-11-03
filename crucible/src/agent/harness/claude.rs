@@ -3,7 +3,7 @@
 
 use crate::agent::harness::{Backend, McpServer, StreamDecoder, TurnArtifacts, json_servers};
 use crate::agent::inference::InferenceEnv;
-use crate::args::Args;
+use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::GenAiRecord;
@@ -22,13 +22,13 @@ const END_OF_OPTIONS: &str = "--";
 /// The local path appends the prompt as an argument; the openshell path leaves it off and
 /// feeds the prompt over stdin (openshell exec rejects newlines in argv), which claude's
 /// print mode reads when no prompt argument is given.
-pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
+pub(crate) fn claude_base_args(agent: &TurnAgent<'_>) -> Vec<String> {
     let mut a = vec![
         "claude".to_string(),
         "--permission-mode".to_string(),
         "bypassPermissions".to_string(),
         "--model".to_string(),
-        args.model().to_string(),
+        agent.model.to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--include-partial-messages".to_string(),
@@ -36,7 +36,7 @@ pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
     ];
     // Per-domain reasoning-effort tier; unset = Claude Code's default (no flag). Pushed before
     // `-p` so `-p` stays last, the sandbox path inserts `--mcp-config` before the trailing `-p`.
-    if let Some(effort) = args.reasoning_effort {
+    if let Some(effort) = agent.reasoning_effort {
         a.push("--effort".to_string());
         a.push(effort.as_flag().to_string());
     }
@@ -44,9 +44,9 @@ pub(crate) fn claude_base_args(args: &Args) -> Vec<String> {
     // commas and spaces, and its variadic stops at the next option token — so this is a
     // single-argument invariant for our own sake, not a workaround. Empty stays absent: a bare
     // flag with no value would consume whatever followed it.
-    if !args.disallowed_tools.is_empty() {
+    if !agent.disallowed_tools.is_empty() {
         a.push("--disallowed-tools".to_string());
-        a.push(args.disallowed_tools.join(","));
+        a.push(agent.disallowed_tools.join(","));
     }
     a.push("-p".to_string());
     a
@@ -81,8 +81,8 @@ impl Backend for Claude {
     }
 
     /// The base args plus the prompt.
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
-        let mut a = claude_base_args(args);
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String> {
+        let mut a = claude_base_args(agent);
         a.push(END_OF_OPTIONS.to_string());
         a.push(prompt.to_string());
         a
@@ -91,11 +91,11 @@ impl Backend for Claude {
     /// Start or resume a local Claude session with an opaque UUID.
     fn local_session_argv(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         prompt: &str,
         session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
-        let mut a = claude_base_args(args);
+        let mut a = claude_base_args(agent);
         insert_session_flags(&mut a, session);
         a.push(END_OF_OPTIONS.to_string());
         a.push(prompt.to_string());
@@ -106,8 +106,8 @@ impl Backend for Claude {
     /// home adds a server, and `--mcp-config <path>` when an MCP config was seeded. The flags go
     /// just before the trailing `-p`, the boundary [`claude_base_args`] guarantees (it ends with
     /// `-p`; the prompt arrives over stdin).
-    fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String> {
-        let mut a = claude_base_args(args);
+    fn sandbox_argv(&self, agent: &TurnAgent<'_>, mcp_seeded: bool) -> Vec<String> {
+        let mut a = claude_base_args(agent);
         let at = a.len().saturating_sub(1); // before the trailing `-p`
         if mcp_seeded {
             a.insert(at, Harness::Claude.spec().config.to_string());
@@ -120,11 +120,11 @@ impl Backend for Claude {
     /// Start or resume a sandbox session; the prompt still arrives over stdin.
     fn sandbox_session_argv(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         mcp_seeded: bool,
         session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
-        let mut a = self.sandbox_argv(args, mcp_seeded);
+        let mut a = self.sandbox_argv(agent, mcp_seeded);
         insert_session_flags(&mut a, session);
         Ok(a)
     }
@@ -132,7 +132,7 @@ impl Backend for Claude {
     /// The `.mcp.json` listing the turn's MCP servers, only when it reaches any.
     fn config(
         &self,
-        _args: &Args,
+        _agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         _inference: &InferenceEnv,
     ) -> Option<String> {
@@ -141,7 +141,7 @@ impl Backend for Claude {
 
     fn decoder(
         &self,
-        _args: &Args,
+        _agent: &TurnAgent<'_>,
         meters: Option<&LiveMeters>,
         tool_io: bool,
     ) -> Box<dyn StreamDecoder> {
@@ -181,6 +181,7 @@ impl Backend for Claude {
 mod tests {
     use super::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::args::Args;
     use clap::Parser;
 
     const MCP_CONFIG: &str = Harness::Claude.spec().config;
@@ -193,8 +194,8 @@ mod tests {
         crate::cli::Cli::parse_from(argv).run
     }
 
-    fn seeds(args: &Args, servers: &[McpServer<'_>]) -> Vec<SeedFile> {
-        Claude.seed_files(args, servers, &SandboxAuth::Gateway, &Default::default())
+    fn seeds(agent: &TurnAgent<'_>, servers: &[McpServer<'_>]) -> Vec<SeedFile> {
+        Claude.seed_files(agent, servers, &SandboxAuth::Gateway, &Default::default())
     }
 
     fn server<'a>(name: &'a str, url: &'a str, token: Option<&'a str>) -> McpServer<'a> {
@@ -208,7 +209,7 @@ mod tests {
     fn a_prompt_that_starts_with_a_dash_is_not_read_as_a_flag() {
         let a = args(&[]);
         for prompt in ["---\nname: analyze\n---\n\nDo it.\n", "-p", "--help", "-"] {
-            let v = Claude.local_argv(&a, prompt);
+            let v = Claude.local_argv(&a.turn_agent(), prompt);
             let end = v.iter().position(|s| s == "--").expect("no end-of-options");
             assert_eq!(v.last().unwrap(), prompt, "{prompt:?}");
             assert_eq!(v.len(), end + 2, "argv continues past the prompt: {v:?}");
@@ -218,7 +219,9 @@ mod tests {
                 provider_id: "11111111-1111-1111-1111-111111111111".into(),
                 completed_turns: 0,
             };
-            let v = Claude.local_session_argv(&a, prompt, &session).unwrap();
+            let v = Claude
+                .local_session_argv(&a.turn_agent(), prompt, &session)
+                .unwrap();
             let end = v.iter().position(|s| s == "--").expect("no end-of-options");
             assert_eq!(v.len(), end + 2, "session argv: {v:?}");
         }
@@ -227,7 +230,7 @@ mod tests {
     #[test]
     fn claude_args_are_stream_json_print_mode() {
         let a = args(&[]);
-        let v = Claude.local_argv(&a, "do the thing");
+        let v = Claude.local_argv(&a.turn_agent(), "do the thing");
         assert_eq!(v.last().unwrap(), "do the thing");
         assert!(v.windows(3).any(|w| w == ["-p", "--", "do the thing"]));
         assert!(
@@ -244,13 +247,13 @@ mod tests {
     #[test]
     fn effort_flag_absent_by_default_present_when_set() {
         // Unset: no `--effort`, `-p` last (Claude Code picks its own default).
-        let base = claude_base_args(&args(&[]));
+        let base = claude_base_args(&args(&[]).turn_agent());
         assert!(!base.iter().any(|s| s == "--effort"));
         assert_eq!(base.last().unwrap(), "-p");
 
         // Set: `--effort <level>` right before the trailing `-p` (which must stay last so the
         // sandbox path can still insert `--mcp-config` before it).
-        let v = claude_base_args(&args(&["--effort", "xhigh"]));
+        let v = claude_base_args(&args(&["--effort", "xhigh"]).turn_agent());
         assert_eq!(&v[v.len() - 3..], &["--effort", "xhigh", "-p"]);
     }
 
@@ -261,7 +264,7 @@ mod tests {
     fn disallowed_tools_join_into_one_value_and_are_absent_when_unset() {
         let mut a = args(&[]);
         assert!(
-            !claude_base_args(&a)
+            !claude_base_args(&a.turn_agent())
                 .iter()
                 .any(|s| s == "--disallowed-tools")
         );
@@ -270,7 +273,7 @@ mod tests {
             "mcp__vllm-broker__codegen_build".to_string(),
             "mcp__vllm-broker__codegen_benchmark".to_string(),
         ];
-        let v = claude_base_args(&a);
+        let v = claude_base_args(&a.turn_agent());
         assert_eq!(
             &v[v.len() - 3..],
             &[
@@ -289,7 +292,7 @@ mod tests {
             completed_turns: 0,
         };
         let started = Claude
-            .local_session_argv(&args(&[]), "try one", &first)
+            .local_session_argv(&args(&[]).turn_agent(), "try one", &first)
             .unwrap();
         assert!(
             started
@@ -303,7 +306,7 @@ mod tests {
             ..first
         };
         let continued = Claude
-            .local_session_argv(&args(&[]), "try two", &resumed)
+            .local_session_argv(&args(&[]).turn_agent(), "try two", &resumed)
             .unwrap();
         assert!(
             continued
@@ -313,7 +316,7 @@ mod tests {
         assert!(!continued.iter().any(|arg| arg == "--session-id"));
 
         let sandbox = Claude
-            .sandbox_session_argv(&args(&[]), true, &resumed)
+            .sandbox_session_argv(&args(&[]).turn_agent(), true, &resumed)
             .unwrap();
         assert!(
             sandbox
@@ -349,14 +352,14 @@ mod tests {
     fn sandbox_args_are_strict_and_inject_mcp_config_only_when_seeded() {
         let a = args(&[]);
         // Not seeded: the base args plus `--strict-mcp-config`, so no stray config adds a server.
-        let off = Claude.sandbox_argv(&a, false);
-        let mut base = claude_base_args(&a);
+        let off = Claude.sandbox_argv(&a.turn_agent(), false);
+        let mut base = claude_base_args(&a.turn_agent());
         base.insert(base.len() - 1, "--strict-mcp-config".to_string());
         assert_eq!(off, base);
         assert!(!off.iter().any(|s| s == "--mcp-config"));
 
         // Seeded: `--mcp-config <path>` inserted right before the trailing `-p`.
-        let on = Claude.sandbox_argv(&a, true);
+        let on = Claude.sandbox_argv(&a.turn_agent(), true);
         let i = on
             .iter()
             .position(|s| s == "--strict-mcp-config")
@@ -366,7 +369,10 @@ mod tests {
             &["--strict-mcp-config", "--mcp-config", MCP_CONFIG, "-p"]
         );
         assert!(
-            !Claude.local_argv(&a, "p").iter().any(|s| s.contains("mcp")),
+            !Claude
+                .local_argv(&a.turn_agent(), "p")
+                .iter()
+                .any(|s| s.contains("mcp")),
             "a local turn keeps the operator's own MCP config"
         );
     }
@@ -374,7 +380,7 @@ mod tests {
     #[test]
     fn sandbox_args_keep_effort_and_mcp_config_before_prompt() {
         let a = args(&["--effort", "max"]);
-        let v = Claude.sandbox_argv(&a, true);
+        let v = Claude.sandbox_argv(&a.turn_agent(), true);
         // Both flags land before the trailing `-p`; the prompt flag stays last.
         assert!(v.windows(2).any(|w| w == ["--effort", "max"]));
         assert!(v.iter().any(|s| s == "--mcp-config"));
@@ -424,8 +430,11 @@ mod tests {
     #[test]
     fn seed_files_only_when_a_server_is_in_scope() {
         let a = args(&[]);
-        assert!(seeds(&a, &[]).is_empty());
-        let seeds = seeds(&a, &[server("broker", "http://h:8849/mcp", None)]);
+        assert!(seeds(&a.turn_agent(), &[]).is_empty());
+        let seeds = seeds(
+            &a.turn_agent(),
+            &[server("broker", "http://h:8849/mcp", None)],
+        );
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].dest, MCP_CONFIG);
         let v: serde_json::Value = serde_json::from_str(&seeds[0].content).expect("valid json");

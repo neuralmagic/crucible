@@ -216,7 +216,9 @@ pub(crate) fn apply_agent_cfg(
     if args.broker.enabled && args.agent_backend == manifest::AgentBackend::Openshell {
         // Hand the broker the deep loop's per-workspace sandbox name, its build sync must download
         // from the same sandbox the turns run in.
-        let sandbox_name = crate::openshell::sandbox::name_for(workspace);
+        let run = crate::openshell::sandbox::RunId::mint();
+        let sandbox_name = crate::openshell::sandbox::name_for(workspace, &run);
+        args.sandbox_run_id = Some(run);
         args.broker_token = broker::ensure_running(
             &args.broker,
             &args.env,

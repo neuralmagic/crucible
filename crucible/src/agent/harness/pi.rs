@@ -24,7 +24,7 @@ use crate::agent::harness::{
     TurnArtifacts, api_endpoint, json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, VertexConfig, WireApi};
-use crate::args::Args;
+use crate::args::TurnAgent;
 use crate::manifest::{Harness, ReasoningEffort};
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::HarnessSpec;
@@ -41,7 +41,7 @@ impl Pi {
     /// --model <model> [--thinking <level>]`. Prompt delivery is appended by the caller.
     /// `--approve` trusts the workspace's project-local files (the toolbox skills among them)
     /// without the interactive prompt.
-    fn base_args(args: &Args) -> Vec<String> {
+    fn base_args(agent: &TurnAgent<'_>) -> Vec<String> {
         let mut a = vec![
             "pi".to_string(),
             "--mode".to_string(),
@@ -51,9 +51,9 @@ impl Pi {
             "--provider".to_string(),
             CRUCIBLE_PROVIDER_ID.to_string(),
             "--model".to_string(),
-            args.model().to_string(),
+            agent.model.to_string(),
         ];
-        if let Some(effort) = args.reasoning_effort {
+        if let Some(effort) = agent.reasoning_effort {
             a.push("--thinking".to_string());
             a.push(thinking_level(effort).to_string());
         }
@@ -230,7 +230,7 @@ impl Backend for Pi {
     /// Pi's option parser reads any positional starting with `-` as a flag, so the prompt goes
     /// over stdin here too: a `bash -c` here-doc feeds it, the delimiter chosen to be absent from
     /// the prompt.
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String> {
         let delimiter = heredoc_delimiter(prompt);
         let script = format!("exec \"$@\" <<'{delimiter}'\n{prompt}\n{delimiter}\n");
         let mut a = vec![
@@ -239,7 +239,7 @@ impl Backend for Pi {
             script,
             "crucible-pi".to_string(),
         ];
-        a.extend(Self::base_args(args));
+        a.extend(Self::base_args(agent));
         a
     }
 
@@ -247,8 +247,8 @@ impl Backend for Pi {
     /// wrapper redirects from the uploaded prompt file. With an MCP server in scope, `codemode`
     /// is added to the default tools up front, so the first request declares it whether or not
     /// the servers in [`MCP_CONFIG`] have connected yet.
-    fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String> {
-        let mut a = Self::base_args(args);
+    fn sandbox_argv(&self, agent: &TurnAgent<'_>, mcp_seeded: bool) -> Vec<String> {
+        let mut a = Self::base_args(agent);
         if mcp_seeded {
             a.push("--tools".to_string());
             a.push("+codemode".to_string());
@@ -260,13 +260,13 @@ impl Backend for Pi {
     /// from); a Vertex turn seeds the extension instead. MCP servers ride [`Backend::mcp_config`].
     fn config(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         _servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String> {
         models_json(
-            args.model(),
-            &api_endpoint(args.model(), inference, &args.env),
+            agent.model,
+            &api_endpoint(agent.model, inference, agent.env),
         )
     }
 
@@ -279,10 +279,10 @@ impl Backend for Pi {
     }
 
     /// The Vertex extension, when the turn runs on the gateway's ambient credential.
-    fn credential(&self, args: &Args, auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(&self, agent: &TurnAgent<'_>, auth: &SandboxAuth) -> Option<SeedFile> {
         match auth {
             SandboxAuth::Gateway => Some(SeedFile {
-                content: vertex_extension(args.model(), &VertexConfig::from_env(&args.env)),
+                content: vertex_extension(agent.model, &VertexConfig::from_env(agent.env)),
                 dest: VERTEX_EXTENSION,
             }),
             SandboxAuth::AnthropicKey | SandboxAuth::ApiKey | SandboxAuth::Codex(_) => None,
@@ -291,12 +291,12 @@ impl Backend for Pi {
 
     fn decoder(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         tool_io: bool,
     ) -> Box<dyn StreamDecoder> {
         Box::new(
-            PiJsonParser::new(args.model())
+            PiJsonParser::new(agent.model)
                 .with_price(crate::agent::event::estimate_cost)
                 .with_tool_io(tool_io),
         )
@@ -480,6 +480,7 @@ fn session_records(content: &[u8]) -> Vec<GenAiRecord> {
 mod tests {
     use crate::agent::harness::pi::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::args::Args;
     use clap::Parser;
 
     const CONFIG: &str = Harness::Pi.spec().config;
@@ -489,11 +490,11 @@ mod tests {
     }
 
     fn seed_files(
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
-        Pi.seed_files(args, servers, &SandboxAuth::ApiKey, inference)
+        Pi.seed_files(agent, servers, &SandboxAuth::ApiKey, inference)
     }
 
     fn server<'a>(name: &'a str, token: Option<&'a str>) -> McpServer<'a> {
@@ -527,7 +528,7 @@ mod tests {
     fn invocation_is_headless_json_print_on_the_crucible_provider() {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
-        let sandbox = Pi.sandbox_argv(&a, false);
+        let sandbox = Pi.sandbox_argv(&a.turn_agent(), false);
         assert_eq!(&sandbox[..PREFIX.len()], PREFIX);
         assert_eq!(sandbox[PREFIX.len()], "qwen-3-8-27b");
         assert_eq!(
@@ -537,12 +538,12 @@ mod tests {
         );
 
         // With a server in scope, codemode joins the default tools.
-        let with_mcp = Pi.sandbox_argv(&a, true);
+        let with_mcp = Pi.sandbox_argv(&a.turn_agent(), true);
         assert_eq!(&with_mcp[..sandbox.len()], &sandbox[..]);
         assert_eq!(&with_mcp[sandbox.len()..], &["--tools", "+codemode"]);
 
         a.reasoning_effort = Some(ReasoningEffort::Max);
-        let sandbox = Pi.sandbox_argv(&a, false);
+        let sandbox = Pi.sandbox_argv(&a.turn_agent(), false);
         assert_eq!(&sandbox[sandbox.len() - 2..], &["--thinking", "xhigh"]);
     }
 
@@ -561,14 +562,14 @@ mod tests {
     #[test]
     fn local_prompt_rides_a_heredoc_with_a_delimiter_absent_from_the_prompt() {
         let a = args();
-        let local = Pi.local_argv(&a, "---\nname: analyze\n---\n\nDo it.");
+        let local = Pi.local_argv(&a.turn_agent(), "---\nname: analyze\n---\n\nDo it.");
         assert_eq!(&local[..2], &["bash", "-c"]);
         assert!(local[2].starts_with("exec \"$@\" <<'CRUCIBLE_PROMPT'\n---\nname: analyze"));
         assert!(local[2].ends_with("\nDo it.\nCRUCIBLE_PROMPT\n"));
         assert_eq!(local[3], "crucible-pi");
         assert_eq!(&local[4..4 + PREFIX.len()], PREFIX);
 
-        let tricky = Pi.local_argv(&a, "CRUCIBLE_PROMPT\nreal prompt");
+        let tricky = Pi.local_argv(&a.turn_agent(), "CRUCIBLE_PROMPT\nreal prompt");
         assert!(tricky[2].starts_with("exec \"$@\" <<'CRUCIBLE_PROMPT_'\n"));
         assert!(tricky[2].ends_with("\nreal prompt\nCRUCIBLE_PROMPT_\n"));
     }
@@ -577,7 +578,7 @@ mod tests {
     #[test]
     fn local_heredoc_delivers_the_prompt_over_stdin() {
         let a = args();
-        let mut argv = Pi.local_argv(&a, "-p looks like a flag\nline two");
+        let mut argv = Pi.local_argv(&a.turn_agent(), "-p looks like a flag\nline two");
         // Replace `pi …` with `cat`, keeping the wrapper: what cat prints is what pi would read.
         argv.truncate(4);
         argv.push("cat".to_string());
@@ -614,7 +615,7 @@ mod tests {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
         let seeds = seed_files(
-            &a,
+            &a.turn_agent(),
             &[server("broker", Some("tok")), server("jira", None)],
             &custom_endpoint(),
         );
@@ -649,7 +650,7 @@ mod tests {
             wire_api: Some(WireApi::Responses),
             ..custom_endpoint()
         };
-        let seeds = seed_files(&a, &[], &responses);
+        let seeds = seed_files(&a.turn_agent(), &[], &responses);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         assert_eq!(v["providers"]["crucible"]["api"], "openai-responses");
     }
@@ -662,7 +663,7 @@ mod tests {
             anthropic_base_url: Some("https://claude.corp".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, &[], &inference);
+        let seeds = seed_files(&a.turn_agent(), &[], &inference);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["providers"]["crucible"];
         assert_eq!(p["api"], "anthropic-messages");
@@ -681,7 +682,12 @@ mod tests {
             ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
             ("CLOUD_ML_REGION".into(), "us-east5".into()),
         ];
-        let seeds = Pi.seed_files(&a, &[], &SandboxAuth::Gateway, &InferenceEnv::default());
+        let seeds = Pi.seed_files(
+            &a.turn_agent(),
+            &[],
+            &SandboxAuth::Gateway,
+            &InferenceEnv::default(),
+        );
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].dest, VERTEX_EXTENSION);
         assert!(VERTEX_EXTENSION.starts_with("/sandbox/.pi/agent/extensions/"));
@@ -701,11 +707,16 @@ mod tests {
 
         // A model name is a JS string literal, so a quote in it cannot break out.
         a.model = Some("odd\"name".to_string());
-        let seeds = Pi.seed_files(&a, &[], &SandboxAuth::Gateway, &InferenceEnv::default());
+        let seeds = Pi.seed_files(
+            &a.turn_agent(),
+            &[],
+            &SandboxAuth::Gateway,
+            &InferenceEnv::default(),
+        );
         assert!(seeds[0].content.contains("const MODEL = \"odd\\\"name\";"));
 
         // A keyed turn seeds no extension.
-        let keyed = seed_files(&a, &[], &custom_endpoint());
+        let keyed = seed_files(&a.turn_agent(), &[], &custom_endpoint());
         assert_eq!(keyed.len(), 1);
         assert_eq!(keyed[0].dest, CONFIG);
     }

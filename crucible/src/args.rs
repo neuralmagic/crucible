@@ -27,6 +27,12 @@ pub(crate) enum Ui {
 
 #[derive(clap::Args, Clone)]
 pub(crate) struct Args {
+    /// The identity this run's sandboxes are named under, minted when its broker starts.
+    #[arg(skip)]
+    pub sandbox_run_id: Option<openshell::sandbox::RunId>,
+    /// The lock every turn of this process boots the gateway under.
+    #[arg(skip)]
+    pub gateway_boot: crucible::openshell::gateway::BootLock,
     /// The domain manifest: the engine reads it, builds a World + Judge, and works in its
     /// workspace. Required (every run is a manifest run).
     #[arg(long)]
@@ -265,6 +271,72 @@ impl Args {
     pub(crate) fn pricing(&self) -> crate::agent::event::Pricing {
         crate::agent::event::Pricing::resolve(self.model(), self.price.as_ref())
     }
+
+    /// The slice a harness backend reads to build a turn.
+    pub(crate) fn turn_agent(&self) -> TurnAgent<'_> {
+        TurnAgent {
+            harness: self.harness(),
+            model: self.model(),
+            reasoning_effort: self.reasoning_effort,
+            disallowed_tools: &self.disallowed_tools,
+            codex: &self.codex,
+            hermes: &self.hermes,
+            env: &self.env,
+        }
+    }
+
+    /// The slice the openshell turn reads.
+    pub(crate) fn sandbox_turn(&self) -> SandboxTurn<'_> {
+        SandboxTurn {
+            agent: self.turn_agent(),
+            pricing: self.pricing(),
+            broker: &self.broker,
+            broker_token: self.broker_token.as_deref(),
+            openshell: &self.openshell,
+            sandbox_image: self.sandbox_image.as_deref(),
+            sandbox_resources: &self.sandbox_resources,
+            relay: &self.relay,
+            mcp: &self.mcp,
+            mcp_scope: &self.mcp_scope,
+            compute_driver: self.compute_driver,
+            disclosure: self.disclosure.as_ref(),
+            run_id: self.sandbox_run_id.as_ref(),
+            gateway_boot: &self.gateway_boot,
+        }
+    }
+}
+
+/// What a harness backend reads off a run to build one turn: the resolved harness and model,
+/// the agent knobs, and the manifest `[agent].env`.
+#[derive(Clone, Copy)]
+pub(crate) struct TurnAgent<'a> {
+    pub harness: manifest::Harness,
+    pub model: &'a str,
+    pub reasoning_effort: Option<manifest::ReasoningEffort>,
+    pub disallowed_tools: &'a [String],
+    pub codex: &'a manifest::CodexCfg,
+    pub hermes: &'a manifest::HermesCfg,
+    pub env: &'a [(String, String)],
+}
+
+/// What the openshell turn reads off a run: the agent slice plus the sandbox, broker, egress,
+/// relay, and MCP settings that shape one sandboxed turn.
+pub(crate) struct SandboxTurn<'a> {
+    pub agent: TurnAgent<'a>,
+    pub pricing: crate::agent::event::Pricing,
+    pub broker: &'a manifest::BrokerCfg,
+    pub broker_token: Option<&'a str>,
+    pub openshell: &'a manifest::OpenshellCfg,
+    pub sandbox_image: Option<&'a str>,
+    pub sandbox_resources: &'a manifest::SandboxResources,
+    pub relay: &'a [manifest::RelayFile],
+    pub mcp: &'a [crate::control::mcp::Server],
+    pub mcp_scope: &'a [String],
+    pub compute_driver: openshell::gateway::ComputeDriver,
+    pub disclosure: Option<&'a crate::exposure::Covered>,
+    /// The run's sandbox identity; `None` names each turn's sandbox afresh.
+    pub run_id: Option<&'a openshell::sandbox::RunId>,
+    pub gateway_boot: &'a crucible::openshell::gateway::BootLock,
 }
 
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit

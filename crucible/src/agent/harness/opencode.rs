@@ -19,7 +19,7 @@ use crate::agent::harness::{
     api_endpoint, json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, WireApi};
-use crate::args::Args;
+use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::{HarnessSpec, OPENCODE_EXPORT as EXPORT};
@@ -160,10 +160,10 @@ impl Backend for OpenCode {
     /// A local turn has no seeded config, so the model is named on the command line under the
     /// `crucible` provider this machine's own opencode config is expected to carry. The prompt
     /// rides as the message positional after `--`, so one starting with `-` is still a message.
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String> {
         let mut a = Self::base_args(&local_export_path().to_string_lossy());
         a.push("--model".to_string());
-        a.push(format!("{CRUCIBLE_PROVIDER_ID}/{}", args.model()));
+        a.push(format!("{CRUCIBLE_PROVIDER_ID}/{}", agent.model));
         a.push("--".to_string());
         a.push(prompt.to_string());
         a
@@ -172,32 +172,32 @@ impl Backend for OpenCode {
     /// No message positional: `run` reads a piped stdin as the message, which the shared exec
     /// wrapper redirects from the uploaded prompt file. The model and the MCP servers come from
     /// the seeded config, not argv, so `args` and `mcp_seeded` are accepted and unused by design.
-    fn sandbox_argv(&self, _args: &Args, _mcp_seeded: bool) -> Vec<String> {
+    fn sandbox_argv(&self, _agent: &TurnAgent<'_>, _mcp_seeded: bool) -> Vec<String> {
         Self::base_args(EXPORT)
     }
 
     /// `opencode.json`, ALWAYS (it carries the model, the provider, and the permission posture).
     fn config(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String> {
         Some(config_json(
-            args.model(),
-            &api_endpoint(args.model(), inference, &args.env),
+            agent.model,
+            &api_endpoint(agent.model, inference, agent.env),
             servers,
         ))
     }
 
     fn decoder(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         _meters: Option<&LiveMeters>,
         tool_io: bool,
     ) -> Box<dyn StreamDecoder> {
         Box::new(
-            OpenCodeJsonParser::new(args.model())
+            OpenCodeJsonParser::new(agent.model)
                 .with_price(crate::agent::event::estimate_cost)
                 .with_tool_io(tool_io),
         )
@@ -418,6 +418,7 @@ fn export_records(content: &[u8]) -> Vec<GenAiRecord> {
 mod tests {
     use super::*;
     use crate::agent::harness::{SandboxAuth, SeedFile};
+    use crate::args::Args;
     use clap::Parser;
     use crucible_contract::event::AgentEvent;
 
@@ -428,11 +429,11 @@ mod tests {
     }
 
     fn seed_files(
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
-        OpenCode.seed_files(args, servers, &SandboxAuth::ApiKey, inference)
+        OpenCode.seed_files(agent, servers, &SandboxAuth::ApiKey, inference)
     }
 
     fn custom_endpoint() -> InferenceEnv {
@@ -452,14 +453,14 @@ mod tests {
     fn invocation_is_the_export_wrapper_around_headless_run() {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
-        let sandbox = OpenCode.sandbox_argv(&a, true);
+        let sandbox = OpenCode.sandbox_argv(&a.turn_agent(), true);
         assert_eq!(&sandbox[..2], &["bash", "-c"]);
         assert_eq!(sandbox[2], WRAPPER);
         assert_eq!(sandbox[3], "crucible-opencode");
         assert_eq!(sandbox[4], EXPORT);
         assert_eq!(&sandbox[5..], RUN_FLAGS, "no model, no message positional");
 
-        let local = OpenCode.local_argv(&a, "--- looks like a flag");
+        let local = OpenCode.local_argv(&a.turn_agent(), "--- looks like a flag");
         assert_eq!(&local[..4], &sandbox[..4]);
         assert!(
             local[4].ends_with("opencode/crucible-export.json"),
@@ -481,7 +482,12 @@ mod tests {
             ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
             ("CLOUD_ML_REGION".into(), "us-east5".into()),
         ];
-        let seeds = OpenCode.seed_files(&a, &[], &SandboxAuth::Gateway, &InferenceEnv::default());
+        let seeds = OpenCode.seed_files(
+            &a.turn_agent(),
+            &[],
+            &SandboxAuth::Gateway,
+            &InferenceEnv::default(),
+        );
         assert_eq!(seeds.len(), 1);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         assert_eq!(v["model"], "google-vertex-anthropic/claude-sonnet-5");
@@ -562,7 +568,7 @@ mod tests {
     fn config_registers_a_custom_endpoint_as_the_crucible_provider() {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
-        let seeds = seed_files(&a, &[], &custom_endpoint());
+        let seeds = seed_files(&a.turn_agent(), &[], &custom_endpoint());
         assert_eq!(
             seeds.len(),
             1,
@@ -590,7 +596,7 @@ mod tests {
             openai_key: Some("sk-oa".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, &[], &key_only);
+        let seeds = seed_files(&a.turn_agent(), &[], &key_only);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["provider"]["crucible"];
         assert_eq!(
@@ -608,7 +614,7 @@ mod tests {
             anthropic_key: Some("sk-ant".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, &[], &inference);
+        let seeds = seed_files(&a.turn_agent(), &[], &inference);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["provider"]["crucible"];
         assert_eq!(p["npm"], "@ai-sdk/anthropic");
@@ -621,7 +627,7 @@ mod tests {
     fn config_lists_exactly_the_turns_servers_as_remote_mcp_servers() {
         let a = args();
         let seeds = seed_files(
-            &a,
+            &a.turn_agent(),
             &[
                 McpServer {
                     name: "broker",

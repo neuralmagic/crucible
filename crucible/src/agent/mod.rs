@@ -182,8 +182,10 @@ fn local_command(
     session: Option<&crate::agent::agent_session::SessionTurn>,
 ) -> std::io::Result<Command> {
     let argv = match session {
-        Some(session) => backend(args.harness()).local_session_argv(args, prompt, session)?,
-        None => backend(args.harness()).local_argv(args, prompt),
+        Some(session) => {
+            backend(args.harness()).local_session_argv(&args.turn_agent(), prompt, session)?
+        }
+        None => backend(args.harness()).local_argv(&args.turn_agent(), prompt),
     };
     let Some((program, rest)) = argv.split_first() else {
         return Err(std::io::Error::other("harness produced an empty argv"));
@@ -245,7 +247,15 @@ pub(crate) fn run_turn_with_session(
     // not a single streamed child, delegate to its module rather than the generic path. It
     // reaches the engine runtime handle itself (see `crate::agent::engine::handle`).
     if source == AgentSource::OpenshellDriver {
-        return crate::openshell::run::turn(args, p, prompt, json, session, deadline, sink);
+        return crate::openshell::run::turn(
+            &args.sandbox_turn(),
+            p,
+            prompt,
+            json,
+            session,
+            deadline,
+            sink,
+        );
     }
     run_turn_with(&source, args, p, prompt, json, session, deadline, sink)
 }
@@ -269,13 +279,13 @@ fn run_turn_with(
     // log, the `otel-log` Tier 2 artifact.
     let collector = if matches!(source, AgentSource::LocalClaude)
         && args.harness().spec().otel_capable
-        && otel_enabled(args)
+        && otel_enabled(&args.env)
     {
         match OtelCollector::start(
             p.state.join("otel.jsonl"),
             "127.0.0.1",
             0,
-            otel_forward(args),
+            otel_forward(&args.env),
         ) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -331,8 +341,11 @@ fn run_turn_with(
         if matches!(source, AgentSource::LocalClaude) {
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
-            let decoder =
-                backend(args.harness()).decoder(args, meters.as_ref(), tool_io_full(args));
+            let decoder = backend(args.harness()).decoder(
+                &args.turn_agent(),
+                meters.as_ref(),
+                tool_io_full(&args.env),
+            );
             cost = pump_stream(out, json, decoder, args.pricing(), &mut sink);
         } else {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
@@ -466,15 +479,15 @@ mod tests {
     #[test]
     fn tool_io_defaults_compact_and_manifest_env_opts_in() {
         let mut a = args(&[]);
-        assert!(!tool_io_full(&a), "compact by default");
+        assert!(!tool_io_full(&a.env), "compact by default");
         a.env
             .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "full".to_string()));
-        assert!(tool_io_full(&a));
+        assert!(tool_io_full(&a.env));
         // Any value other than "full" stays compact.
         a.env.pop();
         a.env
             .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "yes".to_string()));
-        assert!(!tool_io_full(&a));
+        assert!(!tool_io_full(&a.env));
     }
 
     /// A temp workspace for a real turn (the `command` backend shells out for real).

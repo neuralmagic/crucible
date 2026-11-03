@@ -6,7 +6,7 @@
 //! what lives here: argv construction, env defaults, the sandbox seed files, the stream decoder,
 //! and the post-turn transcript backfill. A backend is the [`HarnessSpec`] table entry plus the
 //! few [`Backend`] methods that genuinely differ per CLI; the manifest's `Harness` token
-//! (`[agent].harness` or `--harness`, riding on [`Args`]) selects one through [`backend`].
+//! (`[agent].harness` or `--harness`, riding on [`TurnAgent`]) selects one through [`backend`].
 
 pub(crate) mod claude;
 pub(crate) mod codex;
@@ -16,7 +16,7 @@ pub(crate) mod pi;
 
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::inference::{InferenceEnv, WireApi};
-use crate::args::Args;
+use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
@@ -244,23 +244,23 @@ pub(crate) trait Backend: Sync {
     /// The model this backend hands its turn. Most take the shared `[agent].model` as-is; one that
     /// reads a `[agent.<harness>].model` of its own, or rejects a name from another vendor,
     /// overrides this and its argv builders call it.
-    fn model<'a>(&self, args: &'a Args) -> &'a str {
-        args.model()
+    fn model<'a>(&self, agent: &TurnAgent<'a>) -> &'a str {
+        agent.model
     }
 
     /// The full local-spawn argv (program name first): flags + the prompt as an argument.
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String>;
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String>;
 
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
     /// `mcp_seeded` says whether the turn reaches any MCP server, and so whether
     /// [`Backend::seed_files`] delivered an MCP config, so a harness that takes it on argv
     /// (claude's `--mcp-config`, pi's `-e` for the adapter) can point at it.
-    fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String>;
+    fn sandbox_argv(&self, agent: &TurnAgent<'_>, mcp_seeded: bool) -> Vec<String>;
 
     /// Start or resume a Crucible-managed session locally.
     fn local_session_argv(
         &self,
-        _args: &Args,
+        _agent: &TurnAgent<'_>,
         _prompt: &str,
         _session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
@@ -270,7 +270,7 @@ pub(crate) trait Backend: Sync {
     /// Sandbox counterpart of [`Backend::local_session_argv`].
     fn sandbox_session_argv(
         &self,
-        _args: &Args,
+        _agent: &TurnAgent<'_>,
         _mcp_seeded: bool,
         _session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
@@ -281,14 +281,14 @@ pub(crate) trait Backend: Sync {
     /// host-side; `None` seeds nothing this turn.
     fn config(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String>;
 
     /// The credential file a harness seeds when its credential cannot ride the gateway as-is:
     /// codex's `auth.json`, pi's Vertex extension.
-    fn credential(&self, _args: &Args, _auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(&self, _agent: &TurnAgent<'_>, _auth: &SandboxAuth) -> Option<SeedFile> {
         None
     }
 
@@ -305,7 +305,7 @@ pub(crate) trait Backend: Sync {
     /// (see [`crate::agent::turn::tool_io_full`]).
     fn decoder(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         meters: Option<&LiveMeters>,
         tool_io: bool,
     ) -> Box<dyn StreamDecoder>;
@@ -360,20 +360,20 @@ pub(crate) trait Backend: Sync {
     /// the openshell egress proxy resolves.
     fn seed_files(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         auth: &SandboxAuth,
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
         let mut seeds: Vec<SeedFile> = self
-            .config(args, servers, inference)
+            .config(agent, servers, inference)
             .map(|content| SeedFile {
                 content,
                 dest: self.spec().config,
             })
             .into_iter()
             .collect();
-        seeds.extend(self.credential(args, auth));
+        seeds.extend(self.credential(agent, auth));
         if !servers.is_empty() {
             seeds.extend(self.mcp_config(servers));
         }
@@ -770,13 +770,13 @@ mod tests {
         assert!(
             Harness::Codex
                 .backend()
-                .local_session_argv(&args, "p", &session)
+                .local_session_argv(&args.turn_agent(), "p", &session)
                 .is_err()
         );
         assert!(
             Harness::Codex
                 .backend()
-                .sandbox_session_argv(&args, false, &session)
+                .sandbox_session_argv(&args.turn_agent(), false, &session)
                 .is_err()
         );
         assert_eq!(
@@ -790,7 +790,7 @@ mod tests {
     #[test]
     fn each_harness_decodes_its_own_stdout() {
         let mut args = crate::cli::Cli::parse_from(["crucible"]).run;
-        let claude = Harness::Claude.backend().decoder(&args, None, false).push(
+        let claude = Harness::Claude.backend().decoder(&args.turn_agent(), None, false).push(
             r#"{"type":"system","subtype":"init","model":"claude-opus-4-8","tools":[],"agents":[]}"#,
         );
         assert!(
@@ -799,13 +799,13 @@ mod tests {
         );
         let hermes = Harness::Hermes
             .backend()
-            .decoder(&args, None, false)
+            .decoder(&args.turn_agent(), None, false)
             .push("plain text");
         assert!(matches!(&hermes[0], AgentEvent::Raw { .. }), "{hermes:?}");
         args.codex.model = Some("gpt-5.6-terra".to_string());
         let events = Harness::Codex
             .backend()
-            .decoder(&args, None, false)
+            .decoder(&args.turn_agent(), None, false)
             .push("{\"type\":\"thread.started\",\"thread_id\":\"t1\"}");
         assert!(
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "gpt-5.6-terra"),
@@ -814,7 +814,7 @@ mod tests {
         args.model = Some("qwen-3-8-27b".to_string());
         let events = Harness::OpenCode
             .backend()
-            .decoder(&args, None, false)
+            .decoder(&args.turn_agent(), None, false)
             .push(r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#);
         assert!(
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "qwen-3-8-27b"),
@@ -822,7 +822,7 @@ mod tests {
         );
         let events = Harness::Pi
             .backend()
-            .decoder(&args, None, false)
+            .decoder(&args.turn_agent(), None, false)
             .push(r#"{"type":"session","version":3,"id":"u","timestamp":"t","cwd":"/w"}"#);
         assert!(
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "qwen-3-8-27b"),

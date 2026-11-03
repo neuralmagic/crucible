@@ -408,6 +408,10 @@ pub const SANDBOX_SPIFFE_SOCKET_ENV: &str = "CRUCIBLE_SANDBOX_SPIFFE_SOCKET";
 pub const SERVE_CLIENT_TLS_SECRET_ENV: &str = "CRUCIBLE_GATEWAY_CLIENT_TLS_SECRET";
 pub const SERVE_SERVER_TLS_DIR_ENV: &str = "CRUCIBLE_GATEWAY_SERVER_TLS_DIR";
 
+/// Serializes gateway boots across the turns of one process; clones share the lock.
+#[derive(Clone, Default)]
+pub struct BootLock(std::sync::Arc<tokio::sync::Mutex<()>>);
+
 /// How this process reaches its gateway.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GatewayAccess {
@@ -809,15 +813,15 @@ fn libc_getuid() -> u32 {
 ///
 /// The driver images come from the render-projected env ([`DriverImages::from_env`]).
 /// Fan-out instances run their turns on concurrent threads and each arrives here; a second
-/// `generate-certs` under a live gateway rotates the CA its clients were issued from.
-static BOOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
+/// `generate-certs` under a live gateway rotates the CA its clients were issued from, so every
+/// turn of one process boots under the same [`BootLock`].
 #[tracing::instrument(name = "gateway_boot", skip_all, fields(driver = ?driver))]
 pub async fn ensure_running(
     driver: ComputeDriver,
     access: &GatewayAccess,
+    lock: &BootLock,
 ) -> Result<Option<String>> {
-    let _boot = BOOT.lock().await;
+    let _boot = lock.0.lock().await;
     match access {
         GatewayAccess::Local => {
             if !is_running(access).await {

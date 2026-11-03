@@ -16,7 +16,7 @@ use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::{McpServer, SandboxAuth, SandboxLayout, TurnArtifacts, backend};
 use crate::agent::relay;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
-use crate::args::{Args, Paths};
+use crate::args::{Paths, SandboxTurn};
 use crate::manifest::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
@@ -94,7 +94,7 @@ use tokio_util::sync::CancellationToken;
 /// [`AgentEvent::Error`] through the sink and lands in the outcome's
 /// [`TurnFailure::Orchestration`], carrying whatever the turn had already spent.
 pub fn turn(
-    args: &Args,
+    turn: &SandboxTurn<'_>,
     p: &Paths,
     prompt: &str,
     json: bool,
@@ -127,7 +127,7 @@ pub fn turn(
     let spent = CostMeter::default();
     let at = deadline.map(|d| d.at);
     let outcome = handle.block_on(try_turn(
-        args, p, prompt, json, session, at, &spent, &mut sink,
+        turn, p, prompt, json, session, at, &spent, &mut sink,
     ));
     if outcome.is_err()
         && let Some(deadline) = deadline
@@ -270,7 +270,7 @@ fn selected_codex_api_key(
     fields(
         backend = "openshell",
         workspace = %p.workspace.display(),
-        model = %args.model(),
+        model = %turn.agent.model,
         sandbox = tracing::field::Empty,
         // Queryable without waiting for the run/iteration ancestors to export (long spans only
         // reach the backend when they END): which logical session and turn this is.
@@ -279,7 +279,7 @@ fn selected_codex_api_key(
     )
 )]
 async fn try_turn(
-    args: &Args,
+    turn: &SandboxTurn<'_>,
     p: &Paths,
     prompt: &str,
     json: bool,
@@ -296,20 +296,20 @@ async fn try_turn(
 
     // Env values and relay files are provisioned below, so the disclosure gate runs here, before
     // the sandbox exists (RFC-0001:C-CAPABILITY-DISCLOSURE).
-    if let Some(covered) = &args.disclosure {
-        crate::exposure::refuse_uncovered(covered, &args.env, &args.relay)?;
+    if let Some(covered) = turn.disclosure {
+        crate::exposure::refuse_uncovered(covered, turn.agent.env, turn.relay)?;
     }
 
     // The agent harness for this turn (claude default): argv grammar, env script, seed files,
     // stream decoder, and the post-turn transcript contract all come from here.
-    let harness = args.harness();
+    let harness = turn.agent.harness;
     let backend = backend(harness);
 
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
     stage(sink, "starting the openshell gateway");
     let access = gateway::GatewayAccess::from_env()?;
-    let version_warning = gateway::ensure_running(args.compute_driver, &access)
+    let version_warning = gateway::ensure_running(turn.compute_driver, &access, turn.gateway_boot)
         .await
         .context("ensuring the openshell gateway is up")?;
     // A degraded version check (rev mismatch, unparseable version) is turn telemetry, not a
@@ -336,13 +336,13 @@ async fn try_turn(
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
     let auth = crate::agent::harness::resolve_auth(harness, &inference);
     let gen_ai_system =
-        crate::agent::harness::gen_ai_system(auth, args.model(), &inference, &args.env);
+        crate::agent::harness::gen_ai_system(auth, turn.agent.model, &inference, turn.agent.env);
     let sandbox_auth = match auth {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
                 .await
                 .context("minting the Vertex access token")?;
-            let vertex = crate::agent::inference::VertexConfig::from_env(&args.env);
+            let vertex = crate::agent::inference::VertexConfig::from_env(turn.agent.env);
             ensure_provider(&gw, &token, &vertex.project, &vertex.region).await?;
             SandboxAuth::Gateway
         }
@@ -356,16 +356,16 @@ async fn try_turn(
             }
             SandboxAuth::ApiKey
         }
-        AuthProvider::Codex => {
-            SandboxAuth::Codex(match selected_codex_api_key(&args.codex, &inference)? {
+        AuthProvider::Codex => SandboxAuth::Codex(
+            match selected_codex_api_key(turn.agent.codex, &inference)? {
                 Some(key) => provider::CodexAuth::ApiKey(key),
                 None => provider::CodexAuth::ChatGpt(
                     provider::mint_codex_token()
                         .await
                         .context("minting the codex ChatGPT access token")?,
                 ),
-            })
-        }
+            },
+        ),
     };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
@@ -385,8 +385,8 @@ async fn try_turn(
     //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
     //     policy endpoint bound to this provider (the step-4 `credential_binding`), so the real
     //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
-    let broker_provider = match args.broker_token.as_deref() {
-        Some(token) if args.broker.enabled => {
+    let broker_provider = match turn.broker_token {
+        Some(token) if turn.broker.enabled => {
             ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
             true
         }
@@ -399,8 +399,8 @@ async fn try_turn(
     let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
         .context("reading the run's agent servers")?;
     agent_servers.check_names(
-        args.broker.enabled.then_some(args.broker.name.as_str()),
-        args.mcp.iter().map(|s| s.key.as_str()),
+        turn.broker.enabled.then_some(turn.broker.name.as_str()),
+        turn.mcp.iter().map(|s| s.key.as_str()),
     )?;
     for s in agent_servers.iter() {
         tokio::task::block_in_place(|| s.start_local())
@@ -417,10 +417,9 @@ async fn try_turn(
     //    turn killed mid-create, or whose cleanup delete failed, leaves the name behind, and a
     //    bare create then fails "already exists" for the rest of the run. Clearing it makes
     //    create idempotent. Labels make the sandbox discoverable via `list --selector`.
-    let name = if args.broker.enabled {
-        sandbox::name_for(&p.workspace)
-    } else {
-        sandbox::fresh_name_for(&p.workspace)
+    let name = match turn.run_id {
+        Some(run) => sandbox::name_for(&p.workspace, run),
+        None => sandbox::fresh_name_for(&p.workspace),
     };
     tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
@@ -433,7 +432,7 @@ async fn try_turn(
         sink,
         &format!(
             "creating sandbox from {} (pulls the image on first use, up to {}s before the wait gives up)",
-            args.sandbox_image.as_deref().unwrap_or("the default image"),
+            turn.sandbox_image.unwrap_or("the default image"),
             grpc::pull_timeout().as_secs()
         ),
     );
@@ -455,11 +454,11 @@ async fn try_turn(
     let sandbox_id = gw
         .create_sandbox(
             &name,
-            args.sandbox_image.as_deref(),
+            turn.sandbox_image,
             &providers,
             &labels,
-            &args.openshell.read_only_paths,
-            &args.sandbox_resources,
+            &turn.openshell.read_only_paths,
+            turn.sandbox_resources,
         )
         .await
         .context("creating the openshell sandbox")?;
@@ -496,7 +495,7 @@ async fn try_turn(
     //     Alongside it, this turn's W3C traceparent at `<storage>/turn-traceparent`: the broker is
     //     run-lifetime, so it reads the per-turn parent from this file fresh per call (a static pod
     //     env would collapse every turn's broker spans onto the first turn's trace).
-    if args.broker.enabled {
+    if turn.broker.enabled {
         if let Err(e) = write_turn_token().await {
             let ev = AgentEvent::Raw {
                 text: format!("turn-token write failed (candidate budget stays uncapped): {e:#}"),
@@ -525,10 +524,12 @@ async fn try_turn(
     // `CRUCIBLE_OTEL`; a bind failure degrades to telemetry-off (no `otel_summary`, the
     // pricing-table estimate stays the cost fallback). Its `otel.jsonl` is the `otel-log` Tier 2
     // artifact.
-    let collector = if harness.spec().otel_capable && crate::agent::turn::otel_enabled(args) {
+    let collector = if harness.spec().otel_capable
+        && crate::agent::turn::otel_enabled(turn.agent.env)
+    {
         // The agent's exporter can't attribute its spans to a loop turn; the forwarder stamps
         // session + turn as resource attributes at the same boundary where it re-parents.
-        let forward = crate::agent::turn::otel_forward(args).map(|f| {
+        let forward = crate::agent::turn::otel_forward(turn.agent.env).map(|f| {
             let (name, turn) = session
                 .map(|s| (s.logical_name.clone(), s.completed_turns + 1))
                 .unwrap_or((String::new(), 1));
@@ -563,10 +564,10 @@ async fn try_turn(
         // 4. Egress policy (deny-by-default; merge domain extras over the built-ins). The
         //    broker endpoint is auto-appended when the broker is enabled, and
         //    the collector's egress rule is appended when on.
-        let driver = args.compute_driver;
-        let broker_url = if args.broker.enabled {
+        let driver = turn.compute_driver;
+        let broker_url = if turn.broker.enabled {
             Some(crate::manifest::resolve_broker_url(
-                &args.broker,
+                turn.broker,
                 driver.broker_host(),
             ))
         } else {
@@ -580,7 +581,7 @@ async fn try_turn(
             None => None,
         };
         let mut endpoints = policy::resolve_endpoints(
-            &args.openshell,
+            turn.openshell,
             &policy::default_endpoints(harness),
             broker_ep.as_deref(),
         );
@@ -594,10 +595,10 @@ async fn try_turn(
             endpoints.push(ep);
         }
         // Each `[mcp]` server in the turn's scope, appended after the deny list like the broker.
-        let mcp: Vec<_> = args
+        let mcp: Vec<_> = turn
             .mcp
             .iter()
-            .filter(|s| args.mcp_scope.contains(&s.key))
+            .filter(|s| turn.mcp_scope.contains(&s.key))
             .map(|s| (s, format!("http://{}:{}/mcp", driver.broker_host(), s.port)))
             .collect();
         for (_, url) in &mcp {
@@ -637,10 +638,10 @@ async fn try_turn(
         }
         gw.update_policy_wait_with_tls_skip(
             &name,
-            &policy::resolve_binaries(&args.openshell, harness.spec().binaries),
+            &policy::resolve_binaries(turn.openshell, harness.spec().binaries),
             &endpoints,
             &credential_bindings,
-            &args.openshell.tls_skip_endpoints,
+            &turn.openshell.tls_skip_endpoints,
         )
         .await
         .context("applying the sandbox egress policy")?;
@@ -656,7 +657,7 @@ async fn try_turn(
         .await?;
 
         // 6. Targeted-upload each relayed cred to its sandbox path (never via the repo).
-        for rf in &args.relay {
+        for rf in turn.relay {
             let content = relay::render(&p.workspace, rf)
                 .with_context(|| format!("rendering relay `{}`", rf.dest))?;
             let tmp = write_temp("cred", &content).await?;
@@ -671,7 +672,7 @@ async fn try_turn(
         // 7. Upload the env script and the prompt to absolute /tmp paths. The collector's OTEL_*
         //    matrix appends after the manifest env (so a later `export` wins), pointing the agent's
         //    exporter at the driver-resolved host.
-        let mut turn_env = args.env.clone();
+        let mut turn_env = turn.agent.env.to_vec();
         if let Some(c) = &collector {
             turn_env.extend(crucible_harness::otel_env(
                 &c.sandbox_endpoint(driver.broker_host()),
@@ -713,7 +714,7 @@ async fn try_turn(
                 Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
             }
             (true, BrokerPlaceholder::Canonical) => Some(provider::broker_token_placeholder()),
-            (false, _) => args.broker_token.clone(),
+            (false, _) => turn.broker_token.map(str::to_string),
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -723,7 +724,7 @@ async fn try_turn(
         let mut servers: Vec<McpServer<'_>> = broker_url
             .iter()
             .map(|url| McpServer {
-                name: &args.broker.name,
+                name: &turn.broker.name,
                 url,
                 token: seed_token.as_deref(),
             })
@@ -738,7 +739,7 @@ async fn try_turn(
             url: &s.server.url,
             token: None,
         }));
-        let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
+        let seeds = backend.seed_files(&turn.agent, &servers, &sandbox_auth, &inference);
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
             run_os(
@@ -763,13 +764,13 @@ async fn try_turn(
         let mcp_seeded = !servers.is_empty();
         let argv = match session {
             Some(session) => backend
-                .sandbox_session_argv(args, mcp_seeded, session)
+                .sandbox_session_argv(&turn.agent, mcp_seeded, session)
                 .context("building continuing sandbox harness argv")?,
-            None => backend.sandbox_argv(args, mcp_seeded),
+            None => backend.sandbox_argv(&turn.agent, mcp_seeded),
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
-            pricing: args.pricing(),
+            pricing: turn.pricing,
             json,
             cancel: &cancel,
         };
@@ -805,9 +806,9 @@ async fn try_turn(
             AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => None,
         };
         let decoder = backend.decoder(
-            args,
+            &turn.agent,
             meters.as_ref(),
-            crate::agent::turn::tool_io_full(args),
+            crate::agent::turn::tool_io_full(turn.agent.env),
         );
         let exec_result =
             exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, spent, sink).await;
@@ -872,7 +873,7 @@ async fn try_turn(
     {
         let _ = gw.delete_sandbox(&name).await;
     }
-    for server in &args.mcp {
+    for server in turn.mcp {
         if let Err(e) = server.tokens.revoke(&name) {
             tracing::warn!("revoking {name}'s token on [mcp.{}]: {e:#}", server.key);
         }
