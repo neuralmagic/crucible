@@ -259,7 +259,7 @@ pub struct People {
     pub config: PeopleConfig,
     pub clients: Clients,
     pub grants: grants::PgGrantStore,
-    pub directory: Arc<crate::identity::people_directory::ControllerDirectory>,
+    pub directory: Arc<directory::ControllerDirectory>,
 }
 
 /// A person's access token for `approved`, acting as `kube_user`.

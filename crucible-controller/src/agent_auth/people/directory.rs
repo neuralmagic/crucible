@@ -1,6 +1,12 @@
 //! What the people grant reads about a subject: whether they may still sign in, and who they are
-//! on a cluster. [`crate::identity::people_directory::ControllerDirectory`] answers both from the
-//! controller's own tables; the grant never reads them.
+//! on a cluster. [`ControllerDirectory`] answers both from the controller's own tables.
+
+use crate::agent_auth::people::Approved;
+use crate::identity::cluster_identity::{self, Person, Resolution};
+use anyhow::Context;
+use forge::fleet::ClusterIdentity;
+use sqlx::PgPool;
+use std::collections::BTreeMap;
 
 /// A subject who may still sign in, as their login recorded them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,4 +24,64 @@ pub enum ClusterUser {
     Unlinked,
     /// The cluster's rule names a claim this login did not carry, or one that is no username.
     Unavailable(String),
+}
+
+pub struct ControllerDirectory {
+    pool: PgPool,
+    rules: BTreeMap<String, ClusterIdentity>,
+}
+
+impl ControllerDirectory {
+    /// The rules come from the deploy profile once; a cluster it does not list is `link`.
+    pub fn new(pool: PgPool, profile: &crucible::deploy::DeployProfile) -> Self {
+        Self {
+            pool,
+            rules: profile
+                .cluster_identities()
+                .into_iter()
+                .map(|(cluster, rule)| (cluster.to_string(), rule.clone()))
+                .collect(),
+        }
+    }
+}
+
+impl ControllerDirectory {
+    /// A subject whose row exists and whose stored credential the identity provider has not
+    /// refused: the condition that downgrades a browser session. `None` when the subject is gone
+    /// or their identity provider refused them.
+    pub async fn allowed(&self, sub: &str) -> anyhow::Result<Option<Allowed>> {
+        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT u.login, u.email, c.last_error FROM users u
+               LEFT JOIN user_credentials c ON c.sub = u.sub
+              WHERE u.sub = $1",
+        )
+        .bind(sub)
+        .fetch_optional(&self.pool)
+        .await
+        .context("reading the person behind an approval")?;
+        Ok(row
+            .filter(|(_, _, refused)| refused.is_none())
+            .map(|(login, email, _)| Allowed { login, email }))
+    }
+
+    /// The username `approved` acts as on its cluster, read fresh on every call.
+    pub async fn kube_user(&self, approved: &Approved) -> anyhow::Result<ClusterUser> {
+        let rule = self
+            .rules
+            .get(&approved.cluster)
+            .cloned()
+            .unwrap_or_default();
+        let person = Person {
+            sub: &approved.sub,
+            login: &approved.login,
+            email: approved.email.as_deref(),
+        };
+        Ok(
+            match cluster_identity::resolve(&self.pool, &approved.cluster, &rule, person).await? {
+                Resolution::Known { user, .. } => ClusterUser::Known(user.as_str().to_string()),
+                Resolution::Unlinked => ClusterUser::Unlinked,
+                Resolution::Unavailable(why) => ClusterUser::Unavailable(why),
+            },
+        )
+    }
 }
