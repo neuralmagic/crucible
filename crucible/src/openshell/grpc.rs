@@ -454,7 +454,7 @@ impl Gateway {
         &self,
         name: &str,
         image: Option<&str>,
-        providers: &[String],
+        providers: &[ProviderName],
         labels: &[(String, String)],
         read_only_paths: &[String],
         resources: &crate::manifest::SandboxResources,
@@ -484,7 +484,7 @@ impl Gateway {
         let policy = sandbox_filesystem_policy(read_only_paths, resources.gpus);
         let request = scoped(CreateSandboxRequest {
             spec: Some(SandboxSpec {
-                providers: providers.to_vec(),
+                providers: providers.iter().map(|p| p.as_str().to_string()).collect(),
                 template,
                 policy,
                 resource_requirements: (resources.gpus > 0).then_some(ResourceRequirements {
@@ -1429,11 +1429,37 @@ fn is_deny_action(action: &str) -> bool {
 /// provider `provider`'s credential placeholders resolved at the egress proxy. The endpoint is
 /// upgraded to `protocol: rest` if it was L4-only — placeholder rewrite happens in the L7 relay,
 /// a CONNECT tunnel never sees the header.
+/// A gateway provider's name: one of the engine's fixed providers, or the grant provider of an
+/// agent server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderName(std::borrow::Cow<'static, str>);
+
+impl ProviderName {
+    pub const fn new(name: &'static str) -> Self {
+        ProviderName(std::borrow::Cow::Borrowed(name))
+    }
+
+    /// The provider carrying the agent server `server`'s token grant.
+    pub fn for_server(server: &str) -> Self {
+        ProviderName(std::borrow::Cow::Owned(format!("crucible-{server}")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug)]
 pub struct EndpointCredentialBinding {
     pub host: String,
-    pub port: u32,
-    pub provider: String,
+    pub port: u16,
+    pub provider: ProviderName,
 }
 
 /// Build the incremental `UpdateConfig` merge operations: one add-rule per endpoint, each rule
@@ -1474,13 +1500,13 @@ fn build_merge_operations_with_tls_skip(
             }
             if let Some(b) = credential_bindings
                 .iter()
-                .find(|b| endpoint.host == b.host && endpoint.port == b.port)
+                .find(|b| endpoint.host == b.host && endpoint.port == u32::from(b.port))
             {
                 if endpoint.protocol.is_empty() {
                     endpoint.protocol = "rest".to_string();
                 }
                 endpoint.credential_binding = Some(NetworkCredentialBinding {
-                    provider: b.provider.clone(),
+                    provider: b.provider.as_str().to_string(),
                 });
             }
             let rule_name = generated_rule_name(&endpoint.host, endpoint.port);
@@ -2053,7 +2079,7 @@ pYBZ
         let binding = EndpointCredentialBinding {
             host: "crucible-kueue.crucible-system.svc.cluster.local".to_string(),
             port: 8850,
-            provider: "crucible-kueue".to_string(),
+            provider: ProviderName::new("crucible-kueue"),
         };
         let ops = build_merge_operations(
             &["/usr/local/bin/claude".to_string()],
@@ -2174,7 +2200,7 @@ pYBZ
         let binding = EndpointCredentialBinding {
             host: "host.openshell.internal".to_string(),
             port: 8849,
-            provider: "crucible-broker".to_string(),
+            provider: ProviderName::new("crucible-broker"),
         };
         let ops = build_merge_operations(
             &["/usr/local/bin/claude".to_string()],
@@ -2211,7 +2237,7 @@ pYBZ
         let binding = EndpointCredentialBinding {
             host: "h".to_string(),
             port: 8849,
-            provider: "crucible-broker".to_string(),
+            provider: ProviderName::new("crucible-broker"),
         };
         let ops = build_merge_operations(
             &[],
@@ -2249,7 +2275,7 @@ pYBZ
                 .map(|h| EndpointCredentialBinding {
                     host: (*h).to_string(),
                     port: 443,
-                    provider: "ci-gcp".to_string(),
+                    provider: ProviderName::new("ci-gcp"),
                 })
                 .collect();
         let endpoints: Vec<String> = crate::openshell::policy::DEFAULT_ENDPOINTS

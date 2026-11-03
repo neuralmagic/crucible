@@ -10,6 +10,7 @@
 use crate::manifest::Harness;
 use anyhow::{Context, Result};
 use crucible::harness::ApiFamily;
+use crucible::openshell::endpoint::Endpoint;
 use crucible_contract::inference::{
     InferenceBinding, InferenceProtocol, InferenceRole, TokenPrice,
 };
@@ -219,7 +220,7 @@ impl InferenceEnv {
     }
 
     /// The egress entry the sandbox needs for the harness's custom base URL, if there is one.
-    pub fn egress_endpoint_for(&self, harness: Harness) -> Result<Option<String>> {
+    pub fn egress_endpoint_for(&self, harness: Harness) -> Result<Option<Endpoint>> {
         self.base_url_for(harness).map(egress_endpoint).transpose()
     }
 }
@@ -258,7 +259,7 @@ impl VertexConfig {
 }
 
 /// A base URL as the sandbox policy's `host:port:full` entry.
-pub fn egress_endpoint(base_url: &str) -> Result<String> {
+pub fn egress_endpoint(base_url: &str) -> Result<Endpoint> {
     crate::manifest::broker_endpoint_from_url(base_url)
 }
 
@@ -366,7 +367,10 @@ mod tests {
                 "an OpenAI key is not an Anthropic key"
             );
             assert_eq!(
-                env.egress_endpoint_for(Harness::Codex).unwrap().as_deref(),
+                env.egress_endpoint_for(Harness::Codex)
+                    .unwrap()
+                    .map(|e| e.to_string())
+                    .as_deref(),
                 Some("vllm.internal:8000:full")
             );
         }
@@ -530,11 +534,15 @@ mod tests {
     #[test]
     fn a_base_url_becomes_an_egress_entry_on_its_own_port() {
         assert_eq!(
-            egress_endpoint("http://vllm.internal:8000/v1").unwrap(),
+            egress_endpoint("http://vllm.internal:8000/v1")
+                .unwrap()
+                .to_string(),
             "vllm.internal:8000:full"
         );
         assert_eq!(
-            egress_endpoint("https://proxy.corp/v1").unwrap(),
+            egress_endpoint("https://proxy.corp/v1")
+                .unwrap()
+                .to_string(),
             "proxy.corp:443:full"
         );
         assert!(egress_endpoint("vllm.internal/v1").is_err());
@@ -563,7 +571,10 @@ mod tests {
             Some("http://vllm.internal:8000/v1")
         );
         assert_eq!(
-            env.egress_endpoint_for(Harness::Codex).unwrap().as_deref(),
+            env.egress_endpoint_for(Harness::Codex)
+                .unwrap()
+                .map(|e| e.to_string())
+                .as_deref(),
             Some("vllm.internal:8000:full")
         );
         assert_eq!(

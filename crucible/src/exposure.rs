@@ -192,7 +192,7 @@ fn egress(m: &Manifest) -> Vec<Capability> {
     let resolved = crate::openshell::policy::resolve_endpoints(
         &m.agent.openshell,
         &harness_defaults,
-        broker_endpoint.as_deref(),
+        broker_endpoint.as_ref(),
     );
     resolved
         .iter()
@@ -218,7 +218,7 @@ fn egress(m: &Manifest) -> Vec<Capability> {
 /// The broker's own allowlist entry, when the pack enables one. The sandbox reaches the loop pod
 /// through the compute driver's alias; both drivers name the same pod, so the disclosure states
 /// the in-cluster one.
-fn broker_endpoint(m: &Manifest) -> Option<String> {
+fn broker_endpoint(m: &Manifest) -> Option<crate::openshell::endpoint::Endpoint> {
     if !m.agent.broker.enabled {
         return None;
     }

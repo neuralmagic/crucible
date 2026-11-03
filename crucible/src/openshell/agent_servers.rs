@@ -5,8 +5,10 @@
 //! token on egress to that server alone, so no token reaches the loop pod or the sandbox. No
 //! servers, nothing: no provider, no egress entry, no `.mcp.json` entry.
 
+use crate::openshell::grpc::ProviderName;
 use crate::openshell::{buildit, provider};
 use anyhow::Result;
+use crucible::openshell::endpoint::{Access, Endpoint, Protocol};
 use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS, LocalServer, Transport};
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
@@ -65,14 +67,17 @@ impl Granted {
     }
 
     /// The gateway provider carrying this server's grant.
-    pub fn provider_name(&self) -> String {
-        format!("crucible-{}", self.server.name)
+    pub fn provider_name(&self) -> ProviderName {
+        ProviderName::for_server(self.server.name.as_str())
     }
 
     /// The sandbox egress entry: HTTP-inspected, so the supervisor injects the token, with every
     /// request allowed. The server decides each call itself.
-    pub fn egress_endpoint(&self) -> String {
-        format!("{}:{}:full:rest", self.host, self.port)
+    pub fn egress_endpoint(&self) -> Endpoint {
+        Endpoint {
+            protocol: Some(Protocol::Rest),
+            ..Endpoint::l4(self.host.clone(), self.port, Access::Full)
+        }
     }
 
     /// Start the server in the loop pod when it runs there, and wait until it listens.
@@ -287,7 +292,12 @@ mod tests {
         ]);
         let rows: Vec<(String, String)> = servers
             .iter()
-            .map(|g| (g.provider_name(), g.egress_endpoint()))
+            .map(|g| {
+                (
+                    g.provider_name().to_string(),
+                    g.egress_endpoint().to_string(),
+                )
+            })
             .collect();
         assert_eq!(
             rows,
@@ -315,7 +325,7 @@ mod tests {
                     "{}:{}:full:{}",
                     endpoint.host, endpoint.port, endpoint.protocol
                 ),
-                g.egress_endpoint()
+                g.egress_endpoint().to_string()
             );
             let grant = profile.credentials[0].token_grant.as_ref().unwrap();
             assert_eq!(grant.audience, g.server.url);

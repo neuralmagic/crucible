@@ -138,14 +138,14 @@ pub const IDENTITY_RELAY_KEYS: &[&str] = &[
 pub fn resolve_endpoints(
     cfg: &OpenshellCfg,
     defaults: &[&str],
-    broker_endpoint: Option<&str>,
+    broker_endpoint: Option<&Endpoint>,
 ) -> Vec<String> {
     let merged = merge(inherited(cfg, defaults), &cfg.endpoints);
     let mut out = subtract_endpoints(merged, &cfg.deny_endpoints);
-    if let Some(ep) = broker_endpoint
-        && !out.iter().any(|seen| seen == ep)
+    if let Some(ep) = broker_endpoint.map(Endpoint::to_string)
+        && !out.contains(&ep)
     {
-        out.push(ep.to_string());
+        out.push(ep);
     }
     out
 }
@@ -370,7 +370,7 @@ mod tests {
         // auto-appended at the end, without duplicates.
         let c = OpenshellCfg::default();
         let ep = "host.containers.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(&ep.parse().unwrap()));
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() + 1);
         assert_eq!(eps.last().unwrap(), ep);
     }
@@ -381,7 +381,7 @@ mod tests {
         // endpoint: the broker is engine plumbing, not a domain-subtractable built-in.
         let c = sealed(&[], &[]);
         let ep = "host.containers.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(&ep.parse().unwrap()));
         assert_eq!(eps, vec![ep]);
     }
 
@@ -391,7 +391,7 @@ mod tests {
         // it, it must not appear twice.
         let ep = "host.containers.internal:8849:full";
         let c = cfg(&[ep], &[]);
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(&ep.parse().unwrap()));
         assert_eq!(
             eps.iter().filter(|e| *e == ep).count(),
             1,
@@ -404,7 +404,7 @@ mod tests {
         // Under the kubernetes driver, the broker host is `host.openshell.internal`.
         let c = OpenshellCfg::default();
         let ep = "host.openshell.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(&ep.parse().unwrap()));
         assert!(eps.contains(&ep.to_string()));
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() + 1);
     }
@@ -605,7 +605,7 @@ mod tests {
             ..OpenshellCfg::default()
         };
         let ep = "host.containers.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(&ep.parse().unwrap()));
         assert!(!eps.iter().any(|e| e.contains("github.com")));
         assert_eq!(eps.last().unwrap(), ep);
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() - 1);

@@ -386,29 +386,30 @@ async fn try_turn(
     //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
     //     policy endpoint bound to this provider (the step-4 `credential_binding`), so the real
     //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
-    let broker_provider = match turn.broker_token {
-        Some(token) if turn.broker.enabled => {
-            ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
-            true
-        }
-        _ => false,
-    };
-
-    // 2d. The run's MCP servers that take agent tokens: each a token-grant provider whose tokens
-    //     the sandbox's supervisor obtains from the controller and injects on traffic to that
-    //     server alone. One served in this pod is started first.
     let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
         .context("reading the run's agent servers")?;
     agent_servers.check_names(
         turn.broker.enabled.then_some(turn.broker.name.as_str()),
         turn.mcp.iter().map(|s| s.key.as_str()),
     )?;
+    let broker_auth = BrokerAuth::resolve(
+        turn.broker.enabled,
+        turn.broker_token,
+        !agent_servers.is_empty(),
+    );
+    if let (BrokerAuth::Provider(_), Some(token)) = (&broker_auth, turn.broker_token) {
+        ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
+    }
+
+    // 2d. The run's MCP servers that take agent tokens: each a token-grant provider whose tokens
+    //     the sandbox's supervisor obtains from the controller and injects on traffic to that
+    //     server alone. One served in this pod is started first.
     for s in agent_servers.iter() {
         tokio::task::block_in_place(|| s.start_local())
             .with_context(|| format!("starting the run's {}", s.server.name))?;
         ensure_token_grant_provider(
             &gw,
-            &s.provider_name(),
+            s.provider_name().as_str(),
             agent_servers.token_grant_profile(s),
         )
         .await?;
@@ -442,15 +443,13 @@ async fn try_turn(
         ("crucible-workspace".to_string(), label_value(&basename)),
     ];
     let mut providers = match auth {
-        AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
+        AuthProvider::Vertex => vec![provider::PROVIDER_NAME.clone()],
         AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => Vec::new(),
     };
     if aws_provider {
-        providers.push(provider::AWS_PROVIDER_NAME.to_string());
+        providers.push(provider::AWS_PROVIDER_NAME.clone());
     }
-    if broker_provider {
-        providers.push(provider::BROKER_PROVIDER_NAME.to_string());
-    }
+    providers.extend(broker_auth.provider().cloned());
     providers.extend(agent_servers.iter().map(|s| s.provider_name()));
     let sandbox_id = gw
         .create_sandbox(
@@ -584,13 +583,15 @@ async fn try_turn(
         let mut endpoints = policy::resolve_endpoints(
             turn.openshell,
             &policy::default_endpoints(harness),
-            broker_ep.as_deref(),
+            broker_ep.as_ref(),
         );
         if let Some(c) = &collector {
             endpoints.push(c.sandbox_egress(driver.broker_host()));
         }
         // A custom base URL is a host the harness's built-in allowlist never named.
-        if let Some(ep) = inference.egress_endpoint_for(harness)?
+        if let Some(ep) = inference
+            .egress_endpoint_for(harness)?
+            .map(|e| e.to_string())
             && !endpoints.contains(&ep)
         {
             endpoints.push(ep);
@@ -603,27 +604,25 @@ async fn try_turn(
             .map(|s| (s, format!("http://{}:{}/mcp", driver.broker_host(), s.port)))
             .collect();
         for (_, url) in &mcp {
-            let ep = crate::manifest::broker_endpoint_from_url(url)?;
+            let ep = crate::manifest::broker_endpoint_from_url(url)?.to_string();
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
         }
         let mut credential_bindings: Vec<grpc::EndpointCredentialBinding> = broker_ep
-            .as_deref()
-            .filter(|_| broker_provider)
-            .and_then(|ep| {
-                let mut it = ep.split(':');
-                let host = it.next()?.to_string();
-                let port: u32 = it.next()?.parse().ok()?;
-                Some(grpc::EndpointCredentialBinding {
-                    host,
-                    port,
-                    provider: provider::BROKER_PROVIDER_NAME.to_string(),
-                })
+            .as_ref()
+            .zip(broker_auth.provider())
+            .map(|(ep, provider)| grpc::EndpointCredentialBinding {
+                host: ep.host.clone(),
+                port: ep.port,
+                provider: provider.clone(),
             })
             .into_iter()
             .collect();
-        for ep in agent_servers.iter().map(|s| s.egress_endpoint()) {
+        for ep in agent_servers
+            .iter()
+            .map(|s| s.egress_endpoint().to_string())
+        {
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
@@ -633,7 +632,7 @@ async fn try_turn(
                 grpc::EndpointCredentialBinding {
                     host: (*host).to_string(),
                     port: 443,
-                    provider: provider::PROVIDER_NAME.to_string(),
+                    provider: provider::PROVIDER_NAME.clone(),
                 }
             }));
         }
@@ -708,15 +707,14 @@ async fn try_turn(
         //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
         //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
         //     a fresh token naming this sandbox and its workdir.
-        let seed_token = match (
-            broker_provider,
-            broker_placeholder(!agent_servers.is_empty()),
-        ) {
-            (true, BrokerPlaceholder::Issued) => {
+        let seed_token = match &broker_auth {
+            BrokerAuth::Provider(Placeholder::Issued) => {
                 Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
             }
-            (true, BrokerPlaceholder::Canonical) => Some(provider::broker_token_placeholder()),
-            (false, _) => turn.broker_token.map(str::to_string),
+            BrokerAuth::Provider(Placeholder::Canonical) => {
+                Some(provider::broker_token_placeholder())
+            }
+            BrokerAuth::None => turn.broker_token.map(str::to_string),
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -791,7 +789,7 @@ async fn try_turn(
                             Ok(t) => {
                                 if let Err(e) = gw
                                     .update_provider(
-                                        provider::PROVIDER_NAME,
+                                        provider::PROVIDER_NAME.as_str(),
                                         provider::CRED_KEY,
                                         &t,
                                     )
@@ -941,10 +939,10 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     gw.ensure_provider_profile(provider::google_cloud_profile())
         .await
         .context("importing the google-cloud provider profile")?;
-    if !gw.provider_exists(provider::PROVIDER_NAME).await
+    if !gw.provider_exists(provider::PROVIDER_NAME.as_str()).await
         && gw
             .create_provider(
-                provider::PROVIDER_NAME,
+                provider::PROVIDER_NAME.as_str(),
                 provider::CRED_KEY,
                 token,
                 provider::PROVIDER_TYPE,
@@ -957,7 +955,7 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     {
         return Ok(());
     }
-    gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
+    gw.update_provider(provider::PROVIDER_NAME.as_str(), provider::CRED_KEY, token)
         .await
         .context("updating the Vertex provider token")
 }
@@ -1013,18 +1011,39 @@ fn binds_sandboxes(
 
 /// How the sandbox's `.mcp.json` names the broker token.
 #[derive(Debug, PartialEq, Eq)]
-enum BrokerPlaceholder {
+enum Placeholder {
     /// [`provider::broker_token_placeholder`].
     Canonical,
     /// The placeholder the gateway issued the workload, read from the sandbox.
     Issued,
 }
 
-/// The issued placeholder only alongside a token grant; otherwise the canonical one.
-fn broker_placeholder(token_grant: bool) -> BrokerPlaceholder {
-    match token_grant {
-        true => BrokerPlaceholder::Issued,
-        false => BrokerPlaceholder::Canonical,
+/// How the sandbox authenticates to the run's broker.
+#[derive(Debug, PartialEq, Eq)]
+enum BrokerAuth {
+    /// No broker provider this turn: the seed carries whatever token the run holds, in clear.
+    None,
+    /// The token is a static credential on the broker provider and the seed carries only a
+    /// placeholder, so the real token never enters the sandbox. The issued placeholder only
+    /// alongside a token grant; otherwise the canonical one.
+    Provider(Placeholder),
+}
+
+impl BrokerAuth {
+    fn resolve(enabled: bool, token: Option<&str>, token_grant: bool) -> Self {
+        match (enabled, token, token_grant) {
+            (true, Some(_), true) => BrokerAuth::Provider(Placeholder::Issued),
+            (true, Some(_), false) => BrokerAuth::Provider(Placeholder::Canonical),
+            _ => BrokerAuth::None,
+        }
+    }
+
+    /// The gateway provider the sandbox attaches and the broker endpoint binds to.
+    fn provider(&self) -> Option<&'static grpc::ProviderName> {
+        match self {
+            BrokerAuth::Provider(_) => Some(&provider::BROKER_PROVIDER_NAME),
+            BrokerAuth::None => None,
+        }
     }
 }
 
@@ -1032,7 +1051,7 @@ fn broker_placeholder(token_grant: bool) -> BrokerPlaceholder {
 /// key its placeholder resolves through.
 struct StaticProvider {
     profile: openshell_core::proto::ProviderProfile,
-    name: &'static str,
+    name: grpc::ProviderName,
     cred_key: &'static str,
 }
 
@@ -1040,7 +1059,7 @@ impl StaticProvider {
     fn broker() -> Self {
         Self {
             profile: provider::broker_profile(),
-            name: provider::BROKER_PROVIDER_NAME,
+            name: provider::BROKER_PROVIDER_NAME.clone(),
             cred_key: provider::BROKER_CRED_KEY,
         }
     }
@@ -1054,16 +1073,16 @@ async fn ensure_static_provider(gw: &Gateway, p: &StaticProvider, token: &str) -
     gw.ensure_provider_profile(p.profile.clone())
         .await
         .with_context(|| format!("importing the {} provider profile", p.name))?;
-    if !gw.provider_exists(p.name).await
+    if !gw.provider_exists(p.name.as_str()).await
         && gw
-            .create_static_provider(p.name, p.cred_key, token, &profile_id)
+            .create_static_provider(p.name.as_str(), p.cred_key, token, &profile_id)
             .await
             .with_context(|| format!("creating the {} provider", p.name))?
             == grpc::ProviderCreate::Created
     {
         return Ok(());
     }
-    gw.update_provider(p.name, p.cred_key, token)
+    gw.update_provider(p.name.as_str(), p.cred_key, token)
         .await
         .with_context(|| format!("updating the {} provider token", p.name))
 }
@@ -1096,9 +1115,12 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     gw.ensure_provider_profile(provider::aws_s3_profile())
         .await
         .context("importing the aws-s3 provider profile")?;
-    gw.ensure_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
-        .await
-        .context("creating the aws-s3 provider")?;
+    gw.ensure_minted_provider(
+        provider::AWS_PROVIDER_NAME.as_str(),
+        provider::AWS_PROVIDER_TYPE,
+    )
+    .await
+    .context("creating the aws-s3 provider")?;
     let mut material = std::collections::HashMap::from([
         ("role_arn".to_string(), role_arn.to_string()),
         ("session_name".to_string(), "crucible-sandbox".to_string()),
@@ -1109,16 +1131,19 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
         material.insert("aws_region".to_string(), region.trim().to_string());
     }
     gw.configure_provider_refresh(
-        provider::AWS_PROVIDER_NAME,
+        provider::AWS_PROVIDER_NAME.as_str(),
         provider::AWS_PRIMARY_CRED,
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
         material,
     )
     .await
     .context("configuring the aws-s3 assume-role refresh")?;
-    gw.rotate_provider_credential(provider::AWS_PROVIDER_NAME, provider::AWS_PRIMARY_CRED)
-        .await
-        .context("pre-warming the aws-s3 credentials")
+    gw.rotate_provider_credential(
+        provider::AWS_PROVIDER_NAME.as_str(),
+        provider::AWS_PRIMARY_CRED,
+    )
+    .await
+    .context("pre-warming the aws-s3 credentials")
 }
 
 /// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the turn's
@@ -1772,9 +1797,25 @@ mod tests {
 
     #[test]
     fn the_broker_placeholder_reads_the_sandbox_only_alongside_a_token_grant() {
-        use crate::openshell::run::{BrokerPlaceholder, broker_placeholder};
-        assert_eq!(broker_placeholder(false), BrokerPlaceholder::Canonical);
-        assert_eq!(broker_placeholder(true), BrokerPlaceholder::Issued);
+        use crate::openshell::run::{BrokerAuth, Placeholder};
+        assert_eq!(
+            BrokerAuth::resolve(true, Some("t"), false),
+            BrokerAuth::Provider(Placeholder::Canonical)
+        );
+        assert_eq!(
+            BrokerAuth::resolve(true, Some("t"), true),
+            BrokerAuth::Provider(Placeholder::Issued)
+        );
+        assert_eq!(BrokerAuth::resolve(true, None, true), BrokerAuth::None);
+        assert_eq!(
+            BrokerAuth::resolve(false, Some("t"), true),
+            BrokerAuth::None
+        );
+        assert_eq!(
+            BrokerAuth::resolve(true, Some("t"), false).provider(),
+            Some(&crate::openshell::provider::BROKER_PROVIDER_NAME)
+        );
+        assert_eq!(BrokerAuth::None.provider(), None);
         assert_eq!(
             crate::openshell::provider::broker_token_placeholder(),
             format!(
