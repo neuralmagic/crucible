@@ -500,6 +500,10 @@ mod tests {
                 "0072_manifest_variants.sql",
                 "820c18c5010b64c2c133de3afc5833ab9b689a574848a4097bee3bc39ba64b95",
             ),
+            (
+                "0073_github_token_secret_kind.sql",
+                "6f3e8fef73c64ce84ac99360bfb00dfe52c1c073065204526256c1e5eba2884b",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {
