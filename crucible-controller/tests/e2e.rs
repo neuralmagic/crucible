@@ -563,6 +563,7 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
     ControllerCfg {
         secret_provider: None,
         owner_refresh: None,
+        runtime: Default::default(),
         schedule_owner_ttl_secs: 604800,
         local_secret_allowlist: Vec::new(),
         state_dir: state_dir.to_path_buf(),
@@ -654,6 +655,22 @@ fn daemon_cfg() -> DaemonConfig {
 /// Await a DB-observable state instead of sleeping blind: poll until the issue reaches `want`.
 /// The deadline is generous (a 2-core CI runner is slow, not wrong) and the failure is loud: the
 /// issue's current state plus its scope row, so a wedged chain is diagnosable from the panic.
+/// Block until `launcher` has created `n` pods. The issue is claimed running before its pod is
+/// created, so a status wait alone can return inside that window.
+async fn wait_for_launches(launcher: &FakePodDispatcher, n: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        if launcher.launches.lock().expect("launches").len() >= n {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the launcher never created pod {n}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 async fn wait_for_status(db: &Db, key: &str, want: Status) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {
@@ -746,16 +763,6 @@ impl Drop for EnvGuard {
     }
 }
 
-/// Uninstall the process-wide pod dispatcher on drop (even on panic), so a failed test can't poison
-/// the next one through the global seam.
-struct DispatcherGuard;
-
-impl Drop for DispatcherGuard {
-    fn drop(&mut self) {
-        crucible_controller::reset_dispatcher();
-    }
-}
-
 // --- the tests -------------------------------------------------------------------------------------
 
 /// The full transition chain through ONE running assembled daemon:
@@ -800,7 +807,7 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
         EnvGuard::unset("CONTROLLER_APPROVERS"),
     ];
 
-    let cfg = test_cfg(&state_dir, vec!["testorg/widget".to_string()]);
+    let mut cfg = test_cfg(&state_dir, vec!["testorg/widget".to_string()]);
     let db = Db::open(cfg.db_url()).await?;
     // Boot seed (Lane O3): discovery reads the DB's watch-set, not `cfg.repos`, directly.
     crucible_controller::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos).await?;
@@ -818,8 +825,7 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
         keys: Mutex::new(Vec::new()),
         deleted: Mutex::new(Vec::new()),
     });
-    crucible_controller::install_dispatcher(launcher.clone());
-    let _launcher_guard = DispatcherGuard;
+    cfg.runtime.dispatcher = launcher.clone();
 
     // The assembled daemon — the same `assemble` the binary calls.
     let queue = WorkQueue::new();
@@ -1037,7 +1043,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
         EnvGuard::unset("CONTROLLER_PACK_REPO"),
     ];
 
-    let cfg = test_cfg(&state_dir, Vec::new());
+    let mut cfg = test_cfg(&state_dir, Vec::new());
     let db = Db::open(cfg.db_url()).await?;
 
     // Seed an approved, awaiting-approval issue (the state right before launch).
@@ -1099,8 +1105,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
         keys: Mutex::new(Vec::new()),
         deleted: Mutex::new(Vec::new()),
     });
-    crucible_controller::install_dispatcher(launcher1.clone());
-    let _launcher_guard = DispatcherGuard;
+    cfg.runtime.dispatcher = launcher1.clone();
 
     let keys = crucible_controller::issues::store::non_terminal_keys(db.pool()).await?;
     let shutdown1 = Arc::new(tokio::sync::Notify::new());
@@ -1119,7 +1124,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
         tokio::spawn(daemon::run(keys, daemon_cfg(), wiring, shutdown, None))
     };
     wait_for_status(&db, KEY, Status::Running).await;
-    assert_eq!(launcher1.launches.lock().expect("launches").len(), 1);
+    wait_for_launches(&launcher1, 1).await;
 
     // Kill the daemon mid-"run": drop it after launch, before completion.
     shutdown1.notify_waiters();
@@ -1146,7 +1151,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
         keys: Mutex::new(Vec::new()),
         deleted: Mutex::new(Vec::new()),
     });
-    crucible_controller::install_dispatcher(launcher2.clone());
+    cfg.runtime.dispatcher = launcher2.clone();
 
     let keys = crucible_controller::issues::store::non_terminal_keys(db.pool()).await?;
     assert_eq!(keys, vec![KEY.to_string()], "the running row re-enqueues");
@@ -1418,8 +1423,7 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
         keys: Mutex::new(Vec::new()),
         deleted: Mutex::new(Vec::new()),
     });
-    crucible_controller::install_dispatcher(launcher.clone());
-    let _launcher_guard = DispatcherGuard;
+    cfg.runtime.dispatcher = launcher.clone();
 
     // The assembled daemon and the API it shares its queue and override store with — the same
     // wiring the binary does.
@@ -1651,7 +1655,6 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
 /// registered `survey` playbook, an API to drive it, and the webhook delivery surface.
 struct LaunchRig {
     _root: tempfile::TempDir,
-    _launcher_guard: DispatcherGuard,
     db: Db,
     app: axum::Router,
     hooks: axum::Router,
@@ -1698,7 +1701,7 @@ async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
         keys: Mutex::new(Vec::new()),
         deleted: Mutex::new(Vec::new()),
     });
-    crucible_controller::install_dispatcher(launcher.clone());
+    cfg.runtime.dispatcher = launcher.clone();
 
     let queue = WorkQueue::new();
     let api_queue = if opts.standby {
@@ -1766,7 +1769,6 @@ async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
     };
     Ok(LaunchRig {
         _root: root,
-        _launcher_guard: DispatcherGuard,
         db,
         app,
         hooks,

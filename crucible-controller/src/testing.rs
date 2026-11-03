@@ -77,6 +77,7 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
     crate::config::ControllerCfg {
         secret_provider: None,
         owner_refresh: None,
+        runtime: Default::default(),
         schedule_owner_ttl_secs: 604800,
         local_secret_allowlist: Vec::new(),
         state_dir: state_dir.to_path_buf(),

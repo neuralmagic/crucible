@@ -249,6 +249,10 @@ pub struct ControllerCfg {
     /// [`ControllerCfg::secret_provider`]; `None` leaves a launcher on their stored groups.
     #[arg(skip)]
     pub owner_refresh: Option<std::sync::Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
+    /// The boundaries the daemon assembled: the pod dispatcher, the contract gate, the build
+    /// backend, and the reconcile queue, threaded here like [`ControllerCfg::secret_provider`].
+    #[arg(skip)]
+    pub runtime: crate::daemon::runtime::Runtime,
     /// The state directory: the embedded Postgres's data and the scratch root when
     /// `CONTROLLER_SCRATCH_DIR` is unset. Nothing durable lives here otherwise.
     #[arg(long, env = "CONTROLLER_STATE_DIR", default_value = "state")]

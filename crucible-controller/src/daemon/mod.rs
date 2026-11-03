@@ -17,6 +17,7 @@ pub mod leader;
 pub mod overrides;
 pub mod overrides_store;
 pub mod queue;
+pub mod runtime;
 
 use crate::daemon::queue::TestSyncMarker;
 use crate::daemon::queue::{
@@ -88,12 +89,6 @@ pub async fn assemble(
     completions: CompletionStream,
     policy: crate::authz::policy::ActivePolicy,
 ) -> Wiring {
-    // Install the process-global queue handle so a collection that frees a slot can re-drive a
-    // queued backlog row's issue back through reconcile (the drain can't thread a handle through the
-    // frozen reconcile signature — same rationale as the dispatcher global). Assembly is the one
-    // shared production + harness build point, so both get the real queue.
-    crate::runs::workpod::install_enqueue(queue.clone());
-
     // A failed reconcile that exhausts its retry budget parks the issue with the last error as the
     // reason (machine park — a human sweep or an upstream change can revive it).
     // `park_issue` is async; the `ParkFn` boundary is sync, so it's spawned.
@@ -117,7 +112,9 @@ pub async fn assemble(
     // The reconcile core with the pending human override drained first, so an
     // operator's park/unpark/bump composes with claims instead of racing them.
     let rec_db = db.clone();
-    let rec_cfg = cfg.clone();
+    // A collection that frees a slot re-drives the eldest queued issue through this queue.
+    let mut rec_cfg = cfg.clone();
+    rec_cfg.runtime.queue = Some(queue.clone());
     let reconcile: ReconcileFn = Arc::new(move |key: IssueKey| {
         let db = rec_db.clone();
         let cfg = rec_cfg.clone();

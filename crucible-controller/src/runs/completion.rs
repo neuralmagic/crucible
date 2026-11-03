@@ -225,7 +225,7 @@ async fn close_left_over_run_pods(db: &Db, cfg: &ControllerCfg, key: &str) -> Re
         };
         crate::runs::workpod::collect_run_pod(
             db,
-            crate::runs::workpod::active_dispatcher().as_ref(),
+            cfg.runtime.dispatcher.as_ref(),
             &cfg.pod_namespace,
             collection_profile(cfg).await.as_deref(),
             &pod,
@@ -287,7 +287,7 @@ async fn settle_run(
     if let Some(pod) = run.pod.as_deref()
         && let Err(e) = crate::runs::workpod::collect_run_pod(
             db,
-            crate::runs::workpod::active_dispatcher().as_ref(),
+            cfg.runtime.dispatcher.as_ref(),
             &cfg.pod_namespace,
             collection_profile(cfg).await.as_deref(),
             pod,
@@ -350,7 +350,7 @@ async fn pod_session(
 ) -> Result<Option<String>> {
     use crate::runs::workpod::TurnPhase;
 
-    let dispatcher = crate::runs::workpod::active_dispatcher();
+    let dispatcher = cfg.runtime.dispatcher.clone();
     // The work_pods row records the pod's cluster; a run predating the ledger has no row and
     // only ever ran on the hub.
     let work_pod = crate::runs::work_pods::get_work_pod(db.pool(), pod).await?;

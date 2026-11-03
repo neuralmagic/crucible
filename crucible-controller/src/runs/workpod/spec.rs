@@ -243,6 +243,7 @@ async fn collect<S: TurnSpec>(
             match book_turn_success(
                 db,
                 d,
+                cfg,
                 kind,
                 name,
                 cluster,
@@ -311,6 +312,7 @@ async fn collect<S: TurnSpec>(
 async fn book_turn_success(
     db: &Db,
     d: &dyn PodDispatcher,
+    cfg: &ControllerCfg,
     kind: WorkKind,
     name: &str,
     cluster: &str,
@@ -340,7 +342,7 @@ async fn book_turn_success(
         m.record_turn(kind.label_value(), succeeded_metric);
         m.observe_turn_duration(kind.label_value(), turn_age_secs(created_at));
     }
-    drain_freed_slot(db, kind).await;
+    drain_freed_slot(db, cfg.runtime.queue.as_ref(), kind).await;
     Ok(CasResult::Won)
 }
 
@@ -378,7 +380,7 @@ async fn fail_turn(
             m.observe_turn_duration(kind.label_value(), turn_age_secs(created_at));
         }
     }
-    drain_freed_slot(db, kind).await;
+    drain_freed_slot(db, cfg.runtime.queue.as_ref(), kind).await;
     tracing::warn!(
         kind = kind.label_value(),
         site = site.as_str(),
@@ -643,7 +645,7 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
     let targets: Vec<_> = crate::runs::contract::profile_target(&profile)
         .into_iter()
         .collect();
-    if let Err(failure) = admit_contract(kind.into(), &targets).await {
+    if let Err(failure) = cfg.runtime.admit_contract(kind.into(), &targets).await {
         let rejection = failure.into_rejection()?;
         crate::runs::contract::refuse(db, issue_key, &rejection).await?;
         return Ok(TurnDispatch::Failed {
@@ -660,7 +662,7 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         let rejection = crate::runs::contract::ContractRejection::unsupported_option(
             kind.into(),
             target.reference(),
-            crate::runs::workpod::recorded_engine_version(target).await,
+            cfg.runtime.recorded_engine_version(target).await,
             unsupported.to_string(),
         );
         crate::runs::contract::refuse(db, issue_key, &rejection).await?;

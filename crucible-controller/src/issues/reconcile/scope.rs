@@ -265,7 +265,7 @@ pub(super) async fn run_scope_and_transition(
             crate::playbooks::providers::WorkloadClass::Autoresearch,
         )
         .await?;
-        let dispatcher = crate::runs::workpod::active_dispatcher();
+        let dispatcher = cfg.runtime.dispatcher.clone();
         let outcome = crate::runs::workpod::dispatch_scope(
             db,
             cfg,
@@ -290,11 +290,13 @@ pub(super) async fn run_scope_and_transition(
         return apply_pod_scope_outcome(db, cfg, issue, outcome, scoped_reason).await;
     }
     let bin = crate::runs::engine::resolve_bin();
-    if let Err(failure) = crate::runs::workpod::admit_contract(
-        crate::runs::contract::RequestKind::LocalScope,
-        &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
-    )
-    .await
+    if let Err(failure) = cfg
+        .runtime
+        .admit_contract(
+            crate::runs::contract::RequestKind::LocalScope,
+            &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
+        )
+        .await
     {
         crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?).await?;
         return Ok(());

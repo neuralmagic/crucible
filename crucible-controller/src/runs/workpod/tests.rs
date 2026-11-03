@@ -2373,10 +2373,9 @@ async fn a_mismatched_loop_image_refuses_the_turn_and_parks_the_issue(
         loop_image.clone(),
         Ok(Some("0.0.1".to_string())),
     )]));
-    crate::runs::workpod::install_contracts(Arc::new(ContractRegistry::new(reader.clone())));
-
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:old");
+    let mut cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:old");
+    cfg.runtime.contracts = Some(Arc::new(ContractRegistry::new(reader.clone())));
     let created = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(FakeDispatcher {
         phase: TurnPhase::Succeeded,
@@ -2411,7 +2410,6 @@ async fn a_mismatched_loop_image_refuses_the_turn_and_parks_the_issue(
         None,
     )
     .await;
-    crate::runs::workpod::reset_contracts();
     let out = out?;
     assert!(matches!(out, DispatchOutcome::Failed), "refused: {out:?}");
     assert!(created.lock().expect("lock").is_empty(), "no pod created");
@@ -2492,10 +2490,9 @@ async fn an_unreadable_loop_image_fails_the_turn_without_parking(pool: sqlx::PgP
         loop_image,
         Err(ContractReadError("503 registry unavailable".to_string())),
     )]));
-    crate::runs::workpod::install_contracts(Arc::new(ContractRegistry::new(reader)));
-
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:1");
+    let mut cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:1");
+    cfg.runtime.contracts = Some(Arc::new(ContractRegistry::new(reader)));
     let created = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(FakeDispatcher {
         phase: TurnPhase::Succeeded,
@@ -2530,7 +2527,6 @@ async fn an_unreadable_loop_image_fails_the_turn_without_parking(pool: sqlx::PgP
         None,
     )
     .await;
-    crate::runs::workpod::reset_contracts();
     let err = out.expect_err("an unreadable target fails the dispatch");
     assert!(
         format!("{err:#}").contains("503 registry unavailable"),
@@ -2567,10 +2563,9 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
         .sandbox_image
         .expect("the fixture pack names a sandbox image");
     let reader = Arc::new(TableReader::new([(pack_sandbox.clone(), Ok(None))]));
-    crate::runs::workpod::install_contracts(Arc::new(ContractRegistry::new(reader)));
-
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "img");
+    let mut cfg = pod_cfg(&profile, "img");
+    cfg.runtime.contracts = Some(Arc::new(ContractRegistry::new(reader)));
     let created_pods = Arc::new(Mutex::new(Vec::new()));
     let created_cms = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(RunBundleDispatcher {
@@ -2592,7 +2587,6 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
         None,
     )
     .await;
-    crate::runs::workpod::reset_contracts();
     let out = out?;
     assert!(matches!(out, RunAdmission::Launched { .. }), "{out:?}");
     assert_eq!(created_pods.lock().expect("lock").len(), 1);
@@ -4414,7 +4408,7 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
 
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "img");
+    let mut cfg = pod_cfg(&profile, "img");
     let kind = WorkKind::AgentTurn(TurnKind::GroundedRank);
 
     // A running turn to collect (issue A) + two queued backlog rows (B eldest, C younger).
@@ -4437,7 +4431,7 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
     .await?;
 
     let queue = crate::daemon::queue::WorkQueue::new();
-    install_enqueue(queue.clone());
+    cfg.runtime.queue = Some(queue.clone());
 
     let dispatcher = Arc::new(FakeDispatcher {
             phase: TurnPhase::Succeeded,
@@ -4450,7 +4444,6 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
     let out = adopt_grounded_turn(&db, &cfg, dispatcher, "owner/repo#1")
         .await?
         .expect("adopted");
-    reset_enqueue();
 
     assert!(matches!(out, DispatchOutcome::Verdict(_)), "{out:?}");
     assert_eq!(
@@ -4534,7 +4527,7 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
 
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "img");
+    let mut cfg = pod_cfg(&profile, "img");
     let kind = WorkKind::AgentTurn(TurnKind::GroundedRank);
 
     seed_running_turn(&db, kind, "owner/repo#1", "crucible-turn-a").await?;
@@ -4559,7 +4552,7 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
     .await?;
 
     let queue = crate::daemon::queue::WorkQueue::new();
-    install_enqueue(queue.clone());
+    cfg.runtime.queue = Some(queue.clone());
     let dispatcher = Arc::new(FakeDispatcher {
             phase: TurnPhase::Succeeded,
             message: None,
@@ -4570,7 +4563,6 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
     adopt_grounded_turn(&db, &cfg, dispatcher, "owner/repo#1")
         .await?
         .expect("adopted");
-    reset_enqueue();
 
     assert!(
         crate::runs::work_pods::get_work_pod(db.pool(), "queued-parked")

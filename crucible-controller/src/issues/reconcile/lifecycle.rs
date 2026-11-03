@@ -164,7 +164,7 @@ async fn launch_approved_run(
     let admission = crate::runs::workpod::dispatch_run(
         db,
         cfg,
-        crate::runs::workpod::active_dispatcher(),
+        cfg.runtime.dispatcher.clone(),
         &claim,
         pack,
         &build_digests,

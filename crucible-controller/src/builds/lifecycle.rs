@@ -31,7 +31,6 @@ use crate::event_log::Event;
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// What a dispatchable build needs: the persisted identity (the `builds` row) plus the backend
@@ -347,36 +346,6 @@ impl BuildBackend for ForgeBuildBackend {
     }
 }
 
-/// Install the process-global build backend (the forge backend at daemon assembly, or a test's
-/// fake). The dispatch/poll fire inside the frozen `reconcile(db, cfg, key)` step, which can't thread
-/// a backend argument, so — exactly like [`crate::runs::workpod::install_dispatcher`] — it lives here as
-/// the one sanctioned process-global for the build boundary.
-static ACTIVE_BUILD_BACKEND: std::sync::RwLock<Option<Arc<dyn BuildBackend>>> =
-    std::sync::RwLock::new(None);
-
-/// Install the active build backend (daemon assembly, or a test's fake).
-pub fn install_build_backend(backend: Arc<dyn BuildBackend>) {
-    *ACTIVE_BUILD_BACKEND
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(backend);
-}
-
-/// Drop the installed build backend (a test's teardown).
-pub fn reset_build_backend() {
-    *ACTIVE_BUILD_BACKEND
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-}
-
-/// The backend a dispatch resolves to: the installed one, else the [`StubBuildBackend`].
-pub fn active_build_backend() -> Arc<dyn BuildBackend> {
-    ACTIVE_BUILD_BACKEND
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .unwrap_or_else(|| Arc::new(StubBuildBackend))
-}
-
 /// Assemble the real [`ForgeBuildBackend`] from controller config, or `None` when `--build-backends`
 /// is off (the [`StubBuildBackend`] then parks a `[build]`-declaring pack with a clear reason).
 pub fn forge_backend_from_cfg(cfg: &ControllerCfg) -> Option<ForgeBuildBackend> {
@@ -610,7 +579,7 @@ pub(crate) async fn drive_scope_builds(
     scope_id: i64,
     requests: &[BuildRequest],
 ) -> Result<BuildsProgress> {
-    let backend = active_build_backend();
+    let backend = &cfg.runtime.builds;
     let cap = i64::from(cfg.profile.build_pod_cap);
 
     // Phase 1: (re)dispatch every planned build missing a live row, bounded by the remaining cap.
@@ -997,7 +966,7 @@ fn index_by_name(rows: Vec<BuildRow>) -> std::collections::BTreeMap<String, Buil
 /// never wedge a run at `building` across a restart. Rows still live are left for the level-triggered
 /// [`drive_scope_builds`] to collect. Idempotent: a re-run over already-terminal rows is a no-op.
 pub async fn adopt_builds(db: &Db, cfg: &ControllerCfg) -> Result<()> {
-    let backend = active_build_backend();
+    let backend = &cfg.runtime.builds;
     let dispatched =
         crate::builds::store::builds_in_states(db.pool(), &[BuildState::Dispatched]).await?;
     if dispatched.is_empty() {
@@ -1081,7 +1050,7 @@ mod tests {
     use super::*;
     use crate::builds::model::BuildState;
     use sqlx::PgPool;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     fn db(pool: PgPool) -> Db {
         Db::new(pool)
@@ -1509,19 +1478,19 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        install_build_backend(Arc::new(FakeBackend::new(
+        let mut cfg = cfg_with_cap(4);
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Running,
             Ok("sha256:x".into()),
-        )));
+        ));
 
         let out = drive(
             &db,
-            &cfg_with_cap(4),
+            &cfg,
             scope,
             &[sample_request("a"), sample_request("b")],
         )
         .await?;
-        reset_build_backend();
 
         // Both dispatched, still building → Waiting (never AllReady on a fresh dispatch).
         assert_eq!(out, BuildsProgress::Waiting);
@@ -1547,18 +1516,18 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let db = db(pool);
         let scope = seed_scope(&db).await;
         // Cap 1, plan of 2: `a` dispatches (and even succeeds), `b` is capped out with no row.
-        install_build_backend(Arc::new(FakeBackend::new(
+        let mut cfg = cfg_with_cap(1);
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Succeeded,
             Ok("sha256:beef".into()),
-        )));
+        ));
         let out = drive(
             &db,
-            &cfg_with_cap(1),
+            &cfg,
             scope,
             &[sample_request("a"), sample_request("b")],
         )
         .await?;
-        reset_build_backend();
 
         assert_eq!(
             out,
@@ -1577,13 +1546,13 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(4);
+        let mut cfg = cfg_with_cap(4);
 
         // First pass: dispatch + poll still-running → Waiting (the run is blocked, no digest).
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Running,
             Ok("sha256:beef".into()),
-        )));
+        ));
         assert_eq!(
             drive(&db, &cfg, scope, &[sample_request("a")]).await?,
             BuildsProgress::Waiting
@@ -1594,19 +1563,17 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
                 .is_none(),
             "still blocked: no digest pinned"
         );
-        reset_build_backend();
 
         // Second pass: the backend reports success → the digest pins and the run unblocks. The
         // already-dispatched row is NOT re-dispatched (needs_dispatch is false).
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Succeeded,
             Ok("sha256:beef".into()),
-        )));
+        ));
         assert_eq!(
             drive(&db, &cfg, scope, &[sample_request("a")]).await?,
             BuildsProgress::AllReady
         );
-        reset_build_backend();
         let rows = crate::builds::store::builds_for_scope(db.pool(), scope).await?;
         assert_eq!(rows.len(), 1, "no duplicate row from the second pass");
         assert_eq!(rows[0].state, BuildState::Succeeded);
@@ -1644,15 +1611,14 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(4);
-        install_build_backend(Arc::new(FakeBackend::new(
+        let mut cfg = cfg_with_cap(4);
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Failed {
                 evidence: Some("https://logs/build/42".into()),
             },
             Err("no image".into()),
-        )));
+        ));
         let progress = drive(&db, &cfg, scope, &[sample_request("a")]).await?;
-        reset_build_backend();
         assert_eq!(
             progress,
             BuildsProgress::Blocked {
@@ -1670,13 +1636,13 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(4);
+        let mut cfg = cfg_with_cap(4);
         let mut req = sample_request("a");
         req.timeout = Duration::from_secs(60);
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Running, // the backend would say "still going" — the cap fires anyway
             Ok("sha256:x".into()),
-        )));
+        ));
         drive(&db, &cfg, scope, std::slice::from_ref(&req)).await?;
         // Back-date the dispatch stamp well past the 60s timeout.
         let id = crate::builds::store::builds_for_scope(db.pool(), scope).await?[0].id;
@@ -1688,7 +1654,6 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         .await?;
 
         let progress = drive(&db, &cfg, scope, std::slice::from_ref(&req)).await?;
-        reset_build_backend();
         assert!(
             matches!(progress, BuildsProgress::Blocked { evidence: Some(e) } if e.contains("timeout"))
         );
@@ -1708,14 +1673,14 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(2);
+        let mut cfg = cfg_with_cap(2);
 
         // Pass 1: dispatch errors (transient). The pending row survives; the pass reports Waiting,
         // NOT a wedge — and the row still counts as exactly one in-flight slot, not a leak.
         let attempts = Arc::new(Mutex::new(0u32));
-        install_build_backend(Arc::new(FailingDispatchBackend {
+        cfg.runtime.builds = Arc::new(FailingDispatchBackend {
             attempts: attempts.clone(),
-        }));
+        });
         assert_eq!(
             drive(&db, &cfg, scope, &[sample_request("a")]).await?,
             BuildsProgress::Waiting,
@@ -1735,19 +1700,17 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
             1,
             "the pending row counts once — no cap poison"
         );
-        reset_build_backend();
 
         // Pass 2: the backend recovers. The SAME pending row is re-dispatched (idempotent — no second
         // row forks), and the build pins. Crucially: no wedge across the error.
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Succeeded,
             Ok("sha256:beef".into()),
-        )));
+        ));
         assert_eq!(
             drive(&db, &cfg, scope, &[sample_request("a")]).await?,
             BuildsProgress::AllReady
         );
-        reset_build_backend();
         let rows = crate::builds::store::builds_for_scope(db.pool(), scope).await?;
         assert_eq!(rows.len(), 1, "re-dispatch reused the pending row, no fork");
         assert_eq!(rows[0].state, BuildState::Succeeded);
@@ -1763,17 +1726,16 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(2);
+        let mut cfg = cfg_with_cap(2);
         let attempts = Arc::new(Mutex::new(0u32));
-        install_build_backend(Arc::new(FailingDispatchBackend {
+        cfg.runtime.builds = Arc::new(FailingDispatchBackend {
             attempts: attempts.clone(),
-        }));
+        });
 
         let mut last = BuildsProgress::Waiting;
         for _ in 0..MAX_DISPATCH_ATTEMPTS {
             last = drive(&db, &cfg, scope, &[sample_request("a")]).await?;
         }
-        reset_build_backend();
 
         assert!(
             matches!(last, BuildsProgress::Blocked { evidence: Some(ref e) } if e.contains("dispatch failed")),
@@ -1798,7 +1760,7 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        // No install_build_backend → the ClusterBuildBackend stub is active.
+        // No backend on the config: the stub refuses.
         let progress = drive(&db, &cfg_with_cap(2), scope, &[sample_request("a")]).await?;
         assert!(
             matches!(progress, BuildsProgress::Blocked { evidence: Some(ref e) } if e.contains("not installed")),
@@ -1828,12 +1790,12 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let db = db(pool);
         let scope = seed_scope(&db).await;
         let attempts = Arc::new(Mutex::new(0u32));
-        install_build_backend(Arc::new(PermanentDispatchBackend {
+        let mut cfg = cfg_with_cap(2);
+        cfg.runtime.builds = Arc::new(PermanentDispatchBackend {
             attempts: attempts.clone(),
-        }));
+        });
 
-        let progress = drive(&db, &cfg_with_cap(2), scope, &[sample_request("a")]).await?;
-        reset_build_backend();
+        let progress = drive(&db, &cfg, scope, &[sample_request("a")]).await?;
 
         assert!(
             matches!(progress, BuildsProgress::Blocked { evidence: Some(ref e) } if e.contains("isn't dispatchable")),
@@ -1971,13 +1933,13 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(4);
+        let mut cfg = cfg_with_cap(4);
 
         // Dispatch two builds; the fake reports both live.
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Running,
             Ok("sha256:found".into()),
-        )));
+        ));
         drive(
             &db,
             &cfg,
@@ -1995,18 +1957,16 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
                 "a live build is left alone"
             );
         }
-        reset_build_backend();
 
         // A backend that lists NOTHING live but whose registry HAS the digest → the vanished builds
         // are adopted as succeeded (the registry is the source of truth). Idempotent: re-running
         // adoption over the now-terminal rows changes nothing.
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Running,
             Ok("sha256:found".into()),
-        )));
+        ));
         adopt_builds(&db, &cfg).await?;
         adopt_builds(&db, &cfg).await?;
-        reset_build_backend();
         for r in crate::builds::store::builds_for_scope(db.pool(), scope).await? {
             assert_eq!(
                 r.state,
@@ -2023,21 +1983,19 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(4);
-        install_build_backend(Arc::new(FakeBackend::new(
+        let mut cfg = cfg_with_cap(4);
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Running,
             Ok("sha256:x".into()),
-        )));
+        ));
         drive(&db, &cfg, scope, &[sample_request("a")]).await?;
-        reset_build_backend();
 
         // Not live AND the registry has no digest → the build vanished; adopt fails it with evidence.
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Running,
             Err("manifest unknown".into()),
-        )));
+        ));
         adopt_builds(&db, &cfg).await?;
-        reset_build_backend();
         let row = &crate::builds::store::builds_for_scope(db.pool(), scope).await?[0];
         assert_eq!(row.state, BuildState::Failed);
         assert!(row.evidence_url.as_deref().unwrap().contains("vanished"));
@@ -2050,7 +2008,8 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         // not-installed error the driver parks on.
         let _g = crate::ENV_LOCK.lock().await;
         let _ = pool; // the sqlx harness supplies a pool; this test only needs the serialized lock.
-        let err = active_build_backend()
+        let err = crate::daemon::runtime::Runtime::default()
+            .builds
             .dispatch("ns", &sample_request("a"))
             .await
             .unwrap_err();
@@ -2068,15 +2027,15 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         let _g = crate::ENV_LOCK.lock().await;
         let db = db(pool);
         let scope = seed_scope(&db).await;
-        let cfg = cfg_with_cap(4);
+        let mut cfg = cfg_with_cap(4);
         let mut dependent = sample_request("dependent");
         dependent.needs = vec!["base".to_string()];
 
         // Pass 1: `base` dispatches + succeeds; `dependent` is held back (no row yet).
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Succeeded,
             Ok("sha256:base".into()),
-        )));
+        ));
         let out = drive(
             &db,
             &cfg,
@@ -2084,7 +2043,6 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
             &[sample_request("base"), dependent.clone()],
         )
         .await?;
-        reset_build_backend();
         assert_eq!(out, BuildsProgress::Waiting, "dependent waits on base");
         let rows = crate::builds::store::builds_for_scope(db.pool(), scope).await?;
         assert_eq!(rows.len(), 1, "only base has a row this pass");
@@ -2092,12 +2050,11 @@ base-image = "{{ builds.vllm-sandbox.digest_ref }}"
         assert_eq!(rows[0].state, BuildState::Succeeded);
 
         // Pass 2: base is pinned, so dependent now dispatches + succeeds → the plan is ready.
-        install_build_backend(Arc::new(FakeBackend::new(
+        cfg.runtime.builds = Arc::new(FakeBackend::new(
             BuildProgress::Succeeded,
             Ok("sha256:dep".into()),
-        )));
+        ));
         let out = drive(&db, &cfg, scope, &[sample_request("base"), dependent]).await?;
-        reset_build_backend();
         assert_eq!(out, BuildsProgress::AllReady);
         assert_eq!(
             crate::builds::store::builds_for_scope(db.pool(), scope)

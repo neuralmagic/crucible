@@ -386,7 +386,12 @@ fn dispatch_db_adopt(
         let (_guard, local_path) = if session_uri.starts_with("s3://") {
             let dir = tempfile::tempdir().context("adopt download scratch dir")?;
             let out = dir.path().join("session.jsonl");
-            crucible_controller::runs::engine::fetch_object(&session_uri, &out).await?;
+            crucible_controller::runs::engine::fetch_object(
+                cfg.runtime.contracts.as_deref(),
+                &session_uri,
+                &out,
+            )
+            .await?;
             (Some(dir), out)
         } else {
             let path = PathBuf::from(&session_uri);
@@ -610,9 +615,8 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     cfg.overrides = Some(config_store.clone());
 
     // The WorkPod dispatcher (grounded-rank turns + loop runs + future kinds): the real kube
-    // dispatcher creates/watches/GCs the pod over the kube API. Installed process-wide because the
-    // dispatch fires inside the pure reconcile step (a turn) and the reconcile-awaiting launch (a
-    // run). Then sweep the ledger against the cluster so a restart wastes no paid work and leaks no
+    // dispatcher creates/watches/GCs the pod over the kube API, carried on the config the reconcile
+    // step threads. Then sweep the ledger against the cluster so a restart wastes no paid work and leaks no
     // pod (adopt live pods, ingest completed-but-uncollected turns, converge failed runs, sweep
     // orphans). The sweep runs unconditionally — loop runs flow through the primitive regardless of
     // the grounded-rank executor mode.
@@ -648,7 +652,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     let dispatcher = std::sync::Arc::new(crucible_controller::KubePodDispatcher::new(
         clusters.clone(),
     ));
-    crucible_controller::install_dispatcher(dispatcher.clone());
+    cfg.runtime.dispatcher = dispatcher.clone();
     // The contract check only refuses launches, never serving, so it runs in the background: an
     // unreachable registry must not hold the API listener shut past the liveness probe's patience.
     // Whatever this sweep does not reach, the first dispatch that needs it reads lazily.
@@ -659,7 +663,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             ),
         )),
     );
-    crucible_controller::install_contracts(contracts.clone());
+    cfg.runtime.contracts = Some(contracts.clone());
     {
         let contracts = contracts.clone();
         let targets = crucible_controller::runs::contract::configured_targets(
@@ -678,9 +682,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         if let Some(backend) = crucible_controller::builds::lifecycle::forge_backend_from_cfg(&cfg)
         {
             tracing::info!("autopilot: build backends installed (cluster + github-actions)");
-            crucible_controller::builds::lifecycle::install_build_backend(std::sync::Arc::new(
-                backend,
-            ));
+            cfg.runtime.builds = std::sync::Arc::new(backend);
         }
     }
 

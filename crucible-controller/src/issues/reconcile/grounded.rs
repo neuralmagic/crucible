@@ -65,11 +65,13 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
         GroundedExecutor::Disabled => Grounded::Skipped,
         GroundedExecutor::Local => {
             let bin = crate::runs::engine::resolve_bin();
-            if let Err(failure) = crate::runs::workpod::admit_contract(
-                crate::runs::contract::RequestKind::LocalGroundedRank,
-                &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
-            )
-            .await
+            if let Err(failure) = cfg
+                .runtime
+                .admit_contract(
+                    crate::runs::contract::RequestKind::LocalGroundedRank,
+                    &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
+                )
+                .await
             {
                 crate::runs::contract::refuse(db, key, &failure.into_rejection()?).await?;
                 return Ok(Grounded::Refused);
@@ -96,7 +98,7 @@ async fn run_grounded(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<Gro
             match crate::runs::workpod::dispatch_grounded_rank(
                 db,
                 cfg,
-                crate::runs::workpod::active_dispatcher(),
+                cfg.runtime.dispatcher.clone(),
                 key,
                 &repo_url,
                 issue.git_ref.as_deref(),

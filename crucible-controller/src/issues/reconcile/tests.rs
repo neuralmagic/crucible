@@ -856,8 +856,8 @@ async fn scenario_bypass_is_idempotent_across_pod_redrives(pool: PgPool) -> Resu
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(StillRunningDispatcher));
     let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(StillRunningDispatcher);
     cfg.rank_horizon_days = 7;
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("scenario:idem-1")).await?;
@@ -883,7 +883,6 @@ async fn scenario_bypass_is_idempotent_across_pod_redrives(pool: PgPool) -> Resu
     // leaves it alone and reconcile_new runs again — the bypass must fire a second time, not
     // fall through into the rank-horizon gate now that the row is being re-driven.
     reconcile(&db, &cfg, "scenario:idem-1").await?;
-    crate::runs::workpod::reset_dispatcher();
 
     let after_second = crate::issues::store::get_issue(db.pool(), "scenario:idem-1")
         .await?
@@ -1101,13 +1100,12 @@ async fn scenario_adopt_to_run_end_to_end(pool: PgPool) -> Result<()> {
     // dispatch_run every kind uses — the run itself (not the controller) opens the code PR
     // against the target repo, from the pack's own `[publish] pr_repo` baked in at freeze time.
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg
     };
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(StillRunningDispatcher));
+    cfg.runtime.dispatcher = std::sync::Arc::new(StillRunningDispatcher);
     let res = reconcile(&db, &cfg, &key).await;
-    crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -1303,7 +1301,7 @@ async fn redispatch_relaunches_the_stored_pack_with_a_fresh_run_id(pool: PgPool)
 
     let flag = crate::daemon::autopilot_flag::AutopilotFlag::load(db.pool()).await?;
     flag.set(false, Some("test"), "proving-phase pause").await?;
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         autopilot: Some(flag),
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
@@ -1374,13 +1372,12 @@ async fn redispatch_relaunches_the_stored_pack_with_a_fresh_run_id(pool: PgPool)
     crate::runs::work_pods::set_redispatch(db.pool(), "owner/repo#20", "re-run the approved pack")
         .await?;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let res = reconcile(&db, &cfg, "owner/repo#20").await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     let iss = crate::issues::store::get_issue(db.pool(), "owner/repo#20")
@@ -1608,7 +1605,7 @@ async fn a_malformed_build_table_parks_instead_of_erroring(pool: PgPool) -> Resu
 async fn approved_pack_with_a_build_blocks_the_run_at_building(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#50")).await?;
     assert!(
         crate::issues::store::claim_issue(
@@ -1633,10 +1630,9 @@ async fn approved_pack_with_a_build_blocks_the_run_at_building(pool: PgPool) -> 
     );
 
     // Second pass (building): the builds dispatch, but the run is STILL blocked (poll = running).
-    crate::builds::lifecycle::install_build_backend(std::sync::Arc::new(FakeBuildBackend));
+    cfg.runtime.builds = std::sync::Arc::new(FakeBuildBackend);
     reconcile(&db, &cfg, "owner/repo#50").await?;
     reconcile(&db, &cfg, "owner/repo#50").await?;
-    crate::builds::lifecycle::reset_build_backend();
 
     assert_eq!(
         crate::issues::store::get_issue(db.pool(), "owner/repo#50")
@@ -1722,7 +1718,7 @@ async fn an_approved_scope_runs_the_tree_it_froze_after_the_pack_is_rewritten(
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -1743,9 +1739,8 @@ async fn an_approved_scope_runs_the_tree_it_froze_after_the_pack_is_rewritten(
     write_build_pack(&db, key).await;
 
     let dispatcher = std::sync::Arc::new(PackCapturingDispatcher::default());
-    crate::runs::workpod::install_dispatcher(dispatcher.clone());
+    cfg.runtime.dispatcher = dispatcher.clone();
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     assert_eq!(
@@ -1776,7 +1771,7 @@ async fn building_launches_the_run_once_every_build_pins(pool: PgPool) -> Result
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -1811,13 +1806,12 @@ async fn building_launches_the_run_once_every_build_pins(pool: PgPool) -> Result
     crate::builds::store::set_build_succeeded(db.pool(), id, "ghcr.io/org/sandbox@sha256:beef")
         .await?;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let res = reconcile(&db, &cfg, "owner/repo#51").await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     assert_eq!(
@@ -1923,8 +1917,7 @@ async fn building_with_no_backend_parks_not_wedges(pool: PgPool) -> Result<()> {
     approve_scope(&db, "owner/repo#53").await?;
     write_build_pack(&db, "owner/repo#53").await;
 
-    // No install_build_backend → the stub is active. One building pass must park, not wedge.
-    crate::builds::lifecycle::reset_build_backend();
+    // No backend on the config: the stub is active. One building pass must park, not wedge.
     reconcile(&db, &cfg, "owner/repo#53").await?;
 
     let iss = crate::issues::store::get_issue(db.pool(), "owner/repo#53")
@@ -2612,7 +2605,7 @@ async fn ingest_completion_scrapes_the_session_from_the_finished_pods_logs(
 ) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#40", "run-40", "crucible-run-40").await?;
 
     let logs = [
@@ -2627,13 +2620,12 @@ async fn ingest_completion_scrapes_the_session_from_the_finished_pods_logs(
         r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":"done"}"#,
     ]
     .join("\n");
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs,
         created: Default::default(),
-    }));
+    });
     let outcome = ingest_completion(&db, &cfg, "owner/repo#40").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(outcome?, "the completion edge ingested");
     assert_eq!(
@@ -2702,7 +2694,7 @@ fn finished_loop_session() -> String {
 async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#43", "run-43", "crucible-run-43").await?;
     let token = crate::runs::pod_token::mint(
         db.pool(),
@@ -2714,13 +2706,12 @@ async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Resul
     let session = finished_loop_session();
     seed_uploaded_run_session(db.pool(), "run-43", &session).await;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: "podman login noise\n".into(),
         created: Default::default(),
-    }));
+    });
     let outcome = ingest_completion(&db, &cfg, "owner/repo#43").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(
         outcome?,
@@ -2761,17 +2752,16 @@ async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Resul
 async fn an_uploaded_session_waits_for_its_pod(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#44", "run-44", "crucible-run-44").await?;
     seed_uploaded_run_session(db.pool(), "run-44", &finished_loop_session()).await;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::TimedOut,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let outcome = ingest_completion(&db, &cfg, "owner/repo#44").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(!outcome?, "a running pod's run is still in flight");
     assert_eq!(
@@ -2790,13 +2780,12 @@ async fn an_uploaded_session_waits_for_its_pod(pool: PgPool) -> Result<()> {
 async fn a_gone_pod_with_an_uploaded_session_completes(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#45", "run-45", "crucible-run-45").await?;
     seed_uploaded_run_session(db.pool(), "run-45", &finished_loop_session()).await;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(GoneRunPodDispatcher));
+    cfg.runtime.dispatcher = std::sync::Arc::new(GoneRunPodDispatcher);
     let outcome = ingest_completion(&db, &cfg, "owner/repo#45").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(outcome?, "the stored session settles the run");
     assert_eq!(
@@ -2859,7 +2848,7 @@ async fn a_playbook_issue_with_a_live_pod_run_completes_instead_of_self_healing(
 ) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     let key = "playbook:survey:0199c0de-7c2c-71a5-8000-2";
     seed_registered_playbook(&db, "survey").await;
     adopt_launch(&db, key, 3.5).await;
@@ -2881,13 +2870,12 @@ async fn a_playbook_issue_with_a_live_pod_run_completes_instead_of_self_healing(
     )
     .await?;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::TimedOut,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let in_flight = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     in_flight?;
     assert_eq!(
         crate::issues::store::get_issue(db.pool(), key)
@@ -2911,13 +2899,12 @@ async fn a_playbook_issue_with_a_live_pod_run_completes_instead_of_self_healing(
         r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":"graph complete"}"#,
     ]
     .join("\n");
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: format!("plan v1: completed\n{session}\n"),
         created: Default::default(),
-    }));
+    });
     let finished = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     finished?;
     assert_eq!(
         crate::issues::store::get_issue(db.pool(), key)
@@ -2948,15 +2935,14 @@ async fn a_playbook_issue_with_a_live_pod_run_completes_instead_of_self_healing(
 async fn in_flight_running_is_not_self_healed(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#89", "run-89", "crucible-run-89").await?;
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::TimedOut,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let res = reconcile(&db, &cfg, "owner/repo#89").await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     assert_eq!(
@@ -2979,7 +2965,7 @@ async fn ingest_completion_parks_loud_when_a_terminal_pod_has_no_session(
 ) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#41", "run-41", "crucible-run-41").await?;
     crate::runs::work_pods::insert_work_pod(
         db.pool(),
@@ -2994,13 +2980,12 @@ async fn ingest_completion_parks_loud_when_a_terminal_pod_has_no_session(
     )
     .await?;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Failed,
         logs: "podman noise\ncrucible: exploded before the loop started\n".into(),
         created: Default::default(),
-    }));
+    });
     let outcome = ingest_completion(&db, &cfg, "owner/repo#41").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(!outcome?, "nothing ingested");
     assert!(
@@ -3038,13 +3023,12 @@ async fn ingest_completion_parks_loud_when_a_terminal_pod_has_no_session(
         .expect("row");
     assert_eq!(row.state, crate::runs::workpod::WorkPodState::Failed);
     // Idempotent: a duplicate completion event on the now-parked row is a clean no-op.
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Failed,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let second = ingest_completion(&db, &cfg, "owner/repo#41").await;
-    crate::runs::workpod::reset_dispatcher();
     assert!(!second?);
     Ok(())
 }
@@ -3055,7 +3039,7 @@ async fn disappeared_prestart_pod_is_infrastructure_failure_not_finished(
 ) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#404", "run-404", "crucible-run-404").await?;
     crate::runs::work_pods::insert_work_pod(
         db.pool(),
@@ -3071,14 +3055,12 @@ async fn disappeared_prestart_pod_is_infrastructure_failure_not_finished(
     .await?;
 
     // First reconciliation observes the required-Secret CreateContainerConfigError and persists it.
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(WaitingRunPodDispatcher));
+    cfg.runtime.dispatcher = std::sync::Arc::new(WaitingRunPodDispatcher);
     assert!(!ingest_completion(&db, &cfg, "owner/repo#404").await?);
-    crate::runs::workpod::reset_dispatcher();
 
     // A later reconciliation (including after controller restart) sees that the pod disappeared.
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(GoneRunPodDispatcher));
+    cfg.runtime.dispatcher = std::sync::Arc::new(GoneRunPodDispatcher);
     let first = ingest_completion(&db, &cfg, "owner/repo#404").await;
-    crate::runs::workpod::reset_dispatcher();
     assert!(!first?);
 
     let issue = crate::issues::store::get_issue(db.pool(), "owner/repo#404")
@@ -3108,7 +3090,7 @@ async fn ingest_completion_parks_with_the_rc_when_the_loop_died_before_publishin
 ) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#51", "run-51", "crucible-run-51").await?;
     crate::runs::work_pods::insert_work_pod(
         db.pool(),
@@ -3123,15 +3105,14 @@ async fn ingest_completion_parks_with_the_rc_when_the_loop_died_before_publishin
     )
     .await?;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Failed,
         logs: "Error: reading manifest /opt/crucible/domains/x/crucible.toml: No such file \
                or directory\n=================== SESSION (rc=1) ===================\n"
             .into(),
         created: Default::default(),
-    }));
+    });
     let outcome = ingest_completion(&db, &cfg, "owner/repo#51").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(!outcome?, "nothing ingested");
     let iss = crate::issues::store::get_issue(db.pool(), "owner/repo#51")
@@ -3160,16 +3141,15 @@ async fn ingest_completion_parks_with_the_rc_when_the_loop_died_before_publishin
 async fn ingest_completion_waits_quietly_while_the_pod_still_runs(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#42", "run-42", "crucible-run-42").await?;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::TimedOut,
         logs: "should never be read".into(),
         created: Default::default(),
-    }));
+    });
     let outcome = ingest_completion(&db, &cfg, "owner/repo#42").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(!outcome?);
     assert_eq!(
@@ -3193,7 +3173,7 @@ async fn ingest_completion_waits_quietly_while_the_pod_still_runs(pool: PgPool) 
 async fn ingest_completion_parks_a_truncated_session_without_shutdown(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#43", "run-43", "crucible-run-43").await?;
 
     // No delimiter (rotation ate the tail dump) — the live-streamed tee lines, last one torn.
@@ -3204,13 +3184,12 @@ async fn ingest_completion_parks_a_truncated_session_without_shutdown(pool: PgPo
         r#"{"v":1,"kind":"row","row":{"iter":2,"deci"#,
     ]
     .join("\n");
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs,
         created: Default::default(),
-    }));
+    });
     let outcome = ingest_completion(&db, &cfg, "owner/repo#43").await;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(!outcome?, "a session without shutdown is not complete");
     let run = sqlx::query!(r#"SELECT status, best_score FROM runs WHERE run_id='run-43'"#)
@@ -4274,17 +4253,16 @@ async fn pod_arm_verdict_ledgers_exactly_once_end_to_end(pool: PgPool) -> Result
     unsafe {
         std::env::remove_var("CONTROLLER_RANKER_BACKEND");
     }
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_arm_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         logs: "podman noise\nCRUCIBLE_VERDICT: {\"tier\":\"T0\",\"rationale\":\"grounded: failing test in tests/x.rs\",\"confidence\":\"high\",\"cost_usd\":0.15,\"over_budget\":false}\n".to_string(),
         created: Default::default(),
-    }));
-    let cfg = pod_arm_cfg(dir.path());
+    });
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#60")).await?;
     // Non-blocking: pass 1 launches the grounded turn, pass 2 collects the verdict (stamping the
     // tier + rank cache), pass 3 proceeds through the prescope gate to the local scope turn.
     let outcome = reconcile_to_fixpoint(&db, &cfg, "owner/repo#60", 6).await;
-    crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -4339,11 +4317,11 @@ async fn queued_grounded_turn_defers_the_rank_then_drains(pool: PgPool) -> Resul
     unsafe {
         std::env::remove_var("CONTROLLER_RANKER_BACKEND");
     }
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_arm_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         logs: "CRUCIBLE_VERDICT: {\"tier\":\"T0\",\"rationale\":\"grounded: failing test in tests/x.rs\",\"confidence\":\"high\",\"cost_usd\":0.15,\"over_budget\":false}\n".to_string(),
         created: Default::default(),
-    }));
-    let mut cfg = pod_arm_cfg(dir.path());
+    });
     cfg.profile.grounded_rank_daily_turns = 0; // budget exhausted → the turn queues
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#61")).await?;
@@ -4380,7 +4358,6 @@ async fn queued_grounded_turn_defers_the_rank_then_drains(pool: PgPool) -> Resul
     // verdict and proceed through the prescope gate to the scope turn.
     cfg.profile.grounded_rank_daily_turns = 50;
     let pass2 = reconcile_to_fixpoint(&db, &cfg, "owner/repo#61", 6).await;
-    crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -4449,7 +4426,7 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -4515,13 +4492,12 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
     .await;
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: created.clone(),
-    }));
+    });
     let res = reconcile(&db, &cfg, "owner/repo#21").await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     let wrapper = only_wrapper(&created);
@@ -4595,11 +4571,11 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
     }
     let created: CreatedPods = Default::default();
     let created_secrets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(ScopeTurnDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(ScopeTurnDispatcher {
         created: created.clone(),
         created_secrets: created_secrets.clone(),
-    }));
-    let mut cfg = pod_scope_cfg(dir.path());
+    });
     cfg.secret_provider = Some(std::sync::Arc::new(
         crate::secrets::provider::MapProvider::new([(
             "openai_key".to_string(),
@@ -4660,7 +4636,6 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
         .await?
         .expect("issue");
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
-    crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -4727,13 +4702,13 @@ async fn pod_scope_survival_lands_the_pack_then_transitions(pool: PgPool) -> Res
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(sample_pack_tgz());
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         logs: format!(
             "podman noise\nCRUCIBLE_SCOPE_PACK: {b64}\nCRUCIBLE_SCOPE_REPORT: {{\"stages\":[{{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}}],\"digest\":\"v1:beef\",\"cost\":0.42}}\n"
         ),
         created: Default::default(),
-    }));
-    let cfg = pod_scope_cfg(dir.path());
+    });
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#70")).await?;
     let issue = crate::issues::store::get_issue(db.pool(), "owner/repo#70")
@@ -4752,7 +4727,6 @@ async fn pod_scope_survival_lands_the_pack_then_transitions(pool: PgPool) -> Res
     // Phase 2: the completion re-drive's adopt-first pre-pass collects the terminal pod, lands
     // the pack, and transitions.
     reconcile(&db, &cfg, "owner/repo#70").await?;
-    crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -4789,11 +4763,11 @@ async fn pod_scope_survival_without_a_pack_blob_fails_loudly(pool: PgPool) -> Re
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         logs: "podman noise\nCRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.42}\n".to_string(),
         created: Default::default(),
-    }));
-    let cfg = pod_scope_cfg(dir.path());
+    });
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#71")).await?;
     let issue = crate::issues::store::get_issue(db.pool(), "owner/repo#71")
@@ -4803,7 +4777,6 @@ async fn pod_scope_survival_without_a_pack_blob_fails_loudly(pool: PgPool) -> Re
     // the handoff fails loudly instead of transitioning over nothing.
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
     reconcile(&db, &cfg, "owner/repo#71").await?;
-    crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -4843,11 +4816,11 @@ async fn pod_scope_uses_goal_file_not_issue_for_a_scenario(pool: PgPool) -> Resu
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         created: created.clone(),
         logs: "podman noise\nCRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.42}\n".to_string(),
-    }));
-    let cfg = pod_scope_cfg(dir.path());
+    });
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("scenario:pod-goal-1")).await?;
     mark_scenario(db.pool(), "scenario:pod-goal-1").await?;
@@ -4857,7 +4830,6 @@ async fn pod_scope_uses_goal_file_not_issue_for_a_scenario(pool: PgPool) -> Resu
         .expect("issue");
 
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
-    crate::runs::workpod::reset_dispatcher();
 
     // The ledgered goal text rides into the in-pod command as `--goal`, so the engine never
     // routes the scenario key into its GitHub Ingest arm — see `render::turn::render_turn`'s
@@ -4915,11 +4887,11 @@ async fn pod_scope_forwards_the_adopted_git_ref(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         created: created.clone(),
         logs: "CRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.42}\n".to_string(),
-    }));
-    let cfg = pod_scope_cfg(dir.path());
+    });
 
     let key = crate::issues::store::adopt_scenario(
         db.pool(),
@@ -4944,7 +4916,6 @@ async fn pod_scope_forwards_the_adopted_git_ref(pool: PgPool) -> Result<()> {
     );
 
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
-    crate::runs::workpod::reset_dispatcher();
 
     let wrapper = only_wrapper(&created);
     assert!(
@@ -4963,11 +4934,11 @@ async fn pod_scope_validates_an_adopted_pack_instead_of_proposing(pool: PgPool) 
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         created: created.clone(),
         logs: "CRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.0}\n".to_string(),
-    }));
-    let cfg = pod_scope_cfg(dir.path());
+    });
 
     let key = crate::issues::store::adopt_scenario(
         db.pool(),
@@ -4987,7 +4958,6 @@ async fn pod_scope_validates_an_adopted_pack_instead_of_proposing(pool: PgPool) 
         .expect("issue");
 
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
-    crate::runs::workpod::reset_dispatcher();
 
     let wrapper = only_wrapper(&created);
     assert!(
@@ -5011,11 +4981,11 @@ async fn pod_scope_omits_repo_ref_when_the_scenario_pinned_none(pool: PgPool) ->
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         created: created.clone(),
         logs: "CRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.42}\n".to_string(),
-    }));
-    let cfg = pod_scope_cfg(dir.path());
+    });
 
     let key = crate::issues::store::adopt_scenario(
         db.pool(),
@@ -5033,7 +5003,6 @@ async fn pod_scope_omits_repo_ref_when_the_scenario_pinned_none(pool: PgPool) ->
     assert!(issue.git_ref.is_none());
 
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
-    crate::runs::workpod::reset_dispatcher();
 
     let wrapper = only_wrapper(&created);
     assert!(
@@ -5096,12 +5065,12 @@ async fn pod_scope_forwards_broker_measure_for_a_contracted_scenario(pool: PgPoo
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
-        created: created.clone(),
-        logs: "CRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.42}\n".to_string(),
-    }));
     let contract = r#"{"gpus":1,"build":{"src_dir":"/opt/deepgemm"}}"#;
     let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
+        created: created.clone(),
+        logs: "CRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.42}\n".to_string(),
+    });
     cfg.broker_contracts = crate::config::BrokerContracts::from_map(
         std::collections::BTreeMap::from([("deepgemm".to_string(), contract.to_string())]),
     );
@@ -5125,7 +5094,6 @@ async fn pod_scope_forwards_broker_measure_for_a_contracted_scenario(pool: PgPoo
     assert_eq!(issue.codegen_contract.as_deref(), Some("deepgemm"));
 
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
-    crate::runs::workpod::reset_dispatcher();
 
     assert!(
         created.lock().expect("lock").is_empty(),
@@ -5183,11 +5151,11 @@ async fn pod_scope_omits_broker_measure_when_the_scenario_named_no_contract(
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         created: created.clone(),
         logs: "CRUCIBLE_SCOPE_REPORT: {\"stages\":[{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}],\"digest\":\"v1:beef\",\"cost\":0.42}\n".to_string(),
-    }));
-    let cfg = pod_scope_cfg(dir.path());
+    });
 
     let key = crate::issues::store::adopt_scenario(
         db.pool(),
@@ -5204,7 +5172,6 @@ async fn pod_scope_omits_broker_measure_when_the_scenario_named_no_contract(
         .expect("issue");
 
     run_scope_and_transition(&db, &cfg, &issue, 5.0, "test scope").await?;
-    crate::runs::workpod::reset_dispatcher();
 
     let wrapper = only_wrapper(&created);
     assert!(
@@ -5290,7 +5257,6 @@ async fn adopt_past_an_exhausted_ceiling(
     seed_running_turn_row(db, kind, issue_key, pod_name).await;
 
     let outcome = reconcile(db, cfg, issue_key).await;
-    crate::runs::workpod::reset_dispatcher();
     outcome?;
 
     let row = crate::runs::work_pods::get_work_pod(db.pool(), pod_name)
@@ -5315,15 +5281,15 @@ async fn orphaned_scope_turn_is_adopted_past_an_exhausted_ceiling(pool: PgPool) 
         std::env::remove_var("CRUCIBLE_BIN");
     } // adoption must never render a pod
     let b64 = base64::engine::general_purpose::STANDARD.encode(sample_pack_tgz());
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    // Ceiling exhausted: the normal path declines at the very first gate.
+    db.ledger_append(None, "run", 200.0).await?;
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         logs: format!(
             "podman noise\nCRUCIBLE_SCOPE_PACK: {b64}\nCRUCIBLE_SCOPE_REPORT: {{\"stages\":[{{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}}],\"digest\":\"v1:beef\",\"cost\":0.42}}\n"
         ),
         created: Default::default(),
-    }));
-    // Ceiling exhausted: the normal path declines at the very first gate.
-    db.ledger_append(None, "run", 200.0).await?;
-    let cfg = pod_scope_cfg(dir.path());
+    });
     assert!(cfg.profile.daily_cost_ceiling < 200.0, "ceiling exhausted");
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#301")).await?;
@@ -5372,12 +5338,12 @@ async fn orphaned_grounded_turn_is_adopted_past_an_exhausted_ceiling(pool: PgPoo
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    db.ledger_append(None, "run", 200.0).await?;
+    let mut cfg = pod_arm_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         logs: "CRUCIBLE_VERDICT: {\"tier\":\"T0\",\"rationale\":\"grounded: failing test in tests/x.rs\",\"confidence\":\"high\",\"cost_usd\":0.15,\"over_budget\":false}\n".to_string(),
         created: Default::default(),
-    }));
-    db.ledger_append(None, "run", 200.0).await?;
-    let cfg = pod_arm_cfg(dir.path());
+    });
 
     // The turn was launched off this recorded rank (the prescope-origin shape), so adoption
     // stamps the verdict under the same hash — no GitHub fetch needed.
@@ -5465,15 +5431,14 @@ async fn adopt_first_leaves_a_still_running_turn_alone(pool: PgPool) -> Result<(
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(StillRunningDispatcher));
     db.ledger_append(None, "run", 200.0).await?; // gates decline, so nothing else runs either
-    let cfg = pod_scope_cfg(dir.path());
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(StillRunningDispatcher);
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#303")).await?;
     seed_running_turn_row(&db, "scope", "owner/repo#303", "crucible-scope-live-303").await;
 
     let outcome = reconcile(&db, &cfg, "owner/repo#303").await;
-    crate::runs::workpod::reset_dispatcher();
     outcome?;
 
     assert_eq!(
@@ -5718,13 +5683,7 @@ async fn a_mismatched_engine_binary_parks_the_local_grounded_turn(pool: PgPool) 
     unsafe {
         std::env::remove_var("CONTROLLER_RANKER_BACKEND");
     }
-    crucible_controller::install_contracts(std::sync::Arc::new(ContractRegistry::new(
-        std::sync::Arc::new(TableReader::new([(
-            bin.display().to_string(),
-            Ok(Some("0.0.1".to_string())),
-        )])),
-    )));
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         prescope_grounded: true,
         rank_horizon_days: 0,
         grounded_executor: crucible_controller::GroundedExecutor::Local,
@@ -5732,10 +5691,15 @@ async fn a_mismatched_engine_binary_parks_the_local_grounded_turn(pool: PgPool) 
         grounded_sandbox_image: None,
         ..cfg_with(dir.path(), Profile::default())
     };
+    cfg.runtime.contracts = Some(std::sync::Arc::new(ContractRegistry::new(
+        std::sync::Arc::new(TableReader::new([(
+            bin.display().to_string(),
+            Ok(Some("0.0.1".to_string())),
+        )])),
+    )));
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#43")).await?;
     let out = reconcile(&db, &cfg, "owner/repo#43").await;
-    crucible_controller::reset_contracts();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -6455,15 +6419,15 @@ async fn scope_now_pod_executor_launches_then_a_redrive_scopes(pool: PgPool) -> 
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
     let b64 = base64::engine::general_purpose::STANDARD.encode(sample_pack_tgz());
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(PodArmDispatcher {
+    // Ceiling exhausted: only ScopeNow (human-authorized) could reach the turn at all.
+    db.ledger_append(None, "run", 200.0).await?;
+    let mut cfg = pod_scope_cfg(dir.path());
+    cfg.runtime.dispatcher = std::sync::Arc::new(PodArmDispatcher {
         logs: format!(
             "podman noise\nCRUCIBLE_SCOPE_PACK: {b64}\nCRUCIBLE_SCOPE_REPORT: {{\"stages\":[{{\"name\":\"validate\",\"passed\":true,\"detail\":\"ok\"}}],\"digest\":\"v1:beef\",\"cost\":0.42}}\n"
         ),
         created: Default::default(),
-    }));
-    // Ceiling exhausted: only ScopeNow (human-authorized) could reach the turn at all.
-    db.ledger_append(None, "run", 200.0).await?;
-    let cfg = pod_scope_cfg(dir.path());
+    });
     assert!(cfg.profile.daily_cost_ceiling < 200.0, "ceiling exhausted");
 
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#210")).await?;
@@ -6494,7 +6458,6 @@ async fn scope_now_pod_executor_launches_then_a_redrive_scopes(pool: PgPool) -> 
 
     // Phase 2: the completion re-drive's pre-pass collects the terminal pod and transitions.
     reconcile(&db, &cfg, "owner/repo#210").await?;
-    crate::runs::workpod::reset_dispatcher();
     unsafe {
         std::env::remove_var("CRUCIBLE_BIN");
     }
@@ -7062,7 +7025,7 @@ async fn a_dequeued_playbook_key_dispatches_from_its_stored_row(pool: PgPool) ->
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -7072,13 +7035,12 @@ async fn a_dequeued_playbook_key_dispatches_from_its_stored_row(pool: PgPool) ->
     adopt_launch(&db, key, 3.5).await;
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: created.clone(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     let wrapper = only_wrapper(&created);
@@ -7109,7 +7071,7 @@ async fn a_launch_whose_stored_tree_was_tampered_with_is_refused(pool: PgPool) -
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -7132,13 +7094,12 @@ async fn a_launch_whose_stored_tree_was_tampered_with_is_refused(pool: PgPool) -
     .await?;
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: created.clone(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
 
     let err = format!(
         "{:#}",
@@ -7175,7 +7136,7 @@ async fn a_launch_whose_pack_is_unconvertible_parks_naming_the_reason(pool: PgPo
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -7185,13 +7146,12 @@ async fn a_launch_whose_pack_is_unconvertible_parks_naming_the_reason(pool: PgPo
     adopt_launch(&db, key, 3.5).await;
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: created.clone(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
 
     res?;
     assert!(
@@ -7222,7 +7182,7 @@ async fn with_autoresearch_off_only_playbook_launches_move(pool: PgPool) -> Resu
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         autoresearch: false,
         ..cfg_with(dir.path(), Profile::default())
@@ -7240,13 +7200,12 @@ async fn with_autoresearch_off_only_playbook_launches_move(pool: PgPool) -> Resu
     let key = "playbook:survey:0199c0de-7c2c-71a5-8000-9";
     seed_registered_playbook(&db, "survey").await;
     adopt_launch(&db, key, 3.5).await;
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: CreatedPods::default(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
     let issue = crate::issues::store::get_issue(db.pool(), key)
         .await?
@@ -7313,7 +7272,7 @@ async fn a_playbook_launch_with_a_binding_dispatches(pool: PgPool) -> Result<()>
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         // A scope that binds a secret refuses to dispatch without something that can read values;
         // this stands in for Vault and hands back the one the binding names.
@@ -7331,13 +7290,12 @@ async fn a_playbook_launch_with_a_binding_dispatches(pool: PgPool) -> Result<()>
     adopt_launch(&db, key, 3.5).await;
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: created.clone(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     let issue = crate::issues::store::get_issue(db.pool(), key)
@@ -7376,7 +7334,7 @@ async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool)
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         secret_provider: Some(std::sync::Arc::new(
             crate::secrets::provider::MapProvider::new([(
@@ -7430,13 +7388,12 @@ async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool)
     adopt_launch(&db, key, 3.5).await;
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: created.clone(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
     let issue = crate::issues::store::get_issue(db.pool(), key)
         .await?
@@ -7492,7 +7449,7 @@ async fn a_playbook_launch_the_launcher_does_not_own_parks_with_the_secret_named
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -7501,13 +7458,12 @@ async fn a_playbook_launch_the_launcher_does_not_own_parks_with_the_secret_named
     bind_playbook_secret(&db, "survey", "group:/groups/team-x", None).await;
     adopt_launch(&db, key, 3.5).await;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     let issue = crate::issues::store::get_issue(db.pool(), key)
@@ -7533,7 +7489,7 @@ async fn a_pin_bump_past_the_bindings_revision_parks_the_launch(pool: PgPool) ->
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(dir.path(), Profile::default())
     };
@@ -7543,13 +7499,12 @@ async fn a_pin_bump_past_the_bindings_revision_parks_the_launch(pool: PgPool) ->
     bind_playbook_secret(&db, "survey", "user:wren", Some("cafebabe")).await;
     adopt_launch(&db, key, 3.5).await;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     let issue = crate::issues::store::get_issue(db.pool(), key)
@@ -8190,7 +8145,7 @@ async fn a_capped_playbook_launch_stays_new(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
-    let cfg = ControllerCfg {
+    let mut cfg = ControllerCfg {
         deploy_profile: Some(profile),
         ..cfg_with(
             dir.path(),
@@ -8212,13 +8167,12 @@ async fn a_capped_playbook_launch_stays_new(pool: PgPool) -> Result<()> {
     seed_registered_playbook(&db, "survey").await;
     adopt_launch(&db, key, 3.0).await;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+    cfg.runtime.dispatcher = std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: String::new(),
         created: Default::default(),
-    }));
+    });
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     let issue = crate::issues::store::get_issue(db.pool(), key)
@@ -8335,7 +8289,9 @@ async fn resync_and_reconcile(
     cfg: &ControllerCfg,
     dispatcher: std::sync::Arc<ClusterRunPodDispatcher>,
 ) -> Result<Vec<String>> {
-    crate::runs::workpod::install_dispatcher(dispatcher);
+    let mut cfg = cfg.clone();
+    cfg.runtime.dispatcher = dispatcher;
+    let cfg = &cfg;
     let keys = resync_tick(db).await;
     let mut outcome = keys
         .as_ref()
@@ -8348,7 +8304,6 @@ async fn resync_and_reconcile(
             }
         }
     }
-    crate::runs::workpod::reset_dispatcher();
     outcome?;
     keys
 }
@@ -8763,7 +8718,7 @@ async fn a_loop_pod_is_bounded_by_the_loop_run_max_age(pool: PgPool) -> Result<(
 async fn an_overrun_pod_whose_delete_gets_no_answer_keeps_its_row(pool: PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
+    let mut cfg = cfg_with(dir.path(), Profile::default());
     let key = "playbook:survey:0199c0de-7c2c-71a5-8000-23";
     let pod = "crucible-run-mute-1";
     seed_playbook_pod_run(
@@ -8775,9 +8730,8 @@ async fn an_overrun_pod_whose_delete_gets_no_answer_keeps_its_row(pool: PgPool) 
         std::time::Duration::from_secs(3 * 60 * 60),
     )
     .await?;
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(MuteDeleteDispatcher));
+    cfg.runtime.dispatcher = std::sync::Arc::new(MuteDeleteDispatcher);
     let res = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     res?;
 
     assert_eq!(run_status(&db, "run-mute-1").await?, "running");
@@ -9033,13 +8987,12 @@ async fn die_inside_the_create(
 ) -> CreatedPods {
     let created = CreatedPods::default();
     let dispatcher = InterruptibleDispatcher::new(side, &created);
-    crate::runs::workpod::install_dispatcher(dispatcher.clone());
-    let (db, cfg, key) = (db.clone(), cfg.clone(), key.to_string());
+    let (db, mut cfg, key) = (db.clone(), cfg.clone(), key.to_string());
+    cfg.runtime.dispatcher = dispatcher.clone();
     let pass = tokio::spawn(async move { reconcile(&db, &cfg, &key).await });
     dispatcher.reached.notified().await;
     pass.abort();
     assert!(pass.await.expect_err("aborted").is_cancelled());
-    crate::runs::workpod::reset_dispatcher();
     created
 }
 
@@ -9062,13 +9015,12 @@ async fn a_dispatch_that_dies_after_creating_its_pod_is_never_dispatched_again(
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c1";
-    let cfg = pod_launch(&db, dir.path(), key).await;
+    let mut cfg = pod_launch(&db, dir.path(), key).await;
 
     let first = die_inside_the_create(&db, &cfg, key, PodSide::Hang { created: true }).await;
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Live, &created));
+    cfg.runtime.dispatcher = InterruptibleDispatcher::new(PodSide::Live, &created);
     let restart = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     restart?;
 
     assert_eq!(first.lock().expect("lock").len(), 1);
@@ -9104,13 +9056,12 @@ async fn a_dispatch_that_dies_before_its_pod_exists_settles_as_lost(pool: PgPool
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c2";
-    let cfg = pod_launch(&db, dir.path(), key).await;
+    let mut cfg = pod_launch(&db, dir.path(), key).await;
 
     die_inside_the_create(&db, &cfg, key, PodSide::Hang { created: false }).await;
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Gone, &created));
+    cfg.runtime.dispatcher = InterruptibleDispatcher::new(PodSide::Gone, &created);
     let restart = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     restart?;
 
     assert!(
@@ -9147,16 +9098,15 @@ async fn a_launch_whose_issue_moved_before_the_claim_creates_no_pod(pool: PgPool
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c3";
-    let cfg = pod_launch(&db, dir.path(), key).await;
+    let mut cfg = pod_launch(&db, dir.path(), key).await;
     let read = crate::issues::store::get_issue(db.pool(), key)
         .await?
         .expect("issue");
     human_park(&db, key, "held by hand").await?;
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Live, &created));
+    cfg.runtime.dispatcher = InterruptibleDispatcher::new(PodSide::Live, &created);
     let launched = crate::runs::launch::launch(&db, &cfg, &read).await;
-    crate::runs::workpod::reset_dispatcher();
     launched?;
 
     assert!(created.lock().expect("lock").is_empty(), "no pod");
@@ -9190,11 +9140,10 @@ async fn a_failed_pod_create_releases_the_claim_for_the_retry(pool: PgPool) -> R
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c4";
-    let cfg = pod_launch(&db, dir.path(), key).await;
+    let mut cfg = pod_launch(&db, dir.path(), key).await;
 
-    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RefusingCreateDispatcher));
+    cfg.runtime.dispatcher = std::sync::Arc::new(RefusingCreateDispatcher);
     let failed = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     let err = format!("{:#}", failed.expect_err("the create failed"));
     assert!(err.contains("admission webhook refused"), "{err}");
 
@@ -9232,9 +9181,8 @@ async fn a_failed_pod_create_releases_the_claim_for_the_retry(pool: PgPool) -> R
     );
 
     let created = CreatedPods::default();
-    crate::runs::workpod::install_dispatcher(InterruptibleDispatcher::new(PodSide::Live, &created));
+    cfg.runtime.dispatcher = InterruptibleDispatcher::new(PodSide::Live, &created);
     let retried = reconcile(&db, &cfg, key).await;
-    crate::runs::workpod::reset_dispatcher();
     retried?;
     assert_eq!(created.lock().expect("lock").len(), 1);
     let runs = runs_of(&db, key).await?;

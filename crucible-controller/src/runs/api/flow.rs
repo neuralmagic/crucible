@@ -104,24 +104,30 @@ pub(crate) async fn get_run_flow_enriched(
     };
 
     // `_guard` keeps an S3 temp download alive through the render below.
-    let (session_path, _guard) =
-        match fetch_artifact(state.db.pool(), prefix, "session.jsonl").await {
-            Ok(f) => f,
-            Err(FetchError::NotFound) => {
-                record("no_evidence");
-                return Ok(not_found(format!(
-                    "artifact not found: {run_id}/session.jsonl"
-                )));
-            }
-            Err(FetchError::Fetch(msg)) => {
-                record("fetch_error");
-                tracing::warn!(run_id, error = %msg, "flow-enriched: session fetch failed");
-                return Ok(error_response(
-                    StatusCode::BAD_GATEWAY,
-                    "failed to fetch session log",
-                ));
-            }
-        };
+    let (session_path, _guard) = match fetch_artifact(
+        state.db.pool(),
+        Some(&state.contracts),
+        prefix,
+        "session.jsonl",
+    )
+    .await
+    {
+        Ok(f) => f,
+        Err(FetchError::NotFound) => {
+            record("no_evidence");
+            return Ok(not_found(format!(
+                "artifact not found: {run_id}/session.jsonl"
+            )));
+        }
+        Err(FetchError::Fetch(msg)) => {
+            record("fetch_error");
+            tracing::warn!(run_id, error = %msg, "flow-enriched: session fetch failed");
+            return Ok(error_response(
+                StatusCode::BAD_GATEWAY,
+                "failed to fetch session log",
+            ));
+        }
+    };
 
     let cache_dir = cached
         .parent()

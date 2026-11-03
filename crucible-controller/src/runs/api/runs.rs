@@ -570,6 +570,7 @@ pub(crate) async fn get_artifact(
         .and_then(|v| v.to_str().ok());
     crate::runs::artifacts::serve_artifact(
         state.db.metrics(),
+        Some(&state.contracts),
         state.db.pool(),
         run.session_uri.as_deref(),
         &run_id,

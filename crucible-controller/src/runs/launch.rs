@@ -303,11 +303,10 @@ async fn start_local(
     secrets: Option<&crate::runs::workpod::LaunchSecrets>,
 ) -> Result<Started> {
     let engine = crate::runs::contract::DispatchTarget::Binary(crate::runs::engine::resolve_bin());
-    if let Err(failure) = crate::runs::workpod::admit_contract(
-        crate::runs::contract::RequestKind::LocalRun,
-        &[engine],
-    )
-    .await
+    if let Err(failure) = cfg
+        .runtime
+        .admit_contract(crate::runs::contract::RequestKind::LocalRun, &[engine])
+        .await
     {
         crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?).await?;
         return Ok(Started::ContractRejected);
@@ -405,7 +404,7 @@ async fn dispatch_pod(
     let admission = crate::runs::workpod::dispatch_run(
         db,
         cfg,
-        crate::runs::workpod::active_dispatcher(),
+        cfg.runtime.dispatcher.clone(),
         claim,
         &pack,
         &std::collections::BTreeMap::new(),

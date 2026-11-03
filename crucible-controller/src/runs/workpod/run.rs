@@ -665,7 +665,11 @@ pub(crate) async fn dispatch_run(
         crate::runs::contract::profile_target(&profile)
             .into_iter()
             .collect();
-    if let Err(failure) = admit_contract(WorkKind::Run.into(), &targets).await {
+    if let Err(failure) = cfg
+        .runtime
+        .admit_contract(WorkKind::Run.into(), &targets)
+        .await
+    {
         let rejection = failure.into_rejection()?;
         crate::runs::contract::refuse(db, issue_key, &rejection).await?;
         return Ok(RunAdmission::ContractRejected);
@@ -1269,7 +1273,7 @@ pub(crate) async fn dispatch_grounded_rank(
     let targets: Vec<_> = crate::runs::contract::profile_target(&profile)
         .into_iter()
         .collect();
-    if let Err(failure) = admit_contract(kind.into(), &targets).await {
+    if let Err(failure) = cfg.runtime.admit_contract(kind.into(), &targets).await {
         let rejection = failure.into_rejection()?;
         crate::runs::contract::refuse(db, issue_key, &rejection).await?;
         return Ok(DispatchOutcome::Failed);

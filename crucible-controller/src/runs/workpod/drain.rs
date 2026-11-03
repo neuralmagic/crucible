@@ -1,135 +1,17 @@
-#[cfg(feature = "autoresearch")]
+//! The collect-tail drain: a collection that frees a slot re-drives the eldest queued issue back
+//! through reconcile, which owns the spend gates and promotes the row.
+
+#![cfg(feature = "autoresearch")]
+
 use crate::client::Db;
+use crate::daemon::queue::WorkQueue;
 use crate::runs::workpod::*;
-use std::sync::Arc;
-
-/// Install the process-global pod dispatcher (production [`KubePodDispatcher`], or a test's fake).
-/// The dispatch fires inside the pure reconcile step (a grounded turn) and the reconcile-awaiting
-/// launch (a run), neither of which can thread a dispatcher argument through the frozen reconcile
-/// signature — so it lives here, the one sanctioned process-global for the cluster boundary.
-static ACTIVE_DISPATCHER: std::sync::RwLock<Option<Arc<dyn PodDispatcher>>> =
-    std::sync::RwLock::new(None);
-
-/// Install the active turn dispatcher (daemon assembly, or a test's fake).
-pub fn install_dispatcher(dispatcher: Arc<dyn PodDispatcher>) {
-    *ACTIVE_DISPATCHER
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dispatcher);
-}
-
-/// Drop the installed dispatcher (a test's teardown).
-pub fn reset_dispatcher() {
-    *ACTIVE_DISPATCHER
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-}
-
-/// The dispatcher a dispatch resolves to: the installed one, else a default [`KubePodDispatcher`]
-/// with no spoke credentials (hub-only; no cluster registry was installed).
-pub(crate) fn active_dispatcher() -> Arc<dyn PodDispatcher> {
-    ACTIVE_DISPATCHER
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-        .unwrap_or_else(|| {
-            Arc::new(KubePodDispatcher::new(Arc::new(
-                crate::runs::clusters::ClusterClients::new(None),
-            )))
-        })
-}
-
-/// The contract registry every launch is gated on. Installed by the daemon assembly next to the
-/// dispatcher, for the same reason: the gate fires inside the reconcile step and the launch paths,
-/// which thread no registry handle. `None` (a unit test not exercising the check) gates nothing.
-static ACTIVE_CONTRACTS: std::sync::RwLock<Option<Arc<crate::runs::contract::ContractRegistry>>> =
-    std::sync::RwLock::new(None);
-
-/// Install the active contract registry (daemon assembly, or a test's table-backed one).
-pub fn install_contracts(registry: Arc<crate::runs::contract::ContractRegistry>) {
-    *ACTIVE_CONTRACTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(registry);
-}
-
-/// Drop the installed contract registry (a test's teardown).
-pub fn reset_contracts() {
-    *ACTIVE_CONTRACTS
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-}
-
-/// Gate one launch on the installed registry: `Ok` when no registry is installed or every target
-/// matches this controller; the first failure otherwise.
-pub(crate) async fn admit_contract(
-    request: crate::runs::contract::RequestKind,
-    targets: &[crate::runs::contract::DispatchTarget],
-) -> Result<(), crate::runs::contract::AdmitFailure> {
-    let registry = ACTIVE_CONTRACTS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    let Some(registry) = registry else {
-        return Ok(());
-    };
-    for target in targets {
-        registry.admit(request, target).await?;
-    }
-    Ok(())
-}
-
-/// The engine version the installed registry last recorded for `target`, or `None` when no
-/// registry is installed. Names an engine in a refusal; the gate itself is [`admit_contract`].
-#[cfg(feature = "autoresearch")]
-pub(crate) async fn recorded_engine_version(
-    target: &crate::runs::contract::DispatchTarget,
-) -> Option<String> {
-    let registry = ACTIVE_CONTRACTS
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()?;
-    Some(registry.record(target).await.engine_version)
-}
-
-/// Install the process-global reconcile-queue handle, so a collection that frees a slot can re-drive
-/// a queued backlog row's ISSUE back through reconcile (which owns the spend gates + issue context)
-/// to promote it. Same sanctioned-process-global rationale as [`install_dispatcher`]: the drain
-/// fires deep inside the collection tail (called from the pure reconcile step and its adopt-first
-/// pre-pass), neither of which can thread a queue handle through the frozen reconcile signature. The
-/// daemon assembly installs the real [`crate::daemon::queue::WorkQueue`]; unlike the dispatcher there is NO
-/// default — a process with no queue wired (a unit test not exercising the drain) makes the drain a
-/// safe no-op, since the timeout-sweep backstop and the next reconcile pass still drain the queue.
-static ACTIVE_ENQUEUE: std::sync::RwLock<Option<crate::daemon::queue::WorkQueue>> =
-    std::sync::RwLock::new(None);
-
-/// Install the active reconcile-queue handle (daemon assembly, or a test's recorder).
-pub fn install_enqueue(queue: crate::daemon::queue::WorkQueue) {
-    *ACTIVE_ENQUEUE
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(queue);
-}
-
-/// Drop the installed queue handle (a test's teardown).
-pub fn reset_enqueue() {
-    *ACTIVE_ENQUEUE
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-}
-
-/// The installed reconcile-queue handle, or `None` when no queue is wired (drain is then a no-op).
-#[cfg(feature = "autoresearch")]
-fn active_enqueue() -> Option<crate::daemon::queue::WorkQueue> {
-    ACTIVE_ENQUEUE
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
-}
 
 /// How many queued rows a single collect-tail drain scans while hunting for the eldest DRAINABLE
 /// (non-parked) one. A collection frees exactly one slot, so it re-drives one issue; a run of
 /// stale parked rows at the FIFO head is purged as the scan skips past them. A backlog of parked
 /// rows deeper than this drains over successive collections and the timeout-sweep backstop, so the
 /// bound just keeps one collection's scan cheap.
-#[cfg(feature = "autoresearch")]
 pub(crate) const QUEUE_DRAIN_SCAN: i64 = 256;
 
 /// Collect up to `limit` DRAINABLE queued issue keys for `kind`, eldest-first: scan the FIFO head
@@ -137,7 +19,6 @@ pub(crate) const QUEUE_DRAIN_SCAN: i64 = 256;
 /// spend the park rejected, and purging backfills stale rows whose issue parked before the
 /// park-purge existed — and return the live ones. Best-effort: a DB hiccup is logged and yields the
 /// keys gathered so far (a scan failure yields none) rather than failing the caller.
-#[cfg(feature = "autoresearch")]
 pub(crate) async fn drain_queued(db: &Db, kind: WorkKind, limit: usize) -> Vec<String> {
     let mut keys = Vec::new();
     if limit == 0 {
@@ -190,11 +71,10 @@ pub(crate) async fn drain_queued(db: &Db, kind: WorkKind, limit: usize) -> Vec<S
 /// promotes the row onto the slot this collection just freed. The tail never dispatches a pod itself
 /// — the reconcile pass owns the spend gates and issue context; this only re-drives the key.
 /// Best-effort: a DB hiccup or an unwired queue is logged and the collection it rides never fails.
-#[cfg(feature = "autoresearch")]
-pub(crate) async fn drain_freed_slot(db: &Db, kind: WorkKind) {
+pub(crate) async fn drain_freed_slot(db: &Db, queue: Option<&WorkQueue>, kind: WorkKind) {
     if let Some(key) = drain_queued(db, kind, 1).await.into_iter().next()
-        && let Some(enqueue) = active_enqueue()
+        && let Some(queue) = queue
     {
-        enqueue.enqueue(crate::daemon::queue::IssueKey(key));
+        queue.enqueue(crate::daemon::queue::IssueKey(key));
     }
 }

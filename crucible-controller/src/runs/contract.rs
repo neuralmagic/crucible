@@ -357,6 +357,18 @@ impl ContractRegistry {
         }
     }
 
+    /// [`ContractRegistry::admit`] over every target: the first failure, else `Ok`.
+    pub async fn admit_all(
+        &self,
+        request: RequestKind,
+        targets: &[DispatchTarget],
+    ) -> Result<(), AdmitFailure> {
+        for target in targets {
+            self.admit(request, target).await?;
+        }
+        Ok(())
+    }
+
     /// The launch gate: `Ok` when `target` matches this controller, [`AdmitFailure::Rejected`] when
     /// it reported another version, [`AdmitFailure::Unreadable`] when the read itself failed.
     pub async fn admit(

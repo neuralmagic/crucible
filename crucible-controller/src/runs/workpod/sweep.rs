@@ -294,8 +294,7 @@ impl crate::daemon::queue::DiscoverySource for TurnTimeoutPoll {
         let db = self.db.clone();
         let cfg = self.cfg.clone();
         Box::pin(async move {
-            let dispatcher = active_dispatcher();
-            for key in sweep_timed_out_turns(&db, dispatcher.as_ref(), &cfg).await {
+            for key in sweep_timed_out_turns(&db, cfg.runtime.dispatcher.as_ref(), &cfg).await {
                 queue.enqueue(crate::daemon::queue::IssueKey(key));
             }
             Ok(())

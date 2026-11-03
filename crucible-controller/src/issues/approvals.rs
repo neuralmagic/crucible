@@ -595,7 +595,7 @@ pub(crate) async fn reconcile_upstream_close(
 /// whichever cluster its ledger row names — a row-less (pre-primitive) run only ever ran on the
 /// hub. Reached only in-cluster; unit tests cover the decision, integration tests cover the call.
 async fn stop_pod(db: &Db, cfg: &ControllerCfg, pod: &str) -> Result<()> {
-    let dispatcher = crate::runs::workpod::active_dispatcher();
+    let dispatcher = cfg.runtime.dispatcher.clone();
     let cluster = crate::runs::work_pods::get_work_pod(db.pool(), pod)
         .await?
         .map(|row| row.cluster)
