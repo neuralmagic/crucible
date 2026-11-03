@@ -1,0 +1,47 @@
+name: Rerun lost runner
+
+# Rerun the failed jobs of a CI or Docker run when every unsuccessful job is a self-hosted runner
+# that lost contact with GitHub (a reclaimed spot instance), or the build-and-test gate that fails
+# with them. Any other failure leaves the run alone. At most two reruns per run.
+on:
+  workflow_run:
+    workflows: [CI, Docker]
+    types: [completed]
+
+permissions:
+  actions: write
+  checks: read
+
+jobs:
+  rerun:
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Rerun when only lost runners failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          unsuccessful=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/attempts/$ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion != "success" and .conclusion != "skipped") | "\(.id) \(.name)"')
+          lost=0
+          while read -r id name; do
+            [ -n "$id" ] || continue
+            if [ "$(gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" \
+              --jq 'any(.[]; .message | startswith("The self-hosted runner lost communication with the server"))')" = true ]; then
+              echo "$name: lost its runner"
+              lost=$((lost + 1))
+            elif [ "$name" != build-and-test ]; then
+              echo "$name: failed on its own; leaving run $RUN_ID attempt $ATTEMPT"
+              exit 0
+            fi
+          done <<< "$unsuccessful"
+          if [ "$lost" = 0 ]; then
+            echo "no job in run $RUN_ID attempt $ATTEMPT lost its runner"
+            exit 0
+          fi
+          echo "rerunning the failed jobs of run $RUN_ID attempt $ATTEMPT"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$RUN_ID/rerun-failed-jobs"
