@@ -33,6 +33,17 @@ pub(crate) enum RerunRefusal {
     Internal(#[from] anyhow::Error),
 }
 
+impl From<RerunRefusal> for crate::api::state::ApiError {
+    fn from(refusal: RerunRefusal) -> Self {
+        use crate::api::state::ApiError;
+        match refusal {
+            RerunRefusal::NoRun(_) => ApiError::NotFound(refusal.to_string()),
+            RerunRefusal::Internal(e) => ApiError::Internal(e),
+            other => ApiError::Unprocessable(other.to_string()),
+        }
+    }
+}
+
 /// One task a rerun reuses, as the parent settled it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct ReusedTaskDto {

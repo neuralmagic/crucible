@@ -2,8 +2,7 @@
 //! rules that decided it. The user is resolved from the groups their last sign-in stamped, the
 //! same snapshot viewing as them runs under, so the answer is what they would get now.
 
-use crate::api::dto::{not_found, unprocessable};
-use crate::api::state::{ApiState, AppError, ErrorBody};
+use crate::api::state::{ApiError, ApiResult, ApiState, ErrorBody};
 use crate::authz::action::{Action, ResourceType};
 use crate::authz::api::TeamMembershipDto;
 use crate::authz::decision::Resource;
@@ -64,49 +63,43 @@ fn owned(rtype: ResourceType) -> Option<Owned> {
 pub(crate) async fn explain(
     State(state): State<ApiState>,
     Query(q): Query<ExplainQuery>,
-) -> Response {
-    let action = match Action::parse(q.action.trim()) {
-        Ok(action) => action,
-        Err(e) => return unprocessable(e.to_string()),
-    };
+) -> ApiResult<Response> {
+    let action =
+        Action::parse(q.action.trim()).map_err(|e| ApiError::Unprocessable(e.to_string()))?;
     let login = q.login.trim().to_lowercase();
     let pool = state.db.pool();
-    let (_, groups, groups_at) = match crate::identity::oidc::users::stamped(pool, &login).await {
-        Ok(Some(found)) => found,
-        Ok(None) => return not_found(format!("no one with login {login} has signed in here")),
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    let caller = match crate::authz::resolve_caller(
+    let (_, groups, groups_at) = crate::identity::oidc::users::stamped(pool, &login)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("no one with login {login} has signed in here"))
+        })?;
+    let caller = crate::authz::resolve_caller(
         pool,
         &state.roles,
         Some(&login),
         &groups,
         AuthPath::Impersonated,
     )
-    .await
-    {
-        Ok(caller) => caller,
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    .await?;
     let id = q
         .resource
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty());
     let resource = match (owned(action.resource), id) {
-        (Some(table), Some(id)) => match crate::authz::transfer::owner_of(pool, table, id).await {
-            Ok(Some(owner)) => Resource::new(action.resource, id, owner),
-            Ok(None) => return not_found(format!("no {} {id:?}", action.resource.as_str())),
-            Err(e) => return AppError::from(e).into_response(),
-        },
+        (Some(table), Some(id)) => {
+            let owner = crate::authz::transfer::owner_of(pool, table, id)
+                .await?
+                .ok_or_else(|| {
+                    ApiError::NotFound(format!("no {} {id:?}", action.resource.as_str()))
+                })?;
+            Resource::new(action.resource, id, owner)
+        }
         (_, id) => Resource::platform(action.resource, id.unwrap_or(action.resource.as_str())),
     };
-    let resource = match crate::authz::granted::attach(pool, &caller.principals, resource).await {
-        Ok(resource) => resource,
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    let resource = crate::authz::granted::attach(pool, &caller.principals, resource).await?;
     let decision = crate::authz::owner::decision(&state, &caller, action.verb, &resource);
-    Json(ExplanationDto {
+    Ok(Json(ExplanationDto {
         login,
         action: action.to_string(),
         resource: resource.id.clone(),
@@ -126,5 +119,5 @@ pub(crate) async fn explain(
             })
             .collect(),
     })
-    .into_response()
+    .into_response())
 }

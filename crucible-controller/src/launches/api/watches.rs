@@ -315,7 +315,7 @@ pub(crate) async fn create_watch(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Err(denied) = crate::authz::owner::decide_create(
         &state,
@@ -392,7 +392,7 @@ pub(crate) async fn create_watch(
         )
         .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     (StatusCode::CREATED, Json(WatchDto::from(stored))).into_response()
 }
@@ -405,7 +405,7 @@ pub(crate) async fn create_watch(
 )]
 pub(crate) async fn list_watches(
     State(state): State<ApiState>,
-) -> Result<Json<Vec<WatchDto>>, AppError> {
+) -> Result<Json<Vec<WatchDto>>, ApiError> {
     let rows =
         crate::launches::watches::list(state.db.pool(), crate::launches::watches::LIST_LIMIT)
             .await?;
@@ -442,7 +442,7 @@ pub(crate) async fn list_watch_trackers(State(state): State<ApiState>) -> Json<T
 pub(crate) async fn get_watch(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     match crate::launches::watches::get(state.db.pool(), &id).await? {
         Some(row) => Ok(Json(WatchDto::from(row)).into_response()),
         None => Ok(not_found(format!("no watch {id:?}"))),
@@ -486,7 +486,7 @@ pub(crate) async fn update_watch(
     };
     let prior = match crate::launches::watches::get(state.db.pool(), &id).await {
         Ok(row) => row,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let (authorized, kind, since) = match authorize_watch(&state, &caller, &body).await {
         Ok(ok) => ok,
@@ -510,7 +510,7 @@ pub(crate) async fn update_watch(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     let firing_changed = prior.as_ref().is_none_or(|p| {
         p.playbook != authorized.pack.id
@@ -568,7 +568,7 @@ pub(crate) async fn update_watch(
             tracing::info!(watch = %id, expired = expired.len(), "watches: re-save expired stale-owner parks");
         }
         Ok(_) => {}
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     let audit_reason = format!(
         "playbook {} rewatching {} {:?} from {} as {}",
@@ -595,7 +595,7 @@ pub(crate) async fn update_watch(
         )
         .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     Json(WatchDto::from(stored)).into_response()
 }
@@ -631,12 +631,12 @@ pub(crate) async fn delete_watch(
     match crate::launches::watches::get(state.db.pool(), &id).await {
         Ok(Some(_)) => {}
         Ok(None) => return not_found(format!("no watch {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     match crate::launches::watches::delete(state.db.pool(), &id).await {
         Ok(true) => {}
         Ok(false) => return not_found(format!("no watch {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     state
         .audit(
@@ -688,7 +688,7 @@ pub(crate) async fn set_watch_enabled(
         match crate::launches::watches::set_enabled(state.db.pool(), &id, body.enabled).await {
             Ok(Some(prior)) => prior,
             Ok(None) => return not_found(format!("no watch {id:?}")),
-            Err(e) => return AppError::from(e).into_response(),
+            Err(e) => return ApiError::from(e).into_response(),
         };
     let state_of = |on: bool| if on { "enabled" } else { "disabled" };
     if prior != body.enabled {
@@ -709,7 +709,7 @@ pub(crate) async fn set_watch_enabled(
     match crate::launches::watches::get(state.db.pool(), &id).await {
         Ok(Some(w)) => Json(WatchDto::from(w)).into_response(),
         Ok(None) => not_found(format!("no watch {id:?}")),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -726,7 +726,7 @@ pub(crate) async fn set_watch_enabled(
 pub(crate) async fn list_watch_hits(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if crate::launches::watches::get(state.db.pool(), &id)
         .await?
         .is_none()
@@ -774,7 +774,7 @@ pub(crate) async fn reset_watch_hit(
     match crate::launches::watches::reset_hit(state.db.pool(), &id, &item).await {
         Ok(true) => {}
         Ok(false) => return not_found(format!("watch {id:?} never launched {item:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     let note = format!("{item} reset; the next sweep may launch it again");
     state

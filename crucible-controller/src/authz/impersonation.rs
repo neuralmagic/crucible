@@ -3,7 +3,7 @@
 //! answering every request on the session as the snapshot and refusing every write but a stop.
 
 use crate::api::dto::{not_found, unprocessable};
-use crate::api::state::{ApiState, AppError, ErrorBody};
+use crate::api::state::{ApiError, ApiState, ErrorBody};
 use crate::authz::Caller;
 use crate::identity::auth::AuthPath;
 use crate::identity::session::Impersonation;
@@ -49,7 +49,7 @@ pub(crate) async fn start(
         Err(refused) => return refused,
     };
     if let Err(e) = crate::identity::session::start_impersonation(&session, &view).await {
-        return AppError::from(anyhow::Error::from(e)).into_response();
+        return ApiError::from(anyhow::Error::from(e)).into_response();
     }
     state
         .audit(
@@ -86,7 +86,7 @@ pub(crate) async fn snapshot(
                 "no one with login {login} has signed in here"
             )));
         }
-        Err(e) => return Err(AppError::from(e).into_response()),
+        Err(e) => return Err(ApiError::from(e).into_response()),
     };
     Ok(Impersonation {
         login,
@@ -128,6 +128,6 @@ pub(crate) async fn stop(
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => AppError::from(anyhow::Error::from(e)).into_response(),
+        Err(e) => ApiError::from(anyhow::Error::from(e)).into_response(),
     }
 }

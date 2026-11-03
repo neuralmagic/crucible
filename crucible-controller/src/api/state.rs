@@ -417,20 +417,94 @@ impl axum::extract::FromRef<ApiState> for crate::identity::auth::Roles {
     }
 }
 
-/// The error boundary: any `?`-propagated `anyhow::Error` becomes a 500 with its
-/// message. Expected outcomes (not found, bad query) are returned as explicit responses instead —
-/// this newtype exists only for "something we didn't plan for went wrong."
-pub struct AppError(pub(crate) anyhow::Error);
+/// The one error a handler answers with. Every variant is a status; the body is the same
+/// `{"error": …}` the routes have always sent, the field list for a refused form, the rule for a
+/// policy denial, and the bare message for a failure nobody planned for.
+#[derive(Debug)]
+pub enum ApiError {
+    BadRequest(String),
+    NotFound(String),
+    Forbidden(String),
+    Conflict(String),
+    Unprocessable(String),
+    /// A 422 naming the form inputs that were refused and why.
+    Invalid {
+        error: String,
+        fields: Vec<crate::playbooks::registry::FieldError>,
+    },
+    Unavailable(String),
+    BadGateway(String),
+    /// A policy denial (RFC-0003), or the audit write it could not record.
+    Denied(crate::authz::owner::Denied),
+    /// Something unplanned went wrong: a 500 with the error chain as its text.
+    Internal(anyhow::Error),
+}
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("{:#}", self.0)).into_response()
+pub type ApiResult<T> = Result<T, ApiError>;
+
+impl ApiError {
+    /// A 422 with the schema-refusal headline and the refused fields.
+    pub(crate) fn invalid_fields(fields: Vec<crate::playbooks::registry::FieldError>) -> Self {
+        ApiError::Invalid {
+            error: "the supplied parameters do not satisfy the playbook's schema".to_string(),
+            fields,
+        }
     }
 }
 
-impl<E: Into<anyhow::Error>> From<E> for AppError {
-    fn from(err: E) -> Self {
-        AppError(err.into())
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, message) = match self {
+            ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiError::Unprocessable(m) => (StatusCode::UNPROCESSABLE_ENTITY, m),
+            ApiError::Invalid { error, fields } => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(crate::api::dto::ValidationErrorBody { error, fields }),
+                )
+                    .into_response();
+            }
+            ApiError::Unavailable(m) => (StatusCode::SERVICE_UNAVAILABLE, m),
+            ApiError::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
+            ApiError::Denied(denied) => return denied.into_response(),
+            ApiError::Internal(e) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+            }
+        };
+        (status, Json(ErrorBody::new(message))).into_response()
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(err: anyhow::Error) -> Self {
+        ApiError::Internal(err)
+    }
+}
+
+impl From<sqlx::Error> for ApiError {
+    fn from(err: sqlx::Error) -> Self {
+        ApiError::Internal(err.into())
+    }
+}
+
+impl From<std::io::Error> for ApiError {
+    fn from(err: std::io::Error) -> Self {
+        ApiError::Internal(err.into())
+    }
+}
+
+impl From<tower_sessions::session::Error> for ApiError {
+    fn from(err: tower_sessions::session::Error) -> Self {
+        ApiError::Internal(err.into())
+    }
+}
+
+impl From<crate::authz::owner::Denied> for ApiError {
+    fn from(denied: crate::authz::owner::Denied) -> Self {
+        ApiError::Denied(denied)
     }
 }
 

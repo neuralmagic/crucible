@@ -1,9 +1,9 @@
 //! `GET /api/runs/{run_id}/rerun`: what rerunning a finished playbook run from some of its tasks
 //! would reuse and dispatch again.
 
-use crate::api::dto::{bad_request, not_found, unprocessable};
-use crate::api::state::{ApiState, AppError, ErrorBody};
-use crate::runs::rerun::{RerunPreviewDto, RerunRefusal};
+use crate::api::dto::bad_request;
+use crate::api::state::{ApiResult, ApiState, ErrorBody};
+use crate::runs::rerun::RerunPreviewDto;
 use crate::runs::task_evidence;
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -28,15 +28,6 @@ impl RerunQuery {
     }
 }
 
-/// The answer a refusal gives: a missing run is a 404, anything the engine would refuse a 422.
-pub(crate) fn refused(refusal: RerunRefusal) -> Result<Response, AppError> {
-    match refusal {
-        RerunRefusal::NoRun(_) => Ok(not_found(refusal.to_string())),
-        RerunRefusal::Internal(e) => Err(AppError::from(e)),
-        other => Ok(unprocessable(other.to_string())),
-    }
-}
-
 /// `GET /api/runs/{run_id}/rerun` — preview a rerun of a finished playbook run against the pack
 /// the rerun would run: the newest draft save, or the registered pack. Reused tasks keep their
 /// output, files and commits; the rest dispatch again.
@@ -55,13 +46,13 @@ pub(crate) async fn preview_rerun(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
     Query(q): Query<RerunQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if !task_evidence::safe_segment(&run_id) {
         return Ok(bad_request("a run id is one path segment"));
     }
     match crate::runs::rerun::preview(&state.db, &run_id, &q.tasks()).await {
         Ok(preview) => Ok(Json(preview).into_response()),
-        Err(refusal) => refused(refusal),
+        Err(refusal) => Err(refusal.into()),
     }
 }
 
@@ -75,24 +66,19 @@ pub(crate) struct RerunBody {
     from: Vec<String>,
 }
 
-/// Admit a launch's rerun of `playbook`, or the response that refuses it.
+/// Admit a launch's rerun of `playbook`, or the refusal.
 pub(crate) async fn admit_launch(
     state: &ApiState,
     playbook: &str,
     draft: bool,
     rerun: Option<&RerunBody>,
-) -> Result<Option<crate::launches::model::RerunOf>, Box<Response>> {
+) -> ApiResult<Option<crate::launches::model::RerunOf>> {
     let Some(rerun) = rerun else {
         return Ok(None);
     };
-    match crate::runs::rerun::admit(&state.db, playbook, draft, &rerun.of, &rerun.from).await {
-        Ok(()) => Ok(Some(crate::launches::model::RerunOf {
-            run: rerun.of.clone(),
-            from: rerun.from.clone(),
-        })),
-        Err(refusal) => Err(Box::new(match refused(refusal) {
-            Ok(response) => response,
-            Err(e) => e.into_response(),
-        })),
-    }
+    crate::runs::rerun::admit(&state.db, playbook, draft, &rerun.of, &rerun.from).await?;
+    Ok(Some(crate::launches::model::RerunOf {
+        run: rerun.of.clone(),
+        from: rerun.from.clone(),
+    }))
 }

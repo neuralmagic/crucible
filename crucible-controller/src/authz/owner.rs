@@ -1,7 +1,7 @@
 //! Owner selection on a creation surface (RFC-0003 C-OWNERSHIP) and the decision a handler takes
 //! on a resource it resolved.
 
-use crate::api::state::{ApiState, ErrorBody, Json};
+use crate::api::state::{ApiError, ApiResult, ApiState, Json};
 use crate::authz::Caller;
 use crate::authz::action::{Action, ResourceType, Verb};
 use crate::authz::decision::{Decision, DenialBody, Resource};
@@ -19,27 +19,27 @@ pub enum OwnerRefusal {
     NotActedAs { asked: String, held: Vec<String> },
 }
 
-impl IntoResponse for OwnerRefusal {
-    fn into_response(self) -> Response {
-        let (status, msg) = match self {
-            OwnerRefusal::Anonymous => (
-                StatusCode::FORBIDDEN,
+impl From<OwnerRefusal> for ApiError {
+    fn from(refusal: OwnerRefusal) -> Self {
+        match refusal {
+            OwnerRefusal::Anonymous => ApiError::Forbidden(
                 "an anonymous caller has no principal to own a resource".to_string(),
             ),
-            OwnerRefusal::CannotOwn => (
-                StatusCode::FORBIDDEN,
+            OwnerRefusal::CannotOwn => ApiError::Forbidden(
                 "this credential names nobody who may own a resource".to_string(),
             ),
-            OwnerRefusal::Malformed(e) => (StatusCode::UNPROCESSABLE_ENTITY, e),
-            OwnerRefusal::NotActedAs { asked, held } => (
-                StatusCode::FORBIDDEN,
-                format!(
-                    "{asked} is not a principal you act as; you act as {}",
-                    held.join(", ")
-                ),
-            ),
-        };
-        (status, Json(ErrorBody::new(msg))).into_response()
+            OwnerRefusal::Malformed(e) => ApiError::Unprocessable(e),
+            OwnerRefusal::NotActedAs { asked, held } => ApiError::Forbidden(format!(
+                "{asked} is not a principal you act as; you act as {}",
+                held.join(", ")
+            )),
+        }
+    }
+}
+
+impl IntoResponse for OwnerRefusal {
+    fn into_response(self) -> Response {
+        ApiError::from(self).into_response()
     }
 }
 
@@ -97,7 +97,7 @@ impl IntoResponse for Denied {
                 action,
                 decision,
             } => denial(&who, action, &decision),
-            Denied::Unrecorded(e) => crate::api::state::AppError::from(e).into_response(),
+            Denied::Unrecorded(e) => ApiError::Internal(e).into_response(),
         }
     }
 }
@@ -167,17 +167,14 @@ pub async fn decide_create(
 
 /// The owner a creation asks for, resolved against the principals the caller acts as and decided
 /// as `create` on `rtype` against that owner.
-#[allow(clippy::result_large_err)]
 pub async fn owner_for_create(
     state: &ApiState,
     caller: &Caller,
     asked: Option<&str>,
     rtype: ResourceType,
-) -> Result<Principal, Response> {
-    let owner = resolve_owner(caller, asked).map_err(IntoResponse::into_response)?;
-    decide_create(state, caller, rtype, &owner)
-        .await
-        .map_err(IntoResponse::into_response)?;
+) -> ApiResult<Principal> {
+    let owner = resolve_owner(caller, asked)?;
+    decide_create(state, caller, rtype, &owner).await?;
     Ok(owner)
 }
 
@@ -189,12 +186,18 @@ pub enum Refused {
     Denied(Denied),
 }
 
+impl From<Refused> for ApiError {
+    fn from(refused: Refused) -> Self {
+        match refused {
+            Refused::NotFound(msg) => ApiError::NotFound(msg),
+            Refused::Denied(denied) => ApiError::Denied(denied),
+        }
+    }
+}
+
 impl IntoResponse for Refused {
     fn into_response(self) -> Response {
-        match self {
-            Refused::NotFound(msg) => crate::api::dto::not_found(msg),
-            Refused::Denied(denied) => denied.into_response(),
-        }
+        ApiError::from(self).into_response()
     }
 }
 

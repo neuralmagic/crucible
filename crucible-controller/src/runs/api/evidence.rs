@@ -73,7 +73,7 @@ pub struct TaskEvidenceDto {
 pub(crate) async fn get_task_evidence(
     State(state): State<ApiState>,
     Path((run_id, task)): Path<(String, String)>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if !task_evidence::safe_segment(&run_id) || !task_evidence::safe_segment(&task) {
         return Ok(bad_request(
             "a run id and a task name are each one path segment",
@@ -132,7 +132,7 @@ pub(crate) async fn get_task_evidence(
 
 /// Whether the run's newest admitted plan declares this task. A fan-out instance is never declared,
 /// which is why a recorded result counts on its own.
-async fn planned(pool: &sqlx::PgPool, run_id: &str, task: &str) -> Result<bool, AppError> {
+async fn planned(pool: &sqlx::PgPool, run_id: &str, task: &str) -> ApiResult<bool> {
     let Some(plan) = crate::runs::task_results::latest_run_plan(pool, run_id).await? else {
         return Ok(false);
     };
@@ -175,7 +175,7 @@ pub struct RunLogDto {
 pub(crate) async fn get_run_log(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if !task_evidence::safe_segment(&run_id) {
         return Ok(bad_request("a run id is one path segment"));
     }
@@ -308,7 +308,7 @@ pub struct RunFilesDto {
 pub(crate) async fn get_run_files(
     State(state): State<ApiState>,
     Path(run_id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if !task_evidence::safe_segment(&run_id) {
         return Ok(bad_request("a run id is one path segment"));
     }
@@ -351,7 +351,7 @@ pub(crate) async fn get_run_files(
 pub(crate) async fn get_run_file(
     State(state): State<ApiState>,
     Path((run_id, key)): Path<(String, String)>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if !task_evidence::safe_segment(&run_id) {
         return Ok(bad_request("a run id is one path segment"));
     }

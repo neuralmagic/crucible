@@ -100,7 +100,7 @@ pub(crate) async fn add_repo(
             )
                 .into_response();
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     state
         .audit(
@@ -118,7 +118,7 @@ pub(crate) async fn add_repo(
                 .map(RepoHealthDto::from);
             (StatusCode::CREATED, Json(dto)).into_response()
         }
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -152,7 +152,7 @@ async fn repo_transition(
                 .into_response()
         }
         Ok(false) => not_found(format!("{repo} is not a known repo")),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -249,7 +249,7 @@ pub(crate) async fn unwatch_repo(
 )]
 pub(crate) async fn get_repos(
     State(state): State<ApiState>,
-) -> Result<Json<Vec<RepoHealthDto>>, AppError> {
+) -> Result<Json<Vec<RepoHealthDto>>, ApiError> {
     let health = crate::issues::store::repo_health(state.db.pool()).await?;
     Ok(Json(health.into_iter().map(RepoHealthDto::from).collect()))
 }

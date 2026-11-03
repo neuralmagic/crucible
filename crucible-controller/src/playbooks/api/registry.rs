@@ -105,7 +105,7 @@ pub(crate) fn register_refusal(err: RegisterError) -> Response {
         e @ RegisterError::ExposureChanged { .. } => {
             (StatusCode::CONFLICT, Json(ErrorBody::new(e.to_string()))).into_response()
         }
-        RegisterError::Internal(e) => AppError::from(e).into_response(),
+        RegisterError::Internal(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -209,7 +209,7 @@ pub(crate) async fn catalog(
 ) -> Result<Vec<crate::images::model::CatalogImage>, Response> {
     crate::images::store::list_images(state.db.pool())
         .await
-        .map_err(|e| AppError::from(e).into_response())
+        .map_err(|e| ApiError::from(e).into_response())
 }
 
 /// Decide `launch` on a pack against its owner, for every surface that fires it: the form POST,
@@ -250,7 +250,7 @@ pub(crate) async fn authorize_image(
     };
     let resolved = crate::playbooks::preflight::resolve_harness(state.db.pool(), provider, domain)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     let catalog = catalog(state).await?;
     let verdict = crate::playbooks::preflight::preflight_pack(agent, resolved.as_ref(), &catalog);
     if verdict.refused() {
@@ -426,7 +426,7 @@ pub(crate) async fn register_playbook(
     .await
     {
         Ok(owner) => owner,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
     let req = RegisterPlaybook {
         id: body.id.trim().to_string(),
@@ -448,7 +448,7 @@ pub(crate) async fn register_playbook(
 
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
         Ok(g) => g,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let registered =
         match crate::playbooks::registry::register(state.db.pool(), &git, req, actor).await {
@@ -487,7 +487,7 @@ pub(crate) async fn readable_playbook(
 ) -> Result<crate::playbooks::registry::PlaybookRow, Response> {
     let row = crate::playbooks::registry::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     crate::authz::owner::decide_row(
         state,
         caller,
@@ -510,7 +510,7 @@ pub(crate) async fn readable_playbook(
 pub(crate) async fn list_playbooks(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
-) -> Result<Json<Vec<PlaybookDto>>, AppError> {
+) -> Result<Json<Vec<PlaybookDto>>, ApiError> {
     let rows = crate::playbooks::registry::list(state.db.pool()).await?;
     let rows = crate::authz::owner::readable_with_actions(
         &state,
@@ -548,7 +548,7 @@ pub(crate) async fn get_playbook(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let row = match readable_playbook(&state, &caller, &id, crate::authz::action::Verb::Read).await
     {
         Ok(row) => row,
@@ -590,7 +590,7 @@ pub(crate) async fn get_playbook_schema(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Err(refused) =
         readable_playbook(&state, &caller, &id, crate::authz::action::Verb::Read).await
     {
@@ -792,7 +792,7 @@ pub(crate) async fn launch_playbook(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     let image = match authorize_image(
         &state,
@@ -810,7 +810,7 @@ pub(crate) async fn launch_playbook(
             .await
         {
             Ok(rerun) => rerun,
-            Err(refusal) => return *refusal,
+            Err(refusal) => return refusal.into_response(),
         };
     let actor = saver.actor.as_deref();
     let dispatch_target = saver.dispatch_target.clone();
@@ -865,7 +865,7 @@ pub(crate) async fn launch_playbook(
             )
                 .into_response();
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
 
     let max_time = authorized.max_time;
@@ -948,7 +948,7 @@ pub(crate) async fn dedupe_target(
             s.playbook
         ))),
         Ok(None) => Err(refuse(format!("no schedule {id:?}"))),
-        Err(e) => Err(AppError::from(e).into_response()),
+        Err(e) => Err(ApiError::from(e).into_response()),
     }
 }
 
@@ -991,7 +991,7 @@ pub(crate) async fn authorize_pack(
     let schema = match crate::playbooks::registry::schema(state.db.pool(), id).await {
         Ok(Some(s)) => s,
         Ok(None) => return Err(not_found(format!("no playbook {id:?}"))),
-        Err(e) => return Err(AppError::from(e).into_response()),
+        Err(e) => return Err(ApiError::from(e).into_response()),
     };
     Ok((pack, schema, max_time))
 }
@@ -1016,7 +1016,7 @@ pub(crate) async fn check_plan(
     {
         Ok(Ok(())) => Ok(()),
         Ok(Err(field)) => Err(invalid_fields(vec![field])),
-        Err(e) => Err(AppError::from(e).into_response()),
+        Err(e) => Err(ApiError::from(e).into_response()),
     }
 }
 
@@ -1029,7 +1029,7 @@ pub(crate) fn unreadable_tree(e: anyhow::Error) -> Response {
             message: format!("{e:#}"),
         }]);
     }
-    AppError::from(e).into_response()
+    ApiError::from(e).into_response()
 }
 
 /// Validate one launch request against the registry: [`authorize_pack`], then the values, then

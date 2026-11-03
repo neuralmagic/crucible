@@ -181,7 +181,7 @@ pub(crate) async fn get_access(State(state): State<ApiState>) -> Json<AccessDto>
         (status = 200, description = "Dashboard overview with status/tier counts and caps", body = Overview)
     )
 )]
-pub(crate) async fn overview(State(state): State<ApiState>) -> Result<Json<Overview>, AppError> {
+pub(crate) async fn overview(State(state): State<ApiState>) -> Result<Json<Overview>, ApiError> {
     let dto = overview_dto(&state.db, state.caps.as_ref()).await?;
     Ok(Json(dto))
 }
@@ -195,7 +195,7 @@ pub(crate) async fn overview(State(state): State<ApiState>) -> Result<Json<Overv
 )]
 pub(crate) async fn ledger_summary(
     State(state): State<ApiState>,
-) -> Result<Json<LedgerSummaryDto>, AppError> {
+) -> Result<Json<LedgerSummaryDto>, ApiError> {
     Ok(Json(ledger_summary_dto(&state.db).await?))
 }
 
@@ -227,7 +227,7 @@ pub struct LedgerTagDto {
 )]
 pub(crate) async fn ledger_by_tag(
     State(state): State<ApiState>,
-) -> Result<Json<LedgerByTagDto>, AppError> {
+) -> Result<Json<LedgerByTagDto>, ApiError> {
     let day = crate::clock::today_utc();
     let tags = crate::ledger::ledger_day_by_tag(state.db.pool(), &day).await?;
     Ok(Json(LedgerByTagDto {

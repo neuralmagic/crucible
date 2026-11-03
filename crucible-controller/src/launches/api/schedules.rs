@@ -290,12 +290,12 @@ async fn authorize_schedule(
         Ok(Some(d)) if d.retired_at.is_none() => d,
         Ok(Some(_)) => return Err(conflict("the draft retired after graduation")),
         Ok(None) => return Err(not_found(format!("no draft {:?}", body.playbook))),
-        Err(e) => return Err(AppError::from(e).into_response()),
+        Err(e) => return Err(ApiError::from(e).into_response()),
     };
     let latest = match crate::playbooks::drafts::latest(state.db.pool(), &body.playbook).await {
         Ok(Some(v)) => v,
         Ok(None) => return Err(not_found(format!("no draft {:?}", body.playbook))),
-        Err(e) => return Err(AppError::from(e).into_response()),
+        Err(e) => return Err(ApiError::from(e).into_response()),
     };
     let (Some(schema), Some(schema_digest)) = (latest.params_schema, latest.schema_digest) else {
         return Err(invalid_fields(vec![
@@ -421,7 +421,7 @@ pub(crate) async fn create_schedule(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Err(refusal) = crate::playbooks::api::registry::authorize_image(
         &state,
@@ -511,7 +511,7 @@ pub(crate) async fn create_schedule(
         )
         .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
 
     (StatusCode::CREATED, Json(ScheduleDto::from(stored))).into_response()
@@ -525,7 +525,7 @@ pub(crate) async fn create_schedule(
 )]
 pub(crate) async fn list_schedules(
     State(state): State<ApiState>,
-) -> Result<Json<Vec<ScheduleDto>>, AppError> {
+) -> Result<Json<Vec<ScheduleDto>>, ApiError> {
     let rows = state
         .schedules
         .list(crate::launches::schedules::LIST_LIMIT)
@@ -546,7 +546,7 @@ pub(crate) async fn list_schedules(
 pub(crate) async fn get_schedule(
     State(state): State<ApiState>,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     match state.schedules.get(&id).await? {
         Some(row) => Ok(Json(ScheduleDto::from(row)).into_response()),
         None => Ok(not_found(format!("no schedule {id:?}"))),
@@ -607,7 +607,7 @@ pub(crate) async fn update_schedule(
     };
     let prior = match state.schedules.get(&id).await {
         Ok(row) => row,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let (authorized, spec, cursor, draft_version) =
         match authorize_schedule(&state, &caller, &body).await {
@@ -634,7 +634,7 @@ pub(crate) async fn update_schedule(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Err(refusal) = crate::playbooks::api::registry::authorize_image(
         &state,
@@ -702,7 +702,7 @@ pub(crate) async fn update_schedule(
     // launch.
     let expired = match state.schedules.expire_stale_owner_parks(&id).await {
         Ok(keys) => keys,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     if !expired.is_empty() {
         tracing::info!(schedule = %id, expired = expired.len(), "schedules: re-save expired stale-owner parks");
@@ -736,7 +736,7 @@ pub(crate) async fn update_schedule(
         )
         .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
 
     Json(ScheduleDto::from(stored)).into_response()
@@ -773,7 +773,7 @@ pub(crate) async fn delete_schedule(
     match state.schedules.delete(&id).await {
         Ok(true) => {}
         Ok(false) => return not_found(format!("no schedule {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     state
         .audit(

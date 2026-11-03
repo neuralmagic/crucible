@@ -156,7 +156,7 @@ async fn may_spend(
     })?;
     let row = crate::secrets::store::find_owned(state.db.pool(), &secret.owner, &name)
         .await
-        .map_err(|e| AppError::from(e).into_response())?
+        .map_err(|e| ApiError::from(e).into_response())?
         .ok_or_else(|| {
             unprocessable(format!(
                 "secret_name {name} names no secret owned by {}",
@@ -204,11 +204,11 @@ pub(crate) async fn get_dispatch_providers(
 ) -> Response {
     let providers = match launchable(&state, &caller).await {
         Ok(rows) => rows,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let defaults = match crate::playbooks::providers::list_defaults(state.db.pool()).await {
         Ok(rows) => rows,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     Json(DispatchProvidersDto {
         providers: providers.into_iter().map(ProviderDto::from).collect(),
@@ -280,7 +280,7 @@ async fn detail_for(
     crate::authz::owner::actions_on(state, caller, resource)
         .await
         .map(|actions| ProviderDetailDto::with_actions(provider, actions))
-        .map_err(|e| AppError::from(e).into_response())
+        .map_err(|e| ApiError::from(e).into_response())
 }
 
 /// Everything about a registration except its id, which a POST carries in the body and a PUT in
@@ -450,7 +450,7 @@ async fn check_provider(
     pool: &sqlx::PgPool,
     id: &str,
     body: ProviderBody,
-) -> Result<Result<CheckedProvider, String>, AppError> {
+) -> Result<Result<CheckedProvider, String>, ApiError> {
     let display_name = body.display_name.trim().to_string();
     if display_name.is_empty() {
         return Ok(Err("display_name must be non-empty".to_string()));
@@ -542,7 +542,7 @@ async fn resolve_secret_owner(
     pool: &sqlx::PgPool,
     name: &crate::secrets::SecretName,
     asked: Option<&str>,
-) -> Result<Result<crate::authz::model::Principal, String>, AppError> {
+) -> Result<Result<crate::authz::model::Principal, String>, ApiError> {
     if let Some(raw) = asked.map(str::trim).filter(|o| !o.is_empty()) {
         return Ok(crate::authz::model::Principal::parse(raw)
             .map_err(|e| format!("secret_owner {raw:?} is not a principal: {e}")));
@@ -578,7 +578,7 @@ async fn check_provider_secret(
     endpoint: Option<&Endpoint>,
     raw: &str,
     owner: Option<&str>,
-) -> Result<Result<ProviderSecretRef, String>, AppError> {
+) -> Result<Result<ProviderSecretRef, String>, ApiError> {
     let name = match crate::secrets::SecretName::parse(raw) {
         Ok(name) => name,
         Err(e) => {
@@ -659,7 +659,7 @@ async fn store_provider(
 ) -> Result<ModelProvider, Response> {
     crate::playbooks::providers::upsert(state.db.pool(), &new_provider(id, &checked, actor, owner))
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     read_back(state, id).await
 }
 
@@ -667,9 +667,9 @@ async fn store_provider(
 async fn read_back(state: &ApiState, id: &str) -> Result<ModelProvider, Response> {
     crate::playbooks::providers::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?
+        .map_err(|e| ApiError::from(e).into_response())?
         .ok_or_else(|| {
-            AppError::from(anyhow::anyhow!(
+            ApiError::from(anyhow::anyhow!(
                 "provider {id} vanished between its write and its read back"
             ))
             .into_response()
@@ -687,7 +687,7 @@ async fn readable_provider(
 ) -> Result<ModelProvider, Response> {
     let row = crate::playbooks::providers::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     crate::authz::owner::decide_row(
         state,
         caller,
@@ -714,7 +714,7 @@ pub(crate) async fn list_providers(
 ) -> Response {
     let rows = match crate::playbooks::providers::list(state.db.pool(), false).await {
         Ok(rows) => rows,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let rows = crate::authz::owner::readable_with_actions(
         &state,
@@ -737,7 +737,7 @@ pub(crate) async fn list_providers(
                 .collect::<Vec<_>>(),
         )
         .into_response(),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -782,7 +782,7 @@ pub(crate) async fn register_provider(
     .await
     {
         Ok(owner) => owner,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
     // The existence check IS the write, so two concurrent registrations of one id cannot both
     // decide they created it and silently replace one another.
@@ -802,7 +802,7 @@ pub(crate) async fn register_provider(
             )
                 .into_response();
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     let stored = match read_back(&state, &id).await {
         Ok(stored) => stored,
@@ -933,12 +933,12 @@ pub(crate) async fn delete_provider(
     match crate::playbooks::providers::usage(state.db.pool(), &id).await {
         Ok(usage) if usage.is_empty() => {}
         Ok(usage) => return (StatusCode::CONFLICT, Json(in_use_body(&id, &usage))).into_response(),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     match crate::playbooks::providers::delete(state.db.pool(), &id).await {
         Ok(true) => {}
         Ok(false) => return not_found(format!("no provider {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     let actor = identity.as_deref();
     state
@@ -1154,7 +1154,7 @@ pub(crate) async fn put_dispatch_default(
         match default_target(&state, "", body.role, &body.provider, body.model.as_deref()).await {
             Ok(Ok(target)) => target,
             Ok(Err(msg)) => return unprocessable(msg),
-            Err(e) => return AppError::from(e).into_response(),
+            Err(e) => return ApiError::from(e).into_response(),
         };
     let (fallback_provider_id, fallback_model) = match body
         .fallback_provider
@@ -1185,7 +1185,7 @@ pub(crate) async fn put_dispatch_default(
             {
                 Ok(Ok((id, model))) => (Some(id), model),
                 Ok(Err(msg)) => return unprocessable(msg),
-                Err(e) => return AppError::from(e).into_response(),
+                Err(e) => return ApiError::from(e).into_response(),
             }
         }
     };
@@ -1203,7 +1203,7 @@ pub(crate) async fn put_dispatch_default(
         fallback_model,
     };
     if let Err(e) = crate::playbooks::providers::set_default(state.db.pool(), &row).await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     state
         .audit(
@@ -1284,7 +1284,7 @@ pub(crate) async fn delete_dispatch_default(
                 role.as_str()
             ));
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     state
         .audit(

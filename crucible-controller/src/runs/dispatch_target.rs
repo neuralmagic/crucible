@@ -91,6 +91,22 @@ fn render_names(names: &[String]) -> String {
     }
 }
 
+impl From<TargetRefusal> for crate::api::state::ApiError {
+    fn from(refusal: TargetRefusal) -> Self {
+        use crate::api::state::ApiError;
+        let message = refusal.to_string();
+        match refusal {
+            TargetRefusal::Unknown { .. } => ApiError::NotFound(message),
+            TargetRefusal::Incompatible { .. } | TargetRefusal::NoneEligible { .. } => {
+                ApiError::Unprocessable(message)
+            }
+            TargetRefusal::NotAuthorized { .. } | TargetRefusal::Anonymous => {
+                ApiError::Forbidden(message)
+            }
+        }
+    }
+}
+
 /// Which principals may dispatch to which shared cluster. A cluster absent from the map is
 /// unrestricted; a cluster present admits only the principals listed against it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

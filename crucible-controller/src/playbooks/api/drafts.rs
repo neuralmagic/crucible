@@ -55,7 +55,7 @@ pub(crate) fn draft_refusal(err: DraftError) -> Response {
         DraftError::Push(msg) => {
             (StatusCode::BAD_GATEWAY, Json(ErrorBody::new(msg))).into_response()
         }
-        DraftError::Internal(e) => AppError::from(e).into_response(),
+        DraftError::Internal(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -308,7 +308,7 @@ pub(crate) async fn create_playbook_draft(
     .await
     {
         Ok(owner) => owner,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
     if let Some(t) = template.as_deref()
         && let Err(refused) = crate::playbooks::api::registry::readable_playbook(
@@ -385,7 +385,7 @@ async fn readable_draft(
 ) -> Result<crate::playbooks::drafts::DraftRow, Response> {
     let row = crate::playbooks::drafts::get(state.db.pool(), id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?;
+        .map_err(|e| ApiError::from(e).into_response())?;
     crate::authz::owner::decide_row(
         state,
         caller,
@@ -408,7 +408,7 @@ async fn readable_draft(
 pub(crate) async fn list_playbook_drafts(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
-) -> Result<Json<Vec<PlaybookDraftDto>>, AppError> {
+) -> Result<Json<Vec<PlaybookDraftDto>>, ApiError> {
     let rows = crate::playbooks::drafts::list(state.db.pool()).await?;
     let rows = crate::authz::owner::readable_with_actions(
         &state,
@@ -474,7 +474,7 @@ pub(crate) async fn get_playbook_draft(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let draft = match readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await {
         Ok(draft) => draft,
         Err(refused) => return Ok(refused),
@@ -557,7 +557,7 @@ pub(crate) async fn get_playbook_draft_preview(
     caller: crate::authz::Caller,
     Path(id): Path<String>,
     Query(query): Query<VersionQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Err(refused) =
         readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await
     {
@@ -640,7 +640,7 @@ pub(crate) async fn get_playbook_draft_tarball(
     caller: crate::authz::Caller,
     Path(id): Path<String>,
     Query(query): Query<VersionQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Err(refused) =
         readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await
     {
@@ -779,7 +779,7 @@ pub(crate) async fn delete_playbook_draft(
     identity: crate::identity::session::Identity,
     caller: crate::authz::Caller,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Err(refused) =
         readable_draft(&state, &caller, &id, crate::authz::action::Verb::Delete).await
     {
@@ -963,7 +963,7 @@ pub(crate) async fn clone_playbook_draft(
     .await
     {
         Ok(owner) => owner,
-        Err(refused) => return refused,
+        Err(refused) => return refused.into_response(),
     };
     let to = body.id.trim().to_string();
     let description = body
@@ -1009,7 +1009,7 @@ pub(crate) async fn clone_playbook_draft(
     .await
     {
         Ok(bindings) => bindings,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     (
         StatusCode::CREATED,
@@ -1091,7 +1091,7 @@ pub(crate) async fn launch_playbook_draft(
     let latest = match crate::playbooks::drafts::latest(state.db.pool(), &id).await {
         Ok(Some(l)) => l,
         Ok(None) => return not_found(format!("no draft {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let (Some(schema), Some(schema_digest)) = (latest.params_schema, latest.schema_digest) else {
         return invalid_fields(vec![crate::playbooks::registry::FieldError {
@@ -1142,7 +1142,7 @@ pub(crate) async fn launch_playbook_draft(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     let image = match crate::playbooks::api::registry::authorize_image(
         &state,
@@ -1158,7 +1158,7 @@ pub(crate) async fn launch_playbook_draft(
     let rerun =
         match crate::runs::api::rerun::admit_launch(&state, &id, true, body.rerun.as_ref()).await {
             Ok(rerun) => rerun,
-            Err(refusal) => return *refusal,
+            Err(refusal) => return refusal.into_response(),
         };
     let actor = saver.actor.as_deref();
     let dispatch_target = saver.dispatch_target.clone();
@@ -1196,7 +1196,7 @@ pub(crate) async fn launch_playbook_draft(
                     message,
                 }]);
             }
-            Err(e) => return AppError::from(anyhow::Error::new(e)).into_response(),
+            Err(e) => return ApiError::from(anyhow::Error::new(e)).into_response(),
         };
     let tree =
         match crate::playbooks::drafts::version_tree(state.db.pool(), &id, Some(latest.version))
@@ -1213,7 +1213,7 @@ pub(crate) async fn launch_playbook_draft(
     }
     let exposure_dto = match ExposureDto::try_from(&exposure) {
         Ok(dto) => dto,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     use crate::launches::store::AdoptDraftOutcome;
@@ -1232,7 +1232,7 @@ pub(crate) async fn launch_playbook_draft(
             )
                 .into_response();
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
 
     state
@@ -1345,7 +1345,7 @@ pub(crate) async fn graduate_playbook_draft(
         None => {
             match crate::runs::engine::resolve_pack_pr_token_for(state.pack_pr_app.as_ref()).await {
                 Ok(t) => t,
-                Err(e) => return AppError::from(e).into_response(),
+                Err(e) => return ApiError::from(e).into_response(),
             }
         }
     };
@@ -1429,7 +1429,7 @@ async fn github_token(
         .await
     };
     if let Err(e) = audited.await {
-        return Err(AppError::from(e.context("recording the github token read")).into_response());
+        return Err(ApiError::from(e.context("recording the github token read")).into_response());
     }
     Ok(token)
 }
@@ -1480,7 +1480,7 @@ pub(crate) async fn publish_playbook_draft(
     };
     let replaces = match crate::playbooks::registry::get(state.db.pool(), &target).await {
         Ok(existing) => existing.is_some(),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     if replaces
         && let Err(refused) = crate::playbooks::api::registry::readable_playbook(

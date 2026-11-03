@@ -47,7 +47,7 @@ pub(crate) async fn get_run_flow_enriched(
     Path(run_id): Path<String>,
     Query(q): Query<FlowEnrichedQuery>,
     headers: axum::http::HeaderMap,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let record = |outcome: &str| {
         if let Some(m) = state.db.metrics() {
             m.record_flow_enriched(outcome);

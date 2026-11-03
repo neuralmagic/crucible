@@ -65,7 +65,7 @@ pub enum ActAsRefusal {
 
 impl IntoResponse for ActAsRefusal {
     fn into_response(self) -> Response {
-        let mut response = crate::api::dto::forbidden(self.to_string());
+        let mut response = crate::api::state::ApiError::Forbidden(self.to_string()).into_response();
         response.headers_mut().insert(
             ACT_AS_HEADER,
             axum::http::HeaderValue::from_static("refused"),
@@ -248,7 +248,7 @@ impl FromRequestParts<ApiState> for Caller {
             path,
         )
         .await
-        .map_err(|e| crate::api::state::AppError::from(e).into_response())?;
+        .map_err(|e| crate::api::state::ApiError::from(e).into_response())?;
         let asked = parts
             .headers
             .get(ACT_AS_HEADER)

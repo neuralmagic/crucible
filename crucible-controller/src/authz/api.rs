@@ -136,7 +136,7 @@ pub(crate) struct ListTeamsQuery {
 }
 
 fn internal(e: impl Into<anyhow::Error>) -> Response {
-    AppError::from(e.into()).into_response()
+    ApiError::from(e.into()).into_response()
 }
 
 /// The rule that lets a caller manage a team, or the refusal.
@@ -190,12 +190,18 @@ enum MemberRefusal {
     Cycle(String),
 }
 
+impl From<MemberRefusal> for ApiError {
+    fn from(refusal: MemberRefusal) -> Self {
+        match refusal {
+            MemberRefusal::Unprocessable(msg) => ApiError::Unprocessable(msg),
+            MemberRefusal::Cycle(msg) => ApiError::Conflict(msg),
+        }
+    }
+}
+
 impl IntoResponse for MemberRefusal {
     fn into_response(self) -> Response {
-        match self {
-            MemberRefusal::Unprocessable(msg) => unprocessable(msg),
-            MemberRefusal::Cycle(msg) => conflict(msg),
-        }
+        ApiError::from(self).into_response()
     }
 }
 
@@ -291,7 +297,7 @@ pub(crate) async fn list_teams(
     State(state): State<ApiState>,
     Query(q): Query<ListTeamsQuery>,
     caller: Caller,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let only_unreachable = q.unreachable.unwrap_or(false);
     if only_unreachable && !caller.principals.is_platform_admin() {
         return Ok(forbidden(
@@ -783,7 +789,7 @@ pub(crate) async fn get_schema() -> Response {
 )]
 pub(crate) async fn list_policy_sets(
     State(state): State<ApiState>,
-) -> Result<Json<Vec<PolicySetDto>>, AppError> {
+) -> Result<Json<Vec<PolicySetDto>>, ApiError> {
     let rows = store::list_policy_sets(state.db.pool()).await?;
     Ok(Json(rows.into_iter().map(PolicySetDto::from).collect()))
 }

@@ -126,7 +126,7 @@ const RUNS_LIMIT: i64 = 200;
 )]
 pub(crate) async fn list_playbook_runs(
     State(state): State<ApiState>,
-) -> Result<Json<Vec<PlaybookRunDto>>, AppError> {
+) -> Result<Json<Vec<PlaybookRunDto>>, ApiError> {
     let rows =
         crate::launches::store::list_playbook_runs(state.db.pool(), None, RUNS_LIMIT).await?;
     Ok(Json(rows.into_iter().map(PlaybookRunDto::from).collect()))
@@ -214,7 +214,7 @@ pub struct RerunOfDto {
 pub(crate) async fn get_playbook_run(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let rows = crate::launches::store::list_playbook_runs(state.db.pool(), Some(&key), 1).await?;
     let Some(row) = rows.into_iter().next() else {
         return Ok(not_found(format!("no playbook launch {key:?}")));
@@ -444,7 +444,7 @@ pub(crate) async fn create_one_shot(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Err(denied) = crate::authz::owner::decide_create(
         &state,
@@ -521,7 +521,7 @@ pub(crate) async fn create_one_shot(
 pub(crate) async fn list_one_shots(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
-) -> Result<Json<Vec<OneShotView>>, AppError> {
+) -> Result<Json<Vec<OneShotView>>, ApiError> {
     let rows =
         crate::launches::one_shots::list(state.db.pool(), crate::launches::one_shots::LIST_LIMIT)
             .await?;
@@ -592,12 +592,12 @@ pub(crate) async fn cancel_one_shot(
                 .into_response();
         }
         Ok(CancelOutcome::Unknown) => return not_found(format!("no one-shot {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     let canceled = match crate::launches::one_shots::get(state.db.pool(), &id).await {
         Ok(Some(row)) => row,
         Ok(None) => return not_found(format!("no one-shot {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     state

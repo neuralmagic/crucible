@@ -5,7 +5,7 @@ use axum::response::{IntoResponse, Response};
 use utoipa::ToSchema;
 
 use crate::api::dto::bad_request;
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 
 /// What a pack asks of its image, as the picker sends it.
 #[derive(Debug, serde::Deserialize, ToSchema)]
@@ -33,7 +33,7 @@ pub struct RankImagesBody {
 pub(crate) async fn rank_images(
     State(state): State<ApiState>,
     Json(body): Json<RankImagesBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let harness = match body.harness.as_deref() {
         None => Default::default(),
         Some(name) => match crate::playbooks::providers::parse_harness(name) {

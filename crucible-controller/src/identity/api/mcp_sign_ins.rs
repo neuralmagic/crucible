@@ -3,7 +3,7 @@
 use crate::agent_auth::people::clients::ClientId;
 use crate::api::dto::bad_request;
 use crate::api::dto::not_found;
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 use crate::identity::api::cluster_identities::{no_subject, not_from_a_key};
 use crate::identity::auth::{AuthPath, Subject};
 use axum::extract::{Query, State};
@@ -57,7 +57,7 @@ fn stamp(secs: u64) -> String {
 pub(crate) async fn list_mcp_sign_ins(
     State(state): State<ApiState>,
     subject: Subject,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(sub) = subject.as_deref() else {
         return Ok(no_subject());
     };
@@ -115,7 +115,7 @@ pub(crate) async fn sign_out_mcp_clients(
     subject: Subject,
     path: AuthPath,
     Query(query): Query<SignOutQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if path == AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }

@@ -5,7 +5,7 @@
 use crate::agent_auth::people::directory::ClusterUser;
 use crate::agent_auth::people::{Approved, CODE_TTL_SECS, CodeGrant, PENDING_KEY, Pending};
 use crate::api::dto::{bad_request, conflict, forbidden, not_found, unavailable};
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 use crate::identity::api::cluster_identities::no_subject;
 use crate::identity::api::cluster_identities::{
     ClusterIdentityDto, identity_of, person_row, rules,
@@ -65,7 +65,7 @@ pub(crate) async fn get_consent(
     subject: Subject,
     session: Session,
     Query(query): Query<ConsentQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(sub) = subject.as_deref() else {
         return Ok(no_subject());
     };
@@ -159,7 +159,7 @@ pub(crate) async fn decide_consent(
     path: AuthPath,
     session: Session,
     Json(body): Json<DecisionBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(auth) = state.people_issuer.as_ref() else {
         return Ok(not_found("this controller issues no tokens to people"));
     };

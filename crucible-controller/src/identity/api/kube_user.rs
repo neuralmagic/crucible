@@ -2,7 +2,7 @@
 //! runs a person launches. People link their own per cluster through the cluster identity routes.
 
 use crate::api::dto::{bad_request, forbidden, not_found};
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 use crate::identity::kube_identity::{self, KubeUser};
 use axum::extract::{Path, State};
 use axum::response::{IntoResponse, Response};
@@ -41,7 +41,7 @@ pub(crate) async fn override_kube_user(
     _admin: crate::authz::guard::AdminGuard,
     Path(login): Path<String>,
     Json(body): Json<OverrideBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let caller = identity.as_deref().map(|c| c.trim().to_lowercase());
     if caller.as_deref() == Some(login.trim().to_lowercase().as_str()) {
         return Ok(forbidden(
