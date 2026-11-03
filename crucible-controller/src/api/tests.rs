@@ -9378,6 +9378,82 @@ async fn a_registered_launch_shorter_than_a_task_timeout_is_refused(pool: PgPool
     Ok(())
 }
 
+/// A draft-head schedule is admitted against the draft's newest save like a draft launch: a
+/// `max_time` shorter than a task timeout is refused with the engine's message, a stale form is a
+/// 409 naming both digests, and neither stores a schedule.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_head_schedule_is_admitted_like_a_draft_launch(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_config(db, vec!["wren".to_string()], test_store());
+    let (status, body) = send_json(
+        &app,
+        HttpRequest::put("/api/config/overrides"),
+        serde_json::json!({
+            "allow_draft_head_schedules": true,
+            "justification": "schedule the studio draft",
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(TIMED_WORKFLOW);
+    let saved = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    let digest = saved.1["schema_digest"]
+        .as_str()
+        .expect("the save compiles")
+        .to_string();
+    let schedule = |max_time: &str, schema_digest: &str| {
+        serde_json::json!({
+            "playbook": "studio",
+            "target_kind": "draft_head",
+            "params": {"topic": "attention", "depth": "deep"},
+            "max_cost": 1.0,
+            "max_time": max_time,
+            "cron_expr": "0 6 * * *",
+            "schema_digest": schema_digest,
+        })
+    };
+    let schedules = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM playbook_standing_launches")
+            .fetch_one(&pool)
+            .await
+            .expect("count schedules")
+    };
+
+    let (status, body) = post_admin(&app, "/api/schedules", schedule("1h", &digest)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["field"], "max_time", "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+    assert_eq!(schedules().await, 0, "a refused schedule stores nothing");
+
+    let (status, body) = post_admin(&app, "/api/schedules", schedule("2h", "sha256:stale")).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        body["error"],
+        format!("draft studio now serves schema {digest}, not sha256:stale; reload the form"),
+    );
+    assert_eq!(schedules().await, 0, "a stale form stores nothing");
+
+    let (status, body) = post_admin(&app, "/api/schedules", schedule("2h", &digest)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["eligible_draft_version"], saved.1["version"], "{body}");
+    assert_eq!(schedules().await, 1);
+    Ok(())
+}
+
 /// Overwrite the stored `workflow.star` of `tree` so its files no longer hash to its digest.
 async fn tamper_tree(pool: &PgPool, tree: &str) {
     sqlx::query(
