@@ -2003,6 +2003,9 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
         )
         .await?;
     assert_eq!(res.status(), StatusCode::SEE_OTHER);
+    let pending = sink.pending();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].kind, OverrideKind::Unpark);
 
     let res = app
         .oneshot(
@@ -2014,11 +2017,14 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
         .await?;
     assert_eq!(res.status(), StatusCode::ACCEPTED);
 
-    let calls = sink.pending();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].kind, OverrideKind::Unpark);
-    assert_eq!(calls[1].kind, OverrideKind::Bump);
-    assert_eq!(calls[1].priority, Some(9));
+    let pending = sink.pending();
+    assert_eq!(
+        pending.len(),
+        1,
+        "an issue holds one pending intent, the latest"
+    );
+    assert_eq!(pending[0].kind, OverrideKind::Bump);
+    assert_eq!(pending[0].priority, Some(9));
     Ok(())
 }
 
