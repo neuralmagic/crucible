@@ -2,7 +2,7 @@
 
 use crate::args::Paths;
 use crate::errors::FileError;
-use crate::manifest;
+use crate::manifest::{self, GitRef};
 use std::path::{Path, PathBuf};
 
 /// What preparing a workspace can fail on: the setup command, the clone, the toolbox copy.
@@ -25,10 +25,20 @@ pub(crate) enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
-    #[error("git clone")]
-    SpawnGitClone(#[source] std::io::Error),
+    #[error("running git")]
+    SpawnGit(#[source] std::io::Error),
     #[error("git clone {src} -> {} failed", .dest.display())]
     GitCloneFailed { src: String, dest: PathBuf },
+    #[error("fetching {git_ref} from {src} failed: it names no branch, tag or commit there")]
+    GitFetchFailed { src: String, git_ref: GitRef },
+    #[error("checking out {git_ref} in {} failed", .dest.display())]
+    GitCheckoutFailed { git_ref: GitRef, dest: PathBuf },
+    #[error("reading the refs of {}", .dest.display())]
+    ReadRefs {
+        dest: PathBuf,
+        #[source]
+        source: git2::Error,
+    },
     #[error(
         "[agent].toolbox_exclude names `{name}`, but no such skill dir exists under {}",
         .skills.display()
@@ -78,33 +88,104 @@ pub(crate) fn manifest_setup(
             }
         });
     };
-    clone_repo(src, m.repo.git_ref.as_deref(), workspace)
+    clone_repo(src, m.repo.git_ref.as_ref(), workspace)
 }
 
-/// `git clone <src> <dest>` then optional `checkout <ref>`. The default-setup primitive, shared by the
-/// single-domain `manifest_setup` and the per-component composite checkout.
+/// `git clone <src> <dest>`, then `git_ref` fetched and checked out detached. A clone whose
+/// ref cannot be checked out is removed, so no later run mistakes it for one at that ref.
 pub(crate) fn clone_repo(
     src: &str,
-    git_ref: Option<&str>,
+    git_ref: Option<&GitRef>,
     dest: &Path,
 ) -> Result<(), WorkspaceError> {
-    let ok = std::process::Command::new("git")
-        .args(["clone", src, &dest.to_string_lossy()])
-        .status()
-        .map_err(WorkspaceError::SpawnGitClone)?
-        .success();
-    if !ok {
+    let dest_arg = dest.to_string_lossy();
+    if !git(None, &["clone", "--quiet", src, &dest_arg])? {
         return Err(WorkspaceError::GitCloneFailed {
             src: src.to_owned(),
             dest: dest.to_path_buf(),
         });
     }
-    if let Some(r) = git_ref {
-        let _ = std::process::Command::new("git")
-            .args(["-C", &dest.to_string_lossy(), "checkout", r])
-            .status();
+    let Some(r) = git_ref else {
+        return Ok(());
+    };
+    let checked_out = checkout(src, dest, r);
+    if checked_out.is_err()
+        && let Err(e) = std::fs::remove_dir_all(dest)
+    {
+        tracing::warn!(dest = %dest.display(), error = %e, "removing a clone whose ref failed");
+    }
+    checked_out
+}
+
+/// Fetch `r` from origin and check it out detached. A commit the clone already holds is checked
+/// out without a fetch, since a server need not serve a commit by id.
+fn checkout(src: &str, dest: &Path, r: &GitRef) -> Result<(), WorkspaceError> {
+    let held = r.is_commit() && git(Some(dest), &["cat-file", "-e", &format!("{r}^{{commit}}")])?;
+    let target = if held {
+        r.as_str()
+    } else {
+        if !git(Some(dest), &["fetch", "--quiet", "origin", r.as_str()])? {
+            return Err(WorkspaceError::GitFetchFailed {
+                src: src.to_owned(),
+                git_ref: r.clone(),
+            });
+        }
+        "FETCH_HEAD"
+    };
+    if !git(Some(dest), &["checkout", "--quiet", "--detach", target])? {
+        return Err(WorkspaceError::GitCheckoutFailed {
+            git_ref: r.clone(),
+            dest: dest.to_path_buf(),
+        });
     }
     Ok(())
+}
+
+/// Run git, in `dir` when given; `Ok(false)` is a git that ran and failed.
+fn git(dir: Option<&Path>, args: &[&str]) -> Result<bool, WorkspaceError> {
+    let mut command = std::process::Command::new("git");
+    if let Some(dir) = dir {
+        command.arg("-C").arg(dir);
+    }
+    Ok(command
+        .args(args)
+        .status()
+        .map_err(WorkspaceError::SpawnGit)?
+        .success())
+}
+
+/// The branches and tags of a fresh clone whose history holds `commit`, by short name.
+pub(crate) fn refs_containing(dest: &Path, commit: &GitRef) -> Result<Vec<String>, WorkspaceError> {
+    let read = |source| WorkspaceError::ReadRefs {
+        dest: dest.to_path_buf(),
+        source,
+    };
+    let repo = git2::Repository::open(dest).map_err(read)?;
+    let target = repo
+        .revparse_single(commit.as_str())
+        .and_then(|o| o.peel_to_commit())
+        .map_err(read)?
+        .id();
+    let mut names = Vec::new();
+    for reference in repo.references().map_err(read)? {
+        let reference = reference.map_err(read)?;
+        let Some(short) = reference.name().ok().and_then(|full| {
+            full.strip_prefix("refs/remotes/origin/")
+                .filter(|short| *short != "HEAD")
+                .or_else(|| full.strip_prefix("refs/tags/"))
+        }) else {
+            continue;
+        };
+        let Ok(tip) = reference.peel_to_commit() else {
+            continue;
+        };
+        if tip.id() == target || repo.graph_descendant_of(tip.id(), target).map_err(read)? {
+            names.push(short.to_owned());
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// Copy every non-excluded skill under `p.skills` into the workspace's `skills_dir` (the
@@ -161,6 +242,70 @@ mod tests {
     use super::*;
     use crate::testing::tempdir;
     use std::fs;
+
+    fn at(raw: &str) -> GitRef {
+        GitRef::parse(raw).expect("a ref")
+    }
+
+    #[test]
+    fn a_ref_is_fetched_and_checked_out_detached_by_any_name() {
+        let origin = crate::testing::git_origin("clone-refs");
+        let src = origin.path.to_string_lossy().into_owned();
+        let clone = |name: &str, r: Option<&str>| {
+            let dest = origin.path.with_extension(name);
+            let _ = fs::remove_dir_all(&dest);
+            clone_repo(&src, r.map(at).as_ref(), &dest).map(|()| dest)
+        };
+
+        let plain = clone("plain", None).expect("clones");
+        assert_eq!(
+            crate::testing::checked_out(&plain),
+            (origin.main.clone(), false)
+        );
+        for (name, r, expected) in [
+            ("short", "feature/x", &origin.feature),
+            ("full", "refs/heads/feature/x", &origin.feature),
+            ("tag", "v1", &origin.main),
+            ("commit", origin.feature.as_str(), &origin.feature),
+            ("pull", "refs/pull/7/head", &origin.pull),
+        ] {
+            let dest = clone(name, Some(r)).unwrap_or_else(|e| panic!("{r}: {e:#}"));
+            assert_eq!(
+                crate::testing::checked_out(&dest),
+                (expected.clone(), true),
+                "{r}"
+            );
+        }
+
+        let missing = origin.path.with_extension("missing");
+        let err = clone("missing", Some("feature/nope")).expect_err("no such branch");
+        assert!(
+            matches!(err, WorkspaceError::GitFetchFailed { .. }),
+            "{err:#}"
+        );
+        assert!(
+            !missing.exists(),
+            "a clone whose ref failed is removed, so no later run reuses it at the default branch"
+        );
+    }
+
+    #[test]
+    fn a_commit_is_held_by_the_branches_and_tags_whose_history_has_it() {
+        let origin = crate::testing::git_origin("clone-contains");
+        let dest = origin.path.with_extension("clone");
+        clone_repo(&origin.path.to_string_lossy(), None, &dest).expect("clones");
+        let held = |commit: &str| refs_containing(&dest, &at(commit)).expect("reads refs");
+        assert_eq!(held(&origin.main), ["feature/x", "main", "v1"]);
+        assert_eq!(held(&origin.feature), ["feature/x"]);
+        assert!(
+            held(&origin.dangling).is_empty(),
+            "a commit the clone holds that no ref does"
+        );
+        assert!(
+            held(&origin.pull).is_empty(),
+            "a clone fetches no pull request refs, so a commit only one holds is held by nothing"
+        );
+    }
 
     /// A toolbox source dir with two skills; `install_toolbox` must copy only the one not named in
     /// `toolbox_exclude`, the setup-only skill never reaches the workspace `.claude/skills`.

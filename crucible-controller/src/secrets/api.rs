@@ -79,6 +79,10 @@ dto! {
         pub schema_digest: Option<String>,
         pub created_by: Option<String>,
         pub created_at: String,
+        /// The blueprint this binding came from.
+        pub origin: Option<String>,
+        /// On a binding just made on a blueprint: whether it carries to drafts started from it.
+        pub carries: Option<bool> = None,
     }
 }
 
@@ -327,6 +331,11 @@ pub(crate) struct BindRefusal {
 }
 
 impl BindRefusal {
+    /// The check could not run at all, as opposed to failing for this secret.
+    pub(crate) fn is_unavailable(&self) -> bool {
+        self.status == StatusCode::SERVICE_UNAVAILABLE
+    }
+
     fn invalid(message: impl Into<String>) -> Self {
         BindRefusal {
             status: StatusCode::UNPROCESSABLE_ENTITY,
@@ -358,7 +367,7 @@ impl IntoResponse for BindRefusal {
 /// The Vault reads a new binding of `row` takes: a reference is re-verified with the binder's own
 /// token, and an agent-visible managed secret has the value stored now checked, not whatever the
 /// registration saw. A minted secret stores no bytes and needs neither.
-async fn check_bindable(
+pub(crate) async fn check_bindable(
     state: &ApiState,
     row: &SecretRow,
     vault_token: Option<&str>,
@@ -1103,11 +1112,26 @@ pub(crate) async fn bind_secret(
         None,
     )
     .await;
-    match stored {
-        Ok(stored) => (StatusCode::CREATED, Json(SecretBindingDto::from(stored))).into_response(),
-        Err(e @ store::StoreError::Duplicate { .. }) => conflict(e.to_string()),
-        Err(store::StoreError::Internal(e)) => AppError::from(e).into_response(),
-    }
+    let stored = match stored {
+        Ok(stored) => stored,
+        Err(e @ store::StoreError::Duplicate { .. }) => return conflict(e.to_string()),
+        Err(store::StoreError::Internal(e)) => return AppError::from(e).into_response(),
+    };
+    let carries = match stored.scope_kind {
+        ScopeKind::Playbook => {
+            match crate::playbooks::registry::get(state.db.pool(), &stored.scope_id).await {
+                Ok(Some(playbook)) if playbook.blueprint => {
+                    Some(crate::playbooks::blueprints::barred(&playbook, &stored, &row).is_none())
+                }
+                Ok(_) => None,
+                Err(e) => return AppError::from(e).into_response(),
+            }
+        }
+        ScopeKind::Repo | ScopeKind::Domain => None,
+    };
+    let mut dto = SecretBindingDto::from(stored);
+    dto.carries = carries;
+    (StatusCode::CREATED, Json(dto)).into_response()
 }
 
 /// Store `new` with its bind audit row in one transaction. `source` names the scope a copy was
@@ -1126,6 +1150,14 @@ async fn store_binding(
         .await
         .context("opening the bind transaction")?;
     let stored = store::insert_binding(&mut tx, new).await?;
+    if stored.scope_kind == ScopeKind::Playbook {
+        crate::playbooks::blueprints::fill_placeholder(
+            &mut tx,
+            &stored.scope_id,
+            &stored.declared_name,
+        )
+        .await?;
+    }
     let mut detail = format!(
         "{} {} as {} {}",
         stored.scope_kind.as_str(),

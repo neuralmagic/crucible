@@ -344,7 +344,10 @@ fn load_builds(path: &Path) -> Result<LoadedBuilds> {
         let default_repo = m.repo.url.clone().map(|url| {
             (
                 url,
-                m.repo.git_ref.clone().unwrap_or_else(|| "main".to_string()),
+                m.repo
+                    .git_ref
+                    .as_ref()
+                    .map_or_else(|| "main".to_string(), ToString::to_string),
             )
         });
         Ok(LoadedBuilds {

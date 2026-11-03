@@ -65,13 +65,11 @@ pub enum DraftError {
     Internal(anyhow::Error),
 }
 
-/// An [`Unconvertible`](crate::playbooks::pack_trees::Unconvertible) pack is refused as invalid,
+/// An [unreadable](crate::playbooks::pack_trees::is_unreadable) pack is refused as invalid,
 /// naming its reason; anything else is internal.
 impl From<anyhow::Error> for DraftError {
     fn from(e: anyhow::Error) -> Self {
-        if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
-            .is_some()
-        {
+        if crate::playbooks::pack_trees::is_unreadable(&e) {
             DraftError::Invalid(format!("{e:#}"))
         } else {
             DraftError::Internal(e)
@@ -757,6 +755,10 @@ pub async fn save_version(
         )));
     }
 
+    let declared = match files.get(crate::playbooks::packs::MANIFEST) {
+        Some(manifest) => crate::playbooks::blueprints::declared_anywhere(manifest).ok(),
+        None => Some(Vec::new()),
+    };
     let compiled = tokio::task::spawn_blocking(move || {
         let scratch = tempfile::tempdir()
             .context("draft compile scratch dir")
@@ -911,6 +913,11 @@ pub async fn save_version(
         .await
         .context("advancing draft-head schedule eligibility")
         .map_err(DraftError::Internal)?;
+    }
+    if let Some(declared) = &declared {
+        crate::playbooks::blueprints::drop_undeclared(&mut tx, id, declared)
+            .await
+            .map_err(DraftError::Internal)?;
     }
     tx.commit()
         .await
