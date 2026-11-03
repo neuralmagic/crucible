@@ -9,8 +9,9 @@
 #   crux draft-push human-gate examples/human-gate --base-version 1
 #   crux draft-launch human-gate --max-cost 1 --max-time 30m
 #
-# then open Approvals (or follow the notification) and answer. GPUS sets the job's size and
-# defaults to 8. Run without a controller, the plan truncates at `gate` before anything runs.
+# then open Approvals (or follow the notification) and answer. The job asks for 8 GPUs: the
+# workflow declares no env, so a host GPUS does not reach plan.sh. Run without a controller,
+# the plan truncates at `gate` before anything runs.
 
 [workspace]
 inject = ["plan.sh", "act.sh"]
