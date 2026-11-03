@@ -11,9 +11,10 @@ use std::path::{Path, PathBuf};
 use crucible_contract::session::SessionEvent;
 use crucible_vcs::git_memory::TaskCommit;
 
-use crate::plan::exec::{Prior, TaskStatus};
+use crate::plan::exec::Prior;
 use crate::plan::ir::{Stage, TaskName, ValidPlan};
 use crate::plan::resume::{ResumeError, RunStart, settled_row};
+use crucible_contract::session::TaskStatus;
 
 /// Where a playbook run keeps its git memory: one patch per task commit, in commit order.
 pub const GIT_MEMORY_DIR: &str = "git-memory";
@@ -136,14 +137,14 @@ impl Parent {
     }
 
     /// The status the parent settled each node with: the node's own row, the last one logged.
-    fn statuses(&self) -> BTreeMap<String, String> {
+    fn statuses(&self) -> BTreeMap<String, TaskStatus> {
         self.rows
             .iter()
             .filter_map(|event| match event {
                 SessionEvent::TaskResult { task, status, .. }
                     if TaskName(task.clone()).instance_of().is_none() =>
                 {
-                    Some((task.clone(), status.clone()))
+                    Some((task.clone(), *status))
                 }
                 _ => None,
             })
@@ -265,7 +266,7 @@ pub fn plan(plan: &ValidPlan, parent: &Parent, from: &[TaskName]) -> Result<Reru
     let passed = |name: &TaskName| {
         statuses
             .get(&name.0)
-            .is_some_and(|s| s.parse::<TaskStatus>().is_ok_and(|s| s == TaskStatus::Pass))
+            .is_some_and(|s| *s == TaskStatus::Pass)
     };
     let mut rerun: BTreeSet<TaskName> = from.iter().cloned().collect();
     rerun.extend(
@@ -387,13 +388,13 @@ pub fn read_git_memory(state: &Path) -> Result<Vec<TaskCommit>, RerunError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::exec::TaskStatus;
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::rerun::{
         ParentDir, ParentRef, RerunError, definition_digests, plan, read_git_memory,
         write_git_memory,
     };
     use crate::plan::resume::RunStart;
+    use crucible_contract::session::TaskStatus;
     use crucible_vcs::git_memory::TaskCommit;
     use std::collections::BTreeSet;
     use std::path::PathBuf;

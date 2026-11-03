@@ -16,8 +16,8 @@
 use crate::client::Db;
 use crate::runs::model::{NewCandidate, NewRun, TaskResult};
 use anyhow::{Context, Result};
-use crucible::plan::exec::TaskStatus;
 use crucible_contract::session::PlanTaskWire;
+use crucible_contract::session::TaskStatus;
 use crucible_contract::{BlockedReasonKind, TaskBlocked};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -113,8 +113,7 @@ enum Ev {
 struct TaskResultWire {
     #[serde(default)]
     task: String,
-    #[serde(default)]
-    status: String,
+    status: TaskStatus,
     #[serde(default)]
     iter: u32,
     #[serde(default)]
@@ -479,14 +478,14 @@ fn parse_session(content: &str) -> ParsedRun {
                 }
                 let output = output.filter(|o| !o.is_null());
                 if let Some(output) = &output
-                    && status == "pass"
+                    && status == TaskStatus::Pass
                 {
                     run.result.insert(task.clone(), output.clone());
                 }
                 run.task_results.push(TaskResult {
                     iter: iter.into(),
                     task,
-                    status,
+                    status: status.as_str().to_string(),
                     note,
                     // NaN/inf would poison the column; drop those to NULL rather than store them.
                     cost_usd: Some(cost_usd).filter(|c| c.is_finite()),

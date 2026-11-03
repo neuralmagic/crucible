@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::session::TaskStatus;
+
 /// Env var carrying the run's [`SuppliedHistory`] as JSON. Absent means the run belongs to no
 /// series.
 pub const ENV_HISTORY: &str = "CRUCIBLE_HISTORY";
@@ -13,19 +15,6 @@ pub const HISTORY_WIRE_VERSION: u8 = 1;
 pub const MAX_HISTORY_DEPTH: u32 = 30;
 /// The size bound where the operator sets none.
 pub const DEFAULT_HISTORY_MAX_BYTES: u64 = 64 * 1024;
-
-/// A task's terminal status, under the tokens the task-result event carries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecordedStatus {
-    Pass,
-    Fail,
-    Transport,
-    Skipped,
-    NotTaken,
-    Blocked,
-    Truncated,
-}
 
 /// How a run ended, under the tokens the shutdown event carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +47,7 @@ pub enum RunVerdict {
 pub struct HistoryEntry {
     pub task: String,
     #[serde(deserialize_with = "nullable")]
-    pub status: Option<RecordedStatus>,
+    pub status: Option<TaskStatus>,
     #[serde(deserialize_with = "nullable")]
     pub output: Option<serde_json::Value>,
 }
@@ -167,8 +156,9 @@ impl SuppliedHistory {
 mod tests {
     use crate::history::{
         HISTORY_WIRE_VERSION, HistoryEntry, HistoryError, HistoryRecord, MAX_HISTORY_DEPTH,
-        RecordedStatus, RunOutcome, RunVerdict, SuppliedHistory,
+        RunOutcome, RunVerdict, SuppliedHistory,
     };
+    use crate::session::TaskStatus;
 
     fn record(run: &str) -> serde_json::Value {
         serde_json::json!({
@@ -203,7 +193,7 @@ mod tests {
                 link: "https://controller.test/runs/r1".into(),
                 entry: HistoryEntry {
                     task: "triage".into(),
-                    status: Some(RecordedStatus::Pass),
+                    status: Some(TaskStatus::Pass),
                     output: parsed.records[0].entry.output.clone(),
                 },
             }

@@ -1283,8 +1283,9 @@ fn task_worktree_name(name: &TaskName) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
+    use crate::plan::exec::{ExecCfg, PlanExit, Substrate};
     use crate::plan::harness::*;
+    use crucible_contract::session::TaskStatus;
 
     fn relay(dest: &str) -> crate::manifest::RelayFile {
         crate::manifest::RelayFile {

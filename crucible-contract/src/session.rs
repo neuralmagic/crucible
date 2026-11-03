@@ -517,7 +517,7 @@ pub enum SessionEvent {
     /// cross-link the ledger row to the task's OTLP span in either direction.
     TaskResult {
         task: String,
-        status: String,
+        status: TaskStatus,
         #[serde(default)]
         plan_version: u32,
         /// Task kind label (`agent`/`command`/`top_k`); named to dodge the envelope's `kind` tag.
@@ -621,6 +621,72 @@ pub enum SessionEvent {
         #[serde(default)]
         detail: String,
     },
+}
+
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[error("task status must be pass|fail|transport|skipped|not_taken|blocked|truncated, got {got:?}")]
+pub struct UnknownTaskStatus {
+    pub got: String,
+}
+
+/// A task's terminal status. A `task_result` line carries one, and a consumer reading a session
+/// log decodes it back through this type rather than matching the token itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskStatus {
+    Pass,
+    Fail,
+    Transport,
+    Skipped,
+    NotTaken,
+    Blocked,
+    Truncated,
+}
+
+impl TaskStatus {
+    /// The stable wire token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TaskStatus::Pass => "pass",
+            TaskStatus::Fail => "fail",
+            TaskStatus::Transport => "transport",
+            TaskStatus::Skipped => "skipped",
+            TaskStatus::NotTaken => "not_taken",
+            TaskStatus::Blocked => "blocked",
+            TaskStatus::Truncated => "truncated",
+        }
+    }
+
+    /// Whether this status is the task having done what it was asked. Everything else is a
+    /// failure of some kind, and none of them may read as a pass.
+    pub fn passed(self) -> bool {
+        self == TaskStatus::Pass
+    }
+}
+
+impl std::str::FromStr for TaskStatus {
+    type Err = UnknownTaskStatus;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pass" => Ok(TaskStatus::Pass),
+            "fail" => Ok(TaskStatus::Fail),
+            "transport" => Ok(TaskStatus::Transport),
+            "skipped" => Ok(TaskStatus::Skipped),
+            "not_taken" => Ok(TaskStatus::NotTaken),
+            "blocked" => Ok(TaskStatus::Blocked),
+            "truncated" => Ok(TaskStatus::Truncated),
+            other => Err(UnknownTaskStatus {
+                got: other.to_owned(),
+            }),
+        }
+    }
+}
+
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Borrowing envelope so encoding doesn't clone the event.
@@ -995,11 +1061,12 @@ mod tests {
 
     #[test]
     fn history_entry_round_trips_with_and_without_a_result() {
-        use crate::history::{HistoryEntry, RecordedStatus};
+        use crate::history::HistoryEntry;
+        use crate::session::TaskStatus;
         assert_round_trips(SessionEvent::HistoryEntry {
             entry: HistoryEntry {
                 task: "triage".into(),
-                status: Some(RecordedStatus::Pass),
+                status: Some(TaskStatus::Pass),
                 output: Some(serde_json::json!({"fixed": 1.5, "notes": ["a"]})),
             },
         });
@@ -1120,7 +1187,7 @@ mod tests {
     fn task_result_round_trips_with_output_and_defaults() {
         assert_round_trips(SessionEvent::TaskResult {
             task: "measure-a".into(),
-            status: "pass".into(),
+            status: TaskStatus::Pass,
             plan_version: 1,
             task_kind: "command".into(),
             iter: 0,
@@ -1162,7 +1229,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(task, "t");
-                assert_eq!(status, "fail");
+                assert_eq!(status, TaskStatus::Fail);
                 assert_eq!(attempts, 0);
                 assert!(output.is_none());
                 assert!(blocked.is_none());
@@ -1176,7 +1243,7 @@ mod tests {
     fn a_blocked_task_result_carries_its_reason_as_data_beside_the_note() {
         let ev = SessionEvent::TaskResult {
             task: "deliver".into(),
-            status: "blocked".into(),
+            status: TaskStatus::Blocked,
             plan_version: 1,
             task_kind: "agent".into(),
             iter: 0,
@@ -1237,7 +1304,7 @@ mod tests {
     fn a_transport_task_result_carries_what_the_last_attempt_died_on() {
         let ev = SessionEvent::TaskResult {
             task: "triage[linux-default]".into(),
-            status: "transport".into(),
+            status: TaskStatus::Transport,
             plan_version: 1,
             task_kind: "agent".into(),
             iter: 0,
@@ -1283,7 +1350,7 @@ mod tests {
     fn an_agent_task_result_names_what_its_attempts_ran_on() {
         let ev = SessionEvent::TaskResult {
             task: "analyze[RHAI-1217]".into(),
-            status: "pass".into(),
+            status: TaskStatus::Pass,
             plan_version: 1,
             task_kind: "agent".into(),
             iter: 2,

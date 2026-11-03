@@ -9,9 +9,7 @@ use crucible_contract::session::SessionEvent;
 use serde::{Deserialize, Serialize};
 
 use crate::manifest::variant::VariantName;
-use crate::plan::exec::{
-    FanoutSummary, Prior, TaskResult, TaskStatus, UnknownTaskStatus, row_task,
-};
+use crate::plan::exec::{FanoutSummary, Prior, TaskResult, row_task};
 use crate::plan::ir::{TaskName, ValidPlan};
 use crate::plan::machine::BlockedReason;
 
@@ -92,11 +90,6 @@ pub enum ResumeError {
     NotAdmitted { task: String },
     #[error("the session log settles {task:?}, which this plan cannot produce")]
     UnknownTask { task: String },
-    #[error("the session log settles {task:?} with an unknown status: {source}")]
-    BadStatus {
-        task: String,
-        source: UnknownTaskStatus,
-    },
 }
 
 fn variant_label(variant: Option<&VariantName>) -> String {
@@ -275,12 +268,6 @@ pub fn settled_row(
     let name = TaskName(task.clone());
     let row =
         row_task(plan, &name).ok_or_else(|| ResumeError::UnknownTask { task: task.clone() })?;
-    let status = status
-        .parse::<TaskStatus>()
-        .map_err(|source| ResumeError::BadStatus {
-            task: task.clone(),
-            source,
-        })?;
     let fanout = row
         .over
         .as_ref()
@@ -327,10 +314,10 @@ pub fn fold_log(
 mod tests {
     use crate::manifest::variant::VariantName;
     use crate::plan::exec::Prior;
-    use crate::plan::exec::TaskStatus;
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::machine::BlockedReason;
     use crate::plan::resume::{ResumeError, RunStart, fold, plan_digest};
+    use crucible_contract::session::TaskStatus;
     use std::time::Duration;
 
     const ADMITTED: &str =
@@ -538,10 +525,14 @@ mod tests {
             fold(&log(&[ADMITTED, &row("ghost", "pass", 0.0)]), &plan, Duration::ZERO),
             Err(ResumeError::UnknownTask { task }) if task == "ghost"
         ));
-        assert!(matches!(
-            fold(&log(&[ADMITTED, &row("discover", "maybe", 0.0)]), &plan, Duration::ZERO),
-            Err(ResumeError::BadStatus { task, .. }) if task == "discover"
-        ));
+        // A row whose status the engine does not know does not decode, so it is a torn line.
+        let folded = fold(
+            &log(&[ADMITTED, &row("discover", "maybe", 0.0)]),
+            &plan,
+            Duration::ZERO,
+        )
+        .unwrap();
+        assert!(folded.results.is_empty());
     }
 
     #[test]

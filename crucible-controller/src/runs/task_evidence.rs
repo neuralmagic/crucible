@@ -7,7 +7,7 @@
 //! and the resolved directory is checked against the run's own files root afterwards — a symlinked
 //! task directory does not get to read the rest of the disk.
 
-use crucible::plan::exec::TaskStatus;
+use crucible_contract::session::TaskStatus;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 

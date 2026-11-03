@@ -988,10 +988,11 @@ fn reserved_rows(rows: Vec<Reserved>) -> serde_json::Value {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::plan::exec::{DeclaredStatus, TaskStatus};
+    use crate::plan::exec::DeclaredStatus;
     use crate::plan::starlark::reference::functions;
     use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals};
     use crate::plan::workflow::WorkflowType;
+    use crucible_contract::session::TaskStatus;
 
     /// The reference is the global surface, per lane, in both directions: a constructor the
     /// evaluator registers but the table omits is undocumented, and one the table names but the

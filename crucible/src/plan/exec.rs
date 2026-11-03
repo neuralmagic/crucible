@@ -36,7 +36,7 @@ use crucible_contract::decision::{
     Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId,
 };
 use crucible_contract::inference::{InferenceRole, ResolvedInference};
-use crucible_contract::session::TaskRepair;
+use crucible_contract::session::{TaskRepair, TaskStatus};
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -391,68 +391,6 @@ impl ExecCfg<'_> {
     }
 }
 
-#[derive(Debug, PartialEq, Eq, thiserror::Error)]
-#[error("task status must be pass|fail|transport|skipped|not_taken|blocked|truncated, got {got:?}")]
-pub struct UnknownTaskStatus {
-    pub got: String,
-}
-
-/// Terminal task states.
-///
-/// A `task_result` line carries one of these, and a consumer reading a session log decodes it back
-/// through this type rather than matching the token itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TaskStatus {
-    Pass,
-    Fail,
-    Transport,
-    Skipped,
-    NotTaken,
-    Blocked,
-    Truncated,
-}
-
-impl TaskStatus {
-    /// The stable wire token (`SessionEvent::TaskResult.status`).
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TaskStatus::Pass => "pass",
-            TaskStatus::Fail => "fail",
-            TaskStatus::Transport => "transport",
-            TaskStatus::Skipped => "skipped",
-            TaskStatus::NotTaken => "not_taken",
-            TaskStatus::Blocked => "blocked",
-            TaskStatus::Truncated => "truncated",
-        }
-    }
-
-    /// Whether this status is the task having done what it was asked. Everything else is a
-    /// failure of some kind, and none of them may read as a pass.
-    pub fn passed(self) -> bool {
-        self == TaskStatus::Pass
-    }
-}
-
-impl std::str::FromStr for TaskStatus {
-    type Err = UnknownTaskStatus;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "pass" => Ok(TaskStatus::Pass),
-            "fail" => Ok(TaskStatus::Fail),
-            "transport" => Ok(TaskStatus::Transport),
-            "skipped" => Ok(TaskStatus::Skipped),
-            "not_taken" => Ok(TaskStatus::NotTaken),
-            "blocked" => Ok(TaskStatus::Blocked),
-            "truncated" => Ok(TaskStatus::Truncated),
-            other => Err(UnknownTaskStatus {
-                got: other.to_owned(),
-            }),
-        }
-    }
-}
-
 impl TaskState {
     /// The status a settled state reports; `None` while the task is still open.
     pub fn status(self) -> Option<TaskStatus> {
@@ -468,12 +406,6 @@ impl TaskState {
                 return None;
             }
         })
-    }
-}
-
-impl std::fmt::Display for TaskStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
     }
 }
 

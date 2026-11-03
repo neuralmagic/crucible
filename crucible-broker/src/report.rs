@@ -99,7 +99,7 @@ struct Totals {
 
 impl Totals {
     fn of(report: &crucible_contract::RunReport) -> Self {
-        let passed = report.tasks.iter().filter(|t| t.status == "pass").count();
+        let passed = report.tasks.iter().filter(|t| t.status.passed()).count();
         Self {
             passed,
             failed: report.tasks.len() - passed,
@@ -265,7 +265,7 @@ fn render(
             .take(MAX_TEMPLATE_TASKS)
             .map(|task| TemplateTask {
                 name: &task.name,
-                status: &task.status,
+                status: task.status.as_str(),
                 cost_usd: task.cost_usd,
             })
             .collect(),
@@ -454,7 +454,7 @@ mod tests {
     fn task(name: &str, status: &str) -> crucible_contract::TaskReport {
         crucible_contract::TaskReport {
             name: name.into(),
-            status: status.into(),
+            status: status.parse().unwrap(),
             cost_usd: 0.0,
             blocked: None,
             transport: None,
@@ -518,7 +518,7 @@ mod tests {
             run_url: Some("https://crucible.example/runs/run-7".into()),
             tasks: vec![crucible_contract::TaskReport {
                 name: "roundup".into(),
-                status: "pass".into(),
+                status: crucible_contract::session::TaskStatus::Pass,
                 cost_usd: 0.25,
                 blocked: None,
                 transport: None,

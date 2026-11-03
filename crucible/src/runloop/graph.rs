@@ -20,7 +20,7 @@ use crate::agent;
 use crate::control;
 use crate::plan::admission::{Admission, Refusal};
 use crate::plan::exec::{
-    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
+    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, execute,
 };
 use crate::plan::harness::CandidateEvent;
 use crate::plan::ir::{
@@ -36,6 +36,7 @@ use crate::runloop::step::{Decided, IterStep, Measured, TurnVerdict};
 use crucible::crucible::Direction;
 use crucible::crucible::{Judge, MeasureCtx, Reading, World};
 use crucible::deadline::Deadline;
+use crucible_contract::session::TaskStatus;
 
 #[derive(Debug, thiserror::Error)]
 #[error("graph iteration ended with neither a decision nor a control signal (exit: {exit})")]

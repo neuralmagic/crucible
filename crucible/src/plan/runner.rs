@@ -484,8 +484,9 @@ fn evaluation_note(
 #[cfg(test)]
 mod tests {
     use crate::crucible::Direction;
-    use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
+    use crate::plan::exec::{ExecCfg, PlanExit, Substrate};
     use crate::plan::runner::*;
+    use crucible_contract::session::TaskStatus;
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
     fn execute(

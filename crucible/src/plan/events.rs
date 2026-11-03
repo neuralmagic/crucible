@@ -86,7 +86,7 @@ pub(crate) fn task_result_event(
         .unwrap_or_default();
     crate::report::session::SessionEvent::TaskResult {
         task: task.name.0.clone(),
-        status: r.status.as_str().to_string(),
+        status: r.status,
         plan_version,
         task_kind: task.task.label().to_string(),
         iter,
@@ -345,7 +345,7 @@ mod tests {
         .validate()
         .unwrap();
         let result = crate::plan::exec::TaskResult {
-            status: crate::plan::exec::TaskStatus::Pass,
+            status: crucible_contract::session::TaskStatus::Pass,
             attempts: 1,
             cost_usd: 0.0,
             output: Some(serde_json::json!({
@@ -399,7 +399,7 @@ mod tests {
             notes: vec!["output missing declared field \"lanes\"".into()],
         };
         let result = crate::plan::exec::TaskResult {
-            status: crate::plan::exec::TaskStatus::Pass,
+            status: crucible_contract::session::TaskStatus::Pass,
             attempts: 1,
             cost_usd: 0.75,
             output: Some(serde_json::json!({"lanes": []})),
