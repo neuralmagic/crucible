@@ -128,6 +128,26 @@ export function dispatchTone(state: DispatchState): DispatchTone {
   return DISPATCH_TONE[state];
 }
 
+export interface DispatchFailure {
+  label: string;
+  error: string;
+  at: string | null;
+  blocking: boolean;
+}
+
+/// The stored dispatch failure: what keeps a launch from starting, or, once a run exists, the
+/// last attempt that failed before it. Null when no attempt failed.
+export function dispatchFailure(dispatch: LaunchDetail['dispatch']): DispatchFailure | null {
+  if (!dispatch.failure) return null;
+  const blocking = dispatch.state !== 'dispatched';
+  return {
+    label: blocking ? 'why it did not start' : 'last failed attempt',
+    error: dispatch.failure,
+    at: dispatch.failed_at ?? null,
+    blocking,
+  };
+}
+
 /// The run whose graph the page draws: the newest one this launch dispatched, since a re-dispatch
 /// supersedes what came before. Null when nothing ever started.
 export function graphRunId(detail: LaunchDetail): string | null {
