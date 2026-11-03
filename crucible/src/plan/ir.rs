@@ -441,6 +441,12 @@ impl TaskKind {
     }
 
     /// Whether an attempt of this kind asks a model, and so draws on the run's cost ceiling.
+    /// Whether a passing result of this kind may end a playbook run early: a command or evaluate
+    /// task may, a model's output may not.
+    pub fn may_complete_early(&self) -> bool {
+        matches!(self, TaskKind::Command { .. } | TaskKind::Evaluate { .. })
+    }
+
     pub fn spends(&self) -> bool {
         match self {
             TaskKind::Agent { .. }

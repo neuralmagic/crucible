@@ -914,7 +914,7 @@ pub fn run(
         statuses.insert(task.name.clone(), result.status);
         completed_early |= playbook
             && task.stage == Stage::Iteration
-            && crate::plan::exec::declared_completion(result).is_some();
+            && crate::plan::exec::declared_completion(task, result).is_some();
         if completed_early
             || plan
                 .tasks_topo()

@@ -261,13 +261,18 @@ the same position, the engine skips it and its dependents, and validity does not
 **Failure.** If a `required` task fails, the plan stops. All tasks that did not dispatch are
 blocked. An advisory failure blocks only its dependents.
 
-**Early completion.** In a playbook, a passing main-graph task can return `"complete": true`,
-with an optional `"reason"` string. This ends the run. No other main-graph task dispatches.
-Tasks that did not dispatch stay unsettled, not blocked. Epilogue tasks still run. The run is
-valid unless a required task already settled with a status other than pass. The shutdown
-outcome is `complete`, with the reason. Both fields are reserved, so `emits` cannot list them.
-A revised task that completes ends its loop without another review. A mapped instance that
-completes ends the run after its node folds.
+**Early completion.** In a playbook, a passing main-graph `command` or `evaluate` task can
+return `"complete": true`, with an optional `"reason"` string. This ends the run. No other
+main-graph task dispatches. Tasks that did not dispatch stay unsettled, not blocked. Epilogue
+tasks still run. The run is valid unless a required task already settled with a status other
+than pass. The shutdown outcome is `complete`, with the reason. Both fields are reserved, so
+`emits` cannot list them. A revised command that completes ends its loop without another
+review. A mapped instance that completes ends the run after its node folds.
+
+An agent task, or any other task whose output a model writes, cannot end the run this way. If
+it returns `"complete": true`, the engine refuses it: the task keeps its own outcome, its row's
+note records the refusal, and the run continues. Put the "nothing to do" decision in a command
+or evaluate task that reads the agent's output.
 
 **Retries apply only to transport failures.** Transport failures retry, up to a limit (2 by
 default). A measured failure does not run again.

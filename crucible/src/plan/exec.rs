@@ -1523,12 +1523,17 @@ pub fn execute(
             }
         }
         if cfg.early_completion && completed.is_none() {
-            let mut settled_now: Vec<&TaskName> = Vec::new();
+            let mut settled_now: Vec<(&Task, &TaskName)> = Vec::new();
             for t in dispatch.iter().filter(|t| t.stage == Stage::Iteration) {
                 if t.over.is_some() {
-                    settled_now.extend(results.keys().filter(|n| is_instance_of(&t.name, n)));
+                    settled_now.extend(
+                        results
+                            .keys()
+                            .filter(|n| is_instance_of(&t.name, n))
+                            .map(|n| (*t, n)),
+                    );
                 }
-                settled_now.push(&t.name);
+                settled_now.push((*t, &t.name));
             }
             if let Some(completion) = completion_among(&results, &settled_now) {
                 complete(&mut completed, &mut plan_machine, completion)?;
@@ -1620,8 +1625,10 @@ struct Completion {
     reason: Option<String>,
 }
 
-pub fn declared_completion(r: &TaskResult) -> Option<Option<String>> {
-    if r.status != TaskStatus::Pass {
+/// The reason `task` gave for ending the run early, when its passing result declares
+/// completion and its kind may end a run ([`TaskKind::may_complete_early`]).
+pub fn declared_completion(task: &Task, r: &TaskResult) -> Option<Option<String>> {
+    if r.status != TaskStatus::Pass || !task.task.may_complete_early() {
         return None;
     }
     let output = r.output.as_ref()?.as_object()?;
@@ -1633,17 +1640,45 @@ pub fn declared_completion(r: &TaskResult) -> Option<Option<String>> {
     })
 }
 
+/// The first of `settled` whose result declares completion. Each row is named with the task
+/// whose kind decides whether it may.
 fn completion_among(
     results: &BTreeMap<TaskName, TaskResult>,
-    names: &[&TaskName],
+    settled: &[(&Task, &TaskName)],
 ) -> Option<Completion> {
-    names.iter().find_map(|name| {
-        let reason = declared_completion(results.get(*name)?)?;
+    settled.iter().find_map(|(task, name)| {
+        let reason = declared_completion(task, results.get(*name)?)?;
         Some(Completion {
             task: (*name).clone(),
             reason,
         })
     })
+}
+
+/// The note a passing result carries when its task declared completion and its kind may not end
+/// a run. The run continues as if it had not.
+fn refused_completion(task: &Task, r: &TaskResult) -> Option<String> {
+    let declared = r.status == TaskStatus::Pass
+        && !task.task.may_complete_early()
+        && r.output.as_ref().and_then(|o| o.get(COMPLETE_FIELD)) == Some(&Value::Bool(true));
+    declared.then(|| {
+        format!(
+            "{} task {} declared \"{COMPLETE_FIELD}\": true, which only a command or evaluate task \
+             may do; the run continues",
+            task.task.label(),
+            task.name
+        )
+    })
+}
+
+/// Record on `r` that `task` declared a completion its kind may not, when the run honours early
+/// completion at all.
+fn note_refused_completion(cfg: ExecCfg<'_>, task: &Task, r: &mut TaskResult) {
+    if cfg.early_completion
+        && let Some(note) = refused_completion(task, r)
+    {
+        r.note = Some(note);
+    }
 }
 
 fn complete(
@@ -2051,7 +2086,7 @@ where
                 stopped |= cfg.early_completion
                     && t.stage == Stage::Iteration
                     && t.name != reviewer.name
-                    && declared_completion(&result).is_some();
+                    && declared_completion(t, &result).is_some();
                 view.insert(t.name.clone(), result.clone());
                 rows.push(RoundRow {
                     task: t,
@@ -2166,7 +2201,7 @@ where
                             if cfg.early_completion
                                 && t.stage == Stage::Iteration
                                 && t.name != reviewer.name
-                                && declared_completion(&result).is_some()
+                                && declared_completion(t, &result).is_some()
                             {
                                 stopped = true;
                             }
@@ -2245,10 +2280,10 @@ where
         )?;
     }
     if cfg.early_completion && ledger.completed.is_none() {
-        let names: Vec<&TaskName> = last
+        let names: Vec<(&Task, &TaskName)> = last
             .iter()
             .filter(|row| row.task.stage == Stage::Iteration)
-            .map(|row| &row.task.name)
+            .map(|row| (row.task, &row.task.name))
             .collect();
         if let Some(completion) = completion_among(ledger.results, &names) {
             complete(ledger.completed, ledger.plan_machine, completion)?;
@@ -2372,7 +2407,7 @@ fn replay(
         (t.stage == Stage::Iteration).then_some(())?;
         Some(Completion {
             task: t.name.clone(),
-            reason: declared_completion(r)?,
+            reason: declared_completion(t, r)?,
         })
     });
     match completion {
@@ -2749,7 +2784,10 @@ fn run_with_retries(
         let mut overrun = Overrun::of(&outcome);
         overrun.budget = *spent > budget;
         match settle_attempt(outcome, attempts, cost, a.repairs) {
-            Ok((result, event)) => return (result, event, overrun),
+            Ok((mut result, event)) => {
+                note_refused_completion(cfg, t, &mut result);
+                return (result, event, overrun);
+            }
             Err(failure) => {
                 if t.task.spends()
                     && (*spent > budget || (*spent >= budget && attempts < max_attempts))
@@ -2846,8 +2884,9 @@ fn run_batch_with_retries<'a>(
         let mut next: Vec<(usize, BatchItem<'a>, Option<TransportFailure>)> = Vec::new();
         for (idx, item, outcome, repairs) in attempted {
             match settle_attempt(outcome, item.attempt, cost_so_far[idx], repairs) {
-                Ok(settled) => {
-                    done.insert(idx, settled);
+                Ok((mut result, event)) => {
+                    note_refused_completion(cfg, item.task, &mut result);
+                    done.insert(idx, (result, event));
                 }
                 Err(failure) => {
                     let cut_by_budget = item.task.task.spends() && retry_budget_blocked;
@@ -9732,6 +9771,52 @@ mod tests {
         }
     }
 
+    /// An agent's output is written by the model in its sandbox, so a `"complete": true` there
+    /// would let whatever steered the model skip every task after it, a reviewer among them.
+    /// The run refuses it on the row and dispatches the rest; the shared and the isolated
+    /// dispatch paths both do.
+    #[test]
+    fn an_agents_completion_is_refused_on_its_row_and_the_run_continues() {
+        for isolated in [false, true] {
+            let mut drafted = spending(task("draft", &[], "any", true));
+            if isolated {
+                drafted.isolation = Some(crate::plan::ir::Isolation::Worktree);
+            }
+            let plan = valid(vec![drafted, task("review", &["draft"], "any", true)], 10.0);
+            let mut r = ScriptRunner::new();
+            r.rounds("draft", &[completes]);
+            let (out, rows) = run_completing(&plan, &mut r);
+
+            assert_eq!(out.exit, PlanExit::Completed, "isolated: {isolated}");
+            assert!(out.valid);
+            assert_eq!(rows, ["draft", "review"]);
+            let draft = &out.results[&"draft".into()];
+            assert_eq!(draft.status, TaskStatus::Pass);
+            let note = draft.note.as_deref().unwrap_or_default();
+            assert!(
+                note.contains("agent task draft declared \"complete\": true")
+                    && note.contains("only a command or evaluate task may do"),
+                "{note}"
+            );
+        }
+
+        let plan = valid(
+            vec![
+                spending(task("draft", &[], "any", true)),
+                task("review", &["draft"], "any", true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.rounds("draft", &[completes]);
+        let (out, _) = rows_of(&plan, &mut r);
+        assert_eq!(
+            out.results[&"draft".into()].note,
+            None,
+            "the scored loop has no early completion to refuse"
+        );
+    }
+
     #[test]
     fn the_scored_loop_ignores_a_completion_field() {
         let plan = valid(
@@ -9849,16 +9934,31 @@ mod tests {
         assert!(!out.results.contains_key(&"after".into()));
     }
 
+    /// A revised command that declares completion ends its loop without another review. A
+    /// revised agent may not end the run, so its reviewer sees the round as it would any other.
     #[test]
-    fn a_revised_task_declaring_completion_ends_its_loop_unreviewed() {
-        let plan = valid(
-            vec![
-                agent("author", &[], "any", true),
-                spending(reviewing("repro", &["author"], "author", 3)),
-                agent("after", &["repro"], "any", true),
-            ],
-            10.0,
+    fn a_revised_command_declaring_completion_ends_its_loop_unreviewed() {
+        let reviewed = |author: Task| {
+            valid(
+                vec![
+                    author,
+                    spending(reviewing("repro", &["author"], "author", 3)),
+                    agent("after", &["repro"], "any", true),
+                ],
+                10.0,
+            )
+        };
+        let mut r = ScriptRunner::new();
+        r.rounds("author", &[drafted, completes]);
+        r.rounds("repro", &[rejected, approved]);
+        let (out, _) = run_completing(&reviewed(agent("author", &[], "any", true)), &mut r);
+        assert_eq!(out.exit, PlanExit::Completed, "{:?}", out.results);
+        assert_eq!(
+            dispatches(&r),
+            ["author", "repro", "author", "repro", "after"]
         );
+
+        let plan = reviewed(task("author", &[], "any", true));
         let mut r = ScriptRunner::new();
         r.rounds("author", &[drafted, completes]);
         r.rounds("repro", &[rejected]);
@@ -9876,7 +9976,11 @@ mod tests {
                 "author"
             ]
         );
-        assert!((out.results[&"author".into()].cost_usd - 0.2).abs() < 1e-9);
+        let rounds: f64 = ["author[round-1]", "author[round-2]"]
+            .iter()
+            .map(|round| out.results[&(*round).into()].cost_usd)
+            .sum();
+        assert!((out.results[&"author".into()].cost_usd - rounds).abs() < 1e-9);
         assert!(!out.results.contains_key(&"repro".into()));
     }
 
