@@ -335,7 +335,7 @@ Read out of the object the task returns.
 | --- | --- | --- |
 | `status` | `"pass" \| "fail" \| "skipped"` | `"fail"` or `"skipped"` settles the task that way, whatever its exit status, `pass` or threshold. `"pass"` cannot pass a task that exited nonzero or did not pass its grade. Any other value is ignored. |
 | `note` | `str` | Why the task failed or was skipped, recorded as its note when it is a non-blank string: after the exit status in place of the stderr tail when a command exits nonzero, before the threshold and log handles when an evaluation does not pass, and in place of the default note when `status` is `"fail"` or `"skipped"`. The control plane shows it as a parked run's reason. Read only from a result that fails or skips. |
-| `complete` | `bool` | `true` on a passing main-graph task of a playbook ends the run early and valid: nothing else in the main graph dispatches, undispatched tasks stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it in `emits`. |
+| `complete` | `bool` | `true` on a passing main-graph `command` or `evaluate` task of a playbook ends the run early and valid: nothing else in the main graph dispatches, undispatched tasks stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. Any other task's `true` is refused on its row and the run continues. A task may not list it in `emits`. |
 | `reason` | `str` | Why the run completed early, recorded with the shutdown. A task may not list it in `emits`. |
 
 ### Inputs the engine writes

@@ -62,8 +62,7 @@ change the engine.
 ## The contract
 
 Crucible defines a small contract. A repository implements it in any language. A domain is
-**a manifest and some executables**. It is not Rust code. Each command runs in the workspace
-with the environment of the domain:
+**a manifest and some executables**. It is not Rust code. Each command runs in the workspace:
 
 | Command | Required | Contract |
 | --- | --- | --- |
@@ -72,6 +71,30 @@ with the environment of the domain:
 | `snapshot` | no | Prints an opaque token for the current state. Default: a Git commit ref. |
 | `restore <token>` | no | Rolls back to a token. Default: `git reset --hard` and `clean`. |
 | `setup` | no | Prepares the workspace. Default: Git clone and checkout. |
+
+`measure`, `apply`, `snapshot`, and `restore` get a minimal environment, not the engine's:
+`PATH`, `HOME`, `LANG`, and `TMPDIR`, the variables the engine sets for that command
+(`CRUCIBLE_BASELINE_*`, `CRUCIBLE_BEST_SCORE`, `CRUCIBLE_TOKEN`), and the variables its table
+declares. The agent can edit files a command runs, so nothing else of the engine's environment
+reaches it: no kubeconfig, registry authfile, broker token, or provider key unless you name it.
+
+```toml
+[judge]
+measure_cmd = "./measure.sh"
+direction = "lower"
+env = ["KUBECONFIG"]        # measure_cmd only
+
+[world]
+apply_cmd = "./deploy.sh"
+env = ["KUBECONFIG", "REGISTRY_AUTH_FILE"]   # apply, snapshot, and restore
+```
+
+`[workflow].env` does the same for a workflow's `command` and `evaluate` tasks. A name is a
+letter or underscore followed by letters, digits, and underscores. A declared variable that the
+engine's environment does not set refuses the run before any of these commands runs, naming
+every missing one; `crucible check` reports it as a finding. `crucible check` lists each
+table's declared variables in the capability disclosure as `host-env`. `setup` runs with the
+engine's environment.
 
 The accept policy is the same for all domains. The engine keeps a candidate if it is `valid`
 and its `score` is better than the best score in the `direction`. The run is solved only if

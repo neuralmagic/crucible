@@ -751,10 +751,11 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
         Reserved::new(
             crate::plan::ir::COMPLETE_FIELD,
             "bool",
-            "`true` on a passing main-graph task of a playbook ends the run early and valid: \
-             nothing else in the main graph dispatches, undispatched tasks stay unsettled, and \
-             epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it \
-             in `emits`.",
+            "`true` on a passing main-graph `command` or `evaluate` task of a playbook ends the \
+             run early and valid: nothing else in the main graph dispatches, undispatched tasks \
+             stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. \
+             Any other task's `true` is refused on its row and the run continues. A task may not \
+             list it in `emits`.",
         ),
         Reserved::new(
             crate::plan::ir::REASON_FIELD,
