@@ -151,7 +151,8 @@ mod tests {
              {\"severity\":\"warn\",\"reason\":\"flaky node\",\"ts_ms\":2}\n",
         )
         .unwrap();
-        let notes: Vec<(String, &str)> = drain_notes()
+        let drained = drain_notes();
+        let notes: Vec<(String, &str)> = drained
             .iter()
             .map(|n| (n.severity.to_string(), n.reason.as_str()))
             .collect();
