@@ -20,6 +20,7 @@
 //! ```
 
 use anyhow::{Context, Result};
+use crucible_contract::driver_env::BrokerEnv;
 use forge::steps::{StepKey, StepLedger, StepOutcome};
 use forge::{BuildConfig, BuildOutcome, DeployConfig};
 use serde::Serialize;
@@ -374,10 +375,14 @@ fn ctx_dir(cfg: &BuildConfig) -> PathBuf {
 /// deployment fact with no sane universal default, so it is REQUIRED config: the rendered loop pod
 /// projects it, hand-written pods must set it.
 pub(crate) fn sandbox_workdir() -> Result<String> {
-    std::env::var("BROKER_SANDBOX_WORKDIR")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
+    run_env()
+        .sandbox_workdir
         .ok_or_else(|| SandboxWorkdirUnset.into())
+}
+
+/// The run facts the loop pod projected for this broker.
+pub(crate) fn run_env() -> BrokerEnv {
+    BrokerEnv::from_env(|key| std::env::var(key).ok())
 }
 
 /// The driver's per-run sandbox name (`ci-<pid>-<workspace-hash>`), handed over at spawn as
@@ -401,22 +406,21 @@ fn enabled() -> bool {
 }
 
 pub(crate) fn composite_enabled() -> bool {
-    matches!(
-        std::env::var("BROKER_COMPOSITE").as_deref(),
-        Ok("1") | Ok("true")
-    )
+    run_env().composite
 }
 
 pub(crate) fn composite_apply_cmd() -> String {
-    std::env::var("BROKER_COMPOSITE_APPLY_CMD")
-        .unwrap_or_else(|_| DEFAULT_COMPOSITE_APPLY_CMD.into())
+    run_env()
+        .composite_apply_cmd
+        .unwrap_or_else(|| DEFAULT_COMPOSITE_APPLY_CMD.into())
 }
 
 /// Where the synced composite tree is staged for the apply hook (shares the build storage volume).
 pub(crate) fn composite_ctx_dir() -> PathBuf {
-    std::env::var("BROKER_COMPOSITE_CTX")
+    run_env()
+        .composite_ctx
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/forge/composite-ctx"))
+        .unwrap_or_else(|| PathBuf::from("/var/lib/forge/composite-ctx"))
 }
 
 /// The last non-empty stdout line (the hook prints the deployed refs there), for the agent's reply.

@@ -19,6 +19,7 @@
 
 use crate::openshell::grpc::{GATEWAY_NAME, GATEWAY_PORT, mtls_dir};
 use anyhow::{Context, Result};
+use crucible_contract::driver_env::SandboxDriverEnv;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -268,9 +269,9 @@ fn needs_podman_socket(driver: ComputeDriver) -> bool {
 }
 
 /// The env the loop pod renders the supervisor image into.
-pub const SUPERVISOR_IMAGE_ENV: &str = "OPENSHELL_SUPERVISOR_IMAGE";
+pub const SUPERVISOR_IMAGE_ENV: &str = crucible_contract::driver_env::SUPERVISOR_IMAGE;
 /// The env the loop pod renders the sandbox runtime image (the `openshell-sandbox` binary) into.
-pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = "OPENSHELL_SANDBOX_RUNTIME_IMAGE";
+pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = crucible_contract::driver_env::SANDBOX_RUNTIME_IMAGE;
 /// The env the loop pod's downward API carries its own IP in.
 pub const POD_IP_ENV: &str = "CRUCIBLE_POD_IP";
 
@@ -284,10 +285,10 @@ pub struct DriverImages {
 
 impl DriverImages {
     pub fn from_env() -> Self {
-        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let env = SandboxDriverEnv::from_env(|key| std::env::var(key).ok());
         Self {
-            supervisor: var(SUPERVISOR_IMAGE_ENV),
-            sandbox_runtime: var(SANDBOX_RUNTIME_IMAGE_ENV),
+            supervisor: env.supervisor_image,
+            sandbox_runtime: env.sandbox_runtime_image,
         }
     }
 }
@@ -404,7 +405,7 @@ pub const SERVE_HOST_IP_ENV: &str = "CRUCIBLE_GATEWAY_HOST_IP";
 pub const SERVE_GATEWAY_ID_ENV: &str = "CRUCIBLE_GATEWAY_ID";
 /// The SPIFFE Workload API socket path supervisors get, delivered with a run's agent servers
 /// (`[cluster] sandbox_spiffe_socket`).
-pub const SANDBOX_SPIFFE_SOCKET_ENV: &str = "CRUCIBLE_SANDBOX_SPIFFE_SOCKET";
+pub const SANDBOX_SPIFFE_SOCKET_ENV: &str = crucible_contract::driver_env::SANDBOX_SPIFFE_SOCKET;
 pub const SERVE_CLIENT_TLS_SECRET_ENV: &str = "CRUCIBLE_GATEWAY_CLIENT_TLS_SECRET";
 pub const SERVE_SERVER_TLS_DIR_ENV: &str = "CRUCIBLE_GATEWAY_SERVER_TLS_DIR";
 
@@ -515,43 +516,18 @@ pub fn gateway_toml(
             cfg.grpc_endpoint = dial_back.grpc_endpoint.clone();
             cfg.client_tls_secret_name = client_tls_secret.to_string();
             cfg.host_gateway_ip = Some(dial_back.host_gateway_ip);
-            // At runtime the render-projected env vars fill the driver config fields that
-            // are unknowable at render time or vary per profile.
-            if let Ok(ns) = std::env::var("CRUCIBLE_SANDBOX_NAMESPACE")
-                && !ns.is_empty()
-            {
-                cfg.namespace = Some(ns);
-            }
-            if let Ok(sa) = std::env::var("CRUCIBLE_SANDBOX_SERVICE_ACCOUNT")
-                && !sa.is_empty()
-            {
-                cfg.service_account_name = Some(sa);
-            }
-            if let Ok(img) = std::env::var("CRUCIBLE_SANDBOX_DEFAULT_IMAGE")
-                && !img.is_empty()
-            {
-                cfg.default_image = Some(img);
-            }
+            // At runtime the render-projected env fills the driver config fields that are
+            // unknowable at render time or vary per profile.
+            let sandbox = SandboxDriverEnv::from_env(|key| std::env::var(key).ok());
+            cfg.namespace = sandbox.namespace;
+            cfg.service_account_name = sandbox.service_account;
+            cfg.default_image = sandbox.default_image;
+            cfg.provider_spiffe_workload_api_socket_path = sandbox.spiffe_socket;
+            cfg.image_pull_secrets = sandbox.image_pull_secrets;
             if let Ok(id) = std::env::var(SERVE_GATEWAY_ID_ENV)
                 && !id.is_empty()
             {
                 cfg.gateway_id = Some(id);
-            }
-            if let Ok(socket) = std::env::var(SANDBOX_SPIFFE_SOCKET_ENV)
-                && !socket.is_empty()
-            {
-                cfg.provider_spiffe_workload_api_socket_path = Some(socket);
-            }
-            if let Ok(secrets) = std::env::var("CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS") {
-                let v: Vec<String> = secrets
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if !v.is_empty() {
-                    cfg.image_pull_secrets = v;
-                }
             }
             let body = toml::to_string(&cfg).context("serializing kubernetes driver config")?;
             s.push_str(&format!("\n[openshell.drivers.kubernetes]\n{body}"));
@@ -1195,7 +1171,7 @@ fn publish_client_tls_secret(tls_dir: &std::path::Path, target: &ClientTlsSecret
         std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))
     };
     let name = target.name();
-    let ns = std::env::var("CRUCIBLE_SANDBOX_NAMESPACE")
+    let ns = std::env::var(crucible_contract::driver_env::SANDBOX_NAMESPACE)
         .ok()
         .filter(|s| !s.is_empty())
         // The kubernetes driver's DEFAULT_K8S_NAMESPACE, used when the config omits `namespace`.

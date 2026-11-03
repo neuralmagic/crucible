@@ -4,10 +4,11 @@ use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{
     AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, ComputeDriver, OTEL_COLLECTOR_PORT,
-    POD_IP_ENV, SANDBOX_RUNTIME_IMAGE_ENV, SUPERVISOR_IMAGE_ENV,
+    POD_IP_ENV,
 };
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
+use crucible_contract::driver_env::{BrokerEnv, SandboxDriverEnv};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
 use k8s_openapi::api::admissionregistration::v1 as admission;
@@ -805,27 +806,22 @@ impl Renderer<'_> {
 
         // Broker / composite wiring (manifest-derived, the broker IS the engine, so these are generic).
         // BROKER_BUILD is set by crucible when it spawns the broker (from [agent.broker].build), not here.
-        if self.input.agent.broker.build {
-            env.push(env_var("BROKER_COMPOSITE", "1".to_string()));
-        }
         let ws_basename = Path::new(self.input.workspace_dir)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "workspace".to_string());
-        env.push(env_var(
-            "BROKER_SANDBOX_WORKDIR",
-            format!("/sandbox/{ws_basename}"),
-        ));
-        env.push(env_var(
-            "BROKER_COMPOSITE_CTX",
-            format!("{FORGE_STORAGE_ROOT}/composite-ctx"),
-        ));
-        if let Some(measure_cmd) = self.input.measure_cmd {
-            env.push(env_var("BROKER_MEASURE_CMD", measure_cmd.to_string()));
-        }
-        if let Some(apply) = self.input.apply_cmd {
-            env.push(env_var("BROKER_COMPOSITE_APPLY_CMD", apply.to_string()));
-        }
+        let spoke = self.spoke.as_ref().map(|(_, entry)| entry);
+        let broker = BrokerEnv {
+            composite: self.input.agent.broker.build,
+            sandbox_workdir: Some(format!("/sandbox/{ws_basename}")),
+            composite_ctx: Some(format!("{FORGE_STORAGE_ROOT}/composite-ctx")),
+            measure_cmd: self.input.measure_cmd.map(str::to_string),
+            composite_apply_cmd: self.input.apply_cmd.map(str::to_string),
+            codegen_kubeconfig: spoke.map(|_| SPOKE_KUBECONFIG_PATH.to_string()),
+            codegen_cluster_tier: spoke.map(|entry| entry.tier().as_str().to_string()),
+            codegen_proxy_url: spoke.and_then(|entry| entry.proxy_url.clone()),
+        };
+        env.extend(broker.run_env().into_iter().map(|(k, v)| env_var(k, v)));
 
         // In-pod buildah can't mount: no /dev/fuse for the image default (overlay+fuse-overlayfs)
         // and no privileges for kernel overlay, so builds run vfs + chroot — the same recipe as
@@ -880,19 +876,7 @@ impl Renderer<'_> {
             }
             // Delegated spoke: the mounted kubeconfig path + the tier (named in unreachable-spoke
             // tool errors). BROKER_CODEGEN_CLUSTER itself rides broker_env() above.
-            if let Some((_, entry)) = &self.spoke {
-                env.push(env_var(
-                    "BROKER_CODEGEN_KUBECONFIG",
-                    SPOKE_KUBECONFIG_PATH.to_string(),
-                ));
-                env.push(env_var(
-                    "BROKER_CODEGEN_CLUSTER_TIER",
-                    entry.tier().as_str().to_string(),
-                ));
-                if let Some(proxy) = &entry.proxy_url {
-                    env.push(env_var("BROKER_CODEGEN_PROXY_URL", proxy.clone()));
-                }
-            }
+            env.extend(broker.spoke_env().into_iter().map(|(k, v)| env_var(k, v)));
         }
 
         // Publish-on-keep AWS auth (IRSA): the role + the projected sts-token path (region from profile env).
@@ -2123,69 +2107,55 @@ pub(super) fn secret_env_vars(profile: &DeployProfile) -> Vec<core::EnvVar> {
 /// The supervisor and sandbox runtime images the gateway's compute driver launches, as the env
 /// `gateway::DriverImages::from_env` reads. Shared by the loop and turn renders.
 pub(super) fn driver_image_env(profile: &DeployProfile) -> Result<Vec<core::EnvVar>> {
-    Ok(vec![
-        env_var(
-            SUPERVISOR_IMAGE_ENV,
-            profile.cluster.supervisor_image.clone(),
-        ),
-        env_var(
-            SANDBOX_RUNTIME_IMAGE_ENV,
-            profile.cluster.sandbox_runtime_image()?,
-        ),
-    ])
+    Ok(driver_env(profile, None)?
+        .images_env()
+        .into_iter()
+        .map(|(k, v)| env_var(k, v))
+        .collect())
 }
 
 pub(super) fn kubernetes_sandbox_env(
     profile: &DeployProfile,
     sandbox_image: &str,
 ) -> Result<Vec<core::EnvVar>> {
-    let mut env = vec![core::EnvVar {
-        name: POD_IP_ENV.to_string(),
-        value: None,
-        value_from: Some(core::EnvVarSource {
-            field_ref: Some(core::ObjectFieldSelector {
-                field_path: "status.podIP".to_string(),
-                api_version: None,
-            }),
-            ..Default::default()
-        }),
-    }];
-    env.push(env_var(
-        "CRUCIBLE_SANDBOX_NAMESPACE",
-        profile.cluster.sandbox_namespace().to_string(),
-    ));
-    env.push(env_var(
-        "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT",
-        profile.cluster.sandbox_service_account().to_string(),
-    ));
-    env.push(env_var(
-        "CRUCIBLE_SANDBOX_DEFAULT_IMAGE",
-        sandbox_image.to_string(),
-    ));
-    // The kubelet pulls the sandbox image, so this must be a `kubernetes.io/dockerconfigjson`
-    // secret. `[secrets].pull_authfile` is NOT one: it is an Opaque secret holding an
-    // `auth.json` for the nested podman, and handing it to `imagePullSecrets` yields an
-    // ImagePullBackOff complaining about a missing `.dockerconfigjson` key.
-    if !profile.image.pull_secret.is_empty() {
-        env.push(env_var(
-            "CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS",
-            profile.image.pull_secret.clone(),
-        ));
-    }
-    if !profile.cluster.host_aliases.is_empty() {
-        let aliases = serde_json::to_string(&profile.cluster.host_aliases)
-            .context("serializing [cluster].host_aliases")?;
-        env.push(env_var("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
-    }
-    if !profile.cluster.gpu_sandbox.is_empty() {
-        let placement = serde_json::to_string(&profile.cluster.gpu_sandbox)
-            .context("serializing [cluster.gpu_sandbox]")?;
-        env.push(env_var(
-            crate::openshell::placement::GPU_PLACEMENT_ENV,
-            placement,
-        ));
-    }
+    let mut env = vec![downward(POD_IP_ENV, "status.podIP")];
+    env.extend(
+        driver_env(profile, Some(sandbox_image))?
+            .sandbox_env()
+            .into_iter()
+            .map(|(k, v)| env_var(k, v)),
+    );
     Ok(env)
+}
+
+/// The compute driver's view of the profile. The kubelet pulls the sandbox image, so the pull
+/// secret must be a `kubernetes.io/dockerconfigjson` secret: `[secrets].pull_authfile` is NOT
+/// one, it is an Opaque secret holding an `auth.json` for the nested podman, and handing it to
+/// `imagePullSecrets` yields an ImagePullBackOff complaining about a missing `.dockerconfigjson`
+/// key. The SPIFFE socket is left to the agent-server delivery.
+fn driver_env(profile: &DeployProfile, sandbox_image: Option<&str>) -> Result<SandboxDriverEnv> {
+    fn json<T: serde::Serialize>(what: &str, value: &T) -> Result<String> {
+        serde_json::to_string(value).with_context(|| format!("serializing {what}"))
+    }
+    Ok(SandboxDriverEnv {
+        supervisor_image: Some(profile.cluster.supervisor_image.clone()),
+        sandbox_runtime_image: Some(profile.cluster.sandbox_runtime_image()?),
+        namespace: Some(profile.cluster.sandbox_namespace().to_string()),
+        service_account: Some(profile.cluster.sandbox_service_account().to_string()),
+        default_image: sandbox_image.map(str::to_string),
+        image_pull_secrets: if profile.image.pull_secret.is_empty() {
+            Vec::new()
+        } else {
+            vec![profile.image.pull_secret.clone()]
+        },
+        host_aliases_json: (!profile.cluster.host_aliases.is_empty())
+            .then(|| json("[cluster].host_aliases", &profile.cluster.host_aliases))
+            .transpose()?,
+        gpu_placement_json: (!profile.cluster.gpu_sandbox.is_empty())
+            .then(|| json("[cluster.gpu_sandbox]", &profile.cluster.gpu_sandbox))
+            .transpose()?,
+        spiffe_socket: None,
+    })
 }
 
 /// The profile's node avoid-list as a required nodeAffinity `NotIn` on `kubernetes.io/hostname`
