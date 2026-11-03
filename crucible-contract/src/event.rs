@@ -107,6 +107,9 @@ pub enum AgentEvent {
         input: Option<serde_json::Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         result: Option<String>,
+        /// The call or result reported failure (non-zero exit, tool error).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        failed: bool,
     },
     /// A token/cost telemetry sample.
     Tokens(Tokens),

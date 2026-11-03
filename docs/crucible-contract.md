@@ -72,6 +72,10 @@ agent_cmd     = "..."                          # command backend only (§6)
 [agent.env]                                   # injected into the agent process (creds, Vertex, etc.)
 ANTHROPIC_VERTEX_PROJECT_ID = "my-gcp-project"
 
+[[agent.tool_plugins]]                        # optional; absent = repeat_guard(25), classify, tool_stats
+plugin = "repeat_guard"                       # see tool-plugins.md
+limit  = 25
+
 [judge]
 measure_cmd = "./measure.sh"                  # REQUIRED. §3. Any executable, any language.
 direction   = "lower"                         # lower | higher. REQUIRED.

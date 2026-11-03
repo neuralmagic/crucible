@@ -20,6 +20,7 @@ mod resources;
 mod search;
 mod secret;
 mod selftest;
+mod tool_plugins;
 pub mod variant;
 mod wiring;
 mod world;
@@ -42,6 +43,7 @@ pub use resources::{Quantity, QuantityError, SandboxResources};
 pub use search::SearchCfg;
 pub use secret::{SecretDecl, SecretError, SecretKind};
 pub use selftest::SelftestCfg;
+pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
@@ -808,6 +810,10 @@ pub struct AgentCfg {
     /// that sandbox instead of the defaults above.
     #[serde(default)]
     pub sandbox: BTreeMap<String, SandboxProfile>,
+    /// The `[[agent.tool_plugins]]` chain every turn's tool events run through, in order. Absent
+    /// runs [`default_chain`]; an empty list runs none.
+    #[serde(default)]
+    pub tool_plugins: Option<Vec<ToolPluginSpec>>,
     /// The agent settings a launch may set on the workflow's agent tasks.
     #[serde(default)]
     pub overrides: AgentOverridesCfg,
