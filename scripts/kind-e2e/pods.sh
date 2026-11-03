@@ -349,8 +349,7 @@ J_HOST=$(docker exec "$CLUSTER-control-plane" getent ahostsv4 host.docker.intern
 awk -v url="http://$J_HOST:$PORT" '{ print } /^\[cluster\]$/ { print "ingest_url = \"" url "\"" }' \
     "$WORK/profile.toml" >"$WORK/profile-evidence.toml"
 export CONTROLLER_API_TOKEN="e2e-$(openssl rand -hex 16)"
-CONTROLLER_ENV=(CONTROLLER_API_ADDR="0.0.0.0:$PORT" CONTROLLER_DEV_IDENTITY= CONTROLLER_API_TOKEN_IDENTITY=e2e
-    CONTROLLER_PROXY_TOKEN="proxy-$(openssl rand -hex 16)")
+CONTROLLER_ENV=(CONTROLLER_API_ADDR="0.0.0.0:$PORT" CONTROLLER_DEV_IDENTITY= CONTROLLER_API_TOKEN_IDENTITY=e2e)
 start_controller "$WORK/profile-evidence.toml"
 
 # run_artifacts <run>: the kinds of artifact the run owns, sorted.

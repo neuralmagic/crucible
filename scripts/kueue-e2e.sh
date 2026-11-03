@@ -17,8 +17,8 @@
 #   - the agent's whoami reported the same run and kube_user;
 #   - no kueue token rode the loop pod's env, its Secrets, or any log.
 #
-# The launch is made with the caller's own cluster token, and the launcher's Kubernetes user is
-# seeded in the controller's ledger as a hub link would record it.
+# The launch is made with an api key seeded for the caller's Kubernetes user, which is also seeded
+# in the controller's ledger as a hub link would record it.
 #
 # The e2e runs beside a live deployment on the same cluster: everything it creates lives in its own
 # namespaces or carries an e2e name, the cluster-scoped objects (its ClusterRoles, bindings and a
@@ -199,22 +199,6 @@ if kc get --raw /apis/kueue.x-k8s.io/v1beta2 >/dev/null 2>&1; then KUEUE_API=v1b
 kc get clusterqueue "$CLUSTER_QUEUE" >/dev/null 2>&1 || fail "no ClusterQueue $CLUSTER_QUEUE; set CLUSTER_QUEUE"
 
 LAUNCHER=$(kc auth whoami -o jsonpath='{.status.userInfo.username}')
-# The launcher's own cluster token: the kubeconfig's static token, or what its exec credential
-# plugin returns.
-TOKEN=$(kubectl config view --raw --minify --context "$CONTEXT" -o jsonpath='{.users[0].user.token}')
-if [ -z "$TOKEN" ]; then
-    exec_cfg=$(kubectl config view --raw --minify --context "$CONTEXT" -o json | jq -c '.users[0].user.exec // empty')
-    if [ -n "$exec_cfg" ]; then
-        exec_cmd=() exec_env=()
-        while IFS= read -r arg; do exec_cmd+=("$arg"); done < <(jq -r '.command, (.args // [])[]' <<<"$exec_cfg")
-        while IFS= read -r var; do exec_env+=("$var"); done < <(jq -r '(.env // [])[] | "\(.name)=\(.value)"' <<<"$exec_cfg")
-        exec_info=$(jq -cn --arg v "$(jq -r .apiVersion <<<"$exec_cfg")" \
-            '{apiVersion: $v, kind: "ExecCredential", spec: {interactive: false}}')
-        TOKEN=$(env ${exec_env[@]+"${exec_env[@]}"} KUBERNETES_EXEC_INFO="$exec_info" "${exec_cmd[@]}" \
-            | jq -r '.status.token // empty')
-    fi
-fi
-[ -n "$TOKEN" ] || fail "context $CONTEXT carries no bearer token, nor an exec plugin that returns one"
 GATEWAY_PREFIX="spiffe://$TRUST_DOMAIN/openshell/gateway/"
 AVOID_NODES=$(kc get nodes -l 'kubernetes.io/arch!=amd64' -o json | jq -r '[.items[].metadata.name | "\"\(.)\""] | join(", ")')
 ISSUER="http://crucible-controller.$CTL_NS.svc.cluster.local:8080"
@@ -359,19 +343,27 @@ for _ in $(seq 30); do
 done
 [ -n "$PORT" ] || fail "the port-forward to the controller never listened: $(cat "$WORK/forward.log")"
 printf 'url = "http://127.0.0.1:%s"\n' "$PORT" > "$WORK/crux.toml"
-crux() { env -u CONTROLLER_URL CONTROLLER_API_TOKEN="$TOKEN" "$BIN/crux" "$@" --config "$WORK/crux.toml"; }
-for _ in $(seq 30); do
-    crux whoami >/dev/null 2>&1 && break
-    sleep 2
-done
-crux whoami | grep -q "$LAUNCHER" || fail "the controller does not see the launch as $LAUNCHER: $(crux whoami)"
+# The launcher as a person the controller knows, linked to their username on the hub, with an api
+# key of their own for crux.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+KEY_ID=$(openssl rand -hex 16)
+KEY_SECRET=$(openssl rand -hex 32)
+KEY_HASH=$(printf %s "$KEY_SECRET" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+KEY="crk_${KEY_ID}_${KEY_SECRET}"
 kc -n "$CTL_NS" exec deploy/postgres -- psql -q -U crucible -d crucible -v ON_ERROR_STOP=1 -c \
     "INSERT INTO users (sub, login, last_login, created_at, updated_at)
      VALUES ('e2e:$LAUNCHER', '$LAUNCHER', '$NOW', '$NOW', '$NOW') ON CONFLICT (login) DO NOTHING;
      INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
      SELECT sub, 'hub', '$LAUNCHER', 'token-review', '$NOW' FROM users WHERE login = '$LAUNCHER'
-     ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user" >/dev/null
+     ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user;
+     INSERT INTO api_keys (id, sub, name, secret_hash, created_at)
+     SELECT '$KEY_ID', sub, 'kueue-e2e', '$KEY_HASH', '$NOW' FROM users WHERE login = '$LAUNCHER'" >/dev/null
+crux() { env -u CONTROLLER_URL CONTROLLER_API_TOKEN="$KEY" "$BIN/crux" "$@" --config "$WORK/crux.toml"; }
+for _ in $(seq 30); do
+    crux whoami >/dev/null 2>&1 && break
+    sleep 2
+done
+crux whoami | grep -q "$LAUNCHER" || fail "the controller does not see the launch as $LAUNCHER: $(crux whoami)"
 
 log "launching $PACK with nonce $NONCE"
 cp -R "$PACK" "$WORK/pack"

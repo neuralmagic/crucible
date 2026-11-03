@@ -28,7 +28,7 @@ const LOG_CAP = 500;
 /// Coalesce streamed lines into one render per tick (same discipline as useLiveSession).
 const FLUSH_MS = 120;
 
-/// Subscribe to `GET /api/turns/:podName/live` (native EventSource — same-origin, the oauth2-proxy
+/// Subscribe to `GET /api/turns/:podName/live` (native EventSource — same-origin, the session
 /// cookie rides along like every /api call). The stream has no seq/resume: on reconnect the server
 /// replays the pod's logs from the start, so buffers reset on every (re)open — beats dedup by
 /// (round, kind) and logs just refill. Terminal `end` reasons: turn-not-running, pod-gone,

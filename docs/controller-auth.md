@@ -47,8 +47,7 @@ PUT /api/providers/<id>/owner {"owner": "team:my-org"}
 Members can read, launch, and dispatch what the team owns. Maintainers and owners can also
 edit it. A provider uses its key on every dispatch, so each user who can select the provider
 spends with that key. Move a provider to a team only if the whole team must use it.
-`email-domain:<domain>` rules match only in native mode, where the controller records the
-email of each login.
+`email-domain:<domain>` rules match the email that the controller records at each login.
 
 ### The autoresearch lane
 
@@ -72,15 +71,16 @@ the administrator. API keys and bearer tokens cannot use a view.
 
 ## The controller as the OIDC relying party
 
-With `CONTROLLER_AUTH_MODE=native`, the controller serves `/auth/login`, `/auth/callback`,
+With `CONTROLLER_OIDC_ISSUER` set, the controller serves `/auth/login`, `/auth/callback`,
 and `/auth/logout`. It runs the authorization-code flow with PKCE against the issuer,
 validates the ID token against the JWKS of the issuer, and creates its own server-side
 session (a cookie id and rows in Postgres). There is no proxy in front, and the controller
-reads no identity header on any path.
+reads no identity header on any path: it removes every `X-Auth-Request-*` header from each
+request before it authenticates the request.
 
 | Variable | Meaning |
 | --- | --- |
-| `CONTROLLER_AUTH_MODE` | `native` |
+| `CONTROLLER_AUTH_MODE` | Optional. `native` is the only accepted value. |
 | `CONTROLLER_OIDC_ISSUER` | The issuer URL. The controller reads discovery from `<issuer>/.well-known/openid-configuration`. |
 | `CONTROLLER_OIDC_CLIENT_ID`, `CONTROLLER_OIDC_CLIENT_SECRET` | The confidential client registered on the issuer. |
 | `CONTROLLER_OIDC_REDIRECT_URL` | A callback URL on the host of this controller, registered on the client. The controller answers at that path and at `/auth/callback`. |
@@ -90,7 +90,8 @@ reads no identity header on any path.
 
 The session holds the login, the email, and the `groups` claim from the issuer. Team
 membership rules match on groups. If the issuer emits no `groups` claim, no user gets access
-through groups, and there is no error. Test the claim before you change the mode:
+through groups, and there is no error. Test the claim before you point a deployment at the
+issuer:
 
 ```sh
 CONTROLLER_OIDC_ISSUER=https://sso.example.com/realms/crucible \
@@ -101,8 +102,7 @@ crucible-controller oidc-claims
 
 `oidc-claims` runs one login and prints every claim that the issuer gives this client. The
 test passes if the output has a `groups` array with the expected paths. After the change,
-`GET /api/whoami` in a browser reports `"mode": "native"`, the login, and a list of groups
-that is not empty.
+`GET /api/whoami` in a browser reports the login and a list of groups that is not empty.
 
 ### Offline credentials for scheduled work
 
@@ -152,7 +152,6 @@ docker run -d --name keycloak -p 8180:8080 \
   -e KC_BOOTSTRAP_ADMIN_USERNAME=admin -e KC_BOOTSTRAP_ADMIN_PASSWORD=admin \
   -v "$PWD/crucible-controller/tests/keycloak:/opt/keycloak/data/import:ro" \
   quay.io/keycloak/keycloak:26.4 start-dev --import-realm
-export CONTROLLER_AUTH_MODE=native
 export CONTROLLER_OIDC_ISSUER=http://127.0.0.1:8180/realms/crucible
 export CONTROLLER_OIDC_CLIENT_ID=crucible-controller
 export CONTROLLER_OIDC_CLIENT_SECRET=$(jq -r '.clients[] | select(.clientId=="crucible-controller") | .secret' crucible-controller/tests/keycloak/crucible-realm.json)
@@ -199,18 +198,30 @@ Dex issues refresh tokens if the client requests `offline_access` and the connec
 it (GitHub, LDAP, and OIDC upstreams do). Before you point the controller at Dex, use
 `oidc-claims` to check that `groups` has the expected format.
 
-## Behind a proxy instead
+## Without an issuer
 
-With `CONTROLLER_AUTH_MODE=proxy`, an OIDC proxy in front of the controller runs the login. It
-sends the result in `X-Auth-Request-User`, `X-Auth-Request-Email`, and
-`X-Auth-Request-Groups`. The controller trusts these three headers only on requests that
-carry the proxy bearer token from `CONTROLLER_PROXY_TOKEN`. It removes them from all other
-requests. It rejects a request that has the static API token and any of these headers. The
-proxy token must be different from the API token. If they were the same, every holder of the
-API token could claim any user and any group.
+A controller without `CONTROLLER_OIDC_ISSUER` runs no login. It starts in one of two shapes:
 
-Use native mode for new deployments. Proxy mode lets a deployment change modes and change
-back. A change from native to proxy deletes all native sessions.
+- With `CONTROLLER_DEV_IDENTITY`, it is an open controller for local development. Every
+  request uses that login, and the controller binds its HTTP surface to loopback. The
+  controller refuses to start if `CONTROLLER_API_TOKEN` is also set.
+- With `CONTROLLER_API_TOKEN`, only machine callers get in: the static token, with the login in
+  `CONTROLLER_API_TOKEN_IDENTITY` if it is set, and API keys.
+
+With neither, the controller refuses to start. A deployment that forgets its issuer does not
+become open.
+
+### Retired settings
+
+The controller refuses to start when one of these is set, and the error names the setting:
+
+| Setting | Use instead |
+| --- | --- |
+| `CONTROLLER_AUTH_MODE=proxy` (any value other than `native`) | `CONTROLLER_OIDC_ISSUER`: the controller runs the login itself. |
+| `CONTROLLER_PROXY_TOKEN` | `CONTROLLER_OIDC_ISSUER` for people, `CONTROLLER_API_TOKEN` or an API key for machines. |
+| `CONTROLLER_KUBE_USER_AUTH` | An API key. Cluster tokens are not bearers. |
+| `CONTROLLER_OIDC_DEVICE_CLIENT_ID` | An API key. Device-flow access tokens are not bearers. |
+| `CONTROLLER_TLS_ADDR` | TLS at the Route. The controller serves plain HTTP. |
 
 ## API keys
 

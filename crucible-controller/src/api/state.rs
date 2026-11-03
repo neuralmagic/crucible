@@ -122,9 +122,6 @@ pub struct ApiState {
     /// The environment variable names the deploy profile already fills from pre-created cluster
     /// Secrets. The preview gate warns when a pack declares a secret one of these also supplies.
     pub(crate) profile_secret_env: Arc<Vec<String>>,
-    /// Which identity model the human surface runs, reported by `GET /api/whoami` so the SPA knows
-    /// whose sign-in URLs to use.
-    pub(crate) auth_mode: crate::identity::auth::AuthMode,
     /// The chart-mounted key the offline credential is sealed under. `None` — no key mounted —
     /// answers the revoke route 503, because nothing was ever stored.
     pub(crate) credential_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
@@ -257,7 +254,6 @@ impl ApiState {
                     .map(crate::secrets::manifest::profile_secret_env)
                     .unwrap_or_default(),
             ),
-            auth_mode: crate::identity::auth::AuthMode::from_env(),
             credential_keys: None,
             webhook_keys: None,
             oidc: None,
@@ -397,7 +393,6 @@ impl ApiState {
             hooks_public_url: None,
             vault: None,
             profile_secret_env: Arc::new(Vec::new()),
-            auth_mode: crate::identity::auth::AuthMode::Proxy,
             credential_keys: None,
             webhook_keys: None,
             oidc: None,

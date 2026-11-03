@@ -26,7 +26,7 @@ const ROW_CAP = 2000;
 /// drive a re-render per delta.
 const FLUSH_MS = 120;
 
-/// Subscribe to `GET /api/runs/:runId/live` (native EventSource — same-origin, oauth2-proxy cookie
+/// Subscribe to `GET /api/runs/:runId/live` (native EventSource — same-origin, the session cookie
 /// rides along like every /api call). Returns the latest status snapshot, the connection state, and
 /// the capped, coalesced feed. `onEnded` fires once with the terminal reason (run-not-running /
 /// pod-gone / bridge-closed / error: …). EventSource auto-reconnects on transient drops, replaying

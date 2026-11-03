@@ -239,13 +239,13 @@ DISCOVERY_SECS=5
 # run_controller <api port> <hooks port> <log> <profile>: start CONTROLLER_BIN in the background.
 # CONTROLLER_ENV holds extra VAR=value settings for this boot.
 run_controller() {
-    env -u CONTROLLER_PROXY_TOKEN -u CONTROLLER_OIDC_ISSUER -u VAULT_ADDR \
+    env -u CONTROLLER_OIDC_ISSUER -u VAULT_ADDR \
         -u POD_NAME -u POD_NAMESPACE -u CONTROLLER_DISCOVERY_CADENCE_SECS \
         DATABASE_URL="$DB" \
         CONTROLLER_API_ADDR="127.0.0.1:$1" CONTROLLER_PUBLIC_URL="http://127.0.0.1:$1" \
         CONTROLLER_HOOKS_ADDR="127.0.0.1:$2" \
         ${DISCOVERY_SECS:+CONTROLLER_DISCOVERY_CADENCE_SECS=$DISCOVERY_SECS} \
-        CONTROLLER_DEV_IDENTITY=e2e CONTROLLER_ADMINS=e2e CONTROLLER_AUTH_MODE=proxy \
+        CONTROLLER_DEV_IDENTITY=e2e CONTROLLER_ADMINS=e2e \
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=pod CONTROLLER_SCOPE_EXECUTOR=disabled \
         CONTROLLER_DEPLOY_PROFILE="$4" CONTROLLER_POD_NAMESPACE="$NS" \
@@ -315,22 +315,44 @@ stop_peer() {
 
 crux() { "$BIN/crux" "$@"; }
 
+# user_key <login>: an api key of <login>'s, seeding the person and the key on first use.
+user_key() {
+    local file="$WORK/keys/$1" id secret hash now
+    if [ ! -s "$file" ]; then
+        mkdir -p "$WORK/keys"
+        id=$(openssl rand -hex 16)
+        secret=$(openssl rand -hex 32)
+        hash=$(printf %s "$secret" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+        now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+        sql -c "INSERT INTO users (sub, login, last_login, created_at, updated_at)
+                VALUES ('e2e:$1', '$1', '$now', '$now', '$now') ON CONFLICT (login) DO NOTHING;
+                INSERT INTO api_keys (id, sub, name, secret_hash, created_at)
+                SELECT '$id', sub, 'kind-e2e', '$hash', '$now' FROM users WHERE login = '$1'" >/dev/null
+        printf 'crk_%s_%s' "$id" "$secret" >"$file"
+    fi
+    cat "$file"
+}
+
 # api_call <out> <method> <path> [json body]: call the controller API, writing the response body
-# to <out> and printing the status. AS_USER, when set, is asserted as the caller's login.
+# to <out> and printing the status. AS_USER, when set, calls with that login's api key in place of
+# CONTROLLER_API_TOKEN.
 api_call() {
-    local out="$1" method="$2" path="$3" data=() who=() auth=()
+    local out="$1" method="$2" path="$3" data=() auth=()
     [ $# -ge 4 ] && data=(--data "$4")
-    [ -n "${AS_USER:-}" ] && who=(-H "x-auth-request-user: $AS_USER")
-    [ -n "${CONTROLLER_API_TOKEN:-}" ] && auth=(-H "authorization: Bearer $CONTROLLER_API_TOKEN")
+    if [ -n "${AS_USER:-}" ]; then
+        auth=(-H "authorization: Bearer $(user_key "$AS_USER")")
+    elif [ -n "${CONTROLLER_API_TOKEN:-}" ]; then
+        auth=(-H "authorization: Bearer $CONTROLLER_API_TOKEN")
+    fi
     curl -s -o "$out" -w '%{http_code}' -X "$method" -H 'content-type: application/json' \
-        ${who[@]+"${who[@]}"} ${auth[@]+"${auth[@]}"} ${data[@]+"${data[@]}"} "$CONTROLLER_URL$path"
+        ${auth[@]+"${auth[@]}"} ${data[@]+"${data[@]}"} "$CONTROLLER_URL$path"
 }
 
 # api <method> <path> [json body]: the status lands in HTTP and the body in $WORK/api.json.
 api() { HTTP=$(api_call "$WORK/api.json" "$@"); }
 
-# as <login> <method> <path> [json body]: api as that login. Only a boot without
-# CONTROLLER_DEV_IDENTITY takes the asserted login.
+# as <login> <method> <path> [json body]: api as that login, on an api key of its own. A boot with
+# CONTROLLER_DEV_IDENTITY lands every key-less request as that login instead.
 as() {
     local AS_USER="$1"
     shift

@@ -1338,7 +1338,6 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             user: Some("jordan".into()),
             groups: Vec::new(),
             sub: Some(SUB.into()),
-            source: crate::identity::session::IdentitySource::Native,
         };
         let api = crate::api::router(api_state).layer(axum::middleware::from_fn(
             move |mut req: axum::extract::Request, next: axum::middleware::Next| {

@@ -563,7 +563,6 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
     ControllerCfg {
         secret_provider: None,
         owner_refresh: None,
-        auth_mode: crucible_controller::identity::auth::AuthMode::Proxy,
         schedule_owner_ttl_secs: 604800,
         local_secret_allowlist: Vec::new(),
         state_dir: state_dir.to_path_buf(),

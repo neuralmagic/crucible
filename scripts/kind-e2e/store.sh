@@ -1038,7 +1038,7 @@ pass "[V] a launch is checked against the tree it froze, not the registry's newe
 stop_controller
 log "[V] storing the collected tree's legacy bytes again"
 seed_pack_row kind_e2e_vgc2 "$WORK/vgc.tar.gz"
-log "[V] booting without a dev identity, so callers assert their login"
+log "[V] booting without a dev identity, so callers present their own api keys"
 VHREPO="$WORK/vhrepo"
 small_pack "$VHREPO/pack" "echo vhook-$ID
 $OK_JSON"
@@ -1047,6 +1047,7 @@ echo '# the same commit, another tree' >>"$VHREPO/pack2/check.sh"
 git -C "$VHREPO" init -q
 git_commit "$VHREPO" hook
 VH_SOURCE="\"repo\":\"file://$VHREPO\",\"path\":\"pack\""
+export CONTROLLER_API_TOKEN="e2e-$(openssl rand -hex 16)"
 CONTROLLER_ENV=(CONTROLLER_DEV_IDENTITY=)
 start_controller
 read -r converted unconvertible <<<"$(conversion_report "$BOOT")"
@@ -1108,9 +1109,10 @@ cmp -s "$WORK/template-outsider-old.json" "$WORK/template-outsider-unknown.json"
     fail "[V] the reader got $(cat "$WORK/template-e2e-old.json") and $(cat "$WORK/template-e2e-unknown.json")"
 grep -q "$V_TREE" "$WORK/template-outsider-old.json" && fail "[V] the non-reader's answer names $V_TREE"
 pass "[V] a non-reader's answer for the pre-tree digest is byte-identical to the unknown digest's; a reader's names the replacement"
+stop_controller
+unset CONTROLLER_API_TOKEN
 
 # ---- scenario G ----------------------------------------------------------------------------
-stop_controller
 log "[G] migrating a legacy state dir"
 OLD="$WORK/oldstate/packs/kind_e2e_legacy"
 small_pack "$OLD" "echo migrated-$ID

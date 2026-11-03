@@ -88,7 +88,7 @@ pub(crate) async fn override_kube_user(
 #[cfg(test)]
 mod tests {
     use crate::identity::auth::{AuthPath, Roles};
-    use crate::identity::session::{IdentitySource, Resolved};
+    use crate::identity::session::Resolved;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
@@ -113,7 +113,6 @@ mod tests {
             user: Some(login.to_string()),
             groups: Vec::new(),
             sub: sub.map(str::to_string),
-            source: IdentitySource::Native,
         };
         crate::api::router(state).layer(axum::middleware::from_fn(
             move |mut req: axum::extract::Request, next: axum::middleware::Next| {

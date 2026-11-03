@@ -46,14 +46,14 @@ fn cannot_own() -> Response {
     (
         StatusCode::FORBIDDEN,
         Json(ErrorBody::new(
-            "this cluster token's username matches no signed-in user, so it can own nothing that \
-             fires without a session",
+            "this credential stands for no confirmed sign-in (a downgraded or viewed-as session), \
+             so it can own nothing that fires without a session",
         )),
     )
         .into_response()
 }
 
-/// Resolve the saver. A snapshot surface refuses a credential that names nobody, since the row
+/// Resolve the saver. A snapshot surface refuses a credential that may not own, since the row
 /// would own to nobody; every surface resolves the target and the pin against the caller.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn resolve_saver(
@@ -228,11 +228,11 @@ mod tests {
             .map_err(|r| r.status())
     }
 
-    /// A surface that fires later with no session owns to the saver; a credential that names
-    /// nobody cannot own it, and the refusal is the same on every such surface.
+    /// A surface that fires later with no session owns to the saver; a credential that may not own
+    /// cannot own it, and the refusal is the same on every such surface.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_snapshot_surface_refuses_a_credential_that_names_nobody(pool: PgPool) {
-        for path in [AuthPath::UnknownClusterToken, AuthPath::DowngradedSession] {
+    async fn a_snapshot_surface_refuses_a_credential_that_may_not_own(pool: PgPool) {
+        for path in [AuthPath::DowngradedSession, AuthPath::Impersonated] {
             let refused = resolve(pool.clone(), path, Ownership::Snapshot { asked: None })
                 .await
                 .expect_err("cannot own");
@@ -243,7 +243,7 @@ mod tests {
     /// The same credential launches fine under its session: an immediate launch owns nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_session_surface_takes_any_credential_and_snapshots_no_owner(pool: PgPool) {
-        let saver = resolve(pool, AuthPath::UnknownClusterToken, Ownership::Session)
+        let saver = resolve(pool, AuthPath::DowngradedSession, Ownership::Session)
             .await
             .expect("resolved");
         assert_eq!(saver.actor.as_deref(), Some("alice"));

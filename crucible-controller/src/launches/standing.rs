@@ -1343,8 +1343,8 @@ pub struct TriggerSweep {
     db: Db,
     triggers: Vec<Arc<dyn LaunchTrigger>>,
     cfg: SweepCfg,
-    /// The offline credential the owner's live groups are re-read through. `None` — proxy mode, no
-    /// issuer, no mounted key — leaves every firing on the stored snapshot alone.
+    /// The offline credential the owner's live groups are re-read through. `None` — no issuer, no
+    /// mounted key — leaves every firing on the stored snapshot alone.
     refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
     /// The policy set every firing is decided under. `None` only in harnesses that predate the
     /// decision.

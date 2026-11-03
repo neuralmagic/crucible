@@ -86,9 +86,6 @@ serde_norway = "0.9"
 # tree (aws-lc-rs is, via aws-sdk) — installed once before the pod watch's first client connect,
 # same as `forge::kube`.
 rustls = "0.23"
-# The TLS listener behind the redemption Route's reencrypt hop (`tls.rs`). rustls' own async
-# adapter; already in the tree at this version via kube's rustls stack, so it adds no new build.
-tokio-rustls = { version = "0.26", default-features = false }
 # Mints each isolated run gateway's CA, server, and client certificates.
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # Triage's GitHub client (async — crucible/src/scope.rs's `goal_from_issue` is the sync sibling).
@@ -230,6 +227,9 @@ rmcp = { version = "3.6", features = ["client", "transport-streamable-http-clien
 tokio = { workspace = true, features = ["test-util"] }
 # Fake-GitHub HTTP server for the triage fetch tests (work plan sanctions it).
 wiremock = "0.6"
+# The HTTPS stand-ins in the gateway and client-metadata tests. Already in the tree at this version
+# via kube's rustls stack.
+tokio-rustls = { version = "0.26", default-features = false }
 # UI-page and JSON-payload golden snapshots. "filters" redacts the rendered-at timestamps that
 # would otherwise make every page snapshot flaky.
 insta = { version = "1", features = ["filters"] }

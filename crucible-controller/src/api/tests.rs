@@ -2151,18 +2151,15 @@ async fn auth_guard_rejects_without_bearer_and_allows_with_it() -> Result<()> {
 
 /// The machine path end to end: the static bearer names nobody of its own, so the guard stamps the
 /// configured identity and `/api/whoami` reports it with the role that identity's whitelist entry
-/// gives. A spoofed user or group on the same request buys nothing — 401 once an identity is
-/// pinned, anonymous when it is not.
+/// gives. A spoofed user or group on the same request buys nothing: the pinned identity when one is
+/// configured, anonymous when it is not.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn the_static_token_is_whoami_as_the_configured_identity(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     let guarded = |state: ApiState, identity: Option<&str>| -> Result<Router> {
         let guard = crate::identity::auth::BearerGuard::new(
             crate::identity::auth::SharedToken::new("s3cr3t"),
-            crate::identity::auth::SharedToken::new("edge"),
             identity.map(str::to_string),
-            None,
-            crate::identity::auth::AuthMode::Proxy,
         )?;
         Ok(router(state).layer(axum::middleware::from_fn_with_state(
             Arc::new(guard),
@@ -2188,16 +2185,14 @@ async fn the_static_token_is_whoami_as_the_configured_identity(pool: PgPool) -> 
     };
 
     let admin_state = || state(vec!["crucible-cd".to_string()]);
-    let (status, v) = probe(guarded(admin_state(), Some("crucible-cd"))?, false).await?;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(v["user"], "crucible-cd");
-    assert_eq!(v["role"], "admin");
-    assert_eq!(v["admin"], true);
-    assert_eq!(v["groups"], serde_json::json!([]));
-
-    // The same bearer wearing the edge's headers is an edge on the wrong token, not the CD job.
-    let (status, _) = probe(guarded(admin_state(), Some("crucible-cd"))?, true).await?;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for spoof in [false, true] {
+        let (status, v) = probe(guarded(admin_state(), Some("crucible-cd"))?, spoof).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(v["user"], "crucible-cd");
+        assert_eq!(v["role"], "admin");
+        assert_eq!(v["admin"], true);
+        assert_eq!(v["groups"], serde_json::json!([]));
+    }
 
     // No configured identity: anonymous, and the asserted operator group does not rescue it.
     let (status, v) = probe(guarded(state(vec![]), None)?, true).await?;
@@ -2205,25 +2200,6 @@ async fn the_static_token_is_whoami_as_the_configured_identity(pool: PgPool) -> 
     assert_eq!(v["user"], serde_json::Value::Null);
     assert_eq!(v["role"], "viewer");
     assert_eq!(v["groups"], serde_json::json!([]));
-
-    // The edge's own bearer: its group assertion survives, is reported, and grants operator. This
-    // is the probe an operator runs after an IdP change to see whether the groups claim arrives.
-    let app = guarded(state(vec![]), Some("crucible-cd"))?;
-    let res = app
-        .oneshot(
-            HttpRequest::get("/api/whoami")
-                .header(header::AUTHORIZATION, "Bearer edge")
-                .header("x-auth-request-user", "alice")
-                .header("x-auth-request-groups", "/groups/Team-X, other")
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
-    let v: serde_json::Value = serde_json::from_slice(&body)?;
-    assert_eq!(v["user"], "alice");
-    assert_eq!(v["role"], "operator");
-    assert_eq!(v["groups"], serde_json::json!(["/groups/team-x", "other"]));
     Ok(())
 }
 
@@ -5793,16 +5769,23 @@ async fn app_with_sessions(db: Db, pool: PgPool) -> Router {
         crate::HumanAuth {
             guard: Arc::new(crate::identity::auth::BearerGuard::default()),
             routes: crate::identity::oidc::routes::AuthState {
-                mode: crate::identity::auth::AuthMode::Proxy,
                 oidc: None,
                 pool,
                 credential_keys: None,
-                proxy_prefix: "/oauth2".to_string(),
             },
             issuer: None,
         },
         crate::spa::Source::Embedded,
     )
+}
+
+/// `Bearer <key>` for a fresh api key of `login`'s, the login recorded first.
+async fn bearer_of(pool: &PgPool, login: &str) -> Result<String> {
+    let sub = format!("sub-{login}");
+    crate::identity::oidc::users::record_login(pool, &sub, login, None, jiff::Timestamp::now())
+        .await?;
+    let minted = crate::identity::api_key::mint(pool, &sub, "test", None).await?;
+    Ok(format!("Bearer {}", minted.secret))
 }
 
 fn session_cookie(res: &axum::response::Response) -> Option<String> {
@@ -5819,13 +5802,13 @@ fn cookie_pair(set_cookie: &str) -> &str {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn prefs_roundtrip_across_requests(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool.clone());
-    let app = app_with_sessions(db, pool).await;
+    let app = app_with_sessions(db, pool.clone()).await;
 
     let res = app
         .clone()
         .oneshot(
             HttpRequest::put("/api/prefs")
-                .header("x-auth-request-user", "wren")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"prefs":{"theme":"dark"}}"#))?,
         )
@@ -5840,7 +5823,7 @@ async fn prefs_roundtrip_across_requests(pool: PgPool) -> Result<()> {
     let res = app
         .oneshot(
             HttpRequest::get("/api/prefs")
-                .header("x-auth-request-user", "wren")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
                 .header("cookie", cookie_pair(&set_cookie))
                 .body(Body::empty())?,
         )
@@ -5857,13 +5840,13 @@ async fn prefs_roundtrip_across_requests(pool: PgPool) -> Result<()> {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn editor_prefs_survive_a_fresh_browser_and_stay_per_user(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool.clone());
-    let app = app_with_sessions(db, pool).await;
+    let app = app_with_sessions(db, pool.clone()).await;
 
     let res = app
         .clone()
         .oneshot(
             HttpRequest::put("/api/prefs/editor")
-                .header("x-auth-request-user", "wren")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"prefs":{"fontSize":13,"wordWrap":true}}"#))?,
         )
@@ -5874,7 +5857,7 @@ async fn editor_prefs_survive_a_fresh_browser_and_stay_per_user(pool: PgPool) ->
         .clone()
         .oneshot(
             HttpRequest::get("/api/prefs/editor")
-                .header("x-auth-request-user", "wren")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
                 .body(Body::empty())?,
         )
         .await?;
@@ -5888,7 +5871,7 @@ async fn editor_prefs_survive_a_fresh_browser_and_stay_per_user(pool: PgPool) ->
         .clone()
         .oneshot(
             HttpRequest::get("/api/prefs/editor")
-                .header("x-auth-request-user", "mallory")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "mallory").await?)
                 .body(Body::empty())?,
         )
         .await?;
@@ -5921,13 +5904,13 @@ async fn editor_prefs_survive_a_fresh_browser_and_stay_per_user(pool: PgPool) ->
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn picker_prefs_are_identity_bound_and_separate_from_the_editors(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool.clone());
-    let app = app_with_sessions(db, pool).await;
+    let app = app_with_sessions(db, pool.clone()).await;
 
     let res = app
         .clone()
         .oneshot(
             HttpRequest::put("/api/prefs/pickers")
-                .header("x-auth-request-user", "wren")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
                 .header("content-type", "application/json")
                 .body(Body::from(
                     r#"{"prefs":{"ownerFavorites":["group:/groups/team-x"],"ownerFilter":"team"}}"#,
@@ -5938,10 +5921,11 @@ async fn picker_prefs_are_identity_bound_and_separate_from_the_editors(pool: PgP
 
     let read = |path: &'static str, user: Option<&'static str>| {
         let app = app.clone();
+        let pool = pool.clone();
         async move {
             let mut req = HttpRequest::get(path);
             if let Some(user) = user {
-                req = req.header("x-auth-request-user", user);
+                req = req.header(header::AUTHORIZATION, bearer_of(&pool, user).await?);
             }
             let res = app.oneshot(req.body(Body::empty())?).await?;
             assert_eq!(res.status(), StatusCode::OK);
@@ -5981,12 +5965,12 @@ async fn picker_prefs_are_identity_bound_and_separate_from_the_editors(pool: PgP
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn non_session_routes_never_set_a_cookie(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool.clone());
-    let app = app_with_sessions(db, pool).await;
+    let app = app_with_sessions(db, pool.clone()).await;
 
     let res = app
         .oneshot(
             HttpRequest::get("/api/whoami")
-                .header("x-auth-request-user", "wren")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
                 .body(Body::empty())?,
         )
         .await?;
@@ -6007,7 +5991,7 @@ async fn identity_change_flushes_and_cycles_the_session(pool: PgPool) -> Result<
         .clone()
         .oneshot(
             HttpRequest::put("/api/prefs")
-                .header("x-auth-request-user", "alice")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "alice").await?)
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"prefs":{"theme":"dark"}}"#))?,
         )
@@ -6018,7 +6002,7 @@ async fn identity_change_flushes_and_cycles_the_session(pool: PgPool) -> Result<
     let res = app
         .oneshot(
             HttpRequest::get("/api/prefs")
-                .header("x-auth-request-user", "mallory")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "mallory").await?)
                 .header("cookie", cookie_pair(&alice_cookie))
                 .body(Body::empty())?,
         )
@@ -6049,7 +6033,7 @@ async fn identified_get_without_cookie_stays_stateless(pool: PgPool) -> Result<(
     let res = app
         .oneshot(
             HttpRequest::get("/api/prefs")
-                .header("x-auth-request-user", "wren")
+                .header(header::AUTHORIZATION, bearer_of(&pool, "wren").await?)
                 .body(Body::empty())?,
         )
         .await?;
@@ -14240,9 +14224,6 @@ async fn team_secret_draft(
     let mut guard = crate::identity::auth::BearerGuard::new(
         crate::identity::auth::SharedToken::new("s3cr3t"),
         None,
-        None,
-        None,
-        crate::identity::auth::AuthMode::Native,
     )?;
     guard.refresh = refresh;
     let keyed = router(state).layer(axum::middleware::from_fn_with_state(
@@ -14365,7 +14346,6 @@ async fn launch_draft_with_key(
     let launcher = crate::authz::resolve::dispatch_principals(
         pool,
         refresh,
-        crate::identity::auth::AuthMode::Native,
         launch.created_by.as_deref(),
         &launch.launcher_groups,
         &launch.created_at,
@@ -14529,7 +14509,6 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
         crate::authz::resolve::dispatch_principals(
             &pool,
             refresh,
-            crate::identity::auth::AuthMode::Native,
             Some("tibrahim"),
             &recorded,
             &launched_at,
@@ -14570,14 +14549,10 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// A launcher with no `users` row keeps its recorded groups behind the edge. In native mode it keeps
-/// them while the launch is younger than the session group refresh window and holds none after,
-/// as does a launch that names no launcher.
+/// A launcher with no `users` row keeps its recorded groups while the launch is younger than the
+/// session group refresh window and holds none after, as does a launch that names no launcher.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
-    pool: PgPool,
-) -> Result<()> {
-    use crate::identity::auth::AuthMode;
+async fn a_launcher_with_no_users_row_holds_groups_by_launch_age(pool: PgPool) -> Result<()> {
     let _ = team_secret_draft(&pool, None).await?;
     let team = [TEAM_GROUP.to_string()];
     let window = jiff::SignedDuration::try_from(
@@ -14588,21 +14563,18 @@ async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
     let old = now
         .checked_sub(window + jiff::SignedDuration::from_mins(1))?
         .to_string();
-    let dispatch = async |mode, login, launched_at: &str| {
-        crate::authz::resolve::dispatch_principals(&pool, None, mode, login, &team, launched_at)
-            .await
+    let dispatch = async |login, launched_at: &str| {
+        crate::authz::resolve::dispatch_principals(&pool, None, login, &team, launched_at).await
     };
-    let edge = dispatch(AuthMode::Proxy, Some("proxy-user"), &old).await??;
-    assert!(!edge.teams().is_empty(), "{edge:?}");
     for login in [Some("cli-user"), None] {
-        let fresh = dispatch(AuthMode::Native, login, &young).await??;
+        let fresh = dispatch(login, &young).await??;
         assert_eq!(
             fresh.group_paths().collect::<Vec<_>>(),
             vec![TEAM_GROUP],
             "{login:?}"
         );
         assert!(!fresh.teams().is_empty(), "{login:?}: {fresh:?}");
-        let aged = dispatch(AuthMode::Native, login, &old).await??;
+        let aged = dispatch(login, &old).await??;
         assert_eq!(aged.group_paths().count(), 0, "{login:?}: {aged:?}");
         assert!(aged.teams().is_empty(), "{login:?}: {aged:?}");
     }

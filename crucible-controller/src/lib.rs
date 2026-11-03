@@ -46,7 +46,6 @@ pub mod secrets;
 mod spa;
 pub mod telemetry;
 pub mod testing;
-pub mod tls;
 mod wire_enum;
 
 pub use client::{
@@ -93,7 +92,7 @@ use std::sync::Arc;
 
 /// What guards the human surface and what runs its logins. Built once by [`Surface::bind`] and
 /// handed to [`human_router`] so the guard and the `/auth/*` routes can never disagree about the
-/// mode.
+/// issuer.
 pub(crate) struct HumanAuth {
     pub(crate) guard: Arc<identity::auth::BearerGuard>,
     pub(crate) routes: identity::oidc::routes::AuthState,
@@ -106,9 +105,8 @@ pub(crate) struct HumanAuth {
 /// route through this. Shared with the API tests so the test stack cannot drift from what
 /// [`Surface::bind`] mounts.
 ///
-/// The layering is the whole point of native mode: sessions load OUTSIDE the guard, so a request
-/// may authenticate by cookie, and the login routes sit outside the guard, so a caller with no
-/// credential can get one.
+/// Sessions load OUTSIDE the guard, so a request may authenticate by cookie, and the login routes
+/// sit outside the guard, so a caller with no credential can get one.
 pub(crate) fn human_router(
     state: api::state::ApiState,
     store: tower_sessions_sqlx_store::PostgresStore,
@@ -161,24 +159,21 @@ pub struct Surface {
     http: tokio::net::TcpListener,
     router: axum::Router,
     hooks: Option<(tokio::net::TcpListener, axum::Router)>,
-    tls: Option<tls::TlsListener>,
 }
 
 impl Surface {
-    /// Mount the API + React SPA on one axum router and bind it at `addr`, with the webhook and
-    /// TLS surfaces their environment configures. A listener that cannot bind is an error here,
-    /// before anything is served. Without `CONTROLLER_API_TOKEN` set, the guard is off — so this
-    /// forces the bind to loopback regardless of the requested `addr`'s host, matching the frozen
-    /// "binds loopback by default" contract instead of trusting an unauthenticated port to
-    /// whatever address the caller asked for.
+    /// Mount the API + React SPA on one axum router and bind it at `addr`, with the webhook
+    /// surface its environment configures. A retired setting, or a guard that could name nobody,
+    /// refuses here, before anything is bound. With no issuer and no `CONTROLLER_API_TOKEN` the
+    /// guard is open, so this forces the bind to loopback regardless of the requested `addr`'s
+    /// host instead of trusting an unauthenticated port to whatever address the caller asked for.
     pub async fn bind(
         state: api::state::ApiState,
         addr: SocketAddr,
         secure_session_cookies: bool,
         agent_auth: Option<Arc<agent_auth::AgentAuth>>,
     ) -> anyhow::Result<Self> {
-        let kube_user_auth = identity::kube_user::KubeUserAuth::from_env()
-            .context("building the cluster-token bearer check")?;
+        config::refuse_retired_settings(|var| std::env::var(var).ok())?;
         let oidc =
             identity::oidc::OidcProvider::from_env().context("reading the oidc registration")?;
         let credential_keys = identity::oidc::credentials::CredentialKeys::from_env()
@@ -194,24 +189,13 @@ impl Surface {
         let state = state
             .with_oidc(oidc.clone(), credential_keys.clone())
             .with_webhook_keys(webhook_keys.clone());
-        let auth_mode = identity::auth::AuthMode::from_env();
         let guard = Arc::new(
-            identity::auth::BearerGuard::from_env(
-                kube_user_auth,
-                oidc.clone(),
-                Some(state.db.pool().clone()),
-            )
-            .context("building the bearer guard")?,
+            identity::auth::BearerGuard::from_env(oidc.clone(), Some(state.db.pool().clone()))
+                .context("building the bearer guard")?,
         );
-        if guard.kube.is_some() {
-            tracing::info!(
-                "cluster-token bearer auth on: unrecognized bearers resolve via the own-cluster users/~"
-            );
-        }
-        tracing::info!(mode = ?auth_mode, "controller human-surface auth mode");
         let bind_addr = if guard.is_open() {
             tracing::warn!(
-                "CONTROLLER_API_TOKEN unset — binding the controller http surface to loopback only"
+                "no issuer and no CONTROLLER_API_TOKEN — the dev identity answers every request, so the controller http surface binds loopback only"
             );
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
         } else {
@@ -250,12 +234,9 @@ impl Surface {
             HumanAuth {
                 guard,
                 routes: identity::oidc::routes::AuthState {
-                    mode: auth_mode,
                     oidc,
                     pool: db.pool().clone(),
                     credential_keys,
-                    proxy_prefix: std::env::var("CONTROLLER_PROXY_PREFIX")
-                        .unwrap_or_else(|_| "/oauth2".to_string()),
                 },
                 issuer: agent_auth.clone(),
             },
@@ -331,25 +312,10 @@ impl Surface {
             .await
             .with_context(|| format!("binding the controller http surface to {bind_addr}"))?;
         tracing::info!(%bind_addr, "crucible-controller http surface listening");
-
-        // The TLS surface serves the same router, for the redemption Route's reencrypt hop. It
-        // follows the loopback rule above: an unauthenticated deployment exposes nothing off-host.
-        let tls_front = tls::TlsFront::from_env()
-            .context("reading the controller tls surface's configuration")?
-            .map(|front| front.with_host(bind_addr.ip()));
-        let tls = match tls_front {
-            Some(front) => {
-                let listener = tls::bind(&front).await?;
-                tracing::info!(addr = %front.addr, "crucible-controller tls surface listening");
-                Some(listener)
-            }
-            None => None,
-        };
         Ok(Self {
             http,
             router,
             hooks,
-            tls,
         })
     }
 
@@ -360,7 +326,6 @@ impl Surface {
             http,
             router,
             hooks,
-            tls,
         } = self;
         let hooks = async move {
             match hooks {
@@ -371,13 +336,6 @@ impl Surface {
                 None => std::future::pending().await,
             }
         };
-        let tls_router = router.clone();
-        let tls = async move {
-            match tls {
-                Some(listener) => stopped("tls surface", axum::serve(listener, tls_router).await),
-                None => std::future::pending().await,
-            }
-        };
         let http = async move {
             let peers = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
             stopped("http surface", axum::serve(http, peers).await)
@@ -385,7 +343,6 @@ impl Surface {
         tokio::select! {
             e = http => e,
             e = hooks => e,
-            e = tls => e,
         }
     }
 }
@@ -517,10 +474,12 @@ mod tests {
         )
         .with_cluster_links(links.map(Arc::new))
         .with_people_issuer(agent_auth.clone());
+        // SAFETY: the crate-wide env lock is held for the whole test.
+        unsafe { std::env::set_var("CONTROLLER_DEV_IDENTITY", "wren") };
         let surface =
-            crate::Surface::bind(state, "127.0.0.1:0".parse().unwrap(), false, agent_auth)
-                .await
-                .unwrap();
+            crate::Surface::bind(state, "127.0.0.1:0".parse().unwrap(), false, agent_auth).await;
+        unsafe { std::env::remove_var("CONTROLLER_DEV_IDENTITY") };
+        let surface = surface.unwrap();
         let router = &surface.router;
 
         let routes = [

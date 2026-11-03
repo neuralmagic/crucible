@@ -249,10 +249,6 @@ pub struct ControllerCfg {
     /// [`ControllerCfg::secret_provider`]; `None` leaves a launcher on their stored groups.
     #[arg(skip)]
     pub owner_refresh: Option<std::sync::Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
-    /// `CONTROLLER_AUTH_MODE`. In native mode a launcher with no `users` row keeps the groups its
-    /// launch recorded only inside the session refresh window; behind the edge it keeps them.
-    #[arg(skip = crate::identity::auth::AuthMode::from_env())]
-    pub auth_mode: crate::identity::auth::AuthMode,
     /// The legacy state directory. Nothing durable lives here anymore; kept so
     /// `db migrate-state` can read an old volume. The daemon never requires it to exist.
     #[arg(long, env = "CONTROLLER_STATE_DIR", default_value = "state")]
@@ -422,9 +418,9 @@ pub struct ControllerCfg {
     /// (operator endpoints 403 for everyone but admins, locked-closed).
     #[arg(long = "operator", env = "CONTROLLER_OPERATORS", value_delimiter = ',')]
     pub operators: Vec<String>,
-    /// IdP groups whose members hold operator privileges (the proxy forwards the OIDC `groups`
-    /// claim as `x-auth-request-groups`). Matched verbatim or against the asserted group's last
-    /// `/`-segment. Groups never grant admin.
+    /// IdP groups whose members hold operator privileges (the OIDC `groups` claim a login
+    /// carries). Matched verbatim or against the asserted group's last `/`-segment. Groups never
+    /// grant admin.
     #[arg(
         long = "operator-group",
         env = "CONTROLLER_OPERATOR_GROUPS",
@@ -439,7 +435,7 @@ pub struct ControllerCfg {
         value_delimiter = ','
     )]
     pub publishers: Vec<String>,
-    /// Mark the session cookie `Secure`. On by default — prod is https at the oauth2-proxy edge.
+    /// Mark the session cookie `Secure`. On by default — prod is https at the Route.
     /// Set `CONTROLLER_SESSION_SECURE=false` for plain-http local dev, or browsers drop the cookie.
     #[arg(
         long = "session-secure-cookies",
@@ -1087,6 +1083,77 @@ fn parse_kv_list(
     Ok(map)
 }
 
+/// A setting this controller no longer reads. Starting with one set would silently change what the
+/// deployment does, so the controller refuses to start instead.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{var} is set, but {removed}; {instead}")]
+pub struct RetiredSetting {
+    pub var: &'static str,
+    pub removed: &'static str,
+    pub instead: &'static str,
+}
+
+/// One retired setting: whether a value of it is still live, and the refusal that names it.
+struct Retired {
+    var: &'static str,
+    live: fn(&str) -> bool,
+    removed: &'static str,
+    instead: &'static str,
+}
+
+const RETIRED: &[Retired] = &[
+    Retired {
+        var: "CONTROLLER_AUTH_MODE",
+        live: |v| !v.eq_ignore_ascii_case("native"),
+        removed: "proxy auth mode was removed and `native` is the only mode",
+        instead: "set CONTROLLER_OIDC_ISSUER so the controller runs the login itself, or \
+                  CONTROLLER_DEV_IDENTITY for a local dev controller",
+    },
+    Retired {
+        var: "CONTROLLER_PROXY_TOKEN",
+        live: |_| true,
+        removed: "the SSO edge's bearer was removed with proxy auth mode",
+        instead: "people sign in through CONTROLLER_OIDC_ISSUER; machine callers use \
+                  CONTROLLER_API_TOKEN or an api key",
+    },
+    Retired {
+        var: "CONTROLLER_KUBE_USER_AUTH",
+        live: |_| true,
+        removed: "cluster-token bearers were removed",
+        instead: "mint an api key on the Settings page and present it as the bearer",
+    },
+    Retired {
+        var: "CONTROLLER_OIDC_DEVICE_CLIENT_ID",
+        live: |_| true,
+        removed: "device-flow JWT bearers were removed",
+        instead: "mint an api key on the Settings page and present it as the bearer",
+    },
+    Retired {
+        var: "CONTROLLER_TLS_ADDR",
+        live: |_| true,
+        removed: "the controller's own TLS listener was removed",
+        instead: "terminate TLS at the Route in front of CONTROLLER_API_ADDR",
+    },
+];
+
+/// Refuse every retired setting `env` still carries. An empty value is unset.
+pub fn refuse_retired_settings(env: impl Fn(&str) -> Option<String>) -> Result<(), RetiredSetting> {
+    for retired in RETIRED {
+        let Some(value) = env(retired.var) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() && (retired.live)(value) {
+            return Err(RetiredSetting {
+                var: retired.var,
+                removed: retired.removed,
+                instead: retired.instead,
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -1462,6 +1529,62 @@ mod tests {
         );
         unsafe {
             std::env::remove_var("CONTROLLER_SCOPE_SKIP_GAMING_REVIEW");
+        }
+    }
+
+    fn env_of<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |var| {
+            set.iter()
+                .find(|(name, _)| *name == var)
+                .map(|(_, value)| value.to_string())
+        }
+    }
+
+    /// A deployment still configured for a removed path refuses to start, naming the setting and
+    /// what replaced it, rather than starting as something it never asked to be. `native`, an
+    /// empty value, and an unset variable all start.
+    #[test]
+    fn a_retired_setting_refuses_to_start_and_names_its_replacement() {
+        for (var, value, replacement) in [
+            ("CONTROLLER_AUTH_MODE", "proxy", "CONTROLLER_OIDC_ISSUER"),
+            ("CONTROLLER_AUTH_MODE", "Proxy ", "CONTROLLER_OIDC_ISSUER"),
+            (
+                "CONTROLLER_PROXY_TOKEN",
+                "edge-token",
+                "CONTROLLER_API_TOKEN",
+            ),
+            ("CONTROLLER_KUBE_USER_AUTH", "true", "api key"),
+            (
+                "CONTROLLER_OIDC_DEVICE_CLIENT_ID",
+                "crucible-cli",
+                "api key",
+            ),
+            ("CONTROLLER_TLS_ADDR", "0.0.0.0:8443", "Route"),
+        ] {
+            let refusal =
+                crate::config::refuse_retired_settings(env_of(&[(var, value)])).expect_err(var);
+            assert_eq!(refusal.var, var);
+            let message = refusal.to_string();
+            assert!(
+                message.starts_with(&format!("{var} is set")) && message.contains(replacement),
+                "{message}"
+            );
+            assert!(
+                !message.contains(value.trim()) || var == "CONTROLLER_AUTH_MODE",
+                "a retired setting's value never reaches the refusal: {message}"
+            );
+        }
+        for set in [
+            &[][..],
+            &[("CONTROLLER_AUTH_MODE", "native")][..],
+            &[("CONTROLLER_AUTH_MODE", " NATIVE ")][..],
+            &[("CONTROLLER_PROXY_TOKEN", "")][..],
+            &[("CONTROLLER_TLS_ADDR", "  ")][..],
+        ] {
+            assert!(
+                crate::config::refuse_retired_settings(env_of(set)).is_ok(),
+                "{set:?}"
+            );
         }
     }
 }

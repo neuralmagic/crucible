@@ -125,7 +125,7 @@ controller-local port="8870" user=env_var("USER"):
     echo "UI  http://127.0.0.1:{{port}} as {{user}}"
     echo "Webhook deliveries http://127.0.0.1:$hooks/hooks/<id>"
     echo "CLI {{ if port != "8870" { "CONTROLLER_URL=http://127.0.0.1:" + port + " " } else { "" } }}$bin/crux whoami"
-    exec env -u CONTROLLER_API_TOKEN -u CONTROLLER_PROXY_TOKEN -u CONTROLLER_OIDC_ISSUER -u VAULT_ADDR \
+    exec env -u CONTROLLER_API_TOKEN -u CONTROLLER_OIDC_ISSUER -u VAULT_ADDR \
         KUBECONFIG=/dev/null \
         DATABASE_URL=embedded \
         CONTROLLER_API_ADDR=127.0.0.1:{{port}} \
@@ -135,7 +135,6 @@ controller-local port="8870" user=env_var("USER"):
         CONTROLLER_WEBHOOK_KEY_FILE="$state/webhook.key" \
         CONTROLLER_DEV_IDENTITY={{user}} \
         CONTROLLER_ADMINS={{user}} \
-        CONTROLLER_AUTH_MODE=proxy \
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=local \
         CONTROLLER_SCOPE_EXECUTOR=disabled \

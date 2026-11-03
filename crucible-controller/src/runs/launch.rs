@@ -210,7 +210,6 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let launcher = match crate::authz::resolve::dispatch_principals(
         db.pool(),
         cfg.owner_refresh.as_deref(),
-        cfg.auth_mode,
         launch.created_by.as_deref(),
         &launch.launcher_groups,
         &launch.created_at,

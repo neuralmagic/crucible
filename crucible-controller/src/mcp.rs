@@ -253,7 +253,7 @@ mod tests {
         ));
         let client = crux::Client::new(Arc::new(RouterTransport {
             api,
-            caller: Resolved::named(crate::identity::session::IdentitySource::Proxy, "alice"),
+            caller: Resolved::named("alice"),
             base: "https://crucible.example.com".to_string(),
         }));
         crux::ops::draft_create(&client, "studio", "a drafted pack", None, false)

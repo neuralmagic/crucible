@@ -75,7 +75,7 @@ pub(crate) enum Cmd {
         token_file: PathBuf,
     },
     /// One-shot device-flow login that prints every claim the issuer hands this client, to
-    /// confirm `groups` arrives before switching auth.mode to native.
+    /// confirm `groups` arrives before pointing a deployment at the issuer.
     OidcClaims {
         #[arg(long, default_value = "openid email profile")]
         scopes: String,

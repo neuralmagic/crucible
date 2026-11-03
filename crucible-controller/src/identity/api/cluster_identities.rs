@@ -528,7 +528,7 @@ mod tests {
     use crate::identity::auth::AuthPath;
     use crate::identity::cluster_link::testing::{EXTERNAL, Fleet, authorize_in_browser, fleet};
     use crate::identity::kube_links::testing::Clusters;
-    use crate::identity::session::{IdentitySource, Resolved};
+    use crate::identity::session::Resolved;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde_json::{Value, json};
@@ -639,7 +639,6 @@ openshift = ["ocp"]
                 user: Some("alice".to_string()),
                 groups: Vec::new(),
                 sub: Some(SUB.to_string()),
-                source: IdentitySource::Native,
             };
             crate::api::router(self.state.clone())
                 .layer(axum::middleware::from_fn(
@@ -941,7 +940,10 @@ openshift = ["ocp"]
             h.start(AuthPath::ApiKey, "ocp").await,
             StatusCode::FORBIDDEN
         );
-        assert_eq!(h.start(AuthPath::Jwt, "ocp").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            h.start(AuthPath::StaticToken, "ocp").await,
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             h.start(AuthPath::Session, "k8s").await,
             StatusCode::CONFLICT

@@ -174,7 +174,7 @@ async fn the_static_token_path_refuses_a_group_owner(pool: PgPool) {
         &["/groups/team-x"],
         Some(register_body("k", Some("group:/groups/team-x"), "v")),
     );
-    req.extensions_mut().insert(AuthPath::Edge);
+    req.extensions_mut().insert(AuthPath::Session);
     let (status, _) = call(&app, req).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }

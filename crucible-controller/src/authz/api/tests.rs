@@ -1670,7 +1670,7 @@ async fn the_autoresearch_lane_is_granted_by_policy_and_hidden_from_everyone_els
     let signed_in = |path: &str, who: &str, groups: &[&str]| {
         let mut req = as_user("GET", path, Some(who), groups, None);
         req.extensions_mut()
-            .insert(crate::identity::auth::AuthPath::Edge);
+            .insert(crate::identity::auth::AuthPath::Session);
         req
     };
     let entitled = |who: &'static str, groups: &'static [&'static str]| {

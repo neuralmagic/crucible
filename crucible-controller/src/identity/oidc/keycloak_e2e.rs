@@ -16,7 +16,6 @@
 use crate::api::state::ApiState;
 use crate::client::Db;
 use crate::daemon::queue::{Override, OverrideSink};
-use crate::identity::auth::AuthMode;
 use crate::identity::oidc::{OidcCfg, OidcProvider};
 use crate::identity::session::LoginFlow;
 use axum::body::Body;
@@ -32,8 +31,6 @@ const RP_CLIENT: &str = "crucible-controller";
 const ROLES_CLIENT: &str = "crucible-controller-roles";
 const RP_SECRET: &str = "controller-client-secret";
 const DEVICE_CLIENT: &str = "crucible-cli";
-const BRIEF_CLIENT: &str = "crucible-cli-brief";
-const OTHER_CLIENT: &str = "other-app";
 const USER: &str = "alice";
 const PASSWORD: &str = "alice-password";
 const USER_GROUP: &str = "/platform-devs";
@@ -202,11 +199,11 @@ fn issuer(base: &str) -> String {
     format!("{base}/realms/{REALM}")
 }
 
-fn cfg(base: &str, device_client: &str) -> OidcCfg {
-    cfg_for(base, RP_CLIENT, device_client)
+fn cfg(base: &str) -> OidcCfg {
+    cfg_for(base, RP_CLIENT)
 }
 
-fn cfg_for(base: &str, client_id: &str, device_client: &str) -> OidcCfg {
+fn cfg_for(base: &str, client_id: &str) -> OidcCfg {
     OidcCfg {
         issuer: issuer(base),
         client_id: client_id.to_string(),
@@ -217,7 +214,6 @@ fn cfg_for(base: &str, client_id: &str, device_client: &str) -> OidcCfg {
             "email".to_string(),
             "profile".to_string(),
         ],
-        device_client_id: Some(device_client.to_string()),
         post_logout_redirect: None,
     }
 }
@@ -225,7 +221,7 @@ fn cfg_for(base: &str, client_id: &str, device_client: &str) -> OidcCfg {
 /// The same registration asking for `offline_access`, so the token response carries the offline
 /// refresh token the credential is built from.
 fn cfg_offline(base: &str) -> OidcCfg {
-    let mut cfg = cfg(base, DEVICE_CLIENT);
+    let mut cfg = cfg(base);
     cfg.scopes.push("offline_access".to_string());
     cfg
 }
@@ -236,7 +232,7 @@ impl OverrideSink for NoopSink {
     fn submit(&self, _ov: Override) {}
 }
 
-/// The human surface exactly as `serve` mounts it, in native mode against this issuer, with no
+/// The human surface exactly as `serve` mounts it, against this issuer, with no
 /// offline credential: the shape a realm that grants no `offline_access` runs in.
 async fn native_router(pool: &PgPool, provider: Arc<OidcProvider>) -> axum::Router {
     native_router_with(pool, provider, None, DEFAULT_REFRESH_AFTER).await
@@ -268,13 +264,9 @@ async fn native_router_with(
         let mut guard = crate::identity::auth::BearerGuard::new(
             crate::identity::auth::SharedToken::new("s3cr3t"),
             None,
-            None,
-            None,
-            AuthMode::Native,
         )
         .expect("guard builds");
         guard.oidc = Some(provider.clone());
-        guard.users = Some(pool.clone());
         guard.refresh = crate::identity::oidc::credentials::OwnerRefresh::from_parts(
             pool.clone(),
             Some(provider.clone()),
@@ -285,7 +277,6 @@ async fn native_router_with(
     };
     let state = ApiState {
         roles: crate::identity::auth::Roles::new(vec![], vec![], vec!["platform-devs".to_string()]),
-        auth_mode: AuthMode::Native,
         ..ApiState::test(Db::new(pool.clone()), Arc::new(NoopSink))
     }
     .with_oidc(Some(provider.clone()), keys.clone());
@@ -296,11 +287,9 @@ async fn native_router_with(
         crate::HumanAuth {
             guard,
             routes: crate::identity::oidc::routes::AuthState {
-                mode: AuthMode::Native,
                 oidc: Some(provider),
                 pool: pool.clone(),
                 credential_keys: keys,
-                proxy_prefix: "/oauth2".to_string(),
             },
             issuer: None,
         },
@@ -597,7 +586,7 @@ async fn seed_bound_schedule(pool: &PgPool, login: &str, snapshot_groups: &[&str
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn the_browser_flow_signs_a_user_in_and_the_session_carries_their_groups(pool: PgPool) {
     let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg(&base, DEVICE_CLIENT)).expect("provider"));
+    let provider = Arc::new(OidcProvider::new(cfg(&base)).expect("provider"));
     let app = native_router(&pool, provider).await;
 
     // Nothing is signed in yet, so the guarded surface refuses.
@@ -646,7 +635,6 @@ async fn the_browser_flow_signs_a_user_in_and_the_session_carries_their_groups(p
     assert_eq!(who.status, StatusCode::OK);
     let who: serde_json::Value = serde_json::from_str(&who.body).expect("whoami json");
     assert_eq!(who["user"], serde_json::json!(USER));
-    assert_eq!(who["mode"], serde_json::json!("native"));
     assert_eq!(who["groups"], serde_json::json!([USER_GROUP]));
     assert_eq!(
         who["role"],
@@ -654,7 +642,7 @@ async fn the_browser_flow_signs_a_user_in_and_the_session_carries_their_groups(p
         "the realm's group grants operator through auth.operatorGroups"
     );
 
-    // The login is recorded, which is what lets a `user:` principal and a cluster token resolve.
+    // The login is recorded, which is what lets a `user:` principal resolve.
     assert!(
         crate::identity::oidc::users::is_known_login(&pool, USER)
             .await
@@ -694,7 +682,7 @@ async fn the_browser_flow_signs_a_user_in_and_the_session_carries_their_groups(p
 async fn an_id_token_answering_another_request_is_refused(pool: PgPool) {
     let Some(base) = keycloak().await else { return };
     let _ = &pool;
-    let provider = OidcProvider::new(cfg(&base, DEVICE_CLIENT)).expect("provider");
+    let provider = OidcProvider::new(cfg(&base)).expect("provider");
 
     let (url, flow) = provider
         .authorize("/".to_string())
@@ -723,7 +711,7 @@ async fn an_id_token_answering_another_request_is_refused(pool: PgPool) {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_callback_with_the_wrong_state_is_refused(pool: PgPool) {
     let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg(&base, DEVICE_CLIENT)).expect("provider"));
+    let provider = Arc::new(OidcProvider::new(cfg(&base)).expect("provider"));
     let app = native_router(&pool, provider).await;
 
     let start = call(&app, get("/auth/login", None)).await;
@@ -752,102 +740,30 @@ async fn a_callback_with_the_wrong_state_is_refused(pool: PgPool) {
     assert_eq!(orphan.status, StatusCode::BAD_REQUEST);
 }
 
-/// The CLI path: a real Keycloak access token from the public device-flow client authenticates,
-/// and its claims are the caller's identity and groups.
+/// A Keycloak access token is no bearer: genuinely signed tokens from the public device-flow client
+/// and from this relying party, and an ID token, are all refused.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_device_flow_access_token_authenticates_as_its_claims(pool: PgPool) {
+async fn a_keycloak_token_is_not_a_bearer(pool: PgPool) {
     let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg(&base, DEVICE_CLIENT)).expect("provider"));
+    let provider = Arc::new(OidcProvider::new(cfg(&base)).expect("provider"));
     let app = native_router(&pool, provider).await;
-    let tokens = tokens(&base, DEVICE_CLIENT).await;
-
-    let res = call(
-        &app,
-        Request::get("/api/whoami")
-            .header(
-                header::AUTHORIZATION,
-                format!("Bearer {}", field(&tokens, "access_token")),
-            )
-            .body(Body::empty())
-            .expect("request"),
-    )
-    .await;
-    assert_eq!(res.status, StatusCode::OK, "{}", res.body);
-    let who: serde_json::Value = serde_json::from_str(&res.body).expect("whoami json");
-    assert_eq!(who["user"], serde_json::json!(USER));
-    assert_eq!(who["groups"], serde_json::json!([USER_GROUP]));
-    assert_eq!(who["role"], serde_json::json!("operator"));
-}
-
-/// Everything the JWT path refuses, all of it genuinely signed by this issuer: a token minted for
-/// the relying party (the browser's credential), a token minted for another application on the same
-/// realm, an ID token, and an expired token.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn the_jwt_path_refuses_every_token_that_is_not_the_device_client_s(pool: PgPool) {
-    let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg(&base, DEVICE_CLIENT)).expect("provider"));
-    let app = native_router(&pool, provider).await;
-
-    let bearer = |app: &axum::Router, token: String| {
-        let app = app.clone();
-        async move {
-            call(
-                &app,
-                Request::get("/api/whoami")
-                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .status
-        }
-    };
-
-    // The relying party's own access token: that credential belongs to the browser session, and
-    // accepting it would make a stolen web token a CLI credential.
-    let rp = tokens(&base, RP_CLIENT).await;
-    assert_eq!(
-        bearer(&app, field(&rp, "access_token").to_string()).await,
-        StatusCode::UNAUTHORIZED
-    );
-
-    // A different application on the same realm: same issuer, same signing key, wrong audience.
-    let other = tokens(&base, OTHER_CLIENT).await;
-    assert_eq!(
-        bearer(&app, field(&other, "access_token").to_string()).await,
-        StatusCode::UNAUTHORIZED
-    );
-
-    // An ID token is not a bearer credential, even the device client's own.
     let device = tokens(&base, DEVICE_CLIENT).await;
-    assert_eq!(
-        bearer(&app, field(&device, "id_token").to_string()).await,
-        StatusCode::UNAUTHORIZED
-    );
-
-    // Garbage that is merely JWT-SHAPED never reaches the cluster-token path either.
-    assert_eq!(
-        bearer(&app, "aGVhZGVy.cGF5bG9hZA.c2ln".to_string()).await,
-        StatusCode::UNAUTHORIZED
-    );
-
-    // An expired token: the brief client's access tokens live one second.
-    let brief_provider = Arc::new(OidcProvider::new(cfg(&base, BRIEF_CLIENT)).expect("provider"));
-    let brief_app = native_router(&pool, brief_provider).await;
-    let brief = tokens(&base, BRIEF_CLIENT).await;
-    let token = field(&brief, "access_token").to_string();
-    assert_eq!(
-        bearer(&brief_app, token.clone()).await,
-        StatusCode::OK,
-        "the brief client's token is accepted while it lives"
-    );
-    // The brief client's tokens live one second; the wait clears that plus the guard's skew leeway.
-    tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-    assert_eq!(
-        bearer(&brief_app, token).await,
-        StatusCode::UNAUTHORIZED,
-        "an expired token is refused"
-    );
+    let rp = tokens(&base, RP_CLIENT).await;
+    for token in [
+        field(&device, "access_token"),
+        field(&device, "id_token"),
+        field(&rp, "access_token"),
+    ] {
+        let res = call(
+            &app,
+            Request::get("/api/whoami")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(res.status, StatusCode::UNAUTHORIZED, "{}", res.body);
+    }
 }
 
 /// The offline credential, end to end. The browser flow stores it encrypted in the same
@@ -1233,8 +1149,7 @@ async fn a_session_refreshes_its_groups_on_use_and_a_refusal_downgrades_it(pool:
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn groups_come_from_the_access_token_when_the_id_token_has_none(pool: PgPool) {
     let Some(base) = keycloak().await else { return };
-    let provider =
-        Arc::new(OidcProvider::new(cfg_for(&base, ROLES_CLIENT, DEVICE_CLIENT)).expect("provider"));
+    let provider = Arc::new(OidcProvider::new(cfg_for(&base, ROLES_CLIENT)).expect("provider"));
     let app = native_router(&pool, provider).await;
     let start = call(&app, get("/auth/login?rd=/", None)).await;
     let authorize_url = start.location.expect("login redirects to the issuer");

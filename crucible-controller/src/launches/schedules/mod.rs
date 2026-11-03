@@ -1876,7 +1876,6 @@ mod tests {
                 client_secret: None,
                 redirect_url: "http://localhost/auth/callback".to_string(),
                 scopes: vec!["openid".to_string()],
-                device_client_id: None,
                 post_logout_redirect: None,
             })
             .expect("provider"),
