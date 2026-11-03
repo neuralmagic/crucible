@@ -229,20 +229,15 @@ fn broker_endpoint(m: &Manifest) -> Option<String> {
     crate::manifest::broker_endpoint_from_url(&url).ok()
 }
 
-/// Split an openshell `host:port:access[:proto[:enforcement]]` entry. A bracketed IPv6 literal
-/// keeps its colons inside the brackets.
+/// An allowlist entry's host, port, and access, `full` when the entry names none.
 fn parse_endpoint(entry: &str) -> Option<(String, u16, String)> {
-    let (host, rest) = if let Some(after) = entry.strip_prefix('[') {
-        let close = after.find(']')?;
-        (format!("[{}]", &after[..close]), after.get(close + 2..)?)
-    } else {
-        let colon = entry.find(':')?;
-        (entry[..colon].to_string(), entry.get(colon + 1..)?)
-    };
-    let mut fields = rest.split(':');
-    let port: u16 = fields.next()?.parse().ok()?;
-    let access = fields.next().unwrap_or("full").to_string();
-    Some((host, port, access))
+    let ep: crate::openshell::endpoint::Endpoint = entry.parse().ok()?;
+    let access = ep
+        .access
+        .unwrap_or(crate::openshell::endpoint::Access::Full)
+        .as_str()
+        .to_string();
+    Some((ep.host, ep.port, access))
 }
 
 /// Credentials: every `[agent].env` name, plus every declared secret the env does not already
@@ -834,14 +829,19 @@ mod tests {
             Some(("github.com".into(), 443, "full".into()))
         );
         assert_eq!(
-            parse_endpoint("api.x:8443:read-only:rest:strict"),
+            parse_endpoint("api.x:8443:read-only:rest:enforce"),
             Some(("api.x".into(), 8443, "read-only".into()))
         );
         assert_eq!(
             parse_endpoint("[::1]:8849:full"),
             Some(("[::1]".into(), 8849, "full".into()))
         );
+        assert_eq!(
+            parse_endpoint("h:443"),
+            Some(("h".into(), 443, "full".into()))
+        );
         assert_eq!(parse_endpoint("garbage"), None);
+        assert_eq!(parse_endpoint("api.x:8443:read-only:rest:strict"), None);
     }
 
     #[test]

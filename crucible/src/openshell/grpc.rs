@@ -1508,32 +1508,16 @@ struct InvalidTlsSkipEndpoint {
 fn parse_tls_skip_endpoint(
     spec: &str,
 ) -> std::result::Result<(String, u32), InvalidTlsSkipEndpoint> {
-    let mut parts = spec.split(':');
-    let host = parts
-        .next()
-        .filter(|host| !host.is_empty() && !host.contains(char::is_whitespace))
-        .ok_or_else(|| InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        })?;
-    let port = parts
-        .next()
-        .ok_or_else(|| InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        })?
-        .parse::<u32>()
-        .map_err(|_| InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        })?;
-    if parts.next().is_some() || port == 0 || port > 65535 {
-        return Err(InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        });
+    let invalid = || InvalidTlsSkipEndpoint {
+        spec: spec.to_string(),
+    };
+    let ep: EgressEndpoint = spec.parse().map_err(|_| invalid())?;
+    if ep.access.is_some() || ep.protocol.is_some() {
+        return Err(invalid());
     }
-    Ok((host.to_string(), port))
+    Ok((ep.host, ep.port.into()))
 }
 
-/// The rule name the CLI generates for an endpoint (`allow_<host>_<port>`, host punctuation
-/// mapped to `_`). Kept byte-identical so a stored policy lines up with the CLI's.
 fn generated_rule_name(host: &str, port: u32) -> String {
     let sanitized: String = host
         .replace(['.', '-'], "_")
@@ -1605,36 +1589,10 @@ impl GrpcError {
 
 /// A rejected endpoint spec. The offending spec is named once here rather than re-interpolated
 /// into every message.
-#[derive(Debug, thiserror::Error, PartialEq)]
-#[error("endpoint '{spec}' {problem}")]
-pub struct EndpointSpecError {
-    spec: String,
-    problem: EndpointProblem,
-}
+use crate::openshell::endpoint::{
+    Access, Endpoint as EgressEndpoint, EndpointSpecError, Enforcement, Protocol,
+};
 
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub enum EndpointProblem {
-    #[error("must be host:port[:access[:protocol[:enforcement]]]")]
-    Shape,
-    #[error("has an invalid host segment")]
-    Host,
-    #[error("has a non-numeric port")]
-    NonNumericPort,
-    #[error("port must be in 1..=65535")]
-    PortRange,
-    #[error("access must be read-only, read-write, or full")]
-    Access,
-    #[error("protocol must be rest, websocket, sql, or mcp")]
-    Protocol,
-    #[error("an mcp endpoint's access must be full (every known MCP method) or omitted")]
-    McpAccess,
-    #[error("enforcement must be enforce or audit")]
-    Enforcement,
-    #[error("cannot set enforcement without a protocol")]
-    EnforcementWithoutProtocol,
-}
-
-/// The MCP protocol revisions a `full` MCP endpoint accepts: every one the pinned OpenShell knows.
 const MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
 
 /// An MCP endpoint that allows every known method, under any of [`MCP_PROTOCOL_VERSIONS`].
@@ -1650,60 +1608,39 @@ fn full_mcp() -> McpOptions {
 }
 
 fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError> {
-    let reject = |problem| EndpointSpecError {
-        spec: spec.to_owned(),
-        problem,
-    };
-    let parts: Vec<&str> = spec.split(':').collect();
-    if !(2..=5).contains(&parts.len()) {
-        return Err(reject(EndpointProblem::Shape));
-    }
-    let host = parts[0].trim();
-    if host.is_empty() || host.contains(char::is_whitespace) || host.contains('/') {
-        return Err(reject(EndpointProblem::Host));
-    }
-    let port: u32 = parts[1]
-        .trim()
-        .parse()
-        .map_err(|_| reject(EndpointProblem::NonNumericPort))?;
-    if port == 0 || port > 65535 {
-        return Err(reject(EndpointProblem::PortRange));
-    }
-    let access = parts.get(2).copied().unwrap_or("").trim();
-    let protocol = parts.get(3).copied().unwrap_or("").trim();
-    let enforcement = parts.get(4).copied().unwrap_or("").trim();
-    let access_preset = openshell_policy::network_access_preset_from_str(access)
-        .ok_or_else(|| reject(EndpointProblem::Access))?;
-    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql" | "mcp") {
-        return Err(reject(EndpointProblem::Protocol));
-    }
-    let enforcement_mode = openshell_policy::network_enforcement_mode_from_str(enforcement)
-        .ok_or_else(|| reject(EndpointProblem::Enforcement))?;
-    if enforcement_mode != NetworkEnforcementMode::Unspecified && protocol.is_empty() {
-        return Err(reject(EndpointProblem::EnforcementWithoutProtocol));
-    }
-    // OpenShell rejects an MCP method wildcard, so `full` on an MCP endpoint is its
-    // method-profile switch rather than the generic `*` access preset.
-    let (access_preset, mcp) = match (protocol, access_preset) {
-        ("mcp", NetworkAccessPreset::Full | NetworkAccessPreset::Unspecified) => {
-            (NetworkAccessPreset::Unspecified, Some(full_mcp()))
-        }
-        ("mcp", _) => return Err(reject(EndpointProblem::McpAccess)),
-        (_, preset) => (preset, None),
-    };
-    Ok(NetworkEndpoint {
-        host: host.to_string(),
-        port,
-        ports: vec![port],
-        protocol: protocol.to_string(),
-        enforcement: enforcement_mode.into(),
-        access: access_preset.into(),
-        mcp,
-        ..NetworkEndpoint::default()
-    })
+    spec.parse().map(|ep: EgressEndpoint| network_endpoint(&ep))
 }
 
-/// Dedupe while preserving first-seen order, dropping empties (matches the CLI's binary dedupe).
+/// The gateway's wire form of an endpoint. OpenShell rejects an MCP method wildcard, so `full`
+/// on an MCP endpoint is its method-profile switch rather than the generic `*` access preset.
+fn network_endpoint(ep: &EgressEndpoint) -> NetworkEndpoint {
+    let access = match ep.access {
+        None => NetworkAccessPreset::Unspecified,
+        Some(Access::ReadOnly) => NetworkAccessPreset::ReadOnly,
+        Some(Access::ReadWrite) => NetworkAccessPreset::ReadWrite,
+        Some(Access::Full) => NetworkAccessPreset::Full,
+    };
+    let enforcement = match ep.enforcement {
+        None => NetworkEnforcementMode::Unspecified,
+        Some(Enforcement::Enforce) => NetworkEnforcementMode::Enforce,
+        Some(Enforcement::Audit) => NetworkEnforcementMode::Audit,
+    };
+    let (access, mcp) = match ep.protocol {
+        Some(Protocol::Mcp) => (NetworkAccessPreset::Unspecified, Some(full_mcp())),
+        _ => (access, None),
+    };
+    NetworkEndpoint {
+        host: ep.host.clone(),
+        port: ep.port.into(),
+        ports: vec![ep.port.into()],
+        protocol: ep.protocol.map(Protocol::as_str).unwrap_or("").to_string(),
+        enforcement: enforcement.into(),
+        access: access.into(),
+        mcp,
+        ..NetworkEndpoint::default()
+    }
+}
+
 fn dedup(values: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for v in values {
@@ -1758,6 +1695,7 @@ pub(crate) mod in_process;
 
 #[cfg(test)]
 mod tests {
+    use crate::openshell::endpoint::EndpointProblem;
     use crate::openshell::grpc::in_process::{FakeGateway, Writes};
     use crate::openshell::grpc::*;
     use openshell_core::proto::NetworkAccessPreset;

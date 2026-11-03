@@ -18,6 +18,7 @@
 //! has no domain structure.
 
 use crate::manifest::{Harness, OpenshellCfg};
+use crate::openshell::endpoint::Endpoint;
 
 /// Built-in egress endpoints in openshell's `host:port:access[:proto[:enforcement]]` form.
 /// No protocol is given, so these are L4-only (CONNECT tunneling): `protocol=rest` would
@@ -193,8 +194,8 @@ fn subtract_endpoints(list: Vec<String>, deny: &[String]) -> Vec<String> {
 
 /// Whether the deny entry `deny` removes the allowlist entry `allow`.
 fn denies(deny: &str, allow: &str) -> bool {
-    match (Endpoint::parse(deny), Endpoint::parse(allow)) {
-        (Some(d), Some(a)) => d.port == a.port && d.covers_host_of(&a),
+    match (deny.parse::<Endpoint>(), allow.parse::<Endpoint>()) {
+        (Ok(d), Ok(a)) => d.port == a.port && d.covers_host_of(&a),
         _ => deny == allow,
     }
 }
@@ -213,11 +214,11 @@ pub struct ShadowedDeny {
 pub fn shadowed_denies(resolved: &[String], deny: &[String]) -> Vec<ShadowedDeny> {
     let mut out = Vec::new();
     for d in deny {
-        let Some(dep) = Endpoint::parse(d) else {
+        let Ok(dep) = d.parse::<Endpoint>() else {
             continue;
         };
         for a in resolved {
-            let Some(aep) = Endpoint::parse(a) else {
+            let Ok(aep) = a.parse::<Endpoint>() else {
                 continue;
             };
             if dep.port == aep.port && !dep.covers_host_of(&aep) && dep.overlaps_host_of(&aep) {
@@ -236,55 +237,6 @@ pub fn shadowed_denies(resolved: &[String], deny: &[String]) -> Vec<ShadowedDeny
 ///
 /// Host comparisons go through openshell's own DNS-label matcher
 /// ([`openshell_core::host_pattern`]): `*` stays inside a label, `**` spans several.
-struct Endpoint<'a> {
-    host: &'a str,
-    port: &'a str,
-}
-
-impl<'a> Endpoint<'a> {
-    fn parse(entry: &'a str) -> Option<Self> {
-        let mut parts = entry.split(':');
-        let host = parts.next().filter(|h| !h.is_empty())?;
-        let port = parts.next().filter(|p| !p.is_empty())?;
-        Some(Self { host, port })
-    }
-
-    /// The host patterns a deny naming this endpoint denies: the host itself plus everything under
-    /// it, unless the host is already a wildcard, which names only what it matches.
-    fn denied_patterns(&self) -> Vec<String> {
-        if self.host.contains('*') {
-            vec![self.host.to_string()]
-        } else {
-            vec![self.host.to_string(), format!("**.{}", self.host)]
-        }
-    }
-
-    /// Whether every host `allow` admits is one this deny names, so the entry can be dropped whole.
-    /// A literal deny subsumes any pattern whose every match ends in `.<host>`, wildcard shapes
-    /// included; a wildcard deny drops a literal entry but never a wildcard one it does not spell
-    /// identically.
-    fn covers_host_of(&self, allow: &Endpoint<'_>) -> bool {
-        if self.host.eq_ignore_ascii_case(allow.host) {
-            return true;
-        }
-        if self.host.contains('*') {
-            return !allow.host.contains('*')
-                && openshell_core::host_pattern::host_matches(self.host, allow.host)
-                    .unwrap_or(false);
-        }
-        let suffix = format!(".{}", self.host.to_ascii_lowercase());
-        allow.host.len() > suffix.len() && allow.host.to_ascii_lowercase().ends_with(&suffix)
-    }
-
-    /// Whether `allow` admits any host this deny names, whether or not it can be dropped whole.
-    fn overlaps_host_of(&self, allow: &Endpoint<'_>) -> bool {
-        self.denied_patterns().iter().any(|pattern| {
-            openshell_core::host_pattern::host_patterns_overlap(pattern, allow.host)
-                .unwrap_or(false)
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
