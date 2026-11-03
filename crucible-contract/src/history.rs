@@ -33,6 +33,8 @@ pub enum RecordedStatus {
 pub enum RunOutcome {
     Finished,
     Solved,
+    /// A main-graph task declared early completion.
+    Complete,
     Budget,
     Stopped,
     Escalated,
@@ -210,6 +212,14 @@ mod tests {
         let again: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
         assert_eq!(original, again);
+    }
+
+    #[test]
+    fn a_record_of_a_run_that_completed_early_decodes() {
+        let mut completed = record("r1");
+        completed["outcome"] = serde_json::json!("complete");
+        let parsed = SuppliedHistory::parse(&doc(vec![completed])).unwrap();
+        assert_eq!(parsed.records[0].outcome, Some(RunOutcome::Complete));
     }
 
     #[test]
