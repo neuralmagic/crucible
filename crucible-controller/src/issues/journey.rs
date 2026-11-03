@@ -12,9 +12,10 @@
 
 use crate::client::Db;
 use crate::event_log::EventRecord;
-use crate::issues::refine_trail::{RoundKind, RoundOutcome, extract_trail};
+use crate::issues::refine_trail::extract_trail;
 use crate::model::{ParkReason, Status};
 use anyhow::Result;
+use crucible_contract::refine::{RoundKind, RoundOutcome, RoundRecord};
 use serde::Serialize;
 use utoipa::ToSchema;
 
@@ -124,7 +125,7 @@ fn duration_secs(from: Option<&str>, to: Option<&str>) -> Option<i64> {
 
 /// The `passed` | `concerns` | `none` summary of a scope's adversary round: the last adversary round
 /// in the trail decides (passed → `passed`, anything else → `concerns`); no adversary round → `none`.
-fn adversary_summary(rounds: &[crate::issues::refine_trail::RoundRecord]) -> &'static str {
+fn adversary_summary(rounds: &[RoundRecord]) -> &'static str {
     match rounds.iter().rev().find(|r| r.kind == RoundKind::Adversary) {
         Some(r) => match r.outcome {
             RoundOutcome::Passed => "passed",
