@@ -564,10 +564,7 @@ mod tests {
         pin(&pool, WORKFLOW).await;
         crate::testing::launch_playbook(&pool, "playbook:survey:1").await;
         finished_run(&pool, "run-parent", "playbook:survey:1", &session(WORKFLOW)).await;
-        let app = crate::api::router(crate::api::state::ApiState::test(
-            Db::new(pool.clone()),
-            std::sync::Arc::new(NoSink),
-        ));
+        let app = crate::api::router(crate::api::state::ApiState::test(Db::new(pool.clone())));
         let get = |uri: &'static str| {
             let app = app.clone();
             async move {
@@ -603,12 +600,6 @@ mod tests {
         );
         let (status, _) = get("/api/runs/%2E%2E/rerun").await;
         assert_eq!(status, axum::http::StatusCode::BAD_REQUEST);
-    }
-
-    struct NoSink;
-
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
     }
 
     fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {

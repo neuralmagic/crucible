@@ -1,5 +1,4 @@
-//! The concrete [`OverrideSink`] the daemon mounts under the API/UI, plus the worker-side apply
-//! step. The sink itself is kept abstract as a trait; this module supplies the concrete impl.
+//! The override sink the daemon mounts under the API/UI, plus the worker-side apply step.
 //!
 //! An override does **not** race the reconcile worker: the API handler only builds an [`Override`]
 //! and hands it here; [`QueueOverrideSink::submit`] stashes the intent by key and enqueues the key
@@ -13,7 +12,7 @@
 //! authority). A human *unpark* is always honoured — it's the operator explicitly taking it back.
 
 use crate::client::Db;
-use crate::daemon::queue::{Override, OverrideKind, OverrideSink, WorkQueue};
+use crate::daemon::queue::{Override, OverrideKind, WorkQueue};
 use crate::event_log::Event;
 use crate::model::{ParkedBy, Status};
 use anyhow::Result;
@@ -46,10 +45,22 @@ impl OverrideStore {
     fn take(&self, key: &str) -> Option<Override> {
         self.pending().remove(key)
     }
+
+    /// Every intent waiting to be applied, in key order.
+    #[cfg(all(test, feature = "autoresearch"))]
+    pub(crate) fn submitted(&self) -> Vec<Override> {
+        let pending = self.pending();
+        let mut keys: Vec<&String> = pending.keys().collect();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|k| pending.get(k).cloned())
+            .collect()
+    }
 }
 
-/// The [`OverrideSink`] the API/UI posts to: stash the intent, enqueue the key. It never touches the
-/// database (the frozen contract: POSTs don't write the DB — reconcile does).
+/// Where the API/UI hands an [`Override`] off: stash the intent, enqueue the key. Reconcile is the
+/// only writer of `parked_by = human` stickiness; the sink never touches the database.
+#[derive(Clone)]
 pub struct QueueOverrideSink {
     store: Arc<OverrideStore>,
     queue: WorkQueue,
@@ -59,13 +70,17 @@ impl QueueOverrideSink {
     pub fn new(store: Arc<OverrideStore>, queue: WorkQueue) -> Self {
         QueueOverrideSink { store, queue }
     }
-}
 
-impl OverrideSink for QueueOverrideSink {
-    fn submit(&self, ov: Override) {
+    pub fn submit(&self, ov: Override) {
         let key = ov.key.clone();
         self.store.stash(ov);
         self.queue.enqueue_urgent(key);
+    }
+
+    /// Every intent submitted and not yet applied.
+    #[cfg(all(test, feature = "autoresearch"))]
+    pub(crate) fn pending(&self) -> Vec<Override> {
+        self.store.submitted()
     }
 }
 

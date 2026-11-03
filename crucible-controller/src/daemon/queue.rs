@@ -350,12 +350,6 @@ pub enum OverrideKind {
     },
 }
 
-/// Where the API/UI hands an [`Override`] off. Reconcile is the only writer of `parked_by =
-/// human` stickiness; this sink just queues the intent — it never touches the DB itself.
-pub trait OverrideSink: Send + Sync {
-    fn submit(&self, ov: Override);
-}
-
 /// A discovery source: polls whatever it polls (the upstream watermark, the approval PRs, the
 /// review comments) and enqueues changed keys. Handed an owned [`WorkQueue`] (not a borrow) so a
 /// source that enqueues *after* an async fetch can move it into its future — the handle is a

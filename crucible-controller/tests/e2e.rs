@@ -655,6 +655,7 @@ fn daemon_cfg() -> DaemonConfig {
 /// Await a DB-observable state instead of sleeping blind: poll until the issue reaches `want`.
 /// The deadline is generous (a 2-core CI runner is slow, not wrong) and the failure is loud: the
 /// issue's current state plus its scope row, so a wedged chain is diagnosable from the panic.
+#[cfg(feature = "autoresearch")]
 /// Block until `launcher` has created `n` pods. The issue is claimed running before its pod is
 /// created, so a status wait alone can return inside that window.
 async fn wait_for_launches(launcher: &FakePodDispatcher, n: usize) {
@@ -1441,10 +1442,7 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
     .await;
     let app = crucible_controller::api::router(crucible_controller::api::state::ApiState::new(
         db.clone(),
-        Arc::new(crucible_controller::QueueOverrideSink::new(
-            overrides,
-            queue.clone(),
-        )),
+        crucible_controller::QueueOverrideSink::new(overrides, queue.clone()),
         queue,
         Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
             None,
@@ -1722,10 +1720,7 @@ async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
     .await;
     let app = crucible_controller::api::router(crucible_controller::api::state::ApiState::new(
         db.clone(),
-        Arc::new(crucible_controller::QueueOverrideSink::new(
-            overrides,
-            api_queue.clone(),
-        )),
+        crucible_controller::QueueOverrideSink::new(overrides, api_queue.clone()),
         api_queue,
         Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
             None,

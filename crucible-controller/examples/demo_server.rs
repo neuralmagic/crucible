@@ -33,10 +33,7 @@ async fn main() -> anyhow::Result<()> {
     seed_task_graph(&db).await?;
 
     let queue = WorkQueue::new();
-    let sink = Arc::new(QueueOverrideSink::new(
-        Arc::new(OverrideStore::new()),
-        queue.clone(),
-    ));
+    let sink = QueueOverrideSink::new(Arc::new(OverrideStore::new()), queue.clone());
     let addr: SocketAddr = "127.0.0.1:8899".parse()?;
 
     let mut cfg = DemoCfg::parse_from(["demo_server"]).cfg;

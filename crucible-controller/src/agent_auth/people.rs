@@ -1331,7 +1331,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             deploy_profile: Some(path),
             people_issuer: Some(auth.clone()),
             identities: true,
-            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
+            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()))
         };
         let signed_in = crate::identity::session::Resolved {
             user: Some("jordan".into()),
@@ -1360,11 +1360,6 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             app,
             _profile: dir,
         }
-    }
-
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
     }
 
     struct Reply {

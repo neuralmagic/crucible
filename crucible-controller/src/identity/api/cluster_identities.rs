@@ -537,11 +537,6 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
-
     const SUB: &str = "sub-alice";
 
     /// The hub's usernames are SSO logins, k8s's are prefixed emails, ocp links through
@@ -620,7 +615,7 @@ openshift = ["ocp"]
             reviewer: Arc::new(reviewer),
             cluster_links: Some(Arc::new(links)),
             identities: true,
-            ..ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
+            ..ApiState::test(crate::Db::new(pool.clone()))
         };
         let store = crate::identity::session::store(&pool).await.unwrap();
         Harness {

@@ -5,25 +5,16 @@ use crate::api::router;
 use crate::authz::api::*;
 use crate::authz::model::{PLATFORM_ADMINISTRATORS, PLATFORM_OPERATORS};
 use crate::client::Db;
-use crate::daemon::queue::{Override, OverrideSink};
 use crate::testing::call;
 use axum::Router;
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use std::sync::Arc;
 use tower::ServiceExt;
 
-#[derive(Default)]
-struct NoSink;
-
-impl OverrideSink for NoSink {
-    fn submit(&self, _ov: Override) {}
-}
-
 fn app(pool: PgPool) -> Router {
-    router(ApiState::test(Db::new(pool), Arc::new(NoSink)))
+    router(ApiState::test(Db::new(pool)))
 }
 
 fn as_user(
@@ -587,7 +578,7 @@ fn app_with_roles(pool: PgPool, admins: &[&str], operators: &[&str]) -> Router {
             operators.iter().map(|s| s.to_string()).collect(),
             vec![],
         ),
-        ..ApiState::test(Db::new(pool), Arc::new(NoSink))
+        ..ApiState::test(Db::new(pool))
     })
 }
 

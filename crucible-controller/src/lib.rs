@@ -54,7 +54,7 @@ pub use config::{ControllerCfg, GroundedExecutor, PlaybookExecutor, Profile, Sco
 pub use daemon::autopilot_flag::AutopilotFlag;
 pub use daemon::overrides::{OverrideStore, QueueOverrideSink};
 pub use daemon::overrides_store::{ConfigStore, KubeConfigMapApi};
-pub use daemon::queue::{IssueKey, Override, OverrideSink, QueueConfig, WorkQueue};
+pub use daemon::queue::{IssueKey, Override, QueueConfig, WorkQueue};
 pub use event_log::Event;
 pub use issues::model::{NewIssue, NewScope};
 #[cfg(feature = "autoresearch")]
@@ -404,11 +404,6 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
-
     async fn answer(router: &axum::Router, method: Method, uri: &str) -> (StatusCode, Vec<u8>) {
         let req = Request::builder()
             .method(method)
@@ -459,7 +454,10 @@ mod tests {
         );
         let state = crate::api::state::ApiState::new(
             db.clone(),
-            Arc::new(NoSink),
+            crate::daemon::overrides::QueueOverrideSink::new(
+                Arc::new(crate::daemon::overrides::OverrideStore::new()),
+                crate::daemon::queue::WorkQueue::new(),
+            ),
             crate::daemon::queue::WorkQueue::new(),
             clusters,
             None,

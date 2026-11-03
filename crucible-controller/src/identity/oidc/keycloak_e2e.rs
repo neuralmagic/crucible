@@ -15,7 +15,6 @@
 
 use crate::api::state::ApiState;
 use crate::client::Db;
-use crate::daemon::queue::{Override, OverrideSink};
 use crate::identity::oidc::{OidcCfg, OidcProvider};
 use crate::identity::session::LoginFlow;
 use axum::body::Body;
@@ -226,12 +225,6 @@ fn cfg_offline(base: &str) -> OidcCfg {
     cfg
 }
 
-struct NoopSink;
-
-impl OverrideSink for NoopSink {
-    fn submit(&self, _ov: Override) {}
-}
-
 /// The human surface exactly as `serve` mounts it, against this issuer, with no
 /// offline credential: the shape a realm that grants no `offline_access` runs in.
 async fn native_router(pool: &PgPool, provider: Arc<OidcProvider>) -> axum::Router {
@@ -277,7 +270,7 @@ async fn native_router_with(
     };
     let state = ApiState {
         roles: crate::identity::auth::Roles::new(vec![], vec![], vec!["platform-devs".to_string()]),
-        ..ApiState::test(Db::new(pool.clone()), Arc::new(NoopSink))
+        ..ApiState::test(Db::new(pool.clone()))
     }
     .with_oidc(Some(provider.clone()), keys.clone());
     crate::human_router(

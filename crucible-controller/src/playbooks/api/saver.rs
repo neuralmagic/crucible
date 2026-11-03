@@ -166,19 +166,10 @@ pub(crate) async fn resolve_dispatch_target(
 mod tests {
     use super::*;
     use crate::client::Db;
-    use crate::daemon::queue::{Override, OverrideSink};
     use crate::identity::auth::{AuthPath, Groups};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use sqlx::PgPool;
-    use std::sync::Arc;
-
-    #[derive(Default)]
-    struct NoSink;
-
-    impl OverrideSink for NoSink {
-        fn submit(&self, _ov: Override) {}
-    }
 
     fn request<'a>() -> SaverRequest<'a> {
         SaverRequest {
@@ -194,7 +185,7 @@ mod tests {
         path: AuthPath,
         ownership: Ownership<'_>,
     ) -> Result<Saver, StatusCode> {
-        let state = ApiState::test(Db::new(pool), Arc::new(NoSink));
+        let state = ApiState::test(Db::new(pool));
         let groups = Groups(vec!["/groups/team-x".to_string()]);
         let caller = crate::authz::resolve_caller(
             state.db.pool(),

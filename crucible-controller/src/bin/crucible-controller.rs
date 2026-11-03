@@ -743,9 +743,8 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
 
     // The HTTP API + debug UI, mounted on the same runtime. Binds loopback without
     // CONTROLLER_API_TOKEN (the frozen default); a rendered Deployment sets the token + a real bind.
-    let serve_sink: std::sync::Arc<dyn crucible_controller::OverrideSink> = std::sync::Arc::new(
-        crucible_controller::QueueOverrideSink::new(override_store.clone(), queue.clone()),
-    );
+    let serve_sink =
+        crucible_controller::QueueOverrideSink::new(override_store.clone(), queue.clone());
     let serve_addr = controller_api_addr();
     crucible_controller::runs::dispatch_target::cluster_policy(&cfg)
         .context("validating the per-cluster dispatch policy")?;

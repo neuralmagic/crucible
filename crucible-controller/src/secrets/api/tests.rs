@@ -8,8 +8,6 @@
 
 use crate::api::{openapi_spec, router};
 use crate::client::Db;
-use crate::daemon::queue::Override;
-use crate::daemon::queue::OverrideSink;
 use crate::identity::auth::AuthPath;
 use crate::secrets::api::*;
 use crate::secrets::store;
@@ -22,14 +20,6 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use std::sync::Arc;
 
-/// A sink that records nothing: the registry never enqueues an override.
-#[derive(Default)]
-struct NoSink;
-
-impl OverrideSink for NoSink {
-    fn submit(&self, _ov: Override) {}
-}
-
 /// The registry router with `alice` as an operator, plus whatever Vault client the test has.
 fn app(pool: PgPool, vault: Option<Arc<crate::secrets::vault::VaultClient>>) -> Router {
     router(ApiState {
@@ -39,7 +29,7 @@ fn app(pool: PgPool, vault: Option<Arc<crate::secrets::vault::VaultClient>>) -> 
             vec![],
         ),
         vault,
-        ..ApiState::test(Db::new(pool), Arc::new(NoSink))
+        ..ApiState::test(Db::new(pool))
     })
 }
 
@@ -357,7 +347,7 @@ async fn app_with_installations(
             crate::secrets::github_app::testkey::write_test_key(key_dir),
             server.uri(),
         )),
-        ..ApiState::test(Db::new(pool), Arc::new(NoSink))
+        ..ApiState::test(Db::new(pool))
     })
 }
 
@@ -435,7 +425,7 @@ async fn a_failed_installation_lookup_is_unavailable(pool: PgPool) {
             crate::secrets::github_app::testkey::write_test_key(dir.path()),
             server.uri(),
         )),
-        ..ApiState::test(Db::new(pool.clone()), Arc::new(NoSink))
+        ..ApiState::test(Db::new(pool.clone()))
     });
     let (status, body) = call(
         &app,

@@ -195,12 +195,6 @@ async fn carry_caller(
 mod tests {
     use crate::mcp::*;
 
-    struct NoSink;
-
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
-
     /// Bind a new secret owned by `owner` to playbook scope `scope` as `declared`.
     async fn bind(pool: &sqlx::PgPool, owner: &str, scope: &str, declared: &str) {
         let owner = crate::authz::model::Principal::parse(owner).expect("owner");
@@ -247,10 +241,9 @@ mod tests {
     /// client, DTOs and renderers over the real handlers and database.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn crux_renames_and_clones_a_draft(pool: sqlx::PgPool) {
-        let api = crate::api::router(crate::api::state::ApiState::test(
-            crate::client::Db::new(pool.clone()),
-            Arc::new(NoSink),
-        ));
+        let api = crate::api::router(crate::api::state::ApiState::test(crate::client::Db::new(
+            pool.clone(),
+        )));
         let client = crux::Client::new(Arc::new(RouterTransport {
             api,
             caller: Resolved::named("alice"),

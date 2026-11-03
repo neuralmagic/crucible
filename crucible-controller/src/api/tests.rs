@@ -6,9 +6,10 @@ use crate::builds::model::NewBuild;
 #[cfg(feature = "autoresearch")]
 use crate::builds::model::{BuildBackendKind, BuildState};
 use crate::client::Db;
+use crate::daemon::overrides::{OverrideStore, QueueOverrideSink};
 #[cfg(feature = "autoresearch")]
 use crate::daemon::queue::OverrideKind;
-use crate::daemon::queue::{Override, OverrideSink};
+use crate::daemon::queue::WorkQueue;
 #[cfg(feature = "autoresearch")]
 use crate::issues::model::IssueQuery;
 #[cfg(feature = "autoresearch")]
@@ -24,21 +25,7 @@ use axum::http::{StatusCode, header};
 use axum::response::Response;
 use sqlx::PgPool;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tower::ServiceExt;
-
-/// A recording `OverrideSink` — a plain struct capturing calls, not a mock framework — for
-/// asserting that POSTs enqueue overrides without ever touching the DB.
-#[derive(Default)]
-struct Recorder {
-    calls: Mutex<Vec<Override>>,
-}
-
-impl OverrideSink for Recorder {
-    fn submit(&self, ov: Override) {
-        self.calls.lock().expect("lock").push(ov);
-    }
-}
 
 fn db_with(pool: PgPool) -> (Db, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -61,21 +48,26 @@ fn sample_issue(key: &str) -> NewIssue {
     }
 }
 
-fn app(db: Db, sink: Arc<dyn OverrideSink>) -> Router {
-    router(ApiState::test(db, sink))
+/// A sink the test can read back: POSTs enqueue overrides without ever touching the DB.
+fn test_sink() -> QueueOverrideSink {
+    QueueOverrideSink::new(Arc::new(OverrideStore::new()), WorkQueue::new())
+}
+
+fn app(db: Db) -> Router {
+    router(ApiState::test(db))
 }
 
 fn app_with_caps(db: Db, caps: Option<Caps>) -> Router {
     router(ApiState {
         caps,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
 fn app_with_admins(db: Db, admins: Vec<String>) -> Router {
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, vec![], vec![]),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -89,7 +81,7 @@ fn app_with_contracts(
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, vec![], vec![]),
         broker_contracts: contracts,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -110,7 +102,7 @@ fn app_with_admins_and_jira(
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, vec![], vec![]),
         jira,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -143,15 +135,20 @@ async fn spawn_mock_jira(
     (format!("http://{addr}"), handle)
 }
 
-fn app_with_roles(
+fn app_with_roles(db: Db, admins: Vec<String>, operators: Vec<String>) -> Router {
+    app_with_sink(db, test_sink(), admins, operators)
+}
+
+fn app_with_sink(
     db: Db,
-    sink: Arc<dyn OverrideSink>,
+    sink: QueueOverrideSink,
     admins: Vec<String>,
     operators: Vec<String>,
 ) -> Router {
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, operators, vec![]),
-        ..ApiState::test(db, sink)
+        sink,
+        ..ApiState::test(db)
     })
 }
 
@@ -168,7 +165,7 @@ fn app_with_repo_whitelist(
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, operators, vec![]),
         repo_whitelist: Arc::new(whitelist),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -176,14 +173,14 @@ fn app_with_repo_whitelist(
 fn app_with_scratch_dir(db: Db, scratch_dir: std::path::PathBuf) -> Router {
     router(ApiState {
         scratch_dir,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn healthz_reports_ok(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(HttpRequest::get("/healthz").body(Body::empty())?)
         .await?;
@@ -209,7 +206,7 @@ async fn issue_facets_count_each_axis_without_its_own_filter(pool: PgPool) -> Re
         crate::issues::store::claim_issue(db.pool(), "owner/repo#3", Status::New, Status::Scoped)
             .await?
     );
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let (st, v) = get_json_object(&app, "/api/issues/facets?status=scoped").await;
     assert_eq!(st, StatusCode::OK);
@@ -252,7 +249,7 @@ async fn list_issues_filters_by_status(pool: PgPool) -> Result<()> {
         crate::issues::store::claim_issue(db.pool(), "owner/repo#2", Status::New, Status::Scoped)
             .await?
     );
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .clone()
@@ -286,7 +283,7 @@ async fn list_issues_upstream_filters_validate_and_apply(pool: PgPool) -> Result
         crate::model::ParkedBy::Machine,
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     for bad in [
         "/api/issues?upstream=bogus",
@@ -345,7 +342,7 @@ async fn get_issue_detail_carries_body_and_comments(pool: PgPool) -> Result<()> 
         }],
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .oneshot(HttpRequest::get("/api/issues/owner%2Frepo%231").body(Body::empty())?)
@@ -399,7 +396,7 @@ async fn get_issue_returns_full_provenance_or_404(pool: PgPool) -> Result<()> {
         },
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .clone()
@@ -471,7 +468,7 @@ async fn list_runs_carries_the_score_series_in_iteration_order(pool: PgPool) -> 
         .await?;
     }
 
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let (st, v) = get_json(&app, "/api/runs").await;
     assert_eq!(st, StatusCode::OK);
 
@@ -523,7 +520,7 @@ async fn list_runs_returns_most_recent_with_default_and_explicit_limit(pool: PgP
         },
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .clone()
@@ -695,7 +692,7 @@ async fn list_runs_page_sorts_filters_and_pages(pool: PgPool) -> Result<()> {
         },
     )
     .await?;
-    let app = app(db.clone(), Arc::new(Recorder::default()));
+    let app = app(db.clone());
 
     // Default: sort=created desc → newest run_id first, and the join carries issue_key + repo.
     let (st, v) = get_json(&app, "/api/runs").await;
@@ -826,7 +823,7 @@ async fn list_builds_filters_and_pages_and_per_issue(pool: PgPool) -> Result<()>
     .await?;
     let _pending =
         seed_scoped_build(&db, "o/a", "o/a#2", "cache", BuildBackendKind::Cluster).await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     // No filter → all three, newest first (id desc): cache, web, loop.
     let (st, v) = get_json(&app, "/api/builds").await;
@@ -1197,7 +1194,7 @@ async fn run_iterations_ordered_by_iter_or_404(pool: PgPool) -> Result<()> {
         )
         .await?;
     }
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let (st, v) = get_json(&app, "/api/runs/run-1/iterations").await;
     assert_eq!(st, StatusCode::OK);
@@ -1236,7 +1233,7 @@ async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> 
         },
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let (st, v) = get_json_object(&app, "/api/runs/run-links/graph").await;
     assert_eq!(st, StatusCode::OK);
@@ -1289,7 +1286,7 @@ async fn run_graph_serves_what_each_agent_task_ran_on(pool: PgPool) -> Result<()
         )
         .await?;
     }
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let (st, v) = get_json_object(&app, "/api/runs/run-agent/graph").await;
     assert_eq!(st, StatusCode::OK);
@@ -1338,7 +1335,7 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
         )
         .await?;
     }
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .clone()
@@ -1404,7 +1401,7 @@ async fn run_graph_of_a_launch_whose_pack_is_refused_omits_outputs(pool: PgPool)
         r#"[{"name":"measure","kind":"command","depends_on":[],"session":"","needs":"all","required":true}]"#,
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let (st, v) = get_json_object(&app, "/api/runs/run-survey/graph").await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -1435,7 +1432,7 @@ async fn get_run_returns_candidates_or_404(pool: PgPool) -> Result<()> {
     .await?;
     // A scoped run: the join resolves its issue key + repo onto the DTO.
     seed_scoped_run(&db, "o/x", "o/x#7", "run-2", Some(200.0), Some(1.5)).await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .clone()
@@ -1479,7 +1476,7 @@ async fn get_run_echoes_the_issues_pinned_pair(pool: PgPool) -> Result<()> {
         Some("gpt-5.6-sol"),
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .oneshot(HttpRequest::get("/api/runs/run-2").body(Body::empty())?)
@@ -1511,7 +1508,7 @@ async fn live_run_404s_unknown_and_ends_non_running(pool: PgPool) -> Result<()> 
         },
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     // Unknown run → 404 (distinguishable from a known-but-non-streamable run).
     let res = app
@@ -1543,7 +1540,7 @@ async fn ledger_summary_sums_by_day(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     db.ledger_append(Some("run-1"), "scope", 0.5).await?;
     db.ledger_append(Some("run-1"), "run", 1.25).await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .oneshot(HttpRequest::get("/api/ledger/summary").body(Body::empty())?)
@@ -1593,7 +1590,7 @@ async fn ledger_by_tag_groups_today_and_carries_the_ceiling(pool: PgPool) -> Res
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn ledger_by_tag_without_caps_has_null_ceiling(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .oneshot(HttpRequest::get("/api/ledger/by-tag").body(Body::empty())?)
@@ -1653,7 +1650,7 @@ async fn list_turns_filters_orders_and_limits(pool: PgPool) -> Result<()> {
     .await?;
     seed_work_pod(&db, "turn-b", "scope", "o/r#2", S::Collected, None).await?;
     seed_work_pod(&db, "turn-c", "grounded-rank", "o/r#3", S::Running, None).await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     // Unfiltered: every row, newest first, full shape.
     let (st, v) = get_json(&app, "/api/turns").await;
@@ -1714,7 +1711,7 @@ async fn turns_list_previews_the_error_and_the_detail_serves_it_whole(pool: PgPo
             .join("\n")
     );
     seed_work_pod(&db, "turn-a", "run", "o/r#1", S::Failed, Some(&long_error)).await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let (st, v) = get_json(&app, "/api/turns").await;
     assert_eq!(st, StatusCode::OK);
@@ -1761,7 +1758,7 @@ async fn issues_list_previews_the_parked_reason_and_the_detail_serves_it_whole(
         "2026-01-15T10:15:00Z",
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let (st, v) = get_json(&app, "/api/issues").await;
     assert_eq!(st, StatusCode::OK);
@@ -1802,7 +1799,7 @@ async fn list_events_returns_the_tail_newest_first_with_keys(pool: PgPool) -> Re
         None,
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .clone()
@@ -1830,7 +1827,7 @@ async fn list_events_returns_the_tail_newest_first_with_keys(pool: PgPool) -> Re
 async fn events_stream_emits_a_transition_as_sse_json(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let app = app(db.clone(), Arc::new(Recorder::default()));
+    let app = app(db.clone());
 
     let res = app
         .oneshot(HttpRequest::get("/api/events/stream").body(Body::empty())?)
@@ -1888,10 +1885,10 @@ async fn events_stream_emits_a_transition_as_sse_json(pool: PgPool) -> Result<()
 async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let recorder = Arc::new(Recorder::default());
-    let app = app_with_roles(
+    let sink = test_sink();
+    let app = app_with_sink(
         db.clone(),
-        recorder.clone(),
+        sink.clone(),
         vec![],
         vec!["operator".to_string()],
     );
@@ -1911,7 +1908,7 @@ async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Re
     assert_eq!(v["reason"], "no repro");
 
     {
-        let calls = recorder.calls.lock().expect("lock");
+        let calls = sink.pending();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].key.0, "owner/repo#1");
         assert_eq!(calls[0].kind, OverrideKind::Park);
@@ -1931,8 +1928,8 @@ async fn park_json_enqueues_override_without_touching_the_db(pool: PgPool) -> Re
 async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let recorder = Arc::new(Recorder::default());
-    let app = app_with_roles(db, recorder.clone(), vec![], vec!["wren".to_string()]);
+    let sink = test_sink();
+    let app = app_with_sink(db, sink.clone(), vec![], vec!["wren".to_string()]);
 
     let res = app
         .oneshot(
@@ -1947,7 +1944,7 @@ async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()
     let v: serde_json::Value = serde_json::from_slice(&body)?;
     assert_eq!(v["actor"], "wren", "ack echoes the actor");
 
-    let calls = recorder.calls.lock().expect("lock");
+    let calls = sink.pending();
     assert_eq!(calls[0].actor.as_deref(), Some("wren"));
     Ok(())
 }
@@ -1957,10 +1954,10 @@ async fn park_carries_the_proxy_identity_as_the_actor(pool: PgPool) -> Result<()
 async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let recorder = Arc::new(Recorder::default());
-    let app = app_with_roles(
+    let sink = test_sink();
+    let app = app_with_sink(
         db.clone(),
-        recorder.clone(),
+        sink.clone(),
         vec![],
         vec!["operator".to_string()],
     );
@@ -1977,7 +1974,7 @@ async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
     assert_eq!(res.headers().get(header::LOCATION).unwrap(), "/inbox");
 
     {
-        let calls = recorder.calls.lock().expect("lock");
+        let calls = sink.pending();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].reason.as_deref(), Some("no repro"));
     }
@@ -1993,8 +1990,8 @@ async fn park_form_redirects_and_enqueues(pool: PgPool) -> Result<()> {
 async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let recorder = Arc::new(Recorder::default());
-    let app = app_with_roles(db, recorder.clone(), vec![], vec!["operator".to_string()]);
+    let sink = test_sink();
+    let app = app_with_sink(db, sink.clone(), vec![], vec!["operator".to_string()]);
 
     let res = app
         .clone()
@@ -2017,7 +2014,7 @@ async fn unpark_and_bump_enqueue_without_a_body(pool: PgPool) -> Result<()> {
         .await?;
     assert_eq!(res.status(), StatusCode::ACCEPTED);
 
-    let calls = recorder.calls.lock().expect("lock");
+    let calls = sink.pending();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].kind, OverrideKind::Unpark);
     assert_eq!(calls[1].kind, OverrideKind::Bump);
@@ -2124,7 +2121,7 @@ async fn funnel_returns_a_stage_for_every_pipeline_bucket(pool: PgPool) -> Resul
 async fn auth_guard_rejects_without_bearer_and_allows_with_it() -> Result<()> {
     let pool = crate::connect(&crate::test_ledger_url()).await?;
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default())).layer(axum::middleware::from_fn_with_state(
+    let app = app(db).layer(axum::middleware::from_fn_with_state(
         Arc::new(crate::identity::auth::BearerGuard {
             expected: crate::identity::auth::SharedToken::new("s3cr3t"),
             ..crate::identity::auth::BearerGuard::default()
@@ -2168,7 +2165,7 @@ async fn the_static_token_is_whoami_as_the_configured_identity(pool: PgPool) -> 
     };
     let state = |admins: Vec<String>| ApiState {
         roles: crate::identity::auth::Roles::new(admins, vec![], vec!["team-x".to_string()]),
-        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+        ..ApiState::test(db.clone())
     };
     let probe = |app: Router, spoof: bool| async move {
         let mut req =
@@ -2275,7 +2272,7 @@ async fn get_approvals_returns_awaiting_approval_and_kept_prs(pool: PgPool) -> R
     )
     .await?;
 
-    let on = app(db.clone(), Arc::new(Recorder::default()));
+    let on = app(db.clone());
     let (status, v) = get_json_object(&on, "/api/approvals").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(v["awaiting_approval"].as_array().unwrap().len(), 1);
@@ -2285,7 +2282,7 @@ async fn get_approvals_returns_awaiting_approval_and_kept_prs(pool: PgPool) -> R
 
     let off = router(ApiState {
         autoresearch: false,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
     let (status, v) = get_json_object(&off, "/api/approvals").await;
     assert_eq!(status, StatusCode::OK);
@@ -2299,7 +2296,7 @@ async fn get_approvals_returns_awaiting_approval_and_kept_prs(pool: PgPool) -> R
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn the_autoresearch_routes_are_served_only_with_the_lane_on(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let state = ApiState::test(db.clone(), Arc::new(Recorder::default()));
+    let state = ApiState::test(db.clone());
     #[cfg(feature = "autoresearch")]
     let state = ApiState {
         autoresearch: false,
@@ -2325,7 +2322,7 @@ async fn the_autoresearch_routes_are_served_only_with_the_lane_on(pool: PgPool) 
     let (status, _) = get_json_object(&off, "/api/playbooks").await;
     assert_eq!(status, StatusCode::OK);
 
-    let on = app(db, Arc::new(Recorder::default()));
+    let on = app(db);
     let (_, version) = get_json_object(&on, "/api/version").await;
     assert_eq!(version["autoresearch"], cfg!(feature = "autoresearch"));
     let (status, _) = get_json_object(&on, "/api/issues").await;
@@ -2405,7 +2402,7 @@ async fn issue_surfaces_carry_the_latest_kept_pr_url(pool: PgPool) -> Result<()>
         .await?;
     }
 
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .clone()
         .oneshot(HttpRequest::get("/api/issues").body(Body::empty())?)
@@ -2467,7 +2464,7 @@ async fn get_scope_evidence_parses_the_refine_trail_off_the_stored_pack(
         .await
         .expect("store pack");
 
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(
             HttpRequest::get(format!("/api/approvals/{scope_id}/evidence")).body(Body::empty())?,
@@ -2510,7 +2507,7 @@ async fn get_scope_evidence_is_empty_trail_for_a_pack_with_no_refine_section(
         .await
         .expect("store pack");
 
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(
             HttpRequest::get(format!("/api/approvals/{scope_id}/evidence")).body(Body::empty())?,
@@ -2526,7 +2523,7 @@ async fn get_scope_evidence_is_empty_trail_for_a_pack_with_no_refine_section(
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_scope_evidence_404s_an_unknown_scope(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(HttpRequest::get("/api/approvals/999/evidence").body(Body::empty())?)
         .await?;
@@ -2573,7 +2570,7 @@ async fn get_scope_report_serves_the_latest_structured_report(pool: PgPool) -> R
     )
     .await?;
 
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(HttpRequest::get("/api/issues/owner%2Frepo%231/scope-report").body(Body::empty())?)
         .await?;
@@ -2594,7 +2591,7 @@ async fn get_scope_report_serves_the_latest_structured_report(pool: PgPool) -> R
 async fn get_scope_report_404s_an_issue_with_no_report(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(HttpRequest::get("/api/issues/owner%2Frepo%231/scope-report").body(Body::empty())?)
         .await?;
@@ -2631,7 +2628,7 @@ async fn get_scope_transcript_serves_the_stored_ndjson_decompressed(pool: PgPool
     )
     .await?;
 
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(
             HttpRequest::get("/api/issues/owner%2Frepo%231/scope-transcript").body(Body::empty())?,
@@ -2654,7 +2651,7 @@ async fn get_scope_transcript_serves_the_stored_ndjson_decompressed(pool: PgPool
 async fn get_scope_transcript_404s_an_issue_with_no_transcript(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(
             HttpRequest::get("/api/issues/owner%2Frepo%231/scope-transcript").body(Body::empty())?,
@@ -2676,7 +2673,7 @@ async fn get_repos_returns_repo_health(pool: PgPool) -> Result<()> {
     );
     crate::issues::store::set_watermark(db.pool(), "owner/repo", "2025-01-05T12:00:00Z").await?;
 
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(HttpRequest::get("/api/repos").body(Body::empty())?)
         .await?;
@@ -3058,10 +3055,11 @@ async fn pause_resume_unwatch_require_admin_and_transition_correctly(pool: PgPoo
 async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let recorder = Arc::new(Recorder::default());
+    let sink = test_sink();
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
-        ..ApiState::test(db, recorder.clone())
+        sink: sink.clone(),
+        ..ApiState::test(db)
     });
 
     // The trigger is admin-gated: a non-admin identity is refused before the sink.
@@ -3093,7 +3091,7 @@ async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Re
     assert_eq!(v["reason"], "customer escalation");
     assert_eq!(v["actor"], "wren");
 
-    let calls = recorder.calls.lock().expect("lock");
+    let calls = sink.pending();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, "owner/repo#1");
     assert!(
@@ -3113,10 +3111,11 @@ async fn scope_now_post_enqueues_override_with_justification(pool: PgPool) -> Re
 async fn redispatch_post_enqueues_override_and_is_admin_gated(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let recorder = Arc::new(Recorder::default());
+    let sink = test_sink();
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
-        ..ApiState::test(db, recorder.clone())
+        sink: sink.clone(),
+        ..ApiState::test(db)
     });
 
     // Admin-gated like scope_now: a non-admin identity is refused before the sink.
@@ -3149,7 +3148,7 @@ async fn redispatch_post_enqueues_override_and_is_admin_gated(pool: PgPool) -> R
     assert_eq!(v["actor"], "wren");
 
     // The POST only enqueued an intent — it never wrote the DB (reconcile is the only writer).
-    let calls = recorder.calls.lock().expect("lock");
+    let calls = sink.pending();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].key.0, "owner/repo#1");
     assert!(
@@ -3218,7 +3217,7 @@ async fn artifact_manifest_lists_local_files_and_derives_for_s3(pool: PgPool) ->
         },
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .clone()
@@ -3279,7 +3278,7 @@ async fn artifact_manifest_lists_local_files_and_derives_for_s3(pool: PgPool) ->
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn playbook_limits_report_the_draft_caps_and_the_delivery_budget(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .oneshot(HttpRequest::get("/api/playbook-limits").body(Body::empty())?)
@@ -3303,7 +3302,7 @@ async fn playbook_limits_report_the_draft_caps_and_the_delivery_budget(pool: PgP
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .oneshot(HttpRequest::get("/api/openapi.json").body(Body::empty())?)
@@ -3543,7 +3542,7 @@ async fn rerank_endpoints_are_admin_only(pool: PgPool) -> Result<()> {
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
     // Neither anonymous, a viewer, nor an operator may force a re-rank — only admin.
     for (admins, operators) in [(vec![], vec![]), (vec![], vec!["bob".to_string()])] {
-        let app = app_with_roles(db.clone(), Arc::new(Recorder::default()), admins, operators);
+        let app = app_with_roles(db.clone(), admins, operators);
         for (path, body) in [
             ("/api/issues/owner%2Frepo%231/rerank", ""),
             ("/api/issues/rerank", r#"{"scope":"all"}"#),
@@ -3715,7 +3714,7 @@ fn app_with_reconcile(db: Db, admins: Vec<String>, notify: Arc<tokio::sync::Noti
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, vec![], vec![]),
         reconcile_now: notify,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -3822,7 +3821,7 @@ async fn empty_admin_list_locks_closed(pool: PgPool) -> Result<()> {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_autopilot_returns_default_enabled(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
 
     let res = app
         .oneshot(HttpRequest::get("/api/autopilot").body(Body::empty())?)
@@ -3893,12 +3892,7 @@ async fn whoami_reports_admin_status(pool: PgPool) -> Result<()> {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn whoami_reports_role_for_admin_operator_and_viewer(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app_with_roles(
-        db,
-        Arc::new(Recorder::default()),
-        vec!["alice".to_string()],
-        vec!["bob".to_string()],
-    );
+    let app = app_with_roles(db, vec!["alice".to_string()], vec!["bob".to_string()]);
 
     let whoami_as = |app: Router, user: &str| {
         let user = user.to_string();
@@ -3972,7 +3966,6 @@ async fn operator_guard_covers_park_unpark_bump_for_every_tier(pool: PgPool) -> 
         // Viewer (unknown login): 403.
         let app = app_with_roles(
             db.clone(),
-            Arc::new(Recorder::default()),
             vec!["alice".to_string()],
             vec!["bob".to_string()],
         );
@@ -3989,7 +3982,6 @@ async fn operator_guard_covers_park_unpark_bump_for_every_tier(pool: PgPool) -> 
         // Operator: passes.
         let app = app_with_roles(
             db.clone(),
-            Arc::new(Recorder::default()),
             vec!["alice".to_string()],
             vec!["bob".to_string()],
         );
@@ -4006,7 +3998,6 @@ async fn operator_guard_covers_park_unpark_bump_for_every_tier(pool: PgPool) -> 
         // Admin: passes too (admin implies operator).
         let app = app_with_roles(
             db.clone(),
-            Arc::new(Recorder::default()),
             vec!["alice".to_string()],
             vec!["bob".to_string()],
         );
@@ -4030,7 +4021,7 @@ async fn operator_guard_covers_park_unpark_bump_for_every_tier(pool: PgPool) -> 
 async fn empty_operator_list_locks_closed(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let app = app_with_roles(db, Arc::new(Recorder::default()), vec![], vec![]);
+    let app = app_with_roles(db, vec![], vec![]);
 
     let res = app
         .oneshot(
@@ -4051,12 +4042,7 @@ async fn empty_operator_list_locks_closed(pool: PgPool) -> Result<()> {
 async fn operator_alone_cannot_scope_now_or_set_autopilot(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
-    let app = app_with_roles(
-        db,
-        Arc::new(Recorder::default()),
-        vec![],
-        vec!["bob".to_string()],
-    );
+    let app = app_with_roles(db, vec![], vec!["bob".to_string()]);
 
     let res = app
         .clone()
@@ -4143,7 +4129,7 @@ fn app_with_config(db: Db, admins: Vec<String>, store: ConfigStore) -> Router {
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, vec![], vec![]),
         config: Some(store),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -4205,7 +4191,7 @@ async fn get_config_reports_every_dispatch_target_contract(pool: PgPool) -> Resu
     let app = router(ApiState {
         config: Some(test_store()),
         contracts: registry,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
     let res = app
         .oneshot(HttpRequest::get("/api/config").body(Body::empty())?)
@@ -4246,7 +4232,7 @@ async fn get_config_reports_every_dispatch_target_contract(pool: PgPool) -> Resu
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_config_503_without_a_store(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(HttpRequest::get("/api/config").body(Body::empty())?)
         .await?;
@@ -5168,7 +5154,7 @@ async fn with_the_issuer_an_approval_dispatches_for_the_approver(pool: PgPool) -
     let app = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         agent_tools: true,
-        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+        ..ApiState::test(db.clone())
     });
 
     let res = app
@@ -5306,7 +5292,7 @@ fn app_with_emission(db: Db, admins: Vec<String>, emitter: Option<Arc<MemEmitter
             labels: vec!["agentops".to_string()],
             public_url: None,
         }),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -5628,7 +5614,7 @@ async fn flow_enriched_renders_caches_and_serves(pool: PgPool) -> Result<()> {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn flow_enriched_rejects_a_bad_trace_id(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     for uri in [
         "/api/runs/run-1/flow-enriched?trace_id=abc%2F..%2Fx",
         "/api/runs/run-1/flow-enriched?trace_id=",
@@ -5763,7 +5749,7 @@ async fn app_with_sessions(db: Db, pool: PgPool) -> Router {
         .await
         .expect("session store");
     crate::human_router(
-        ApiState::test(db, Arc::new(Recorder::default())),
+        ApiState::test(db),
         store,
         true,
         crate::HumanAuth {
@@ -6348,12 +6334,7 @@ async fn post_json_as(
 async fn an_operator_proposes_an_import_and_an_admin_registers_it(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
     let repo = import_fixture(dir.path(), IMPORT_WORKFLOW);
-    let app = app_with_roles(
-        db,
-        Arc::new(Recorder::default()),
-        vec!["wren".to_string()],
-        vec!["dana".to_string()],
-    );
+    let app = app_with_roles(db, vec!["wren".to_string()], vec!["dana".to_string()]);
 
     let (status, listed) = post_json_as(
         &app,
@@ -6566,12 +6547,7 @@ async fn discarding_an_import_closes_it(pool: PgPool) -> Result<()> {
 async fn a_pending_import_opens_as_a_draft(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
     let repo = import_fixture(dir.path(), IMPORT_WORKFLOW);
-    let app = app_with_roles(
-        db,
-        Arc::new(Recorder::default()),
-        vec!["wren".to_string()],
-        vec!["dana".to_string()],
-    );
+    let app = app_with_roles(db, vec!["wren".to_string()], vec!["dana".to_string()]);
 
     let (status, import) = post_json_as(
         &app,
@@ -6613,12 +6589,7 @@ async fn opening_an_unconvertible_import_as_a_draft_is_refused_naming_the_reason
 ) -> Result<()> {
     let (db, dir) = db_with(pool.clone());
     let repo = import_fixture(dir.path(), IMPORT_WORKFLOW);
-    let app = app_with_roles(
-        db,
-        Arc::new(Recorder::default()),
-        vec!["wren".to_string()],
-        vec!["dana".to_string()],
-    );
+    let app = app_with_roles(db, vec!["wren".to_string()], vec!["dana".to_string()]);
     let (status, import) = post_json_as(
         &app,
         "/api/playbooks/imports",
@@ -6654,12 +6625,7 @@ async fn opening_an_unconvertible_import_as_a_draft_is_refused_naming_the_reason
 async fn a_draft_opens_straight_from_git_carrying_its_import(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
     let repo = import_fixture(dir.path(), IMPORT_WORKFLOW);
-    let app = app_with_roles(
-        db,
-        Arc::new(Recorder::default()),
-        vec!["wren".to_string()],
-        vec!["dana".to_string()],
-    );
+    let app = app_with_roles(db, vec!["wren".to_string()], vec!["dana".to_string()]);
 
     let from_git = serde_json::json!({
         "id": "survey-draft",
@@ -6820,7 +6786,7 @@ async fn the_co_draft_skill_downloads_with_this_deployments_url(pool: PgPool) ->
     let (db, _dir) = db_with(pool);
     let app = router(ApiState {
         public_url: Some("https://crucible.example.com".to_string()),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
 
     let res = app
@@ -6865,7 +6831,7 @@ async fn the_co_draft_setup_falls_back_to_the_forwarded_host(pool: PgPool) -> Re
             crate::config::PlaybookExecutor::Local,
             false,
         ),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
 
     let body = |req: HttpRequest<Body>| {
@@ -6913,7 +6879,7 @@ async fn the_co_draft_setup_mints_a_key_and_points_at_the_mcp_surface(pool: PgPo
     let (db, _dir) = db_with(pool);
     let app = router(ApiState {
         public_url: Some("https://crucible.example.com".to_string()),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
     let (status, json) = get_json_object(&app, "/api/playbooks/drafts/co-draft").await;
     assert_eq!(status, StatusCode::OK);
@@ -7058,12 +7024,7 @@ async fn a_re_import_carries_the_new_form_while_the_registry_serves_the_old(
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn import_endpoints_hold_their_roles(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app_with_roles(
-        db,
-        Arc::new(Recorder::default()),
-        vec!["wren".to_string()],
-        vec!["dana".to_string()],
-    );
+    let app = app_with_roles(db, vec!["wren".to_string()], vec!["dana".to_string()]);
 
     for uri in ["/api/playbooks/import/candidates", "/api/playbooks/imports"] {
         let (status, _) = post_json_as(
@@ -7119,7 +7080,7 @@ fn app_with_playbook_caps(
     router(ApiState {
         roles: crate::identity::auth::Roles::new(admins, vec![], vec![]),
         playbook_caps: caps,
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -7322,7 +7283,7 @@ async fn launching_a_backend_this_deployment_cannot_dispatch_is_refused(
             crate::config::PlaybookExecutor::Pod,
             false,
         ),
-        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+        ..ApiState::test(db.clone())
     });
     let digest = register_survey_with(&app, dir.path(), LAUNCH_WORKFLOW, OPENSHELL_MANIFEST).await;
 
@@ -7385,7 +7346,7 @@ async fn the_same_backend_launches_where_a_cluster_is_reachable(pool: PgPool) ->
             crate::config::PlaybookExecutor::Pod,
             true,
         ),
-        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+        ..ApiState::test(db.clone())
     });
     let digest = register_survey_with(&app, dir.path(), LAUNCH_WORKFLOW, OPENSHELL_MANIFEST).await;
     let (status, ack) = post_launch(
@@ -7546,7 +7507,7 @@ async fn launching_an_unregistered_playbook_is_404(pool: PgPool) -> Result<()> {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn dispatch_targets_for_an_unregistered_playbook_is_404(pool: PgPool) -> Result<()> {
     let (db, _dir) = db_with(pool);
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .oneshot(HttpRequest::get("/api/dispatch-targets?playbook=nope").body(Body::empty())?)
         .await?;
@@ -9535,7 +9496,7 @@ async fn graduating_as_yourself_pushes_with_your_own_github_token(pool: PgPool) 
             ("notes".to_string(), "not a token".to_string()),
             ("bob-pat".to_string(), "ghp-bob-4567".to_string()),
         ]))),
-        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+        ..ApiState::test(db.clone())
     });
     let (status, body) = post_admin(
         &app,
@@ -10363,7 +10324,7 @@ async fn task_evidence_serves_the_payload_note_and_captured_files(pool: PgPool) 
     evidence_rig(&db, dir.path()).await?;
     let app = router(ApiState {
         scratch_dir: dir.path().to_path_buf(),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
 
     let (status, ev) =
@@ -10456,7 +10417,7 @@ async fn run_graph_and_evidence_serve_each_attempts_output(pool: PgPool) -> Resu
     }
     let app = router(ApiState {
         scratch_dir: dir.path().to_path_buf(),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
 
     let (st, v) = get_json_object(&app, "/api/runs/run-out/graph").await;
@@ -10499,7 +10460,7 @@ async fn task_evidence_refuses_a_traversal(pool: PgPool) -> Result<()> {
     )?;
     let app = router(ApiState {
         scratch_dir: dir.path().to_path_buf(),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
 
     for path in [
@@ -10564,7 +10525,7 @@ async fn a_run_lists_and_serves_the_files_its_tasks_captured(pool: PgPool) -> Re
     .await?;
     let app = router(ApiState {
         scratch_dir: dir.path().to_path_buf(),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
 
     // The local run: `evidence_rig` wrote one capture under a fan-out instance's own directory.
@@ -10648,7 +10609,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
     .await?;
     let app = router(ApiState {
         scratch_dir: dir.path().to_path_buf(),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     });
 
     // Before the supervisor writes one, a local run says where its log would be.
@@ -10838,7 +10799,7 @@ async fn the_mcp_surface_speaks_mcp_to_a_key_and_nothing_to_anyone_else(
 
     let (db, _d) = db_with(pool.clone());
     let app = crate::mcp::router(
-        app(db, Arc::new(Recorder::default())),
+        app(db),
         crate::identity::auth::KeyGuard {
             pool,
             refresh: None,
@@ -13175,7 +13136,7 @@ fn catalog_image(
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn list_images_serves_the_cached_catalog_with_verification_state(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
-    let app = app(db.clone(), Arc::new(Recorder::default()));
+    let app = app(db.clone());
 
     // Nothing configured yet: an empty catalog, not an error.
     let (st, v) = get_json_object(&app, "/api/images").await;
@@ -13227,7 +13188,7 @@ async fn refresh_images_is_admin_only_and_wakes_the_watcher(pool: PgPool) -> Res
     let (db, _d) = db_with(pool);
     let state = ApiState {
         roles: crate::identity::auth::Roles::new(vec!["alice".into()], vec![], vec![]),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     };
     let refresh = state.images_refresh();
     let app = router(state);
@@ -13466,7 +13427,7 @@ async fn rank_images_orders_compatible_images_and_names_exclusions(pool: PgPool)
         },
     )
     .await?;
-    let app = app(db, Arc::new(Recorder::default()));
+    let app = app(db);
     let res = app
         .clone()
         .oneshot(
@@ -13703,7 +13664,6 @@ async fn an_import_is_readable_and_drivable_by_its_owner_alone(pool: PgPool) -> 
     let repo = import_fixture(dir.path(), IMPORT_WORKFLOW);
     let app = app_with_roles(
         db,
-        Arc::new(Recorder::default()),
         vec!["wren".to_string()],
         vec!["alice".to_string(), "bob".to_string()],
     );
@@ -13803,7 +13763,7 @@ fn app_with_webhook_keys(db: Db) -> Router {
                 .expect("keys"),
         )),
         hooks_public_url: Some("https://hooks.example.com/".to_string()),
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     })
 }
 
@@ -13997,7 +13957,7 @@ async fn a_webhook_save_refuses_each_bad_field(pool: PgPool) -> Result<()> {
             crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![5u8; 32]])
                 .expect("keys"),
         )),
-        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+        ..ApiState::test(db.clone())
     });
     register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
 
@@ -14357,7 +14317,7 @@ async fn team_secret_draft(
             max_cost: 10.0,
             max_time: crate::model::MaxTime::parse("2h").expect("cap"),
         },
-        ..ApiState::test(db, Arc::new(Recorder::default()))
+        ..ApiState::test(db)
     };
     let open = router(state.clone());
     let mut guard = crate::identity::auth::BearerGuard::new(

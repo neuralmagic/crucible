@@ -2,7 +2,8 @@
 //! modules depend on this and on [`crate::api::dto`]; only [`crate::api`] itself assembles the router.
 
 use crate::client::Db;
-use crate::daemon::queue::{OverrideSink, WorkQueue};
+use crate::daemon::overrides::QueueOverrideSink;
+use crate::daemon::queue::WorkQueue;
 #[cfg(feature = "autoresearch")]
 use crate::issues::repo_ref::RepoWhitelist;
 use axum::extract::{FromRequest, Request};
@@ -53,7 +54,7 @@ pub struct Caps {
 pub struct ApiState {
     pub(crate) db: Db,
     pub(crate) schedules: crate::launches::schedules::ScheduleStore,
-    pub(crate) sink: Arc<dyn OverrideSink>,
+    pub(crate) sink: QueueOverrideSink,
     pub(crate) queue: WorkQueue,
     pub(crate) caps: Option<Caps>,
     pub(crate) roles: crate::identity::auth::Roles,
@@ -183,7 +184,7 @@ impl ApiState {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Db,
-        sink: Arc<dyn OverrideSink>,
+        sink: QueueOverrideSink,
         queue: WorkQueue,
         clusters: Arc<crate::runs::clusters::ClusterClients>,
         config: Option<crate::daemon::overrides_store::ConfigStore>,
@@ -347,18 +348,22 @@ impl ApiState {
 #[cfg(test)]
 impl ApiState {
     /// Baseline router state for tests: guards off, stores absent, loopback defaults. Override the
-    /// few fields a test cares about with `..ApiState::test(db, sink)` struct-update syntax.
-    pub(crate) fn test(db: Db, sink: Arc<dyn OverrideSink>) -> Self {
+    /// few fields a test cares about with `..ApiState::test(db)` struct-update syntax.
+    pub(crate) fn test(db: Db) -> Self {
         let schedules = crate::launches::schedules::ScheduleStore::new(db.clone());
         #[cfg(feature = "autoresearch")]
         let autopilot =
             crate::daemon::autopilot_flag::AutopilotFlag::seeded(db.pool().clone(), true);
         let clusters = Arc::new(crate::runs::clusters::ClusterClients::new(None));
+        let queue = WorkQueue::new();
         Self {
             db,
             schedules,
-            sink,
-            queue: WorkQueue::new(),
+            sink: QueueOverrideSink::new(
+                Arc::new(crate::daemon::overrides::OverrideStore::new()),
+                queue.clone(),
+            ),
+            queue,
             caps: None,
             roles: crate::identity::auth::Roles::new(vec![], vec![], vec![]),
             #[cfg(feature = "autoresearch")]

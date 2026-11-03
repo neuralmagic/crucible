@@ -93,13 +93,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use serde_json::{Value, json};
     use sqlx::PgPool;
-    use std::sync::Arc;
     use tower::ServiceExt;
-
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
 
     /// The API router, with the identity routes on, as `require_auth` admitted `login` on `path`
     /// with issuer subject `sub`.
@@ -107,7 +101,7 @@ mod tests {
         let state = crate::api::state::ApiState {
             roles: Roles::new(vec!["admin".to_string()], vec![], vec![]),
             identities: true,
-            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
+            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()))
         };
         let resolved = Resolved {
             user: Some(login.to_string()),
