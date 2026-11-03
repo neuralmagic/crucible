@@ -2145,6 +2145,7 @@ dependencies = [
  "kube",
  "moka",
  "reqwest",
+ "rmcp",
  "rustls",
  "serde",
  "serde_json",

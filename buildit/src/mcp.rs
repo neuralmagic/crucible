@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Request, State};
 use axum::http::request::Parts;
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use clap::Args;
@@ -22,8 +22,6 @@ use rmcp::model::{
     Task, TaskPayload, TaskStatus,
 };
 use rmcp::service::RequestContext;
-use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
-use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{ErrorData as McpError, RoleServer};
 use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
@@ -36,11 +34,12 @@ use crate::step::{self, Fetch, Published, Snapshot, Status};
 use crate::task::{self, Progress, TaskRef};
 use crucible_mcp_auth::access::{AccessCheck, AccessRules, Call};
 use crucible_mcp_auth::guard::PolicyGuard;
+use crucible_mcp_auth::mount::{Mount, mcp_router, stateless_config};
 use crucible_mcp_auth::policy::Refusal;
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::principal::{Callers, Principal};
 use crucible_mcp_auth::server::{
-    AuthError, JwksTls, ResourceServer, ResourceServerConfig, TrustedIssuer,
+    AuthError, JwksTls, ResourceServer, ResourceServerConfig, TrustedIssuer, bearer_token,
 };
 
 pub const MCP_PATH: &str = "/mcp";
@@ -241,26 +240,15 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
 /// The MCP endpoint behind authentication and the guard: [`BuilditRules`] decide which calls
 /// exist and their scopes, and `policy` adds validate and mutate rules.
 pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -> axum::Router {
-    let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
-    hosts.extend(SANDBOX_HOSTS.map(String::from));
-    hosts.extend(extra_hosts.iter().map(|h| h.trim().to_string()));
-    let config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
-        .with_json_response(true)
+    let hosts: Vec<String> = SANDBOX_HOSTS
+        .iter()
+        .map(|h| h.to_string())
+        .chain(extra_hosts.iter().cloned())
+        .collect();
+    let config = stateless_config(&hosts)
         .with_sse_keep_alive(None)
-        .with_sse_retry(None)
-        .with_allowed_hosts(hosts);
+        .with_sse_retry(None);
     let served = broker.clone();
-    let service: StreamableHttpService<BuilditMcp, NeverSessionManager> =
-        StreamableHttpService::new(
-            move || {
-                Ok(BuilditMcp {
-                    broker: served.clone(),
-                })
-            },
-            Arc::new(NeverSessionManager::default()),
-            config,
-        );
     let oidc = broker.oidc.clone();
     let guard = PolicyGuard {
         policy,
@@ -268,18 +256,20 @@ pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -
         server: oidc.clone(),
         reviewer: None,
     };
-    let mcp = axum::Router::new()
-        .fallback_service(service)
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(guard),
-            crucible_mcp_auth::guard::enforce,
-        ))
-        .layer(axum::middleware::from_fn_with_state(broker, authenticate));
-    let app = axum::Router::new().nest_service(MCP_PATH, mcp);
-    match oidc {
-        Some(server) => app.merge(crucible_mcp_auth::metadata::router(server)),
-        None => app,
-    }
+    mcp_router(
+        move || {
+            Ok(BuilditMcp {
+                broker: served.clone(),
+            })
+        },
+        axum::middleware::from_fn_with_state(broker, authenticate),
+        Mount {
+            path: MCP_PATH,
+            config,
+            guard,
+            metadata: oidc,
+        },
+    )
 }
 
 async fn authenticate(State(broker): State<Arc<Broker>>, mut req: Request, next: Next) -> Response {
@@ -295,15 +285,6 @@ async fn authenticate(State(broker): State<Arc<Broker>>, mut req: Request, next:
 
 fn is_jwt(token: &str) -> bool {
     token.split('.').count() == 3
-}
-
-fn bearer(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .filter(|t| !t.is_empty())
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -837,7 +818,7 @@ impl Broker {
     /// A realm access token when OIDC is on and the bearer is a JWT, otherwise a tokens-file
     /// token. A JWT never falls back to the tokens file.
     async fn authenticate(&self, headers: &HeaderMap) -> Result<(Caller, Principal), Refused> {
-        if let (Some(oidc), Some(token)) = (&self.oidc, bearer(headers))
+        if let (Some(oidc), Some(token)) = (&self.oidc, bearer_token(headers))
             && is_jwt(token)
         {
             let principal = oidc.authenticate(headers).await.map_err(|error| {
@@ -862,7 +843,7 @@ impl Broker {
                 Ok((caller, principal))
             }
             Err(StatusCode::UNAUTHORIZED) if self.oidc.is_some() => {
-                Err(Refused::Token(match bearer(headers) {
+                Err(Refused::Token(match bearer_token(headers) {
                     None => AuthError::Missing,
                     Some(_) => AuthError::Unrecognized,
                 }))
@@ -937,7 +918,7 @@ impl Broker {
     }
 
     async fn caller(&self, headers: &HeaderMap) -> Result<Caller, StatusCode> {
-        let token = bearer(headers).ok_or(StatusCode::UNAUTHORIZED)?;
+        let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
         let tokens_file = self.tokens_file.as_ref().ok_or(StatusCode::UNAUTHORIZED)?;
         let lines = tokio::fs::read_to_string(tokens_file)
             .await
