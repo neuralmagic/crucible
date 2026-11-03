@@ -163,7 +163,7 @@ jobs:
           tasks/scripts/verify-glibc-symbols.sh 2.39 target/release/openshell-supervisor
           mkdir -p ../dist/supervisor
           cp target/release/openshell-supervisor ../dist/supervisor/
-          cp ../Containerfile.openshell-supervisor ../dist/supervisor/
+          cp ../docker/Containerfile.openshell-supervisor ../dist/supervisor/
 
       - name: Build sandbox runtime (musl static)
         if: steps.exists.outputs.skip != 'true'
@@ -217,7 +217,7 @@ jobs:
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: dist/bin
-          file: Containerfile.openshell-dist
+          file: docker/Containerfile.openshell-dist
           platforms: linux/amd64
           push: true
           tags: ghcr.io/neuralmagic/openshell-gateway:sha-${{ steps.rev.outputs.rev }}

@@ -2096,7 +2096,7 @@ Do these steps in this order. The issuer must not issue agent tokens before gate
 in place.
 
 1. Build the images from the same commit: the loop image, the controller image and the
-   `crucible-kueue` image (`Containerfile.kueue`). The loop image must contain
+   `crucible-kueue` image (`docker/Containerfile.kueue`). The loop image must contain
    `crucible openshell-gateway`, `openshell-gateway` and `buildit`.
 2. On each cluster that hosts runs, install SPIRE with the OIDC discovery provider. Add a
    ClusterSPIFFEID for supervisor pods in the sandbox namespace, with `jwtTtl: 5m` and the

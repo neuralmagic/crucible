@@ -13,7 +13,7 @@ default:
 # The OpenShell fork rev pinned in Cargo.lock (openshell-core's git source). The runtime image
 # takes it as --build-arg OPENSHELL_REV so its gateway/CLI match the rev crucible's gRPC
 # client compiled against, e.g.:
-#   docker build -f Containerfile.runtime --build-arg OPENSHELL_REV=$(just openshell-rev) .
+#   docker build -f docker/Containerfile.runtime --build-arg OPENSHELL_REV=$(just openshell-rev) .
 openshell-rev:
     @cargo xtask openshell-rev
 
@@ -192,10 +192,11 @@ revise-loop-e2e:
 # End-to-end proof that a sandboxed agent reaches crucible-kueue with an agent token its own
 # supervisor obtained: a controller in the cluster dispatches e2e/kueue/pack, and the script checks
 # the issued token, the Job and the agent's whoami (scenario in the script header). Images come
-# from Containerfile.runtime-selfcontained, Containerfile.controller-selfcontained on top of it, and
-# Containerfile.kueue, built from this checkout. KEEP=1 leaves everything behind. It runs on
-# OpenShift or plain Kubernetes (detected); the script header lists the per-platform values the
-# environment may set (PLATFORM, SPIRE_NS, CLUSTER_QUEUE, ANTHROPIC_KEY_FILE, ...).
+# from docker/Containerfile.runtime-selfcontained, docker/Containerfile.controller-selfcontained on
+# top of it, and docker/Containerfile.kueue, built from this checkout. KEEP=1 leaves everything
+# behind. It runs on OpenShift or plain Kubernetes (detected); the script header lists the
+# per-platform values the environment may set (PLATFORM, SPIRE_NS, CLUSTER_QUEUE,
+# ANTHROPIC_KEY_FILE, ...).
 kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo anthropic_base_url anthropic_key_secret="" sandbox_scc_role="" loop_scc_role="" pack="e2e/kueue/pack":
     PACK={{pack}} CONTEXT={{context}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} PULL_SECRET={{pull_secret}} PUSH_REPO={{push_repo}} \

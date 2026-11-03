@@ -49,8 +49,9 @@
 #   CONTROLLER_IMAGE=<controller image> PULL_SECRET=<secret> PUSH_REPO=<registry/path> \
 #   ANTHROPIC_BASE_URL=<url> ANTHROPIC_KEY_SECRET=<secret> scripts/kueue-e2e.sh
 #
-# LOOP_IMAGE is Containerfile.runtime-selfcontained built from this checkout, CONTROLLER_IMAGE is
-# Containerfile.controller-selfcontained on top of it, KUEUE_IMAGE is Containerfile.kueue.
+# LOOP_IMAGE is docker/Containerfile.runtime-selfcontained built from this checkout,
+# CONTROLLER_IMAGE is docker/Containerfile.controller-selfcontained on top of it, KUEUE_IMAGE is
+# docker/Containerfile.kueue.
 # On OpenShift, SANDBOX_SCC_ROLE and LOOP_SCC_ROLE name ClusterRoles to bind the sandbox and loop
 # accounts to (an SCC giving the loop pod a writable home).
 # BUILDER_SCC_ROLE (default LOOP_SCC_ROLE) is bound to BUILD_NS's default account, which buildit's

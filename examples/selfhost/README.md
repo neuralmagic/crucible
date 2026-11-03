@@ -54,8 +54,8 @@ Two images, both Rust-capable, because the agent turn and the measure run in dif
 
 | Pod | Image | Recipe |
 | --- | --- | --- |
-| agent sandbox (OpenShell) | `ghcr.io/neuralmagic/crucible-sandbox-rust` | `Containerfile.sandbox-rust` |
-| loop pod (engine + measure) | `ghcr.io/neuralmagic/crucible-rust` | `Containerfile.runtime-rust` |
+| agent sandbox (OpenShell) | `ghcr.io/neuralmagic/crucible-sandbox-rust` | `docker/Containerfile.sandbox-rust` |
+| loop pod (engine + measure) | `ghcr.io/neuralmagic/crucible-rust` | `docker/Containerfile.runtime-rust` |
 
 Both pre-fetch the workspace's `Cargo.lock` deps (plus criterion/divan) so the first
 `cargo bench` in a fresh pod compiles offline. Set `backend = "openshell"`, `sandbox_image`,
