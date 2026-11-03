@@ -20,54 +20,23 @@
 //! from `codemode` scripts, which the turn enables explicitly whenever a server is in scope.
 
 use crate::agent::harness::{
-    ApiEndpoint, AuthProvider, Backend, CRUCIBLE_PROVIDER_ID, HarnessSpec, McpServer, SandboxAuth,
-    SeedFile, StreamDecoder, TranscriptLocator, TurnArtifacts, api_endpoint, json_servers,
-    json_str,
+    ApiEndpoint, Backend, CRUCIBLE_PROVIDER_ID, McpServer, SandboxAuth, SeedFile, StreamDecoder,
+    TurnArtifacts, api_endpoint, json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, VertexConfig, WireApi};
 use crate::args::Args;
-use crate::manifest::ReasoningEffort;
+use crate::manifest::{Harness, ReasoningEffort};
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
+use crucible::harness::HarnessSpec;
 use crucible_harness::tool_summary::summarize;
 use crucible_harness::{LiveMeters, PiJsonParser};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 pub(crate) struct Pi;
 
 impl Pi {
-    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
-        name: "pi",
-        // `pi` is a node script, so the process that opens the socket is node itself (the
-        // sandbox policy matches the kernel-resolved binary); the UBI rpm and a tarball install
-        // put it in different places.
-        binaries: &[
-            "/usr/local/bin/pi",
-            "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/**",
-            "/usr/bin/node",
-            "/usr/bin/node-*",
-            "/usr/local/bin/node",
-        ],
-        // Pi discovers project skills under `.agents/skills` (the Agent Skills layout).
-        skills_dir: ".agents/skills",
-        // Relocates settings, models.json, and the session store off `~/.pi/agent`.
-        home_var: "PI_CODING_AGENT_DIR",
-        home: "/sandbox/.pi/agent",
-        config: "/sandbox/.pi/agent/models.json",
-        sandbox_env: &[("PI_OFFLINE", "1"), ("PI_SKIP_VERSION_CHECK", "1")],
-        local_env: &[("PI_SKIP_VERSION_CHECK", "1")],
-        // `$PI_CODING_AGENT_DIR/sessions/<cwd-slug>/<timestamp>_<id>.jsonl`: one slug segment.
-        transcript: TranscriptLocator::NewestJsonl {
-            sandbox_root: "/sandbox/.pi/agent/sessions",
-            glob: "*/*.jsonl",
-        },
-        transcript_fetch_timeout: Duration::from_secs(30),
-        auth: AuthProvider::ApiKey,
-        otel_capable: false,
-        backfill_required: false,
-    };
-
     /// The shared invocation prefix: `pi --mode json --print --approve --provider crucible
     /// --model <model> [--thinking <level>]`. Prompt delivery is appended by the caller.
     /// `--approve` trusts the workspace's project-local files (the toolbox skills among them)
@@ -255,7 +224,7 @@ fn models_json(model: &str, endpoint: &ApiEndpoint) -> Option<String> {
 
 impl Backend for Pi {
     fn spec(&self) -> &'static HarnessSpec {
-        &Self::SPEC
+        Harness::Pi.spec()
     }
 
     /// Pi's option parser reads any positional starting with `-` as a flag, so the prompt goes
@@ -513,7 +482,7 @@ mod tests {
     use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
 
-    const CONFIG: &str = Pi::SPEC.config;
+    const CONFIG: &str = Harness::Pi.spec().config;
 
     fn args() -> Args {
         crate::cli::Cli::parse_from(["crucible"]).run

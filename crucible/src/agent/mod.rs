@@ -29,7 +29,7 @@ pub(crate) mod relay;
 pub(crate) mod turn;
 
 use crate::agent::event::{AgentEvent, Pricing, RawStream};
-use crate::agent::harness::{HarnessRuntime, StreamDecoder};
+use crate::agent::harness::{StreamDecoder, backend};
 use crate::args::{Args, Paths};
 #[cfg(feature = "autoresearch")]
 use crate::manifest::AgentBackend;
@@ -73,7 +73,7 @@ pub(crate) fn backend_supports_persistent_sessions(
     backend: AgentBackend,
     harness: crate::manifest::Harness,
 ) -> bool {
-    backend == AgentBackend::Command || harness == crate::manifest::Harness::Claude
+    backend == AgentBackend::Command || harness.spec().persistent_sessions
 }
 
 /// A spawned transport: a child process plus the streams a turn reads from it.
@@ -182,11 +182,8 @@ fn local_command(
     session: Option<&crate::agent::agent_session::SessionTurn>,
 ) -> std::io::Result<Command> {
     let argv = match session {
-        Some(session) => args
-            .harness()
-            .backend()
-            .local_session_argv(args, prompt, session)?,
-        None => args.harness().backend().local_argv(args, prompt),
+        Some(session) => backend(args.harness()).local_session_argv(args, prompt, session)?,
+        None => backend(args.harness()).local_argv(args, prompt),
     };
     let Some((program, rest)) = argv.split_first() else {
         return Err(std::io::Error::other("harness produced an empty argv"));
@@ -205,7 +202,7 @@ fn local_command(
     // env_script is built from the manifest env, not the process env).
     cmd.env_remove("TRACEPARENT").env_remove("TRACESTATE");
     // Harness defaults first, so a manifest `[agent].env` override takes precedence.
-    for (k, v) in args.harness().backend().local_env() {
+    for (k, v) in backend(args.harness()).local_env() {
         cmd.env(k, v);
     }
     for (k, v) in &args.env {
@@ -335,9 +332,7 @@ fn run_turn_with(
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
             let decoder =
-                args.harness()
-                    .backend()
-                    .decoder(args, meters.as_ref(), tool_io_full(args));
+                backend(args.harness()).decoder(args, meters.as_ref(), tool_io_full(args));
             cost = pump_stream(out, json, decoder, args.pricing(), &mut sink);
         } else {
             for line in BufReader::new(out).lines().map_while(Result::ok) {
@@ -366,7 +361,7 @@ fn run_turn_with(
     // post-hoc from the local session store. Dead for claude (`backfill_required` is false).
     if matches!(source, AgentSource::LocalClaude)
         && args.harness().spec().backfill_required
-        && let Some(artifacts) = args.harness().backend().local_backfill(p)
+        && let Some(artifacts) = backend(args.harness()).local_backfill(p)
     {
         for ev in &artifacts.events {
             cost.observe(ev);

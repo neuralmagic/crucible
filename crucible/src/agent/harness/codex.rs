@@ -11,19 +11,19 @@
 //! uses an L4 WebSocket tunnel. The real credential therefore has to be in the auth file.
 
 use crate::agent::harness::{
-    AuthProvider, Backend, HarnessSpec, McpServer, SandboxAuth, SeedFile, StreamDecoder,
-    TranscriptLocator, TurnArtifacts, json_str,
+    Backend, McpServer, SandboxAuth, SeedFile, StreamDecoder, TurnArtifacts, json_str,
 };
 use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
 use crate::manifest::{Harness, ReasoningEffort};
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
+use crucible::harness::HarnessSpec;
 use crucible_harness::{CodexJsonParser, LiveMeters};
 use jiff::Timestamp;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 /// Where the seeded access token lands; codex reads it at startup.
 pub(crate) const AUTH: &str = "/sandbox/.codex/auth.json";
@@ -31,31 +31,6 @@ pub(crate) const AUTH: &str = "/sandbox/.codex/auth.json";
 pub(crate) struct Codex;
 
 impl Codex {
-    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
-        name: "codex",
-        binaries: &[
-            "/usr/local/bin/codex",
-            "/usr/local/lib/node_modules/@openai/codex/**",
-        ],
-        // Codex has no skills discovery; the toolbox still lands where domain prompts reference it.
-        skills_dir: ".claude/skills",
-        // Relocates config, auth, and the rollout store off `~/.codex`.
-        home_var: "CODEX_HOME",
-        home: "/sandbox/.codex",
-        config: "/sandbox/.codex/config.toml",
-        sandbox_env: &[],
-        local_env: &[],
-        // `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`: three date segments, then the file.
-        transcript: TranscriptLocator::NewestJsonl {
-            sandbox_root: "/sandbox/.codex/sessions",
-            glob: "*/*/*/rollout-*.jsonl",
-        },
-        transcript_fetch_timeout: Duration::from_secs(30),
-        auth: AuthProvider::Codex,
-        otel_capable: false,
-        backfill_required: false,
-    };
-
     /// The shared invocation prefix: `codex exec --json --dangerously-bypass-approvals-and-sandbox
     /// --skip-git-repo-check --color never -m <model> [-c model_reasoning_effort=<tier>]`. Prompt
     /// delivery is appended by the caller. The bypass flag is what makes the run headless; the
@@ -179,7 +154,7 @@ fn config_toml(
 
 impl Backend for Codex {
     fn spec(&self) -> &'static HarnessSpec {
-        &Self::SPEC
+        Harness::Codex.spec()
     }
 
     /// `[agent.codex].model` overrides the shared `[agent].model`, and a Claude name in the shared
@@ -542,8 +517,8 @@ mod tests {
     use super::*;
     use clap::Parser;
 
-    const CONFIG: &str = Codex::SPEC.config;
-    const DEFAULT_BINARIES: &[&str] = Codex::SPEC.binaries;
+    const CONFIG: &str = Harness::Codex.spec().config;
+    const DEFAULT_BINARIES: &[&str] = Harness::Codex.spec().binaries;
 
     fn args() -> Args {
         crate::cli::Cli::parse_from(["crucible"]).run

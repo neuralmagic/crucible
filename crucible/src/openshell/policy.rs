@@ -78,12 +78,7 @@ pub const OPENAI_API_ENDPOINTS: &[&str] = &["api.openai.com:443:full"];
 /// never grows the OpenAI hosts a codex turn needs.
 pub fn default_endpoints(harness: Harness) -> Vec<&'static str> {
     let mut out = DEFAULT_ENDPOINTS.to_vec();
-    match harness {
-        Harness::Codex => out.extend_from_slice(CODEX_ENDPOINTS),
-        Harness::OpenCode | Harness::Pi => out.extend_from_slice(OPENAI_API_ENDPOINTS),
-        Harness::Claude => out.extend_from_slice(CLAUDE_ENDPOINTS),
-        Harness::Hermes => {}
-    }
+    out.extend_from_slice(harness.spec().model_endpoints);
     out
 }
 

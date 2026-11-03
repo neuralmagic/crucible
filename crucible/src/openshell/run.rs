@@ -13,10 +13,7 @@
 //! crucible processes sharing one gateway never collide on a fixed name.
 
 use crate::agent::event::{AgentEvent, RawStream};
-use crate::agent::harness::{
-    AuthProvider, HarnessRuntime, McpServer, SandboxAuth, SandboxLayout, TranscriptLocator,
-    TurnArtifacts,
-};
+use crate::agent::harness::{McpServer, SandboxAuth, SandboxLayout, TurnArtifacts, backend};
 use crate::agent::relay;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
 use crate::args::{Args, Paths};
@@ -24,6 +21,7 @@ use crate::manifest::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};
+use crucible::harness::{ApiFamily, AuthProvider, TranscriptLocator};
 use crucible_contract::TransportCause;
 use std::time::Instant;
 
@@ -305,7 +303,7 @@ async fn try_turn(
     // The agent harness for this turn (claude default): argv grammar, env script, seed files,
     // stream decoder, and the post-turn transcript contract all come from here.
     let harness = args.harness();
-    let backend = harness.backend();
+    let backend = backend(harness);
 
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
@@ -1288,13 +1286,13 @@ pub(crate) fn inference_env(
             set(env, crate::agent::inference::ANTHROPIC_API_KEY, key);
         }
     }
-    match harness {
-        Harness::Claude | Harness::Hermes => {
+    match harness.spec().api {
+        ApiFamily::Anthropic => {
             if let Some(url) = inference.anthropic_base_url.as_deref() {
                 set(env, crate::agent::inference::ANTHROPIC_BASE_URL, url);
             }
         }
-        Harness::Codex => {
+        ApiFamily::OpenAi => {
             if let Some(url) = inference.openai_base_url.as_deref() {
                 set(env, crate::agent::inference::OPENAI_BASE_URL, url);
                 if let Some(provider::CodexAuth::ApiKey(key)) = sandbox_auth.codex() {
@@ -1306,7 +1304,7 @@ pub(crate) fn inference_env(
                 }
             }
         }
-        Harness::OpenCode | Harness::Pi => {
+        ApiFamily::Both => {
             for (key, value) in [
                 (
                     crate::agent::inference::OPENAI_API_KEY_ENV,
@@ -1419,7 +1417,7 @@ async fn graft_turn_telemetry(
     // One infallible parse over the in-memory transcript feeds span export and (backfill
     // harnesses) the turn's result; skip it when nothing consumes it.
     let artifacts = if export.spans() || harness.spec().backfill_required {
-        harness.backend().parse_transcript(&bytes)
+        backend(harness).parse_transcript(&bytes)
     } else {
         TurnArtifacts::default()
     };
@@ -1435,7 +1433,7 @@ async fn graft_turn_telemetry(
         if export.content() {
             // Content logs come from the harness's own transcript reader (claude maps its jsonl;
             // hermes: Phase B), off the same in-memory bytes, no re-read.
-            let records = harness.backend().content_records(&bytes);
+            let records = backend(harness).content_records(&bytes);
             crate::agent::engine::emit_conversation_logs(&span, &records, gen_ai_system);
         }
     }

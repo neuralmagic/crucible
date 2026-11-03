@@ -9,6 +9,7 @@
 
 use crate::manifest::Harness;
 use anyhow::{Context, Result};
+use crucible::harness::ApiFamily;
 use crucible_contract::inference::{
     InferenceBinding, InferenceProtocol, InferenceRole, TokenPrice,
 };
@@ -82,32 +83,13 @@ pub struct AgentSelection {
     pub price: Option<TokenPrice>,
 }
 
-/// Whether `harness` is a client of `protocol`.
-pub fn speaks(harness: Harness, protocol: InferenceProtocol) -> bool {
-    match protocol {
-        InferenceProtocol::Messages => matches!(
-            harness,
-            Harness::Claude | Harness::Hermes | Harness::OpenCode | Harness::Pi
-        ),
-        InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => {
-            matches!(harness, Harness::Codex | Harness::OpenCode | Harness::Pi)
-        }
-        InferenceProtocol::SystemOne | InferenceProtocol::Decisions => false,
-    }
-}
-
 impl AgentSelection {
     /// `preferred` when it speaks the binding's protocol, else the harness that does.
     pub fn harness(&self, preferred: Harness) -> Harness {
-        if speaks(preferred, self.protocol) {
+        if preferred.speaks(self.protocol) {
             return preferred;
         }
-        match self.protocol {
-            InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => Harness::Codex,
-            InferenceProtocol::Messages
-            | InferenceProtocol::SystemOne
-            | InferenceProtocol::Decisions => Harness::Claude,
-        }
+        Harness::default_for(self.protocol)
     }
 }
 
@@ -226,10 +208,10 @@ impl InferenceEnv {
     /// families (opencode, pi) takes the OpenAI one first, the same precedence
     /// `crate::agent::harness::api_endpoint` resolves its provider by.
     pub fn base_url_for(&self, harness: Harness) -> Option<&str> {
-        match harness {
-            Harness::Claude | Harness::Hermes => self.anthropic_base_url.as_deref(),
-            Harness::Codex => self.openai_base_url.as_deref(),
-            Harness::OpenCode | Harness::Pi => self
+        match harness.spec().api {
+            ApiFamily::Anthropic => self.anthropic_base_url.as_deref(),
+            ApiFamily::OpenAi => self.openai_base_url.as_deref(),
+            ApiFamily::Both => self
                 .openai_base_url
                 .as_deref()
                 .or(self.anthropic_base_url.as_deref()),
@@ -340,7 +322,7 @@ mod tests {
         assert_eq!(env.anthropic_base_url, None);
         assert_eq!(
             crate::agent::harness::resolve_auth(Harness::Claude, &env),
-            crate::agent::harness::AuthProvider::Vertex
+            crucible::harness::AuthProvider::Vertex
         );
         assert_eq!(env.selection.unwrap().model, "the-model");
     }
@@ -354,7 +336,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             crate::agent::harness::resolve_auth(Harness::Claude, &env),
-            crate::agent::harness::AuthProvider::AnthropicKey
+            crucible::harness::AuthProvider::AnthropicKey
         );
     }
 
@@ -507,8 +489,8 @@ mod tests {
             Harness::OpenCode,
             Harness::Pi,
         ] {
-            assert!(!speaks(harness, InferenceProtocol::SystemOne));
-            assert!(!speaks(harness, InferenceProtocol::Decisions));
+            assert!(!harness.speaks(InferenceProtocol::SystemOne));
+            assert!(!harness.speaks(InferenceProtocol::Decisions));
         }
     }
 

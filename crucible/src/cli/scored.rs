@@ -1,7 +1,6 @@
 //! The scored loop's run path: a `crucible.toml` builds the [`World`] + [`Judge`], anchors every
 //! path, picks a front-end, and calls [`crate::runloop::driver::run_loop`].
 
-use crate::agent::harness::HarnessRuntime;
 use crate::args::{Args, Paths, Prepared, Ui};
 use crate::control;
 use crate::control::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};

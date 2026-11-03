@@ -371,7 +371,7 @@ fn turn_args(a: &RankGroundedArgs) -> Result<crate::args::Args> {
     if crate::agent::harness::resolve_auth(
         args.harness(),
         &crate::agent::inference::InferenceEnv::from_process_env()?,
-    ) == crate::agent::harness::AuthProvider::Vertex
+    ) == crucible::harness::AuthProvider::Vertex
     {
         crate::openshell::run::relay_vertex_env(&mut args.env);
     }

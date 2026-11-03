@@ -4,10 +4,9 @@
 //! claude today, hermes next. Everything downstream of the decoder (session log, SSE, cost,
 //! keep/discard) consumes the harness-neutral `AgentEvent`, so the swappable surface is exactly
 //! what lives here: argv construction, env defaults, the sandbox seed files, the stream decoder,
-//! and the post-turn transcript backfill. A backend is a [`HarnessSpec`] of data plus the few
-//! [`Backend`] methods that genuinely differ per CLI; the manifest's `Harness` token
-//! (`[agent].harness` or `--harness`, riding on [`Args`]) selects one through
-//! [`HarnessRuntime::backend`].
+//! and the post-turn transcript backfill. A backend is the [`HarnessSpec`] table entry plus the
+//! few [`Backend`] methods that genuinely differ per CLI; the manifest's `Harness` token
+//! (`[agent].harness` or `--harness`, riding on [`Args`]) selects one through [`backend`].
 
 pub(crate) mod claude;
 pub(crate) mod codex;
@@ -21,25 +20,8 @@ use crate::args::Args;
 use crate::manifest::Harness;
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
+use crucible::harness::{AuthProvider, HarnessSpec};
 use crucible_harness::LiveMeters;
-use std::time::Duration;
-
-/// How a sandbox turn gets its model credential. Vertex mints a `cloud-platform` access token from
-/// ADC and serves it through the gateway's metadata emulator; Codex seeds either an API key or a
-/// host-refreshed ChatGPT OAuth access token into the sandbox's `auth.json`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AuthProvider {
-    Vertex,
-    Codex,
-    /// A direct Anthropic API key from the environment ([`crate::agent::inference::ANTHROPIC_API_KEY`]),
-    /// relayed into the sandbox; no gateway provider, no metadata emulator.
-    AnthropicKey,
-    /// A direct API key from the environment for whichever API the turn's endpoint speaks
-    /// ([`api_endpoint`]): `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, relayed into the sandbox
-    /// alongside its base URL. The harnesses that take a provider table (opencode, pi) read the
-    /// key back from that env through their seeded config.
-    ApiKey,
-}
 
 /// Which credential this turn runs on: the harness's default, unless the environment carries a
 /// direct Anthropic key for a Claude-speaking harness, or nothing at all for a key-authenticated
@@ -162,31 +144,6 @@ pub(crate) struct SeedFile {
     pub dest: &'static str,
 }
 
-/// Where a harness leaves its native session transcript inside the sandbox, for the post-turn
-/// fetch. Claude writes one jsonl per session under a projects tree (newest wins); hermes keeps
-/// a single SQLite db at a fixed path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TranscriptLocator {
-    /// The newest file matching `<sandbox_root>/<glob>`: claude's `projects/<slug>/<session>.jsonl`
-    /// sits one segment down, codex's `sessions/YYYY/MM/DD/rollout-*.jsonl` three.
-    NewestJsonl {
-        sandbox_root: &'static str,
-        glob: &'static str,
-    },
-    /// One fixed file (hermes's `state.db`).
-    File { sandbox_path: &'static str },
-}
-
-impl TranscriptLocator {
-    /// The `(root, glob)` of a jsonl tree, `None` for a fixed file.
-    pub(crate) fn jsonl_tree(self) -> Option<(&'static str, &'static str)> {
-        match self {
-            TranscriptLocator::NewestJsonl { sandbox_root, glob } => Some((sandbox_root, glob)),
-            TranscriptLocator::File { .. } => None,
-        }
-    }
-}
-
 /// What a harness recovers from its transcript after the turn. For claude this is trace garnish
 /// (tool spans; empty events, no cost, the live stream already carried both); for a backfill
 /// harness (hermes) it is the turn's ONLY source of result events + cost.
@@ -246,49 +203,6 @@ impl SandboxAuth {
             SandboxAuth::Gateway | SandboxAuth::AnthropicKey | SandboxAuth::ApiKey => None,
         }
     }
-}
-
-/// What a backend is, as data: the values the shared assembly reads. One per harness, on its
-/// backend type as `SPEC`.
-#[derive(Debug)]
-pub(crate) struct HarnessSpec {
-    /// The `AGENT_TOOL` value, exported first in both the sandbox env script and the local env.
-    pub name: &'static str,
-    /// Binaries always allowed to open egress for this harness (the agent CLIs). OpenShell
-    /// denies network to any binary not listed, but descendants inherit a parent's egress, so a
-    /// tool the agent shells out to (e.g. `kubectl`) does not need its own entry, only the
-    /// root agent does.
-    pub binaries: &'static [&'static str],
-    /// The workspace-relative dir the toolbox skills install into.
-    pub skills_dir: &'static str,
-    /// The env var that relocates the harness's state dir into the sandbox, and its value.
-    pub home_var: &'static str,
-    pub home: &'static str,
-    /// Where the rendered config file ([`Backend::config`]) lands in the sandbox.
-    pub config: &'static str,
-    /// Further sandbox exports, after `AGENT_TOOL` and the home var; unquoted, like them.
-    pub sandbox_env: &'static [(&'static str, &'static str)],
-    /// Local-spawn env defaults after `AGENT_TOOL`, applied before the manifest `[agent].env`.
-    pub local_env: &'static [(&'static str, &'static str)],
-    /// Where this harness's session transcript lives inside the sandbox.
-    pub transcript: TranscriptLocator,
-    /// Hard bound on the whole transcript fetch (find + download). For claude the fetch is pure
-    /// telemetry and must never wedge the turn; for a backfill harness the transcript carries
-    /// the turn's result, so it gets more headroom.
-    pub transcript_fetch_timeout: Duration,
-    /// Which credential the sandbox turn attaches (token mint + provider create/attach + the
-    /// pod-env relay). Claude and hermes both resolve Vertex ADC through the gateway's metadata
-    /// emulator (hermes via its config.yaml `provider: vertex-anthropic`), key-free; codex
-    /// authenticates against the ChatGPT backend instead.
-    pub auth: AuthProvider,
-    /// Whether the harness exports the `claude_code.*` OTEL metrics the in-process collector
-    /// captures. False means the collector never starts (no `otel_summary`; the pricing-table
-    /// estimate stays the cost fallback).
-    pub otel_capable: bool,
-    /// Whether the transcript is the turn's ONLY source of result events + cost. When true the
-    /// post-turn fetch runs unconditionally (not export-gated) and a fetch failure surfaces as
-    /// an [`AgentEvent::Error`], never a silent $0 success (keep/discard integrity).
-    pub backfill_required: bool,
 }
 
 /// One MCP server a seeded config points the agent at. `token`, when set, rides as an
@@ -475,26 +389,23 @@ fn no_sessions(spec: &HarnessSpec) -> std::io::Error {
 }
 
 /// The manifest's harness token, resolved to its backend.
+pub(crate) fn backend(harness: Harness) -> &'static dyn Backend {
+    match harness {
+        Harness::Claude => &claude::Claude,
+        Harness::Hermes => &hermes::Hermes,
+        Harness::Codex => &codex::Codex,
+        Harness::OpenCode => &opencode::OpenCode,
+        Harness::Pi => &pi::Pi,
+    }
+}
+
 pub(crate) trait HarnessRuntime {
     fn backend(self) -> &'static dyn Backend;
-
-    fn spec(self) -> &'static HarnessSpec
-    where
-        Self: Sized,
-    {
-        self.backend().spec()
-    }
 }
 
 impl HarnessRuntime for Harness {
     fn backend(self) -> &'static dyn Backend {
-        match self {
-            Harness::Claude => &claude::Claude,
-            Harness::Hermes => &hermes::Hermes,
-            Harness::Codex => &codex::Codex,
-            Harness::OpenCode => &opencode::OpenCode,
-            Harness::Pi => &pi::Pi,
-        }
+        backend(self)
     }
 }
 
@@ -541,6 +452,7 @@ mod tests {
     use super::*;
     use crate::agent::event::AgentEvent;
     use clap::Parser;
+    use crucible::harness::TranscriptLocator;
 
     #[test]
     fn npm_installed_harnesses_allow_their_canonical_install_tree() {

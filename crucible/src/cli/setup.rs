@@ -1,7 +1,6 @@
 //! Resolving a run from its manifest: the agent config folded onto the CLI args, the frozen
 //! projection the broker sees, and a plan runner over the same workspace a loop run would use.
 
-use crate::agent::harness::HarnessRuntime;
 use crate::args::Args;
 use crate::control::broker;
 use crate::manifest;
@@ -186,7 +185,7 @@ pub(crate) fn apply_agent_cfg(
         && crate::agent::harness::resolve_auth(
             args.harness(),
             &crate::agent::inference::InferenceEnv::from_process_env()?,
-        ) == crate::agent::harness::AuthProvider::Vertex
+        ) == crucible::harness::AuthProvider::Vertex
     {
         crate::openshell::run::relay_vertex_env(&mut args.env);
     }
@@ -1001,7 +1000,7 @@ mod tests {
             if let Some(name) = sandbox {
                 crate::plan::harness::enter_sandbox(&mut turn, name).unwrap();
             }
-            turn.harness().backend().env_script(&turn.env)
+            crate::agent::harness::backend(turn.harness()).env_script(&turn.env)
         };
 
         let default = script(None);

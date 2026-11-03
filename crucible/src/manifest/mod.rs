@@ -618,12 +618,7 @@ pub enum Harness {
 impl Harness {
     /// The default model when neither the CLI nor the manifest names one.
     pub const fn default_model(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude-opus-4-6",
-            Harness::Hermes => "claude-opus-4-6",
-            Harness::Codex => "gpt-5.6-sol",
-            Harness::OpenCode | Harness::Pi => "claude-opus-4-6",
-        }
+        self.spec().default_model
     }
 
     /// The manifest and CLI spelling of the harness.

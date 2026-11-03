@@ -12,14 +12,14 @@
 //! argv.
 
 use crate::agent::harness::{
-    AuthProvider, Backend, HarnessSpec, McpServer, RawLines, StreamDecoder, TranscriptLocator,
-    TurnArtifacts, json_servers,
+    Backend, McpServer, RawLines, StreamDecoder, TurnArtifacts, json_servers,
 };
 use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
+use crate::manifest::Harness;
 use crate::turn_trace::GenAiRecord;
+use crucible::harness::HarnessSpec;
 use crucible_harness::LiveMeters;
-use std::time::Duration;
 
 /// The provider named in hermes's `config.yaml`: the `vertex-anthropic` provider from the
 /// hermes-agent fork (github.com/wseaton/hermes-agent, branch `anthropic-vertex`). It speaks the
@@ -30,26 +30,6 @@ pub(crate) const PROVIDER: &str = "vertex-anthropic";
 pub(crate) struct Hermes;
 
 impl Hermes {
-    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
-        name: "hermes",
-        binaries: &["/usr/local/bin/hermes"],
-        // Hermes has no skills discovery; the toolbox still lands where domain prompts reference it.
-        skills_dir: ".claude/skills",
-        home_var: "HERMES_HOME",
-        home: "/sandbox/.hermes",
-        config: "/sandbox/.hermes/config.yaml",
-        sandbox_env: &[],
-        local_env: &[],
-        // `$HERMES_HOME/state.db`, the session store.
-        transcript: TranscriptLocator::File {
-            sandbox_path: "/sandbox/.hermes/state.db",
-        },
-        transcript_fetch_timeout: Duration::from_secs(60),
-        auth: AuthProvider::Vertex,
-        otel_capable: false,
-        backfill_required: true,
-    };
-
     /// The shared invocation prefix: `hermes chat --yolo --model <model>`; prompt delivery is
     /// appended by the caller. `--yolo` bypasses approval prompts (headless); `[agent.hermes].model`
     /// overrides the shared `[agent].model`.
@@ -96,7 +76,7 @@ impl From<crate::agent::hermes_trace::HermesTurn> for TurnArtifacts {
 
 impl Backend for Hermes {
     fn spec(&self) -> &'static HarnessSpec {
-        &Self::SPEC
+        Harness::Hermes.spec()
     }
 
     /// `[agent.hermes].model` overrides the shared `[agent].model`.
@@ -183,8 +163,8 @@ mod tests {
     use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
 
-    const CONFIG: &str = Hermes::SPEC.config;
-    const DEFAULT_BINARIES: &[&str] = Hermes::SPEC.binaries;
+    const CONFIG: &str = Harness::Hermes.spec().config;
+    const DEFAULT_BINARIES: &[&str] = Harness::Hermes.spec().binaries;
 
     fn args() -> Args {
         crate::cli::Cli::parse_from(["crucible"]).run

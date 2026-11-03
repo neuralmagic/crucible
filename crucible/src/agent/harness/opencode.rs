@@ -15,21 +15,20 @@
 //! reaches the metadata emulator like claude's does.
 
 use crate::agent::harness::{
-    ApiEndpoint, AuthProvider, Backend, CRUCIBLE_PROVIDER_ID, HarnessSpec, McpServer,
-    StreamDecoder, TranscriptLocator, TurnArtifacts, api_endpoint, json_servers, json_str,
+    ApiEndpoint, Backend, CRUCIBLE_PROVIDER_ID, McpServer, StreamDecoder, TurnArtifacts,
+    api_endpoint, json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::args::Args;
+use crate::manifest::Harness;
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
+use crucible::harness::{HarnessSpec, OPENCODE_EXPORT as EXPORT};
 use crucible_harness::tool_summary::summarize;
 use crucible_harness::{LiveMeters, OpenCodeJsonParser};
 use serde_json::{Value, json};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub(crate) struct OpenCode;
-
-/// Where the sandbox wrapper leaves the session export; the transcript the turn is read from.
-pub(crate) const EXPORT: &str = "/sandbox/.local/share/opencode/crucible-export.json";
 
 /// The in-sandbox wrapper around `opencode run`: mirror the stream to stdout while keeping a
 /// copy, then export the session it opened to `$1`. Exits with `run`'s status.
@@ -47,40 +46,6 @@ exit "$rc"
 "#;
 
 impl OpenCode {
-    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
-        name: "opencode",
-        binaries: &[
-            "/usr/local/bin/opencode",
-            "/usr/local/lib/node_modules/opencode-ai/**",
-        ],
-        // OpenCode discovers Claude Code's skills tree, so the toolbox lands where claude's does.
-        skills_dir: ".claude/skills",
-        // Relocates the session store (and the export) off `~/.local/share`.
-        home_var: "XDG_DATA_HOME",
-        home: "/sandbox/.local/share",
-        config: "/sandbox/.config/opencode/opencode.json",
-        sandbox_env: &[
-            ("XDG_CONFIG_HOME", "/sandbox/.config"),
-            ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
-            ("OPENCODE_DISABLE_MODELS_FETCH", "1"),
-            ("OPENCODE_DISABLE_DEFAULT_PLUGINS", "1"),
-            ("OPENCODE_DISABLE_LSP_DOWNLOAD", "1"),
-            ("OPENCODE_DISABLE_SHARE", "1"),
-            ("OPENCODE_DISABLE_PRUNE", "1"),
-        ],
-        local_env: &[
-            ("OPENCODE_DISABLE_AUTOUPDATE", "1"),
-            ("OPENCODE_DISABLE_SHARE", "1"),
-        ],
-        transcript: TranscriptLocator::File {
-            sandbox_path: EXPORT,
-        },
-        transcript_fetch_timeout: Duration::from_secs(60),
-        auth: AuthProvider::ApiKey,
-        otel_capable: false,
-        backfill_required: true,
-    };
-
     /// The wrapper invocation up to and including `opencode run`'s flags: `bash -c <wrapper>
     /// crucible-opencode <export> run --format json --auto`. The model comes from the seeded
     /// config (which provider it rides on depends on the endpoint) and prompt delivery is
@@ -189,7 +154,7 @@ fn config_json(model: &str, endpoint: &ApiEndpoint, servers: &[McpServer<'_>]) -
 
 impl Backend for OpenCode {
     fn spec(&self) -> &'static HarnessSpec {
-        &Self::SPEC
+        Harness::OpenCode.spec()
     }
 
     /// A local turn has no seeded config, so the model is named on the command line under the
@@ -456,7 +421,7 @@ mod tests {
     use clap::Parser;
     use crucible_contract::event::AgentEvent;
 
-    const CONFIG: &str = OpenCode::SPEC.config;
+    const CONFIG: &str = Harness::OpenCode.spec().config;
 
     fn args() -> Args {
         crate::cli::Cli::parse_from(["crucible"]).run

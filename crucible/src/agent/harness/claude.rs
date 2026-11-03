@@ -1,56 +1,16 @@
 //! The claude arm of the harness boundary: Claude Code's argv grammar, env defaults, `.mcp.json`
 //! seeding, and transcript layout.
 
-use crate::agent::harness::{
-    AuthProvider, Backend, HarnessSpec, McpServer, StreamDecoder, TranscriptLocator, TurnArtifacts,
-    json_servers,
-};
+use crate::agent::harness::{Backend, McpServer, StreamDecoder, TurnArtifacts, json_servers};
 use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
+use crate::manifest::Harness;
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::GenAiRecord;
+use crucible::harness::HarnessSpec;
 use crucible_harness::LiveMeters;
-use std::time::Duration;
 
 pub(crate) struct Claude;
-
-impl Claude {
-    pub(crate) const SPEC: HarnessSpec = HarnessSpec {
-        name: "claude",
-        binaries: &[
-            "/usr/local/bin/claude",
-            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/**",
-            "/usr/local/bin/opencode",
-            "/usr/local/lib/node_modules/opencode-ai/**",
-        ],
-        skills_dir: ".claude/skills",
-        home_var: "CLAUDE_CONFIG_DIR",
-        home: "/sandbox/.claude",
-        // The generated `.mcp.json` (the turn's MCP servers), loaded via `--mcp-config`.
-        // Absolute `/tmp`, like the env/prompt uploads.
-        config: "/tmp/.crucible-mcp.json",
-        sandbox_env: &[
-            ("CLAUDE_CODE_PLUGIN_SEED_DIR", "/sandbox/.claude-seed"),
-            ("CLAUDE_CODE_SYNC_PLUGIN_INSTALL", "1"),
-            ("DISABLE_AUTOUPDATER", "1"),
-            ("CLAUDE_CODE_MAX_RETRIES", "20"),
-        ],
-        local_env: &[
-            ("DISABLE_AUTOUPDATER", "1"),
-            // `-p` sets sessionKind, which breaks `--continue` lookup (claude-code#43013).
-            ("CLAUDE_CODE_ENTRYPOINT", "sdk-cli"),
-        ],
-        // `$CLAUDE_CONFIG_DIR/projects/<slug>/<session>.jsonl`: one project-slug segment.
-        transcript: TranscriptLocator::NewestJsonl {
-            sandbox_root: "/sandbox/.claude/projects",
-            glob: "*/*.jsonl",
-        },
-        transcript_fetch_timeout: Duration::from_secs(30),
-        auth: AuthProvider::Vertex,
-        otel_capable: true,
-        backfill_required: false,
-    };
-}
 
 /// Ends option parsing, so a prompt is a prompt however it starts.
 ///
@@ -117,7 +77,7 @@ fn mcp_config_json(servers: &[McpServer<'_>]) -> String {
 
 impl Backend for Claude {
     fn spec(&self) -> &'static HarnessSpec {
-        &Self::SPEC
+        Harness::Claude.spec()
     }
 
     /// The base args plus the prompt.
@@ -150,7 +110,7 @@ impl Backend for Claude {
         let mut a = claude_base_args(args);
         let at = a.len().saturating_sub(1); // before the trailing `-p`
         if mcp_seeded {
-            a.insert(at, Self::SPEC.config.to_string());
+            a.insert(at, Harness::Claude.spec().config.to_string());
             a.insert(at, "--mcp-config".to_string());
         }
         a.insert(at, "--strict-mcp-config".to_string());
@@ -223,7 +183,7 @@ mod tests {
     use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
 
-    const MCP_CONFIG: &str = Claude::SPEC.config;
+    const MCP_CONFIG: &str = Harness::Claude.spec().config;
 
     /// Parse a bare arg list into [`Args`] via the top-level CLI (the loop is the
     /// default subcommand), so we exercise the real clap wiring.
