@@ -15,7 +15,7 @@
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::{McpServer, SandboxAuth, SandboxLayout, TurnArtifacts, backend};
 use crate::agent::relay;
-use crate::agent::sandbox_env::{EnvSource, SandboxEnv, process_env};
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv};
 use crate::agent::turn::{TurnFailure, TurnOutcome};
 use crate::args::{Paths, SandboxTurn};
 use crate::manifest::Harness;
@@ -104,13 +104,14 @@ pub fn turn(
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
-    // path, reached from the published handle rather than threaded through `run_turn` and the
-    // reporter trait (see `crate::agent::engine`). A missing runtime surfaces like any orchestration
-    // failure (through the sink, a $0 no-op turn).
-    let handle = match crate::agent::engine::handle() {
-        Ok(h) => h,
-        Err(e) => {
-            let message = format!("{e:#}");
+    // path. A missing runtime surfaces like any orchestration failure (through the sink, a $0
+    // no-op turn).
+    let handle = match turn.engine {
+        Some(h) => h,
+        None => {
+            let message = "the engine runtime is not initialized (EngineCtx::new was not called \
+                           before an async call site) — this is an engine wiring bug"
+                .to_string();
             let ev = AgentEvent::Error {
                 error_type: "openshell".into(),
                 message: message.clone(),
@@ -1757,22 +1758,6 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
     })
     .await
     .context("temp-file task panicked")?
-}
-
-/// Seed `env` with the process values of [`crate::openshell::policy::VERTEX_RELAY_KEYS`], on the
-/// terms of [`SandboxEnv::relay`]: a manifest-provided value wins.
-pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
-    relay_keys(
-        EnvSource::VertexRelay,
-        crate::openshell::policy::VERTEX_RELAY_KEYS,
-        env,
-    );
-}
-
-fn relay_keys(source: EnvSource, keys: &[&str], env: &mut Vec<(String, String)>) {
-    let mut sandbox = SandboxEnv::from_manifest(env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
-    sandbox.relay(source, keys.iter().copied(), process_env);
-    *env = sandbox.into_vars();
 }
 
 #[cfg(test)]

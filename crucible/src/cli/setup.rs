@@ -306,6 +306,7 @@ pub(crate) fn prep_plan_runner(
         &std::collections::BTreeMap::new(),
         crate::openshell::gateway::ComputeDriver::Podman,
         crate::args::AgentOverride::default(),
+        None,
     )
 }
 
@@ -386,6 +387,7 @@ pub(crate) fn prep_plan_runner_with_params(
     params: &std::collections::BTreeMap<String, String>,
     compute_driver: crate::openshell::gateway::ComputeDriver,
     agent: crate::args::AgentOverride,
+    engine: Option<tokio::runtime::Handle>,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
@@ -417,6 +419,7 @@ pub(crate) fn prep_plan_runner_with_params(
     // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
     // the manifest's [agent] folded on top — the same resolution a loop run does.
     let mut args = Args::defaults().context("constructing default args")?;
+    args.engine = engine;
     args.manifest = Some(manifest_path.to_path_buf());
     args.compute_driver = compute_driver;
     args.harness = agent.harness;

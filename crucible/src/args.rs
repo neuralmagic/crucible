@@ -33,6 +33,10 @@ pub(crate) struct Args {
     /// The lock every turn of this process boots the gateway under.
     #[arg(skip)]
     pub gateway_boot: crucible::openshell::gateway::BootLock,
+    /// The engine runtime's handle, set by the arm that built the runtime; the async call sites
+    /// (the openshell turn, the S3 publish and fetch) run on it.
+    #[arg(skip)]
+    pub engine: Option<tokio::runtime::Handle>,
     /// The domain manifest: the engine reads it, builds a World + Judge, and works in its
     /// workspace. Required (every run is a manifest run).
     #[arg(long)]
@@ -269,6 +273,12 @@ impl Args {
         crate::agent::event::Pricing::resolve(self.model(), self.price.as_ref())
     }
 
+    /// The engine runtime, which every async call site runs on; an error, never a panic, when
+    /// the arm that built this run never built one.
+    pub(crate) fn engine_handle(&self) -> Result<&tokio::runtime::Handle, EngineUninitialized> {
+        self.engine.as_ref().ok_or(EngineUninitialized)
+    }
+
     /// The slice a harness backend reads to build a turn.
     pub(crate) fn turn_agent(&self) -> TurnAgent<'_> {
         TurnAgent {
@@ -298,9 +308,18 @@ impl Args {
             disclosure: self.disclosure.as_ref(),
             run_id: self.sandbox_run_id.as_ref(),
             gateway_boot: &self.gateway_boot,
+            engine: self.engine.as_ref(),
         }
     }
 }
+
+/// An async call site reached before the arm that owns the run built the engine runtime.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the engine runtime is not initialized (EngineCtx::new was not called before an async call \
+     site) — this is an engine wiring bug"
+)]
+pub(crate) struct EngineUninitialized;
 
 /// What a harness backend reads off a run to build one turn: the resolved harness and model,
 /// the agent knobs, and the manifest `[agent].env`.
@@ -332,6 +351,8 @@ pub(crate) struct SandboxTurn<'a> {
     /// The run's sandbox identity; `None` names each turn's sandbox afresh.
     pub run_id: Option<&'a openshell::sandbox::RunId>,
     pub gateway_boot: &'a crucible::openshell::gateway::BootLock,
+    /// The engine runtime the turn runs on; `None` fails the turn as an orchestration error.
+    pub engine: Option<&'a tokio::runtime::Handle>,
 }
 
 /// Runtime paths for a manifest run. Everything anchors off the manifest dir + an explicit

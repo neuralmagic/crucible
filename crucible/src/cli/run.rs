@@ -76,10 +76,10 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
 
     #[cfg(feature = "autoresearch")]
     if let Some(Cmd::Scope(args)) = cli.command {
-        // Constructing the engine runtime publishes the handle a `--propose` openshell turn
-        // reaches; held for the duration of `scope::run`.
-        let _engine = crate::agent::engine::EngineCtx::new()?;
-        return crate::scope::run(args);
+        // The engine runtime a `--propose` openshell turn runs on; held for the duration of
+        // `scope::run`.
+        let engine = crate::agent::engine::EngineCtx::new()?;
+        return crate::scope::run(args, engine.handle());
     }
 
     #[cfg(feature = "autoresearch")]
@@ -123,8 +123,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     }
     if let Some(Cmd::Fetch { uri, out }) = &cli.command {
         // The engine runtime the S3 GetObject block_ons on (for `object_store::fetch_object`).
-        let _engine = crate::agent::engine::EngineCtx::new()?;
-        return crate::object_store::fetch_object(uri, out);
+        let engine = crate::agent::engine::EngineCtx::new()?;
+        return crate::object_store::fetch_object(uri, out, &engine.handle());
     }
 
     // One code-grounded ranking turn over an existing checkout. A cheap, checkout-backed agent turn
@@ -145,9 +145,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
 
     #[cfg(feature = "autoresearch")]
     if let Some(Cmd::RankGrounded(args)) = cli.command {
-        // Constructing the engine runtime publishes the handle an openshell grounded turn reaches.
-        let _engine = crate::agent::engine::EngineCtx::new()?;
-        return crate::scope::rank_grounded::run(args);
+        // The engine runtime an openshell grounded turn runs on.
+        let engine = crate::agent::engine::EngineCtx::new()?;
+        return crate::scope::rank_grounded::run(args, engine.handle());
     }
 
     if let Some(Cmd::Plan { action }) = &cli.command {
@@ -227,7 +227,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 rerun_of,
                 from,
             } => {
-                let _engine = crate::agent::engine::EngineCtx::new()?;
+                let engine = crate::agent::engine::EngineCtx::new()?;
                 crate::plan::cli::run(
                     file.as_deref(),
                     &crate::plan::cli::parse_params(params)?,
@@ -249,6 +249,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                         },
                         resume: *resume,
                         variant: variant.clone(),
+                        engine: Some(engine.handle()),
                         rerun: rerun_of.as_ref().map(|parent| crate::plan::cli::Rerun {
                             parent: parent.clone(),
                             from: from
@@ -392,13 +393,15 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
     }
 
     // One run path: a `crucible.toml` manifest builds the World + Judge and anchors every path.
-    // The engine runtime is created here, once; constructing it publishes the handle every async call site reaches
-    // (the openshell turns, the swept S3 publish calls). Held to the end of the process (the loop
-    // exits via `process::exit`), so the runtime stays alive under the loop.
+    // The engine runtime is created here, once, and its handle rides the run's Args to every async
+    // call site (the openshell turns, the swept S3 publish calls). Held to the end of the process
+    // (the loop exits via `process::exit`), so the runtime stays alive under the loop.
     #[cfg(feature = "autoresearch")]
     {
-        let _engine = crate::agent::engine::EngineCtx::new()?;
-        crate::cli::scored::run_from_manifest(cli.run)
+        let engine = crate::agent::engine::EngineCtx::new()?;
+        let mut run = cli.run;
+        run.engine = Some(engine.handle());
+        crate::cli::scored::run_from_manifest(run)
     }
     #[cfg(not(feature = "autoresearch"))]
     {

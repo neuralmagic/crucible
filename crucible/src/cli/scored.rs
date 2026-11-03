@@ -141,7 +141,8 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
     // Cross-run memory: seed the prior run's tried-ideas ledger for this goal from S3 (best-effort),
     // so a fresh run (or a future harness version) inherits history instead of re-walking dead ends.
-    let prior = publish::fetch_prior_results(&args.results_bucket, &goal).unwrap_or_default();
+    let prior = publish::fetch_prior_results(args.engine.as_ref(), &args.results_bucket, &goal)
+        .unwrap_or_default();
     if !prior.is_empty() {
         let n = prior.lines().count();
         eprintln!("seeded {n} prior tried-idea row(s) from S3 (cross-run memory)");
@@ -285,7 +286,8 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
     args.component_pr_repos = m.component_pr_repos();
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
-    let prior = publish::fetch_prior_results(&args.results_bucket, &goal).unwrap_or_default();
+    let prior = publish::fetch_prior_results(args.engine.as_ref(), &args.results_bucket, &goal)
+        .unwrap_or_default();
     let prep = Prepared {
         run_id: publish::run_id(&goal),
         prior,
@@ -372,7 +374,7 @@ fn drive_loop(
     // A signal would otherwise kill the process with this span still open and the batch unflushed,
     // so every rolled loop pod loses its run span. Installed here, where the span exists, rather
     // than behind a static.
-    crate::agent::engine::abort_on_signal(run_span.clone());
+    crate::agent::engine::abort_on_signal(run_span.clone(), args.engine.as_ref());
 
     // The liveness beat runs for the whole loop, parented to the run span so its beats hang off the
     // run in Tempo. Declared AFTER `run_span` so the guard's Drop runs first and the beat is joined

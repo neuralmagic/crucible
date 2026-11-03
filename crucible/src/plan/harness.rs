@@ -1896,6 +1896,7 @@ mod tests {
                 harness: Some(crate::manifest::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
+            None,
         )
         .unwrap();
         assert_eq!(overridden.args.harness(), crate::manifest::Harness::Codex);
@@ -4890,6 +4891,7 @@ workflow(type = "playbook", tasks = [echo])
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
+            None,
         )
         .unwrap()
         .0;

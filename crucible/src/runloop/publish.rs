@@ -517,7 +517,7 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
     let index = serde_json::to_vec_pretty(&build_index_entry(rec, &goal_slug, &record_uri))
         .context("serialize index entry")?;
 
-    crate::agent::engine::handle()?.block_on(async {
+    rec.args.engine_handle()?.block_on(async {
         let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_s3::Client::new(&conf);
 
@@ -617,7 +617,11 @@ fn s3_record(rec: &Record<'_>, prs: &[PrLink]) -> Result<String> {
 /// `latest.json` pointer, then that run's `RESULTS.md`, and returns its candidate rows (baseline
 /// and header rows stripped). Best-effort: `None` when there's no bucket, no prior run for this
 /// goal, or any S3 hiccup, the loop then starts with an empty history (the prior behavior).
-pub fn fetch_prior_results(results_bucket: &str, goal: &str) -> Option<String> {
+pub fn fetch_prior_results(
+    engine: Option<&tokio::runtime::Handle>,
+    results_bucket: &str,
+    goal: &str,
+) -> Option<String> {
     if results_bucket.is_empty() {
         return None;
     }
@@ -641,7 +645,7 @@ pub fn fetch_prior_results(results_bucket: &str, goal: &str) -> Option<String> {
     let (bucket, base) = parse_s3_uri(results_bucket).ok()?;
     // `latest.json` is run-id-independent; it names the most recent prior run for this goal.
     let latest_key = keys(&base, &goal_slug, "").latest_key;
-    let md = crate::agent::engine::handle().ok()?.block_on(async {
+    let md = engine?.block_on(async {
         let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_s3::Client::new(&conf);
         let latest = get_string(&client, &bucket, &latest_key).await?;
@@ -1812,7 +1816,8 @@ mod tests {
             "{body}"
         );
 
-        let prior = fetch_prior_results(&args.results_bucket, "goal")
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let prior = fetch_prior_results(None, &args.results_bucket, "goal")
             .expect("prior results readable from file backend");
         assert!(prior.contains("tried X"), "{prior}");
 
@@ -1824,6 +1829,7 @@ mod tests {
                 run.join("artifacts/codegen-out/summary.txt").display()
             ),
             &dest,
+            rt.handle(),
         )
         .expect("fetch_object file");
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "investigation");

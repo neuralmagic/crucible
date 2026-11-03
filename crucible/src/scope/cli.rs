@@ -162,7 +162,7 @@ pub struct ScopeArgs {
 /// CLI entry point: resolve `--propose` vs. the classic pack path, run the pipeline, print each
 /// stage as it runs (or, with `json`, the whole [`ScopeReport`] as one object), and exit nonzero
 /// if the pipeline stopped on a failure *or* the propose turn ran over `--max-cost`.
-pub fn run(a: ScopeArgs) -> Result<()> {
+pub fn run(a: ScopeArgs, engine: tokio::runtime::Handle) -> Result<()> {
     let (pack, propose_opts) = if a.propose {
         let out = a
             .out
@@ -189,6 +189,7 @@ pub fn run(a: ScopeArgs) -> Result<()> {
                 progress: a.marker,
                 compute_driver: a.compute_driver,
                 authoritative: a.authoritative,
+                engine: Some(engine.clone()),
             }),
         )
     } else {

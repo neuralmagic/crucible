@@ -521,6 +521,8 @@ pub struct RunOpts {
     pub variant: Option<crate::manifest::variant::VariantName>,
     /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
     pub rerun: Option<Rerun>,
+    /// The engine runtime the run's sandboxed turns run on.
+    pub engine: Option<tokio::runtime::Handle>,
 }
 
 /// A rerun's parent and the tasks it dispatches again.
@@ -653,6 +655,7 @@ pub fn run(
         resume,
         variant,
         rerun,
+        engine,
     } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
@@ -683,6 +686,7 @@ pub fn run(
                     params,
                     compute_driver,
                     agent,
+                    engine,
                 )?;
                 let session_log = prepared.paths.session_log.clone();
                 agent_args = Some(prepared.args.clone());

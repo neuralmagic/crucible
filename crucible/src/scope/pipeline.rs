@@ -1,5 +1,6 @@
 use crate::agent::activity::ActivityFeed;
 use crate::agent::event::{AgentEvent, RawStream};
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv, process_env};
 use crate::agent::turn::TurnOutcome;
 use crate::agent::{self};
 use crate::args::Paths;
@@ -221,6 +222,8 @@ pub struct ProposeOpts {
     /// The goal is an authoritative brief (`--authoritative`): the propose/refine prompts tell
     /// the agent to carry its prescriptions into `goal.md` intact instead of de-prescribing them.
     pub authoritative: bool,
+    /// The engine runtime an openshell turn runs on.
+    pub engine: Option<tokio::runtime::Handle>,
 }
 
 /// Stage 2 (`--propose` only): one agent turn drafts the pack into `ctx.pack`. Runs after
@@ -918,9 +921,16 @@ fn turn_args(opts: &ProposeOpts) -> crate::args::Args {
     }
     args.sandbox_image = opts.sandbox_image.clone();
     args.compute_driver = opts.compute_driver;
+    args.engine = opts.engine.clone();
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead.
-    crate::openshell::run::relay_vertex_env(&mut args.env);
+    let mut env = SandboxEnv::default();
+    env.relay(
+        EnvSource::VertexRelay,
+        crate::openshell::policy::VERTEX_RELAY_KEYS.iter().copied(),
+        process_env,
+    );
+    args.env = env.into_vars();
     args
 }
 
@@ -1574,6 +1584,7 @@ mod tests {
             progress: false,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
             authoritative: false,
+            engine: None,
         }
     }
 
