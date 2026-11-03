@@ -20,9 +20,8 @@ use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::args::Args;
 use crate::manifest::Harness;
 use crate::openshell::provider::CodexAuth;
-use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
-use crucible_harness::{CodexJsonParser, LiveMeters, OpenCodeJsonParser, PiJsonParser};
+use crucible_harness::LiveMeters;
 use std::time::Duration;
 
 /// How a sandbox turn gets its model credential. Vertex mints a `cloud-platform` access token from
@@ -205,27 +204,9 @@ pub(crate) trait StreamDecoder: Send {
     fn push(&mut self, line: &str) -> Vec<AgentEvent>;
 }
 
-impl StreamDecoder for StreamJsonParser {
+impl<T: crucible_harness::line::LineFormat + Send> StreamDecoder for T {
     fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        StreamJsonParser::push(self, line)
-    }
-}
-
-impl StreamDecoder for CodexJsonParser {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        CodexJsonParser::push(self, line)
-    }
-}
-
-impl StreamDecoder for OpenCodeJsonParser {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        OpenCodeJsonParser::push(self, line)
-    }
-}
-
-impl StreamDecoder for PiJsonParser {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        PiJsonParser::push(self, line)
+        crucible_harness::line::LineFormat::push(self, line)
     }
 }
 

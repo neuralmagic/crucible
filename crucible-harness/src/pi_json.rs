@@ -13,9 +13,10 @@
 //! [`AgentEvent::Raw`] so a viewer never loses output to schema drift.
 
 use crate::codex_json::PriceFn;
+use crate::line::{LineFormat, lines_of, raw};
 use crate::stream_json::{TOOL_IO_LIMIT, bounded_input, str_field, truncate_chars, u64_field};
 use crate::tool_summary::summarize;
-use crucible_contract::event::{AgentEvent, RawStream, Tokens};
+use crucible_contract::event::{AgentEvent, Tokens};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -70,18 +71,10 @@ impl PiJsonParser {
         self.tool_io = on;
         self
     }
+}
 
-    /// Decode one line of `pi --mode json`, returning every [`AgentEvent`] it completed.
-    pub fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        let mut out = Vec::new();
-        let line = line.trim();
-        if line.is_empty() {
-            return out;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            out.push(raw(line));
-            return out;
-        };
+impl LineFormat for PiJsonParser {
+    fn line(&mut self, msg: &Value, text: &str, out: &mut Vec<AgentEvent>) {
         match msg.get("type").and_then(Value::as_str) {
             Some("session") => out.push(AgentEvent::Init {
                 model: self.model.clone(),
@@ -92,22 +85,22 @@ impl PiJsonParser {
                 if let Some(m) = msg.get("message")
                     && str_field(m, "role") == "assistant"
                 {
-                    self.assistant(m, &mut out);
+                    self.assistant(m, out);
                 }
             }
             Some("tool_execution_start") => {
-                let id = str_field(&msg, "toolCallId");
+                let id = str_field(msg, "toolCallId");
                 if !id.is_empty() {
                     self.open
                         .insert(id, msg.get("args").cloned().unwrap_or(Value::Null));
                 }
             }
-            Some("tool_execution_end") => self.tool_end(&msg, &mut out),
+            Some("tool_execution_end") => self.tool_end(msg, out),
             Some("auto_retry_end") => {
                 if msg.get("success").and_then(Value::as_bool) == Some(true) {
                     self.error = None;
                 } else if self.error.is_none() {
-                    let detail = str_field(&msg, "finalError");
+                    let detail = str_field(msg, "finalError");
                     self.error = Some(if detail.is_empty() {
                         "automatic retry failed".to_string()
                     } else {
@@ -138,11 +131,12 @@ impl PiJsonParser {
                 | "queue_update"
                 | "compaction_start",
             ) => {}
-            _ => out.push(raw(line)),
+            _ => out.push(raw(text)),
         }
-        out
     }
+}
 
+impl PiJsonParser {
     /// The turn's terminal event: an error when one stayed latched through the last retry.
     fn result(&self) -> AgentEvent {
         AgentEvent::Result {
@@ -239,31 +233,20 @@ impl PiJsonParser {
     }
 
     fn tokens(&self) -> Tokens {
-        let mut t = Tokens {
+        crate::line::Usage {
             input: self.input,
             output: self.output,
             cache_read: self.cache_read,
             cache_write: self.cache_write,
-            total: self.input + self.output + self.cache_read + self.cache_write,
-            rate: None,
-            cost_usd: None,
-        };
-        t.cost_usd = self.cost_for(&t);
-        t
-    }
-
-    /// The turn's cost so far: pi's own number when it priced the model, else the installed
-    /// estimate, else nothing.
-    fn cost_for(&self, t: &Tokens) -> Option<f64> {
-        if self.priced > 0.0 {
-            Some(self.priced)
-        } else {
-            self.price.map(|p| p(&self.model, t))
+            priced: self.priced,
+            model: &self.model,
+            price: self.price,
         }
+        .tokens()
     }
 
     fn cost(&self) -> f64 {
-        self.cost_for(&self.tokens()).unwrap_or(0.0)
+        self.tokens().cost_usd.unwrap_or(0.0)
     }
 }
 
@@ -284,27 +267,10 @@ fn result_text(result: &Value) -> String {
     }
 }
 
-/// Split a block of text into one event per line, dropping a trailing newline's empty tail.
-fn lines_of(text: &str) -> Vec<String> {
-    if text.trim().is_empty() {
-        return Vec::new();
-    }
-    text.trim_end_matches('\n')
-        .split('\n')
-        .map(str::to_string)
-        .collect()
-}
-
-fn raw(line: &str) -> AgentEvent {
-    AgentEvent::Raw {
-        text: line.to_string(),
-        stream: RawStream::Stdout,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::pi_json::*;
+    use crucible_contract::event::RawStream;
 
     /// Pricing stand-in: $1/MTok in, $10/MTok out, cached reads a tenth of input.
     fn price(_model: &str, t: &Tokens) -> f64 {

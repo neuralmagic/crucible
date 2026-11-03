@@ -9,6 +9,7 @@
 //!   and the `otel_summary` / `usage` rollup.
 
 pub mod codex_json;
+pub mod line;
 pub mod opencode_json;
 pub mod otel;
 pub mod pi_json;

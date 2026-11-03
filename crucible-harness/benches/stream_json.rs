@@ -7,6 +7,7 @@
 //! hash and exits, for re-baking after an intentional event-shape change.
 
 use crucible_harness::StreamJsonParser;
+use crucible_harness::line::LineFormat as _;
 use std::fmt::Write as _;
 use std::time::Instant;
 

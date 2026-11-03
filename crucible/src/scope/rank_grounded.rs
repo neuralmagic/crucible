@@ -572,6 +572,7 @@ pub fn run(a: RankGroundedArgs) -> Result<()> {
 mod tests {
     use super::*;
     use crucible_contract::Tier;
+    use crucible_harness::line::LineFormat as _;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 

@@ -11,9 +11,10 @@
 //! [`AgentEvent::Raw`] so a viewer never loses output to schema drift.
 
 use crate::codex_json::PriceFn;
+use crate::line::{LineFormat, lines_of, raw};
 use crate::stream_json::{TOOL_IO_LIMIT, bounded_input, str_field, truncate_chars, u64_field};
 use crate::tool_summary::{SUMMARY_CAP, summarize};
-use crucible_contract::event::{AgentEvent, RawStream, Tokens};
+use crucible_contract::event::{AgentEvent, Tokens};
 use serde_json::Value;
 
 /// Stateful decoder: feed it one stdout line at a time via [`OpenCodeJsonParser::push`].
@@ -60,20 +61,11 @@ impl OpenCodeJsonParser {
         self.tool_io = on;
         self
     }
+}
 
-    /// Decode one line of `opencode run --format json`, returning every [`AgentEvent`] it
-    /// completed.
-    pub fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        let mut out = Vec::new();
-        let line = line.trim();
-        if line.is_empty() {
-            return out;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            out.push(raw(line));
-            return out;
-        };
-        let kind = str_field(&msg, "type");
+impl LineFormat for OpenCodeJsonParser {
+    fn line(&mut self, msg: &Value, text: &str, out: &mut Vec<AgentEvent>) {
+        let kind = str_field(msg, "type");
         if !self.init_sent && msg.get("sessionID").is_some() {
             self.init_sent = true;
             out.push(AgentEvent::Init {
@@ -129,11 +121,12 @@ impl OpenCodeJsonParser {
                     message,
                 });
             }
-            _ => out.push(raw(line)),
+            _ => out.push(raw(text)),
         }
-        out
     }
+}
 
+impl OpenCodeJsonParser {
     /// A finished tool part: the tool name, a summary of its input (or the title opencode gave
     /// it), and (verbose only) the bounded input and output.
     fn tool(&self, part: &Value) -> AgentEvent {
@@ -175,45 +168,23 @@ impl OpenCodeJsonParser {
     }
 
     fn tokens(&self) -> Tokens {
-        let mut t = Tokens {
+        crate::line::Usage {
             input: self.input,
             output: self.output,
             cache_read: self.cache_read,
             cache_write: self.cache_write,
-            total: self.input + self.output + self.cache_read + self.cache_write,
-            rate: None,
-            cost_usd: None,
-        };
-        t.cost_usd = if self.priced > 0.0 {
-            Some(self.priced)
-        } else {
-            self.price.map(|p| p(&self.model, &t))
-        };
-        t
-    }
-}
-
-/// Split a block of text into one event per line, dropping a trailing newline's empty tail.
-fn lines_of(text: &str) -> Vec<String> {
-    if text.trim().is_empty() {
-        return Vec::new();
-    }
-    text.trim_end_matches('\n')
-        .split('\n')
-        .map(str::to_string)
-        .collect()
-}
-
-fn raw(line: &str) -> AgentEvent {
-    AgentEvent::Raw {
-        text: line.to_string(),
-        stream: RawStream::Stdout,
+            priced: self.priced,
+            model: &self.model,
+            price: self.price,
+        }
+        .tokens()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crucible_contract::event::RawStream;
 
     /// Pricing stand-in: $1/MTok in, $10/MTok out, cached reads a tenth of input.
     fn price(_model: &str, t: &Tokens) -> f64 {
