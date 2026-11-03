@@ -59,19 +59,17 @@ pub(crate) async fn add_repo(
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
     Json(body): Json<AddRepoBody>,
-) -> Response {
+) -> ApiResult<Response> {
     let justification = body.justification.trim().to_string();
     if justification.is_empty() {
-        return unprocessable("justification is required and must be non-empty");
+        return Err(ApiError::Unprocessable(
+            "justification is required and must be non-empty".to_string(),
+        ));
     }
 
     // Step 1 + 2: format, then the org whitelist (sync, no I/O).
-    let repo_ref = match validate_repo_ref(body.repo.trim(), &state.repo_whitelist) {
-        Ok(r) => r,
-        Err(msg) => {
-            return unprocessable(msg);
-        }
-    };
+    let repo_ref = validate_repo_ref(body.repo.trim(), &state.repo_whitelist)
+        .map_err(ApiError::Unprocessable)?;
     let repo = repo_ref.as_repo_string();
 
     // Step 3: the repo must actually exist on GitHub — the same client/metric path every other
@@ -83,24 +81,20 @@ pub(crate) async fn add_repo(
     match exists {
         Ok(true) => {}
         Ok(false) => {
-            return unprocessable(format!("{repo} does not exist on GitHub"));
+            return Err(ApiError::Unprocessable(format!(
+                "{repo} does not exist on GitHub"
+            )));
         }
         Err(e) => {
-            return unprocessable(format!("could not verify {repo} exists on GitHub: {e:#}"));
+            return Err(ApiError::Unprocessable(format!(
+                "could not verify {repo} exists on GitHub: {e:#}"
+            )));
         }
     }
 
     let actor = identity.as_deref();
-    match crate::issues::repo_watch::insert_watched_repo(state.db.pool(), &repo, actor).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(ErrorBody::new(format!("{repo} is already watched"))),
-            )
-                .into_response();
-        }
-        Err(e) => return ApiError::from(e).into_response(),
+    if !crate::issues::repo_watch::insert_watched_repo(state.db.pool(), &repo, actor).await? {
+        return Err(ApiError::Conflict(format!("{repo} is already watched")));
     }
     state
         .audit(
@@ -110,16 +104,12 @@ pub(crate) async fn add_repo(
         )
         .await;
 
-    match crate::issues::store::repo_health(state.db.pool()).await {
-        Ok(health) => {
-            let dto = health
-                .into_iter()
-                .find(|r| r.repo == repo)
-                .map(RepoHealthDto::from);
-            (StatusCode::CREATED, Json(dto)).into_response()
-        }
-        Err(e) => ApiError::from(e).into_response(),
-    }
+    let health = crate::issues::store::repo_health(state.db.pool()).await?;
+    let dto = health
+        .into_iter()
+        .find(|r| r.repo == repo)
+        .map(RepoHealthDto::from);
+    Ok((StatusCode::CREATED, Json(dto)).into_response())
 }
 
 /// Shared body for pause/resume/unwatch: look the repo up (404 if unknown), apply `f`, audit-log
@@ -132,28 +122,24 @@ async fn repo_transition(
     to: &'static str,
     identity: &crate::identity::session::Identity,
     apply: impl std::future::Future<Output = Result<bool, anyhow::Error>>,
-) -> Response {
-    match apply.await {
-        Ok(true) => {
-            state
-                .audit(
-                    crate::event_log::Event::now(repo, from, to, None, None)
-                        .by(identity.as_deref()),
-                    action,
-                )
-                .await;
-            (
-                StatusCode::OK,
-                Json(RepoActionAck {
-                    repo: repo.to_string(),
-                    action,
-                }),
-            )
-                .into_response()
-        }
-        Ok(false) => not_found(format!("{repo} is not a known repo")),
-        Err(e) => ApiError::from(e).into_response(),
+) -> ApiResult<Response> {
+    if !apply.await? {
+        return Err(ApiError::NotFound(format!("{repo} is not a known repo")));
     }
+    state
+        .audit(
+            crate::event_log::Event::now(repo, from, to, None, None).by(identity.as_deref()),
+            action,
+        )
+        .await;
+    Ok((
+        StatusCode::OK,
+        Json(RepoActionAck {
+            repo: repo.to_string(),
+            action,
+        }),
+    )
+        .into_response())
 }
 
 #[utoipa::path(
@@ -171,7 +157,7 @@ pub(crate) async fn pause_repo(
     Path(repo): Path<String>,
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
-) -> Response {
+) -> ApiResult<Response> {
     repo_transition(
         &state,
         &repo,
@@ -199,7 +185,7 @@ pub(crate) async fn resume_repo(
     Path(repo): Path<String>,
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
-) -> Response {
+) -> ApiResult<Response> {
     repo_transition(
         &state,
         &repo,
@@ -227,7 +213,7 @@ pub(crate) async fn unwatch_repo(
     Path(repo): Path<String>,
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
-) -> Response {
+) -> ApiResult<Response> {
     repo_transition(
         &state,
         &repo,
@@ -249,7 +235,7 @@ pub(crate) async fn unwatch_repo(
 )]
 pub(crate) async fn get_repos(
     State(state): State<ApiState>,
-) -> Result<Json<Vec<RepoHealthDto>>, ApiError> {
+) -> ApiResult<Json<Vec<RepoHealthDto>>> {
     let health = crate::issues::store::repo_health(state.db.pool()).await?;
     Ok(Json(health.into_iter().map(RepoHealthDto::from).collect()))
 }
