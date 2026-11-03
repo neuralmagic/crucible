@@ -211,7 +211,7 @@ pub(crate) async fn decide_consent(
         cluster: r.cluster.clone(),
         scopes: r.scopes.clone(),
     };
-    match issued.links.kube_user(&approved).await? {
+    match issued.directory.kube_user(&approved).await? {
         ClusterUser::Known(_) => {}
         ClusterUser::Unlinked => {
             session

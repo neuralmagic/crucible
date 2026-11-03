@@ -2,7 +2,7 @@
 //! credential, and who a person is on a cluster, from the deploy profile's rules and the links.
 
 use crate::agent_auth::people::Approved;
-use crate::agent_auth::people::directory::{Allowed, ClusterUser, LinkDirectory, SubjectDirectory};
+use crate::agent_auth::people::directory::{Allowed, ClusterUser};
 use crate::identity::cluster_identity::{self, Person, Resolution};
 use anyhow::Context;
 use forge::fleet::ClusterIdentity;
@@ -28,11 +28,11 @@ impl ControllerDirectory {
     }
 }
 
-#[async_trait::async_trait]
-impl SubjectDirectory for ControllerDirectory {
+impl ControllerDirectory {
     /// A subject whose row exists and whose stored credential the identity provider has not
-    /// refused: the condition that downgrades a browser session.
-    async fn allowed(&self, sub: &str) -> anyhow::Result<Option<Allowed>> {
+    /// refused: the condition that downgrades a browser session. `None` when the subject is gone
+    /// or their identity provider refused them.
+    pub async fn allowed(&self, sub: &str) -> anyhow::Result<Option<Allowed>> {
         let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT u.login, u.email, c.last_error FROM users u
                LEFT JOIN user_credentials c ON c.sub = u.sub
@@ -46,11 +46,9 @@ impl SubjectDirectory for ControllerDirectory {
             .filter(|(_, _, refused)| refused.is_none())
             .map(|(login, email, _)| Allowed { login, email }))
     }
-}
 
-#[async_trait::async_trait]
-impl LinkDirectory for ControllerDirectory {
-    async fn kube_user(&self, approved: &Approved) -> anyhow::Result<ClusterUser> {
+    /// The username `approved` acts as on its cluster, read fresh on every call.
+    pub async fn kube_user(&self, approved: &Approved) -> anyhow::Result<ClusterUser> {
         let rule = self
             .rules
             .get(&approved.cluster)
@@ -95,8 +93,7 @@ pub fn people(
                 .map(|policy| std::sync::Arc::new(Dcr::new(pool.clone(), policy))),
         ),
         config,
-        grants: std::sync::Arc::new(crate::agent_auth::people::grants::PgGrantStore::new(pool)),
-        subjects: directory.clone(),
-        links: directory,
+        grants: crate::agent_auth::people::grants::PgGrantStore::new(pool),
+        directory,
     })
 }
