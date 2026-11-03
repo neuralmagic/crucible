@@ -668,9 +668,8 @@ mod tests {
     /// ran; the third resume finds the ceiling spent and blocks the task instead of running it.
     #[test]
     fn a_task_that_kills_its_process_every_attempt_is_stopped_by_the_cost_ceiling() {
-        use crate::plan::exec::{
-            Attempt, AttemptOutcome, ExecCfg, PlanExit, Substrate, TaskRunner, execute,
-        };
+        use crate::plan::attempt::{Attempt, AttemptOutcome};
+        use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskRunner, execute};
         use crate::plan::ir::Task;
         use crate::plan::machine::BlockedReason;
         use std::collections::BTreeMap;

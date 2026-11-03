@@ -19,9 +19,8 @@ use crate::args::{Args, Paths, Prepared};
 use crate::agent;
 use crate::control;
 use crate::plan::admission::{Admission, Refusal};
-use crate::plan::exec::{
-    Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, execute,
-};
+use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
+use crate::plan::exec::{ExecCfg, Substrate, TaskRunner, execute};
 use crate::plan::harness::CandidateEvent;
 use crate::plan::ir::{
     EngineOp, Isolation, Join, Plan, PlanBudget, Stage, Task, TaskKind, TaskName, ValidPlan,

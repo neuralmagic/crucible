@@ -454,10 +454,8 @@ mod tests {
     /// the session log carries it, folds to the same result.
     #[test]
     fn every_settled_row_folds_back_to_the_result_it_was_written_from() {
-        use crate::plan::exec::{
-            Attempt, AttemptOutcome, ExecCfg, Substrate, TaskResult, TaskRunner, TransportFailure,
-            execute,
-        };
+        use crate::plan::attempt::{Attempt, AttemptOutcome, TransportFailure};
+        use crate::plan::exec::{ExecCfg, Substrate, TaskResult, TaskRunner, execute};
         use crate::plan::ir::{Task, TaskName};
         use std::collections::BTreeMap;
 

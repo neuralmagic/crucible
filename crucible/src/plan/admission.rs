@@ -13,7 +13,7 @@ use std::time::Instant;
 use crucible_contract::session::SessionEvent;
 
 use crate::deadline::{Deadline, RunCeiling};
-use crate::plan::exec::{Attempt, BatchItem};
+use crate::plan::attempt::{Attempt, BatchItem};
 use crate::plan::ir::{Task, TaskName};
 use crate::plan::machine::BlockedReason;
 
@@ -261,7 +261,7 @@ mod tests {
 
     use crate::deadline::{Bound, RunCeiling};
     use crate::plan::admission::{Admission, Refusal};
-    use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem};
+    use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
     use crate::plan::ir::{Join, Stage, Task, TaskKind};
 
     fn task(name: &str, kind: TaskKind) -> Task {

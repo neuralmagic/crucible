@@ -16,7 +16,8 @@ use serde_json::Value;
 
 use crate::crucible::Direction;
 use crate::deadline::{Deadline, Supervised};
-use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner, own_note};
+use crate::plan::attempt::{Attempt, AttemptOutcome, own_note};
+use crate::plan::exec::TaskRunner;
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};

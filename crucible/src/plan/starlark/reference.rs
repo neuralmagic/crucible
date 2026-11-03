@@ -5,7 +5,7 @@
 //! [`crate::plan::starlark::known_kwargs`], so a constructor cannot be added, renamed, or given a
 //! new argument without the reference following it.
 
-use crate::plan::exec::DeclaredStatus;
+use crate::plan::attempt::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
@@ -988,7 +988,7 @@ fn reserved_rows(rows: Vec<Reserved>) -> serde_json::Value {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::plan::exec::DeclaredStatus;
+    use crate::plan::attempt::DeclaredStatus;
     use crate::plan::starlark::reference::functions;
     use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals};
     use crate::plan::workflow::WorkflowType;
