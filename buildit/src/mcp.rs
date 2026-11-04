@@ -1643,7 +1643,7 @@ impl Broker {
                 .workspace
                 .fetch_context(&caller.sandbox, &context, &ctx)
         })?;
-        let tar = crate::context::tar_bytes(&ctx)?;
+        let tar = crate::context::staged_tar_bytes(&ctx)?;
         let digest = crate::context::digest(&tar)?;
         let tarball = crate::context::gzip(&tar)?;
         let (id, pod, warm_age) = match warm {
