@@ -144,8 +144,8 @@ def ninja_jobs(build_dir: Path, since_ns: int) -> list[Job]:
 
 def ninja_log_jobs(log: Path, since_ns: int | None = None) -> list[Job]:
     """The jobs ninja logged in LOG with a stamp at or after SINCE_NS, on wall-clock time; without
-    SINCE_NS, the jobs of the log's last ninja run, the lines whose run start lies within
-    RUN_GAP_NS of the latest one.
+    SINCE_NS, the jobs of the log's last ninja run, the lines stamped no more than RUN_GAP_NS
+    before it started.
 
     A log line gives a job's start and end in ms from its ninja run's start, and a stamp in ns:
     the output's mtime, near the job's end, in older logs; the job's start in newer ones. The
@@ -169,7 +169,7 @@ def ninja_log_jobs(log: Path, since_ns: int | None = None) -> list[Job]:
             continue
         latest[parts[3]] = (start_ms, end_ms, mtime_ns)
     if since_ns is None and latest:
-        since_ns = _last_run_start(list(latest.values()), version) - RUN_GAP_NS
+        since_ns = _last_run_start(list(latest.values())) - RUN_GAP_NS
     rows = {out: r for out, r in latest.items() if r[2] >= (since_ns or 0)}
     if not rows:
         return []
@@ -180,10 +180,10 @@ def ninja_log_jobs(log: Path, since_ns: int | None = None) -> list[Job]:
     )
 
 
-def _last_run_start(rows: list[tuple[int, int, int]], version: int) -> int:
-    """The latest run's start: each line dated by its start (newer logs) or end (older ones)."""
-    stamped_at_start = version >= START_STAMPED_FROM
-    return max(stamp - (start if stamped_at_start else end) * MS for start, end, stamp in rows)
+def _last_run_start(rows: list[tuple[int, int, int]]) -> int:
+    """The latest run's start, or up to its shortest job before it: a line is stamped at its
+    job's start, or at its end for a restat output, so stamp - end never passes its run's start."""
+    return max(stamp - end * MS for _, end, stamp in rows)
 
 
 def _run_start(rows: list[tuple[int, int, int]], version: int) -> int:

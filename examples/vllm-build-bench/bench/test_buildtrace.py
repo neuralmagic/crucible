@@ -113,6 +113,23 @@ class TestNinjaJobs(unittest.TestCase):
         )
         self.assertEqual(len(t.ninja_log_jobs(self.tmp / t.NINJA_LOG, since_ns=0)), 3)
 
+    def test_a_long_restat_output_stamped_at_its_end_stays_in_its_run(self) -> None:
+        earlier, run = 1_000_000 * MS, 1_100_000 * MS
+        ninja_log(
+            self.tmp,
+            [
+                (0, 900, earlier, "CMakeFiles/_C.dir/a.cu.o"),
+                (12, 39, run + 12 * MS, "CMakeFiles/spinloop.dir/csrc/spinloop.cpp.o"),
+                (1323, 3803, run + 1323 * MS, "_C_stable_libtorch.abi3.so"),
+                (1333, 54929, run + 54929 * MS, "deepgemm_C/.built"),
+            ],
+        )
+        self.assertEqual(
+            [j.output for j in t.ninja_log_jobs(self.tmp / t.NINJA_LOG)],
+            ["CMakeFiles/spinloop.dir/csrc/spinloop.cpp.o", "_C_stable_libtorch.abi3.so", "deepgemm_C/.built"],
+            "deepgemm's restat output is stamped at its end, 54 s in, and is still this run's",
+        )
+
     def test_a_missing_empty_or_malformed_log_is_no_jobs(self) -> None:
         self.assertEqual(t.ninja_jobs(self.tmp, 0), [])
         (self.tmp / t.NINJA_LOG).write_text("# ninja log v7\nnot\ta\tlog\nx\ty\tz\tw\tv\n")
