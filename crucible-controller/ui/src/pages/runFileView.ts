@@ -1,6 +1,13 @@
 import type { components } from '../api/schema';
+import { evidencePolicy } from './decisions';
 
 type RunFile = components['schemas']['RunFile'];
+
+/** Scripts a captured HTML file may load from the network, each pinned to one exact build. */
+export const RUN_FILE_SCRIPTS: readonly string[] = ['https://cdn.plot.ly/plotly-2.35.2.min.js'];
+
+/** The policy a captured HTML file runs under: the evidence policy plus `RUN_FILE_SCRIPTS`. */
+export const RUN_FILE_CSP = evidencePolicy(RUN_FILE_SCRIPTS);
 
 /** How a captured file is rendered inline; null means download only. */
 export type InlineKind = 'markdown' | 'json' | 'text' | 'image' | 'html';

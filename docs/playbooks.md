@@ -421,7 +421,9 @@ crux draft-launch haiku --max-cost 1 --max-time 5m
 draft is ready, `crux draft-graduate` opens a PR that exports it to a repository.
 `crux playbook-import owner/repo --path haiku` proposes to register it from that repository.
 After registration, `crux launch` starts the playbook with parameters, and
-`crux playbook-runs` lists its runs.
+`crux playbook-runs` lists its runs. The run view shows the files that tasks declared in
+`emits_files`, and renders an HTML file as an interactive report. See
+[Captured files and reports](./run-files.md).
 
 A registration runs one variant of the pack's manifest
 ([variants](crucible-contract.md#1-the-manifest-crucibletoml)). Add `--variant offline` to
