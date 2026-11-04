@@ -216,6 +216,12 @@ const PACK_WORKDIR_VOLUME: &str = "pack-workdir";
 /// The pack ConfigMap key holding the pack's gzipped tar, which `pack-stage` extracts into the
 /// domain dir.
 pub const PACK_TARBALL_KEY: &str = "pack.tar.gz";
+/// The emptyDir `buildit-bin` copies `[buildit] image`'s binary into, and the loop container's
+/// read-only mount of it, first on its PATH.
+const BUILDIT_BIN_VOLUME: &str = "buildit-bin";
+pub const BUILDIT_BIN_DIR: &str = "/opt/crucible/buildit/bin";
+/// Where `[buildit] image` holds the binary.
+const BUILDIT_IN_IMAGE: &str = "/usr/local/bin/buildit";
 /// The pack ConfigMap key holding [`PackDelivery::inputs`] as a gzipped tar, present only when
 /// there are inputs.
 pub const RUN_INPUTS_KEY: &str = "inputs.tar.gz";
@@ -323,6 +329,12 @@ pub fn render(
         "loop image",
         &profile.image.loop_image,
     )?;
+    let buildit_image = profile
+        .buildit
+        .as_ref()
+        .and_then(|b| b.image.as_deref())
+        .map(|i| pin_image(opts.digests.as_deref(), "buildit image", i))
+        .transpose()?;
     // The loop image bakes the domain pack at its DIRECTORY name, which is
     // not the composite's `[composite].name` (an issue overlay may rename it). The wrapper resolves
     // `<domains_root>/<domain-dir>`.
@@ -358,6 +370,7 @@ pub fn render(
         profile,
         opts,
         image,
+        buildit_image,
         sandbox_image,
         driver: profile.cluster.sandbox_driver(),
         spoke,
@@ -481,6 +494,8 @@ struct Renderer<'a> {
     opts: &'a RenderOpts,
     /// The loop image, digest-resolved when pinning is on.
     image: String,
+    /// `[buildit] image`, digest-resolved when pinning is on.
+    buildit_image: Option<String>,
     /// The agent's sandbox image. Always present for the openshell-loop template; a playbook
     /// declares one only when a task runs sandboxed.
     sandbox_image: Option<String>,
@@ -690,12 +705,16 @@ impl Renderer<'_> {
     }
 
     fn pod(&self) -> Result<core::Pod> {
+        let mut script = self.wrapper_script()?;
+        if self.buildit_image.is_some() {
+            script.insert_str(0, &format!("export PATH=\"{BUILDIT_BIN_DIR}:$PATH\"\n"));
+        }
         let container = core::Container {
             name: "loop".to_string(),
             image: Some(self.image.clone()),
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-            args: Some(vec![self.wrapper_script()?]),
+            args: Some(vec![script]),
             security_context: self.loop_security_context(),
             env: Some(self.env()?),
             volume_mounts: Some(self.volume_mounts()),
@@ -753,6 +772,37 @@ impl Renderer<'_> {
     /// container does, so inputs under `state/` land where the run reads them. Reuses the loop
     /// image (it has `/bin/sh`, `tar`, and `gzip`), no extra pull.
     fn init_containers(&self) -> Option<Vec<core::Container>> {
+        let init: Vec<core::Container> = self
+            .pack_stage()
+            .into_iter()
+            .chain(self.buildit_bin())
+            .collect();
+        (!init.is_empty()).then_some(init)
+    }
+
+    /// With `[buildit] image`, the init container that copies its `buildit` into the emptyDir the
+    /// loop container runs it from.
+    fn buildit_bin(&self) -> Option<core::Container> {
+        let image = self.buildit_image.as_ref()?;
+        Some(core::Container {
+            name: BUILDIT_BIN_VOLUME.to_string(),
+            image: Some(image.clone()),
+            image_pull_policy: Some("IfNotPresent".to_string()),
+            command: Some(vec![
+                "cp".to_string(),
+                BUILDIT_IN_IMAGE.to_string(),
+                format!("{BUILDIT_BIN_DIR}/buildit"),
+            ]),
+            volume_mounts: Some(vec![core::VolumeMount {
+                name: BUILDIT_BIN_VOLUME.to_string(),
+                mount_path: BUILDIT_BIN_DIR.to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        })
+    }
+
+    fn pack_stage(&self) -> Option<core::Container> {
         let pack = self.opts.pack.as_ref()?;
         let domain_dir = self.domain_dir();
         let mut script = format!(
@@ -763,7 +813,7 @@ impl Renderer<'_> {
                 "tar -xzf {PACK_SRC_DIR}/{RUN_INPUTS_KEY} -C {domain_dir}\n"
             ));
         }
-        Some(vec![core::Container {
+        Some(core::Container {
             name: "pack-stage".to_string(),
             image: Some(self.image.clone()),
             image_pull_policy: Some("IfNotPresent".to_string()),
@@ -788,7 +838,7 @@ impl Renderer<'_> {
                 .collect(),
             ),
             ..Default::default()
-        }])
+        })
     }
 
     /// The broker-child + gate env, projected from the manifest (the source of truth) + the profile. The
@@ -1093,6 +1143,9 @@ exit $rc
             mount_path: FORGE_STORAGE_ROOT.to_string(),
             ..Default::default()
         });
+        if self.buildit_image.is_some() {
+            mounts.push(ro(BUILDIT_BIN_VOLUME, BUILDIT_BIN_DIR, None));
+        }
         // Pack delivery: the staged, writable domain dir (the init-container populated it from the CM).
         if self.opts.pack.is_some() {
             mounts.push(core::VolumeMount {
@@ -1251,6 +1304,13 @@ exit $rc
             empty_dir: Some(core::EmptyDirVolumeSource::default()),
             ..Default::default()
         });
+        if self.buildit_image.is_some() {
+            volumes.push(core::Volume {
+                name: BUILDIT_BIN_VOLUME.to_string(),
+                empty_dir: Some(core::EmptyDirVolumeSource::default()),
+                ..Default::default()
+            });
+        }
 
         // Pack delivery: the read-only ConfigMap holding the pack tarball + the writable emptyDir the
         // init-container extracts it into.
@@ -5243,6 +5303,61 @@ mod tests {
         assert!(!mounted(&none));
         no_cache_env(&none);
         assert!(!unshared.iter().any(|r| r["ports"][0]["port"] == 8850));
+    }
+
+    /// With `[buildit] image`, an init container copies that image's `buildit` into an emptyDir the
+    /// loop container mounts read-only and puts first on its PATH; without it, none of that.
+    #[test]
+    fn a_pinned_buildit_image_puts_its_binary_first_on_the_loop_container_s_path() {
+        let manifest = k8s_manifest();
+        let pod = |extra: &str| -> serde_json::Value {
+            let profile = k8s_profile(&format!(
+                "[buildit]\nnamespace = \"crucible-builds\"\n{extra}"
+            ));
+            serde_norway::Deserializer::from_str(&render_k8s_manifest(&manifest, &profile))
+                .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+                .find(|d| d["kind"] == "Pod")
+                .unwrap()
+        };
+        let named = |list: &serde_json::Value, name: &str| -> Option<serde_json::Value> {
+            list.as_array()?.iter().find(|i| i["name"] == name).cloned()
+        };
+
+        let spec = pod("image = \"ghcr.io/example/crucible-buildit@sha256:abc\"\n")["spec"].clone();
+        let init = named(&spec["initContainers"], "buildit-bin").expect("the buildit-bin init");
+        assert_eq!(init["image"], "ghcr.io/example/crucible-buildit@sha256:abc");
+        assert_eq!(
+            init["command"],
+            serde_json::json!([
+                "cp",
+                "/usr/local/bin/buildit",
+                "/opt/crucible/buildit/bin/buildit"
+            ])
+        );
+        assert_eq!(
+            init["volumeMounts"],
+            serde_json::json!([{"name": "buildit-bin", "mountPath": "/opt/crucible/buildit/bin"}])
+        );
+        assert_eq!(
+            named(&spec["volumes"], "buildit-bin").expect("the volume")["emptyDir"],
+            serde_json::json!({})
+        );
+        let main = &spec["containers"][0];
+        let mount = named(&main["volumeMounts"], "buildit-bin").expect("the loop mount");
+        assert_eq!(mount["mountPath"], BUILDIT_BIN_DIR);
+        assert_eq!(mount["readOnly"], true);
+        let script = main["args"][0].as_str().unwrap().to_string();
+
+        let spec = pod("")["spec"].clone();
+        assert!(named(&spec["initContainers"], "buildit-bin").is_none());
+        assert!(named(&spec["volumes"], "buildit-bin").is_none());
+        assert!(named(&spec["containers"][0]["volumeMounts"], "buildit-bin").is_none());
+        let unpinned = spec["containers"][0]["args"][0].as_str().unwrap();
+        assert_eq!(
+            script,
+            format!("export PATH=\"/opt/crucible/buildit/bin:$PATH\"\n{unpinned}")
+        );
+        assert!(!unpinned.contains(BUILDIT_BIN_DIR));
     }
 
     /// With `[buildit]`, the builder namespace gets the admission policy buildit ships, bound to
