@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::logs::LogName;
+use crate::logs::StepLog;
 use crate::pod::BuilderPod;
 use crate::sandbox::RelPath;
 
@@ -73,7 +73,7 @@ run)
 esac
 printf '%s%s\n' "$c" "$t" > "$log.exit.$$" && ln "$log.exit.$$" "$log.exit" 2>/dev/null
 rm -f "$log.exit.$$"
-[ -n "$term" ] && cat "$log.exit" > "$term" 2>/dev/null
+[ -n "$term" ] && { cat "$log.exit"; printf '%s\n' "$log"; } > "$term" 2>/dev/null
 exit 0"#;
 
 pub(crate) const LAUNCH: &str = r#"body=$1; log=$2; mirror=$3; shift 3
@@ -172,6 +172,14 @@ impl State {
             code: code.parse().ok()?,
             timed_out,
         })
+    }
+
+    /// A termination message: the exit record of the build that wrote it, and that build's log,
+    /// which pods from before shared pods leave out.
+    pub fn termination(message: &str) -> Option<(Self, Option<&str>)> {
+        let mut lines = message.lines();
+        let state = Self::record(lines.next()?)?;
+        Some((state, lines.next().map(str::trim).filter(|l| !l.is_empty())))
     }
 
     pub fn status(self) -> Status {
@@ -293,7 +301,7 @@ pub fn run_args(
 // `mirror` copies the log to that path as it grows, e.g. the container's stdout
 pub async fn launch(
     pod: &BuilderPod,
-    log: LogName,
+    log: &StepLog,
     mirror: Option<&str>,
     paths: &[RelPath],
     args: Vec<String>,
@@ -311,7 +319,7 @@ pub async fn launch(
 }
 
 // None when the step was never started
-pub async fn snapshot(pod: &BuilderPod, log: LogName) -> Result<Option<Snapshot>> {
+pub async fn snapshot(pod: &BuilderPod, log: &StepLog) -> Result<Option<Snapshot>> {
     let out = pod
         .exec_output(&sh(STATUS, [log.path()]), STATUS_LIMIT)
         .await?;
@@ -326,7 +334,7 @@ pub async fn snapshot(pod: &BuilderPod, log: LogName) -> Result<Option<Snapshot>
 }
 
 // the snapshot once the step stops running or `limit` passes, whichever is first
-pub async fn wait(pod: &BuilderPod, log: LogName, limit: Duration) -> Result<Snapshot> {
+pub async fn wait(pod: &BuilderPod, log: &StepLog, limit: Duration) -> Result<Snapshot> {
     let deadline = Instant::now() + limit;
     loop {
         let snap = snapshot(pod, log)
@@ -346,24 +354,24 @@ pub async fn wait(pod: &BuilderPod, log: LogName, limit: Duration) -> Result<Sna
 }
 
 // true when this call ended the step, false when it had already ended
-pub async fn cancel(pod: &BuilderPod, log: LogName) -> Result<bool> {
+pub async fn cancel(pod: &BuilderPod, log: &StepLog) -> Result<bool> {
     let out = pod.exec_capture(&sh(CANCEL, [log.path()])).await?;
     Ok(out.trim() == "cancelled")
 }
 
 // true when this caller holds the claim and should publish the run's fetch
-pub async fn claim(pod: &BuilderPod, log: LogName) -> Result<bool> {
+pub async fn claim(pod: &BuilderPod, log: &StepLog) -> Result<bool> {
     let argv = sh(CLAIM, [log.path(), CLAIM_STALE_MIN.to_string()]);
     Ok(pod.exec_output(&argv, 4096).await?.code == Some(0))
 }
 
-pub async fn record(pod: &BuilderPod, log: LogName, published: &Published) -> Result<()> {
+pub async fn record(pod: &BuilderPod, log: &StepLog, published: &Published) -> Result<()> {
     let body = serde_json::to_string(published).context("serializing the published record")?;
     pod.exec_with_stdin(&sh(RECORD, [log.path()]), body.as_bytes())
         .await
 }
 
-pub async fn fetched_tar(pod: &BuilderPod, log: LogName) -> Result<Vec<u8>> {
+pub async fn fetched_tar(pod: &BuilderPod, log: &StepLog) -> Result<Vec<u8>> {
     let argv = ["cat", "--", &format!("{}.tar", log.path())].map(String::from);
     let out = pod.exec_output(&argv, FETCH_LIMIT).await?;
     match out.code {
@@ -376,7 +384,7 @@ pub async fn fetched_tar(pod: &BuilderPod, log: LogName) -> Result<Vec<u8>> {
     }
 }
 
-pub async fn fetch_error(pod: &BuilderPod, log: LogName) -> Result<String> {
+pub async fn fetch_error(pod: &BuilderPod, log: &StepLog) -> Result<String> {
     let argv = ["cat", "--", &format!("{}.fetch-err", log.path())].map(String::from);
     let out = pod.exec_output(&argv, 64 * 1024).await?;
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -385,6 +393,38 @@ pub async fn fetch_error(pod: &BuilderPod, log: LogName) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use crate::step::{Fetch, Published, Snapshot, State, Status};
+
+    #[test]
+    fn a_termination_message_names_the_build_log_it_came_from() {
+        let log = "/tmp/buildit-logs/buildit-1-0000beef/build.log";
+        assert_eq!(
+            State::termination(&format!("124 timeout\n{log}\n")),
+            Some((
+                State::Exited {
+                    code: 124,
+                    timed_out: true
+                },
+                Some(log)
+            ))
+        );
+        assert_eq!(
+            State::termination(&format!("cancelled\n{log}\n")),
+            Some((State::Cancelled, Some(log)))
+        );
+        assert_eq!(
+            State::termination("0\n"),
+            Some((
+                State::Exited {
+                    code: 0,
+                    timed_out: false
+                },
+                None
+            )),
+            "a pod from before shared pods writes the record alone"
+        );
+        assert_eq!(State::termination("garbage\n{log}"), None);
+        assert_eq!(State::termination(""), None);
+    }
 
     #[test]
     fn states_parse_from_the_status_script() {
@@ -595,7 +635,8 @@ mod tests {
             wait_for(name, || !read(&ext(&log, "term")).is_empty());
             let log_text = read(&log);
             wait_for(name, || read(&ext(&log, "mirror")) == log_text);
-            assert_eq!(read(&ext(&log, "term")), read(&ext(&log, "exit")), "{name}");
+            let record = format!("{}{}\n", read(&ext(&log, "exit")), log.display());
+            assert_eq!(read(&ext(&log, "term")), record, "{name}");
             (status(&log).state, log_text)
         };
 
@@ -638,7 +679,10 @@ mod tests {
         wait_for("the termination record", || {
             !read(&ext(&log, "term")).is_empty()
         });
-        assert_eq!(read(&ext(&log, "term")), "cancelled\n");
+        assert_eq!(
+            read(&ext(&log, "term")),
+            format!("cancelled\n{}\n", log.display())
+        );
         assert_eq!(status(&log).state, State::Cancelled);
         assert_eq!(cancel(&log), "ended\n");
         let stage = read(&ext(&log, "stage"));

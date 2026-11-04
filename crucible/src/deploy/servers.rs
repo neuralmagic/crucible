@@ -3,9 +3,9 @@
 //! it. `[kueue]`, `[buildit]` and each `[[agent_servers]]` entry describe one; the issuer and
 //! dispatch read only these descriptions.
 
-use crate::deploy::profile::DeployProfile;
+use crate::deploy::profile::{BuilditCacheCfg, DeployProfile};
 use crucible_contract::agent_servers::{
-    BuilderPods, BuilditSite, LocalServer, NotServerName, ServerName, Transport,
+    BuilderPods, BuilditSite, LocalServer, NotServerName, ServerName, SharedCache, Transport,
 };
 use crucible_contract::oauth::Scope;
 use std::collections::BTreeMap;
@@ -43,9 +43,16 @@ pub enum Hosting {
         push_repo: Option<String>,
         /// Where it fetches the agent issuer's keys, when not from the issuer itself.
         run_jwks_uri: Option<url::Url>,
-        /// Its builder pods on each of the server's clusters.
-        builders: BTreeMap<String, BuilderPods>,
+        /// What it runs with on each of the server's clusters.
+        sites: BTreeMap<String, ClusterSite>,
     },
+}
+
+/// buildit on one cluster: its builder pods, and the shared cache there if there is one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterSite {
+    pub builders: BuilderPods,
+    pub cache: Option<SharedCache>,
 }
 
 impl ServerSpec {
@@ -64,16 +71,18 @@ impl ServerSpec {
                 queue,
                 push_repo,
                 run_jwks_uri,
-                builders,
+                sites,
             } => {
                 let jwks = crate::deploy::profile::jwks_uri(issuer, run_jwks_uri.as_ref())?;
-                Transport::Local(LocalServer::Buildit(BuilditSite {
+                let site = sites.get(cluster).cloned().unwrap_or_default();
+                Transport::Local(LocalServer::Buildit(Box::new(BuilditSite {
                     run_issuer: format!("{issuer}={jwks}"),
                     namespace: namespace.clone(),
                     push_repo: push_repo.clone(),
                     queue: queue.clone(),
-                    builders: builders.get(cluster).cloned().unwrap_or_default(),
-                }))
+                    builders: site.builders,
+                    cache: site.cache,
+                })))
             }
         })
     }
@@ -111,6 +120,8 @@ pub enum ServerSpecError {
     PeopleUrlCluster(String),
     #[error("[buildit] cluster_builders names cluster {0}, which is not one of [buildit] clusters")]
     BuilderCluster(String),
+    #[error("[buildit.cache] clusters names cluster {0}, which is not one of [buildit] clusters")]
+    CacheCluster(String),
     #[error("agent servers {first} and {second} both serve {url} on cluster {cluster}")]
     DuplicateUrl {
         first: ServerName,
@@ -159,6 +170,18 @@ impl DeployProfile {
             if let Some(stray) = b.cluster_builders.keys().find(|c| !b.serves(c)) {
                 return Err(ServerSpecError::BuilderCluster(stray.clone()));
             }
+            if let Some(cache) = &b.cache
+                && let Some(stray) = cache.clusters.iter().find(|c| !b.serves(c))
+            {
+                return Err(ServerSpecError::CacheCluster(stray.clone()));
+            }
+            let cache_on = |cluster: &String| {
+                let cache = b.cache.as_ref().filter(|c| c.clusters.contains(cluster))?;
+                Some(SharedCache {
+                    url: BuilditCacheCfg::url(&self.cluster.loop_namespace),
+                    write: cache.write,
+                })
+            };
             servers.push(ServerSpec {
                 name: ServerName::parse("buildit")?,
                 url: b.url(),
@@ -173,10 +196,16 @@ impl DeployProfile {
                     queue: b.queue.as_ref().map(ToString::to_string),
                     push_repo: b.push_repo.clone(),
                     run_jwks_uri: b.run_jwks_uri.clone(),
-                    builders: b
+                    sites: b
                         .clusters
                         .iter()
-                        .map(|c| (c.clone(), b.builders_on(c)))
+                        .map(|c| {
+                            let site = ClusterSite {
+                                builders: b.builders_on(c),
+                                cache: cache_on(c),
+                            };
+                            (c.clone(), site)
+                        })
                         .collect(),
                 },
                 limits: [
@@ -354,7 +383,7 @@ mod tests {
                         queue: Some("builders".into()),
                         push_repo: Some("quay.io/team/agent".into()),
                         run_jwks_uri: None,
-                        builders: BTreeMap::from([("ocp".into(), BuilderPods::default())]),
+                        sites: BTreeMap::from([("ocp".into(), ClusterSite::default())]),
                     },
                     limits: BTreeMap::from([
                         ("push_repo".into(), "quay.io/team/agent".into()),
@@ -378,13 +407,14 @@ mod tests {
         );
         assert_eq!(
             servers[1].transport(issuer, "ocp").unwrap(),
-            Transport::Local(LocalServer::Buildit(BuilditSite {
+            Transport::Local(LocalServer::Buildit(Box::new(BuilditSite {
                 run_issuer: format!("{issuer}={issuer}/.well-known/jwks.json"),
                 namespace: "builds".into(),
                 push_repo: Some("quay.io/team/agent".into()),
                 queue: Some("builders".into()),
                 builders: BuilderPods::default(),
-            }))
+                cache: None,
+            })))
         );
         let routed = profile(&KUEUE_AND_BUILDIT.replace(
             "push_repo = ",
@@ -464,6 +494,35 @@ mod tests {
             }
         );
         assert_eq!(builders(&servers[0], "south"), BuilderPods::default());
+    }
+
+    #[test]
+    fn the_shared_cache_serves_only_its_own_clusters_which_must_be_buildit_s() {
+        let cache = |clusters: &str| {
+            profile(&format!(
+                "[buildit]\nclusters = [\"east\", \"west\"]\n\
+                 [buildit.cache]\ntoken_secret = \"buildit-cache-token\"\n{clusters}"
+            ))
+            .agent_servers()
+        };
+        let Hosting::Buildit { sites, .. } = &cache("clusters = [\"west\"]\n").unwrap()[0].hosting
+        else {
+            panic!("buildit runs in the loop pod")
+        };
+        let cached: Vec<&String> = sites
+            .iter()
+            .filter_map(|(c, site)| site.cache.as_ref().map(|_| c))
+            .collect();
+        assert_eq!(cached, ["west"]);
+        assert_eq!(sites.keys().collect::<Vec<_>>(), ["east", "west"]);
+        assert!(matches!(
+            cache("cluster = \"north\"\n"),
+            Err(ServerSpecError::CacheCluster(c)) if c == "north"
+        ));
+        assert!(
+            matches!(cache(""), Err(ServerSpecError::CacheCluster(c)) if c == "hub"),
+            "the default is the hub, which a spoke-only buildit does not serve"
+        );
     }
 
     #[test]
@@ -609,10 +668,10 @@ mod tests {
                 queue: None,
                 push_repo: Some("quay.io/example/crucible-smoke".into()),
                 run_jwks_uri: None,
-                builders: servers[1]
+                sites: servers[1]
                     .clusters
                     .iter()
-                    .map(|c| (c.clone(), BuilderPods::default()))
+                    .map(|c| (c.clone(), ClusterSite::default()))
                     .collect(),
             }
         );

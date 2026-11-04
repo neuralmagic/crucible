@@ -152,6 +152,31 @@ numbered lines capped at `max_bytes` (default 16 KiB, max 64 KiB); on
 overflow, grep and tail keep the end of the log and range keeps its start.
 `clean` deletes builder pods.
 
+Builds of one sandbox share builder pods. A build runs in an idle live pod of its sandbox
+whose deadline leaves room for the build's timeout, as `<pod>-<suffix>`, with
+`buildah bud --layers`, so it reuses the pod's pulled images, layer cache and
+`RUN --mount=type=cache` contents. `clean` of one build drops its image name, context and logs
+and leaves the pod for the next build; `clean` with no build_id deletes the sandbox's pods.
+`--reuse-builders false` gives every build a pod of its own. `--pod-deadline` defaults to 4h.
+`--storage-driver overlay` stores layers with kernel overlayfs instead of vfs, on nodes that
+allow it in a user namespace.
+
+A build may declare caches, `caches: [{name, path, read_only}]` (`--cache NAME=PATH[:ro]` on the
+CLI): directories of its builder pod mounted at `path` in every `RUN` step and kept for the
+sandbox's later builds there. Every `RUN` step also sees `/buildit`. A `facts.json` object a build
+leaves there comes back as `status.facts`. With `--cache-url`, buildit first writes `cache.json`
+there, naming the shared cache and, with `--cache-token-file`, its write token.
+
+`buildit cache` is that shared cache: blobs over HTTP, open to GET and HEAD, with PUT and DELETE
+behind the token in `--token-file`, sent as a bearer token or a basic-auth password. ccache uses it
+as remote storage:
+
+```sh
+buildit cache --dir /var/cache/buildit --token-file /etc/buildit-cache/token --max-gib 180
+CCACHE_REMOTE_STORAGE="http://x:$TOKEN@buildit-cache:8850/ccache"    # writes
+CCACHE_REMOTE_STORAGE="http://buildit-cache:8850/ccache|read-only"   # reads only
+```
+
 Build and run steps run detached in the builder pod. A step's exit code,
 cancellation and fetched tarball are kept in files next to its log, so any
 server process can report on it. Clients that declare the

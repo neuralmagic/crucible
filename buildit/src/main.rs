@@ -3,6 +3,7 @@
 mod auth;
 mod backend;
 mod build;
+mod cache;
 mod client;
 mod context;
 mod job;
@@ -54,6 +55,8 @@ enum Cmd {
     },
     /// Serve build/status/run/logs/clean as stateless MCP tools over streamable http
     Mcp(Box<mcp::McpArgs>),
+    /// Serve a blob store over http that builds share: ccache objects and stored build outputs
+    Cache(cache::CacheArgs),
     /// Delete leftover buildit pods, jobs, and secrets (label app=buildit). With --server, delete
     /// BUILD_ID on that server, or every build of its caller
     Clean {
@@ -239,8 +242,32 @@ pub struct BuildArgs {
     /// Print the started build at once instead of waiting for it to end
     #[arg(long, requires = "server", conflicts_with = "image")]
     pub no_wait: bool,
+    /// A cache every RUN step sees at PATH, kept for the sandbox's later builds; repeatable
+    #[arg(
+        long = "cache",
+        value_name = "NAME=PATH[:ro]",
+        value_parser = parse_cache,
+        requires = "server",
+        conflicts_with = "image"
+    )]
+    pub caches: Vec<mcp::CacheSpec>,
     #[command(flatten)]
     pub server: ServerOpt,
+}
+
+fn parse_cache(raw: &str) -> Result<mcp::CacheSpec, String> {
+    let (name, rest) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("{raw:?} is not NAME=PATH[:ro]"))?;
+    let (path, read_only) = match rest.strip_suffix(":ro") {
+        Some(path) => (path, true),
+        None => (rest, false),
+    };
+    Ok(mcp::CacheSpec {
+        name: name.to_string(),
+        path: path.to_string(),
+        read_only,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, clap::ValueEnum)]
@@ -305,6 +332,7 @@ impl BuildArgs {
             target: self.target.clone(),
             build_args,
             timeout_s: self.timeout,
+            caches: self.caches.clone(),
         })
     }
 
@@ -397,6 +425,7 @@ async fn main() -> Result<ExitCode> {
             let client = client_for(args.kubecontext.as_deref()).await?;
             mcp::serve(client, *args).await?
         }
+        Cmd::Cache(args) => cache::serve(args).await?,
         Cmd::Clean {
             build_id,
             server: ServerOpt {
@@ -494,6 +523,37 @@ mod tests {
             Ok(_) => panic!("{argv:?} parsed"),
             Err(e) => e.to_string(),
         }
+    }
+
+    #[test]
+    fn a_server_build_declares_caches_as_name_path_and_mode() {
+        let Ok(Cmd::Build(args)) = parse(&[
+            "build",
+            "--server",
+            "/s",
+            "-c",
+            "svc",
+            "--cache",
+            "ccache=/root/.cache/ccache",
+            "--cache",
+            "ext=/var/cache/ext:ro",
+        ]) else {
+            panic!("a server build with caches parses")
+        };
+        let caches: Vec<(&str, &str, bool)> = args
+            .caches
+            .iter()
+            .map(|c| (c.name.as_str(), c.path.as_str(), c.read_only))
+            .collect();
+        assert_eq!(
+            caches,
+            [
+                ("ccache", "/root/.cache/ccache", false),
+                ("ext", "/var/cache/ext", true)
+            ]
+        );
+        assert!(refused(&["build", "--server", "/s", "--cache", "nopath"]).contains("NAME=PATH"));
+        assert!(refused(&["build", "img:t", "--cache", "c=/c"]).contains("--cache"));
     }
 
     #[test]

@@ -6,3 +6,6 @@ pub const URL: &str = "http://host.openshell.internal:8848/mcp";
 
 /// The port in [`URL`], which buildit listens on in the loop pod.
 pub const PORT: u16 = 8848;
+
+/// Where a loop pod mounts the shared cache's write token, when its builds may write.
+pub const CACHE_TOKEN_FILE: &str = "/etc/buildit-cache/token";

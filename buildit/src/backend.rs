@@ -47,6 +47,33 @@ impl Resources {
     }
 }
 
+/// containers-storage driver of a rootless buildah builder.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, ValueEnum)]
+pub enum StorageDriver {
+    /// a full copy of the tree per layer; works wherever a userns does
+    #[default]
+    Vfs,
+    /// kernel overlayfs mounted inside buildah's userns; needs a kernel that allows it
+    Overlay,
+}
+
+impl StorageDriver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageDriver::Vfs => "vfs",
+            StorageDriver::Overlay => "overlay",
+        }
+    }
+
+    /// The storage.conf a rootless buildah builder reads, written to /tmp/storage.conf.
+    pub fn setup_script(self) -> String {
+        format!(
+            "mkdir -p /tmp/containers-run && printf '[storage]\\ndriver = \"{}\"\\ngraphroot = \"/home/build/.local/share/containers/storage\"\\nrunroot = \"/tmp/containers-run\"\\n' > /tmp/storage.conf",
+            self.as_str()
+        )
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum Backend {
     /// rootless buildkitd, driven one-shot via buildctl-daemonless.sh
@@ -126,9 +153,7 @@ impl Backend {
             Backend::Kaniko => format!("mkdir -p {ws} /tmp /kaniko/.docker"),
             // the stable image's storage.conf points at a rootful store under
             // /usr/lib that rootless vfs can't lock, so bring our own conf
-            Backend::Buildah => format!(
-                "mkdir -p {ws} /tmp/containers-run && printf '[storage]\\ndriver = \"vfs\"\\ngraphroot = \"/home/build/.local/share/containers/storage\"\\nrunroot = \"/tmp/containers-run\"\\n' > /tmp/storage.conf"
-            ),
+            Backend::Buildah => format!("mkdir -p {ws} && {}", StorageDriver::Vfs.setup_script()),
         };
         vec![self.shell().to_string(), "-c".to_string(), script]
     }

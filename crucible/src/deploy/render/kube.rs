@@ -1,4 +1,5 @@
-use crate::deploy::profile::DeployProfile;
+use crate::deploy::buildit_cache;
+use crate::deploy::profile::{BuilditCacheCfg, DeployProfile};
 use crate::deploy::render::pod::{ProfilePod, RestartPolicy, downward, env_var};
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
@@ -1075,6 +1076,9 @@ exit $rc
         if self.profile.secrets.push_authfile.is_some() {
             mounts.push(ro("quay-push", PUSH_AUTHFILE_DIR, None));
         }
+        if buildit_cache::configured(self.profile).is_some_and(|(_, c)| c.write) {
+            mounts.push(ro("buildit-cache-token", buildit_cache::TOKEN_DIR, None));
+        }
         if self.spoke.is_some() {
             mounts.push(ro("spoke-kubeconfig", SPOKE_KUBECONFIG_DIR, None));
         }
@@ -1182,6 +1186,25 @@ exit $rc
                         path: "push.json".to_string(),
                         ..Default::default()
                     }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
+        if let Some((_, cache)) = buildit_cache::configured(self.profile)
+            && cache.write
+        {
+            volumes.push(core::Volume {
+                name: "buildit-cache-token".to_string(),
+                secret: Some(core::SecretVolumeSource {
+                    secret_name: Some(cache.token_secret.to_string()),
+                    items: Some(vec![core::KeyToPath {
+                        key: BuilditCacheCfg::TOKEN_KEY.to_string(),
+                        path: BuilditCacheCfg::TOKEN_KEY.to_string(),
+                        ..Default::default()
+                    }]),
+                    optional: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1865,7 +1888,14 @@ exit $rc
                 }),
                 policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
                 ingress: None,
-                egress: Some(std::iter::once(dns).chain(allowed).collect()),
+                egress: Some(
+                    std::iter::once(dns)
+                        .chain(allowed)
+                        .chain(buildit_cache::configured(self.profile).map(|_| {
+                            buildit_cache::builder_egress(&self.profile.cluster.loop_namespace)
+                        }))
+                        .collect(),
+                ),
             }),
         })
     }
@@ -5118,6 +5148,101 @@ mod tests {
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");
         // No Egress lockdown.
         assert!(!netpol.contains("- Egress"), "no egress: {netpol}");
+    }
+
+    /// With `[buildit.cache]` and `write`, the loop pod mounts the token Secret, optional since a
+    /// cluster without the cache has none; builder pods may reach the cache either way. A run
+    /// learns the cache itself from its buildit site, not the pod.
+    #[test]
+    fn the_shared_buildit_cache_s_token_and_port_reach_the_loop_and_builder_pods() {
+        let manifest = k8s_manifest();
+        let docs = |extra: &str| -> Vec<serde_json::Value> {
+            let profile = k8s_profile(&format!(
+                "[buildit]\nnamespace = \"crucible-builds\"\n{extra}"
+            ));
+            let yaml = render_k8s_manifest(&manifest, &profile);
+            serde_norway::Deserializer::from_str(&yaml)
+                .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+                .collect()
+        };
+        let pod = |docs: &[serde_json::Value]| -> serde_json::Value {
+            docs.iter().find(|d| d["kind"] == "Pod").unwrap().clone()
+        };
+        let mounted = |docs: &[serde_json::Value]| -> bool {
+            let pod = pod(docs);
+            let mounts = pod["spec"]["containers"][0]["volumeMounts"]
+                .as_array()
+                .unwrap();
+            let volumes = pod["spec"]["volumes"].as_array().unwrap();
+            let mount = mounts.iter().find(|m| m["name"] == "buildit-cache-token");
+            let volume = volumes.iter().find(|v| v["name"] == "buildit-cache-token");
+            if let (Some(m), Some(v)) = (mount, volume) {
+                assert_eq!(m["mountPath"], "/etc/buildit-cache");
+                assert_eq!(m["readOnly"], true);
+                assert_eq!(
+                    v["secret"],
+                    serde_json::json!({
+                        "secretName": "buildit-cache-token",
+                        "items": [{"key": "token", "path": "token"}],
+                        "optional": true
+                    })
+                );
+            }
+            assert_eq!(mount.is_some(), volume.is_some());
+            mount.is_some()
+        };
+        let no_cache_env = |docs: &[serde_json::Value]| {
+            let env = pod(docs)["spec"]["containers"][0]["env"].clone();
+            let names: Vec<&str> = env
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e["name"].as_str())
+                .collect();
+            assert!(
+                !names.iter().any(|n| n.starts_with("MCP_CACHE")),
+                "{names:?}"
+            );
+        };
+        let builder_egress = |docs: &[serde_json::Value]| -> Vec<serde_json::Value> {
+            let netpol = docs
+                .iter()
+                .find(|d| d["metadata"]["name"] == BUILDER_NETPOL && d["kind"] == "NetworkPolicy")
+                .unwrap();
+            netpol["spec"]["egress"].as_array().unwrap().clone()
+        };
+        let none = docs("");
+        let unshared = builder_egress(&none);
+
+        let writes = docs("[buildit.cache]\ntoken_secret = \"buildit-cache-token\"\n");
+        assert!(mounted(&writes));
+        no_cache_env(&writes);
+        let egress = builder_egress(&writes);
+        assert_eq!(egress[..unshared.len()], unshared[..]);
+        assert_eq!(egress.len(), unshared.len() + 1);
+        assert_eq!(
+            egress[unshared.len()],
+            serde_json::json!({
+                "ports": [{"port": 8850, "protocol": "TCP"}],
+                "to": [{
+                    "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "autoresearch"}},
+                    "podSelector": {"matchLabels": {"app.kubernetes.io/name": "buildit-cache"}}
+                }]
+            })
+        );
+
+        let reads =
+            docs("[buildit.cache]\ntoken_secret = \"buildit-cache-token\"\nwrite = false\n");
+        assert!(!mounted(&reads), "a read-only cache mounts no token");
+        assert_eq!(
+            builder_egress(&reads),
+            egress,
+            "readers reach the cache too"
+        );
+
+        assert!(!mounted(&none));
+        no_cache_env(&none);
+        assert!(!unshared.iter().any(|r| r["ports"][0]["port"] == 8850));
     }
 
     /// With `[buildit]`, the builder namespace gets the admission policy buildit ships, bound to

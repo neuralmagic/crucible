@@ -31,10 +31,10 @@ impl LogName {
         }
     }
 
-    pub fn path(self) -> String {
+    fn file(self) -> String {
         match self {
-            Self::Build => format!("{LOG_DIR}/build.log"),
-            Self::Run(n) => format!("{LOG_DIR}/run-{n}.log"),
+            Self::Build => "build.log".to_string(),
+            Self::Run(n) => format!("run-{n}.log"),
         }
     }
 }
@@ -45,6 +45,42 @@ impl fmt::Display for LogName {
             Self::Build => f.write_str("build"),
             Self::Run(n) => write!(f, "run:{n}"),
         }
+    }
+}
+
+/// A step's log in its builder pod. One pod can host several builds, so each build keeps its
+/// steps under `<LOG_DIR>/<build>/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StepLog {
+    build: String,
+    name: LogName,
+}
+
+impl StepLog {
+    pub fn new(build: &str, name: LogName) -> Self {
+        Self {
+            build: build.to_string(),
+            name,
+        }
+    }
+
+    /// The directory a build's step logs live in.
+    pub fn dir(build: &str) -> String {
+        format!("{LOG_DIR}/{build}")
+    }
+
+    pub fn name(&self) -> LogName {
+        self.name
+    }
+
+    pub fn path(&self) -> String {
+        format!("{}/{}", Self::dir(&self.build), self.name.file())
+    }
+}
+
+impl fmt::Display for StepLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.name.fmt(f)
     }
 }
 
@@ -83,7 +119,7 @@ pub struct Log {
 }
 
 impl Log {
-    pub async fn fetch(pod: &BuilderPod, name: LogName, window: u64) -> Result<Self> {
+    pub async fn fetch(pod: &BuilderPod, name: &StepLog, window: u64) -> Result<Self> {
         let read = (window + 1).to_string();
         let argv = ["tail", "-c", &read, "--", &name.path()].map(String::from);
         let out = pod.exec_output(&argv, window + 1).await?;
@@ -239,7 +275,7 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
-    use crate::logs::{Log, LogName, MAX_READ, Query};
+    use crate::logs::{Log, LogName, MAX_READ, Query, StepLog};
 
     fn log(text: &str) -> Log {
         Log::from_bytes(text.as_bytes().to_vec(), MAX_READ)
@@ -250,14 +286,14 @@ mod tests {
     }
 
     #[test]
-    fn log_names_are_build_or_numbered_runs() {
-        assert_eq!(
-            LogName::parse("build").unwrap().path(),
-            "/tmp/buildit-logs/build.log"
-        );
-        let run = LogName::parse("run:7").unwrap();
-        assert_eq!(run.path(), "/tmp/buildit-logs/run-7.log");
+    fn log_names_are_build_or_numbered_runs_under_their_build() {
+        let build = StepLog::new("buildit-0a", LogName::parse("build").unwrap());
+        assert_eq!(build.path(), "/tmp/buildit-logs/buildit-0a/build.log");
+        let run = StepLog::new("buildit-0a", LogName::parse("run:7").unwrap());
+        assert_eq!(run.path(), "/tmp/buildit-logs/buildit-0a/run-7.log");
+        assert_eq!(StepLog::dir("buildit-0a"), "/tmp/buildit-logs/buildit-0a");
         assert_eq!(run.to_string(), "run:7");
+        assert_eq!(run.name(), LogName::Run(7));
         for bad in [
             "",
             "Build",

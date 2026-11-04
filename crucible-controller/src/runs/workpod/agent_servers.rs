@@ -121,7 +121,7 @@ mod tests {
     use crate::runs::workpod::agent_servers::*;
     use crucible::deploy::profile::DeployProfile;
     use crucible_contract::agent_servers::{
-        BuilderPods, BuilditSite, LocalServer, NodeArch, Transport,
+        BuilderPods, BuilditSite, LocalServer, NodeArch, SharedCache, Transport,
     };
 
     const SOCKET: &str = "/run/spire/agent.sock";
@@ -311,7 +311,7 @@ mod tests {
                 name: crucible_contract::agent_servers::ServerName::parse("buildit").unwrap(),
                 url: crucible_contract::buildit::URL.into(),
                 scopes: vec!["buildit.read".into(), "buildit.build".into()],
-                transport: Transport::Local(LocalServer::Buildit(BuilditSite {
+                transport: Transport::Local(LocalServer::Buildit(Box::new(BuilditSite {
                     run_issuer: format!(
                         "{}=https://crucible-ext.hub.example/.well-known/jwks.json",
                         tokens().svid_audience
@@ -320,7 +320,8 @@ mod tests {
                     push_repo: Some("quay.io/example/crucible-smoke".into()),
                     queue: Some("builders".into()),
                     builders: BuilderPods::default(),
-                })),
+                    cache: None,
+                }))),
             }]
         );
         let on_ocp = access(&all, "ocp", &tokens(), SOCKET).unwrap().unwrap();
@@ -334,6 +335,42 @@ mod tests {
             1,
             "the token endpoint once for both servers"
         );
+    }
+
+    /// A run on a cluster with the shared cache is told its URL and whether its builds write; a
+    /// run on another buildit cluster is told nothing of it.
+    #[test]
+    fn only_runs_on_a_cache_cluster_are_told_of_the_shared_cache() {
+        let site = |tables: &str, cluster: &str| {
+            let delivery = access(&servers(tables), cluster, &tokens(), SOCKET)
+                .unwrap()
+                .unwrap();
+            match &granted_servers(&delivery)[0].transport {
+                Transport::Local(LocalServer::Buildit(site)) => site.cache.clone(),
+                Transport::Remote => panic!("buildit runs in the loop pod"),
+            }
+        };
+        let url = "http://buildit-cache.crucible-system.svc:8850";
+        let writes = format!(
+            "{BUILDIT}[buildit.cache]\ncluster = \"k8s\"\ntoken_secret = \"buildit-cache-token\"\n"
+        );
+        assert_eq!(
+            site(&writes, "k8s"),
+            Some(SharedCache {
+                url: url.into(),
+                write: true,
+            })
+        );
+        assert_eq!(site(&writes, "ocp"), None);
+        let reads = format!("{writes}write = false\n");
+        assert_eq!(
+            site(&reads, "k8s"),
+            Some(SharedCache {
+                url: url.into(),
+                write: false,
+            })
+        );
+        assert_eq!(site(BUILDIT, "k8s"), None);
     }
 
     #[test]

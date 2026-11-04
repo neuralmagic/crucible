@@ -1741,6 +1741,32 @@ completed build task and `push` report it after a server restart too. `buildit c
 <dir>` stages a directory the way a build does and computes the same digest with the same code,
 so a script can check that what was built is what it prepared.
 
+### 8.7 The shared cache
+
+With `[buildit.cache]`, `crucible deploy --buildit-cache` renders `buildit cache` in the loop
+namespace (`crucible/src/deploy/buildit_cache.rs`): a PersistentVolumeClaim, a Deployment that
+mounts it and the `token` key of `token_secret`, a Service on 8850, and a NetworkPolicy that admits
+builder pods from the builder namespace alone. The loop render adds an egress rule to it to the
+`buildit-builders` NetworkPolicy.
+
+The cache is a blob store over HTTP (`buildit/src/cache.rs`). GET and HEAD are open; PUT and
+DELETE need the write token, as a bearer token or a basic-auth password, which is how ccache's http
+backend sends a URL's userinfo. It re-reads the token file on every write and drops the least
+recently read blobs past its limit.
+
+The cache serves the dispatch clusters in `[buildit.cache] clusters`, each one of `[buildit]
+clusters`, and is deployed on each. The controller puts it in the buildit site of a run on one of
+them (`BuilditSite.cache`): the Service URL and, with `write`, the token file
+`/etc/buildit-cache/token`. Runs on other clusters are told nothing of it. With `write`, every loop
+pod mounts the token Secret there, as an optional volume so a cluster without the Secret still
+starts its runs. The loop passes the site to buildit as `--cache-url` and `--cache-token-file`, and
+buildit writes `/buildit/cache.json` into each build before `bud`: `{"url": ...}`, with `"token"`
+when it has one. A build uses the cache only if its `RUN` steps read that file, as the vLLM bench's
+informer does for ccache and its build store.
+
+Warning: with `write`, `RUN` steps can read the token, so any run's agent on the cluster can store
+objects that other runs' builds then use. Set `write` only where runs trust each other.
+
 ## 9. Configuration reference and feature flags
 
 ### 9.1 Minimal configuration
@@ -1873,6 +1899,11 @@ tokens, the controller does not read them.
 | `[buildit] run_jwks_uri` | `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
 | `[buildit] quota` | `{ pods = "16", "requests.nvidia.com/gpu" = "0", "requests.amd.com/gpu" = "0" }` | The builder namespace's ResourceQuota `hard` limits. |
+| `[buildit.cache] clusters` | the hub | The dispatch clusters the shared cache is deployed on and serves, each one of `[buildit] clusters`. |
+| `[buildit.cache] token_secret` | required with `[buildit.cache]` | The loop-namespace Secret whose `token` key is the shared cache's write token ([8.7](#87-the-shared-cache)). |
+| `[buildit.cache] write` | `true` | Builds get the token and may write to the shared cache. `false`: they read only. |
+| `[buildit.cache] size_gib` | `200` | The cache's claim size; it keeps 90% of it before dropping the least recently read blobs. |
+| `[buildit.cache] storage_class`, `image` | the cluster's, the loop image | The claim's StorageClass and the image `buildit cache` runs from. |
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
 | `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `scopes` (default none), `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |

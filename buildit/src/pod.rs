@@ -25,8 +25,54 @@ pub struct BuilderPod {
     pub name: String,
 }
 
+/// An exec's stderr, read as it arrives: kube buffers each stream in 1 KiB, and an unread stream
+/// stalls the others and the exit status behind it.
+struct Stderr(Option<tokio::task::JoinHandle<Vec<u8>>>);
+
+const STDERR_TAIL: usize = 2048;
+
+impl Stderr {
+    fn drain(attached: &mut AttachedProcess) -> Self {
+        Self(attached.stderr().map(|mut err| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = err.read_to_end(&mut buf).await;
+                buf
+            })
+        }))
+    }
+
+    /// The end of what the command wrote to stderr, as `: <text>`, or nothing.
+    async fn collect(self) -> String {
+        let Some(task) = self.0 else {
+            return String::new();
+        };
+        let buf = task.await.unwrap_or_default();
+        let text = String::from_utf8_lossy(&buf);
+        let text = text.trim();
+        if text.is_empty() {
+            return String::new();
+        }
+        let start = text.floor_char_boundary(text.len().saturating_sub(STDERR_TAIL));
+        format!(": {}", &text[start..])
+    }
+}
+
 /// The scheduling gate Kueue holds a pod behind until it admits the pod's workload.
 pub const KUEUE_GATE: &str = "kueue.x-k8s.io/admission";
+
+const CREATE_TRIES: u32 = 4;
+const CREATE_BACKOFF: Duration = Duration::from_secs(2);
+
+/// An error the API server may not repeat: a 5xx or 429, such as an admission plugin that timed
+/// out, or a connection that broke.
+pub(crate) fn transient(e: &kube::Error) -> bool {
+    match e {
+        kube::Error::Api(status) => status.code >= 500 || status.code == 429,
+        kube::Error::HyperError(_) | kube::Error::Service(_) => true,
+        _ => false,
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Release {
@@ -64,12 +110,26 @@ impl BuilderPod {
         Self::create_from(client, namespace, &spec).await
     }
 
+    /// Create the pod, again after a transient error; a conflict on a retry is an earlier try
+    /// that landed after all.
     pub async fn create_from(client: kube::Client, namespace: &str, spec: &Pod) -> Result<Self> {
         let pods: Api<Pod> = Api::namespaced(client, namespace);
         let name = spec.metadata.name.clone().unwrap_or_default();
-        pods.create(&PostParams::default(), spec)
-            .await
-            .with_context(|| format!("creating pod {name} in {namespace}"))?;
+        let mut backoff = CREATE_BACKOFF;
+        for attempt in 1..=CREATE_TRIES {
+            match pods.create(&PostParams::default(), spec).await {
+                Ok(_) => break,
+                Err(kube::Error::Api(status)) if attempt > 1 && status.code == 409 => break,
+                Err(e) if attempt < CREATE_TRIES && transient(&e) => {
+                    tracing::warn!("creating pod {name} (try {attempt}): {e}; retrying");
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("creating pod {name} in {namespace}"));
+                }
+            }
+        }
         Ok(Self { pods, name })
     }
 
@@ -142,14 +202,21 @@ impl BuilderPod {
             .ok_or_else(|| anyhow!("{}", status.message.unwrap_or_default()))
     }
 
-    async fn finish(&self, attached: AttachedProcess, argv: &[String]) -> Result<()> {
+    async fn finish(
+        &self,
+        attached: AttachedProcess,
+        stderr: Stderr,
+        argv: &[String],
+    ) -> Result<()> {
         let code = self.exit_code(attached).await;
+        let stderr = stderr.collect().await;
         if !matches!(code, Ok(0)) {
             bail!(
-                "`{}` failed in pod {}: {}",
+                "`{}` failed in pod {}: {}{}",
                 argv.join(" "),
                 self.name,
-                code.map_or_else(|e| format!("{e:#}"), |c| format!("exit code {c}"))
+                code.map_or_else(|e| format!("{e:#}"), |c| format!("exit code {c}")),
+                stderr
             );
         }
         Ok(())
@@ -177,7 +244,7 @@ impl BuilderPod {
         let (out, err) = tokio::join!(out, err);
         out.context("streaming exec stdout")?;
         err.context("streaming exec stderr")?;
-        self.finish(attached, argv).await
+        self.finish(attached, Stderr(None), argv).await
     }
 
     pub async fn exec_with_stdin(&self, argv: &[String], data: &[u8]) -> Result<()> {
@@ -190,13 +257,22 @@ impl BuilderPod {
             .exec(&self.name, argv.iter().map(String::as_str), &params)
             .await
             .with_context(|| format!("exec `{}` in pod {}", argv.join(" "), self.name))?;
+        let stderr = Stderr::drain(&mut attached);
+        let stdout = attached.stdout().map(|mut out| {
+            tokio::spawn(async move { tokio::io::copy(&mut out, &mut tokio::io::sink()).await })
+        });
         let mut stdin = attached
             .stdin()
             .ok_or_else(|| anyhow!("exec stdin stream missing"))?;
         stdin.write_all(data).await.context("writing exec stdin")?;
         stdin.shutdown().await.context("closing exec stdin")?;
         drop(stdin);
-        self.finish(attached, argv).await
+        if let Some(out) = stdout {
+            out.await
+                .context("joining exec stdout")?
+                .context("reading exec stdout")?;
+        }
+        self.finish(attached, stderr, argv).await
     }
 
     pub async fn exec_with_stdin_capture(&self, argv: &[String], data: &[u8]) -> Result<String> {
@@ -209,20 +285,25 @@ impl BuilderPod {
             .exec(&self.name, argv.iter().map(String::as_str), &params)
             .await
             .with_context(|| format!("exec `{}` in pod {}", argv.join(" "), self.name))?;
+        let stderr = Stderr::drain(&mut attached);
+        let mut stdout = attached
+            .stdout()
+            .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
+        let captured = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            tokio::io::copy(&mut stdout, &mut buf).await.map(|_| buf)
+        });
         let mut stdin = attached
             .stdin()
             .ok_or_else(|| anyhow!("exec stdin stream missing"))?;
         stdin.write_all(data).await.context("writing exec stdin")?;
         stdin.shutdown().await.context("closing exec stdin")?;
         drop(stdin);
-        let mut stdout = attached
-            .stdout()
-            .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
-        let mut buf = Vec::new();
-        tokio::io::copy(&mut stdout, &mut buf)
+        let buf = captured
             .await
+            .context("joining exec stdout")?
             .context("capturing exec stdout")?;
-        self.finish(attached, argv).await?;
+        self.finish(attached, stderr, argv).await?;
         String::from_utf8(buf).context("exec output was not utf-8")
     }
 
@@ -233,6 +314,7 @@ impl BuilderPod {
             .exec(&self.name, argv.iter().map(String::as_str), &params)
             .await
             .with_context(|| format!("exec `{}` in pod {}", argv.join(" "), self.name))?;
+        let stderr = Stderr::drain(&mut attached);
         let mut stdout = attached
             .stdout()
             .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
@@ -240,7 +322,7 @@ impl BuilderPod {
         tokio::io::copy(&mut stdout, &mut buf)
             .await
             .context("capturing exec stdout")?;
-        self.finish(attached, argv).await?;
+        self.finish(attached, stderr, argv).await?;
         String::from_utf8(buf).context("exec output was not utf-8")
     }
 
@@ -370,4 +452,31 @@ pub async fn clean(client: kube::Client, namespace: &str) -> Result<usize> {
         }
     }
     Ok(deleted)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::pod::transient;
+
+    fn api(code: u16) -> kube::Error {
+        let status: kube::core::Status = serde_json::from_value(serde_json::json!({
+            "status": "Failure",
+            "code": code,
+            "message": "admission plugin \"LimitRanger\" failed to complete mutation in 13s",
+        }))
+        .unwrap();
+        kube::Error::Api(Box::new(status))
+    }
+
+    #[test]
+    fn server_errors_and_throttling_are_retried_and_refusals_are_not() {
+        for code in [500, 502, 503, 504, 429] {
+            assert!(transient(&api(code)), "{code}");
+        }
+        for code in [400, 403, 404, 409, 422] {
+            assert!(!transient(&api(code)), "{code}");
+        }
+        let bad_json = serde_json::from_str::<serde_json::Value>("{").unwrap_err();
+        assert!(!transient(&kube::Error::SerdeError(bad_json)));
+    }
 }

@@ -516,6 +516,10 @@ pub(crate) struct DeployArgs {
     /// namespace) from the profile's `[kueue]` table, no `--manifest` needed.
     #[arg(long, conflicts_with = "controller", group = "issuer_user")]
     pub kueue: bool,
+    /// Render the shared buildit cache (PersistentVolumeClaim, Deployment, Service, NetworkPolicy)
+    /// from the profile's `[buildit.cache]` table, no `--manifest` needed.
+    #[arg(long, conflicts_with_all = ["controller", "kueue", "cluster_link"])]
+    pub buildit_cache: bool,
     /// With `--kueue`, the `[kueue] clusters` entry to render the server for: it is started with
     /// `--cluster` and accepts only tokens for that cluster. Required when the table names several.
     #[arg(long, value_name = "CLUSTER", requires = "kueue")]
