@@ -422,7 +422,10 @@ The steps are these:
    `client_assertion_type`, `client_assertion`, `audience`, `scope`. Any other field, for example
    `client_id` or `resource`, is refused (`crucible-controller/src/agent_auth/mod.rs:149`).
 9. The supervisor injects the token as a bearer header only on egress to the host and port of the
-   provider endpoint. The agent never sees the token.
+   provider endpoint, from a binary the provider's profile lists. The profile lists the same
+   binaries as the sandbox policy: OpenShell injects a grant only when the profile's own rule
+   admits the request, and with binary identity required, a rule admits only the binaries it names.
+   The agent never sees the token.
 
 ### 3.2 What the token endpoint checks
 
