@@ -283,7 +283,7 @@ mod tests {
             let delivery = access(&all, cluster, &tokens(), SOCKET).unwrap().unwrap();
             match &granted_servers(&delivery)[0].transport {
                 Transport::Local(LocalServer::Buildit(site)) => site.builders.clone(),
-                Transport::Remote => panic!("buildit runs in the loop pod"),
+                other => panic!("buildit runs in the loop pod, not {other:?}"),
             }
         };
         let shared = BuilderPods {
@@ -347,7 +347,7 @@ mod tests {
                 .unwrap();
             match &granted_servers(&delivery)[0].transport {
                 Transport::Local(LocalServer::Buildit(site)) => site.cache.clone(),
-                Transport::Remote => panic!("buildit runs in the loop pod"),
+                other => panic!("buildit runs in the loop pod, not {other:?}"),
             }
         };
         let url = "http://buildit-cache.crucible-system.svc:8850";

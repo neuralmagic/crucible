@@ -2077,6 +2077,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "crucible-git"
+version = "0.5.1"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "clap",
+ "crucible-mcp-auth",
+ "futures-util",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "crucible-harness"
 version = "0.5.1"
 dependencies = [

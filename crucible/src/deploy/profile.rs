@@ -55,6 +55,9 @@ pub struct DeployProfile {
     /// buildit, started in each run's loop pod on the clusters it names.
     #[serde(default)]
     pub buildit: Option<BuilditCfg>,
+    /// `crucible-git`, started in each run's loop pod on the clusters it names.
+    #[serde(default)]
+    pub git: Option<GitCfg>,
     /// Other MCP servers that take agent tokens, each `[[agent_servers]]`.
     #[serde(default)]
     pub agent_servers: Vec<AgentServerCfg>,
@@ -314,6 +317,39 @@ pub fn jwks_uri(issuer: &str, over: Option<&url::Url>) -> Result<url::Url, url::
             "{}/.well-known/jwks.json",
             issuer.trim_end_matches('/')
         )),
+    }
+}
+
+/// The `[git]` table. A run on one of `clusters` starts `crucible-git` in its loop pod, which
+/// proxies the run's git traffic to GitHub and opens its pull requests with the run's minted App
+/// token, accepting sandbox tokens from the controller's agent issuer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitCfg {
+    /// The dispatch clusters whose runs get `crucible-git`: `clusters = [...]`, or `cluster = "..."`.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
+    /// Where it fetches the agent issuer's keys. Default
+    /// `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json`.
+    #[serde(default)]
+    pub run_jwks_uri: Option<url::Url>,
+    /// The URL sandboxes reach it at; it listens on its port in the loop pod. Default
+    /// `http://host.openshell.internal:8853/mcp`.
+    #[serde(default)]
+    pub url: Option<url::Url>,
+}
+
+impl GitCfg {
+    /// The URL sandboxes reach `crucible-git` at.
+    pub fn url(&self) -> String {
+        match &self.url {
+            Some(url) => url.to_string(),
+            None => crucible_contract::git::URL.to_string(),
+        }
     }
 }
 

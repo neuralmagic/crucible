@@ -3095,6 +3095,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             workflow_toolbox_exclude: Vec::new(),
             workflow_env: Default::default(),
             buildit_socket: None,
+            git_url: None,
             watch_feedback: false,
             sandbox_run_id: None,
             gateway_boot: Default::default(),

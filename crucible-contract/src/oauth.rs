@@ -9,10 +9,14 @@ pub enum Scope {
     KueueSubmit,
     BuilditRead,
     BuilditBuild,
+    GitRead,
+    GitWrite,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("unknown scope `{0}`; one of kueue.read, kueue.submit, buildit.read, buildit.build")]
+#[error(
+    "unknown scope `{0}`; one of kueue.read, kueue.submit, buildit.read, buildit.build, git.read, git.write"
+)]
 pub struct ScopeParseError(String);
 
 impl Scope {
@@ -20,6 +24,8 @@ impl Scope {
     pub const KUEUE: [Scope; 2] = [Scope::KueueRead, Scope::KueueSubmit];
     /// Read builds' status and logs; build, run, push, and clean.
     pub const BUILDIT: [Scope; 2] = [Scope::BuilditRead, Scope::BuilditBuild];
+    /// Fetch from repositories; push to them and open pull requests.
+    pub const GIT: [Scope; 2] = [Scope::GitRead, Scope::GitWrite];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -27,6 +33,8 @@ impl Scope {
             Scope::KueueSubmit => "kueue.submit",
             Scope::BuilditRead => "buildit.read",
             Scope::BuilditBuild => "buildit.build",
+            Scope::GitRead => "git.read",
+            Scope::GitWrite => "git.write",
         }
     }
 
@@ -36,6 +44,8 @@ impl Scope {
             "kueue.submit" => Ok(Scope::KueueSubmit),
             "buildit.read" => Ok(Scope::BuilditRead),
             "buildit.build" => Ok(Scope::BuilditBuild),
+            "git.read" => Ok(Scope::GitRead),
+            "git.write" => Ok(Scope::GitWrite),
             other => Err(ScopeParseError(other.to_string())),
         }
     }
@@ -61,7 +71,11 @@ mod tests {
 
     #[test]
     fn every_scope_round_trips_through_its_wire_spelling() {
-        for scope in Scope::KUEUE.into_iter().chain(Scope::BUILDIT) {
+        for scope in Scope::KUEUE
+            .into_iter()
+            .chain(Scope::BUILDIT)
+            .chain(Scope::GIT)
+        {
             assert_eq!(scope.as_str().parse::<Scope>(), Ok(scope));
             assert_eq!(scope.to_string(), scope.as_str());
         }

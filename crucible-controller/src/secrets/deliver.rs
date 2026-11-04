@@ -45,6 +45,8 @@ pub enum DeliverError {
     },
     #[error("two deliveries both claim Secret key {key}")]
     KeyCollision { key: String },
+    #[error("{first} and {second} are both GitHub App token files; crucible-git pushes with one")]
+    TwoAppTokenFiles { first: String, second: String },
 }
 
 /// One run's secret delivery: the object to create, and how the pod refers to it.
@@ -166,6 +168,25 @@ pub fn assemble(
                 }
                 seen_paths.insert(projection.to_string(), name.clone());
                 delivery.files.push((projection.to_string(), name.clone()));
+                if matches!(
+                    crate::secrets::minter::Minter::of(row.mode, &row.vault_path),
+                    Ok(Some(crate::secrets::minter::Minter::GithubApp(_)))
+                ) {
+                    if let Some((_, first)) = delivery
+                        .plain_env
+                        .iter()
+                        .find(|(var, _)| var == crucible_contract::git::ENV_TOKEN_FILE)
+                    {
+                        return Err(DeliverError::TwoAppTokenFiles {
+                            first: first.clone(),
+                            second: projection.to_string(),
+                        });
+                    }
+                    delivery.plain_env.push((
+                        crucible_contract::git::ENV_TOKEN_FILE.to_string(),
+                        projection.to_string(),
+                    ));
+                }
             }
         }
     }

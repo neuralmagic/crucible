@@ -43,6 +43,9 @@ pub struct ShellRunner {
     /// The run's buildit socket, exported to command and evaluate tasks as
     /// [`BUILDIT_SOCKET_ENV`].
     pub buildit_socket: Option<PathBuf>,
+    /// The run's `crucible-git` base URL, exported to command and evaluate tasks as
+    /// [`crucible_contract::git::ENV_URL`].
+    pub git_url: Option<String>,
 }
 
 impl TaskRunner for ShellRunner {
@@ -102,6 +105,7 @@ impl ShellRunner {
         }
         crate::inference::withhold_from_task(&mut cmd);
         cmd.env_remove(BUILDIT_SOCKET_ENV);
+        cmd.env_remove(crucible_contract::git::ENV_URL);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -134,6 +138,9 @@ impl ShellRunner {
                 cmd.arg(command);
                 if let Some(socket) = &self.buildit_socket {
                     cmd.env(BUILDIT_SOCKET_ENV, socket);
+                }
+                if let Some(url) = &self.git_url {
+                    cmd.env(crucible_contract::git::ENV_URL, url);
                 }
             }
             TaskKind::Agent {
@@ -519,6 +526,7 @@ mod tests {
             agent_cmd: None,
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
+            git_url: None,
         }
     }
 
@@ -1404,6 +1412,7 @@ mod tests {
             agent_cmd: Some("true".into()),
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
+            git_url: None,
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
@@ -1463,6 +1472,7 @@ mod tests {
         let mut r = ShellRunner {
             agent_cmd: Some(show.into()),
             buildit_socket: Some("/runs/r1/pack/state/buildit.sock".into()),
+            git_url: None,
             ..runner()
         };
         let seen =

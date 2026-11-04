@@ -92,6 +92,16 @@ pub enum Transport {
 pub enum LocalServer {
     /// `buildit mcp`.
     Buildit(Box<BuilditSite>),
+    /// `crucible-git serve`: the run's git and GitHub calls, made with the run's App token.
+    Git(Box<GitSite>),
+}
+
+/// What `crucible-git serve` runs with for a run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GitSite {
+    /// The issuer it trusts for run tokens, `<issuer>=<jwks uri>`.
+    pub run_issuer: String,
 }
 
 /// What `buildit mcp` runs with for a run.
