@@ -118,6 +118,34 @@ the parse), and a name is either required or optional, not both. `crucible check
 table's declared variables in the capability disclosure as `host-env`, the optional ones marked
 `(optional)`. `setup` runs with the engine's environment in every edition.
 
+`crucible migrate` moves a pack to a newer edition ([ADR-0072](./adr/ADR-0072.md)):
+
+```sh
+crucible migrate --manifest crucible.toml            # dry run: the diff, the changes, the findings
+crucible migrate --manifest crucible.toml --write    # write the migrated manifest over the pack's
+```
+
+`--to N` picks the edition; the newest this engine runs is the default. Moving to edition 2 sets
+`edition = 2` and finds every host command, compiling `[workflow].file` to find the ones its
+graph builds. It follows the pack files those commands run, through `[workspace].inject`, Python
+imports, sourced and invoked scripts, and script paths a Python file names, and reads shell
+(`$X`, `${X:-default}`), Python (`os.environ`, `getenv`), and nushell (`$env.X`). Each variable
+that code reads without setting it first is declared optional (`X?`) in the command's table, or
+in a variant's own copy of the table, with the file and line it is read at. Optional keeps what
+an edition-1 run passed whenever the engine has the variable and never refuses a run, so a
+migration cannot add a refusal; make a name required by hand once you know every deployment sets
+it. The base set and the variables the engine sets for a command are never declared.
+
+What the text cannot settle is printed for review instead of guessed: a command that runs inline
+code (`sh -c '…'`), an expanded program (`$SCRIPT`), a path the pack does not carry, or a file
+that is not shell, Python, or nushell; a pack file that reads variables but that no host command
+was found to run (a script a command copies into a pod lands here); a file only an agent turn,
+`setup`, or the `agent_cmd` stand-in runs, which the edition does not govern; and a read of a
+computed name. Comments and layout survive the rewrite, the result is parsed before it is
+written, and running it again on an edition-2 pack changes nothing. A draft in the controller is
+migrated from the studio's edition banner or with `crux draft-migrate`, which save the result as
+the draft's next version.
+
 The accept policy is the same for all domains. The engine keeps a candidate if it is `valid`
 and its `score` is better than the best score in the `direction`. The run is solved only if
 `measure` reports it. A domain does not supply code for the keep logic.

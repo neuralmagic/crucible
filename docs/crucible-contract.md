@@ -117,6 +117,8 @@ Rules:
 - **Edition.** `edition` is 1 when absent; 1 and 2 are the editions this engine runs, and any
   other value fails the parse naming them. An `env` list in `[judge]`, `[world]`, or
   `[workflow]` needs edition 2 and fails the parse of an edition-1 manifest (§3).
+  `crucible migrate --manifest <path> [--to N] [--write]` moves a pack to a newer edition: one
+  step per edition, each declared variable optional, findings printed for review (ADR-0072).
 - Unknown keys are an error (typo protection), not silently ignored.
 - **Frozen loading (`load_frozen`).** When the manifest file lives *inside* the workspace it
   targets (the BYO on-ramp: `crucible init` scaffolds `[repo] path = "."`), the engine parses it
