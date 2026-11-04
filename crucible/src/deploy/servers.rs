@@ -447,7 +447,7 @@ mod tests {
     /// shares the rest of `builders`; a cluster setting replaces the default one whole.
     #[test]
     fn builder_pods_come_from_builders_and_each_cluster_s_overrides() {
-        use crucible_contract::agent_servers::NodeArch;
+        use crucible_contract::agent_servers::{NodeArch, StorageDriver};
         use std::num::NonZeroU32;
         let servers = profile(
             r#"
@@ -458,11 +458,13 @@ mod tests {
             pod_deadline_secs = 3600
             requests = { cpu = "8" }
             limits = { cpu = "32" }
+            storage_driver = "overlay"
             [buildit.cluster_builders.west]
             node_arch = "amd64"
             [buildit.cluster_builders.north]
             node_arch = "arm64"
             limits = { cpu = "16", memory = "32Gi" }
+            storage_driver = "vfs"
             "#,
         )
         .agent_servers()
@@ -473,6 +475,7 @@ mod tests {
             pod_deadline_secs: NonZeroU32::new(3600),
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+            storage_driver: Some(StorageDriver::Overlay),
         };
         assert_eq!(builders(&servers[0], "east"), shared);
         assert_eq!(
@@ -490,6 +493,7 @@ mod tests {
                     ("cpu".into(), "16".into()),
                     ("memory".into(), "32Gi".into()),
                 ])),
+                storage_driver: Some(StorageDriver::Vfs),
                 ..shared.clone()
             }
         );

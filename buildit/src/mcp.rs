@@ -2446,7 +2446,9 @@ mod tests {
             deadline_secs,
             max_builds: 4,
             reuse,
-            storage: StorageDriver::Vfs,
+            storage: std::env::var("BUILDIT_E2E_STORAGE_DRIVER")
+                .map(|d| <StorageDriver as clap::ValueEnum>::from_str(&d, false).unwrap())
+                .unwrap_or_default(),
             node_arch: None,
             queue: None,
             run_id: None,
