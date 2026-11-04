@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { $api } from '../api/client';
 import { CodeSurface } from '../editor/CodeSurface';
+import { LogView } from '../logs/LogView';
 import { cn, Split, SplitHandle, SplitPane } from '../ui';
 import { evidenceItems, logBody, logPath, pendingLine, type EvidenceItem } from './taskEvidenceView';
 
@@ -124,6 +125,8 @@ export function TaskEvidence({ runId, task }: { runId: string; task: string }) {
               </p>
             ) : selected.path === null ? (
               <Prose body={selected.body} testId={CONTENT_TEST_ID[selected.kind]} />
+            ) : selected.kind === 'log' ? (
+              <LogView text={selected.body} testId={CONTENT_TEST_ID[selected.kind]} />
             ) : (
               <CodeSurface
                 path={selected.path}

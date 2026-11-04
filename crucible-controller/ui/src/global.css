@@ -119,6 +119,20 @@
   --mono: var(--font-mono);
   --sans: var(--font-sans);
   --row: var(--spacing-row);
+
+  --ansi-black: var(--color-ink);
+  --ansi-red: var(--color-red);
+  --ansi-green: var(--color-green);
+  --ansi-yellow: var(--color-amber);
+  --ansi-blue: var(--color-blue);
+  --ansi-magenta: #7a2a6e;
+  --ansi-cyan: #0b6470;
+  --ansi-white: var(--color-ink-3);
+}
+
+:root[data-theme='dark'] {
+  --ansi-magenta: #d58bcc;
+  --ansi-cyan: #6cc6cc;
 }
 
 * {
@@ -247,6 +261,182 @@ body {
 
 .monaco-editor .margin-view-overlays .line-numbers {
   font-size: var(--text-micro);
+}
+
+/* Program output's ANSI colours, in the theme's palette: the live feed's pod lines (AnsiText) and
+   the log viewer, whose own stylesheet assumes a black terminal. */
+.ansi-black,
+.crucible-log [class*='index-module_black__'],
+.crucible-log [class*='index-module_blackBold__'] {
+  color: var(--ansi-black);
+}
+.ansi-red,
+.crucible-log [class*='index-module_red__'],
+.crucible-log [class*='index-module_redBold__'] {
+  color: var(--ansi-red);
+}
+.ansi-green,
+.crucible-log [class*='index-module_green__'],
+.crucible-log [class*='index-module_greenBold__'] {
+  color: var(--ansi-green);
+}
+.ansi-yellow,
+.crucible-log [class*='index-module_yellow__'],
+.crucible-log [class*='index-module_yellowBold__'] {
+  color: var(--ansi-yellow);
+}
+.ansi-blue,
+.crucible-log [class*='index-module_blue__'],
+.crucible-log [class*='index-module_blueBold__'] {
+  color: var(--ansi-blue);
+}
+.ansi-magenta,
+.crucible-log [class*='index-module_magenta__'],
+.crucible-log [class*='index-module_magentaBold__'] {
+  color: var(--ansi-magenta);
+}
+.ansi-cyan,
+.crucible-log [class*='index-module_cyan__'],
+.crucible-log [class*='index-module_cyanBold__'] {
+  color: var(--ansi-cyan);
+}
+.ansi-white,
+.crucible-log [class*='index-module_white__'],
+.crucible-log [class*='index-module_whiteBold__'] {
+  color: var(--ansi-white);
+}
+.crucible-log [class*='index-module_grey__'],
+.crucible-log [class*='index-module_greyBold__'] {
+  color: var(--color-ink-3);
+}
+.ansi-bg-black,
+.crucible-log [class*='index-module_blackBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-black) 22%, transparent);
+}
+.ansi-bg-red,
+.crucible-log [class*='index-module_redBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-red) 22%, transparent);
+}
+.ansi-bg-green,
+.crucible-log [class*='index-module_greenBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-green) 22%, transparent);
+}
+.ansi-bg-yellow,
+.crucible-log [class*='index-module_yellowBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-yellow) 22%, transparent);
+}
+.ansi-bg-blue,
+.crucible-log [class*='index-module_blueBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-blue) 22%, transparent);
+}
+.ansi-bg-magenta,
+.crucible-log [class*='index-module_magentaBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-magenta) 22%, transparent);
+}
+.ansi-bg-cyan,
+.crucible-log [class*='index-module_cyanBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-cyan) 22%, transparent);
+}
+.ansi-bg-white,
+.crucible-log [class*='index-module_whiteBg__'] {
+  background-color: color-mix(in srgb, var(--ansi-white) 22%, transparent);
+}
+.ansi-bold {
+  font-weight: 600;
+}
+.ansi-dim {
+  opacity: 0.65;
+}
+.ansi-italic {
+  font-style: italic;
+}
+.ansi-underline {
+  text-decoration: underline;
+}
+
+.crucible-log {
+  display: flex;
+  flex-direction: column;
+  background-color: var(--color-paper);
+}
+
+.crucible-log [class*='index-module_lazyLog__'] {
+  background-color: var(--color-paper);
+  color: var(--color-ink-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-data);
+}
+
+.crucible-log [class*='index-module_lazyLog__'] span a {
+  color: var(--color-blue);
+}
+
+.crucible-log [class*='index-module_line__']:hover {
+  background-color: var(--color-sunk);
+}
+
+.crucible-log [class*='index-module_lineHighlight__'] {
+  background-color: var(--color-hi);
+}
+
+.crucible-log [class*='index-module_lineNumber__'] {
+  width: auto;
+  min-width: 4ch;
+  margin-left: 0;
+  margin-right: 8px;
+  padding-right: 0;
+  color: var(--color-ink-3);
+}
+
+.crucible-log [class*='index-module_lineNumberHighlight__'] {
+  color: var(--color-ink);
+}
+
+.crucible-log [class*='index-module_searchMatch__'] {
+  background-color: var(--color-hi);
+  color: var(--color-ink);
+}
+
+.crucible-log [class*='index-module_searchMatchHighlighted__'] {
+  background-color: var(--color-amber);
+  color: var(--color-paper);
+}
+
+.crucible-log [class*='index-module_searchBar__'] {
+  justify-content: flex-start;
+  gap: 4px;
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--color-rule);
+  background-color: var(--color-sunk);
+  color: var(--color-ink-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-data);
+}
+
+.crucible-log [class*='index-module_searchInput__'] {
+  flex: 1;
+  min-width: 0;
+  margin-right: 4px;
+  border: 1px solid var(--color-rule-hard);
+  background-color: var(--color-surface);
+  color: var(--color-ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-data);
+}
+
+.crucible-log [class*='index-module_active__'] {
+  color: var(--color-ink-2);
+  fill: var(--color-ink-2);
+}
+
+.crucible-log [class*='index-module_inactive__'] {
+  color: var(--color-rule-hard);
+  fill: var(--color-rule-hard);
+}
+
+.crucible-log [class*='index-module_clickable__']:hover {
+  border-radius: 0;
+  background: var(--color-raised);
 }
 
 /* A textarea has no password type; text-security is the only way to mask multi-line content. */

@@ -232,6 +232,63 @@ test.describe('the run task graph', () => {
     await expect(panel.getByTestId('run-log')).toContainText('admitted 3 tasks');
   });
 
+  /// Program output keeps its colours, in the theme's palette, and none of its escape codes.
+  test('reads the run log in the log viewer with its ANSI colours in the theme palette', async ({ page }) => {
+    await stubApi(page);
+    const text =
+      '\x1b[2m2026-11-04T20:04:14Z\x1b[0m \x1b[32m INFO\x1b[0m \x1b[1mserve_inner\x1b[0m\x1b[2m:\x1b[0m task cancelled\n' +
+      'plan run: admitted 3 tasks\n';
+    await page.route(`**/api/runs/${TRIAGE_RUN}/log`, (route) =>
+      route.fulfill({ json: { run_id: TRIAGE_RUN, dispatch: 'local', text, truncated: false, location: null } }),
+    );
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+    await page.getByTestId('workflow-graph').locator('[data-task="triage[1027]"]').click();
+    const panel = page.getByRole('complementary', { name: 'Task triage[1027]' });
+    await panel.getByRole('button', { name: 'run log' }).click();
+
+    const log = panel.getByTestId('run-log');
+    await expect(log).toContainText('serve_inner: task cancelled');
+    await expect(log).toContainText('admitted 3 tasks');
+    await expect(log).not.toContainText('[2m');
+    const info = log.locator('[class*="index-module_green__"]');
+    const body = log.locator('[class*="index-module_lazyLog__"]');
+    await expect(info).toHaveText(' INFO');
+    await expect(info).toHaveCSS('color', 'rgb(90, 203, 134)');
+    await expect(body).toHaveCSS('background-color', 'rgb(10, 10, 9)');
+
+    await log.getByRole('textbox').fill('cancelled');
+    await expect(log.locator('[class*="index-module_searchMatch"]').first()).toHaveText('cancelled');
+
+    await page.evaluate(() => {
+      document.documentElement.dataset.theme = 'light';
+    });
+    await expect(info).toHaveCSS('color', 'rgb(0, 102, 58)');
+    await expect(body).toHaveCSS('background-color', 'rgb(237, 235, 226)');
+  });
+
+  test('reads a captured log file in the log viewer', async ({ page }) => {
+    await stubApi(page);
+    const body = '\x1b[31merror\x1b[0m: kernel_selector.h: No such file or directory\n[127/130] Building CUDA object\n';
+    await page.route('**/api/runs/RUN-0412/files', (route) =>
+      route.fulfill({
+        json: {
+          run_id: 'RUN-0412',
+          files: [{ task: 'build', instance: null, path: 'edit1.log', size_bytes: body.length, key: 'build/edit1.log' }],
+        },
+      }),
+    );
+    await page.route('**/api/runs/RUN-0412/files/build/edit1.log', (route) =>
+      route.fulfill({ contentType: 'application/octet-stream', body }),
+    );
+    await ready(page, '/runs/RUN-0412');
+
+    await page.locator('[id="crucible.run-files"]').getByRole('button', { name: 'build/edit1.log' }).click();
+    const view = page.getByTestId('run-file-log');
+    await expect(view).toContainText('error: kernel_selector.h: No such file or directory');
+    await expect(view).toContainText('[127/130] Building CUDA object');
+    await expect(view.locator('[class*="index-module_red__"]')).toHaveCSS('color', 'rgb(229, 107, 105)');
+  });
+
   /// A task the run has not finished says so, instead of reading as a finished one with nothing to
   /// show.
   test('says a task is still running rather than showing empty evidence', async ({ page }) => {
