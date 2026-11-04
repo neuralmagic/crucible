@@ -212,6 +212,7 @@ nothing against its quota for builds without requests.
 ```sh
 MCP_TOKENS_FILE=/run/crucible/buildit.tokens buildit mcp
 BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored   # e2e on a disposable cluster
+BUILDIT_E2E_STORAGE_DRIVER=overlay BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored
 ```
 
 ### The run's socket and the CLI client

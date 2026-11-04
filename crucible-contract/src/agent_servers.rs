@@ -148,6 +148,34 @@ pub struct BuilderPods {
     /// Resource limits, `{ cpu = "32", memory = "64Gi" }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, String>>,
+    /// Where buildah keeps image layers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_driver: Option<StorageDriver>,
+}
+
+/// The containers-storage driver of buildah in a builder pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageDriver {
+    /// A full copy of the filesystem per layer; works wherever a user namespace does.
+    Vfs,
+    /// Kernel overlayfs mounted in buildah's user namespace; each layer stored once.
+    Overlay,
+}
+
+impl StorageDriver {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Vfs => "vfs",
+            Self::Overlay => "overlay",
+        }
+    }
+}
+
+impl fmt::Display for StorageDriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl BuilderPods {
@@ -163,6 +191,7 @@ impl BuilderPods {
             pod_deadline_secs: self.pod_deadline_secs.or(base.pod_deadline_secs),
             requests: self.requests.clone().or_else(|| base.requests.clone()),
             limits: self.limits.clone().or_else(|| base.limits.clone()),
+            storage_driver: self.storage_driver.or(base.storage_driver),
         }
     }
 }
@@ -295,6 +324,7 @@ mod tests {
             pod_deadline_secs: NonZeroU32::new(3600),
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+            storage_driver: Some(StorageDriver::Overlay),
         });
         let raw = serde_json::to_value(&pinned).unwrap();
         assert_eq!(
@@ -305,9 +335,11 @@ mod tests {
                 "pod_deadline_secs": 3600,
                 "requests": {"cpu": "8"},
                 "limits": {"cpu": "32"},
+                "storage_driver": "overlay",
             })
         );
         assert_eq!(serde_json::from_value::<BuilditSite>(raw).unwrap(), pinned);
+        assert!(serde_json::from_str::<BuilderPods>(r#"{"storage_driver": "zfs"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"node_arch": "x86_64"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"max_builds": 0}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"cpu": "8"}"#).is_err());
@@ -355,11 +387,13 @@ mod tests {
             pod_deadline_secs: None,
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+            storage_driver: Some(StorageDriver::Vfs),
         };
         let cluster = BuilderPods {
             node_arch: Some(NodeArch::Amd64),
             pod_deadline_secs: NonZeroU32::new(600),
             limits: Some(BTreeMap::new()),
+            storage_driver: Some(StorageDriver::Overlay),
             ..BuilderPods::default()
         };
         assert_eq!(
@@ -370,6 +404,7 @@ mod tests {
                 pod_deadline_secs: NonZeroU32::new(600),
                 requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
                 limits: Some(BTreeMap::new()),
+                storage_driver: Some(StorageDriver::Overlay),
             }
         );
         assert_eq!(BuilderPods::default().over(&base), base);

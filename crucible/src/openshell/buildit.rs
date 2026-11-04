@@ -108,6 +108,9 @@ impl Buildit<'_> {
                 args.extend([flag.to_string(), format!("{key}={qty}")]);
             }
         }
+        if let Some(driver) = pods.storage_driver {
+            args.extend(["--storage-driver".to_string(), driver.to_string()]);
+        }
         if let Some(cache) = &self.site.cache {
             args.extend(["--cache-url", &cache.url].map(String::from));
             if cache.write {
@@ -190,7 +193,7 @@ fn accepts(socket: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::openshell::buildit::*;
-    use crucible_contract::agent_servers::{BuilderPods, SharedCache};
+    use crucible_contract::agent_servers::{BuilderPods, SharedCache, StorageDriver};
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
@@ -436,6 +439,7 @@ mod tests {
                 ("memory".into(), "16Gi".into()),
             ])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+            storage_driver: Some(StorageDriver::Overlay),
         };
         let on_arm = RunSite {
             run_id: "r",
@@ -458,6 +462,8 @@ mod tests {
                 "memory=16Gi",
                 "--limit",
                 "cpu=32",
+                "--storage-driver",
+                "overlay",
             ],
             "the site's arch wins over the loop pod's"
         );
