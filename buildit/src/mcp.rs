@@ -91,6 +91,10 @@ const CACHE_ROOT: &str = "/home/build/.local/share/containers/buildit-caches";
 const MAX_CACHES: usize = 8;
 /// Mounted read-write into every RUN step of a build, for it to leave `facts.json` in.
 const FACTS_MOUNT: &str = "/buildit";
+const CCACHE_CONF: &str = "ccache.conf";
+const CCACHE_STATS: &str = "ccache-stats.log";
+const CCACHE_USER: &str = "buildit";
+const CACHES_FILE: &str = "caches";
 const MAX_FACTS: u64 = 64 * 1024;
 const CACHE_FILE: &str = "cache.json";
 const LIST_BACKOFF: Duration = Duration::from_secs(1);
@@ -719,8 +723,15 @@ impl SharedCache {
     /// /buildit/cache.json: the cache's URL, and its write token when one is configured and
     /// readable. A build without a token reads only.
     fn document(&self) -> Vec<u8> {
-        let token = self
-            .token_file
+        let mut doc = serde_json::json!({ "url": self.url.as_str() });
+        if let Some(t) = self.token() {
+            doc["token"] = serde_json::Value::String(t);
+        }
+        doc.to_string().into_bytes()
+    }
+
+    fn token(&self) -> Option<String> {
+        self.token_file
             .as_ref()
             .and_then(|path| match std::fs::read_to_string(path) {
                 Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
@@ -732,13 +743,41 @@ impl SharedCache {
                     );
                     None
                 }
-            });
-        let mut doc = serde_json::json!({ "url": self.url.as_str() });
-        if let Some(t) = token {
-            doc["token"] = serde_json::Value::String(t);
-        }
-        doc.to_string().into_bytes()
+            })
     }
+
+    /// ccache's remote storage URL for the cache: the write token as the basic-auth password,
+    /// or read-only without one.
+    fn ccache_storage(&self) -> String {
+        let mut url = self.url.clone();
+        url.set_path(&format!("{}/ccache", self.url.path().trim_end_matches('/')));
+        match self.token() {
+            Some(token) => {
+                let _ = url.set_username(CCACHE_USER);
+                let _ = url.set_password(Some(&token));
+                url.to_string()
+            }
+            None => format!("{url}|read-only"),
+        }
+    }
+}
+
+/// A build's cache volume specs, one per line, as a `run` of it mounts them: read-only.
+fn read_only_volumes(specs: &str) -> Vec<String> {
+    specs
+        .lines()
+        .filter_map(|spec| spec.rsplit_once(':'))
+        .map(|(volume, _)| format!("{volume}:ro"))
+        .collect()
+}
+
+/// The /etc/ccache.conf of a build that asks for ccache.
+fn ccache_conf(cache: Option<&SharedCache>) -> String {
+    let mut conf = format!("stats_log = {FACTS_MOUNT}/{CCACHE_STATS}\n");
+    if let Some(cache) = cache {
+        conf.push_str(&format!("secondary_storage = {}\n", cache.ccache_storage()));
+    }
+    conf
 }
 
 /// Where `push` publishes: one repository the operator chose, and the authfile for it.
@@ -822,6 +861,11 @@ pub struct BuildParams {
     /// builds in the same builder pod see what this one left
     #[serde(default)]
     pub caches: Vec<CacheSpec>,
+    /// Configure ccache in every RUN step through a generated /etc/ccache.conf: the shared cache
+    /// as remote storage when the server has one, and a per-object log at
+    /// /buildit/ccache-stats.log. Needs ccache 4.4 or later in the image
+    #[serde(default)]
+    pub ccache: bool,
 }
 
 /// A cache a build declares.
@@ -1127,6 +1171,7 @@ fn bud_argv(
     build_args: &BTreeMap<String, String>,
     layers: bool,
     volumes: &[(String, String)],
+    ccache: bool,
 ) -> Result<Vec<String>> {
     let ws = id.workspace();
     let mut out = argv(["buildah", "bud"]);
@@ -1140,6 +1185,12 @@ fn bud_argv(
         "--volume".to_string(),
         format!("{}:{FACTS_MOUNT}:rw", id.facts_dir()),
     ]);
+    if ccache {
+        out.extend([
+            "--volume".to_string(),
+            format!("{}/{CCACHE_CONF}:/etc/ccache.conf:ro", id.facts_dir()),
+        ]);
+    }
     if let Some(t) = target {
         out.extend(["--target".to_string(), t.to_string()]);
     }
@@ -1612,6 +1663,7 @@ impl Broker {
             &p.build_args,
             self.reuse,
             &volumes,
+            p.ccache,
         )?;
         tracing::info!(
             "build {}: sandbox {} context {} {digest} ({} KiB) in {} pod {}",
@@ -1643,10 +1695,20 @@ impl Broker {
                 file = id.digest_file(),
             );
             pod.exec_with_stdin(&sh_c(&untar), &tarball).await?;
+            let specs: String = volumes.iter().map(|(_, spec)| format!("{spec}\n")).collect();
+            let file = format!("{}/{CACHES_FILE}", StepLog::dir(&id.0));
+            let write = argv(["sh", "-c", r#"cat > "$1""#, "sh", &file]);
+            pod.exec_with_stdin(&write, specs.as_bytes()).await?;
             if let Some(cache) = &self.shared_cache {
                 let file = format!("{}/{CACHE_FILE}", id.facts_dir());
                 let write = argv(["sh", "-c", r#"umask 077 && cat > "$1""#, "sh", &file]);
                 pod.exec_with_stdin(&write, &cache.document()).await?;
+            }
+            if p.ccache {
+                let file = format!("{}/{CCACHE_CONF}", id.facts_dir());
+                let write = argv(["sh", "-c", r#"umask 022 && cat > "$1""#, "sh", &file]);
+                let conf = ccache_conf(self.shared_cache.as_ref());
+                pod.exec_with_stdin(&write, conf.as_bytes()).await?;
             }
             let limit = build_limit(requested, self.deadline_secs, used)?;
             let args = step::build_args(limit, &bud);
@@ -1877,7 +1939,18 @@ impl Broker {
         let log = id.log(LogName::Run(n));
         let ctr = format!("{}-run{n}", id.0);
         let limit = timeout(p.timeout_s, DEFAULT_RUN_TIMEOUT_S);
-        let args = step::run_args(FROM_TIMEOUT, limit, &ctr, &id.tag(), &p.cmd);
+        let caches = pod
+            .exec_capture(&argv([
+                "sh",
+                "-c",
+                r#"cat "$1" 2>/dev/null || true"#,
+                "sh",
+                &format!("{}/{CACHES_FILE}", StepLog::dir(id.as_str())),
+            ]))
+            .await?;
+        let mut volumes = vec![format!("{}:{FACTS_MOUNT}:ro", id.facts_dir())];
+        volumes.extend(read_only_volumes(&caches));
+        let args = step::run_args(FROM_TIMEOUT, limit, &ctr, &id.tag(), &volumes, &p.cmd);
         step::launch(&pod, &log, None, &paths, args).await?;
         let snap = step::snapshot(&pod, &log)
             .await?
@@ -2405,8 +2478,8 @@ mod tests {
         PodView, PushParams, PushTarget, REUSE_SLACK, ResourceServer, ResourceServerConfig,
         Response, SCOPE_BUILD, SCOPE_READ, SharedCache, StatusCode, TokenLine, ToolPolicy,
         TrustedIssuer, alive, annotated_digest, annotation, argv, bind_socket, bud_argv,
-        build_limit, cache_volumes, held, hosts, parse_tokens, push_argv, reusable, router,
-        run_sandbox, socket_router, unpack,
+        build_limit, cache_volumes, ccache_conf, held, hosts, parse_tokens, push_argv,
+        read_only_volumes, reusable, router, run_sandbox, socket_router, unpack,
     };
     use crate::pod::BuilderPod;
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
@@ -4057,7 +4130,7 @@ mod tests {
 
         let args = BTreeMap::from([("A".to_string(), "x=y z".to_string())]);
         let df = RelPath::parse("docker/Dockerfile").unwrap();
-        let bud = bud_argv(&id, &df, Some("base"), &args, false, &[])
+        let bud = bud_argv(&id, &df, Some("base"), &args, false, &[], false)
             .unwrap()
             .join(" ");
         assert_eq!(
@@ -4073,7 +4146,7 @@ mod tests {
             read_only: false,
         }])
         .unwrap();
-        let layered = bud_argv(&id, &df, None, &args, true, &caches).unwrap();
+        let layered = bud_argv(&id, &df, None, &args, true, &caches, false).unwrap();
         assert_eq!(
             layered[..7],
             [
@@ -4087,7 +4160,7 @@ mod tests {
             ]
         );
         let bad = BTreeMap::from([("A=B".to_string(), "v".to_string())]);
-        assert!(bud_argv(&id, &df, None, &bad, false, &[]).is_err());
+        assert!(bud_argv(&id, &df, None, &bad, false, &[], false).is_err());
     }
 
     #[test]
@@ -4118,6 +4191,68 @@ mod tests {
         std::fs::remove_file(&token).unwrap();
         assert_eq!(doc(&cache(Some(&token))), serde_json::json!({ "url": url }));
         assert_eq!(doc(&cache(None)), serde_json::json!({ "url": url }));
+    }
+
+    #[test]
+    fn a_build_that_asks_for_ccache_gets_a_conf_for_the_cache_it_may_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        let cache = |url: &str, token_file: Option<&Path>| SharedCache {
+            url: url::Url::parse(url).unwrap(),
+            token_file: token_file.map(Path::to_path_buf),
+        };
+        let stats = "stats_log = /buildit/ccache-stats.log\n";
+        assert_eq!(
+            ccache_conf(None),
+            stats,
+            "no cache: only the per-object log"
+        );
+
+        let read_only = cache("http://cache.example.svc:8850/", None);
+        assert_eq!(
+            ccache_conf(Some(&read_only)),
+            format!("{stats}secondary_storage = http://cache.example.svc:8850/ccache|read-only\n")
+        );
+
+        std::fs::write(&token, "  t0k/en+1\n").unwrap();
+        let writable = cache("http://cache.example.svc:8850/shared/", Some(&token));
+        assert_eq!(
+            writable.ccache_storage(),
+            "http://buildit:t0k%2Fen+1@cache.example.svc:8850/shared/ccache",
+            "the token is the basic-auth password, escaped"
+        );
+        std::fs::write(&token, "\n").unwrap();
+        assert_eq!(
+            writable.ccache_storage(),
+            "http://cache.example.svc:8850/shared/ccache|read-only",
+            "an empty token reads only"
+        );
+
+        let id = BuildId::fresh();
+        let df = RelPath::parse("Dockerfile").unwrap();
+        let args = BTreeMap::new();
+        let conf = format!("{}/ccache.conf:/etc/ccache.conf:ro", id.facts_dir());
+        let with = bud_argv(&id, &df, None, &args, false, &[], true).unwrap();
+        assert!(
+            with.windows(2).any(|w| w == ["--volume", conf.as_str()]),
+            "{with:?}"
+        );
+        let without = bud_argv(&id, &df, None, &args, false, &[], false).unwrap();
+        assert!(!without.iter().any(|a| a.contains("ccache")), "{without:?}");
+    }
+
+    #[test]
+    fn a_run_mounts_the_build_s_caches_read_only() {
+        let specs = "/home/build/caches/ccache:/root/.cache/ccache:rw\n\
+                     /home/build/caches/src:/var/cache/src:ro\n";
+        assert_eq!(
+            read_only_volumes(specs),
+            [
+                "/home/build/caches/ccache:/root/.cache/ccache:ro",
+                "/home/build/caches/src:/var/cache/src:ro"
+            ]
+        );
+        assert!(read_only_volumes("").is_empty(), "a build without caches");
     }
 
     #[test]
@@ -4601,6 +4736,162 @@ mod tests {
         assert_eq!(gone, want);
     }
 
+    /// The shared cache an e2e build uses: a deployed one (BUILDIT_E2E_CACHE_URL and
+    /// BUILDIT_E2E_CACHE_TOKEN_FILE), or one served from this host, which pods reach at
+    /// BUILDIT_E2E_HOST_ADDR. True when it is local, so its blobs are on disk under `work`.
+    async fn e2e_cache(work: &Path, cache_token: &Path) -> (String, bool) {
+        match std::env::var("BUILDIT_E2E_CACHE_URL") {
+            Ok(url) => {
+                let token = std::env::var("BUILDIT_E2E_CACHE_TOKEN_FILE").unwrap();
+                std::fs::copy(token, cache_token).unwrap();
+                (url, false)
+            }
+            Err(_) => {
+                let host_addr = std::env::var("BUILDIT_E2E_HOST_ADDR").unwrap();
+                std::fs::write(cache_token, "e2e-cache-token\n").unwrap();
+                let store = crate::cache::Store::open(
+                    &work.join("cache"),
+                    cache_token.to_path_buf(),
+                    u64::MAX,
+                    1 << 30,
+                )
+                .unwrap();
+                let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                tokio::spawn(async move {
+                    axum::serve(listener, crate::cache::router(Arc::new(store))).await
+                });
+                (format!("http://{host_addr}:{port}"), true)
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x and either \
+                BUILDIT_E2E_HOST_ADDR=<this host's address from a pod> for a cache on this host, or \
+                BUILDIT_E2E_CACHE_URL and BUILDIT_E2E_CACHE_TOKEN_FILE for a deployed one"]
+    async fn e2e_a_plain_dockerfile_shares_ccache_objects_when_its_build_asks_for_ccache() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap();
+        let cache_token = work.join("cache-token");
+        let run = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (cache_url, _) = e2e_cache(&work, &cache_token).await;
+        std::fs::create_dir_all(work.join("svc")).unwrap();
+        std::fs::write(
+            work.join("svc/a.c"),
+            format!(
+                "int plain(int x) {{ return x * 7 + {}; }}\n",
+                run % 1_000_000_007
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("svc/Dockerfile"),
+            "FROM docker.io/library/alpine:3.20\n\
+             RUN apk add --no-cache ccache gcc musl-dev\n\
+             COPY a.c /src/\n\
+             ARG NONCE\n\
+             RUN set -e; export CCACHE_DIR=/tmp/ccache; \\\n\
+               ccache -z > /dev/null; ccache gcc -c /src/a.c -o /tmp/a.o; cp /tmp/a.o /objs/; \\\n\
+               stats=$(ccache --print-stats); \\\n\
+               hits=$(echo \"$stats\" | awk '$1 == \"remote_storage_hit\" || $1 == \"secondary_storage_hit\" { n += $2 } END { print n + 0 }'); \\\n\
+               misses=$(echo \"$stats\" | awk '$1 == \"cache_miss\" { n += $2 } END { print n + 0 }'); \\\n\
+               echo \"plain-ccache nonce=$NONCE remote_hits=$hits misses=$misses\"\n",
+        )
+        .unwrap();
+        let file = tokens(&work, "tok-a sb-plain-a\ntok-b sb-plain-b\n");
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        let broker = Broker {
+            shared_cache: Some(SharedCache {
+                url: url::Url::parse(&cache_url).unwrap(),
+                token_file: Some(cache_token.clone()),
+            }),
+            ..Arc::into_inner(broker_with(client, &file, Some(&work), 900, true)).unwrap()
+        };
+        let (addr, _server) = serve(Arc::new(broker)).await;
+        for token in ["tok-a", "tok-b"] {
+            call(&addr, token, "clean", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        let build = |token: &'static str, nonce: String| {
+            let addr = addr.clone();
+            async move {
+                let args = serde_json::json!({
+                    "context": "svc", "timeout_s": 600, "ccache": true,
+                    "caches": [{ "name": "plain-objs", "path": "/objs" }],
+                    "build_args": { "NONCE": nonce },
+                });
+                let started = call(&addr, token, "build", args).await.unwrap();
+                let id = started["build_id"].as_str().unwrap().to_string();
+                let args = serde_json::json!({ "build_id": id });
+                for _ in 0..300 {
+                    let status = call(&addr, token, "status", args.clone()).await.unwrap();
+                    if status["status"] != "running" {
+                        assert_eq!(status["status"], "succeeded", "{status}");
+                        let grep = serde_json::json!({ "build_id": id, "grep": "^plain-ccache " });
+                        let lines = call(&addr, token, "logs", grep).await.unwrap();
+                        let line = lines["lines"].as_str().unwrap_or_default().trim_end();
+                        return (id, line.to_string());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("build {id} still running after 600s");
+            }
+        };
+
+        let (_, line) = build("tok-a", format!("{run}-a")).await;
+        assert!(
+            line.ends_with(&format!(
+                "plain-ccache nonce={run}-a remote_hits=0 misses=1"
+            )),
+            "{line}"
+        );
+        let (b, line) = build("tok-b", format!("{run}-b")).await;
+        assert!(
+            line.ends_with(&format!(
+                "plain-ccache nonce={run}-b remote_hits=1 misses=0"
+            )),
+            "a Dockerfile that never names the cache hits a's object through it: {line}"
+        );
+
+        let read = serde_json::json!({
+            "build_id": b,
+            "cmd": ["sh", "-c", "cat /buildit/ccache-stats.log; test -e /etc/ccache.conf || echo no-conf; ls /objs; touch /objs/x 2>/dev/null || echo caches-read-only"],
+        });
+        let ran = call(&addr, "tok-b", "run", read).await.unwrap();
+        let id = serde_json::json!({ "build_id": b, "which": "run:1", "tail_lines": 50 });
+        let out = call(&addr, "tok-b", "logs", id).await.unwrap();
+        let out = out["lines"].as_str().unwrap_or_default();
+        assert_eq!(ran["exit"], 0, "{ran} {out}");
+        assert!(
+            out.contains("/src/a.c")
+                && out
+                    .lines()
+                    .any(|l| l.contains("storage") && l.ends_with("hit")),
+            "run sees the build's per-object ccache log under /buildit: {out}"
+        );
+        assert!(
+            out.contains("no-conf"),
+            "the generated conf is mounted into RUN steps, not left in the image: {out}"
+        );
+        assert!(
+            out.contains("a.o") && out.contains("caches-read-only"),
+            "run sees the build's caches, read-only: {out}"
+        );
+
+        for token in ["tok-a", "tok-b"] {
+            call(&addr, token, "clean", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x and either \
                 BUILDIT_E2E_HOST_ADDR=<this host's address from a pod> for a cache on this host, or \
@@ -4615,30 +4906,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let (cache_url, local) = match std::env::var("BUILDIT_E2E_CACHE_URL") {
-            Ok(url) => {
-                let token = std::env::var("BUILDIT_E2E_CACHE_TOKEN_FILE").unwrap();
-                std::fs::copy(token, &cache_token).unwrap();
-                (url, false)
-            }
-            Err(_) => {
-                let host_addr = std::env::var("BUILDIT_E2E_HOST_ADDR").unwrap();
-                std::fs::write(&cache_token, "e2e-cache-token\n").unwrap();
-                let store = crate::cache::Store::open(
-                    &work.join("cache"),
-                    cache_token.clone(),
-                    u64::MAX,
-                    1 << 30,
-                )
-                .unwrap();
-                let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
-                let port = listener.local_addr().unwrap().port();
-                tokio::spawn(async move {
-                    axum::serve(listener, crate::cache::router(Arc::new(store))).await
-                });
-                (format!("http://{host_addr}:{port}"), true)
-            }
-        };
+        let (cache_url, local) = e2e_cache(&work, &cache_token).await;
         let blobs = || {
             let mut dirs = vec![work.join("cache/blobs")];
             let mut found = Vec::new();
@@ -4653,10 +4921,12 @@ mod tests {
             found
         };
 
-        let informer = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../examples/vllm-build-bench/bench/informer.py");
+        let bench =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/vllm-build-bench/bench");
         std::fs::create_dir_all(work.join("svc")).unwrap();
-        std::fs::copy(&informer, work.join("svc/informer.py")).unwrap();
+        for module in ["informer.py", "buildtrace.py"] {
+            std::fs::copy(bench.join(module), work.join("svc").join(module)).unwrap();
+        }
         std::fs::write(
             work.join("svc/a.c"),
             format!(
@@ -4669,7 +4939,7 @@ mod tests {
             work.join("svc/Dockerfile"),
             "FROM docker.io/library/alpine:3.20\n\
              RUN apk add --no-cache ccache gcc musl-dev python3\n\
-             COPY informer.py a.c /src/\n\
+             COPY informer.py buildtrace.py a.c /src/\n\
              ARG NONCE\n\
              RUN set -e; \\\n\
                remote=$(python3 -c 'import pathlib, sys; sys.path.insert(0, \"/src\"); import informer; \\\n\
@@ -5180,6 +5450,7 @@ done; echo "$n""#;
                 build_args: BTreeMap::new(),
                 timeout_s: None,
                 caches: Vec::new(),
+                ccache: false,
             },
             wait,
         };

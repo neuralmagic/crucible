@@ -163,9 +163,17 @@ allow it in a user namespace.
 
 A build may declare caches, `caches: [{name, path, read_only}]` (`--cache NAME=PATH[:ro]` on the
 CLI): directories of its builder pod mounted at `path` in every `RUN` step and kept for the
-sandbox's later builds there. Every `RUN` step also sees `/buildit`. A `facts.json` object a build
-leaves there comes back as `status.facts`. With `--cache-url`, buildit first writes `cache.json`
-there, naming the shared cache and, with `--cache-token-file`, its write token.
+sandbox's later builds there. Every `RUN` step also sees `/buildit`; a `run` of the build sees it
+and the build's caches read-only. A `facts.json` object a build leaves there comes back as `status.facts`. With
+`--cache-url`, buildit first writes `cache.json` there, naming the shared cache and, with
+`--cache-token-file`, its write token.
+
+A build with `ccache: true` (`--ccache` on the CLI) gets a generated `/etc/ccache.conf` in every
+`RUN` step, so a Dockerfile that already compiles through ccache needs no change: ccache uses the
+shared cache as remote storage (writing to it when the server holds the token) and logs each
+object's result to `/buildit/ccache-stats.log`. The file overrides any `/etc/ccache.conf` the
+image has and is not part of the image. It needs ccache 4.4 or later, which reads the
+`secondary_storage` key.
 
 `buildit cache` is that shared cache: blobs over HTTP, open to GET and HEAD, with PUT and DELETE
 behind the token in `--token-file`, sent as a bearer token or a basic-auth password. ccache uses it
