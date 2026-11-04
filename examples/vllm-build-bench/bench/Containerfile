@@ -1,0 +1,52 @@
+# A vLLM candidate build: the sandbox base (CUDA dev packages, editable vLLM on its precompiled
+# wheel, vllm-envs), then the candidate tree over it, built by the informer unless MODE is derive.
+# The informer's caches are declared to buildit with --cache, not mounted here.
+ARG BASE
+FROM ${BASE}
+USER root
+ARG VLLM_REF
+ARG VLLM_ENVS_REF=e8557dc4645b5ee9819ee47b185ce360d2e1bd07
+RUN set -eu; \
+    mkdir -p /var/tmp/crucible-bench; \
+    printf 'base_start=%s\narch=%s\ncpus=%s\n' "$(date +%s)" "$(uname -m)" "$(nproc)" \
+        > /var/tmp/crucible-bench/times; \
+    v=$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr . -); \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*; do \
+        if [ -f "$f" ]; then sed -i 's|http://|https://|g' "$f"; fi; \
+    done; \
+    apt-get update --error-on=any; \
+    apt-get install -y --no-install-recommends git g++ ccache libdw-dev \
+        cuda-nvrtc-dev-$v cuda-cudart-dev-$v libcusparse-dev-$v libcusolver-dev-$v \
+        libcublas-dev-$v libcurand-dev-$v libcufft-dev-$v; \
+    rm -rf /var/lib/apt/lists/*; \
+    git init -q /src/vllm; \
+    git -C /src/vllm fetch -q --depth 1 https://github.com/vllm-project/vllm.git "$VLLM_REF"; \
+    git -C /src/vllm checkout -q --detach FETCH_HEAD; \
+    cd /src/vllm; \
+    grep -v '^torch' requirements/build/cuda.txt > /tmp/build-reqs.txt; \
+    python3 -m pip install --no-cache-dir -r /tmp/build-reqs.txt; \
+    VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_COMMIT="$VLLM_REF" \
+        python3 -m pip install --no-cache-dir --no-build-isolation --no-deps -e .; \
+    python3 -m pip install --no-cache-dir \
+        "vllm-envs @ git+https://github.com/neuralmagic/vllm-envs@$VLLM_ENVS_REF"; \
+    echo "base_end=$(date +%s)" >> /var/tmp/crucible-bench/times
+COPY . /src/vllm
+ARG BASE
+ARG MODE=full
+ARG ARCH_LIST=10.0
+ARG JOBS=16
+ARG MARKER_FILES=
+ARG BUILD_NONCE=
+RUN set -eu; \
+    echo "nonce $BUILD_NONCE"; \
+    t=/var/tmp/crucible-bench/times; \
+    echo "compile_start=$(date +%s)" >> "$t"; \
+    python3 /src/vllm/.crucible-bench/informer.py build /src/vllm --base "$BASE" \
+        --arch-list "$ARCH_LIST" --jobs "$JOBS" --mode "$MODE"; \
+    echo "compile_end=$(date +%s)" >> "$t"; \
+    cd /src/vllm; \
+    found=$( (find vllm -name '*.so' -exec grep -aoh 'crucible-bench-marker:[a-z0-9_]*' {} + || true; \
+              for f in $MARKER_FILES; do grep -oh 'crucible-bench-marker:[a-z0-9_]*' "$f" || true; done) \
+             | sort -u | tr '\n' ' '); \
+    echo "crucible-bench-times $(tr '\n' ' ' < "$t")"; \
+    echo "crucible-bench-found $found"

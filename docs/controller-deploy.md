@@ -334,7 +334,29 @@ limits            = { cpu = "32" }
 
 [buildit.cluster_builders.spoke-b]                  # optional, per cluster
 node_arch = "amd64"
+
+[buildit.cache]                                     # optional, a cache builds share
+clusters     = ["spoke-a"]                          # default the hub; deploy it on each
+token_secret = "buildit-cache-token"
+size_gib     = 500
+write        = true
 ```
+
+`[buildit.cache]` adds a `buildit cache` in the loop namespace that every build may use: ccache
+objects and stored build outputs shared across runs. `crucible deploy --buildit-cache --profile
+<profile>` renders its PersistentVolumeClaim, Deployment, Service and a NetworkPolicy that admits
+builder pods only; apply it on each cluster in `clusters`. The loop render opens builder egress to
+it, and runs on those clusters, and no others, get its URL. Create the token Secret first, in the
+loop namespace, with a URL-safe value:
+
+```bash
+oc create secret generic buildit-cache-token --from-literal=token="$(openssl rand -hex 32)"
+```
+
+With `write` (the default) loop pods mount the token and builds on the cache's clusters may write
+to it. A build's `RUN` steps can read it, so one run's agent could store objects other runs' builds
+use: keep `write` for clusters whose runs trust each other, and set `write = false` otherwise so
+builds read only.
 
 ```bash
 openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out agent-signing.pem

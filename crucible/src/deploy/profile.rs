@@ -369,6 +369,67 @@ pub struct BuilditCfg {
     /// `cluster_builders = { east = { node_arch = "amd64" } }`.
     #[serde(default)]
     pub cluster_builders: BTreeMap<String, BuilderPods>,
+    /// A `buildit cache` in the loop namespace that builds on its clusters may read: ccache
+    /// objects and stored build outputs shared across runs. `crucible deploy --buildit-cache`
+    /// renders it.
+    #[serde(default)]
+    pub cache: Option<BuilditCacheCfg>,
+}
+
+/// `[buildit.cache]`: where the shared cache runs, its storage, and whether builds may write to it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilditCacheCfg {
+    /// The dispatch clusters it is deployed on, each one of `[buildit] clusters`: `clusters =
+    /// [...]`, or `cluster = "..."`. Runs elsewhere are not told of it. Default the hub.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
+    /// The Secret in the loop namespace whose `token` key is the cache's write token, a URL-safe
+    /// string. The cache and, with `write`, every loop pod mount it.
+    pub token_secret: KubeName,
+    /// Whether builds get the write token. A build's `RUN` steps can read it, so a run's agent
+    /// could store objects other runs' builds then use: set it only on a cluster whose runs trust
+    /// each other. Without it builds read only. Default true.
+    #[serde(default = "yes")]
+    pub write: bool,
+    /// The cache's PersistentVolumeClaim size in GiB; it keeps 90% of it before it drops the
+    /// least recently used blobs. Default 200.
+    #[serde(default = "default_cache_gib")]
+    pub size_gib: u64,
+    /// The claim's StorageClass. Default the cluster's.
+    #[serde(default)]
+    pub storage_class: Option<String>,
+    /// The image the cache runs, which must hold the `buildit` binary. Default the loop image.
+    #[serde(default)]
+    pub image: Option<String>,
+}
+
+impl BuilditCacheCfg {
+    pub const NAME: &str = "buildit-cache";
+    pub const PORT: u16 = 8850;
+    pub const TOKEN_KEY: &str = "token";
+
+    /// The URL builds reach the cache at, through its Service in `namespace`.
+    pub fn url(namespace: &str) -> String {
+        format!("http://{}.{namespace}.svc:{}", Self::NAME, Self::PORT)
+    }
+
+    /// The bytes the cache keeps before it drops the least recently used blobs, in GiB.
+    pub fn keep_gib(&self) -> u64 {
+        self.size_gib.saturating_mul(9) / 10
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn default_cache_gib() -> u64 {
+    200
 }
 
 /// An IP network builder pods may reach, on `ports`, less the networks in `except` (such as the

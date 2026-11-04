@@ -91,7 +91,7 @@ pub enum Transport {
 #[serde(rename_all = "snake_case")]
 pub enum LocalServer {
     /// `buildit mcp`.
-    Buildit(BuilditSite),
+    Buildit(Box<BuilditSite>),
 }
 
 /// What `buildit mcp` runs with for a run.
@@ -111,6 +111,21 @@ pub struct BuilditSite {
     /// Where and how large its builder pods are.
     #[serde(default, skip_serializing_if = "BuilderPods::is_unset")]
     pub builders: BuilderPods,
+    /// The shared `buildit cache` its builds use; none, they use only their pods' own caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<SharedCache>,
+}
+
+/// A `buildit cache` every build of the run may read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SharedCache {
+    /// Where builds reach it.
+    pub url: String,
+    /// Whether builds get its write token, at [`crate::buildit::CACHE_TOKEN_FILE`]; otherwise
+    /// they only read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub write: bool,
 }
 
 /// buildit's builder pods: the node architecture they run on, how many a sandbox may have live,
@@ -236,13 +251,17 @@ mod tests {
                 name: ServerName::parse("buildit").unwrap(),
                 url: "http://host.openshell.internal:8848/mcp".into(),
                 scopes: vec!["buildit.read".into(), "buildit.build".into()],
-                transport: Transport::Local(LocalServer::Buildit(BuilditSite {
+                transport: Transport::Local(LocalServer::Buildit(Box::new(BuilditSite {
                     run_issuer: "https://hub.example=https://hub.example/jwks".into(),
                     namespace: "builds".into(),
                     push_repo: None,
                     queue: Some("builders".into()),
                     builders: BuilderPods::default(),
-                })),
+                    cache: Some(SharedCache {
+                        url: "http://buildit-cache.loops.svc:8850".into(),
+                        write: true,
+                    }),
+                }))),
             },
         ];
         let raw = encode(&servers).unwrap();
@@ -265,9 +284,11 @@ mod tests {
             push_repo: None,
             queue: None,
             builders,
+            cache: None,
         };
         let plain = serde_json::to_value(site(BuilderPods::default())).unwrap();
         assert!(plain.get("builders").is_none(), "{plain}");
+        assert!(plain.get("cache").is_none(), "{plain}");
         let pinned = site(BuilderPods {
             node_arch: Some(NodeArch::Amd64),
             max_builds: NonZeroU32::new(2),
@@ -290,6 +311,40 @@ mod tests {
         assert!(serde_json::from_str::<BuilderPods>(r#"{"node_arch": "x86_64"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"max_builds": 0}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"cpu": "8"}"#).is_err());
+    }
+
+    #[test]
+    fn a_shared_cache_rides_the_env_and_says_write_only_when_builds_write() {
+        let site = |write| BuilditSite {
+            run_issuer: "https://hub.example=https://hub.example/jwks".into(),
+            namespace: "builds".into(),
+            push_repo: None,
+            queue: None,
+            builders: BuilderPods::default(),
+            cache: Some(SharedCache {
+                url: "http://buildit-cache.loops.svc:8850".into(),
+                write,
+            }),
+        };
+        let raw = serde_json::to_value(site(false)).unwrap();
+        assert_eq!(
+            raw["cache"],
+            serde_json::json!({"url": "http://buildit-cache.loops.svc:8850"})
+        );
+        assert_eq!(
+            serde_json::from_value::<BuilditSite>(raw).unwrap(),
+            site(false)
+        );
+        let raw = serde_json::to_value(site(true)).unwrap();
+        assert_eq!(
+            raw["cache"],
+            serde_json::json!({"url": "http://buildit-cache.loops.svc:8850", "write": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<BuilditSite>(raw).unwrap(),
+            site(true)
+        );
+        assert!(serde_json::from_str::<SharedCache>(r#"{"url": "u", "token": "t"}"#).is_err());
     }
 
     #[test]

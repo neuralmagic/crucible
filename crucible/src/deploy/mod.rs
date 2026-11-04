@@ -9,6 +9,7 @@
 //! a single domain is a degenerate composite of one component, so it needs its own `[deploy]` block
 //! naming that one target (see [`render::RenderInput::from_manifest`]).
 
+pub mod buildit_cache;
 pub mod cluster_link;
 mod controller;
 pub mod kueue;
@@ -144,6 +145,20 @@ pub fn apply_kueue_cmd(
     let profile = DeployProfile::load(profile_path)?;
     let yaml = kueue::render(&profile, opts, target)?;
     forge::kube::apply_yaml(&yaml).context("applying the rendered crucible-kueue deployment")
+}
+
+/// Emit the shared buildit cache's YAML, rendered from the profile's `[buildit.cache]` table.
+pub fn render_buildit_cache_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+    let profile = DeployProfile::load(profile_path)?;
+    print!("{}", buildit_cache::render(&profile, opts)?);
+    Ok(())
+}
+
+/// Render the shared buildit cache then server-side apply it.
+pub fn apply_buildit_cache_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+    let profile = DeployProfile::load(profile_path)?;
+    let yaml = buildit_cache::render(&profile, opts)?;
+    forge::kube::apply_yaml(&yaml).context("applying the rendered buildit cache")
 }
 
 /// Emit the controller's `OAuthClient` for `cluster`, from the profile's `[cluster_link]` table. It

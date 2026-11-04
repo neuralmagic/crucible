@@ -292,13 +292,14 @@ mod tests {
     /// A remote server and one in the loop pod get the same provider, egress and grant shape.
     #[test]
     fn every_server_gets_a_grant_bound_to_its_own_host_with_its_own_scopes() {
-        let buildit = Transport::Local(LocalServer::Buildit(BuilditSite {
+        let buildit = Transport::Local(LocalServer::Buildit(Box::new(BuilditSite {
             run_issuer: format!("{ISSUER}={ISSUER}/.well-known/jwks.json"),
             namespace: "builds".into(),
             push_repo: None,
             queue: None,
             builders: Default::default(),
-        }));
+            cache: None,
+        })));
         let servers = granted(&[
             server("kueue", KUEUE, Transport::Remote),
             server(

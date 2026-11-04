@@ -27,6 +27,9 @@ use crate::step::Status;
 /// Names the socket of the server these commands call.
 pub const ENV_SERVER: &str = "CRUCIBLE_BUILDIT_SOCKET";
 
+/// Status polls in a row that may fail before waiting on a build gives up.
+const STATUS_TRIES: u32 = 6;
+
 /// One call to the server.
 pub enum Call {
     /// Start a build, then poll its status until it ends unless `wait` is false.
@@ -202,17 +205,30 @@ async fn build(server: &Server, params: &BuildParams, wait: bool) -> Result<Outc
     let status = StatusParams {
         build_id: built.build_id,
     };
+    let mut failed = 0;
     loop {
-        let reply = match server.call("status", &status).await? {
-            Reply::Ok(reply) => reply,
-            Reply::Failed(reply) => return Ok(Outcome::failed(reply)),
+        let error = match server.call("status", &status).await {
+            Ok(Reply::Ok(reply)) => {
+                let polled = StatusReply::deserialize(&reply).context("reading status's reply")?;
+                if polled.status != Status::Running {
+                    return Ok(Outcome {
+                        ok: polled.status == Status::Succeeded,
+                        reply,
+                    });
+                }
+                failed = 0;
+                None
+            }
+            Ok(Reply::Failed(reply)) => Some(reply),
+            Err(e) => Some(serde_json::json!({ "error": format!("{e:#}") })),
         };
-        let polled = StatusReply::deserialize(&reply).context("reading status's reply")?;
-        if polled.status != Status::Running {
-            return Ok(Outcome {
-                ok: polled.status == Status::Succeeded,
-                reply,
-            });
+        if let Some(mut reply) = error {
+            failed += 1;
+            tracing::warn!("polling build {}: {reply}", status.build_id);
+            if failed >= STATUS_TRIES {
+                reply["build_id"] = status.build_id.clone().into();
+                return Ok(Outcome::failed(reply));
+            }
         }
         tokio::time::sleep(poll).await;
     }

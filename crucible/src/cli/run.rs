@@ -366,6 +366,13 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 args.issuer.as_deref(),
             );
         }
+        if args.buildit_cache {
+            return if apply {
+                deploy::apply_buildit_cache_cmd(&args.profile, &opts)
+            } else {
+                deploy::render_buildit_cache_cmd(&args.profile, &opts)
+            };
+        }
         if args.kueue {
             let target = deploy::kueue::KueueTarget {
                 cluster: args.kueue_cluster.as_deref(),
@@ -382,7 +389,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             };
         }
         let manifest = args.manifest.context(
-            "--manifest is required unless --controller, --kueue or --cluster-link is set",
+            "--manifest is required unless --controller, --kueue, --buildit-cache or --cluster-link \
+             is set",
         )?;
         return if apply {
             deploy::apply_cmd(&manifest, &args.profile, &opts)

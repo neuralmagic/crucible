@@ -230,6 +230,12 @@ optimize-loop context ctl_ns gpu="false" rounds="3" min_speedup="5":
     CONTEXT={{context}} CTL_NS={{ctl_ns}} GPU={{gpu}} ROUNDS={{rounds}} MIN_SPEEDUP={{min_speedup}} \
         scripts/optimize-loop.sh
 
+# examples/vllm-build-bench's replay and informer against real git checkouts and a C++ compiler,
+# and the pack compiled to its step chain.
+vllm-build-bench-test:
+    cargo build -q -p buildit
+    SQLX_OFFLINE=true cargo test -q -p crucible --test vllm_build_bench_example
+
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
 # the full production submit/stream/parse path and print the typed result JSON. `cluster` is a
 # [clusters.<name>] entry in the deploy profile; pass `context` to run it against a local

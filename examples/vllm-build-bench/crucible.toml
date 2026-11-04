@@ -1,0 +1,18 @@
+# vllm-build-bench: builds a fixed trace of vLLM source edits through the run's buildit and times
+# each build. See README.md.
+[workspace]
+inject = [
+    "bench/replay.py",
+    "bench/Containerfile",
+    "bench/informer.py",
+    { src = "workspace.gitignore", dst = ".gitignore" },
+]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Time vLLM candidate builds over a fixed trace of source edits."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

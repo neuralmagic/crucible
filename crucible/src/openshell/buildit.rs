@@ -108,6 +108,18 @@ impl Buildit<'_> {
                 args.extend([flag.to_string(), format!("{key}={qty}")]);
             }
         }
+        if let Some(cache) = &self.site.cache {
+            args.extend(["--cache-url", &cache.url].map(String::from));
+            if cache.write {
+                args.extend(
+                    [
+                        "--cache-token-file",
+                        crucible_contract::buildit::CACHE_TOKEN_FILE,
+                    ]
+                    .map(String::from),
+                );
+            }
+        }
         if let Some(socket) = self.socket {
             for (flag, path) in [
                 ("--socket", &socket.path),
@@ -178,7 +190,7 @@ fn accepts(socket: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use crate::openshell::buildit::*;
-    use crucible_contract::agent_servers::BuilderPods;
+    use crucible_contract::agent_servers::{BuilderPods, SharedCache};
     use std::collections::BTreeMap;
     use std::num::NonZeroU32;
 
@@ -193,6 +205,7 @@ mod tests {
             push_repo: push.map(str::to_string),
             queue: None,
             builders: BuilderPods::default(),
+            cache: None,
         }
     }
 
@@ -241,6 +254,34 @@ mod tests {
         );
         assert!(!args.contains(&"--insecure-jwks-http".to_string()));
         assert!(!args.contains(&"--queue".to_string()), "no queue: {args:?}");
+        assert!(
+            !args.iter().any(|a| a.starts_with("--cache")),
+            "no cache: {args:?}"
+        );
+        let url = "http://buildit-cache.crucible-system.svc:8850";
+        let reads = BuilditSite {
+            cache: Some(SharedCache {
+                url: url.into(),
+                write: false,
+            }),
+            ..plain.clone()
+        };
+        let args = buildit(&reads).args(&run, "/p").unwrap();
+        assert_eq!(flag(&args, "--cache-url").as_deref(), Some(url));
+        assert!(!args.contains(&"--cache-token-file".to_string()));
+        let writes = BuilditSite {
+            cache: Some(SharedCache {
+                url: url.into(),
+                write: true,
+            }),
+            ..plain.clone()
+        };
+        let args = buildit(&writes).args(&run, "/p").unwrap();
+        assert_eq!(flag(&args, "--cache-url").as_deref(), Some(url));
+        assert_eq!(
+            flag(&args, "--cache-token-file").as_deref(),
+            Some("/etc/buildit-cache/token")
+        );
         let queued = BuilditSite {
             queue: Some("builders".into()),
             ..plain.clone()
