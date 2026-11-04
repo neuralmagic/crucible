@@ -43,8 +43,8 @@ that allows overlay mounts in a user namespace (5.13 and later).
   `/buildit` with buildit's `run`, which sees both read-only, and declares them as its files.
   `trace/render.py` turns each pair into `traces/<build>.html` and writes `traces/index.html`
   comparing the builds. The run page shows them under its captured files.
-- `build/.dockerignore` keeps `vllm/.git` out of the build context; `.gitignore` keeps the checkout
-  out of the run's workspace history.
+- The checkout's `.git` stays in the build context, since `setup.py` takes vLLM's version from it.
+  `.gitignore` keeps the checkout out of the run's workspace history.
 - The sandbox needs `git` and egress to github.com to check vLLM out:
   `[agent.openshell] binaries = ["/usr/bin/git", "/usr/lib/git-core/git-remote-https"]`.
 
