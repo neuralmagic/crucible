@@ -5,7 +5,7 @@ build's ninja and ccache logs and report what each took.
 If the buildit tools are not available to you, write `report.json` with an `error` saying so and
 stop. Do not look for credentials, tokens or other ways in.
 
-Every build uses the same arguments: context `.`, dockerfile `build/Dockerfile`, `ccache` true,
+Every build uses the same arguments: context `build`, dockerfile `Dockerfile`, `ccache` true,
 `timeout_s` 3600, build_args `BASE`, `TORCH_CUDA_ARCH_LIST` and `MAX_JOBS` from below, and these
 caches, unchanged:
 
@@ -20,14 +20,14 @@ build_id, cmd
 and fetch_paths `["/trace"]`, then copy the two fetched files to `traces/<name>.ninja_log` and
 `traces/<name>.ccache-stats.log`.
 
-1. Check out vLLM at `vllm_ref` (below) into `vllm/`:
-   `git init -q vllm && git -C vllm fetch -q --depth 1 https://github.com/vllm-project/vllm.git <vllm_ref> && git -C vllm checkout -q --detach FETCH_HEAD`
+1. Check out vLLM at `vllm_ref` (below) into `build/vllm/`:
+   `git init -q build/vllm && git -C build/vllm fetch -q --depth 1 https://github.com/vllm-project/vllm.git <vllm_ref> && git -C build/vllm checkout -q --detach FETCH_HEAD`
    Build it as `checkout`.
 2. For N in 1, 2, 3, append this line to the file below, then build as `editN`:
    `namespace crucible_smoke { [[maybe_unused]] __attribute__((used)) inline const char marker_N[] = "crucible-smoke-N"; }`
-   - N=1: `vllm/csrc/layernorm_kernels.cu`
-   - N=2: `vllm/csrc/activation_kernels.cu`
-   - N=3: `vllm/csrc/layernorm_kernels.cu` again
+   - N=1: `build/vllm/csrc/layernorm_kernels.cu`
+   - N=2: `build/vllm/csrc/activation_kernels.cu`
+   - N=3: `build/vllm/csrc/layernorm_kernels.cu` again
 3. Write `report.json`:
    `{"builds": [{"name": "checkout" | "edit1" | "edit2" | "edit3", "build_id": ..., "status": ..., "seconds": <from the build call to the last status>}]}`
 

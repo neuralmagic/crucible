@@ -1,5 +1,5 @@
 # vLLM built from source on a vLLM release image: CUDA dev packages and the build requirements,
-# then the workspace's vllm/ tree, compiled in place through ccache.
+# then the context's vllm/ tree, compiled in place through ccache.
 ARG BASE
 FROM ${BASE}
 USER root

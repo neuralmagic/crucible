@@ -29,8 +29,9 @@ that allows overlay mounts in a user namespace (5.13 and later).
 ## The pack
 
 - `build/Dockerfile` is an ordinary vLLM source build: CUDA dev packages and the build
-  requirements on a vLLM release image, then the workspace's `vllm/` compiled in place with
-  `setup.py build_ext --inplace`. Nothing in it knows about buildit or caching.
+  requirements on a vLLM release image, then the agent's `build/vllm/` checkout compiled in place
+  with `setup.py build_ext --inplace`. Nothing in it knows about buildit or caching. `build/` is the
+  build context: buildit ships a subdirectory of the workspace, never the workspace root.
 - The agent builds it once as checked out, then edits one CUDA kernel at a time and builds again,
   three times. Every `build` call names the same buildit caches: ccache's directory, vLLM's
   FetchContent sources (`.deps`) and its CMake build dir. buildit keeps them in the sandbox's
@@ -42,8 +43,8 @@ that allows overlay mounts in a user namespace (5.13 and later).
   `/buildit` with buildit's `run`, which sees both read-only, and declares them as its files.
   `trace/render.py` turns each pair into `traces/<build>.html` and writes `traces/index.html`
   comparing the builds. The run page shows them under its captured files.
-- `.dockerignore` keeps `vllm/.git` out of the build context; `.gitignore` keeps the checkout out
-  of the run's workspace history.
+- `build/.dockerignore` keeps `vllm/.git` out of the build context; `.gitignore` keeps the checkout
+  out of the run's workspace history.
 - The sandbox needs `git` and egress to github.com to check vLLM out:
   `[agent.openshell] binaries = ["/usr/bin/git", "/usr/lib/git-core/git-remote-https"]`.
 

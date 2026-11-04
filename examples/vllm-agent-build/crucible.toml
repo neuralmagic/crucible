@@ -7,7 +7,7 @@ inject = [
     "trace/buildtrace.py",
     "trace/trace.html",
     "trace/render.py",
-    { src = "dockerignore", dst = ".dockerignore" },
+    { src = "dockerignore", dst = "build/.dockerignore" },
     { src = "gitignore", dst = ".gitignore" },
 ]
 
