@@ -76,6 +76,7 @@ import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView
 import {
   downloadName,
   imageMimeType,
+  inlineKind,
   listedFiles,
   parseRunFilePath,
   prettyJson,
@@ -97,6 +98,9 @@ const DECISION_TONE: Record<DecisionTone, StatusTone> = {
   neutral: 'blue',
 };
 
+/** How often a running playbook run's page refetches while it has no event stream of its own. */
+const POLL_RUNNING = 5000;
+
 /// A personal target's name is an opaque secret id, so it is shown as what it is rather than as a
 /// cluster name a reader could go look up.
 function clusterLabel(cluster: string): string {
@@ -117,9 +121,17 @@ export function RunDetailPage() {
   const isPlaybook = runId.startsWith('playbook_');
 
   const agentTools = useAgentTools() === true;
-  const runDetail = $api.useQuery('get', '/api/runs/{run_id}', {
-    params: { path: { run_id: runId } },
-  });
+  const runDetail = $api.useQuery(
+    'get',
+    '/api/runs/{run_id}',
+    { params: { path: { run_id: runId } } },
+    {
+      // A playbook run drives local processes, so nothing streams its status or its captured
+      // files; without polling the page stays on whatever it was opened with until a reload.
+      refetchInterval: (query) =>
+        isPlaybook && query.state.data?.run.status === 'running' ? POLL_RUNNING : false,
+    },
+  );
   const iterations = $api.useQuery(
     'get',
     '/api/runs/{run_id}/iterations',
@@ -315,7 +327,12 @@ export function RunDetailPage() {
         </Section>
       )}
 
-      <FilesPanel runId={runId} launchKey={launchKey} fileKey={deepLinkedFile} />
+      <FilesPanel
+        runId={runId}
+        launchKey={launchKey}
+        fileKey={deepLinkedFile}
+        live={isPlaybook && isLiveRun}
+      />
 
       <div className="grid grid-cols-2 max-wide:grid-cols-1">
         <CostSection runId={runId} runCost={run.cost_usd} />
@@ -1240,21 +1257,46 @@ function CopyLinkButton({ route, className }: { route: RunFileRoute; className?:
   );
 }
 
+/**
+ * The file listing can arrive before the task graph renders, so a single scroll happens while the
+ * page is still shorter than the viewport, does nothing, and the graph then pushes the panel below
+ * the fold. Re-anchor over the next frames until the panel sits at the top of the scroller or the
+ * page has stopped growing and cannot be scrolled any further.
+ */
+function anchorFilesPanel(el: HTMLElement): void {
+  const deadline = performance.now() + 3000;
+  let held = 0;
+  const step = () => {
+    el.scrollIntoView({ block: 'start' });
+    const main = el.closest('main');
+    if (main !== null) {
+      const top = el.getBoundingClientRect().top - main.getBoundingClientRect().top;
+      const scrollable = main.scrollHeight > main.clientHeight + 1;
+      held = scrollable && Math.abs(top) < 8 ? held + 1 : 0;
+    }
+    if (held >= 2 || performance.now() > deadline) return;
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 function FilesPanel({
   runId,
   launchKey,
   fileKey,
+  live,
 }: {
   runId: string;
   launchKey: string | null;
   fileKey: string | null;
+  live: boolean;
 }) {
   const navigate = useNavigate();
   const listing = $api.useQuery(
     'get',
     '/api/runs/{run_id}/files',
     { params: { path: { run_id: runId } } },
-    { retry: 2 },
+    { retry: 2, refetchInterval: live ? POLL_RUNNING : false },
   );
   const graph = $api.useQuery(
     'get',
@@ -1291,7 +1333,7 @@ function FilesPanel({
     const el = anchor.current;
     if (el === null) return;
     anchored.current = true;
-    el.scrollIntoView({ block: 'start' });
+    anchorFilesPanel(el);
   }, [loaded]);
 
   if (listing.isPending) {
@@ -1494,7 +1536,46 @@ function RunFileContent({
   if (mediaType !== null) {
     return <RunFileImage runId={runId} fileKey={fileKey} mediaType={mediaType} />;
   }
+  if (inlineKind(path) === 'html') {
+    return <RunFileHtml runId={runId} fileKey={fileKey} />;
+  }
   return <RunFileText runId={runId} fileKey={fileKey} kind={textKind(path)} />;
+}
+
+/**
+ * A self-contained HTML report renders as a document in a sandboxed iframe: srcDoc plus sandbox
+ * keep it opaque-origin, so its inline scripts run without reaching controller cookies or the API.
+ * The endpoint serves the bytes as an octet stream, which does not matter here — srcDoc takes text.
+ */
+function RunFileHtml({ runId, fileKey }: { runId: string; fileKey: string }) {
+  const query = useQuery({
+    queryKey: ['run-file', runId, fileKey],
+    queryFn: () => fetchRunFile(runId, fileKey),
+  });
+  if (query.isPending) {
+    return (
+      <div className="px-2 py-1.5">
+        <Spinner label="Loading file" />
+      </div>
+    );
+  }
+  if (query.isError) {
+    return (
+      <div className="px-2 py-1.5">
+        <Mono tone="ink-3">{formatError(query.error)}</Mono>
+      </div>
+    );
+  }
+  return (
+    <div className="min-h-0 flex-1">
+      <iframe
+        className="h-full w-full border-0 bg-surface"
+        title={fileKey}
+        sandbox="allow-scripts"
+        srcDoc={query.data ?? ''}
+      />
+    </div>
+  );
 }
 
 function RunFileText({
