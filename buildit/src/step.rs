@@ -60,7 +60,7 @@ run)
   fs=$1; rs=$2; ctr=$3; img=$4; fetch=$5; shift 5
   stage "$fs" buildah from --pull-never --name "$ctr" "$img"; c=$?
   if [ "$c" -eq 0 ]; then
-    stage "$rs" buildah run "$ctr" -- "$@"; c=$?
+    stage "$rs" buildah run "$@"; c=$?
     if [ -s "$log.paths" ] && [ ! -e "$log.exit" ]; then
       buildah unshare sh -c "$fetch" sh "$ctr" "$log.paths" > "$log.tar.part" 2> "$log.fetch-err" \
         && mv "$log.tar.part" "$log.tar"
@@ -279,11 +279,13 @@ pub fn build_args(limit: Duration, cmd: &[String]) -> Vec<String> {
     args
 }
 
+/// Each of `volumes` is a `buildah run --volume` spec, mounted into the run's container.
 pub fn run_args(
     from_limit: Duration,
     run_limit: Duration,
     ctr: &str,
     image: &str,
+    volumes: &[String],
     cmd: &[String],
 ) -> Vec<String> {
     let mut args = vec![
@@ -294,6 +296,10 @@ pub fn run_args(
         image.to_string(),
         FETCH.to_string(),
     ];
+    for volume in volumes {
+        args.extend(["--volume".to_string(), volume.clone()]);
+    }
+    args.extend([ctr.to_string(), "--".to_string()]);
     args.extend_from_slice(cmd);
     args
 }

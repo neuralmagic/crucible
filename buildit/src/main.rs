@@ -251,6 +251,9 @@ pub struct BuildArgs {
         conflicts_with = "image"
     )]
     pub caches: Vec<mcp::CacheSpec>,
+    /// Point ccache in every RUN step at the server's shared cache; needs ccache 4.4 or later
+    #[arg(long, requires = "server", conflicts_with = "image")]
+    pub ccache: bool,
     #[command(flatten)]
     pub server: ServerOpt,
 }
@@ -333,6 +336,7 @@ impl BuildArgs {
             build_args,
             timeout_s: self.timeout,
             caches: self.caches.clone(),
+            ccache: self.ccache,
         })
     }
 
