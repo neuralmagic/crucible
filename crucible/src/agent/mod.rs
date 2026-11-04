@@ -289,6 +289,7 @@ fn run_turn_with(
             "127.0.0.1",
             0,
             otel_forward(&args.env),
+            crucible_harness::redact::Redactor::default(),
         ) {
             Ok(c) => Some(c),
             Err(e) => {

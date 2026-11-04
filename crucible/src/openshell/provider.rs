@@ -327,13 +327,58 @@ pub fn broker_token_placeholder() -> String {
 /// The endpointless `crucible-broker` profile: one required bearer credential, no endpoints, no
 /// refresh (the token is per-run static).
 pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
-    bearer_profile(
+    env_credential_profile(
         BROKER_PROFILE_ID,
         "Crucible broker",
         "Per-run bearer token for the loop-pod provisioning broker",
         "Broker bearer token",
         BROKER_CRED_KEY,
     )
+}
+
+/// A model API key, held as a static credential on its own endpointless provider. The policy
+/// binds it to the inference endpoint, so the sandbox env carries only the placeholder the
+/// gateway issues under the variable the harness reads, and the proxy swaps in the key on that
+/// endpoint's traffic alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InferenceKeyVar {
+    Anthropic,
+    OpenAi,
+}
+
+pub static ANTHROPIC_KEY_PROVIDER_NAME: ProviderName = ProviderName::new("crucible-anthropic-key");
+pub static OPENAI_KEY_PROVIDER_NAME: ProviderName = ProviderName::new("crucible-openai-key");
+
+impl InferenceKeyVar {
+    /// The variable the harness reads the key from, and the provider credential's key.
+    pub fn env(self) -> &'static str {
+        match self {
+            InferenceKeyVar::Anthropic => crate::agent::inference::ANTHROPIC_API_KEY,
+            InferenceKeyVar::OpenAi => crate::agent::inference::OPENAI_API_KEY_ENV,
+        }
+    }
+
+    pub fn provider_name(self) -> &'static ProviderName {
+        match self {
+            InferenceKeyVar::Anthropic => &ANTHROPIC_KEY_PROVIDER_NAME,
+            InferenceKeyVar::OpenAi => &OPENAI_KEY_PROVIDER_NAME,
+        }
+    }
+
+    /// The endpointless profile backing [`InferenceKeyVar::provider_name`], under the same id.
+    pub fn profile(self) -> openshell_core::proto::ProviderProfile {
+        let (display_name, description) = match self {
+            InferenceKeyVar::Anthropic => ("Crucible Anthropic key", "Anthropic Messages API key"),
+            InferenceKeyVar::OpenAi => ("Crucible OpenAI key", "OpenAI-compatible API key"),
+        };
+        env_credential_profile(
+            self.provider_name().as_str(),
+            display_name,
+            "Model API key the egress proxy injects on the inference endpoint",
+            description,
+            self.env(),
+        )
+    }
 }
 
 /// An MCP server a sandbox reaches with controller-issued agent tokens.
@@ -391,7 +436,7 @@ pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto:
     }
 }
 
-fn bearer_profile(
+fn env_credential_profile(
     id: &str,
     display_name: &str,
     description: &str,
@@ -615,6 +660,37 @@ mod tests {
             broker_profile().credentials[0].description,
             "Broker bearer token"
         );
+    }
+
+    #[test]
+    fn each_inference_key_is_an_endpointless_credential_under_its_harness_variable() {
+        let mut names = vec![
+            PROVIDER_NAME.as_str(),
+            BROKER_PROVIDER_NAME.as_str(),
+            AWS_PROVIDER_NAME.as_str(),
+        ];
+        for (var, env) in [
+            (InferenceKeyVar::Anthropic, "ANTHROPIC_API_KEY"),
+            (InferenceKeyVar::OpenAi, "OPENAI_API_KEY"),
+        ] {
+            assert_eq!(var.env(), env);
+            let profile = var.profile();
+            assert_eq!(profile.id, var.provider_name().as_str());
+            assert!(
+                profile.endpoints.is_empty(),
+                "the policy's credential_binding is the boundary"
+            );
+            assert!(profile.binaries.is_empty());
+            let [credential] = profile.credentials.as_slice() else {
+                panic!("one credential: {:?}", profile.credentials);
+            };
+            assert_eq!(credential.env_vars, vec![env.to_string()]);
+            assert!(credential.required);
+            assert!(credential.refresh.is_none() && credential.token_grant.is_none());
+            names.push(var.provider_name().as_str());
+        }
+        let distinct: std::collections::BTreeSet<_> = names.iter().collect();
+        assert_eq!(distinct.len(), names.len(), "{names:?}");
     }
 
     #[test]

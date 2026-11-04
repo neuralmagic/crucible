@@ -24,7 +24,9 @@ use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};
 use crucible::harness::{ApiFamily, AuthProvider, TranscriptLocator};
+use crucible::openshell::endpoint::Endpoint;
 use crucible_contract::TransportCause;
+use crucible_harness::redact::Redactor;
 use std::time::Instant;
 
 /// Which step of the turn an orchestration error came from, read off the typed errors in its
@@ -85,6 +87,22 @@ pub enum OpenshellCliError {
     )]
     NoApiKey { harness: &'static str },
 }
+
+/// Why a turn's model API key cannot be bound to its endpoint. The egress proxy injects the key,
+/// so the endpoint has to be an allowlisted rule whose TLS the proxy terminates.
+#[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
+pub enum InferenceKeyError {
+    #[error(
+        "the inference endpoint {endpoint} is not in the sandbox egress allowlist; its API key is \
+         injected only on an allowlisted endpoint (add {endpoint} to [agent.openshell].endpoints)"
+    )]
+    NotAllowlisted { endpoint: String },
+    #[error(
+        "the inference endpoint {endpoint} is in [agent.openshell].tls_skip_endpoints; the egress \
+         proxy injects its API key, which needs the TLS it skips (remove {endpoint} from the list)"
+    )]
+    TlsSkipped { endpoint: String },
+}
 use crucible_harness::otel::OtelCollector;
 use std::sync::atomic::Ordering;
 use tokio::fs;
@@ -94,7 +112,8 @@ use tokio_util::sync::CancellationToken;
 /// Run one openshell turn. Mirrors `agent::run_turn`'s contract: drives `sink` per output
 /// line/event and returns the turn's [`TurnOutcome`]. Any orchestration failure surfaces as an
 /// [`AgentEvent::Error`] through the sink and lands in the outcome's
-/// [`TurnFailure::Orchestration`], carrying whatever the turn had already spent.
+/// [`TurnFailure::Orchestration`], carrying whatever the turn had already spent. Every secret the
+/// turn hands the sandbox is masked out of what reaches `sink` and the outcome.
 pub fn turn(
     turn: &SandboxTurn<'_>,
     p: &Paths,
@@ -104,6 +123,11 @@ pub fn turn(
     deadline: Option<crucible::deadline::Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
+    let redactor = Redactor::default();
+    let mut sink = |line: &str, stream: RawStream, ev: Option<&AgentEvent>| {
+        let ev = ev.map(|ev| redactor.event(ev));
+        sink(&redactor.text(line), stream, ev.as_deref());
+    };
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
     // path. A missing runtime surfaces like any orchestration failure (through the sink, a $0
     // no-op turn).
@@ -130,7 +154,7 @@ pub fn turn(
     let spent = CostMeter::default();
     let at = deadline.map(|d| d.at);
     let outcome = handle.block_on(try_turn(
-        turn, p, prompt, json, session, at, &spent, &mut sink,
+        turn, p, prompt, json, session, at, &spent, &redactor, &mut sink,
     ));
     if outcome.is_err()
         && let Some(deadline) = deadline
@@ -141,7 +165,7 @@ pub fn turn(
     match outcome {
         Ok(cost) => TurnOutcome::completed(cost),
         Err(e) => {
-            let failure = failure_of(e);
+            let failure = masked(failure_of(e), &redactor);
             if let TurnFailure::Orchestration { message, .. } = &failure {
                 let ev = AgentEvent::Error {
                     error_type: "openshell".into(),
@@ -163,6 +187,28 @@ fn failure_of(e: anyhow::Error) -> TurnFailure {
             cause: transport_cause(&e),
             message: format!("{e:#}"),
         },
+    }
+}
+
+/// `failure` with every secret `redactor` holds masked out of its text.
+fn masked(failure: TurnFailure, redactor: &Redactor) -> TurnFailure {
+    match failure {
+        TurnFailure::Orchestration { cause, message } => TurnFailure::Orchestration {
+            cause,
+            message: redactor.text(&message).into_owned(),
+        },
+        TurnFailure::Stopped(StopReason::Wedged(wedged)) => {
+            TurnFailure::Stopped(StopReason::Wedged(crate::agent::tool_chain::Wedged {
+                calls: wedged
+                    .calls
+                    .iter()
+                    .map(|call| redactor.text(call).into_owned())
+                    .collect(),
+                repeats: wedged.repeats,
+            }))
+        }
+        TurnFailure::Spawn(message) => TurnFailure::Spawn(redactor.text(&message).into_owned()),
+        deadline @ TurnFailure::DeadlineExceeded(_) => deadline,
     }
 }
 
@@ -302,6 +348,7 @@ async fn try_turn(
     session: Option<&crate::agent::agent_session::SessionTurn>,
     deadline: Option<Instant>,
     spent: &CostMeter,
+    redactor: &Redactor,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
     // Ctrl-C plumbing for the whole turn: STOP → this token, tripped by a bridge task; the exec
@@ -344,12 +391,18 @@ async fn try_turn(
 
     // 2. Resolve this harness's model credential: Vertex's static credential becomes a gateway
     //    provider the metadata emulator serves to claude/hermes, and to opencode/pi when the
-    //    env names no key (see `provider` docs); codex gets
-    //    the auth mode selected by `[agent.codex]`: an API key from the named env or a
-    //    host-refreshed ChatGPT OAuth token. Either is seeded as auth.json (step 7b), since Codex
-    //    reads the real bytes off disk and its L4 WebSocket never crosses a placeholder-resolving
-    //    proxy hop.
+    //    env names no key (see `provider` docs); codex gets the auth mode selected by
+    //    `[agent.codex]`: an API key from the named env or a host-refreshed ChatGPT OAuth token,
+    //    seeded as auth.json (step 7b). An API key, whatever the harness, becomes a static
+    //    credential the proxy injects on the inference endpoint alone (step 4): the sandbox only
+    //    ever holds the gateway's placeholder for it.
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
+    for key in [&inference.anthropic_key, &inference.openai_key]
+        .into_iter()
+        .flatten()
+    {
+        redactor.add(key);
+    }
     let auth = crate::agent::harness::resolve_auth(harness, &inference);
     let gen_ai_system =
         crate::agent::harness::gen_ai_system(auth, turn.agent.model, &inference, turn.agent.env);
@@ -358,6 +411,7 @@ async fn try_turn(
             let token = provider::mint_vertex_token()
                 .await
                 .context("minting the Vertex access token")?;
+            redactor.add(&token);
             let vertex = crate::agent::inference::VertexConfig::from_env(turn.agent.env);
             ensure_provider(&gw, &token, &vertex.project, &vertex.region).await?;
             SandboxAuth::Gateway
@@ -383,6 +437,18 @@ async fn try_turn(
             },
         ),
     };
+    match sandbox_auth.codex() {
+        Some(provider::CodexAuth::ApiKey(key)) => redactor.add(key),
+        Some(provider::CodexAuth::ChatGpt(token)) => {
+            redactor.add(&token.access_token);
+            redactor.add(&token.id_token);
+        }
+        None => {}
+    }
+    let model_key = InferenceKey::resolve(auth, &inference, &sandbox_auth, &turn.agent)?;
+    if let Some(key) = &model_key {
+        ensure_static_provider(&gw, &StaticProvider::inference(key.var), key.value).await?;
+    }
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
     //     provider signs sandbox S3 egress at the proxy via the read-only sandbox role, which
@@ -412,6 +478,14 @@ async fn try_turn(
         turn.broker_token,
         !agent_servers.is_empty(),
     );
+    if let Some(token) = turn.broker_token {
+        redactor.add(token);
+    }
+    for (key, value) in turn.agent.env {
+        if turn.relayed_secrets.values().any(|var| var == key) {
+            redactor.add(value);
+        }
+    }
     if let (BrokerAuth::Provider(_), Some(token)) = (&broker_auth, turn.broker_token) {
         ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
     }
@@ -465,6 +539,7 @@ async fn try_turn(
         providers.push(provider::AWS_PROVIDER_NAME.clone());
     }
     providers.extend(broker_auth.provider().cloned());
+    providers.extend(model_key.as_ref().map(|k| k.var.provider_name().clone()));
     providers.extend(agent_servers.iter().map(|s| s.provider_name()));
     let sandbox_id = gw
         .create_sandbox(
@@ -558,6 +633,7 @@ async fn try_turn(
             "0.0.0.0",
             crate::openshell::gateway::OTEL_COLLECTOR_PORT,
             forward,
+            redactor.clone(),
         ) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -651,6 +727,9 @@ async fn try_turn(
                 }
             }));
         }
+        if let Some(key) = &model_key {
+            credential_bindings.push(key.binding(&endpoints, &turn.openshell.tls_skip_endpoints)?);
+        }
         gw.update_policy_wait_with_tls_skip(
             &name,
             &policy::resolve_binaries(turn.openshell, harness.spec().binaries),
@@ -673,9 +752,12 @@ async fn try_turn(
 
         // 6. Targeted-upload each relayed cred to its sandbox path (never via the repo).
         for rf in turn.relay {
-            let content = relay::render(&p.workspace, rf)
+            let rendered = relay::render(&p.workspace, rf)
                 .with_context(|| format!("rendering relay `{}`", rf.dest))?;
-            let tmp = write_temp("cred", &content).await?;
+            for value in &rendered.values {
+                redactor.add(value);
+            }
+            let tmp = write_temp("cred", &rendered.content).await?;
             run_os(
                 &sandbox::file_upload_args(&name, &tmp.path().to_string_lossy(), &rf.dest),
                 &format!("cred upload {}", rf.dest),
@@ -696,7 +778,13 @@ async fn try_turn(
                 turn_env.set(EnvSource::Otel, &k, &v);
             }
         }
-        inference_env(&mut turn_env, harness, auth, &inference, &sandbox_auth);
+        inference_env(
+            &mut turn_env,
+            harness,
+            auth,
+            &inference,
+            model_key.as_ref().map(|k| k.var),
+        );
         let env_tmp = write_temp("env", &turn_env.script(harness.spec())).await?;
         run_os(
             &sandbox::file_upload_args(
@@ -738,6 +826,9 @@ async fn try_turn(
             &name,
             &SandboxLayout::workdir(&basename),
         )?;
+        for token in &tokens {
+            redactor.add(token);
+        }
         let mut servers: Vec<McpServer<'_>> = broker_url
             .iter()
             .map(|url| McpServer {
@@ -756,7 +847,18 @@ async fn try_turn(
             url: &s.server.url,
             token: None,
         }));
-        let seeds = backend.seed_files(&turn.agent, &servers, &sandbox_auth, &inference);
+        let issued = match (&sandbox_auth, &model_key) {
+            (SandboxAuth::Codex(provider::CodexAuth::ApiKey(_)), Some(key)) => {
+                Some(issued_placeholder(&gw, &name, key.var.env(), &cancel).await?)
+            }
+            _ => None,
+        };
+        let seeds = backend.seed_files(
+            &turn.agent,
+            &servers,
+            &sandbox_auth.seeded(issued),
+            &inference,
+        );
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
             run_os(
@@ -798,11 +900,13 @@ async fn try_turn(
         let refresher = match auth {
             AuthProvider::Vertex => Some(tokio::spawn({
                 let gw = gw.clone();
+                let redactor = redactor.clone();
                 async move {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(25 * 60)).await;
                         match provider::mint_vertex_token().await {
                             Ok(t) => {
+                                redactor.add(&t);
                                 if let Err(e) = gw
                                     .update_provider(
                                         provider::PROVIDER_NAME.as_str(),
@@ -875,8 +979,17 @@ async fn try_turn(
         if harness.spec().backfill_required
             || crate::agent::engine::TurnExport::resolve().emits_anything()
         {
-            graft_turn_telemetry(harness, gen_ai_system, &gw, &name, &cancel, &mut cost, sink)
-                .await;
+            graft_turn_telemetry(
+                harness,
+                gen_ai_system,
+                &gw,
+                &name,
+                &cancel,
+                redactor,
+                &mut cost,
+                sink,
+            )
+            .await;
             spent.raise(cost.total());
         }
         Ok(cost.total())
@@ -1080,6 +1193,108 @@ impl StaticProvider {
             name: provider::BROKER_PROVIDER_NAME.clone(),
             cred_key: provider::BROKER_CRED_KEY,
         }
+    }
+
+    fn inference(var: provider::InferenceKeyVar) -> Self {
+        Self {
+            profile: var.profile(),
+            name: var.provider_name().clone(),
+            cred_key: var.env(),
+        }
+    }
+}
+
+/// The model API key a turn's harness sends, and the endpoint it sends it to.
+#[derive(Debug, PartialEq, Eq)]
+struct InferenceKey<'a> {
+    var: provider::InferenceKeyVar,
+    value: &'a str,
+    endpoint: Endpoint,
+}
+
+impl<'a> InferenceKey<'a> {
+    /// The key this turn authenticates to its model with, when it uses one: the direct Anthropic
+    /// key, Codex's selected API key, or the key a provider-table harness's endpoint takes. `None`
+    /// for Vertex, Codex's ChatGPT sign-in, and an endpoint the env names no key for.
+    fn resolve(
+        auth: AuthProvider,
+        inference: &'a crate::agent::inference::InferenceEnv,
+        sandbox_auth: &'a SandboxAuth,
+        agent: &crate::args::TurnAgent<'_>,
+    ) -> Result<Option<InferenceKey<'a>>> {
+        use crate::agent::harness::ApiEndpoint;
+        use crate::agent::inference::{ANTHROPIC_API_URL, OPENAI_API_URL, egress_endpoint};
+        use provider::InferenceKeyVar::{Anthropic, OpenAi};
+        let (var, value, base_url) = match auth {
+            AuthProvider::Vertex => return Ok(None),
+            AuthProvider::AnthropicKey => match &inference.anthropic_key {
+                Some(key) => (
+                    Anthropic,
+                    key,
+                    inference
+                        .anthropic_base_url
+                        .clone()
+                        .unwrap_or_else(|| ANTHROPIC_API_URL.to_string()),
+                ),
+                None => return Ok(None),
+            },
+            AuthProvider::Codex => match sandbox_auth.codex() {
+                Some(provider::CodexAuth::ApiKey(key)) => (
+                    OpenAi,
+                    key,
+                    inference
+                        .openai_base_url
+                        .clone()
+                        .unwrap_or_else(|| OPENAI_API_URL.to_string()),
+                ),
+                Some(provider::CodexAuth::ChatGpt(_)) | None => return Ok(None),
+            },
+            AuthProvider::ApiKey => {
+                match crate::agent::harness::api_endpoint(agent.model, inference, agent.env) {
+                    ApiEndpoint::OpenAi { base_url, .. } => match &inference.openai_key {
+                        Some(key) => (OpenAi, key, base_url),
+                        None => return Ok(None),
+                    },
+                    ApiEndpoint::Anthropic { base_url } => match &inference.anthropic_key {
+                        Some(key) => (Anthropic, key, base_url),
+                        None => return Ok(None),
+                    },
+                    ApiEndpoint::Vertex(_) => return Ok(None),
+                }
+            }
+        };
+        Ok(Some(InferenceKey {
+            var,
+            value,
+            endpoint: egress_endpoint(&base_url)
+                .with_context(|| format!("the inference endpoint {base_url:?}"))?,
+        }))
+    }
+
+    /// The policy binding that has the proxy inject this key on its endpoint, which `endpoints`
+    /// must name exactly and `tls_skip` must not.
+    fn binding(
+        &self,
+        endpoints: &[String],
+        tls_skip: &[String],
+    ) -> Result<grpc::EndpointCredentialBinding, InferenceKeyError> {
+        let (host, port) = (&self.endpoint.host, self.endpoint.port);
+        let names_it = |spec: &String| {
+            spec.parse::<Endpoint>()
+                .is_ok_and(|e| &e.host == host && e.port == port)
+        };
+        let endpoint = format!("{host}:{port}");
+        if tls_skip.iter().any(names_it) {
+            return Err(InferenceKeyError::TlsSkipped { endpoint });
+        }
+        if !endpoints.iter().any(names_it) {
+            return Err(InferenceKeyError::NotAllowlisted { endpoint });
+        }
+        Ok(grpc::EndpointCredentialBinding {
+            host: host.clone(),
+            port,
+            provider: self.var.provider_name().clone(),
+        })
     }
 }
 
@@ -1315,69 +1530,35 @@ async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path
     Ok(())
 }
 
-/// The model-reach variables this turn's sandbox carries. A direct Anthropic key replaces the
-/// Vertex selectors the manifest set (Claude Code prefers Vertex whenever they are present), and
-/// a custom base URL rides under the name its harness reads. Codex reads a custom endpoint's key
-/// from the environment where the built-in provider reads `auth.json`, so the key is exported only
-/// in that case. A key-authenticated harness (opencode, pi) gets every key and base URL the env
-/// carries: its seeded provider table names which variable it reads.
+/// The model-reach variables this turn's sandbox carries: base URLs, never a key. A direct
+/// Anthropic key replaces the Vertex selectors the manifest set (Claude Code prefers Vertex
+/// whenever they are present), and a custom base URL rides under the name its harness reads. The
+/// gateway issues the placeholder for `key` under its variable, so a manifest entry of that name
+/// is dropped rather than left to shadow it.
 pub(crate) fn inference_env(
     env: &mut SandboxEnv,
     harness: Harness,
     auth: AuthProvider,
     inference: &crate::agent::inference::InferenceEnv,
-    sandbox_auth: &SandboxAuth,
+    key: Option<provider::InferenceKeyVar>,
 ) {
-    let set = |env: &mut SandboxEnv, key: &str, value: &str| {
-        env.set(EnvSource::Inference, key, value);
-    };
+    use crate::agent::inference::{ANTHROPIC_BASE_URL, OPENAI_BASE_URL};
     if auth == AuthProvider::AnthropicKey {
         env.remove(crate::agent::inference::VERTEX_SELECTORS);
-        if let Some(key) = inference.anthropic_key.as_deref() {
-            set(env, crate::agent::inference::ANTHROPIC_API_KEY, key);
-        }
     }
-    match harness.spec().api {
-        ApiFamily::Anthropic => {
-            if let Some(url) = inference.anthropic_base_url.as_deref() {
-                set(env, crate::agent::inference::ANTHROPIC_BASE_URL, url);
-            }
-        }
-        ApiFamily::OpenAi => {
-            if let Some(url) = inference.openai_base_url.as_deref() {
-                set(env, crate::agent::inference::OPENAI_BASE_URL, url);
-                if let Some(provider::CodexAuth::ApiKey(key)) = sandbox_auth.codex() {
-                    set(
-                        env,
-                        crate::agent::inference::OPENAI_API_KEY_ENV,
-                        key.as_str(),
-                    );
-                }
-            }
-        }
-        ApiFamily::Both => {
-            for (key, value) in [
-                (
-                    crate::agent::inference::OPENAI_API_KEY_ENV,
-                    &inference.openai_key,
-                ),
-                (
-                    crate::agent::inference::OPENAI_BASE_URL,
-                    &inference.openai_base_url,
-                ),
-                (
-                    crate::agent::inference::ANTHROPIC_API_KEY,
-                    &inference.anthropic_key,
-                ),
-                (
-                    crate::agent::inference::ANTHROPIC_BASE_URL,
-                    &inference.anthropic_base_url,
-                ),
-            ] {
-                if let Some(v) = value.as_deref() {
-                    set(env, key, v);
-                }
-            }
+    if let Some(var) = key {
+        env.remove(&[var.env()]);
+    }
+    let anthropic = (ANTHROPIC_BASE_URL, &inference.anthropic_base_url);
+    let openai = (OPENAI_BASE_URL, &inference.openai_base_url);
+    let urls = match harness.spec().api {
+        ApiFamily::Anthropic => vec![anthropic],
+        ApiFamily::OpenAi => vec![openai],
+        ApiFamily::Both => vec![openai, anthropic],
+    };
+    for (var, url) in urls {
+        if let Some(url) = url.as_deref() {
+            env.set(EnvSource::Inference, var, url);
         }
     }
 }
@@ -1437,13 +1618,15 @@ async fn write_traceparent_files(
 /// Best-effort for claude (telemetry must never wedge the turn); loud for a backfill harness,
 /// whose transcript is the turn's ONLY source of result + cost: a fetch failure emits
 /// [`AgentEvent::Error`] rather than letting the turn pass as a silent $0 success. Returns the
-/// turn's (possibly raised) cost.
+/// turn's (possibly raised) cost. Spans and content logs carry nothing `redactor` holds.
+#[allow(clippy::too_many_arguments)]
 async fn graft_turn_telemetry(
     harness: Harness,
     gen_ai_system: &'static str,
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
+    redactor: &Redactor,
     cost: &mut crate::agent::turn::TurnCost,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) {
@@ -1474,17 +1657,28 @@ async fn graft_turn_telemetry(
     };
     if export.emits_anything() {
         let span = tracing::Span::current();
+        let mask = |s: &str| redactor.text(s).into_owned();
         if export.spans() {
+            let tool_calls: Vec<_> = artifacts
+                .tool_calls
+                .iter()
+                .cloned()
+                .map(|call| call.masked(mask))
+                .collect();
             crate::agent::engine::synthesize_tool_spans(
                 &span,
-                &artifacts.tool_calls,
+                &tool_calls,
                 std::time::SystemTime::now(),
             );
         }
         if export.content() {
             // Content logs come from the harness's own transcript reader (claude maps its jsonl;
             // hermes: Phase B), off the same in-memory bytes, no re-read.
-            let records = backend(harness).content_records(&bytes);
+            let records: Vec<_> = backend(harness)
+                .content_records(&bytes)
+                .into_iter()
+                .map(|record| record.masked(mask))
+                .collect();
             crate::agent::engine::emit_conversation_logs(&span, &records, gen_ai_system);
         }
     }
@@ -1833,7 +2027,7 @@ mod tests {
         );
     }
 
-    use super::*;
+    use crate::openshell::run::*;
 
     #[test]
     fn an_orchestration_error_is_classified_by_the_typed_error_in_its_chain() {
@@ -2083,65 +2277,357 @@ mod tests {
         );
     }
 
+    const ANTHROPIC_KEY: &str = "sk-ant-real-0123456789abcdef";
+    const OPENAI_KEY: &str = "sk-oai-real-0123456789abcdef";
+    const CODEX_KEY: &str = "sk-codex-real-0123456789abcdef";
+    const PLACEHOLDER: &str = "the-placeholder-the-gateway-issued";
+
+    fn inference(
+        anthropic_key: Option<&str>,
+        anthropic_url: Option<&str>,
+        openai_key: Option<&str>,
+        openai_url: Option<&str>,
+    ) -> crate::agent::inference::InferenceEnv {
+        crate::agent::inference::InferenceEnv {
+            anthropic_key: anthropic_key.map(str::to_string),
+            anthropic_base_url: anthropic_url.map(str::to_string),
+            openai_key: openai_key.map(str::to_string),
+            openai_base_url: openai_url.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn agent<'a>(
+        harness: Harness,
+        model: &'a str,
+        codex: &'a crate::manifest::CodexCfg,
+    ) -> crate::args::TurnAgent<'a> {
+        crate::args::TurnAgent {
+            harness,
+            model,
+            reasoning_effort: None,
+            disallowed_tools: &[],
+            codex,
+            env: &[],
+        }
+    }
+
+    /// Every harness family on the auth it resolves for a keyed env: claude on a direct Anthropic
+    /// key, codex on its API key, opencode and pi on the endpoint's key.
+    fn keyed_turns() -> Vec<(Harness, AuthProvider, SandboxAuth)> {
+        vec![
+            (
+                Harness::Claude,
+                AuthProvider::AnthropicKey,
+                SandboxAuth::AnthropicKey,
+            ),
+            (
+                Harness::Codex,
+                AuthProvider::Codex,
+                SandboxAuth::Codex(provider::CodexAuth::ApiKey(CODEX_KEY.into())),
+            ),
+            (Harness::OpenCode, AuthProvider::ApiKey, SandboxAuth::ApiKey),
+            (Harness::Pi, AuthProvider::ApiKey, SandboxAuth::ApiKey),
+        ]
+    }
+
+    fn assert_no_real_key(text: &str) {
+        for key in [ANTHROPIC_KEY, OPENAI_KEY, CODEX_KEY] {
+            assert!(!text.contains(key), "{text}");
+        }
+    }
+
     #[test]
-    fn a_direct_key_turn_drops_the_vertex_selectors_and_carries_the_key() {
+    fn a_direct_key_turn_drops_the_vertex_selectors_and_never_carries_the_key() {
         let mut env = SandboxEnv::from_manifest([
             ("CLAUDE_CODE_USE_VERTEX", "1"),
             ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+            ("ANTHROPIC_API_KEY", "set-by-the-manifest"),
             ("KEEP_ME", "yes"),
         ]);
-        let inference = crate::agent::inference::InferenceEnv {
-            anthropic_key: Some("sk-ant".into()),
-            anthropic_base_url: Some("https://claude.corp/v1".into()),
-            ..Default::default()
-        };
+        let inference = inference(
+            Some(ANTHROPIC_KEY),
+            Some("https://claude.corp/v1"),
+            None,
+            None,
+        );
         inference_env(
             &mut env,
             Harness::Claude,
             AuthProvider::AnthropicKey,
             &inference,
-            &SandboxAuth::AnthropicKey,
+            Some(provider::InferenceKeyVar::Anthropic),
         );
         let get = |k: &str| env.get(k);
         assert_eq!(get("CLAUDE_CODE_USE_VERTEX"), None);
         assert_eq!(get("ANTHROPIC_VERTEX_PROJECT_ID"), None);
         assert_eq!(get("KEEP_ME"), Some("yes"));
-        assert_eq!(get("ANTHROPIC_API_KEY"), Some("sk-ant"));
+        assert_eq!(
+            get("ANTHROPIC_API_KEY"),
+            None,
+            "the gateway's placeholder is the only value the variable may hold"
+        );
         assert_eq!(get("ANTHROPIC_BASE_URL"), Some("https://claude.corp/v1"));
     }
 
-    /// Codex reads a custom endpoint's key from the environment, so the key is exported only when
-    /// a base URL is set; against the built-in provider it stays in `auth.json`.
     #[test]
-    fn codex_exports_its_key_only_for_a_custom_endpoint() {
-        let auth = SandboxAuth::Codex(provider::CodexAuth::ApiKey("sk-oa".to_string()));
-        let mut plain = SandboxEnv::default();
-        inference_env(
-            &mut plain,
-            Harness::Codex,
-            AuthProvider::Codex,
-            &Default::default(),
-            &auth,
+    fn no_harness_family_writes_a_key_into_the_env_script() {
+        let codex = crate::manifest::CodexCfg::default();
+        let inference = inference(
+            Some(ANTHROPIC_KEY),
+            Some("https://claude.corp/v1"),
+            Some(OPENAI_KEY),
+            Some("http://vllm.internal:8000/v1"),
         );
-        assert_eq!(plain.vars().count(), 0, "{plain:?}");
+        for (harness, auth, sandbox_auth) in keyed_turns() {
+            let agent = agent(harness, "claude-opus-4-6", &codex);
+            let key = InferenceKey::resolve(auth, &inference, &sandbox_auth, &agent)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{harness:?} resolves a key"));
+            let mut env = SandboxEnv::from_manifest([(key.var.env(), "manifest-value")]);
+            inference_env(&mut env, harness, auth, &inference, Some(key.var));
+            let script = env.script(harness.spec());
+            assert_no_real_key(&script);
+            assert!(!script.contains(key.var.env()), "{harness:?}: {script}");
+            assert!(
+                script.contains("https://claude.corp/v1")
+                    || script.contains("http://vllm.internal:8000/v1"),
+                "{harness:?}: {script}"
+            );
+        }
+    }
 
-        let mut custom = SandboxEnv::default();
-        let inference = crate::agent::inference::InferenceEnv {
-            openai_base_url: Some("http://vllm.internal:8000/v1".into()),
-            ..Default::default()
+    #[test]
+    fn each_auth_resolves_the_key_its_harness_sends_and_where_it_sends_it() {
+        use provider::InferenceKeyVar::{Anthropic, OpenAi};
+        let codex = crate::manifest::CodexCfg::default();
+        let codex_key = SandboxAuth::Codex(provider::CodexAuth::ApiKey(CODEX_KEY.into()));
+        let chatgpt = SandboxAuth::Codex(provider::CodexAuth::ChatGpt(provider::CodexToken {
+            access_token: "at".into(),
+            account_id: "acct".into(),
+            id_token: "id".into(),
+        }));
+        let enmaas = Some("https://api.enmaas.devshift.net/v1");
+        let vllm = Some("http://vllm.internal:8000/v1");
+        let cases: Vec<(_, _, _, _, _, Option<(_, &str, &str)>)> = vec![
+            (
+                Harness::Claude,
+                "claude-opus-4-6",
+                AuthProvider::AnthropicKey,
+                &SandboxAuth::AnthropicKey,
+                inference(Some(ANTHROPIC_KEY), enmaas, None, None),
+                Some((Anthropic, ANTHROPIC_KEY, "api.enmaas.devshift.net:443")),
+            ),
+            (
+                Harness::Claude,
+                "claude-opus-4-6",
+                AuthProvider::AnthropicKey,
+                &SandboxAuth::AnthropicKey,
+                inference(Some(ANTHROPIC_KEY), None, None, None),
+                Some((Anthropic, ANTHROPIC_KEY, "api.anthropic.com:443")),
+            ),
+            (
+                Harness::Claude,
+                "claude-opus-4-6",
+                AuthProvider::Vertex,
+                &SandboxAuth::Gateway,
+                inference(None, None, None, None),
+                None,
+            ),
+            (
+                Harness::Codex,
+                "gpt-5.6-sol",
+                AuthProvider::Codex,
+                &codex_key,
+                inference(None, None, Some(OPENAI_KEY), vllm),
+                Some((OpenAi, CODEX_KEY, "vllm.internal:8000")),
+            ),
+            (
+                Harness::Codex,
+                "gpt-5.6-sol",
+                AuthProvider::Codex,
+                &codex_key,
+                inference(None, None, None, None),
+                Some((OpenAi, CODEX_KEY, "api.openai.com:443")),
+            ),
+            (
+                Harness::Codex,
+                "gpt-5.6-sol",
+                AuthProvider::Codex,
+                &chatgpt,
+                inference(None, None, None, None),
+                None,
+            ),
+            (
+                Harness::OpenCode,
+                "rits/zai-org/glm-5-3",
+                AuthProvider::ApiKey,
+                &SandboxAuth::ApiKey,
+                inference(Some(ANTHROPIC_KEY), None, Some(OPENAI_KEY), enmaas),
+                Some((OpenAi, OPENAI_KEY, "api.enmaas.devshift.net:443")),
+            ),
+            (
+                Harness::Pi,
+                "claude-opus-4-6",
+                AuthProvider::ApiKey,
+                &SandboxAuth::ApiKey,
+                inference(Some(ANTHROPIC_KEY), None, None, None),
+                Some((Anthropic, ANTHROPIC_KEY, "api.anthropic.com:443")),
+            ),
+            (
+                Harness::OpenCode,
+                "claude-opus-4-6",
+                AuthProvider::ApiKey,
+                &SandboxAuth::ApiKey,
+                inference(Some(ANTHROPIC_KEY), None, Some(OPENAI_KEY), None),
+                Some((Anthropic, ANTHROPIC_KEY, "api.anthropic.com:443")),
+            ),
+            (
+                Harness::Pi,
+                "gpt-5.6-sol",
+                AuthProvider::ApiKey,
+                &SandboxAuth::ApiKey,
+                inference(Some(ANTHROPIC_KEY), None, Some(OPENAI_KEY), None),
+                Some((OpenAi, OPENAI_KEY, "api.openai.com:443")),
+            ),
+            (
+                Harness::OpenCode,
+                "rits/zai-org/glm-5-3",
+                AuthProvider::ApiKey,
+                &SandboxAuth::ApiKey,
+                inference(Some(ANTHROPIC_KEY), None, None, vllm),
+                None,
+            ),
+        ];
+        for (harness, model, auth, sandbox_auth, inference, want) in &cases {
+            let agent = agent(*harness, model, &codex);
+            let got = InferenceKey::resolve(*auth, inference, sandbox_auth, &agent).unwrap();
+            let got = got.map(|k| {
+                (
+                    k.var,
+                    k.value,
+                    format!("{}:{}", k.endpoint.host, k.endpoint.port),
+                )
+            });
+            let want = want.map(|(var, value, at)| (var, value, at.to_string()));
+            assert_eq!(got, want, "{harness:?} {auth:?} {model}");
+        }
+    }
+
+    #[test]
+    fn a_key_binds_only_to_an_exactly_allowlisted_endpoint_the_proxy_inspects() {
+        let key = InferenceKey {
+            var: provider::InferenceKeyVar::Anthropic,
+            value: ANTHROPIC_KEY,
+            endpoint: "api.anthropic.com:443:full".parse().unwrap(),
         };
-        inference_env(
-            &mut custom,
-            Harness::Codex,
-            AuthProvider::Codex,
-            &inference,
-            &auth,
-        );
+        let allow = |specs: &[&str]| specs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let binding = key
+            .binding(
+                &allow(&["github.com:443:full", "api.anthropic.com:443:read-write"]),
+                &[],
+            )
+            .expect("allowlisted");
+        assert_eq!(binding.host, "api.anthropic.com");
+        assert_eq!(binding.port, 443);
+        assert_eq!(binding.provider, provider::ANTHROPIC_KEY_PROVIDER_NAME);
+        let not_allowlisted = Err(InferenceKeyError::NotAllowlisted {
+            endpoint: "api.anthropic.com:443".into(),
+        });
+        for endpoints in [
+            allow(&[]),
+            allow(&["*.anthropic.com:443:full"]),
+            allow(&["api.anthropic.com:8443:full"]),
+        ] {
+            assert_eq!(
+                key.binding(&endpoints, &[]).map(|b| b.provider),
+                not_allowlisted.clone(),
+                "{endpoints:?}"
+            );
+        }
         assert_eq!(
-            custom.get("OPENAI_BASE_URL"),
-            Some("http://vllm.internal:8000/v1")
+            key.binding(
+                &allow(&["api.anthropic.com:443:full"]),
+                &allow(&["api.anthropic.com:443"])
+            )
+            .map(|b| b.provider),
+            Err(InferenceKeyError::TlsSkipped {
+                endpoint: "api.anthropic.com:443".into(),
+            })
         );
-        assert_eq!(custom.get("OPENAI_API_KEY"), Some("sk-oa"));
+        assert!(
+            key.binding(
+                &allow(&["api.anthropic.com:443:full"]),
+                &allow(&["registry.internal:443"])
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn no_seeded_file_carries_a_real_key_for_any_harness() {
+        let codex = crate::manifest::CodexCfg::default();
+        let inference = inference(
+            Some(ANTHROPIC_KEY),
+            Some("https://claude.corp/v1"),
+            Some(OPENAI_KEY),
+            Some("http://vllm.internal:8000/v1"),
+        );
+        let broker = provider::broker_token_placeholder();
+        let servers = [McpServer {
+            name: "broker",
+            url: "http://host.openshell.internal:8849/mcp",
+            token: Some(&broker),
+        }];
+        for (harness, _, sandbox_auth) in keyed_turns() {
+            let agent = agent(harness, "claude-opus-4-6", &codex);
+            for issued in [Some(PLACEHOLDER.to_string()), None] {
+                let seeds = backend(harness).seed_files(
+                    &agent,
+                    &servers,
+                    &sandbox_auth.seeded(issued.clone()),
+                    &inference,
+                );
+                for seed in &seeds {
+                    assert_no_real_key(&seed.content);
+                }
+                if harness == Harness::Codex && issued.is_some() {
+                    let auth = seeds
+                        .iter()
+                        .find(|s| s.dest == crate::agent::harness::codex::AUTH)
+                        .expect("codex seeds auth.json");
+                    assert!(auth.content.contains(PLACEHOLDER), "{}", auth.content);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_failure_never_carries_a_registered_secret() {
+        let redactor = Redactor::default();
+        redactor.add(OPENAI_KEY);
+        let orchestration = masked(
+            TurnFailure::Orchestration {
+                cause: TransportCause::Other,
+                message: format!("openshell seed upload failed: {OPENAI_KEY}"),
+            },
+            &redactor,
+        );
+        let wedged = masked(
+            TurnFailure::Stopped(StopReason::Wedged(crate::agent::tool_chain::Wedged {
+                calls: vec![format!(
+                    "Bash `$ curl -H 'Authorization: Bearer {OPENAI_KEY}'`"
+                )],
+                repeats: 25,
+            })),
+            &redactor,
+        );
+        let spawn = masked(TurnFailure::Spawn(OPENAI_KEY.into()), &redactor);
+        for failure in [orchestration, wedged, spawn] {
+            let shown = format!("{failure} {failure:?}");
+            assert_no_real_key(&shown);
+            assert!(shown.contains(crucible_harness::redact::MASK), "{shown}");
+        }
     }
 
     #[test]
