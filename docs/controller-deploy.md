@@ -328,6 +328,7 @@ egress       = [{ cidr = "0.0.0.0/0", except = ["10.128.0.0/14", "172.30.0.0/16"
 run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
 push_repo    = "registry.example.com/team/crucible-smoke"  # optional
 queue        = "crucible-builds"                    # optional, a Kueue LocalQueue in namespace
+image        = "ghcr.io/neuralmagic/crucible-buildit@sha256:..."  # optional, default the loop image's
 
 [buildit.builders]                                  # optional
 max_builds        = 2
@@ -345,6 +346,13 @@ token_secret = "buildit-cache-token"
 size_gib     = 500
 write        = true
 ```
+
+`image` pins buildit apart from the loop image: loop pods copy its `/usr/local/bin/buildit` in
+with an init container and run it ahead of their own, and the cache runs it unless
+`[buildit.cache] image` says otherwise. Every main build publishes
+`ghcr.io/neuralmagic/crucible-buildit`, so a buildit-only change rolls by moving this pin; the
+controller reads the profile at each dispatch, and the cache needs `crucible deploy
+--buildit-cache` applied again.
 
 `[buildit.cache]` adds a `buildit cache` in the loop namespace that every build may use: ccache
 objects and stored build outputs shared across runs. `crucible deploy --buildit-cache --profile

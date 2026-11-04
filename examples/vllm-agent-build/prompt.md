@@ -10,8 +10,7 @@ Every build uses the same arguments: context `build`, dockerfile `Dockerfile`, `
 caches, unchanged:
 
     [{"name": "vllm-ccache", "path": "/root/.cache/ccache"},
-     {"name": "vllm-deps", "path": "/src/vllm/.deps"},
-     {"name": "vllm-build", "path": "/src/vllm/build"}]
+     {"name": "vllm-deps", "path": "/src/vllm/.deps"}]
 
 After calling `build`, poll `status` every 30 seconds until it is no longer running. If a build
 fails, read the end of its log with `logs` and stop. When one succeeds, call `run` with its

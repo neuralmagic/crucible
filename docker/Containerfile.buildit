@@ -1,0 +1,22 @@
+# produces: ghcr.io/neuralmagic/crucible-buildit
+# buildit alone, for a deploy profile that pins it apart from the loop image (`[buildit] image`):
+# the loop pod copies /usr/local/bin/buildit out of it, and the shared `buildit cache` runs it.
+# Packages the binary docker.yml compiled on the runner (prebuilt/bin/buildit); glibc as in
+# Containerfile.runtime.
+
+ARG VERSION=dev
+ARG REVISION=unknown
+
+FROM registry.access.redhat.com/ubi10/ubi-minimal:10.2
+ARG VERSION
+ARG REVISION
+LABEL org.opencontainers.image.title="crucible-buildit" \
+      org.opencontainers.image.description="buildit: unprivileged in-cluster image builds for crucible runs, and their shared cache" \
+      org.opencontainers.image.source="https://github.com/neuralmagic/crucible" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+COPY prebuilt/bin/buildit /usr/local/bin/buildit
+RUN buildit --help >/dev/null
+USER 65532
+ENTRYPOINT ["buildit"]
