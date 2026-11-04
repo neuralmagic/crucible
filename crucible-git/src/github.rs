@@ -82,9 +82,63 @@ impl GitHub {
         )
     }
 
-    /// The open pull request into `repo` from `head` (`owner:branch`), or a new one.
+    /// The open pull request into `repo` from `head` (`owner:branch`), or a new one, carrying
+    /// `pr.labels` and asking `pr.reviewers` either way.
     pub async fn open_pr(&self, pr: &NewPr<'_>) -> Result<OpenedPr> {
         let token = self.token().await?;
+        let mut opened = self.find_or_create(pr, &token).await?;
+        if !pr.labels.is_empty() {
+            let url = self
+                .api
+                .join(&format!(
+                    "repos/{}/issues/{}/labels",
+                    pr.repo, opened.number
+                ))
+                .context("building the labels URL")?;
+            let _: serde_json::Value = self
+                .call(
+                    self.http
+                        .post(url)
+                        .json(&serde_json::json!({ "labels": pr.labels })),
+                    &token,
+                )
+                .await
+                .context("labelling the pull request")?;
+            opened.labels = pr.labels.to_vec();
+        }
+        if !pr.reviewers.is_empty() {
+            let (teams, users): (Vec<&str>, Vec<&str>) = pr
+                .reviewers
+                .iter()
+                .map(String::as_str)
+                .partition(|r| r.contains('/'));
+            let teams: Vec<&str> = teams
+                .into_iter()
+                .filter_map(|t| t.split_once('/').map(|(_, slug)| slug))
+                .collect();
+            let url = self
+                .api
+                .join(&format!(
+                    "repos/{}/pulls/{}/requested_reviewers",
+                    pr.repo, opened.number
+                ))
+                .context("building the reviewers URL")?;
+            let _: serde_json::Value = self
+                .call(
+                    self.http.post(url).json(&serde_json::json!({
+                        "reviewers": users,
+                        "team_reviewers": teams,
+                    })),
+                    &token,
+                )
+                .await
+                .context("requesting reviewers")?;
+            opened.reviewers = pr.reviewers.to_vec();
+        }
+        Ok(opened)
+    }
+
+    async fn find_or_create(&self, pr: &NewPr<'_>, token: &str) -> Result<OpenedPr> {
         let pulls = self
             .api
             .join(&format!("repos/{}/pulls", pr.repo))
@@ -95,7 +149,7 @@ impl GitHub {
             .append_pair("head", pr.head)
             .append_pair("base", pr.base);
         let listed: Vec<Pull> = self
-            .call(self.http.get(open), &token)
+            .call(self.http.get(open), token)
             .await
             .context("listing open pull requests for the head")?;
         if let Some(found) = listed.into_iter().next() {
@@ -104,6 +158,8 @@ impl GitHub {
                 number: found.number,
                 draft: found.draft,
                 existing: true,
+                labels: Vec::new(),
+                reviewers: Vec::new(),
             });
         }
         let created: Pull = self
@@ -115,7 +171,7 @@ impl GitHub {
                     "base": pr.base,
                     "draft": pr.draft,
                 })),
-                &token,
+                token,
             )
             .await
             .context("opening the pull request")?;
@@ -124,6 +180,8 @@ impl GitHub {
             number: created.number,
             draft: created.draft,
             existing: false,
+            labels: Vec::new(),
+            reviewers: Vec::new(),
         })
     }
 
@@ -160,6 +218,9 @@ pub struct NewPr<'a> {
     pub title: &'a str,
     pub body: &'a str,
     pub draft: bool,
+    pub labels: &'a [String],
+    /// Users, and teams as `org/team`.
+    pub reviewers: &'a [String],
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -169,6 +230,10 @@ pub struct OpenedPr {
     pub draft: bool,
     /// The pull request was already open, so nothing was created.
     pub existing: bool,
+    /// The labels this call added.
+    pub labels: Vec<String>,
+    /// The reviewers this call asked.
+    pub reviewers: Vec<String>,
 }
 
 #[derive(Deserialize)]

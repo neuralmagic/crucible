@@ -11,6 +11,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+LABEL = "crucible-git-smoke"
+
 
 def params() -> dict:
     with open(os.environ["CRUCIBLE_INPUTS_FILE"]) as f:
@@ -42,7 +44,7 @@ def mcp(method: str, params: dict, rid: int) -> dict:
     return reply["result"]
 
 
-def open_pr(repo: str, base: str, head: str, title: str, body: str) -> dict:
+def open_pr(repo: str, base: str, head: str, title: str, body: str, labels: list[str] | None = None) -> dict:
     mcp(
         "initialize",
         {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "git-smoke", "version": "1"}},
@@ -50,7 +52,7 @@ def open_pr(repo: str, base: str, head: str, title: str, body: str) -> dict:
     )
     result = mcp(
         "tools/call",
-        {"name": "open_pr", "arguments": {"repo": repo, "base": base, "head": head, "title": title, "body": body}},
+        {"name": "open_pr", "arguments": {"repo": repo, "base": base, "head": head, "title": title, "body": body, "labels": labels or []}},
         2,
     )
     if result.get("isError"):
@@ -97,8 +99,8 @@ def check(args: argparse.Namespace) -> None:
         heads = git("ls-remote", remote(repo), f"refs/heads/{ev['branch']}").split()
         if not heads or heads[0] != ev["sha"]:
             failures.append(f"{path}: {ev['branch']} is {heads[:1]} on GitHub, not {ev['sha']}")
-        again = open_pr(repo, base, ev["branch"], "unused", "unused")
-        if not again["existing"] or again["url"] != ev["pr"] or not again["draft"]:
+        again = open_pr(repo, base, ev["branch"], "unused", "unused", [LABEL])
+        if not again["existing"] or again["url"] != ev["pr"] or not again["draft"] or again["labels"] != [LABEL]:
             failures.append(f"{path}: open_pr did not find {ev['pr']} again: {again}")
         prs.append(ev["pr"])
     print(json.dumps({"pass": not failures, "score": 1.0 if not failures else 0.0, "prs": prs, "failures": failures}))

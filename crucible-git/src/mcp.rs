@@ -51,6 +51,12 @@ pub struct OpenPrParams {
     /// Open it as a draft. Default true.
     #[serde(default = "yes")]
     pub draft: bool,
+    /// Labels to add, created on the repository when missing.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Users to ask for review, and teams as `org/team`.
+    #[serde(default)]
+    pub reviewers: Vec<String>,
 }
 
 fn yes() -> bool {
@@ -65,10 +71,11 @@ pub struct GitMcp {
 #[tool_router]
 impl GitMcp {
     #[tool(
-        description = "Open a pull request (params: repo, base, head, title, body, draft) as the \
-        run's GitHub App, a draft unless draft is false, or return the one already open from \
-        head into base. Push head first through this server's /git/<owner>/<repo>.git. Returns \
-        url, number, draft and existing."
+        description = "Open a pull request (params: repo, base, head, title, body, draft, labels, \
+        reviewers) as the run's GitHub App, a draft unless draft is false, or return the one \
+        already open from head into base; either way add labels and ask reviewers (users, or \
+        teams as org/team). Push head first through this server's /git/<owner>/<repo>.git. \
+        Returns url, number, draft, existing, labels and reviewers."
     )]
     async fn open_pr(&self, Parameters(p): Parameters<OpenPrParams>) -> Result<String, String> {
         let owner = p.repo.split_once('/').map(|(o, _)| o).unwrap_or_default();
@@ -88,6 +95,8 @@ impl GitMcp {
                 title: &p.title,
                 body: &p.body,
                 draft: p.draft,
+                labels: &p.labels,
+                reviewers: &p.reviewers,
             })
             .await
             .map_err(|e| format!("{e:#}"))?;
