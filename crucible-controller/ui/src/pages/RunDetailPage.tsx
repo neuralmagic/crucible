@@ -79,6 +79,7 @@ import { EngineLogSection } from './EngineLogSection';
 import { planOrder } from './runGrid';
 import { absoluteTime, relativeTime } from './journeyView';
 import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView';
+import { sandboxedDocument } from './decisions';
 import {
   downloadName,
   imageMimeType,
@@ -87,12 +88,14 @@ import {
   parseRunFilePath,
   prettyJson,
   producerOf,
+  RUN_FILE_CSP,
   runFileApiPath,
   runFilePath,
   runFileUrl,
   selectRunFile,
   shouldAnchorFiles,
   textKind,
+  type InlineKind,
   type RunFileRoute,
   type TextKind,
 } from './runFileView';
@@ -193,6 +196,15 @@ export function RunDetailPage() {
     },
     [queryClient],
   );
+
+  const wasLive = useRef(isLiveRun);
+  useEffect(() => {
+    if (wasLive.current && !isLiveRun) {
+      void queryClient.invalidateQueries({ queryKey: ['get', '/api/runs/{run_id}/files'] });
+      void queryClient.invalidateQueries({ queryKey: ['get', '/api/runs/{run_id}/graph'] });
+    }
+    wasLive.current = isLiveRun;
+  }, [isLiveRun, queryClient]);
 
   if (!runId) {
     return <Empty title="No run ID" />;
@@ -362,7 +374,7 @@ export function RunDetailPage() {
         runId={runId}
         launchKey={launchKey}
         fileKey={deepLinkedFile}
-        live={isPlaybook && isLiveRun}
+        live={isLiveRun}
       />
 
       <div className="grid grid-cols-2 max-wide:grid-cols-1">
@@ -1337,15 +1349,22 @@ function CopyLinkButton({ route, className }: { route: RunFileRoute; className?:
   );
 }
 
+const USER_SCROLL = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const;
+
 /**
  * The file listing can arrive before the task graph renders, so a single scroll happens while the
  * page is still shorter than the viewport, does nothing, and the graph then pushes the panel below
- * the fold. Re-anchor over the next frames until the panel sits at the top of the scroller or the
- * page has stopped growing and cannot be scrolled any further.
+ * the fold. Re-anchor over the next frames until the panel holds at the top of the scroller, the
+ * reader scrolls, or three seconds pass. Returns a function that stops it.
  */
-function anchorFilesPanel(el: HTMLElement): void {
+function anchorFilesPanel(el: HTMLElement): () => void {
   const deadline = performance.now() + 3000;
   let held = 0;
+  let frame = 0;
+  const stop = () => {
+    cancelAnimationFrame(frame);
+    for (const type of USER_SCROLL) window.removeEventListener(type, stop, true);
+  };
   const step = () => {
     el.scrollIntoView({ block: 'start' });
     const main = el.closest('main');
@@ -1354,10 +1373,17 @@ function anchorFilesPanel(el: HTMLElement): void {
       const scrollable = main.scrollHeight > main.clientHeight + 1;
       held = scrollable && Math.abs(top) < 8 ? held + 1 : 0;
     }
-    if (held >= 2 || performance.now() > deadline) return;
-    requestAnimationFrame(step);
+    if (held >= 2 || performance.now() > deadline) {
+      stop();
+      return;
+    }
+    frame = requestAnimationFrame(step);
   };
-  requestAnimationFrame(step);
+  for (const type of USER_SCROLL) {
+    window.addEventListener(type, stop, { capture: true, passive: true });
+  }
+  frame = requestAnimationFrame(step);
+  return stop;
 }
 
 function FilesPanel({
@@ -1372,11 +1398,12 @@ function FilesPanel({
   live: boolean;
 }) {
   const navigate = useNavigate();
+  const poll = live ? POLL_RUNNING : false;
   const listing = $api.useQuery(
     'get',
     '/api/runs/{run_id}/files',
     { params: { path: { run_id: runId } } },
-    { retry: 2, refetchInterval: live ? POLL_RUNNING : false },
+    { retry: 2, refetchInterval: poll },
   );
   const graph = useRunGraph(runId);
   // A file captured from a task that did not pass is evidence of the failure, and must not read
@@ -1393,8 +1420,11 @@ function FilesPanel({
   const selection = selectRunFile(entries, fileKey, order);
   const anchor = useRef<HTMLDivElement>(null);
   const anchored = useRef(false);
+  const stopAnchor = useRef<(() => void) | null>(null);
   const openedOnDeepLink = useRef(fileKey !== null);
   const loaded = entries.length;
+
+  useEffect(() => () => stopAnchor.current?.(), []);
 
   useEffect(() => {
     if (
@@ -1408,7 +1438,7 @@ function FilesPanel({
     const el = anchor.current;
     if (el === null) return;
     anchored.current = true;
-    anchorFilesPanel(el);
+    stopAnchor.current = anchorFilesPanel(el);
   }, [loaded]);
 
   if (listing.isPending) {
@@ -1611,46 +1641,8 @@ function RunFileContent({
   if (mediaType !== null) {
     return <RunFileImage runId={runId} fileKey={fileKey} mediaType={mediaType} />;
   }
-  if (inlineKind(path) === 'html') {
-    return <RunFileHtml runId={runId} fileKey={fileKey} />;
-  }
-  return <RunFileText runId={runId} fileKey={fileKey} kind={textKind(path)} />;
-}
-
-/**
- * A self-contained HTML report renders as a document in a sandboxed iframe: srcDoc plus sandbox
- * keep it opaque-origin, so its inline scripts run without reaching controller cookies or the API.
- * The endpoint serves the bytes as an octet stream, which does not matter here — srcDoc takes text.
- */
-function RunFileHtml({ runId, fileKey }: { runId: string; fileKey: string }) {
-  const query = useQuery({
-    queryKey: ['run-file', runId, fileKey],
-    queryFn: () => fetchRunFile(runId, fileKey),
-  });
-  if (query.isPending) {
-    return (
-      <div className="px-2 py-1.5">
-        <Spinner label="Loading file" />
-      </div>
-    );
-  }
-  if (query.isError) {
-    return (
-      <div className="px-2 py-1.5">
-        <Mono tone="ink-3">{formatError(query.error)}</Mono>
-      </div>
-    );
-  }
-  return (
-    <div className="min-h-0 flex-1">
-      <iframe
-        className="h-full w-full border-0 bg-surface"
-        title={fileKey}
-        sandbox="allow-scripts"
-        srcDoc={query.data ?? ''}
-      />
-    </div>
-  );
+  const kind = inlineKind(path);
+  return <RunFileText runId={runId} fileKey={fileKey} kind={kind === 'image' ? null : kind} />;
 }
 
 function RunFileText({
@@ -1660,7 +1652,7 @@ function RunFileText({
 }: {
   runId: string;
   fileKey: string;
-  kind: TextKind | null;
+  kind: Exclude<InlineKind, 'image'> | null;
 }) {
   const query = useQuery({
     queryKey: ['run-file', runId, fileKey],
@@ -1692,6 +1684,19 @@ function RunFileText({
     return (
       <div className="min-h-0 flex-1 overflow-auto bg-paper px-4 py-3">
         <MarkdownView markdown={query.data ?? ''} />
+      </div>
+    );
+  }
+  if (kind === 'html') {
+    return (
+      <div className="min-h-0 flex-1">
+        <iframe
+          className="h-full w-full border-0 bg-surface"
+          title={fileKey}
+          sandbox="allow-scripts"
+          referrerPolicy="no-referrer"
+          srcDoc={sandboxedDocument(query.data ?? '', 'text/html', RUN_FILE_CSP)}
+        />
       </div>
     );
   }

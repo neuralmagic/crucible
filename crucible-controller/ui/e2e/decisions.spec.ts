@@ -120,6 +120,7 @@ test.describe('decision requests', () => {
     await expect(frame.contentFrame().locator('#chart')).toHaveText('8 × H100');
     const srcdoc = await frame.getAttribute('srcdoc');
     expect(srcdoc).toMatch(/^<meta http-equiv="Content-Security-Policy" content="default-src 'none'/);
+    expect(srcdoc).not.toMatch(/^<meta [^>]*https:/);
 
     const csv = page.locator('[data-view="csv"] table');
     await expect(csv.locator('th')).toHaveText(['node', 'gpus']);

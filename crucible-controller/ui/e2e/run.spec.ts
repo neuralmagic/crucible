@@ -1,4 +1,5 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type Route } from '@playwright/test';
+import { RUN_FILE_CSP } from '../src/pages/runFileView';
 import {
   COST_DRIFT_RUN,
   PLANLESS_RUN,
@@ -617,5 +618,212 @@ test.describe('the cost table beside the artifacts table', () => {
     await page.setViewportSize({ width: 900, height: 1000 });
     await expect(shareHeader).toHaveCSS('border-right-width', '1px');
     await expect(section).toHaveCSS('border-right-width', '0px');
+  });
+});
+
+const LOCAL_RUN = 'playbook_bench_01a1-1791474738';
+const REPORT_KEY = 'report/index.html';
+
+/** A report whose own script draws it, then tries the page around it and the network. */
+const REPORT_HTML = `<!DOCTYPE html><html><head><title>report</title></head><body>
+<h1 id="drawn">not drawn</h1><p id="reach">reached the page</p><p id="net">no request</p>
+<script>
+document.getElementById('drawn').textContent = 'drawn by its own script';
+try { void parent.document.title; } catch { document.getElementById('reach').textContent = 'isolated'; }
+document.addEventListener('securitypolicyviolation', (e) => {
+  document.getElementById('net').textContent = 'blocked by ' + e.effectiveDirective;
+});
+fetch('/api/whoami').catch(() => {});
+</script></body></html>`;
+
+const planTask = (name: string, dependsOn: string[]) => ({
+  name,
+  kind: 'command',
+  depends_on: dependsOn,
+  session: '',
+  needs: 'any',
+  required: true,
+  over: '',
+  max_fanout: 0,
+  when: '',
+  keyed: [],
+});
+
+const passed = (task: string) => ({
+  iter: 0,
+  task,
+  status: 'pass',
+  note: '',
+  cost_usd: null,
+  secs: 0,
+  links: [],
+  repairs: [],
+  agent: null,
+});
+
+const captured = (task: string, path: string, sizeBytes: number) => ({
+  task,
+  instance: null,
+  path,
+  size_bytes: sizeBytes,
+  key: `${task}/${path}`,
+});
+
+/** What the run has done when the next request lands. */
+interface LocalRun {
+  built: boolean;
+  finished: boolean;
+  landed: boolean;
+}
+
+async function stubLocalRun(page: Page, run: LocalRun): Promise<void> {
+  await page.route(
+    (url: URL) => url.pathname.startsWith(`/api/runs/${LOCAL_RUN}`),
+    async (route: Route) => {
+      const path = decodeURIComponent(new URL(route.request().url()).pathname);
+      const json = (body: unknown) =>
+        route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
+      switch (path.slice(`/api/runs/${LOCAL_RUN}`.length)) {
+        case '': {
+          if (run.finished && !run.landed) {
+            await new Promise((resolve) => setTimeout(resolve, 300));
+            run.landed = true;
+          }
+          return json({
+            run: {
+              run_id: LOCAL_RUN,
+              scope: 4,
+              cluster: 'hub',
+              namespace: 'autoresearch',
+              issue_key: 'playbook:bench:01a1',
+              repo: null,
+              status: run.finished ? 'succeeded' : 'running',
+              dispatch: 'local',
+              best_score: null,
+              cost_usd: null,
+              score_series: [],
+              identity_digest: null,
+              pod: null,
+              created: '2026-11-04T18:00:00Z',
+            },
+            candidates: [],
+          });
+        }
+        case '/iterations':
+          return json([]);
+        case '/graph':
+          return json({
+            plan_version: 1,
+            tasks: [planTask('build', []), planTask('report', ['build'])],
+            fanout: [],
+            decisions: [],
+            results: [
+              ...(run.built ? [passed('build')] : []),
+              ...(run.landed ? [passed('report')] : []),
+            ],
+          });
+        case '/files':
+          return json({
+            run_id: LOCAL_RUN,
+            files: [
+              ...(run.built ? [captured('build', 'BUILD.md', 24)] : []),
+              ...(run.landed ? [captured('report', 'index.html', REPORT_HTML.length)] : []),
+            ],
+          });
+        case '/files/build/BUILD.md':
+          return route.fulfill({ status: 200, contentType: 'application/octet-stream', body: '# build\n\nwheel built' });
+        case `/files/${REPORT_KEY}`:
+          return route.fulfill({ status: 200, contentType: 'application/octet-stream', body: REPORT_HTML });
+        default:
+          return route.fallback();
+      }
+    },
+  );
+}
+
+test.describe('a playbook run on this machine', () => {
+  /// A captured HTML report runs its own script, but cannot reach the page or the network.
+  test('renders a captured HTML report in an isolated frame', async ({ page }) => {
+    await stubApi(page);
+    await stubLocalRun(page, { built: true, finished: true, landed: true });
+    await ready(page, `/runs/${LOCAL_RUN}/files/${REPORT_KEY}`);
+
+    const frame = page.locator(`iframe[title="${REPORT_KEY}"]`);
+    await expect(frame).toHaveAttribute('sandbox', 'allow-scripts');
+    await expect(frame).toHaveAttribute('referrerpolicy', 'no-referrer');
+    const srcdoc = (await frame.getAttribute('srcdoc')) ?? '';
+    expect(srcdoc.slice(0, srcdoc.indexOf('>') + 1)).toBe(
+      `<meta http-equiv="Content-Security-Policy" content="${RUN_FILE_CSP}">`,
+    );
+    expect(RUN_FILE_CSP).toContain("default-src 'none'");
+    const report = frame.contentFrame();
+    await expect(report.locator('#drawn')).toHaveText('drawn by its own script');
+    await expect(report.locator('#reach')).toHaveText('isolated');
+    await expect(report.locator('#net')).toHaveText('blocked by connect-src');
+  });
+
+  /// A task that finishes and the file it captured show up without a reload.
+  test('shows results and captures that land while it runs', async ({ page }) => {
+    const run = { built: false, finished: false, landed: false };
+    await page.clock.install();
+    await stubApi(page);
+    await stubLocalRun(page, run);
+    await ready(page, `/runs/${LOCAL_RUN}`);
+
+    const build = page.getByTestId('workflow-graph').locator('[data-task="build"]');
+    await expect(build).toHaveAttribute('data-status', 'pending');
+    await expect(page.getByText('No files captured for this run.')).toBeVisible();
+
+    run.built = true;
+    await page.clock.fastForward(5_000);
+    await expect(build).toHaveAttribute('data-status', 'pass');
+    await expect(
+      page.locator('[id="crucible.run-files"]').getByRole('button', { name: 'build/BUILD.md' }),
+    ).toBeVisible();
+  });
+
+  /// A finished run shows its report and does not say a task that ran never did.
+  test('fetches its last captures and results once it stops', async ({ page }) => {
+    const run = { built: true, finished: false, landed: false };
+    await page.clock.install();
+    await stubApi(page);
+    await stubLocalRun(page, run);
+    await ready(page, `/runs/${LOCAL_RUN}`);
+
+    const report = page.getByTestId('workflow-graph').locator('[data-task="report"]');
+    await expect(report).toHaveAttribute('data-status', 'pending');
+
+    run.finished = true;
+    await page.clock.fastForward(5_000);
+    await expect(report).toHaveAttribute('data-status', 'pass');
+    await expect(
+      page.locator('[id="crucible.run-files"]').getByRole('button', { name: REPORT_KEY }),
+    ).toBeVisible();
+  });
+});
+
+test.describe('a run file deep link', () => {
+  /// The files panel scrolls itself into view, and stops once the reader scrolls.
+  test('leaves the scroll to the reader once they scroll', async ({ page }) => {
+    await page.addInitScript(() => {
+      document.addEventListener('DOMContentLoaded', () => {
+        const style = document.createElement('style');
+        style.textContent = '[data-ui="main"] div:has([id="crucible.run-files"]) ~ * { display: none !important; }';
+        document.head.append(style);
+      });
+    });
+    await stubApi(page);
+    await page.goto(`${RUN}/files/rank/RANKING.md`);
+
+    const scrollTop = () => page.locator('main').evaluate((main) => main.scrollTop);
+    await expect.poll(scrollTop).toBeGreaterThan(0);
+
+    const box = await page.locator('main').boundingBox();
+    if (box === null) throw new Error('main has no box');
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.wheel(0, -10_000);
+    await expect.poll(scrollTop).toBe(0);
+    await page.waitForTimeout(500);
+    expect(await scrollTop()).toBe(0);
   });
 });
