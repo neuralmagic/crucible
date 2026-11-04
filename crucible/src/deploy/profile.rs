@@ -344,6 +344,14 @@ pub struct GitCfg {
 }
 
 impl GitCfg {
+    /// The port `crucible-git` listens on in the loop pod for sandboxes: its URL's.
+    pub fn port(&self) -> u16 {
+        self.url
+            .as_ref()
+            .and_then(url::Url::port_or_known_default)
+            .unwrap_or(crucible_contract::git::PORT)
+    }
+
     /// The URL sandboxes reach `crucible-git` at.
     pub fn url(&self) -> String {
         match &self.url {
