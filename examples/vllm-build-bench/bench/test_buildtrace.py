@@ -321,10 +321,6 @@ class TestBuildOutput(unittest.TestCase):
         self.assertEqual(t.shown_lines(lines[:10], []), lines[:10])
 
 
-@unittest.skipUnless(
-    all(shutil.which(x) for x in ("cmake", "ninja", "ccache", "cc")),
-    "needs cmake, ninja, ccache, cc",
-)
 def embedded_trace(page: str) -> dict[str, object]:
     """The trace a rendered page carries, read back the way its script reads it."""
     start = page.index("const TRACE = ") + len("const TRACE = ")
@@ -409,6 +405,10 @@ class TestHtml(unittest.TestCase):
         self.assertEqual((data["otherData"]["k"], data["otherData"]["run"]), ("v", "7"))
 
 
+@unittest.skipUnless(
+    all(shutil.which(x) for x in ("cmake", "ninja", "ccache", "cc")),
+    "needs cmake, ninja, ccache, cc",
+)
 class TestARealBuild(unittest.TestCase):
     """A CMake project compiled through ccache twice: once cold, once after its objects are gone
     so ccache serves them, with one source changed so it compiles."""
