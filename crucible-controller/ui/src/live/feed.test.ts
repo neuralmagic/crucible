@@ -186,4 +186,14 @@ describe('appendPodLine', () => {
     expect(rowMatches(row, 'imagepull')).toBe(true);
     expect(rowMatches(row, 'nothing here')).toBe(false);
   });
+
+  it('searches a coloured pod line as it reads, not through its escapes', () => {
+    const row: FeedRow = {
+      id: 1,
+      kind: 'pod',
+      text: '\x1b[1mserve_inner\x1b[0m\x1b[2m:\x1b[0m task cancelled',
+    };
+    expect(rowMatches(row, 'serve_inner: task')).toBe(true);
+    expect(rowMatches(row, '[2m')).toBe(false);
+  });
 });

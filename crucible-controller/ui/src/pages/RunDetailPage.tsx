@@ -49,6 +49,8 @@ import {
   useDataTable,
 } from '../ui';
 import { CodeSurface } from '../editor/CodeSurface';
+import { AnsiText } from '../logs/AnsiText';
+import { LogView } from '../logs/LogView';
 import type { SpecItem, StatusTone } from '../ui';
 import {
   decisionTone,
@@ -1218,7 +1220,8 @@ const FILE_PANES = ['list', 'content'];
 
 /// The files the run's tasks declared and captured — a playbook's reports and findings land here,
 /// not in the artifact store. Master-detail: pick a file on the left, read it on the right —
-/// markdown renders, json and text show as code, an image renders inline, anything else downloads.
+/// markdown renders, json and text show as code, a log reads in the log viewer, an image renders
+/// inline, anything else downloads.
 /// The selected file is the URL, so the address bar is always a link someone else can open.
 
 function CopyLinkButton({ route, className }: { route: RunFileRoute; className?: string }) {
@@ -1582,6 +1585,9 @@ function RunFileText({
       </div>
     );
   }
+  if (kind === 'log') {
+    return <LogView text={query.data ?? ''} testId="run-file-log" />;
+  }
   return (
     <div className="min-h-0 flex-1">
       <CodeSurface
@@ -1622,7 +1628,17 @@ function ArtifactInline({ runId, path, kind }: { runId: string; path: string; ki
   }
   return (
     <pre className="m-0 max-h-120 overflow-auto bg-surface px-4.5 py-3 font-mono text-data whitespace-pre-wrap text-ink">
-      {query.data ? (kind === 'json' ? prettyJson(query.data) : query.data) : ''}
+      {kind === 'log' ? (
+        <AnsiText text={query.data ?? ''} />
+      ) : query.data ? (
+        kind === 'json' ? (
+          prettyJson(query.data)
+        ) : (
+          query.data
+        )
+      ) : (
+        ''
+      )}
     </pre>
   );
 }
