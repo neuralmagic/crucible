@@ -3,7 +3,7 @@ import type { components } from '../api/schema';
 type RunFile = components['schemas']['RunFile'];
 
 /** How a captured file is rendered inline; null means download only. */
-export type InlineKind = 'markdown' | 'json' | 'text' | 'image';
+export type InlineKind = 'markdown' | 'json' | 'text' | 'image' | 'html';
 
 const IMAGE_MIME: Record<string, string> = {
   png: 'image/png',
@@ -33,16 +33,17 @@ export function inlineKind(path: string): InlineKind | null {
   if (ext === 'md') return 'markdown';
   if (ext === 'json') return 'json';
   if (ext === 'txt' || ext === 'log') return 'text';
+  if (ext === 'html' || ext === 'htm') return 'html';
   if (imageMimeType(path) !== null) return 'image';
   return null;
 }
 
-/** The inline kinds that read as text; an image is bytes and has no text rendering. */
+/** The inline kinds shown as text; an image and an html page render as themselves. */
 export type TextKind = 'markdown' | 'json' | 'text';
 
 export function textKind(path: string): TextKind | null {
   const kind = inlineKind(path);
-  return kind === null || kind === 'image' ? null : kind;
+  return kind === null || kind === 'image' || kind === 'html' ? null : kind;
 }
 
 export function prettyJson(text: string): string {

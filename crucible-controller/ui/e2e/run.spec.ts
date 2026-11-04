@@ -180,6 +180,37 @@ test.describe('the run task graph', () => {
     await expect(page.getByText('captured from a task that failed')).toBeVisible();
   });
 
+  /// A captured html page, such as a build trace, renders in place the way flow.html does: in an
+  /// iframe sandboxed to scripts alone, so the page runs but cannot reach the controller.
+  test('renders a captured html page in a script-only sandbox', async ({ page }) => {
+    await stubApi(page);
+    const html =
+      '<!doctype html><html><head><title>trace</title></head><body><p id="t">static</p>' +
+      "<script>document.getElementById('t').textContent = 'scripted trace';</script></body></html>";
+    await page.route('**/api/runs/RUN-0412/files', (route) =>
+      route.fulfill({
+        json: {
+          run_id: 'RUN-0412',
+          files: [
+            { task: 'rank', instance: null, path: 'RANKING.md', size_bytes: 210, key: 'rank/RANKING.md' },
+            { task: 'trace', instance: null, path: 'build-trace.html', size_bytes: html.length, key: 'trace/build-trace.html' },
+          ],
+        },
+      }),
+    );
+    await page.route('**/api/runs/RUN-0412/files/trace/build-trace.html', (route) =>
+      route.fulfill({ contentType: 'application/octet-stream', body: html }),
+    );
+    await ready(page, '/runs/RUN-0412');
+
+    const list = page.locator('[id="crucible.run-files"]');
+    await list.getByRole('button', { name: 'trace/build-trace.html' }).click();
+    const frame = page.locator('iframe[title="trace/build-trace.html"]');
+    await expect(frame).toHaveAttribute('sandbox', 'allow-scripts');
+    await expect(frame.contentFrame().locator('#t')).toHaveText('scripted trace');
+    await expect(frame.contentFrame().locator('#flow-theme-bridge')).toHaveCount(1);
+  });
+
   test('reads a captured file out of a finished run', async ({ page }) => {
     await stubApi(page);
     await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);

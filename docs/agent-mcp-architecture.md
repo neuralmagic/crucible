@@ -1616,7 +1616,11 @@ For `build`, `buildit` downloads the build context with
 `openshell sandbox download <sandbox> <workdir>/<context> <dest>` through the run's gateway
 (`buildit/src/sandbox.rs:101`). The context path must be relative, without `..`. It may not
 contain `.git`, `.mcp.json`, `.claude`, `.buildit`, `.kube` or `.jira`. `sanitize` then deletes
-those names, special files, and symlinks that resolve outside the context (`sandbox.rs:207`). `run`
+those names but `.git`, special files, and symlinks that resolve outside the context
+(`sandbox.rs:207`). Of each `.git` directory it keeps `HEAD`, `index`, `objects`, `packed-refs`,
+`refs` and `shallow`, so a build can read the checkout's history (vLLM's `setup.py` takes its
+version from it), and deletes the rest: the config, where remote URLs and http headers can carry
+credentials, the hooks and the logs. `run`
 writes requested output paths back to `<workdir>/.buildit/<build id>/` in the sandbox with
 `openshell sandbox upload`.
 
