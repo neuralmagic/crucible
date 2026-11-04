@@ -104,6 +104,9 @@ const DECISION_TONE: Record<DecisionTone, StatusTone> = {
   neutral: 'blue',
 };
 
+/** How often a running playbook run's page refetches while it has no event stream of its own. */
+const POLL_RUNNING = 5000;
+
 /// A personal target's name is an opaque secret id, so it is shown as what it is rather than as a
 /// cluster name a reader could go look up.
 function clusterLabel(cluster: string): string {
@@ -355,7 +358,12 @@ export function RunDetailPage() {
         </Section>
       )}
 
-      <FilesPanel runId={runId} launchKey={launchKey} fileKey={deepLinkedFile} />
+      <FilesPanel
+        runId={runId}
+        launchKey={launchKey}
+        fileKey={deepLinkedFile}
+        live={isPlaybook && isLiveRun}
+      />
 
       <div className="grid grid-cols-2 max-wide:grid-cols-1">
         <CostSection runId={runId} runCost={run.cost_usd} />
@@ -1329,21 +1337,46 @@ function CopyLinkButton({ route, className }: { route: RunFileRoute; className?:
   );
 }
 
+/**
+ * The file listing can arrive before the task graph renders, so a single scroll happens while the
+ * page is still shorter than the viewport, does nothing, and the graph then pushes the panel below
+ * the fold. Re-anchor over the next frames until the panel sits at the top of the scroller or the
+ * page has stopped growing and cannot be scrolled any further.
+ */
+function anchorFilesPanel(el: HTMLElement): void {
+  const deadline = performance.now() + 3000;
+  let held = 0;
+  const step = () => {
+    el.scrollIntoView({ block: 'start' });
+    const main = el.closest('main');
+    if (main !== null) {
+      const top = el.getBoundingClientRect().top - main.getBoundingClientRect().top;
+      const scrollable = main.scrollHeight > main.clientHeight + 1;
+      held = scrollable && Math.abs(top) < 8 ? held + 1 : 0;
+    }
+    if (held >= 2 || performance.now() > deadline) return;
+    requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
 function FilesPanel({
   runId,
   launchKey,
   fileKey,
+  live,
 }: {
   runId: string;
   launchKey: string | null;
   fileKey: string | null;
+  live: boolean;
 }) {
   const navigate = useNavigate();
   const listing = $api.useQuery(
     'get',
     '/api/runs/{run_id}/files',
     { params: { path: { run_id: runId } } },
-    { retry: 2 },
+    { retry: 2, refetchInterval: live ? POLL_RUNNING : false },
   );
   const graph = useRunGraph(runId);
   // A file captured from a task that did not pass is evidence of the failure, and must not read
@@ -1375,7 +1408,7 @@ function FilesPanel({
     const el = anchor.current;
     if (el === null) return;
     anchored.current = true;
-    el.scrollIntoView({ block: 'start' });
+    anchorFilesPanel(el);
   }, [loaded]);
 
   if (listing.isPending) {
@@ -1584,12 +1617,12 @@ function RunFileContent({
   return <RunFileText runId={runId} fileKey={fileKey} kind={textKind(path)} />;
 }
 
-/// A captured html page, rendered like flow.html: srcDoc in a sandboxed iframe, so its scripts
-/// run at an opaque origin with no reach into the controller's cookies or API, and with the same
-/// theme bridge, so a page that styles itself with the --flow-* tokens follows the app's theme.
+/**
+ * A self-contained HTML report renders as a document in a sandboxed iframe: srcDoc plus sandbox
+ * keep it opaque-origin, so its inline scripts run without reaching controller cookies or the API.
+ * The endpoint serves the bytes as an octet stream, which does not matter here — srcDoc takes text.
+ */
 function RunFileHtml({ runId, fileKey }: { runId: string; fileKey: string }) {
-  const theme = useAppTheme();
-  const brand = useAppBrand();
   const query = useQuery({
     queryKey: ['run-file', runId, fileKey],
     queryFn: () => fetchRunFile(runId, fileKey),
@@ -1608,18 +1641,15 @@ function RunFileHtml({ runId, fileKey }: { runId: string; fileKey: string }) {
       </div>
     );
   }
-  const tokens = getComputedStyle(document.documentElement);
   return (
-    <iframe
-      key={`${brand}-${theme}`}
-      className="min-h-0 w-full flex-1 border-0 bg-surface"
-      title={fileKey}
-      sandbox="allow-scripts"
-      srcDoc={injectFlowTheme(
-        query.data ?? '',
-        flowThemeStyle(theme, (token) => tokens.getPropertyValue(token)),
-      )}
-    />
+    <div className="min-h-0 flex-1">
+      <iframe
+        className="h-full w-full border-0 bg-surface"
+        title={fileKey}
+        sandbox="allow-scripts"
+        srcDoc={query.data ?? ''}
+      />
+    </div>
   );
 }
 
