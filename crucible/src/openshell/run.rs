@@ -419,13 +419,14 @@ async fn try_turn(
     // 2d. The run's MCP servers that take agent tokens: each a token-grant provider whose tokens
     //     the sandbox's supervisor obtains from the controller and injects on traffic to that
     //     server alone. One served in this pod is started first.
+    let binaries = policy::resolve_binaries(turn.openshell, harness.spec().binaries);
     for s in agent_servers.iter() {
         tokio::task::block_in_place(|| s.start_local(turn.buildit_socket))
             .with_context(|| format!("starting the run's {}", s.server.name))?;
         ensure_token_grant_provider(
             &gw,
             s.provider_name().as_str(),
-            agent_servers.token_grant_profile(s),
+            agent_servers.token_grant_profile(s, &binaries),
         )
         .await?;
     }
@@ -653,7 +654,7 @@ async fn try_turn(
         }
         gw.update_policy_wait_with_tls_skip(
             &name,
-            &policy::resolve_binaries(turn.openshell, harness.spec().binaries),
+            &binaries,
             &endpoints,
             &credential_bindings,
             &turn.openshell.tls_skip_endpoints,

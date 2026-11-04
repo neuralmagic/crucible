@@ -200,8 +200,12 @@ impl AgentServers {
     }
 
     /// The token-grant provider profile for `granted`. Its endpoint binds the injected token to
-    /// that server alone.
-    pub fn token_grant_profile(&self, granted: &Granted) -> openshell_core::proto::ProviderProfile {
+    /// that server alone, on requests from `binaries`.
+    pub fn token_grant_profile(
+        &self,
+        granted: &Granted,
+        binaries: &[String],
+    ) -> openshell_core::proto::ProviderProfile {
         let name = granted.server.name.as_str();
         provider::token_grant_profile(&provider::GrantedServer {
             profile_id: &format!("{}-grant", granted.provider_name()),
@@ -212,6 +216,7 @@ impl AgentServers {
             token_endpoint: &self.endpoint,
             svid_audience: &self.svid_audience,
             scopes: &granted.server.scopes,
+            binaries,
         })
     }
 }
@@ -340,8 +345,18 @@ mod tests {
                 ),
             ]
         );
+        let binaries = vec![
+            "/usr/local/bin/claude".to_string(),
+            "/usr/bin/curl".to_string(),
+        ];
         for g in servers.iter() {
-            let profile = servers.token_grant_profile(g);
+            let profile = servers.token_grant_profile(g, &binaries);
+            let profile_binaries: Vec<&str> =
+                profile.binaries.iter().map(|b| b.path.as_str()).collect();
+            assert_eq!(
+                profile_binaries, binaries,
+                "the grant's rule must admit the binaries the sandbox policy admits"
+            );
             assert_eq!(profile.id, format!("crucible-{}-grant", g.server.name));
             let endpoint = &profile.endpoints[0];
             assert_eq!(
