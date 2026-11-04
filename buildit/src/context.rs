@@ -148,13 +148,22 @@ pub fn digest_dir(dir: &Path) -> Result<ContextDigest> {
     let stage = tempfile::tempdir().context("creating staging dir")?;
     let ctx = stage.path().join("ctx");
     crate::sandbox::stage_local(dir, &ctx)?;
-    digest(&tar_bytes(&ctx)?)
+    digest(&staged_tar_bytes(&ctx)?)
 }
 
 // honors .dockerignore; .git/ and target/ always skipped because nobody
 // wants to ship a mac-arch target dir to an amd64 builder. uncompressed so
 // detach mode can use one sha256 as both blob digest and diff_id.
 pub fn tar_bytes(ctx: &Path) -> Result<Vec<u8>> {
+    archive(ctx, &[".git", "target"])
+}
+
+/// A context staged by `sandbox::sanitize`, whose top-level .git/ is kept as sanitized.
+pub fn staged_tar_bytes(ctx: &Path) -> Result<Vec<u8>> {
+    archive(ctx, &["target"])
+}
+
+fn archive(ctx: &Path, skipped: &'static [&'static str]) -> Result<Vec<u8>> {
     if !ctx.is_dir() {
         return Err(anyhow!("context {} is not a directory", ctx.display()));
     }
@@ -162,8 +171,8 @@ pub fn tar_bytes(ctx: &Path) -> Result<Vec<u8>> {
     walk.standard_filters(false)
         .hidden(false)
         .add_custom_ignore_filename(".dockerignore");
-    walk.filter_entry(|entry| {
-        entry.depth() != 1 || (entry.file_name() != ".git" && entry.file_name() != "target")
+    walk.filter_entry(move |entry| {
+        entry.depth() != 1 || skipped.iter().all(|name| entry.file_name() != *name)
     });
 
     let mut tar = tar::Builder::new(Vec::new());
@@ -202,7 +211,7 @@ mod tests {
 
     use flate2::read::GzDecoder;
 
-    use crate::context::{ContextDigest, digest, digest_dir, tar_bytes, tarball};
+    use crate::context::{ContextDigest, digest, digest_dir, staged_tar_bytes, tarball};
     use crate::sandbox::{RelPath, SandboxName, Workspace};
 
     #[derive(Clone, Copy)]
@@ -390,13 +399,14 @@ mod tests {
         assert!(serde_json::from_value::<ContextDigest>(serde_json::json!("sha256:zz")).is_err());
     }
 
-    // a tree with a file, an executable, a nested dir, an inner and an outer link, an excluded
+    // a tree with a file, an executable, a nested dir, an inner and an outer link, a .git
     // dir and a dockerignored file; `stamp` sets every file's mtime
     fn tree(root: &Path, stamp: SystemTime, reverse: bool) {
         let mut files: Vec<(&str, &[u8], u32)> = vec![
             ("svc/Dockerfile", b"FROM scratch\nCOPY . /\n", 0o644),
             ("svc/bin/run.sh", b"#!/bin/sh\necho hi\n", 0o755),
             ("svc/.git/HEAD", b"ref: x\n", 0o644),
+            ("svc/.git/config", b"[remote]\n", 0o644),
             ("svc/notes.txt", b"ignored\n", 0o644),
             ("svc/.dockerignore", b"notes.txt\n", 0o644),
             ("secret", b"outside\n", 0o600),
@@ -445,13 +455,19 @@ mod tests {
                 &ctx,
             )
             .unwrap();
-        let uploaded = tar_bytes(&ctx).unwrap();
+        let uploaded = staged_tar_bytes(&ctx).unwrap();
         assert_eq!(digest(&uploaded).unwrap(), ours, "the build's own staging");
         let names = entries(&crate::context::gzip(&uploaded).unwrap());
-        for kept in ["Dockerfile", "bin/run.sh", "inner", ".dockerignore"] {
+        for kept in [
+            "Dockerfile",
+            "bin/run.sh",
+            "inner",
+            ".dockerignore",
+            ".git/HEAD",
+        ] {
             assert!(names.contains(kept), "{kept}: {names:?}");
         }
-        for dropped in ["outer", ".git/HEAD", "notes.txt"] {
+        for dropped in ["outer", ".git/config", "notes.txt"] {
             assert!(!names.contains(dropped), "{dropped}: {names:?}");
         }
 

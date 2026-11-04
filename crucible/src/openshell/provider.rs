@@ -393,15 +393,17 @@ pub struct GrantedServer<'a> {
     pub token_endpoint: &'a str,
     pub svid_audience: &'a str,
     pub scopes: &'a [String],
+    /// The sandbox binaries that may reach the server; only their requests carry the token.
+    pub binaries: &'a [String],
 }
 
 /// A token-grant profile: one dynamic credential the supervisor obtains from the controller's
 /// `token_endpoint` with a JWT-SVID for `svid_audience`, requesting a token whose audience is the
-/// server's `url`, and injects as a bearer header on traffic to `host:port` alone. It holds no
-/// secret and gives the sandbox no placeholder.
+/// server's `url`, and injects as a bearer header on `binaries`' traffic to `host:port` alone. It
+/// holds no secret and gives the sandbox no placeholder.
 pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto::ProviderProfile {
     use openshell_core::proto::{
-        NetworkAccessPreset, NetworkEndpoint, ProviderCredentialTokenGrant,
+        NetworkAccessPreset, NetworkBinary, NetworkEndpoint, ProviderCredentialTokenGrant,
         ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
         ProviderProfileCredential,
     };
@@ -432,6 +434,11 @@ pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto:
             access: NetworkAccessPreset::Full as i32,
             ..Default::default()
         }],
+        binaries: server
+            .binaries
+            .iter()
+            .map(|path| NetworkBinary { path: path.clone() })
+            .collect(),
         ..Default::default()
     }
 }
@@ -624,6 +631,7 @@ mod tests {
             token_endpoint: "http://controller.example.svc:8080/oauth/token",
             svid_audience: "http://controller.example.svc:8080",
             scopes: &[],
+            binaries: &["/usr/local/bin/claude".to_string()],
         });
         let grant = profile.credentials[0]
             .token_grant

@@ -374,6 +374,10 @@ pub struct BuilditCfg {
     /// renders it.
     #[serde(default)]
     pub cache: Option<BuilditCacheCfg>,
+    /// The image the loop pod takes its `buildit` from, at `/usr/local/bin/buildit`, ahead of the
+    /// loop image's own on the loop container's PATH. Default the loop image's.
+    #[serde(default)]
+    pub image: Option<String>,
 }
 
 /// `[buildit.cache]`: where the shared cache runs, its storage, and whether builds may write to it.
@@ -403,7 +407,8 @@ pub struct BuilditCacheCfg {
     /// The claim's StorageClass. Default the cluster's.
     #[serde(default)]
     pub storage_class: Option<String>,
-    /// The image the cache runs, which must hold the `buildit` binary. Default the loop image.
+    /// The image the cache runs, which must hold the `buildit` binary. Default `[buildit] image`,
+    /// else the loop image.
     #[serde(default)]
     pub image: Option<String>,
 }

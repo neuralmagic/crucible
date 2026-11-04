@@ -6,6 +6,8 @@ trees and tar.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import re
@@ -148,7 +150,8 @@ class TestInformer(unittest.TestCase):
         self.assertEqual((self.tree / "vllm/vllm_flash_attn/_vllm_fa3_C.abi3.so").read_bytes(), b"\x7fELF fa3")
 
     def test_a_derive_build_reports_its_facts_without_compiling(self) -> None:
-        out = informer("build", str(self.tree), "--base", "img", "--mode", "derive")
+        trace = self.tmp / "trace.json"
+        out = informer("build", str(self.tree), "--base", "img", "--mode", "derive", "--trace", str(trace))
         self.assertEqual(out.returncode, 0, out.stderr)
         line = out.stdout.strip().splitlines()[-1]
         self.assertTrue(line.startswith("informer-facts "), line)
@@ -156,6 +159,27 @@ class TestInformer(unittest.TestCase):
         self.assertEqual(facts.keys(), {"mode", "store", "shared", "build_s"})
         self.assertEqual((facts["mode"], facts["store"], facts["shared"]), ("derive", "off", "off"))
         self.assertEqual(git(self.tree, "status", "--porcelain"), "")
+        traced = json.loads(trace.read_text())
+        self.assertEqual([e["ph"] for e in traced["traceEvents"]], ["M", "M", "M"])
+        self.assertEqual(traced["otherData"]["facts"], facts | {"build_s": traced["otherData"]["facts"]["build_s"]})
+        self.assertEqual(traced["otherData"]["ninja"], {"jobs": {}, "job_s": {}, "ninja_s": 0.0})
+
+    def test_no_shared_builds_ignore_the_shared_cache(self) -> None:
+        shared = self.tmp / "cache.json"
+        shared.write_text('{"url": "http://cache.svc:8850", "token": "t"}')
+        default = t.SHARED
+        t.SHARED = shared
+        self.addCleanup(setattr, t, "SHARED", default)
+
+        def shared_mode(*flags: str) -> object:
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = t.main(["build", str(self.tree), "--base", "img", "--mode", "derive", *flags])
+            self.assertEqual(code, 0)
+            return json.loads(out.getvalue().strip().removeprefix("informer-facts "))["shared"]
+
+        self.assertEqual(shared_mode(), "read-write")
+        self.assertEqual(shared_mode("--no-shared"), "off")
 
     def test_bad_arguments_exit_with_usage(self) -> None:
         self.assertEqual(informer().returncode, 2)
@@ -245,13 +269,24 @@ class TestSharedCache(unittest.TestCase):
 
         stored.unlink()
         (tree / "vllm/_C.abi3.so").write_bytes(b"stale")
-        self.assertEqual(t.restore(tree, stored, reader), "remote-hit")
+        timeline = t.Timeline()
+        self.assertEqual(t.restore(tree, stored, reader, timeline), "remote-hit")
         self.assertEqual((tree / "vllm/_C.abi3.so").read_bytes(), b"\x7fELF outputs")
         self.assertTrue(stored.exists(), "a remote hit fills the local store")
-        self.assertEqual(t.restore(tree, stored, None), "hit")
-        self.assertIsNone(t.restore(tree, local / "k2.tar", reader))
-        self.assertIsNone(t.restore(tree, local / "k2.tar", None))
+        self.assertEqual(t.restore(tree, stored, None, timeline), "hit")
+        self.assertIsNone(t.restore(tree, local / "k2.tar", reader, timeline))
+        self.assertIsNone(t.restore(tree, local / "k2.tar", None, timeline))
         self.assertFalse((local / "k2.tar").exists() or (local / "k2.tar.part").exists())
+        self.assertEqual(
+            [(s.name, s.args) for s in timeline.spans],
+            [
+                ("fetch", {"found": True}),
+                ("untar", {"bytes": stored.stat().st_size}),
+                ("untar", {"bytes": stored.stat().st_size}),
+                ("fetch", {"found": False}),
+            ],
+            "a remote hit is fetched then unpacked, a local hit only unpacked, a miss only asked",
+        )
 
     def test_an_unreachable_cache_is_a_miss_not_a_failure(self) -> None:
         gone = t.Remote(f"http://127.0.0.1:{free_port()}", self.TOKEN)
