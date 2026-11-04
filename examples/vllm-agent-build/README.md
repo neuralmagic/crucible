@@ -42,8 +42,9 @@ that allows overlay mounts in a user namespace (5.13 and later).
 - The calls also set `ccache: true`. buildit then mounts a generated `/etc/ccache.conf` into every
   `RUN` step: the shared cache as ccache's remote storage, so a first build in a new pod starts
   from objects other runs compiled, and a per-object log at `/buildit/ccache-stats.log`.
-- After each build the agent copies the ninja log out of the build dir and that ccache log out of
-  `/buildit` with buildit's `run`, which sees both read-only, and declares them as its files.
+- After each build the agent copies the ninja log out of the build dir, and that ccache log and the
+  time buildit stamped on each Dockerfile step out of `/buildit`, with buildit's `run`, which sees
+  them read-only, and declares them as its files.
   `trace/render.py` turns each pair into `traces/<build>.html` and writes `traces/index.html`
   comparing the builds. The run page shows them under its captured files.
 - The checkout's `.git` stays in the build context, since `setup.py` takes vLLM's version from it.

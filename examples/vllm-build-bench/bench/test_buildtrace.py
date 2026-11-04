@@ -136,6 +136,70 @@ class TestNinjaJobs(unittest.TestCase):
         self.assertEqual(t.ninja_jobs(self.tmp, 0), [])
 
 
+class TestBuildSteps(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_each_step_is_a_phase_until_the_next_stamp(self) -> None:
+        at = 5_000_000 * MS
+        steps = self.tmp / "steps.log"
+        steps.write_text(
+            f"{at} STEP 1/3: FROM docker.io/vllm/vllm-openai:v0.32.0\n"
+            f"{at + 61_000 * MS} STEP 3/3: RUN python3 setup.py build_ext --inplace\n"
+            "not a stamp\n"
+            f"{at + 30_000 * MS} STEP 2/3: RUN apt-get install -y ccache " + "x" * 80 + "\n"
+            f"{at + 950_000 * MS} COMMIT localhost/buildit/b:latest\n"
+            f"{at + 990_000 * MS} END 0\n"
+        )
+        self.assertEqual(
+            [(s.name, s.start_ns - at, s.end_ns - at) for s in t.build_steps(steps)],
+            [
+                ("1/3 FROM docker.io/vllm/vllm-openai:v0.32.0", 0, 30_000 * MS),
+                (("2/3 RUN apt-get install -y ccache " + "x" * 80)[: t.PHASE_CHARS], 30_000 * MS, 61_000 * MS),
+                ("3/3 RUN python3 setup.py build_ext --inplace", 61_000 * MS, 950_000 * MS),
+                ("commit", 950_000 * MS, 990_000 * MS),
+            ],
+            "stamps sort before they pair; the END line closes the commit and is no phase",
+        )
+        self.assertEqual(t.build_steps(self.tmp / "missing.log"), [])
+
+    def test_a_trace_with_steps_starts_at_the_first_and_keeps_its_jobs_on_the_same_clock(self) -> None:
+        at = 6_000_000 * MS
+        ninja_log(
+            self.tmp,
+            [
+                (0, 900, at + 70_000 * MS, "CMakeFiles/_C.dir/a.cu.o"),
+                (901, 950, at + 70_901 * MS, "_C.abi3.so"),
+            ],
+        )
+        steps = self.tmp / "steps.log"
+        steps.write_text(
+            f"{at} STEP 1/2: FROM base\n{at + 60_000 * MS} STEP 2/2: RUN ninja\n"
+            f"{at + 72_000 * MS} COMMIT img\n{at + 75_000 * MS} END 0\n"
+        )
+        trace = t.logs_trace(self.tmp / t.NINJA_LOG, None, {}, steps)
+        phases = {e["name"]: e for e in trace["traceEvents"] if e.get("cat") == "phase"}
+        self.assertEqual(phases["1/2 FROM base"]["ts"], 0.0)
+        self.assertEqual(phases["2/2 RUN ninja"]["ts"], 60_000_000.0)
+        jobs = [e for e in trace["traceEvents"] if e.get("pid") == 2 and e.get("ph") == "X"]
+        self.assertEqual(jobs[0]["ts"], 70_000_000.0)
+        self.assertEqual(trace["otherData"]["phases_s"], {"1/2 FROM base": 60.0, "2/2 RUN ninja": 12.0, "commit": 3.0})
+        page = self.tmp / "trace.html"
+        t.main(
+            [
+                "html",
+                "--ninja-log",
+                str(self.tmp / t.NINJA_LOG),
+                "--steps-log",
+                str(steps),
+                "-o",
+                str(page),
+            ]
+        )
+        self.assertEqual(embedded_trace(page.read_text())["otherData"]["phases_s"]["commit"], 3.0)
+
+
 class TestCcacheOutcomes(unittest.TestCase):
     def test_each_logged_compile_reads_as_remote_hit_hit_miss_or_uncached(self) -> None:
         log = Path(tempfile.mkdtemp()) / "stats.log"

@@ -92,4 +92,10 @@ fn the_vllm_agent_build_trace_step_writes_every_page_and_ends_with_its_json() {
         let html = std::fs::read_to_string(work.path().join("traces").join(page)).unwrap();
         assert!(html.starts_with("<!doctype html>"), "{page}");
     }
+    let checkout = std::fs::read_to_string(work.path().join("traces/checkout.html")).unwrap();
+    assert!(
+        checkout.contains("\"name\": \"11/11 RUN TORCH_CUDA_ARCH_LIST")
+            && checkout.contains("\"name\": \"commit\""),
+        "the checkout's Dockerfile steps are its phases"
+    );
 }

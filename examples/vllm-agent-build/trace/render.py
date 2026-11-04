@@ -1,5 +1,5 @@
-"""Render each build the agent reported as traces/<name>.html, from the ninja log and ccache stats
-log it fetched out of the build, and traces/index.html comparing them."""
+"""Render each build the agent reported as traces/<name>.html, from the ninja log, ccache stats log
+and Dockerfile step times it fetched out of the build, and traces/index.html comparing them."""
 
 import html
 import json
@@ -16,10 +16,12 @@ rows = []
 for b in report["builds"]:
     name = b["name"]
     facts = {k: b[k] for k in ("build_id", "status", "seconds") if k in b}
+    steps = inputs / "traces" / f"{name}.steps.log"
     trace = buildtrace.logs_trace(
         inputs / "traces" / f"{name}.ninja_log",
         inputs / "traces" / f"{name}.ccache-stats.log",
         facts,
+        steps if steps.exists() else None,
     )
     (out / f"{name}.html").write_text(buildtrace.html(trace, f"vLLM build: {name}"))
     ninja = trace["otherData"]["ninja"]
