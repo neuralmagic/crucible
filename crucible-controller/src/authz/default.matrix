@@ -1,0 +1,128 @@
+# Generated from default.cedar by authz::policy::tests::the_access_matrix_is_the_pinned_one.
+# Review the diff, then accept it with CONTROLLER_UPDATE_POLICY_MATRIX=1.
+platform:read: platform-user
+platform:create: admin only, unbound
+platform:update: admin only
+platform:delete: admin only, unbound
+platform:transfer: admin only, unbound
+platform:share: admin only, unbound
+platform:impersonate: admin only
+issue:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+issue:create: team-maintainer team-owner team-firing group-member user-owner
+issue:update: team-maintainer team-owner team-firing group-member user-owner share-editor platform-operator
+issue:delete: team-owner group-member user-owner
+issue:transfer: team-owner group-member user-owner
+issue:share: team-owner group-member user-owner
+issue:launch: team-member team-maintainer team-owner team-firing group-member user-owner share-launcher
+issue:approve: team-owner group-member user-owner
+repo:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+repo:create: team-maintainer team-owner team-firing group-member user-owner
+repo:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+repo:delete: team-owner group-member user-owner
+repo:transfer: team-owner group-member user-owner
+repo:share: team-owner group-member user-owner
+build:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+build:create: team-maintainer team-owner team-firing group-member user-owner
+build:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+build:delete: team-owner group-member user-owner
+build:transfer: team-owner group-member user-owner
+build:share: team-owner group-member user-owner
+run:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+run:create: team-maintainer team-owner team-firing group-member user-owner
+run:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+run:delete: team-owner group-member user-owner
+run:transfer: team-owner group-member user-owner
+run:share: team-owner group-member user-owner
+run:publish: team-owner group-member user-owner run-own-tree
+run:approve: team-maintainer team-owner team-firing group-member user-owner
+playbook:read: team-member team-maintainer team-owner team-firing public-blueprint group-member user-owner share-viewer platform-user run-own-tree
+playbook:create: team-maintainer team-owner team-firing group-member user-owner
+playbook:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+playbook:delete: team-owner group-member user-owner
+playbook:transfer: team-owner group-member user-owner
+playbook:share: team-owner group-member user-owner
+playbook:launch: team-member team-maintainer team-owner team-firing group-member user-owner share-launcher platform-user
+playbook_draft:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+playbook_draft:create: team-member team-maintainer team-owner team-firing group-member user-owner
+playbook_draft:update: team-member team-maintainer team-owner team-firing group-member user-owner share-editor
+playbook_draft:delete: team-maintainer team-owner team-firing group-member user-owner
+playbook_draft:transfer: team-owner group-member user-owner
+playbook_draft:share: team-owner group-member user-owner
+playbook_draft:launch: team-member team-maintainer team-owner team-firing group-member user-owner share-launcher
+playbook_draft:approve: team-maintainer team-owner team-firing group-member user-owner
+playbook_draft:publish: publisher-owner
+pack_import:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+pack_import:create: team-maintainer team-owner team-firing group-member user-owner
+pack_import:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+pack_import:delete: team-maintainer team-owner team-firing group-member user-owner
+pack_import:transfer: team-owner group-member user-owner
+pack_import:share: team-owner group-member user-owner
+pack_import:approve: team-maintainer team-owner team-firing group-member user-owner
+scope:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+scope:create: team-maintainer team-owner team-firing group-member user-owner
+scope:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+scope:delete: team-owner group-member user-owner
+scope:transfer: team-owner group-member user-owner
+scope:share: team-owner group-member user-owner
+scope:approve: team-owner group-member user-owner
+standing_launch:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+standing_launch:create: team-maintainer team-owner team-firing group-member user-owner
+standing_launch:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+standing_launch:delete: team-maintainer team-owner team-firing group-member user-owner
+standing_launch:transfer: team-owner group-member user-owner
+standing_launch:share: team-owner group-member user-owner
+standing_launch:launch: team-member team-maintainer team-owner team-firing group-member user-owner share-launcher
+one_shot:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+one_shot:create: team-member team-maintainer team-owner team-firing group-member user-owner
+one_shot:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+one_shot:delete: team-maintainer team-owner team-firing group-member user-owner
+one_shot:transfer: team-owner group-member user-owner
+one_shot:share: team-owner group-member user-owner
+secret:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+secret:create: team-maintainer team-owner team-firing group-member user-owner
+secret:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+secret:delete: team-owner group-member user-owner
+secret:transfer: team-owner group-member user-owner
+secret:share: team-owner group-member user-owner
+secret:bind: team-maintainer team-owner team-firing team-member-carried group-member user-owner share-editor
+secret:rotate: team-maintainer team-owner team-firing group-member user-owner
+model_provider:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer platform-user run-own-tree
+model_provider:create: team-maintainer team-owner team-firing group-member user-owner
+model_provider:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+model_provider:delete: team-owner group-member user-owner
+model_provider:transfer: team-owner group-member user-owner
+model_provider:share: team-owner group-member user-owner
+dispatch_target:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+dispatch_target:create: team-maintainer team-owner team-firing group-member user-owner
+dispatch_target:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+dispatch_target:delete: team-owner group-member user-owner
+dispatch_target:transfer: team-owner group-member user-owner
+dispatch_target:share: team-owner group-member user-owner
+dispatch_target:dispatch: team-member team-maintainer team-owner team-firing group-member user-owner platform-user
+api_key:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+api_key:create: team-maintainer team-owner team-firing group-member user-owner
+api_key:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+api_key:delete: team-owner group-member user-owner
+api_key:transfer: team-owner group-member user-owner
+api_key:share: team-owner group-member user-owner
+user_prefs:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer run-own-tree
+user_prefs:create: team-maintainer team-owner team-firing group-member user-owner
+user_prefs:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+user_prefs:delete: team-owner group-member user-owner
+user_prefs:transfer: team-owner group-member user-owner
+user_prefs:share: team-owner group-member user-owner
+policy_set:read: platform-user
+policy_set:create: admin only
+policy_set:update: admin only, unbound
+policy_set:delete: admin only, unbound
+policy_set:transfer: admin only, unbound
+policy_set:share: admin only, unbound
+policy_set:activate: admin only
+team:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer platform-user run-own-tree
+team:create: team-member team-maintainer team-owner team-firing team-outsider group-member user-owner other-user platform-user
+team:update: team-maintainer team-owner team-firing group-member user-owner share-editor
+team:delete: team-owner group-member user-owner
+team:transfer: team-owner group-member user-owner
+team:share: team-owner group-member user-owner
+team:manage-members: team-owner group-member user-owner
+autoresearch:access: platform-operator

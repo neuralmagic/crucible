@@ -225,7 +225,7 @@ impl Decision {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::authz::decision::*;
     use crate::authz::model::{Membership, Via};
     use std::collections::BTreeSet;
 

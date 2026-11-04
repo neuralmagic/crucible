@@ -1099,7 +1099,7 @@ pub async fn enforce(State(state): State<ApiState>, req: Request, next: Next) ->
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::authz::bindings::*;
     use std::collections::BTreeSet;
 
     #[test]

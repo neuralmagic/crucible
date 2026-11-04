@@ -54,4 +54,5 @@ changed = [
     "C-PRINCIPALS and C-TEAM-UX defer to C-ACT-AS",
     "C-OWNERSHIP, C-HIERARCHY, C-DECISION, and C-ENFORCEMENT name webhooks and their deliveries",
     "C-APPROVALS: a draft graduation binds the pack's digest, which for a pack saved on a base covers the flattened tree",
+    "C-POLICY default grants members create and update on playbook drafts and create on one-shots, and maintainers delete on drafts, standing launches, one-shots, and imports and approve on drafts and imports",
 ]

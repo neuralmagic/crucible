@@ -32,6 +32,32 @@ permit(principal, action, resource)
 when { resource.owner_kind == "team" && resource has owner_role && resource.owner_role == "owner" }
 unless { action == Action::"playbook_draft:publish" };
 
+@id("team-member-edit-drafts")
+permit(principal, action == Action::"playbook_draft:update", resource)
+when { resource.owner_kind == "team" && resource has owner_role };
+
+@id("team-member-create-drafts")
+permit(principal, action == Action::"playbook_draft:create", resource)
+when { resource.owner_kind == "team" && resource has owner_role };
+
+@id("team-member-one-shot")
+permit(principal, action == Action::"one_shot:create", resource)
+when { resource.owner_kind == "team" && resource has owner_role };
+
+@id("team-maintainer-delete")
+permit(principal, action in [Action::"playbook_draft:delete", Action::"standing_launch:delete", Action::"one_shot:delete", Action::"pack_import:delete"], resource)
+when {
+    resource.owner_kind == "team" && resource has owner_role
+    && ["maintainer", "owner"].contains(resource.owner_role)
+};
+
+@id("team-maintainer-promote")
+permit(principal, action in [Action::"playbook_draft:approve", Action::"pack_import:approve"], resource)
+when {
+    resource.owner_kind == "team" && resource has owner_role
+    && ["maintainer", "owner"].contains(resource.owner_role)
+};
+
 @id("everyone-read-platform")
 permit(principal is UserPrincipal, action in [Action::"platform:read", Action::"policy_set:read", Action::"team:read"], resource)
 when { resource.owner == "team:platform-administrators" };
