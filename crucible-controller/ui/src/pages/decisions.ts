@@ -69,14 +69,19 @@ export function parseCsv(text: string): string[][] {
   return rows;
 }
 
+/// The evidence policy with `scripts` also admitted, each by its exact URL.
+export function evidencePolicy(scripts: readonly string[]): string {
+  const scriptSrc = ["'unsafe-inline'", ...scripts].join(' ');
+  return `default-src 'none'; script-src ${scriptSrc}; style-src 'unsafe-inline'; img-src data:; font-src data:`;
+}
+
 /// The policy an untrusted evidence document runs under: inline script and style only, no network,
 /// images from data URIs. The frame around it adds `sandbox` without same-origin.
-export const EVIDENCE_CSP =
-  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; font-src data:";
+export const EVIDENCE_CSP = evidencePolicy([]);
 
 /// An HTML or SVG file as the `srcdoc` of a sandboxed frame, with the policy as its first element.
-export function sandboxedDocument(source: string, mediaType: string): string {
-  const policy = `<meta http-equiv="Content-Security-Policy" content="${EVIDENCE_CSP}">`;
+export function sandboxedDocument(source: string, mediaType: string, csp = EVIDENCE_CSP): string {
+  const policy = `<meta http-equiv="Content-Security-Policy" content="${csp}">`;
   if (mediaType === 'image/svg+xml') {
     return `<!doctype html><html><head>${policy}<style>html,body{margin:0}svg{max-width:100%;height:auto}</style></head><body>${source}</body></html>`;
   }
