@@ -45,10 +45,7 @@ export function inlineKind(path: string): InlineKind | null {
   return null;
 }
 
-/**
- * The inline kinds that read as text; an image is bytes and has no text rendering, and an HTML
- * report renders as a document rather than as its source.
- */
+/** The inline kinds shown as text; an image and an html page render as themselves. */
 export type TextKind = 'markdown' | 'json' | 'text';
 
 export function textKind(path: string): TextKind | null {

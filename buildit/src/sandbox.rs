@@ -6,7 +6,13 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow, bail};
 
-pub const EXCLUDED: [&str; 6] = [".git", ".mcp.json", ".claude", ".buildit", ".kube", ".jira"];
+pub const EXCLUDED: [&str; 5] = [".mcp.json", ".claude", ".buildit", ".kube", ".jira"];
+
+const GIT_DIR: &str = ".git";
+
+/// What a context keeps of a `.git` directory: enough for git to read the history, none of the
+/// config, hooks or logs.
+const GIT_KEPT: [&str; 6] = ["HEAD", "index", "objects", "packed-refs", "refs", "shallow"];
 
 pub const RESULTS_DIR: &str = ".buildit";
 
@@ -55,6 +61,9 @@ impl RelPath {
                         .ok_or_else(|| anyhow!("path {raw:?} is not utf-8"))?;
                     if EXCLUDED.contains(&part) {
                         bail!("path {raw:?} goes through {part}, which is never shipped");
+                    }
+                    if part == GIT_DIR {
+                        bail!("path {raw:?} goes into a .git directory");
                     }
                     parts.push(part);
                 }
@@ -232,7 +241,8 @@ fn copy_tree(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-// drops excluded names, special files, and links that resolve outside `root`
+// drops excluded names, special files, links that resolve outside `root`, and all of a .git
+// directory but GIT_KEPT
 pub fn sanitize(root: &Path) -> Result<()> {
     let real_root = root
         .canonicalize()
@@ -245,11 +255,12 @@ fn sanitize_in(real_root: &Path, dir: &Path) -> Result<()> {
         let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
         let ft = entry.file_type()?;
-        let excluded = entry
-            .file_name()
-            .to_str()
-            .is_some_and(|n| EXCLUDED.contains(&n));
-        if ft.is_dir() && !excluded {
+        let name = entry.file_name();
+        let excluded = name.to_str().is_some_and(|n| EXCLUDED.contains(&n));
+        if ft.is_dir() && name.to_str() == Some(GIT_DIR) {
+            trim_git(&path)?;
+            sanitize_in(real_root, &path)?;
+        } else if ft.is_dir() && !excluded {
             sanitize_in(real_root, &path)?;
         } else if ft.is_dir() {
             fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
@@ -267,11 +278,34 @@ fn sanitize_in(real_root: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
+fn trim_git(git: &Path) -> Result<()> {
+    for entry in fs::read_dir(git).with_context(|| format!("reading {}", git.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", git.display()))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| GIT_KEPT.contains(&n))
+        {
+            continue;
+        }
+        let path = entry.path();
+        tracing::info!("dropping {} from the build context", path.display());
+        if entry.file_type()?.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        }
+        .with_context(|| format!("removing {}", path.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::Path;
+    use std::process::Command;
 
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
 
@@ -346,7 +380,16 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let w = work.path();
         touch(&w.join("svc/Dockerfile"), "FROM x");
-        touch(&w.join("svc/.git/config"), "x");
+        for git in [
+            "config",
+            "HEAD",
+            "hooks/pre-commit",
+            "logs/HEAD",
+            "FETCH_HEAD",
+            "refs/heads/main",
+        ] {
+            touch(&w.join("svc/.git").join(git), "x");
+        }
         touch(&w.join("svc/sub/.mcp.json"), "x");
         touch(&w.join("secret"), "x");
         symlink("Dockerfile", w.join("svc/inner")).unwrap();
@@ -367,7 +410,13 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         names.sort();
-        assert_eq!(names, ["Dockerfile", "inner", "sub"]);
+        assert_eq!(names, [".git", "Dockerfile", "inner", "sub"]);
+        let mut git: Vec<String> = fs::read_dir(dest.join(".git"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        git.sort();
+        assert_eq!(git, ["HEAD", "refs"]);
         assert_eq!(
             fs::read_link(dest.join("inner")).unwrap(),
             Path::new("Dockerfile")
@@ -378,6 +427,81 @@ mod tests {
             .fetch_context(&name, &RelPath::parse("linked").unwrap(), &dest)
             .unwrap_err();
         assert!(err.to_string().contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn a_checkout_in_the_context_keeps_its_history_and_loses_its_credentials() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let repo = w.join("svc/repo");
+        touch(&repo.join("setup.py"), "print('hi')\n");
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "one"]);
+        git(&repo, &["tag", "v1.2.3"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://u:s3cret@example.com/r.git",
+            ],
+        );
+        git(
+            &repo,
+            &["config", "http.extraHeader", "Authorization: Bearer s3cret"],
+        );
+        touch(
+            &repo.join(".git/FETCH_HEAD"),
+            "abc\t\tbranch 'main' of s3cret\n",
+        );
+        touch(&repo.join(".git/hooks/post-checkout"), "s3cret");
+        let head = git(&repo, &["rev-parse", "HEAD"]);
+
+        let ws = Workspace::Local {
+            dir: w.to_path_buf(),
+        };
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("ctx");
+        ws.fetch_context(
+            &SandboxName::parse("sb").unwrap(),
+            &RelPath::parse("svc").unwrap(),
+            &dest,
+        )
+        .unwrap();
+
+        let shipped = dest.join("repo");
+        assert_eq!(git(&shipped, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&shipped, &["describe", "--tags"]), "v1.2.3");
+        assert_eq!(git(&shipped, &["status", "--porcelain"]), "");
+        let mut stack = vec![shipped.join(".git")];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let body = fs::read(&path).unwrap();
+                    assert!(
+                        !body.windows(6).any(|w| w == b"s3cret"),
+                        "{} carries the secret",
+                        path.display()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

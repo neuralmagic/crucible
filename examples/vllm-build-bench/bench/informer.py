@@ -5,6 +5,8 @@ outputs are stored under, and the build that fills and reuses them.
     informer.py caches                    the caches to declare to buildit, as JSON
     informer.py plan TREE --base IMAGE    the build key and env vllm-envs derives, as JSON
     informer.py build TREE --base IMAGE   build the tree's extensions; facts to /buildit/facts.json
+                    [--trace FILE]        and the build as a Chrome trace (buildtrace.py)
+                    [--no-shared]         without the shared cache /buildit/cache.json names
 
 `caches` is stdlib only and runs anywhere. `plan` and `build` run in the build, where vllm_envs
 is installed. A full build restores the outputs stored under its key, or compiles through ccache
@@ -31,6 +33,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+from buildtrace import Job, Line, Timeline, ccache_outcomes, chrome_trace, ninja_jobs, run_logged
 
 FACTS = Path("/buildit/facts.json")
 SHARED = Path("/buildit/cache.json")
@@ -231,10 +235,26 @@ def ccache_counts(stats: str) -> Facts:
     }
 
 
+@dataclass(frozen=True)
+class Compiled:
+    facts: Facts
+    jobs: list[Job]
+    outcomes: list[tuple[str, str]]
+    lines: list[Line]
+    started_ns: int
+
+
 def compile_tree(
-    tree: Path, arch_list: str, jobs: int, env: dict[str, str], scratch: Path, remote: Remote | None
-) -> Facts:
+    tree: Path,
+    arch_list: str,
+    jobs: int,
+    env: dict[str, str],
+    scratch: Path,
+    remote: Remote | None,
+    timeline: Timeline,
+) -> Compiled:
     (CMAKE / "deps").mkdir(parents=True, exist_ok=True)
+    stats_log = scratch / "ccache-stats.log"
     if remote is not None:
         os.environ["CCACHE_REMOTE_STORAGE"] = os.environ["CCACHE_SECONDARY_STORAGE"] = (
             remote.ccache_storage()
@@ -249,70 +269,117 @@ def compile_tree(
         "FETCHCONTENT_BASE_DIR": str(CMAKE / "deps"),
         "TORCH_CUDA_ARCH_LIST": arch_list,
         "MAX_JOBS": str(jobs),
+        "CCACHE_STATSLOG": str(stats_log),
     }
     run(["ccache", "-z"], tree)
     generated = CMAKE / "generated.tar"
-    restore_generated(tree, generated)
     saved = CMAKE / "manifest.json"
-    now = manifest(tree)
-    touched = touch_changed(tree, json.loads(saved.read_text()) if saved.exists() else {}, now)
+    with timeline.span("prepare") as span:
+        restore_generated(tree, generated)
+        now = manifest(tree)
+        touched = touch_changed(tree, json.loads(saved.read_text()) if saved.exists() else {}, now)
+        span["touched"] = len(touched)
     log = scratch / "build.log"
-    with log.open("w") as out:
-        built = subprocess.run(
+    with timeline.span("setup.py"):
+        started_ns = time.time_ns()
+        returncode, printed = run_logged(
             ["python3", "setup.py", "build_ext", "--inplace", "--build-temp", str(CMAKE / "build")],
-            cwd=tree,
-            stdout=out,
-            stderr=subprocess.STDOUT,
+            tree,
+            dict(os.environ),
+            log,
         )
-    lines = log.read_text(errors="replace").splitlines()
-    if built.returncode != 0:
+    lines = [line.text for line in printed]
+    if returncode != 0:
         errors = [s for s in lines if ERRORS.search(s) and "deprecat" not in s.lower()]
         raise Failed("\n".join(errors[:25] + lines[-20:]))
-    saved.write_text(json.dumps(now))
-    save_generated(tree, generated)
+    with timeline.span("save"):
+        saved.write_text(json.dumps(now))
+        save_generated(tree, generated)
     configured = [float(m) for s in lines for m in CONFIGURED.findall(s)]
-    return ccache_counts(run(["ccache", "--print-stats"], tree)) | {
+    facts = ccache_counts(run(["ccache", "--print-stats"], tree)) | {
         "configure_s": configured[-1] if configured else None,
         "touched": len(touched),
     }
+    jobs_run = ninja_jobs(CMAKE / "build", started_ns)
+    return Compiled(facts, jobs_run, ccache_outcomes(stats_log), printed, started_ns)
 
 
-def restore(tree: Path, stored: Path, remote: Remote | None) -> str | None:
+def restore(tree: Path, stored: Path, remote: Remote | None, timeline: Timeline) -> str | None:
     """Restore the outputs stored at STORED, from the local store or the shared one: `hit`,
     `remote-hit`, or None when neither has them."""
-    if stored.exists():
-        untar(stored, tree, keep_existing=False)
-        return "hit"
-    if remote is not None and remote.fetch(stored.name, stored):
-        untar(stored, tree, keep_existing=False)
-        return "remote-hit"
-    return None
+    found = "hit" if stored.exists() else None
+    if found is None and remote is not None:
+        with timeline.span("fetch") as span:
+            found = "remote-hit" if remote.fetch(stored.name, stored) else None
+            span["found"] = found is not None
+    if found is not None:
+        with timeline.span("untar", bytes=stored.stat().st_size):
+            untar(stored, tree, keep_existing=False)
+    return found
+
+
+def tree_bytes(root: Path) -> int:
+    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file() and not p.is_symlink())
 
 
 def build(
-    tree: Path, base: str, arch_list: str, jobs: int, mode: str, remote: Remote | None
+    tree: Path,
+    base: str,
+    arch_list: str,
+    jobs: int,
+    mode: str,
+    remote: Remote | None,
+    trace: Path | None = None,
 ) -> Facts:
-    started = time.time()
+    timeline = Timeline()
     facts: Facts = {"mode": mode, "store": "off", "shared": shared_mode(remote)}
+    compiled = Compiled({}, [], [], [], 0)
+    sizes: dict[str, object] = {}
     if mode == "full":
-        planned = plan(tree, base, arch_list)
+        with timeline.span("plan"):
+            planned = plan(tree, base, arch_list)
         stored = STORE / f"{planned.key}.tar"
         facts |= {"key": planned.key, "src_dirs": sorted(planned.env)}
         STORE.mkdir(parents=True, exist_ok=True)
-        if restored := restore(tree, stored, remote):
+        if restored := restore(tree, stored, remote, timeline):
             facts["store"] = restored
         else:
             with tempfile.TemporaryDirectory() as tmp:
                 scratch = Path(tmp)
                 stamp = scratch / "stamp"
                 stamp.touch()
-                facts |= compile_tree(tree, arch_list, jobs, planned.env, scratch, remote)
-                outputs = written_since(tree, "vllm", stamp)
-            tar_into(stored, tree, outputs)
+                compiled = compile_tree(tree, arch_list, jobs, planned.env, scratch, remote, timeline)
+                facts |= compiled.facts
+                with timeline.span("collect"):
+                    outputs = written_since(tree, "vllm", stamp)
+            with timeline.span("tar"):
+                tar_into(stored, tree, outputs)
             facts |= {"store": "miss", "outputs": len(outputs)}
+            sizes["outputs"] = sorted(
+                ({"path": p, "bytes": (tree / p).stat().st_size} for p in outputs),
+                key=lambda o: -int(o["bytes"]),
+            )
             if remote is not None:
-                facts["published"] = remote.publish(stored.name, stored)
-    facts["build_s"] = round(time.time() - started, 1)
+                with timeline.span("publish", bytes=stored.stat().st_size) as span:
+                    facts["published"] = span["result"] = remote.publish(stored.name, stored)
+        if stored.exists():
+            sizes["store_bytes"] = stored.stat().st_size
+        sizes["ccache_bytes"] = tree_bytes(CCACHE) if CCACHE.is_dir() else 0
+    facts["build_s"] = round((time.time_ns() - timeline.origin_ns) / 1e9, 1)
+    traced = chrome_trace(
+        timeline,
+        compiled.jobs,
+        compiled.outcomes,
+        {"facts": dict(facts), "sizes": sizes},
+        compiled.lines,
+        compiled.started_ns or None,
+    )
+    meta = traced["otherData"]
+    assert isinstance(meta, dict)
+    if timeline.spans:
+        facts |= {"phases_s": meta["phases_s"], "ninja": meta["ninja"], "quiet": meta["quiet"][:3]}
+    if trace is not None:
+        trace.write_text(json.dumps(traced, separators=(",", ":")))
     return facts
 
 
@@ -340,6 +407,10 @@ def main(argv: list[str]) -> int:
         if name == "build":
             cmd.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
             cmd.add_argument("--mode", choices=("full", "derive"), default="full")
+            cmd.add_argument("--trace", type=Path, help="write the build as a Chrome trace here")
+            cmd.add_argument(
+                "--no-shared", action="store_true", help="build without the shared cache"
+            )
     args = parser.parse_args(argv)
     match args.command:
         case "caches":
@@ -348,8 +419,10 @@ def main(argv: list[str]) -> int:
             print(json.dumps(asdict(plan(args.tree, args.base, args.arch_list))))
         case _:
             try:
-                remote = Remote.load(SHARED)
-                facts = build(args.tree, args.base, args.arch_list, args.jobs, args.mode, remote)
+                remote = None if args.no_shared else Remote.load(SHARED)
+                facts = build(
+                    args.tree, args.base, args.arch_list, args.jobs, args.mode, remote, args.trace
+                )
                 write_facts(facts)
             except Failed as e:
                 print(e, file=sys.stderr)

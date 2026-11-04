@@ -61,6 +61,10 @@ To write a report that renders here, put everything in one file: scripts and sty
 images as `data:` URIs or inline SVG, fonts as `data:` URIs. Inline the chart library, or load
 it from the allowlist with the URL exactly as listed.
 
+The view adds a `<style id="flow-theme-bridge">` at the end of the document's `<head>`. It sets
+the app's `--flow-*` CSS variables and `color-scheme`, so a report that styles itself with
+those variables follows the light or dark theme. A document without a `</head>` gets no bridge.
+
 Decision evidence is stricter. [RFC-0002](./rfc/RFC-0002.md#rfc-0002c-decision-evidence)
 forbids every network request from it, so the allowlist does not apply there.
 

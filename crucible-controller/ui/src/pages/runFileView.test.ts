@@ -148,8 +148,8 @@ describe('inlineKind', () => {
     expect(inlineKind('chart.png')).toBe('image');
     expect(inlineKind('photo.JPEG')).toBe('image');
     expect(inlineKind('diagram.svg')).toBe('image');
-    expect(inlineKind('CAMPAIGN.html')).toBe('html');
-    expect(inlineKind('report.HTM')).toBe('html');
+    expect(inlineKind('build-trace.html')).toBe('html');
+    expect(inlineKind('REPORT.HTM')).toBe('html');
     expect(inlineKind('bundle.tar.gz')).toBeNull();
     expect(inlineKind('Makefile')).toBeNull();
     expect(inlineKind('dir.d/README')).toBeNull();
@@ -256,7 +256,7 @@ describe('textKind', () => {
   it('drops images so a text surface never gets bytes', () => {
     expect(textKind('a.md')).toBe('markdown');
     expect(textKind('a.png')).toBeNull();
-    expect(textKind('a.html')).toBeNull();
+    expect(textKind('trace.html')).toBeNull();
     expect(textKind('a.bin')).toBeNull();
   });
 });
