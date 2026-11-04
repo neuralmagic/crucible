@@ -42,7 +42,7 @@ def mcp(method: str, params: dict, rid: int) -> dict:
     return reply["result"]
 
 
-def open_draft_pr(repo: str, base: str, head: str, title: str, body: str) -> dict:
+def open_pr(repo: str, base: str, head: str, title: str, body: str) -> dict:
     mcp(
         "initialize",
         {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "git-smoke", "version": "1"}},
@@ -50,11 +50,11 @@ def open_draft_pr(repo: str, base: str, head: str, title: str, body: str) -> dic
     )
     result = mcp(
         "tools/call",
-        {"name": "open_draft_pr", "arguments": {"repo": repo, "base": base, "head": head, "title": title, "body": body}},
+        {"name": "open_pr", "arguments": {"repo": repo, "base": base, "head": head, "title": title, "body": body}},
         2,
     )
     if result.get("isError"):
-        raise RuntimeError(f"open_draft_pr: {result['content']}")
+        raise RuntimeError(f"open_pr: {result['content']}")
     return json.loads(result["content"][0]["text"])
 
 
@@ -74,7 +74,7 @@ def push(args: argparse.Namespace) -> None:
             "commit", "-q", "--allow-empty", "-m", f"crucible-git smoke ({run}, {args.who})", cwd=tmp)
         sha = git("rev-parse", "HEAD", cwd=tmp)
         git("push", "-q", "origin", branch, cwd=tmp)
-    pr = open_draft_pr(repo, base, branch, f"crucible-git smoke: {args.who}", f"Opened by run {run}'s {args.who} through crucible-git.")
+    pr = open_pr(repo, base, branch, f"crucible-git smoke: {args.who}", f"Opened by run {run}'s {args.who} through crucible-git.")
     out = {"branch": branch, "sha": sha, "pr": pr["url"]}
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(out, indent=2) + "\n")
@@ -97,9 +97,9 @@ def check(args: argparse.Namespace) -> None:
         heads = git("ls-remote", remote(repo), f"refs/heads/{ev['branch']}").split()
         if not heads or heads[0] != ev["sha"]:
             failures.append(f"{path}: {ev['branch']} is {heads[:1]} on GitHub, not {ev['sha']}")
-        again = open_draft_pr(repo, base, ev["branch"], "unused", "unused")
-        if not again["existing"] or again["url"] != ev["pr"]:
-            failures.append(f"{path}: open_draft_pr did not find {ev['pr']} again: {again}")
+        again = open_pr(repo, base, ev["branch"], "unused", "unused")
+        if not again["existing"] or again["url"] != ev["pr"] or not again["draft"]:
+            failures.append(f"{path}: open_pr did not find {ev['pr']} again: {again}")
         prs.append(ev["pr"])
     print(json.dumps({"pass": not failures, "score": 1.0 if not failures else 0.0, "prs": prs, "failures": failures}))
 

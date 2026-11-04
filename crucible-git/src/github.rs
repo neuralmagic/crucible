@@ -82,8 +82,8 @@ impl GitHub {
         )
     }
 
-    /// The open pull request into `repo` from `head` (`owner:branch`), or a new draft one.
-    pub async fn open_draft_pr(&self, pr: &DraftPr<'_>) -> Result<OpenedPr> {
+    /// The open pull request into `repo` from `head` (`owner:branch`), or a new one.
+    pub async fn open_pr(&self, pr: &NewPr<'_>) -> Result<OpenedPr> {
         let token = self.token().await?;
         let pulls = self
             .api
@@ -102,6 +102,7 @@ impl GitHub {
             return Ok(OpenedPr {
                 url: found.html_url,
                 number: found.number,
+                draft: found.draft,
                 existing: true,
             });
         }
@@ -112,15 +113,16 @@ impl GitHub {
                     "body": pr.body,
                     "head": pr.head,
                     "base": pr.base,
-                    "draft": true,
+                    "draft": pr.draft,
                 })),
                 &token,
             )
             .await
-            .context("opening the draft pull request")?;
+            .context("opening the pull request")?;
         Ok(OpenedPr {
             url: created.html_url,
             number: created.number,
+            draft: created.draft,
             existing: false,
         })
     }
@@ -149,7 +151,7 @@ impl GitHub {
     }
 }
 
-pub struct DraftPr<'a> {
+pub struct NewPr<'a> {
     /// `owner/name` the pull request is opened on.
     pub repo: &'a str,
     pub base: &'a str,
@@ -157,12 +159,14 @@ pub struct DraftPr<'a> {
     pub head: &'a str,
     pub title: &'a str,
     pub body: &'a str,
+    pub draft: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct OpenedPr {
     pub url: String,
     pub number: u64,
+    pub draft: bool,
     /// The pull request was already open, so nothing was created.
     pub existing: bool,
 }
@@ -171,4 +175,6 @@ pub struct OpenedPr {
 struct Pull {
     html_url: String,
     number: u64,
+    #[serde(default)]
+    draft: bool,
 }

@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!   sandbox ──run token──▶ --bind        ─┐  /git/<owner>/<repo>.git/…  ─▶ github.com
-//!   task    ──────────────▶ --local-bind ─┘  /mcp  open_draft_pr        ─▶ api.github.com
+//!   task    ──────────────▶ --local-bind ─┘  /mcp  open_pr              ─▶ api.github.com
 //! ```
 
 mod github;

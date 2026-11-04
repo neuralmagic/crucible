@@ -1,7 +1,7 @@
-//! The MCP endpoint: one tool, `open_draft_pr`.
+//! The MCP endpoint: one tool, `open_pr`.
 
 use crate::SCOPE_WRITE;
-use crate::github::{DraftPr, GitHub};
+use crate::github::{GitHub, NewPr};
 use axum::Router;
 use crucible_mcp_auth::access::{AccessCheck, AccessRules, Call};
 use crucible_mcp_auth::guard::PolicyGuard;
@@ -26,8 +26,7 @@ impl AccessRules for GitRules {
     fn scopes(&self, call: &Call<'_>) -> Result<&'static [&'static str], Refusal> {
         match call {
             Call::Tool {
-                name: "open_draft_pr",
-                ..
+                name: "open_pr", ..
             } => Ok(&[SCOPE_WRITE]),
             _ => Err(call.unserved()),
         }
@@ -39,7 +38,7 @@ impl AccessRules for GitRules {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct OpenDraftPrParams {
+pub struct OpenPrParams {
     /// The repository to open it on, `owner/name`.
     pub repo: String,
     /// The branch it merges into.
@@ -49,6 +48,13 @@ pub struct OpenDraftPrParams {
     pub title: String,
     #[serde(default)]
     pub body: String,
+    /// Open it as a draft. Default true.
+    #[serde(default = "yes")]
+    pub draft: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 #[derive(Clone)]
@@ -59,14 +65,12 @@ pub struct GitMcp {
 #[tool_router]
 impl GitMcp {
     #[tool(
-        description = "Open a draft pull request (params: repo, base, head, title, body) as the \
-        run's GitHub App, or return the one already open from head into base. Push head first \
-        through this server's /git/<owner>/<repo>.git. Returns url, number and existing."
+        description = "Open a pull request (params: repo, base, head, title, body, draft) as the \
+        run's GitHub App, a draft unless draft is false, or return the one already open from \
+        head into base. Push head first through this server's /git/<owner>/<repo>.git. Returns \
+        url, number, draft and existing."
     )]
-    async fn open_draft_pr(
-        &self,
-        Parameters(p): Parameters<OpenDraftPrParams>,
-    ) -> Result<String, String> {
+    async fn open_pr(&self, Parameters(p): Parameters<OpenPrParams>) -> Result<String, String> {
         let owner = p.repo.split_once('/').map(|(o, _)| o).unwrap_or_default();
         if owner.is_empty() {
             return Err(format!("repo {:?} is not owner/name", p.repo));
@@ -77,12 +81,13 @@ impl GitMcp {
         };
         let opened = self
             .gh
-            .open_draft_pr(&DraftPr {
+            .open_pr(&NewPr {
                 repo: &p.repo,
                 base: &p.base,
                 head: &head,
                 title: &p.title,
                 body: &p.body,
+                draft: p.draft,
             })
             .await
             .map_err(|e| format!("{e:#}"))?;

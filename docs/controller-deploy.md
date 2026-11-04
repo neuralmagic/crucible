@@ -376,7 +376,7 @@ oc create secret generic crucible-agent-signing-key --from-file=agent-signing.pe
 ```
 
 `[git]` starts `crucible-git` in the loop pod of each run on `clusters`. It proxies git's
-smart-HTTP protocol to GitHub and serves one MCP tool, `open_draft_pr`, both with the run's minted
+smart-HTTP protocol to GitHub and serves one MCP tool, `open_pr`, both with the run's minted
 GitHub App token, which it reads from its file on every request. A run gets the token by binding a
 `mint://github-app/<owner>` secret as a file; the controller names that file to the loop pod in
 `CRUCIBLE_GITHUB_TOKEN_FILE`. Sandboxes reach `crucible-git` at `url` with run tokens, so git there
