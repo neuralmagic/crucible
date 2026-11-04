@@ -35,7 +35,11 @@ pub fn configured(profile: &DeployProfile) -> Option<(&BuilditCfg, &BuilditCache
 pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
     let (buildit, cache) = configured(profile).ok_or(MissingCacheTable)?;
     let namespace = profile.cluster.loop_namespace.as_str();
-    let image = cache.image.as_deref().unwrap_or(&profile.image.loop_image);
+    let image = cache
+        .image
+        .as_deref()
+        .or(buildit.image.as_deref())
+        .unwrap_or(&profile.image.loop_image);
     let image = pin_image(opts.digests.as_deref(), "buildit cache image", image)?;
     let docs = [
         yaml(&claim(cache, namespace)),
@@ -450,6 +454,27 @@ mod tests {
         let c = &kind(&docs, "Deployment")["spec"]["template"]["spec"]["containers"][0];
         assert_eq!(c["image"], "registry.example.com/buildit:1");
         assert_eq!(c["args"][8], "180");
+    }
+
+    #[test]
+    fn the_cache_runs_the_buildit_image_unless_it_names_its_own() {
+        let image = |extra: &str| {
+            kind(&docs(extra), "Deployment")["spec"]["template"]["spec"]["containers"][0]["image"]
+                .clone()
+        };
+        let pinned = "image = \"registry.example.com/crucible-buildit:2\"\n";
+        let cache = "[buildit.cache]\ntoken_secret = \"t\"\n";
+        assert_eq!(image(cache), "registry.example.com/crucible-loop:latest");
+        assert_eq!(
+            image(&format!("{pinned}{cache}")),
+            "registry.example.com/crucible-buildit:2"
+        );
+        assert_eq!(
+            image(&format!(
+                "{pinned}{cache}image = \"registry.example.com/buildit:1\"\n"
+            )),
+            "registry.example.com/buildit:1"
+        );
     }
 
     #[test]

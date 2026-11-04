@@ -33,9 +33,12 @@ that allows overlay mounts in a user namespace (5.13 and later).
   with `setup.py build_ext --inplace`. Nothing in it knows about buildit or caching. `build/` is the
   build context: buildit ships a subdirectory of the workspace, never the workspace root.
 - The agent builds it once as checked out, then edits one CUDA kernel at a time and builds again,
-  three times. Every `build` call names the same buildit caches: ccache's directory, vLLM's
-  FetchContent sources (`.deps`) and its CMake build dir. buildit keeps them in the sandbox's
-  builder pod between builds, so an edit recompiles what it touched and nothing else.
+  three times. Every `build` call names the same buildit caches: ccache's directory and vLLM's
+  FetchContent sources (`.deps`). buildit keeps them in the sandbox's builder pod between builds,
+  so each build configures afresh and ccache serves every object an edit did not touch. The
+  CMake build dir is not cached: configure writes generated kernels such as Marlin's
+  `kernel_selector.h` into the source tree, which every build replaces, and a cached build dir
+  records them as already generated.
 - The calls also set `ccache: true`. buildit then mounts a generated `/etc/ccache.conf` into every
   `RUN` step: the shared cache as ccache's remote storage, so a first build in a new pod starts
   from objects other runs compiled, and a per-object log at `/buildit/ccache-stats.log`.
