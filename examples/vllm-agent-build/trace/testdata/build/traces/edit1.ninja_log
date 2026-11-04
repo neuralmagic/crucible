@@ -1,0 +1,25 @@
+# ninja log v7
+5	9	1793823972602845980	/src/vllm/build/temp.linux-x86_64-cpython-312/CMakeFiles/cmake.verify_globs	92c38bf4f39a7995
+12	39	1793823972609845430	CMakeFiles/spinloop.dir/csrc/spinloop.cpp.o	1a19494bc92a7e06
+13	43	1793823972610845352	CMakeFiles/fs_io_C.dir/csrc/fs_io.cpp.o	a112c7a1a24e068e
+13	45	1793823972610845352	CMakeFiles/cumem_allocator.dir/csrc/cumem_allocator.cpp.o	96352c7d9db90df1
+14	47	1793823972611845273	CMakeFiles/_C_stable_libtorch.dir/csrc/cuda_utils_kernels.cu.o	ef039d1e835a32ee
+13	58	1793823972610845352	CMakeFiles/_C_stable_libtorch.dir/csrc/torch_bindings.cpp.o	60302f1a6ce04b7d
+20	77	1793823972617844801	CMakeFiles/_C_stable_libtorch.dir/csrc/custom_all_gather_reduce_scatter_ops.cpp.o	c52582cfaf759ac4
+33	99	1793823972630843780	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_float16_fe2m1f_float16.cu.o	361ff55848304042
+34	100	1793823972631843701	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_float16_u4_float16.cu.o	f3258ae1ab08e615
+35	101	1793823972632843623	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_float16_u8b128_float16.cu.o	1fdff085f6b484cb
+33	103	1793823972630843780	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_float16_fe4m3fn_float16.cu.o	4ab3baecdac4d8be
+34	104	1793823972631843701	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_float16_u4b8_float16.cu.o	efd5ebfd8f9767c9
+36	105	1793823972633843544	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_s8_u4b8_float16.cu.o	c40772a60875e83b
+38	106	1793823972635843387	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_bfloat16_u4_bfloat16.cu.o	203c1def45c60be9
+38	107	1793823972635843387	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_bfloat16_u4b8_bfloat16.cu.o	d73066668d417412
+35	108	1793823972632843623	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_s8_u4_float16.cu.o	c766425686cbab6a
+36	109	1793823972634843465	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_bfloat16_fe2m1f_bfloat16.cu.o	4c346a378456db3d
+47	109	1793823972644842679	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm75_kernel_float16_fe2m1f_float16.cu.o	fd71e0d6a842e58c
+46	111	1793823972643842758	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_s8_u4b8_bfloat16.cu.o	5fef6aba5a1d1c1b
+44	114	1793823972641842915	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_s8_u4_bfloat16.cu.o	2861a1c35cb0ebc3
+42	116	1793823972639843072	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_bfloat16_u8b128_bfloat16.cu.o	87db1682fc7cbd60
+37	122	1793823972634843465	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_bfloat16_fe4m3fn_bfloat16.cu.o	ed9935130eae4d04
+59	123	1793823972656841736	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm75_kernel_float16_fe4m3fn_float16.cu.o	8050f241f8e3b067
+14	133	1793823972611845273	CMakeFiles/_C_stable_libtorch.dir/csrc/ngram_embedding_kernels.cu.o	bfd29aab9dee71f2

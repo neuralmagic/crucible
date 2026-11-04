@@ -24,7 +24,7 @@ for b in report["builds"]:
     (out / f"{name}.html").write_text(buildtrace.html(trace, f"vLLM build: {name}"))
     ninja = trace["otherData"]["ninja"]
     rows.append((name, b.get("seconds"), ninja["ninja_s"], ninja["jobs"]))
-    print(f"traces/{name}.html: {ninja}")
+    print(f"traces/{name}.html: {ninja}", file=sys.stderr)
 
 def cell(text: object) -> str:
     return f"<td>{html.escape(str(text))}</td>"
@@ -51,4 +51,14 @@ body = "".join(
     "<tr><th>Build</th><th>Build call</th><th>ninja</th><th>Jobs by result</th></tr>"
     f"{body}</table><p style='color:var(--flow-muted)'>Each build's trace is"
     " traces/&lt;build&gt;.html in the run's captured files.</p></body></html>"
+)
+print(
+    json.dumps(
+        {
+            "builds": [
+                {"name": name, "seconds": seconds, "ninja_s": ninja_s, "jobs": jobs}
+                for name, seconds, ninja_s, jobs in rows
+            ]
+        }
+    )
 )
