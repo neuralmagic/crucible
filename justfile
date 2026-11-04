@@ -232,7 +232,7 @@ optimize-loop context ctl_ns gpu="false" rounds="3" min_speedup="5":
 # examples/vllm-build-bench's replay and informer against real git checkouts and a C++ compiler,
 # and the pack compiled to its step chain.
 vllm-build-bench-test:
-    cargo build -q -p buildit
+    cargo test -q -p buildit --test vllm_build_bench
     SQLX_OFFLINE=true cargo test -q -p crucible --test vllm_build_bench_example
 
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through

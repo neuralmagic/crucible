@@ -1,10 +1,9 @@
-//! The vllm-build-bench example pack compiles to its step chain, and its replay suite passes.
+//! The vllm-build-bench example pack compiles to its step chain.
 
 use crucible::plan::ir::TaskKind;
 use crucible::plan::starlark::compile_file_with;
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 const STEPS: [&str; 7] = [
     "clean",
@@ -42,35 +41,5 @@ fn the_vllm_build_bench_example_compiles_to_a_chain_of_steps_and_a_report() {
     assert_eq!(
         compiled.workflow.result.as_ref().map(|r| r.0.as_str()),
         Some("report")
-    );
-}
-
-#[test]
-fn the_vllm_build_bench_replay_suite_passes() {
-    let bench = Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples/vllm-build-bench/bench");
-    let beside_tests = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("buildit")));
-    let candidates: Vec<PathBuf> = std::env::var_os("BUILDIT_BIN")
-        .map(PathBuf::from)
-        .into_iter()
-        .chain(beside_tests)
-        .chain([Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/debug/buildit")])
-        .collect();
-    let buildit = candidates
-        .iter()
-        .find(|p| p.is_file())
-        .unwrap_or_else(|| panic!("no buildit binary in {candidates:?}: cargo build -p buildit"));
-    let out = Command::new("python3")
-        .args(["-m", "unittest", "discover", "-s"])
-        .arg(&bench)
-        .env("BUILDIT_BIN", buildit)
-        .output()
-        .expect("python3 runs");
-    assert!(
-        out.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
     );
 }
