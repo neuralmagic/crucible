@@ -53,6 +53,7 @@ fn pack(tag: &str) -> PathBuf {
         dir.join("crucible.toml"),
         format!(
             r#"
+edition = 2
 [repo]
 path = "."
 [workspace]
@@ -65,6 +66,7 @@ goal = "audit every target"
 [workflow]
 type = "playbook"
 file = "workflow.star"
+env = ["LEDGER"]
 "#,
             agent.display()
         ),

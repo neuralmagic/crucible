@@ -1,3 +1,4 @@
+use crate::openshell::endpoint::{Access, Endpoint};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
@@ -89,7 +90,7 @@ pub fn resolve_broker_url(cfg: &BrokerCfg, host: &str) -> String {
 /// Derived from the resolved broker URL's authority so the allowlist and the URL the sandbox
 /// actually contacts can never disagree (the bug this replaces: computing them independently
 /// let an explicit `[agent.broker].url` override reach a host the allowlist didn't name).
-pub fn broker_endpoint_from_url(url: &str) -> Result<String> {
+pub fn broker_endpoint_from_url(url: &str) -> Result<Endpoint> {
     // Strip scheme to get `host[:port]/path…`.
     let authority = url
         .strip_prefix("https://")
@@ -127,7 +128,7 @@ pub fn broker_endpoint_from_url(url: &str) -> Result<String> {
     } else {
         (host_port, default_port)
     };
-    Ok(format!("{host}:{port}:full"))
+    Ok(Endpoint::l4(host, port, Access::Full))
 }
 
 #[cfg(test)]
@@ -179,13 +180,13 @@ mod tests {
         let cfg = BrokerCfg::default();
         let url = resolve_broker_url(&cfg, "host.containers.internal");
         assert_eq!(
-            broker_endpoint_from_url(&url).unwrap(),
+            broker_endpoint_from_url(&url).unwrap().to_string(),
             "host.containers.internal:8849:full"
         );
         // Same for the kubernetes driver host.
         let url = resolve_broker_url(&cfg, "host.openshell.internal");
         assert_eq!(
-            broker_endpoint_from_url(&url).unwrap(),
+            broker_endpoint_from_url(&url).unwrap().to_string(),
             "host.openshell.internal:8849:full"
         );
     }
@@ -193,7 +194,9 @@ mod tests {
     #[test]
     fn broker_endpoint_from_url_explicit_override_with_port() {
         assert_eq!(
-            broker_endpoint_from_url("http://broker.example:9000/mcp").unwrap(),
+            broker_endpoint_from_url("http://broker.example:9000/mcp")
+                .unwrap()
+                .to_string(),
             "broker.example:9000:full"
         );
     }
@@ -201,7 +204,9 @@ mod tests {
     #[test]
     fn broker_endpoint_from_url_https_no_port() {
         assert_eq!(
-            broker_endpoint_from_url("https://broker.example/mcp").unwrap(),
+            broker_endpoint_from_url("https://broker.example/mcp")
+                .unwrap()
+                .to_string(),
             "broker.example:443:full"
         );
     }
@@ -209,7 +214,9 @@ mod tests {
     #[test]
     fn broker_endpoint_from_url_http_no_port() {
         assert_eq!(
-            broker_endpoint_from_url("http://broker.example/mcp").unwrap(),
+            broker_endpoint_from_url("http://broker.example/mcp")
+                .unwrap()
+                .to_string(),
             "broker.example:80:full"
         );
     }
@@ -247,11 +254,15 @@ mod tests {
     fn broker_endpoint_from_url_handles_bracketed_ipv6() {
         // The bracket case is the one place a colon is not a port separator.
         assert_eq!(
-            broker_endpoint_from_url("http://[::1]:8849/mcp").unwrap(),
+            broker_endpoint_from_url("http://[::1]:8849/mcp")
+                .unwrap()
+                .to_string(),
             "[::1]:8849:full"
         );
         assert_eq!(
-            broker_endpoint_from_url("https://[::1]/mcp").unwrap(),
+            broker_endpoint_from_url("https://[::1]/mcp")
+                .unwrap()
+                .to_string(),
             "[::1]:443:full"
         );
     }

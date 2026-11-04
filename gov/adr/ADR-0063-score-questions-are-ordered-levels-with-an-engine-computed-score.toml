@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0063"
 title = "Score questions are ordered levels with an engine-computed score"
-status = "proposed"
+status = "accepted"
 date = "2026-10-07"
 refs = [
     "RFC-0001:C-ROUTE",

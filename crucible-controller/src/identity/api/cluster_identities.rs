@@ -3,7 +3,7 @@
 //! cannot be changed here; a link cluster's name is only ever that cluster's own answer.
 
 use crate::api::dto::{bad_request, conflict, not_found, unavailable};
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiError, ApiResult, ApiState, ErrorBody, Json};
 use crate::identity::auth::{AuthPath, Subject};
 use crate::identity::cluster_identity::{self, Person, Resolution, Source};
 use crate::identity::cluster_link::{Callback, LinkFlowError};
@@ -236,7 +236,7 @@ async fn link_target(
     state: &ApiState,
     subject: &Subject,
     cluster: &str,
-) -> Result<Result<LinkTarget, Response>, AppError> {
+) -> Result<Result<LinkTarget, Response>, ApiError> {
     let Some(sub) = subject.as_deref() else {
         return Ok(Err(no_subject()));
     };
@@ -276,7 +276,7 @@ async fn link_target(
 pub(crate) async fn list_my_cluster_identities(
     State(state): State<ApiState>,
     subject: Subject,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(sub) = subject.as_deref() else {
         return Ok(no_subject());
     };
@@ -297,7 +297,7 @@ pub(crate) async fn list_my_cluster_identities(
 
 /// Whether this controller links cluster usernames at all: it serves people's tokens, or links
 /// clusters through OAuth. Without either, the list is empty and the writes are not served.
-fn link_refused(e: LinkError) -> Result<Response, AppError> {
+fn link_refused(e: LinkError) -> ApiResult<Response> {
     match e {
         LinkError::Unreachable { cluster, detail } => {
             tracing::warn!(
@@ -332,7 +332,7 @@ pub(crate) async fn link_by_token(
     path: AuthPath,
     Path(cluster): Path<String>,
     Json(body): Json<LinkBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if path == AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -372,7 +372,7 @@ pub(crate) async fn unlink(
     subject: Subject,
     path: AuthPath,
     Path(cluster): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if path == AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -411,7 +411,7 @@ pub(crate) async fn start_oauth_link(
     session: Session,
     Path(cluster): Path<String>,
     Json(body): Json<LinkStartBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if path != AuthPath::Session {
         return Ok(browser_only());
     }
@@ -470,7 +470,7 @@ pub(crate) async fn oauth_link_callback(
     session: Session,
     Path(cluster): Path<String>,
     Query(callback): Query<Callback>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let refused = |page: Option<&str>, e: LinkFlowError| {
         tracing::info!(cluster, reason = %e, "cluster link refused");
         land(page, &[("link_error", e.code())])
@@ -528,7 +528,7 @@ mod tests {
     use crate::identity::auth::AuthPath;
     use crate::identity::cluster_link::testing::{EXTERNAL, Fleet, authorize_in_browser, fleet};
     use crate::identity::kube_links::testing::Clusters;
-    use crate::identity::session::{IdentitySource, Resolved};
+    use crate::identity::session::Resolved;
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use serde_json::{Value, json};
@@ -536,11 +536,6 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use tower::ServiceExt;
-
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
 
     const SUB: &str = "sub-alice";
 
@@ -620,7 +615,7 @@ openshift = ["ocp"]
             reviewer: Arc::new(reviewer),
             cluster_links: Some(Arc::new(links)),
             identities: true,
-            ..ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
+            ..ApiState::test(crate::Db::new(pool.clone()))
         };
         let store = crate::identity::session::store(&pool).await.unwrap();
         Harness {
@@ -639,7 +634,6 @@ openshift = ["ocp"]
                 user: Some("alice".to_string()),
                 groups: Vec::new(),
                 sub: Some(SUB.to_string()),
-                source: IdentitySource::Native,
             };
             crate::api::router(self.state.clone())
                 .layer(axum::middleware::from_fn(
@@ -941,7 +935,10 @@ openshift = ["ocp"]
             h.start(AuthPath::ApiKey, "ocp").await,
             StatusCode::FORBIDDEN
         );
-        assert_eq!(h.start(AuthPath::Jwt, "ocp").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            h.start(AuthPath::StaticToken, "ocp").await,
+            StatusCode::FORBIDDEN
+        );
         assert_eq!(
             h.start(AuthPath::Session, "k8s").await,
             StatusCode::CONFLICT

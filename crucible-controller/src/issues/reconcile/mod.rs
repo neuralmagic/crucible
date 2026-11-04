@@ -186,7 +186,7 @@ async fn autoresearch_step(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
 #[cfg(feature = "autoresearch")]
 async fn adopt_orphaned_turns(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<bool> {
     use crate::runs::workpod::{DispatchOutcome, TurnKind, WorkKind};
-    let dispatcher = crate::runs::workpod::active_dispatcher();
+    let dispatcher = cfg.runtime.dispatcher.clone();
 
     // The scope kind first (the expensive turn); at most one kind is expected in flight per issue.
     let scope_kind = WorkKind::AgentTurn(TurnKind::Scope).label_value();

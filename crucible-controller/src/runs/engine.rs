@@ -27,13 +27,20 @@ pub fn resolve_bin() -> PathBuf {
 /// engine subprocess boundary; local paths never come here. A nonzero exit carries the engine's
 /// stderr verbatim: the invoking shell may lack the pod's S3 credentials, and that stderr is the
 /// only diagnostic.
-pub async fn fetch_object(uri: &str, out: &Path) -> Result<()> {
+pub async fn fetch_object(
+    contracts: Option<&crate::runs::contract::ContractRegistry>,
+    uri: &str,
+    out: &Path,
+) -> Result<()> {
     let bin = resolve_bin();
-    crate::runs::workpod::admit_contract(
-        crate::runs::contract::RequestKind::Fetch,
-        &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
-    )
-    .await?;
+    if let Some(contracts) = contracts {
+        contracts
+            .admit_all(
+                crate::runs::contract::RequestKind::Fetch,
+                &[crate::runs::contract::DispatchTarget::Binary(bin.clone())],
+            )
+            .await?;
+    }
     let output = tokio::process::Command::new(&bin)
         .arg("fetch")
         .arg("--uri")
@@ -447,12 +454,14 @@ mod tests {
         }
 
         let out = root.join("session.jsonl");
-        fetch_object("s3://b/ok/session.jsonl", &out)
+        fetch_object(None, "s3://b/ok/session.jsonl", &out)
             .await
             .expect("fetch succeeds");
         assert_eq!(std::fs::read_to_string(&out).unwrap(), "fetched");
 
-        let err = fetch_object("s3://b/missing", &out).await.unwrap_err();
+        let err = fetch_object(None, "s3://b/missing", &out)
+            .await
+            .unwrap_err();
         assert!(
             format!("{err:#}").contains("AccessDenied: no credentials"),
             "stderr rides the error: {err:#}"

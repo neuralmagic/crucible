@@ -1,5 +1,5 @@
 //! The real-harness runner. `Agent` tasks execute through [`crate::agent::run_turn`], the
-//! same path the loop uses (local claude, hermes, openshell, or the free `command` backend),
+//! same path the loop uses (local claude, openshell, or the free `command` backend),
 //! with the task's harness/model/effort overriding the manifest's `[agent]` defaults.
 //! `Command` tasks run in the workspace via the shell runner.
 //!
@@ -15,10 +15,11 @@ use clap::ValueEnum;
 use serde_json::Value;
 
 use crate::agent::event::{AgentEvent, RawStream};
-use crate::agent::harness::HarnessRuntime;
 use crate::agent::turn::TurnFailure;
 use crate::plan::admission::{Admission, Lane, Refusal};
-use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
+use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure};
+use crate::plan::exec::TaskRunner;
+use crate::plan::files::CapturedFiles;
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
 use crate::plan::turn_log::{Heartbeat, TurnLog};
@@ -78,14 +79,6 @@ fn confined(workspace: &Path, declared: &str) -> Result<PathBuf, String> {
         }
     }
     Ok(path)
-}
-
-fn captured_dir(state: &Path, task: &str) -> PathBuf {
-    state.join("files").join(task)
-}
-
-fn captured_path(state: &Path, task: &str, declared: &str) -> PathBuf {
-    captured_dir(state, task).join(declared)
 }
 
 /// The mode the engine gives a captured file, regardless of what the source carried. A
@@ -180,7 +173,7 @@ impl PriorContents {
 
 /// One file an ancestor declared, as the producer's name and the path it declared.
 pub struct StagedInput {
-    pub producer: String,
+    pub producer: TaskName,
     pub declared: String,
 }
 
@@ -206,7 +199,8 @@ impl HarnessRunner {
     /// Count what an interrupted process of this run already captured against the run's bound,
     /// which covers the run and not any one process of it.
     pub fn take_over(&mut self) {
-        self.captured_bytes = AtomicU64::new(tree_bytes(&self.paths.state.join("files")));
+        self.captured_bytes =
+            AtomicU64::new(tree_bytes(CapturedFiles::new(&self.paths.state).root()));
     }
 }
 
@@ -266,41 +260,13 @@ impl TaskRunner for HarnessRunner {
             .iter()
             .flat_map(|producer| {
                 producer.emits_files.iter().map(|declared| StagedInput {
-                    producer: producer.name.0.clone(),
+                    producer: producer.name.clone(),
                     declared: declared.path.clone(),
                 })
             })
             .collect();
         self.staged.insert(task.name.clone(), files);
         Ok(())
-    }
-
-    fn has_captured_files(&self, task: &Task) -> bool {
-        captured_dir(&self.paths.state, &task.name.0).is_dir()
-    }
-
-    fn captured_file(&self, producer: &TaskName, path: &str) -> Option<Vec<u8>> {
-        std::fs::read(captured_path(&self.paths.state, &producer.0, path)).ok()
-    }
-
-    /// Discards the set published under this task's name, and for a mapped node the sets
-    /// published under its instances' names too: a node that did not expand this run has no
-    /// instance rows, so nothing else in the run ever reaches them.
-    fn drop_captured(&mut self, task: &Task) {
-        let _ = std::fs::remove_dir_all(captured_dir(&self.paths.state, &task.name.0));
-        if task.over.is_none() {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(self.paths.state.join("files")) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if crate::plan::exec::is_instance_of(&task.name, &TaskName(name.to_string())) {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
     }
 
     /// Commit what a passing task did, and discard what a failing one did.
@@ -516,14 +482,17 @@ fn capture_declared(
         AttemptOutcome::Fail { .. } => true,
         AttemptOutcome::Skipped(..) | AttemptOutcome::Transport(_) => return attempt,
         AttemptOutcome::TimedOut(_) => {
-            let _ = std::fs::remove_dir_all(captured_dir(&paths.state, &task.name.0));
+            CapturedFiles::new(&paths.state).drop(task);
             return attempt;
         }
     };
     if task.emits_files.is_empty() {
         return attempt;
     }
-    let staging = paths.state.join("files.tmp").join(&task.name.0);
+    let staging = paths
+        .state
+        .join("files.tmp")
+        .join(task.name.dir_name().as_ref());
     let _ = std::fs::remove_dir_all(&staging);
     let mut charged = 0u64;
     let taken = (|| -> Result<(), String> {
@@ -575,7 +544,7 @@ fn capture_declared(
         }
         Ok(())
     })();
-    let published = captured_dir(&paths.state, &task.name.0);
+    let published = CapturedFiles::new(&paths.state).dir(&task.name);
     let outcome = taken.and_then(|()| {
         if let Some(parent) = published.parent() {
             std::fs::create_dir_all(parent)
@@ -623,7 +592,7 @@ fn agent_prompt(
     inputs: &BTreeMap<TaskName, Value>,
     workspace: &Path,
 ) -> anyhow::Result<String> {
-    let history_key = TaskName(crate::plan::ir::HISTORY_INPUT.to_string());
+    let history_key = TaskName::reserved(crate::plan::ir::HISTORY_INPUT);
     let mut upstream = inputs.clone();
     let history = upstream.remove(&history_key);
     let inputs_json =
@@ -681,12 +650,15 @@ fn materialize_inputs(
     };
     let inputs = root.join(STAGED_INPUTS);
     let _ = std::fs::remove_dir_all(&inputs);
+    let files = CapturedFiles::new(state);
     for file in staged {
-        let from = captured_path(state, &file.producer, &file.declared);
+        let from = files.path(&file.producer, &file.declared);
         if !from.exists() {
             continue;
         }
-        let to = inputs.join(&file.producer).join(&file.declared);
+        let to = inputs
+            .join(file.producer.dir_name().as_ref())
+            .join(&file.declared);
         if let Some(parent) = to.parent()
             && let Err(error) = std::fs::create_dir_all(parent)
         {
@@ -818,10 +790,10 @@ pub(crate) fn resolved_agent(
         _ => return None,
     };
     let args = agent_knobs(args, knobs.0, knobs.1, knobs.2).ok()?;
-    let backend = crate::agent::harness::HarnessRuntime::backend(args.harness());
+    let backend = crate::agent::harness::backend(args.harness());
     Some(crucible_contract::session::TaskAgent {
         harness: args.harness().as_str().to_string(),
-        model: backend.model(&args).to_string(),
+        model: backend.model(&args.turn_agent()).to_string(),
         effort: args
             .reasoning_effort
             .map(|e| e.as_flag().to_string())
@@ -866,6 +838,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
+                env: args.workflow_env.clone(),
                 buildit_socket,
             };
             return if task.isolation == Some(Isolation::Worktree) {
@@ -989,13 +962,56 @@ fn agent_turn(
     session: Option<&crate::agent::agent_session::SessionTurn>,
     banked: f64,
 ) -> (f64, TurnEnd) {
-    let paths = cx.paths;
-    let result_path = paths.workspace.join(RESULT_FILE);
+    let result_path = cx.paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
     let _ = std::fs::remove_file(&result_path);
+    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_, _, _| {});
+    let transport_error = match stop {
+        TurnStop::TimedOut(deadline) => {
+            let _ = std::fs::remove_file(&result_path);
+            return (cost, TurnEnd::TimedOut(deadline));
+        }
+        TurnStop::Transport(failure) | TurnStop::Reported(failure) => Some(failure),
+        TurnStop::Clean => None,
+    };
+    let end = match std::fs::read_to_string(&result_path) {
+        Ok(body) => {
+            let _ = std::fs::remove_file(&result_path);
+            match serde_json::from_str::<Value>(&body) {
+                Ok(v) => TurnEnd::Wrote(v),
+                Err(e) => TurnEnd::Unreadable(format!("{RESULT_FILE} is not valid JSON: {e}")),
+            }
+        }
+        Err(_) => match transport_error {
+            Some(failure) => TurnEnd::Transport(failure),
+            None => TurnEnd::Silent,
+        },
+    };
+    (cost, end)
+}
 
+/// How an agent turn's process ended, before anything it wrote is read.
+enum TurnStop {
+    Clean,
+    TimedOut(Deadline),
+    Transport(TransportFailure),
+    /// The agent's own result said the turn failed, and nothing under it did.
+    Reported(TransportFailure),
+}
+
+/// Stream one agent turn to its end under `cx.deadline`, showing every output line to `on_line`,
+/// and advance a ledgered session only when the turn neither failed nor reported failing.
+fn stream_turn(
+    cx: &TurnCx<'_>,
+    prompt: &str,
+    session: Option<&crate::agent::agent_session::SessionTurn>,
+    banked: f64,
+    on_line: &mut dyn FnMut(&str, RawStream, Option<&AgentEvent>),
+) -> (f64, TurnStop) {
+    let paths = cx.paths;
     let name = cx.name.to_string();
     let mut transport_error: Option<TransportFailure> = None;
+    let mut reported = false;
     let log = Arc::new(Mutex::new(TurnLog::new(Instant::now())));
     let heartbeat = {
         let name = name.clone();
@@ -1023,17 +1039,19 @@ fn agent_turn(
                 lane.spent_so_far(banked + cost);
             }
             if let Some(failure) = ev.and_then(agent_transport_error) {
+                reported = matches!(ev, Some(AgentEvent::Result { .. }));
                 transport_error = Some(failure);
             }
+            on_line(line, stream, ev);
         },
     );
     drop(heartbeat);
     let cost = turn.cost_usd;
     if let Some(TurnFailure::DeadlineExceeded(deadline)) = turn.failure() {
-        let _ = std::fs::remove_file(&result_path);
-        return (cost, TurnEnd::TimedOut(*deadline));
+        return (cost, TurnStop::TimedOut(*deadline));
     }
     if let Some(failure) = turn.failure() {
+        reported = false;
         transport_error = Some(TransportFailure::new(
             failure.transport_cause(),
             failure.to_string(),
@@ -1044,23 +1062,79 @@ fn agent_turn(
         session.filter(|_| cx.ledgered),
         transport_error.is_none(),
     ) {
+        reported = false;
         transport_error = Some(TransportFailure::new(TransportCause::Workspace, note));
     }
+    match transport_error {
+        Some(failure) if reported => (cost, TurnStop::Reported(failure)),
+        Some(failure) => (cost, TurnStop::Transport(failure)),
+        None => (cost, TurnStop::Clean),
+    }
+}
 
-    let end = match std::fs::read_to_string(&result_path) {
-        Ok(body) => {
-            let _ = std::fs::remove_file(&result_path);
-            match serde_json::from_str::<Value>(&body) {
-                Ok(v) => TurnEnd::Wrote(v),
-                Err(e) => TurnEnd::Unreadable(format!("{RESULT_FILE} is not valid JSON: {e}")),
-            }
+#[cfg(feature = "autoresearch")]
+/// What the scored loop's candidate turn reports while it runs.
+pub(crate) enum CandidateEvent<'a> {
+    /// The turn is about to start, resuming or starting this session if it has one.
+    Starting(Option<&'a crate::agent::agent_session::SessionTurn>),
+    /// One line of the agent's output, with the event it decoded to, if any.
+    Line(&'a str, RawStream, Option<&'a AgentEvent>),
+}
+
+#[cfg(feature = "autoresearch")]
+impl HarnessRunner {
+    /// The scored loop's candidate turn for `task`: `prompt`, or `resume_prompt` when the task's
+    /// session resumes, run in the shared workspace under `deadline`. The turn edits the
+    /// workspace and writes no result file, so a turn whose transport held passes, and one whose
+    /// own result says it failed is a measured failure of the candidate.
+    pub(crate) fn candidate_turn(
+        &self,
+        task: &Task,
+        prompt: &str,
+        resume_prompt: &str,
+        deadline: Option<Deadline>,
+        on_event: &mut dyn FnMut(CandidateEvent<'_>),
+    ) -> Attempt {
+        let session = match crate::agent::agent_session::prepare_named(
+            &self.paths.state,
+            task.session.as_deref(),
+        ) {
+            Ok(session) => session,
+            Err(note) => return Attempt::transport(TransportCause::Workspace, note),
+        };
+        on_event(CandidateEvent::Starting(session.as_ref()));
+        let cx = TurnCx {
+            args: &self.args,
+            paths: &self.paths,
+            name: &task.name.0,
+            deadline,
+            ledgered: task.session.is_some(),
+            lane: None,
+        };
+        let prompt = crate::agent::agent_session::effective_prompt(
+            session.as_ref(),
+            prompt,
+            Some(resume_prompt),
+        );
+        let (cost, stop) = stream_turn(
+            &cx,
+            prompt,
+            session.as_ref(),
+            0.0,
+            &mut |line, stream, ev| on_event(CandidateEvent::Line(line, stream, ev)),
+        );
+        let outcome = match stop {
+            TurnStop::Clean => AttemptOutcome::Pass(serde_json::json!({ "cost_usd": cost })),
+            TurnStop::TimedOut(deadline) => AttemptOutcome::TimedOut(deadline),
+            TurnStop::Transport(failure) => AttemptOutcome::Transport(failure),
+            TurnStop::Reported(failure) => AttemptOutcome::fail(failure.note),
+        };
+        Attempt {
+            outcome,
+            cost_usd: cost,
+            repairs: Vec::new(),
         }
-        Err(_) => match transport_error {
-            Some(failure) => TurnEnd::Transport(failure),
-            None => TurnEnd::Silent,
-        },
-    };
-    (cost, end)
+    }
 }
 
 /// Resume `session` to fix a passing attempt whose output breaks the task's declared emits or
@@ -1228,8 +1302,9 @@ fn task_worktree_name(name: &TaskName) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
+    use crate::plan::exec::{ExecCfg, PlanExit, Substrate};
     use crate::plan::harness::*;
+    use crucible_contract::session::TaskStatus;
 
     fn relay(dest: &str) -> crate::manifest::RelayFile {
         crate::manifest::RelayFile {
@@ -1524,9 +1599,14 @@ mod tests {
         plan: &crate::plan::ir::ValidPlan,
         substrate: &Substrate,
         cfg: ExecCfg,
-        runner: &mut dyn crate::plan::exec::TaskRunner,
+        runner: &mut HarnessRunner,
         on_result: impl FnMut(&crate::plan::ir::Task, &crate::plan::exec::TaskResult),
     ) -> crate::plan::exec::PlanOutcome {
+        let files = CapturedFiles::new(&runner.paths.state);
+        let cfg = ExecCfg {
+            files: Some(&files),
+            ..cfg
+        };
         crate::plan::exec::execute(plan, substrate, cfg, runner, on_result)
             .expect("an executor transition its table does not list")
     }
@@ -1836,6 +1916,7 @@ mod tests {
                 harness: Some(crate::manifest::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
+            None,
             crate::cli::setup::Start::Fresh,
         )
         .unwrap();
@@ -1908,6 +1989,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
                 &params(pairs),
                 crate::openshell::gateway::ComputeDriver::Podman,
                 flags,
+                None,
                 crate::cli::setup::Start::Fresh,
             )
             .unwrap();
@@ -1967,6 +2049,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
                 harness: None,
                 model: Some("flag-model".into()),
             },
+            None,
             crate::cli::setup::Start::Fresh,
         )
         .map(|_| ())
@@ -2010,6 +2093,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
                 &BTreeMap::from([("repo.ref".to_string(), r.to_string())]),
                 crate::openshell::gateway::ComputeDriver::Podman,
                 crate::args::AgentOverride::default(),
+                None,
                 start,
             )
             .map(|_| ())
@@ -2510,7 +2594,7 @@ workflow(type = "playbook", tasks = [prod, cons, serial_stranger, isolated_stran
             name = "bump-2"
             kind = "agent"
             prompt = "raise it again"
-            harness = "hermes"
+            harness = "codex"
             depends_on = ["bump-1"]
             [[task]]
             name = "measure"
@@ -5086,6 +5170,7 @@ workflow(type = "playbook", tasks = [echo])
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
+            None,
             crate::cli::setup::Start::Fresh,
         )
         .unwrap()

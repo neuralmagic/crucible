@@ -16,11 +16,13 @@
 
 use crate::agent::activity::ActivityFeed;
 use crate::agent::event::{AgentEvent, RawStream};
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv, process_env};
 use crate::agent::turn::{TurnFailure, TurnOutcome};
 use crate::agent::{self};
 use crate::args::Paths;
 use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
+use crucible_contract::verdict::{Failed, Ruled};
 use crucible_contract::{Disposition, GroundedErrorKind, GroundedVerdict};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -128,14 +130,14 @@ impl GroundedReport {
     /// plus the turn's cost, or the error shape when the agent emitted no parseable verdict.
     fn wire(&self) -> GroundedVerdict {
         match &self.verdict {
-            Some(v) => GroundedVerdict::Ruled {
+            Some(v) => GroundedVerdict::Ruled(Ruled {
                 tier: v.disposition,
                 rationale: v.rationale.clone(),
                 confidence: Some(v.confidence.clone()),
                 cost_usd: self.cost_usd,
                 over_budget: self.over_budget,
-            },
-            None => GroundedVerdict::Failed {
+            }),
+            None => GroundedVerdict::Failed(Failed {
                 error: self
                     .error
                     .as_ref()
@@ -149,7 +151,7 @@ impl GroundedReport {
                 output_tail: self.output_tail.clone(),
                 cost_usd: self.cost_usd,
                 over_budget: self.over_budget,
-            },
+            }),
         }
     }
 
@@ -371,9 +373,15 @@ fn turn_args(a: &RankGroundedArgs) -> Result<crate::args::Args> {
     if crate::agent::harness::resolve_auth(
         args.harness(),
         &crate::agent::inference::InferenceEnv::from_process_env()?,
-    ) == crate::agent::harness::AuthProvider::Vertex
+    ) == crucible::harness::AuthProvider::Vertex
     {
-        crate::openshell::run::relay_vertex_env(&mut args.env);
+        let mut env = SandboxEnv::default();
+        env.relay(
+            EnvSource::VertexRelay,
+            crate::openshell::policy::VERTEX_RELAY_KEYS.iter().copied(),
+            process_env,
+        );
+        args.env = env.into_vars();
     }
     // Flag wins; CRUCIBLE_RANK_MODEL lets a parent (rank-compare, the controller's escalation
     // arm) pin the model without threading a parameter through every layer.
@@ -396,6 +404,7 @@ fn run_grounded_turn(
     workspace: &Path,
     prompt: &str,
     a: &RankGroundedArgs,
+    engine: &tokio::runtime::Handle,
 ) -> Result<(TurnOutcome, String)> {
     let scratch = worktree_path();
     git(
@@ -410,7 +419,8 @@ fn run_grounded_turn(
     )
     .context("creating the read-only worktree for the grounded turn")?;
 
-    let args = turn_args(a)?;
+    let mut args = turn_args(a)?;
+    args.engine = Some(engine.clone());
     let paths = grounded_paths(&scratch);
     let _ = std::fs::create_dir_all(&paths.state);
 
@@ -439,12 +449,12 @@ fn run_grounded_turn(
 
 /// Drive one grounded ranking turn and return its report. Pure of process exit / printing, [`run`]
 /// owns rendering + the exit code, so tests drive this directly.
-pub fn execute(a: &RankGroundedArgs) -> Result<GroundedReport> {
+pub fn execute(a: &RankGroundedArgs, engine: &tokio::runtime::Handle) -> Result<GroundedReport> {
     let (repo, number) = crate::scope::issue::parse_ref(&a.issue)?;
     let issue = crate::scope::issue::fetch(&repo, number, "crucible-rank-grounded")
         .with_context(|| format!("fetching {} for grounded ranking", a.issue))?;
     let prompt = render_prompt(&issue.title, &issue.body, &issue.labels);
-    let (outcome, buf) = run_grounded_turn(&a.workspace, &prompt, a)?;
+    let (outcome, buf) = run_grounded_turn(&a.workspace, &prompt, a, engine)?;
     Ok(report_from_turn(outcome, &buf, a.max_cost))
 }
 
@@ -493,7 +503,7 @@ fn tail_of(buf: &str) -> Option<String> {
 
 /// CLI entry point: run the turn, print the verdict (JSON or human lines), and exit nonzero if the
 /// agent produced no verdict OR the turn ran over `--max-cost` (the `scope` visible-guard shape).
-pub fn run(a: RankGroundedArgs) -> Result<()> {
+pub fn run(a: RankGroundedArgs, engine: tokio::runtime::Handle) -> Result<()> {
     let json = a.json;
     // A controller-dispatched rank pod: adopt the dispatch as this turn's trace parent so the
     // `openshell_turn` nests under the controller's tree instead of floating orphaned. `None` (a
@@ -506,7 +516,7 @@ pub fn run(a: RankGroundedArgs) -> Result<()> {
     );
     let report = {
         let _turn_guard = turn_span.as_ref().map(tracing::Span::enter);
-        execute(&a)?
+        execute(&a, &engine)?
     };
     drop(turn_span);
 
@@ -570,8 +580,13 @@ pub fn run(a: RankGroundedArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    fn grounded(a: &RankGroundedArgs) -> Result<GroundedReport> {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        execute(a, rt.handle())
+    }
     use super::*;
     use crucible_contract::Tier;
+    use crucible_harness::line::LineFormat as _;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
@@ -755,10 +770,10 @@ mod tests {
         assert_eq!(decoded.cost_usd(), 0.12);
         assert!(matches!(
             decoded,
-            GroundedVerdict::Failed {
+            GroundedVerdict::Failed(Failed {
                 error_kind: GroundedErrorKind::TurnFailed,
                 ..
-            }
+            })
         ));
     }
 
@@ -823,7 +838,7 @@ mod tests {
     /// to replay. Driven through the real parser, not a hand-built event.
     #[test]
     fn undecodable_agent_stdout_reaches_the_verdict_buffer() {
-        let mut parser = crucible_harness::StreamJsonParser::default();
+        let mut parser = crucible_harness::stream_json::StreamJsonParser::default();
         let mut buf = String::new();
         for ev in parser.push("Error: could not fetch an access token") {
             accumulate(Some(&ev), &mut buf);
@@ -958,7 +973,7 @@ mod tests {
         unsafe {
             std::env::set_var("GITHUB_API_URL", &api);
         }
-        let report = execute(&args(&repo, &script, 5.0));
+        let report = grounded(&args(&repo, &script, 5.0));
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }
@@ -987,7 +1002,7 @@ mod tests {
         unsafe {
             std::env::set_var("GITHUB_API_URL", &api);
         }
-        let report = execute(&args(&repo, &script, 5.0)).expect("execute ok");
+        let report = grounded(&args(&repo, &script, 5.0)).expect("execute ok");
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }
@@ -1020,7 +1035,7 @@ mod tests {
         unsafe {
             std::env::set_var("GITHUB_API_URL", &api);
         }
-        let report = execute(&args(&repo, &script, 5.0)).expect("execute ok");
+        let report = grounded(&args(&repo, &script, 5.0)).expect("execute ok");
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }
@@ -1053,7 +1068,7 @@ mod tests {
         unsafe {
             std::env::set_var("GITHUB_API_URL", &api);
         }
-        let report = execute(&args(&repo, &script, 0.5)).expect("execute ok");
+        let report = grounded(&args(&repo, &script, 0.5)).expect("execute ok");
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }
@@ -1094,7 +1109,7 @@ mod tests {
             model: None,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
         };
-        let _ = execute(&a);
+        let _ = grounded(&a);
         let _ = fs::remove_dir_all(&repo);
     }
 
@@ -1115,7 +1130,7 @@ mod tests {
         unsafe {
             std::env::set_var("GITHUB_API_URL", &api);
         }
-        let report = execute(&args(&repo, &script, 5.0)).expect("execute ok");
+        let report = grounded(&args(&repo, &script, 5.0)).expect("execute ok");
         unsafe {
             std::env::remove_var("GITHUB_API_URL");
         }

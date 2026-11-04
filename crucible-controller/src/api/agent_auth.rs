@@ -111,13 +111,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use sqlx::PgPool;
-    use std::sync::Arc;
     use tower::ServiceExt;
-
-    struct NoSink;
-    impl crate::daemon::queue::OverrideSink for NoSink {
-        fn submit(&self, _ov: crate::daemon::queue::Override) {}
-    }
 
     /// A deployment that mints agent tokens and nothing else still serves the identity routes:
     /// people link the usernames their runs' tokens carry, and an administrator sets the override.
@@ -125,7 +119,7 @@ mod tests {
     async fn agent_tokens_alone_serve_the_identity_routes(pool: PgPool) {
         let state = crate::api::state::ApiState {
             agent_tools: true,
-            ..crate::api::state::ApiState::test(crate::Db::new(pool), Arc::new(NoSink))
+            ..crate::api::state::ApiState::test(crate::Db::new(pool))
         }
         .with_cluster_links(None)
         .with_people_issuer(None);
@@ -147,7 +141,7 @@ mod tests {
         let state = crate::api::state::ApiState {
             agent_tools: true,
             identities: true,
-            ..crate::api::state::ApiState::test(crate::Db::new(pool), Arc::new(NoSink))
+            ..crate::api::state::ApiState::test(crate::Db::new(pool))
         };
         let app = crate::api::router(state);
         let res = app

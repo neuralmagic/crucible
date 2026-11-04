@@ -8,7 +8,7 @@ status = "active"
 since = "0.1.0"
 
 [content]
-text = """
+text = '''
 A task MAY declare emits_files: the workspace-relative paths its output includes as files. Each declared path MUST be relative, MUST NOT traverse outside the workspace, and MUST NOT reach a file outside the workspace through a link of any kind. A symbolic link is refused per path component; a hard link is not distinguishable by resolving the path, so the engine MUST establish confinement by a means that does not rely on resolution alone.
 
 When a task passes, the engine MUST capture each declared file. A declared file absent after an otherwise-passing attempt MUST convert that attempt to a measured failure at the producing task, MUST NOT be retried, and MUST block its dependents. This mirrors the rule for declared JSON output fields: output drift fails where it happened. A task that settles failing is captured too, under the additional provenance and withholding rules of [[RFC-0002:C-SETTLED-JOIN]], and its set is staged only along the edges that clause names.
@@ -17,10 +17,10 @@ A declared file MAY carry a schema_file(), under the rules [[RFC-0001:C-WORKFLOW
 
 Captured files MUST be staged into a task's workspace before it is dispatched, for every ancestor on its dependency paths and not only its direct dependencies. A pipeline whose later stages need an earlier stage's artifact is the ordinary case, and requiring each hop to re-emit what it received would reproduce by hand the state files this replaces. JSON outputs keep the narrower direct-dependency rule.
 
-Staged files MUST be namespaced by the producing task's name, so that two producers declaring the same path cannot collide. Staged files MUST be read-only to the consuming task.
+Staged files MUST be namespaced by the producing task's name, so that two producers declaring the same path cannot collide. Staged files MUST be read-only to the consuming task. An instance of a mapped task is named after its node and its item key, which is runtime data: the engine MUST NOT refuse a key for holding a path separator or a dot, and where an instance's name forms the directory its files are captured or staged under, the engine MUST escape the key so that the directory is one path component and distinct keys name distinct directories, writing %, /, \, NUL, and a leading . as %25, %2F, %5C, %00, and %2E. Everywhere else, the instance's name, its session-log rows, its inputs, and the matching of folded results on resume and rerun, the key MUST stay raw.
 
 Captured files MUST be staged for a dependent even when the producing task ran in disposable isolation. A declared file is part of a task's output, not part of the workspace state that isolation discards.
 
 The total size of files captured in one run MUST be bounded, the bound MUST be operator-configurable and discoverable before a run starts, and exceeding it MUST fail the producing task naming the bound rather than truncating silently.
 
-emits_files MUST NOT be used as a channel between runs. Material that must outlive its run MUST be referenced by published artifact location instead."""
+emits_files MUST NOT be used as a channel between runs. Material that must outlive its run MUST be referenced by published artifact location instead.'''

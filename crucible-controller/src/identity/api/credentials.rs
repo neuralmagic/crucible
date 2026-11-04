@@ -4,7 +4,7 @@
 //! so it does not wait on the schedule-row snapshot's TTL: the schedules whose scopes bind secrets
 //! are marked as needing sign-in and park on their next firing.
 
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -47,7 +47,7 @@ fn no_subject() -> Response {
 pub(crate) async fn get_credential(
     State(state): State<ApiState>,
     subject: crate::identity::auth::Subject,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(sub) = subject.as_deref() else {
         return Ok(no_subject());
     };
@@ -91,7 +91,7 @@ pub(crate) async fn revoke_credential(
     State(state): State<ApiState>,
     identity: crate::identity::session::Identity,
     subject: crate::identity::auth::Subject,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(sub) = subject.as_deref() else {
         return Ok(no_subject());
     };

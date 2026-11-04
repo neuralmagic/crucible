@@ -1,8 +1,7 @@
 //! The `users` table: the issuer's stable `sub` mapped to the login everything else is spelled in.
 //!
-//! A `user:` principal in the secrets registry is an SSO login. The cluster-token bearer path
-//! resolves an OpenShift username that need not be one, so [`is_known_login`] is what decides
-//! whether that credential may own anything.
+//! A `user:` principal in the secrets registry is an SSO login; [`is_known_login`] answers whether
+//! anyone has signed in under one.
 
 use anyhow::Context;
 use sqlx::PgPool;

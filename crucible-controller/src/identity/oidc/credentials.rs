@@ -396,7 +396,7 @@ impl OwnerRefresh {
     }
 
     /// Build one when the deployment configured both an issuer and a key. `None` otherwise, which
-    /// is what keeps a proxy-mode or key-less deploy on the schedule-row snapshot alone.
+    /// is what keeps an issuer-less or key-less deploy on the schedule-row snapshot alone.
     pub fn from_parts(
         pool: PgPool,
         provider: Option<Arc<OidcProvider>>,

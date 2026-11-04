@@ -7,13 +7,14 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 use crate::plan::exec::Prior;
-use crate::plan::exec::{Substrate, TaskStatus, required_tasks_held, runnable_set};
+use crate::plan::exec::{Substrate, required_tasks_held, runnable_set};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{Plan, Stage, TaskKind, TaskName, ValidPlan};
 use crate::plan::record::declared_output;
 use crate::plan::rerun::ParentRef;
 use crate::plan::resume::RunStart;
 use crucible::crucible::Direction;
+use crucible_contract::session::TaskStatus;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
 #[derive(Debug, thiserror::Error)]
@@ -529,6 +530,8 @@ pub struct RunOpts {
     pub variant: Option<crate::manifest::variant::VariantName>,
     /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
     pub rerun: Option<Rerun>,
+    /// The engine runtime the run's sandboxed turns run on.
+    pub engine: Option<tokio::runtime::Handle>,
 }
 
 /// A rerun's parent and the tasks it dispatches again.
@@ -661,6 +664,7 @@ pub fn run(
         resume,
         variant,
         rerun,
+        engine,
     } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
@@ -696,6 +700,7 @@ pub fn run(
                     params,
                     compute_driver,
                     agent,
+                    engine,
                     start,
                 )?;
                 let session_log = prepared.paths.session_log.clone();
@@ -796,6 +801,7 @@ pub fn run(
                         workdir: std::env::current_dir()
                             .context("resolving the working directory")?,
                         agent_cmd,
+                        env: crucible::host_env::HostEnv::inherited(),
                         buildit_socket: None,
                     }),
                     None,
@@ -809,7 +815,7 @@ pub fn run(
     // A task under a deadline runs in a process group of its own, where the terminal's SIGINT
     // does not reach it.
     let _ = ctrlc::set_handler(|| {
-        crucible::deadline::terminate_live_groups();
+        crucible::deadline::terminate_live_children();
         std::process::exit(130);
     });
     // Manifest runs append plan wire events to the run's session log so tailers (and the
@@ -886,7 +892,10 @@ pub fn run(
     let mut report = crucible_contract::RunReport {
         run: std::env::var(crucible_contract::ENV_RUN_DISPLAY_NAME)
             .unwrap_or_else(|_| run.to_string()),
-        run_url: match (std::env::var("CRUCIBLE_UI_BASE_URL").ok(), &run_name) {
+        run_url: match (
+            std::env::var(crucible_contract::ENV_UI_BASE_URL).ok(),
+            &run_name,
+        ) {
             (Some(base), Some(run)) => Some(format!("{}/runs/{run}", base.trim_end_matches('/'))),
             _ => None,
         },
@@ -920,7 +929,7 @@ pub fn run(
     let mut observe = |task: &crate::plan::ir::Task, result: &crate::plan::exec::TaskResult| {
         report.tasks.push(crucible_contract::TaskReport {
             name: task.name.0.clone(),
-            status: result.status.as_str().to_string(),
+            status: result.status,
             cost_usd: result.cost_usd,
             blocked: result
                 .blocked
@@ -935,7 +944,7 @@ pub fn run(
         statuses.insert(task.name.clone(), result.status);
         completed_early |= playbook
             && task.stage == Stage::Iteration
-            && crate::plan::exec::declared_completion(result).is_some();
+            && crate::plan::exec::declared_completion(task, result).is_some();
         if completed_early
             || plan
                 .tasks_topo()
@@ -957,6 +966,9 @@ pub fn run(
             observe(&task, result);
         }
     }
+    let files = evidence
+        .as_ref()
+        .map(|p| crate::plan::files::CapturedFiles::new(&p.state));
     let out = execute(
         &plan,
         &substrate,
@@ -965,6 +977,8 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
+            journal: events.as_ref(),
+            files: files.as_ref(),
             decisions: desk
                 .as_ref()
                 .map(|d| d as &dyn crucible::plan::decide::DecisionDesk),
@@ -1109,6 +1123,7 @@ mod tests {
     /// neither run reaches a task.
     #[test]
     fn an_undeclared_parameter_refuses_both_spellings_of_the_same_pack() {
+        let _guard = crucible::test_support::env_lock();
         let dir =
             std::env::temp_dir().join(format!("crucible-param-parity-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1174,6 +1189,7 @@ mod tests {
     /// of that run must select it again.
     #[test]
     fn a_variant_run_reads_its_own_graph_and_resumes_only_as_itself() {
+        let _guard = crucible::test_support::env_lock();
         let dir = crate::testing::tempdir("plan-run-variant");
         let base_ran = dir.join("base-ran");
         let offline_ran = dir.join("offline-ran");
@@ -1472,7 +1488,7 @@ mod tests {
             [budget]
             usd = 1.0
             [[task]]
-            name = "review/a"
+            name = "review.a"
             kind = "command"
             command = "true"
             [[task]]
@@ -1482,7 +1498,7 @@ mod tests {
         "#;
         let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
         let out = render_mermaid(&plan, &BTreeSet::new());
-        assert!(out.contains("t0[\"review/a\"]"));
+        assert!(out.contains("t0[\"review.a\"]"));
         assert!(out.contains("t1[\"review-a\"]"));
         assert!(!out.contains("run:"), "public source omits commands: {out}");
     }
@@ -1643,7 +1659,7 @@ mod tests {
         }
         let t = plan.get(&"measure".into()).unwrap();
         let r = crate::plan::exec::TaskResult {
-            status: crate::plan::exec::TaskStatus::Pass,
+            status: crucible_contract::session::TaskStatus::Pass,
             attempts: 1,
             cost_usd: 0.25,
             output: Some(serde_json::json!({"score": 3})),
@@ -1667,7 +1683,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(task, "measure");
-                assert_eq!(status, "pass");
+                assert_eq!(status, crucible_contract::session::TaskStatus::Pass);
                 assert_eq!(task_kind, "command");
                 assert_eq!(cost_usd, 0.25);
                 assert_eq!(output.unwrap()["score"], 3);
@@ -1958,12 +1974,13 @@ workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
                 .tasks
                 .iter()
                 .find(|t| t.name == name)
-                .map(|t| t.status.clone())
+                .map(|t| t.status)
         };
-        assert_eq!(status("b").as_deref(), Some("not_taken"));
-        assert_eq!(status("lint").as_deref(), Some("fail"));
-        assert_eq!(status("optional").as_deref(), Some("skipped"));
-        assert_eq!(status("publish").as_deref(), Some("pass"));
+        use crucible_contract::session::TaskStatus;
+        assert_eq!(status("b"), Some(TaskStatus::NotTaken));
+        assert_eq!(status("lint"), Some(TaskStatus::Fail));
+        assert_eq!(status("optional"), Some(TaskStatus::Skipped));
+        assert_eq!(status("publish"), Some(TaskStatus::Pass));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

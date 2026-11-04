@@ -13,18 +13,17 @@
 //! crucible processes sharing one gateway never collide on a fixed name.
 
 use crate::agent::event::{AgentEvent, RawStream};
-use crate::agent::harness::{
-    AuthProvider, HarnessRuntime, McpServer, SandboxAuth, SandboxLayout, TranscriptLocator,
-    TurnArtifacts,
-};
+use crate::agent::harness::{McpServer, SandboxAuth, SandboxLayout, TurnArtifacts, backend};
 use crate::agent::relay;
+use crate::agent::sandbox_env::{EnvSource, SandboxEnv};
 use crate::agent::tool_chain::StopReason;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
-use crate::args::{Args, Paths};
+use crate::args::{Paths, SandboxTurn};
 use crate::manifest::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};
+use crucible::harness::{ApiFamily, AuthProvider, TranscriptLocator};
 use crucible_contract::TransportCause;
 use std::time::Instant;
 
@@ -86,7 +85,7 @@ pub enum OpenshellCliError {
     )]
     NoApiKey { harness: &'static str },
 }
-use crucible_harness::OtelCollector;
+use crucible_harness::otel::OtelCollector;
 use std::sync::atomic::Ordering;
 use tokio::fs;
 use tokio::process::Command;
@@ -97,7 +96,7 @@ use tokio_util::sync::CancellationToken;
 /// [`AgentEvent::Error`] through the sink and lands in the outcome's
 /// [`TurnFailure::Orchestration`], carrying whatever the turn had already spent.
 pub fn turn(
-    args: &Args,
+    turn: &SandboxTurn<'_>,
     p: &Paths,
     prompt: &str,
     json: bool,
@@ -106,13 +105,14 @@ pub fn turn(
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
     // The whole turn is async; the engine runtime drives it. The one `block_on` in the openshell
-    // path, reached from the published handle rather than threaded through `run_turn` and the
-    // reporter trait (see `crate::agent::engine`). A missing runtime surfaces like any orchestration
-    // failure (through the sink, a $0 no-op turn).
-    let handle = match crate::agent::engine::handle() {
-        Ok(h) => h,
-        Err(e) => {
-            let message = format!("{e:#}");
+    // path. A missing runtime surfaces like any orchestration failure (through the sink, a $0
+    // no-op turn).
+    let handle = match turn.engine {
+        Some(h) => h,
+        None => {
+            let message = "the engine runtime is not initialized (EngineCtx::new was not called \
+                           before an async call site) — this is an engine wiring bug"
+                .to_string();
             let ev = AgentEvent::Error {
                 error_type: "openshell".into(),
                 message: message.clone(),
@@ -130,7 +130,7 @@ pub fn turn(
     let spent = CostMeter::default();
     let at = deadline.map(|d| d.at);
     let outcome = handle.block_on(try_turn(
-        args, p, prompt, json, session, at, &spent, &mut sink,
+        turn, p, prompt, json, session, at, &spent, &mut sink,
     ));
     if outcome.is_err()
         && let Some(deadline) = deadline
@@ -286,7 +286,7 @@ fn selected_codex_api_key(
     fields(
         backend = "openshell",
         workspace = %p.workspace.display(),
-        model = %args.model(),
+        model = %turn.agent.model,
         sandbox = tracing::field::Empty,
         // Queryable without waiting for the run/iteration ancestors to export (long spans only
         // reach the backend when they END): which logical session and turn this is.
@@ -295,7 +295,7 @@ fn selected_codex_api_key(
     )
 )]
 async fn try_turn(
-    args: &Args,
+    turn: &SandboxTurn<'_>,
     p: &Paths,
     prompt: &str,
     json: bool,
@@ -312,20 +312,20 @@ async fn try_turn(
 
     // Env values and relay files are provisioned below, so the disclosure gate runs here, before
     // the sandbox exists (RFC-0001:C-CAPABILITY-DISCLOSURE).
-    if let Some(covered) = &args.disclosure {
-        crate::exposure::refuse_uncovered(covered, &args.env, &args.relay)?;
+    if let Some(covered) = turn.disclosure {
+        crate::exposure::refuse_uncovered(covered, turn.agent.env, turn.relay)?;
     }
 
     // The agent harness for this turn (claude default): argv grammar, env script, seed files,
     // stream decoder, and the post-turn transcript contract all come from here.
-    let harness = args.harness();
-    let backend = harness.backend();
+    let harness = turn.agent.harness;
+    let backend = backend(harness);
 
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
     stage(sink, "starting the openshell gateway");
     let access = gateway::GatewayAccess::from_env()?;
-    let version_warning = gateway::ensure_running(args.compute_driver, &access)
+    let version_warning = gateway::ensure_running(turn.compute_driver, &access, turn.gateway_boot)
         .await
         .context("ensuring the openshell gateway is up")?;
     // A degraded version check (rev mismatch, unparseable version) is turn telemetry, not a
@@ -351,12 +351,14 @@ async fn try_turn(
     //    proxy hop.
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
     let auth = crate::agent::harness::resolve_auth(harness, &inference);
+    let gen_ai_system =
+        crate::agent::harness::gen_ai_system(auth, turn.agent.model, &inference, turn.agent.env);
     let sandbox_auth = match auth {
         AuthProvider::Vertex => {
             let token = provider::mint_vertex_token()
                 .await
                 .context("minting the Vertex access token")?;
-            let vertex = crate::agent::inference::VertexConfig::from_env(&args.env);
+            let vertex = crate::agent::inference::VertexConfig::from_env(turn.agent.env);
             ensure_provider(&gw, &token, &vertex.project, &vertex.region).await?;
             SandboxAuth::Gateway
         }
@@ -370,16 +372,16 @@ async fn try_turn(
             }
             SandboxAuth::ApiKey
         }
-        AuthProvider::Codex => {
-            SandboxAuth::Codex(match selected_codex_api_key(&args.codex, &inference)? {
+        AuthProvider::Codex => SandboxAuth::Codex(
+            match selected_codex_api_key(turn.agent.codex, &inference)? {
                 Some(key) => provider::CodexAuth::ApiKey(key),
                 None => provider::CodexAuth::ChatGpt(
                     provider::mint_codex_token()
                         .await
                         .context("minting the codex ChatGPT access token")?,
                 ),
-            })
-        }
+            },
+        ),
     };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
@@ -399,29 +401,30 @@ async fn try_turn(
     //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
     //     policy endpoint bound to this provider (the step-4 `credential_binding`), so the real
     //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
-    let broker_provider = match args.broker_token.as_deref() {
-        Some(token) if args.broker.enabled => {
-            ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
-            true
-        }
-        _ => false,
-    };
+    let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
+        .context("reading the run's agent servers")?;
+    agent_servers.check_names(
+        turn.broker.enabled.then_some(turn.broker.name.as_str()),
+        turn.mcp.iter().map(|s| s.key.as_str()),
+    )?;
+    let broker_auth = BrokerAuth::resolve(
+        turn.broker.enabled,
+        turn.broker_token,
+        !agent_servers.is_empty(),
+    );
+    if let (BrokerAuth::Provider(_), Some(token)) = (&broker_auth, turn.broker_token) {
+        ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
+    }
 
     // 2d. The run's MCP servers that take agent tokens: each a token-grant provider whose tokens
     //     the sandbox's supervisor obtains from the controller and injects on traffic to that
     //     server alone. One served in this pod is started first.
-    let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
-        .context("reading the run's agent servers")?;
-    agent_servers.check_names(
-        args.broker.enabled.then_some(args.broker.name.as_str()),
-        args.mcp.iter().map(|s| s.key.as_str()),
-    )?;
     for s in agent_servers.iter() {
-        tokio::task::block_in_place(|| s.start_local(args.buildit_socket.as_ref()))
+        tokio::task::block_in_place(|| s.start_local(turn.buildit_socket))
             .with_context(|| format!("starting the run's {}", s.server.name))?;
         ensure_token_grant_provider(
             &gw,
-            &s.provider_name(),
+            s.provider_name().as_str(),
             agent_servers.token_grant_profile(s),
         )
         .await?;
@@ -431,10 +434,9 @@ async fn try_turn(
     //    turn killed mid-create, or whose cleanup delete failed, leaves the name behind, and a
     //    bare create then fails "already exists" for the rest of the run. Clearing it makes
     //    create idempotent. Labels make the sandbox discoverable via `list --selector`.
-    let name = if args.broker.enabled {
-        sandbox::name_for(&p.workspace)
-    } else {
-        sandbox::fresh_name_for(&p.workspace)
+    let name = match turn.run_id {
+        Some(run) => sandbox::name_for(&p.workspace, run),
+        None => sandbox::fresh_name_for(&p.workspace),
     };
     tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
@@ -447,7 +449,7 @@ async fn try_turn(
         sink,
         &format!(
             "creating sandbox from {} (pulls the image on first use, up to {}s before the wait gives up)",
-            args.sandbox_image.as_deref().unwrap_or("the default image"),
+            turn.sandbox_image.unwrap_or("the default image"),
             grpc::pull_timeout().as_secs()
         ),
     );
@@ -456,24 +458,22 @@ async fn try_turn(
         ("crucible-workspace".to_string(), label_value(&basename)),
     ];
     let mut providers = match auth {
-        AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
+        AuthProvider::Vertex => vec![provider::PROVIDER_NAME.clone()],
         AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => Vec::new(),
     };
     if aws_provider {
-        providers.push(provider::AWS_PROVIDER_NAME.to_string());
+        providers.push(provider::AWS_PROVIDER_NAME.clone());
     }
-    if broker_provider {
-        providers.push(provider::BROKER_PROVIDER_NAME.to_string());
-    }
+    providers.extend(broker_auth.provider().cloned());
     providers.extend(agent_servers.iter().map(|s| s.provider_name()));
     let sandbox_id = gw
         .create_sandbox(
             &name,
-            args.sandbox_image.as_deref(),
+            turn.sandbox_image,
             &providers,
             &labels,
-            &args.openshell.read_only_paths,
-            &args.sandbox_resources,
+            &turn.openshell.read_only_paths,
+            turn.sandbox_resources,
         )
         .await
         .context("creating the openshell sandbox")?;
@@ -510,7 +510,7 @@ async fn try_turn(
     //     Alongside it, this turn's W3C traceparent at `<storage>/turn-traceparent`: the broker is
     //     run-lifetime, so it reads the per-turn parent from this file fresh per call (a static pod
     //     env would collapse every turn's broker spans onto the first turn's trace).
-    if args.broker.enabled {
+    if turn.broker.enabled {
         if let Err(e) = write_turn_token().await {
             let ev = AgentEvent::Raw {
                 text: format!("turn-token write failed (candidate budget stays uncapped): {e:#}"),
@@ -539,10 +539,12 @@ async fn try_turn(
     // `CRUCIBLE_OTEL`; a bind failure degrades to telemetry-off (no `otel_summary`, the
     // pricing-table estimate stays the cost fallback). Its `otel.jsonl` is the `otel-log` Tier 2
     // artifact.
-    let collector = if harness.spec().otel_capable && crate::agent::turn::otel_enabled(args) {
+    let collector = if harness.spec().otel_capable
+        && crate::agent::turn::otel_enabled(turn.agent.env)
+    {
         // The agent's exporter can't attribute its spans to a loop turn; the forwarder stamps
         // session + turn as resource attributes at the same boundary where it re-parents.
-        let forward = crate::agent::turn::otel_forward(args).map(|f| {
+        let forward = crate::agent::turn::otel_forward(turn.agent.env).map(|f| {
             let (name, turn) = session
                 .map(|s| (s.logical_name.clone(), s.completed_turns + 1))
                 .unwrap_or((String::new(), 1));
@@ -577,10 +579,10 @@ async fn try_turn(
         // 4. Egress policy (deny-by-default; merge domain extras over the built-ins). The
         //    broker endpoint is auto-appended when the broker is enabled, and
         //    the collector's egress rule is appended when on.
-        let driver = args.compute_driver;
-        let broker_url = if args.broker.enabled {
+        let driver = turn.compute_driver;
+        let broker_url = if turn.broker.enabled {
             Some(crate::manifest::resolve_broker_url(
-                &args.broker,
+                turn.broker,
                 driver.broker_host(),
             ))
         } else {
@@ -594,48 +596,48 @@ async fn try_turn(
             None => None,
         };
         let mut endpoints = policy::resolve_endpoints(
-            &args.openshell,
+            turn.openshell,
             &policy::default_endpoints(harness),
-            broker_ep.as_deref(),
+            broker_ep.as_ref(),
         );
         if let Some(c) = &collector {
             endpoints.push(c.sandbox_egress(driver.broker_host()));
         }
         // A custom base URL is a host the harness's built-in allowlist never named.
-        if let Some(ep) = inference.egress_endpoint_for(harness)?
+        if let Some(ep) = inference
+            .egress_endpoint_for(harness)?
+            .map(|e| e.to_string())
             && !endpoints.contains(&ep)
         {
             endpoints.push(ep);
         }
         // Each `[mcp]` server in the turn's scope, appended after the deny list like the broker.
-        let mcp: Vec<_> = args
+        let mcp: Vec<_> = turn
             .mcp
             .iter()
-            .filter(|s| args.mcp_scope.contains(&s.key))
+            .filter(|s| turn.mcp_scope.contains(&s.key))
             .map(|s| (s, format!("http://{}:{}/mcp", driver.broker_host(), s.port)))
             .collect();
         for (_, url) in &mcp {
-            let ep = crate::manifest::broker_endpoint_from_url(url)?;
+            let ep = crate::manifest::broker_endpoint_from_url(url)?.to_string();
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
         }
         let mut credential_bindings: Vec<grpc::EndpointCredentialBinding> = broker_ep
-            .as_deref()
-            .filter(|_| broker_provider)
-            .and_then(|ep| {
-                let mut it = ep.split(':');
-                let host = it.next()?.to_string();
-                let port: u32 = it.next()?.parse().ok()?;
-                Some(grpc::EndpointCredentialBinding {
-                    host,
-                    port,
-                    provider: provider::BROKER_PROVIDER_NAME.to_string(),
-                })
+            .as_ref()
+            .zip(broker_auth.provider())
+            .map(|(ep, provider)| grpc::EndpointCredentialBinding {
+                host: ep.host.clone(),
+                port: ep.port,
+                provider: provider.clone(),
             })
             .into_iter()
             .collect();
-        for ep in agent_servers.iter().map(|s| s.egress_endpoint()) {
+        for ep in agent_servers
+            .iter()
+            .map(|s| s.egress_endpoint().to_string())
+        {
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
@@ -645,16 +647,16 @@ async fn try_turn(
                 grpc::EndpointCredentialBinding {
                     host: (*host).to_string(),
                     port: 443,
-                    provider: provider::PROVIDER_NAME.to_string(),
+                    provider: provider::PROVIDER_NAME.clone(),
                 }
             }));
         }
         gw.update_policy_wait_with_tls_skip(
             &name,
-            &policy::resolve_binaries(&args.openshell, harness.spec().binaries),
+            &policy::resolve_binaries(turn.openshell, harness.spec().binaries),
             &endpoints,
             &credential_bindings,
-            &args.openshell.tls_skip_endpoints,
+            &turn.openshell.tls_skip_endpoints,
         )
         .await
         .context("applying the sandbox egress policy")?;
@@ -670,7 +672,7 @@ async fn try_turn(
         .await?;
 
         // 6. Targeted-upload each relayed cred to its sandbox path (never via the repo).
-        for rf in &args.relay {
+        for rf in turn.relay {
             let content = relay::render(&p.workspace, rf)
                 .with_context(|| format!("rendering relay `{}`", rf.dest))?;
             let tmp = write_temp("cred", &content).await?;
@@ -685,14 +687,17 @@ async fn try_turn(
         // 7. Upload the env script and the prompt to absolute /tmp paths. The collector's OTEL_*
         //    matrix appends after the manifest env (so a later `export` wins), pointing the agent's
         //    exporter at the driver-resolved host.
-        let mut turn_env = args.env.clone();
+        let mut turn_env =
+            SandboxEnv::from_manifest(turn.agent.env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
         if let Some(c) = &collector {
-            turn_env.extend(crucible_harness::otel_env(
-                &c.sandbox_endpoint(driver.broker_host()),
-            ));
+            for (k, v) in
+                crucible_harness::otel::otel_env(&c.sandbox_endpoint(driver.broker_host()))
+            {
+                turn_env.set(EnvSource::Otel, &k, &v);
+            }
         }
         inference_env(&mut turn_env, harness, auth, &inference, &sandbox_auth);
-        let env_tmp = write_temp("env", &backend.env_script(&turn_env)).await?;
+        let env_tmp = write_temp("env", &turn_env.script(harness.spec())).await?;
         run_os(
             &sandbox::file_upload_args(
                 &name,
@@ -719,15 +724,14 @@ async fn try_turn(
         //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
         //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
         //     a fresh token naming this sandbox and its workdir.
-        let seed_token = match (
-            broker_provider,
-            broker_placeholder(!agent_servers.is_empty()),
-        ) {
-            (true, BrokerPlaceholder::Issued) => {
+        let seed_token = match &broker_auth {
+            BrokerAuth::Provider(Placeholder::Issued) => {
                 Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
             }
-            (true, BrokerPlaceholder::Canonical) => Some(provider::broker_token_placeholder()),
-            (false, _) => args.broker_token.clone(),
+            BrokerAuth::Provider(Placeholder::Canonical) => {
+                Some(provider::broker_token_placeholder())
+            }
+            BrokerAuth::None => turn.broker_token.map(str::to_string),
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -737,7 +741,7 @@ async fn try_turn(
         let mut servers: Vec<McpServer<'_>> = broker_url
             .iter()
             .map(|url| McpServer {
-                name: &args.broker.name,
+                name: &turn.broker.name,
                 url,
                 token: seed_token.as_deref(),
             })
@@ -752,7 +756,7 @@ async fn try_turn(
             url: &s.server.url,
             token: None,
         }));
-        let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
+        let seeds = backend.seed_files(&turn.agent, &servers, &sandbox_auth, &inference);
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
             run_os(
@@ -777,9 +781,9 @@ async fn try_turn(
         let mcp_seeded = !servers.is_empty();
         let argv = match session {
             Some(session) => backend
-                .sandbox_session_argv(args, mcp_seeded, session)
+                .sandbox_session_argv(&turn.agent, mcp_seeded, session)
                 .context("building continuing sandbox harness argv")?,
-            None => backend.sandbox_argv(args, mcp_seeded),
+            None => backend.sandbox_argv(&turn.agent, mcp_seeded),
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
@@ -801,7 +805,7 @@ async fn try_turn(
                             Ok(t) => {
                                 if let Err(e) = gw
                                     .update_provider(
-                                        provider::PROVIDER_NAME,
+                                        provider::PROVIDER_NAME.as_str(),
                                         provider::CRED_KEY,
                                         &t,
                                     )
@@ -817,12 +821,12 @@ async fn try_turn(
             })),
             AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => None,
         };
-        let full = crate::agent::turn::tool_io_full(args);
+        let full = crate::agent::turn::tool_io_full(turn.agent.env);
         let pump = crate::agent::turn::StreamPump::new(
-            backend.decoder(args, meters.as_ref(), full),
-            (!full).then(|| backend.decoder(args, None, true)),
-            crate::agent::tool_chain::ToolChain::for_args(args),
-            args.pricing(),
+            backend.decoder(&turn.agent, meters.as_ref(), full),
+            (!full).then(|| backend.decoder(&turn.agent, None, true)),
+            crate::agent::tool_chain::ToolChain::declared(turn.tool_plugins),
+            turn.pricing,
         );
         let exec_result =
             exec_and_stream(&gw, &name, &wrapper, pump, &exec_opts, spent, sink).await;
@@ -871,7 +875,8 @@ async fn try_turn(
         if harness.spec().backfill_required
             || crate::agent::engine::TurnExport::resolve().emits_anything()
         {
-            graft_turn_telemetry(harness, &gw, &name, &cancel, &mut cost, sink).await;
+            graft_turn_telemetry(harness, gen_ai_system, &gw, &name, &cancel, &mut cost, sink)
+                .await;
             spent.raise(cost.total());
         }
         Ok(cost.total())
@@ -886,7 +891,7 @@ async fn try_turn(
     {
         let _ = gw.delete_sandbox(&name).await;
     }
-    for server in &args.mcp {
+    for server in turn.mcp {
         if let Err(e) = server.tokens.revoke(&name) {
             tracing::warn!("revoking {name}'s token on [mcp.{}]: {e:#}", server.key);
         }
@@ -952,10 +957,10 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     gw.ensure_provider_profile(provider::google_cloud_profile())
         .await
         .context("importing the google-cloud provider profile")?;
-    if !gw.provider_exists(provider::PROVIDER_NAME).await
+    if !gw.provider_exists(provider::PROVIDER_NAME.as_str()).await
         && gw
             .create_provider(
-                provider::PROVIDER_NAME,
+                provider::PROVIDER_NAME.as_str(),
                 provider::CRED_KEY,
                 token,
                 provider::PROVIDER_TYPE,
@@ -968,7 +973,7 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     {
         return Ok(());
     }
-    gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
+    gw.update_provider(provider::PROVIDER_NAME.as_str(), provider::CRED_KEY, token)
         .await
         .context("updating the Vertex provider token")
 }
@@ -1024,18 +1029,39 @@ fn binds_sandboxes(
 
 /// How the sandbox's `.mcp.json` names the broker token.
 #[derive(Debug, PartialEq, Eq)]
-enum BrokerPlaceholder {
+enum Placeholder {
     /// [`provider::broker_token_placeholder`].
     Canonical,
     /// The placeholder the gateway issued the workload, read from the sandbox.
     Issued,
 }
 
-/// The issued placeholder only alongside a token grant; otherwise the canonical one.
-fn broker_placeholder(token_grant: bool) -> BrokerPlaceholder {
-    match token_grant {
-        true => BrokerPlaceholder::Issued,
-        false => BrokerPlaceholder::Canonical,
+/// How the sandbox authenticates to the run's broker.
+#[derive(Debug, PartialEq, Eq)]
+enum BrokerAuth {
+    /// No broker provider this turn: the seed carries whatever token the run holds, in clear.
+    None,
+    /// The token is a static credential on the broker provider and the seed carries only a
+    /// placeholder, so the real token never enters the sandbox. The issued placeholder only
+    /// alongside a token grant; otherwise the canonical one.
+    Provider(Placeholder),
+}
+
+impl BrokerAuth {
+    fn resolve(enabled: bool, token: Option<&str>, token_grant: bool) -> Self {
+        match (enabled, token, token_grant) {
+            (true, Some(_), true) => BrokerAuth::Provider(Placeholder::Issued),
+            (true, Some(_), false) => BrokerAuth::Provider(Placeholder::Canonical),
+            _ => BrokerAuth::None,
+        }
+    }
+
+    /// The gateway provider the sandbox attaches and the broker endpoint binds to.
+    fn provider(&self) -> Option<&'static grpc::ProviderName> {
+        match self {
+            BrokerAuth::Provider(_) => Some(&provider::BROKER_PROVIDER_NAME),
+            BrokerAuth::None => None,
+        }
     }
 }
 
@@ -1043,7 +1069,7 @@ fn broker_placeholder(token_grant: bool) -> BrokerPlaceholder {
 /// key its placeholder resolves through.
 struct StaticProvider {
     profile: openshell_core::proto::ProviderProfile,
-    name: &'static str,
+    name: grpc::ProviderName,
     cred_key: &'static str,
 }
 
@@ -1051,7 +1077,7 @@ impl StaticProvider {
     fn broker() -> Self {
         Self {
             profile: provider::broker_profile(),
-            name: provider::BROKER_PROVIDER_NAME,
+            name: provider::BROKER_PROVIDER_NAME.clone(),
             cred_key: provider::BROKER_CRED_KEY,
         }
     }
@@ -1065,16 +1091,16 @@ async fn ensure_static_provider(gw: &Gateway, p: &StaticProvider, token: &str) -
     gw.ensure_provider_profile(p.profile.clone())
         .await
         .with_context(|| format!("importing the {} provider profile", p.name))?;
-    if !gw.provider_exists(p.name).await
+    if !gw.provider_exists(p.name.as_str()).await
         && gw
-            .create_static_provider(p.name, p.cred_key, token, &profile_id)
+            .create_static_provider(p.name.as_str(), p.cred_key, token, &profile_id)
             .await
             .with_context(|| format!("creating the {} provider", p.name))?
             == grpc::ProviderCreate::Created
     {
         return Ok(());
     }
-    gw.update_provider(p.name, p.cred_key, token)
+    gw.update_provider(p.name.as_str(), p.cred_key, token)
         .await
         .with_context(|| format!("updating the {} provider token", p.name))
 }
@@ -1107,9 +1133,12 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     gw.ensure_provider_profile(provider::aws_s3_profile())
         .await
         .context("importing the aws-s3 provider profile")?;
-    gw.ensure_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
-        .await
-        .context("creating the aws-s3 provider")?;
+    gw.ensure_minted_provider(
+        provider::AWS_PROVIDER_NAME.as_str(),
+        provider::AWS_PROVIDER_TYPE,
+    )
+    .await
+    .context("creating the aws-s3 provider")?;
     let mut material = std::collections::HashMap::from([
         ("role_arn".to_string(), role_arn.to_string()),
         ("session_name".to_string(), "crucible-sandbox".to_string()),
@@ -1120,16 +1149,19 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
         material.insert("aws_region".to_string(), region.trim().to_string());
     }
     gw.configure_provider_refresh(
-        provider::AWS_PROVIDER_NAME,
+        provider::AWS_PROVIDER_NAME.as_str(),
         provider::AWS_PRIMARY_CRED,
         ProviderCredentialRefreshStrategy::AwsStsAssumeRole,
         material,
     )
     .await
     .context("configuring the aws-s3 assume-role refresh")?;
-    gw.rotate_provider_credential(provider::AWS_PROVIDER_NAME, provider::AWS_PRIMARY_CRED)
-        .await
-        .context("pre-warming the aws-s3 credentials")
+    gw.rotate_provider_credential(
+        provider::AWS_PROVIDER_NAME.as_str(),
+        provider::AWS_PRIMARY_CRED,
+    )
+    .await
+    .context("pre-warming the aws-s3 credentials")
 }
 
 /// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the front-end
@@ -1290,29 +1322,28 @@ async fn publish_workspace(staged: &std::path::Path, workspace: &std::path::Path
 /// in that case. A key-authenticated harness (opencode, pi) gets every key and base URL the env
 /// carries: its seeded provider table names which variable it reads.
 pub(crate) fn inference_env(
-    env: &mut Vec<(String, String)>,
+    env: &mut SandboxEnv,
     harness: Harness,
     auth: AuthProvider,
     inference: &crate::agent::inference::InferenceEnv,
     sandbox_auth: &SandboxAuth,
 ) {
-    let set = |env: &mut Vec<(String, String)>, key: &str, value: &str| {
-        env.retain(|(k, _)| k != key);
-        env.push((key.to_string(), value.to_string()));
+    let set = |env: &mut SandboxEnv, key: &str, value: &str| {
+        env.set(EnvSource::Inference, key, value);
     };
     if auth == AuthProvider::AnthropicKey {
-        env.retain(|(k, _)| !crate::agent::inference::VERTEX_SELECTORS.contains(&k.as_str()));
+        env.remove(crate::agent::inference::VERTEX_SELECTORS);
         if let Some(key) = inference.anthropic_key.as_deref() {
             set(env, crate::agent::inference::ANTHROPIC_API_KEY, key);
         }
     }
-    match harness {
-        Harness::Claude | Harness::Hermes => {
+    match harness.spec().api {
+        ApiFamily::Anthropic => {
             if let Some(url) = inference.anthropic_base_url.as_deref() {
                 set(env, crate::agent::inference::ANTHROPIC_BASE_URL, url);
             }
         }
-        Harness::Codex => {
+        ApiFamily::OpenAi => {
             if let Some(url) = inference.openai_base_url.as_deref() {
                 set(env, crate::agent::inference::OPENAI_BASE_URL, url);
                 if let Some(provider::CodexAuth::ApiKey(key)) = sandbox_auth.codex() {
@@ -1324,7 +1355,7 @@ pub(crate) fn inference_env(
                 }
             }
         }
-        Harness::OpenCode | Harness::Pi => {
+        ApiFamily::Both => {
             for (key, value) in [
                 (
                     crate::agent::inference::OPENAI_API_KEY_ENV,
@@ -1409,6 +1440,7 @@ async fn write_traceparent_files(
 /// turn's (possibly raised) cost.
 async fn graft_turn_telemetry(
     harness: Harness,
+    gen_ai_system: &'static str,
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
@@ -1436,7 +1468,7 @@ async fn graft_turn_telemetry(
     // One infallible parse over the in-memory transcript feeds span export and (backfill
     // harnesses) the turn's result; skip it when nothing consumes it.
     let artifacts = if export.spans() || harness.spec().backfill_required {
-        harness.backend().parse_transcript(&bytes)
+        backend(harness).parse_transcript(&bytes)
     } else {
         TurnArtifacts::default()
     };
@@ -1452,8 +1484,8 @@ async fn graft_turn_telemetry(
         if export.content() {
             // Content logs come from the harness's own transcript reader (claude maps its jsonl;
             // hermes: Phase B), off the same in-memory bytes, no re-read.
-            let records = harness.backend().content_records(&bytes);
-            crate::agent::engine::emit_conversation_logs(&span, &records);
+            let records = backend(harness).content_records(&bytes);
+            crate::agent::engine::emit_conversation_logs(&span, &records, gen_ai_system);
         }
     }
 
@@ -1749,77 +1781,6 @@ async fn write_temp(tag: &str, content: &str) -> Result<tempfile::NamedTempFile>
     .context("temp-file task panicked")?
 }
 
-/// The env var naming the projections a run's agent may receive, comma-separated. The controller
-/// sets it from the registry, which is the only place visibility is known.
-pub const AGENT_VISIBLE_ENV: &str = "CRUCIBLE_AGENT_VISIBLE_ENV";
-
-/// Seed `env` with the declared secrets the agent may hold: those the manifest declares an `env`
-/// projection for AND [`AGENT_VISIBLE_ENV`] names. An unset or empty list relays nothing. A
-/// manifest-provided value wins, as with the Vertex keys. Returns what it relayed, as
-/// `[[secret]].name -> env var`.
-pub fn relay_agent_visible_secrets(
-    secrets: &[crate::manifest::SecretDecl],
-    env: &mut Vec<(String, String)>,
-) -> std::collections::BTreeMap<String, String> {
-    let mut relayed = std::collections::BTreeMap::new();
-    let Ok(allowed) = std::env::var(AGENT_VISIBLE_ENV) else {
-        return relayed;
-    };
-    let allowed: Vec<&str> = allowed
-        .split(',')
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .collect();
-    for secret in secrets {
-        let Some(key) = secret
-            .env
-            .as_deref()
-            .map(str::trim)
-            .filter(|k| !k.is_empty())
-        else {
-            continue;
-        };
-        if !allowed.contains(&key) || env.iter().any(|(k, _)| k == key) {
-            continue;
-        }
-        if let Ok(v) = std::env::var(key)
-            && !v.is_empty()
-        {
-            env.push((key.to_string(), v));
-            relayed.insert(secret.name.clone(), key.to_string());
-        }
-    }
-    relayed
-}
-
-/// Seed `env` with the process values of [`crate::openshell::policy::VERTEX_RELAY_KEYS`]: only keys that are set and
-/// non-empty relay, and an existing entry (a manifest-provided value) always wins.
-pub fn relay_vertex_env(env: &mut Vec<(String, String)>) {
-    relay_keys(crate::openshell::policy::VERTEX_RELAY_KEYS, env);
-}
-
-/// Seed `env` with the process values of [`crate::openshell::policy::IDENTITY_RELAY_KEYS`], on the same terms. Without this
-/// the agent commits under whatever the pack's `setup_cmd` hardcoded, and the pull request that
-/// carries the commit is attributed to nobody.
-pub fn relay_identity_env(env: &mut Vec<(String, String)>) {
-    relay_keys(crate::openshell::policy::IDENTITY_RELAY_KEYS, env);
-}
-
-/// The shared relay: only keys that are set and non-empty cross, and an existing entry (a
-/// manifest-provided value) always wins.
-fn relay_keys(keys: &[&str], env: &mut Vec<(String, String)>) {
-    for key in keys {
-        if env.iter().any(|(k, _)| k == key) {
-            continue;
-        }
-        if let Ok(v) = std::env::var(key)
-            && !v.is_empty()
-        {
-            env.push((key.to_string(), v));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -1844,9 +1805,25 @@ mod tests {
 
     #[test]
     fn the_broker_placeholder_reads_the_sandbox_only_alongside_a_token_grant() {
-        use crate::openshell::run::{BrokerPlaceholder, broker_placeholder};
-        assert_eq!(broker_placeholder(false), BrokerPlaceholder::Canonical);
-        assert_eq!(broker_placeholder(true), BrokerPlaceholder::Issued);
+        use crate::openshell::run::{BrokerAuth, Placeholder};
+        assert_eq!(
+            BrokerAuth::resolve(true, Some("t"), false),
+            BrokerAuth::Provider(Placeholder::Canonical)
+        );
+        assert_eq!(
+            BrokerAuth::resolve(true, Some("t"), true),
+            BrokerAuth::Provider(Placeholder::Issued)
+        );
+        assert_eq!(BrokerAuth::resolve(true, None, true), BrokerAuth::None);
+        assert_eq!(
+            BrokerAuth::resolve(false, Some("t"), true),
+            BrokerAuth::None
+        );
+        assert_eq!(
+            BrokerAuth::resolve(true, Some("t"), false).provider(),
+            Some(&crate::openshell::provider::BROKER_PROVIDER_NAME)
+        );
+        assert_eq!(BrokerAuth::None.provider(), None);
         assert_eq!(
             crate::openshell::provider::broker_token_placeholder(),
             format!(
@@ -2108,14 +2085,11 @@ mod tests {
 
     #[test]
     fn a_direct_key_turn_drops_the_vertex_selectors_and_carries_the_key() {
-        let mut env = vec![
-            ("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string()),
-            (
-                "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-                "proj".to_string(),
-            ),
-            ("KEEP_ME".to_string(), "yes".to_string()),
-        ];
+        let mut env = SandboxEnv::from_manifest([
+            ("CLAUDE_CODE_USE_VERTEX", "1"),
+            ("ANTHROPIC_VERTEX_PROJECT_ID", "proj"),
+            ("KEEP_ME", "yes"),
+        ]);
         let inference = crate::agent::inference::InferenceEnv {
             anthropic_key: Some("sk-ant".into()),
             anthropic_base_url: Some("https://claude.corp/v1".into()),
@@ -2128,11 +2102,7 @@ mod tests {
             &inference,
             &SandboxAuth::AnthropicKey,
         );
-        let get = |k: &str| {
-            env.iter()
-                .find(|(key, _)| key == k)
-                .map(|(_, v)| v.as_str())
-        };
+        let get = |k: &str| env.get(k);
         assert_eq!(get("CLAUDE_CODE_USE_VERTEX"), None);
         assert_eq!(get("ANTHROPIC_VERTEX_PROJECT_ID"), None);
         assert_eq!(get("KEEP_ME"), Some("yes"));
@@ -2145,7 +2115,7 @@ mod tests {
     #[test]
     fn codex_exports_its_key_only_for_a_custom_endpoint() {
         let auth = SandboxAuth::Codex(provider::CodexAuth::ApiKey("sk-oa".to_string()));
-        let mut plain = Vec::new();
+        let mut plain = SandboxEnv::default();
         inference_env(
             &mut plain,
             Harness::Codex,
@@ -2153,9 +2123,9 @@ mod tests {
             &Default::default(),
             &auth,
         );
-        assert!(plain.is_empty(), "{plain:?}");
+        assert_eq!(plain.vars().count(), 0, "{plain:?}");
 
-        let mut custom = Vec::new();
+        let mut custom = SandboxEnv::default();
         let inference = crate::agent::inference::InferenceEnv {
             openai_base_url: Some("http://vllm.internal:8000/v1".into()),
             ..Default::default()
@@ -2167,11 +2137,11 @@ mod tests {
             &inference,
             &auth,
         );
-        assert!(custom.contains(&(
-            "OPENAI_BASE_URL".to_string(),
-            "http://vllm.internal:8000/v1".to_string()
-        )));
-        assert!(custom.contains(&("OPENAI_API_KEY".to_string(), "sk-oa".to_string())));
+        assert_eq!(
+            custom.get("OPENAI_BASE_URL"),
+            Some("http://vllm.internal:8000/v1")
+        );
+        assert_eq!(custom.get("OPENAI_API_KEY"), Some("sk-oa"));
     }
 
     #[test]
@@ -2245,186 +2215,6 @@ mod tests {
         assert_eq!(label_value("my workspace/v2"), "my-workspace-v2");
         assert_eq!(label_value("-.trimmed.-"), "trimmed");
         assert_eq!(label_value("vllm"), "vllm");
-    }
-
-    fn decl(name: &str, env: Option<&str>) -> crate::manifest::SecretDecl {
-        let toml = match env {
-            Some(e) => format!("name = \"{name}\"\nenv = \"{e}\"\n"),
-            None => format!("name = \"{name}\"\npath = \"/tmp/{name}\"\n"),
-        };
-        toml::from_str(&toml).expect("a secret declaration")
-    }
-
-    /// The whole point of the allowlist: what the registry did not name does not cross, and a
-    /// controller that sends no list withholds everything rather than leaking each secret.
-    #[test]
-    fn only_the_named_projections_reach_the_agent() {
-        let _guard = crucible::test_support::env_lock();
-        let secrets = [
-            decl("pr", Some("GH_TOKEN")),
-            decl("push", Some("REG_TOKEN")),
-        ];
-        unsafe {
-            std::env::set_var("GH_TOKEN", "t-gh");
-            std::env::set_var("REG_TOKEN", "t-reg");
-        }
-
-        // No list at all: nothing crosses.
-        unsafe { std::env::remove_var(AGENT_VISIBLE_ENV) };
-        let mut env = Vec::new();
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert!(env.is_empty(), "an absent allowlist must relay nothing");
-
-        // An empty list: still nothing.
-        unsafe { std::env::set_var(AGENT_VISIBLE_ENV, "") };
-        let mut env = Vec::new();
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert!(env.is_empty(), "an empty allowlist must relay nothing");
-
-        // One named: only that one, and the broker-only sibling stays behind.
-        unsafe { std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN") };
-        let mut env = Vec::new();
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert_eq!(env, vec![("GH_TOKEN".to_string(), "t-gh".to_string())]);
-
-        unsafe {
-            std::env::remove_var("GH_TOKEN");
-            std::env::remove_var("REG_TOKEN");
-            std::env::remove_var(AGENT_VISIBLE_ENV);
-        }
-    }
-
-    /// The identity the controller named for the run reaches the agent that does the committing.
-    /// Unset relays nothing, so a deploy that names no identity is unchanged.
-    #[test]
-    fn the_run_identity_reaches_the_agent_and_a_manifest_value_wins() {
-        let _guard = crucible::test_support::env_lock();
-        for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
-            unsafe { std::env::remove_var(key) };
-        }
-        let mut env = Vec::new();
-        relay_identity_env(&mut env);
-        assert!(env.is_empty(), "no identity named, nothing relayed");
-
-        unsafe {
-            std::env::set_var("GIT_AUTHOR_NAME", "crucible-bot[bot]");
-            std::env::set_var(
-                "GIT_AUTHOR_EMAIL",
-                "299632118+crucible-bot[bot]@users.noreply.github.com",
-            );
-            std::env::set_var("GIT_COMMITTER_NAME", "crucible-bot[bot]");
-            std::env::set_var("GIT_COMMITTER_EMAIL", "");
-        }
-        // A manifest that named its own author keeps it; the empty committer email does not cross.
-        let mut env = vec![("GIT_AUTHOR_NAME".to_string(), "from-manifest".to_string())];
-        relay_identity_env(&mut env);
-        assert_eq!(
-            env,
-            vec![
-                ("GIT_AUTHOR_NAME".to_string(), "from-manifest".to_string()),
-                (
-                    "GIT_AUTHOR_EMAIL".to_string(),
-                    "299632118+crucible-bot[bot]@users.noreply.github.com".to_string()
-                ),
-                (
-                    "GIT_COMMITTER_NAME".to_string(),
-                    "crucible-bot[bot]".to_string()
-                ),
-            ]
-        );
-
-        for key in crate::openshell::policy::IDENTITY_RELAY_KEYS {
-            unsafe { std::env::remove_var(key) };
-        }
-    }
-
-    /// A file projection has no env name to relay, and a manifest value is not overwritten.
-    #[test]
-    fn a_file_projection_relays_nothing_and_a_manifest_value_wins() {
-        let _guard = crucible::test_support::env_lock();
-        let secrets = [decl("kube", None), decl("pr", Some("GH_TOKEN"))];
-        unsafe {
-            std::env::set_var(AGENT_VISIBLE_ENV, "GH_TOKEN");
-            std::env::set_var("GH_TOKEN", "from-pod");
-        }
-        let mut env = vec![("GH_TOKEN".to_string(), "from-manifest".to_string())];
-        relay_agent_visible_secrets(&secrets, &mut env);
-        assert_eq!(
-            env,
-            vec![("GH_TOKEN".to_string(), "from-manifest".to_string())]
-        );
-        unsafe {
-            std::env::remove_var("GH_TOKEN");
-            std::env::remove_var(AGENT_VISIBLE_ENV);
-        }
-    }
-
-    fn clear_relay_keys() {
-        for k in crate::openshell::policy::VERTEX_RELAY_KEYS {
-            unsafe {
-                std::env::remove_var(k);
-            }
-        }
-    }
-
-    #[test]
-    fn relay_copies_set_nonempty_keys_and_skips_empty_and_unset() {
-        let _guard = crucible::test_support::env_lock();
-        clear_relay_keys();
-        unsafe {
-            std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
-        }
-        unsafe {
-            std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "proj-x");
-        }
-        unsafe {
-            std::env::set_var("CLOUD_ML_REGION", "");
-        }
-
-        let mut env = Vec::new();
-        relay_vertex_env(&mut env);
-        clear_relay_keys();
-
-        assert_eq!(
-            env,
-            vec![
-                ("CLAUDE_CODE_USE_VERTEX".to_string(), "1".to_string()),
-                (
-                    "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-                    "proj-x".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn manifest_provided_values_win_over_the_process_env() {
-        let _guard = crucible::test_support::env_lock();
-        clear_relay_keys();
-        unsafe {
-            std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "from-process");
-        }
-        unsafe {
-            std::env::set_var("VERTEX_LOCATION", "us-east5");
-        }
-
-        let mut env = vec![(
-            "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-            "from-manifest".to_string(),
-        )];
-        relay_vertex_env(&mut env);
-        clear_relay_keys();
-
-        assert_eq!(
-            env,
-            vec![
-                (
-                    "ANTHROPIC_VERTEX_PROJECT_ID".to_string(),
-                    "from-manifest".to_string()
-                ),
-                ("VERTEX_LOCATION".to_string(), "us-east5".to_string()),
-            ]
-        );
     }
 
     #[tokio::test]

@@ -64,15 +64,15 @@ loop: the gates between iterations and the ways a run ends.
 
 | Stage | What happens | Deeper |
 | --- | --- | --- |
-| **Goal** | A GitHub issue or Jira ticket becomes a frozen run objective. The objective does not change after the run starts. | [ADR 0001](./adr/0001-adaptive-harness.md) |
-| **wide round** | Optional. `--wide N` runs N independent propose turns in parallel, one for each `[search].approaches` entry. The gate ranks them, and the winner is the start point of the deep loop. With 0 (default), the run starts at propose. | [ADR 0010](./adr/0010-candidate-portfolios-and-search.md) |
+| **Goal** | A GitHub issue or Jira ticket becomes a frozen run objective. The objective does not change after the run starts. | [ADR-0001](./adr/ADR-0001.md) |
+| **wide round** | Optional. `--wide N` runs N independent propose turns in parallel, one for each `[search].approaches` entry. The gate ranks them, and the winner is the start point of the deep loop. With 0 (default), the run starts at propose. | [ADR-0010](./adr/ADR-0010.md) |
 | **propose** | The agent reads the history and edits the world toward the goal. A backend (`local`, `openshell`, or `command`) supplies the proposal policy. The engine does not. | [The loop in one read](./crucible.md) |
-| **apply** | Makes the candidate live. For a code repository, the edits are the apply step. For a deploy domain, apply builds and sets the image. | [ADR 0005](./adr/0005-engine-side-builds.md), [ADR 0012](./adr/0012-rendered-deployments.md) |
-| **measure** | The frozen judge scores the candidate one time. The agent gets a `World` but not the `Judge`, so it cannot change the test that grades it. | [ADR 0001](./adr/0001-adaptive-harness.md) |
+| **apply** | Makes the candidate live. For a code repository, the edits are the apply step. For a deploy domain, apply builds and sets the image. | [ADR-0005](./adr/ADR-0005.md), [ADR-0011](./adr/ADR-0011.md) |
+| **measure** | The frozen judge scores the candidate one time. The agent gets a `World` but not the `Judge`, so it cannot change the test that grades it. | [ADR-0001](./adr/ADR-0001.md) |
 | **accept?** | Keeps the candidate only if it is `valid` and its score is strictly better than the best score in the `direction`. Otherwise, restores the last good state. | [Contract](./crucible-contract.md) |
 | **as a plan** | Every iteration runs as a work-graph plan (`propose -> apply -> measure -> decide`) through the shared executor. An authored workflow replaces the default graph. | [Work graphs](./work-graphs.md) |
-| **remember** | Kept states are Git commits. Each step is an NDJSON session event. Git is the durable store. Each run writes exactly one `shutdown` event as its last line, so the viewer and any published record can tell a clean end from a pod that stopped during the run. | [ADR 0004](./adr/0004-core-loop-state-model.md) |
-| **broker** | Provisioning, issue-tracker grounding, the profiler, build and deploy, and draft PRs run on the host. The agent sends requests over MCP. The privileges do not go into its sandbox. | [ADR 0002](./adr/0002-mediated-provisioning-mcp.md), [ADR 0006](./adr/0006-profiling-over-mcp.md) |
+| **remember** | Kept states are Git commits. Each step is an NDJSON session event. Git is the durable store. Each run writes exactly one `shutdown` event as its last line, so the viewer and any published record can tell a clean end from a pod that stopped during the run. | [ADR-0004](./adr/ADR-0004.md) |
+| **broker** | Provisioning, issue-tracker grounding, the profiler, build and deploy, and draft PRs run on the host. The agent sends requests over MCP. The privileges do not go into its sandbox. | [ADR-0002](./adr/ADR-0002.md), [ADR-0006](./adr/ADR-0006.md) |
 | **publish** | On keep, the engine sends the run record to S3 and opens a draft PR for each fork. Authorized review comments steer the run again. A pod that the control plane dispatches uploads its evidence to the controller with its pod token, and the controller shows leaderboards and run pages. The engine binary does not link the controller. | [Contract](./crucible-contract.md) |
 
 ## Glossary

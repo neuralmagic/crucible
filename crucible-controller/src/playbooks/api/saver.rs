@@ -1,7 +1,4 @@
-use crate::api::dto::invalid_fields;
 use crate::api::state::*;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
 
 /// Who a launch runs as, and where. The same resolution for every launch endpoint: the dispatch
 /// target against the caller's reach, the agent pin, and, for a standing surface that fires with
@@ -42,35 +39,30 @@ pub(crate) struct SaverRequest<'a> {
     pub model: Option<&'a str>,
 }
 
-fn cannot_own() -> Response {
-    (
-        StatusCode::FORBIDDEN,
-        Json(ErrorBody::new(
-            "this cluster token's username matches no signed-in user, so it can own nothing that \
-             fires without a session",
-        )),
+fn cannot_own() -> ApiError {
+    ApiError::Forbidden(
+        "this credential stands for no confirmed sign-in (a downgraded or viewed-as session), \
+         so it can own nothing that fires without a session"
+            .to_string(),
     )
-        .into_response()
 }
 
-/// Resolve the saver. A snapshot surface refuses a credential that names nobody, since the row
+/// Resolve the saver. A snapshot surface refuses a credential that may not own, since the row
 /// would own to nobody; every surface resolves the target and the pin against the caller.
-#[allow(clippy::result_large_err)]
 pub(crate) async fn resolve_saver(
     state: &ApiState,
     caller: &crate::authz::Caller,
     groups: &crate::identity::auth::Groups,
     ownership: Ownership<'_>,
     req: SaverRequest<'_>,
-) -> Result<Saver, Response> {
+) -> ApiResult<Saver> {
     let owner_principal = match ownership {
         Ownership::Session => None,
         Ownership::Snapshot { asked } => {
             if !caller.path.may_own() {
                 return Err(cannot_own());
             }
-            let owner = crate::authz::owner::resolve_owner(caller, asked)
-                .map_err(IntoResponse::into_response)?;
+            let owner = crate::authz::owner::resolve_owner(caller, asked)?;
             Some(owner.to_string())
         }
         Ownership::Keep { principal, .. } => principal.map(str::to_string),
@@ -100,8 +92,8 @@ pub(crate) async fn resolve_saver(
     .await
     {
         Ok(Ok(pin)) => pin,
-        Ok(Err(refusal)) => return Err(invalid_fields(vec![refusal.field_error()])),
-        Err(e) => return Err(AppError::from(e).into_response()),
+        Ok(Err(refusal)) => return Err(ApiError::invalid_fields(vec![refusal.field_error()])),
+        Err(e) => return Err(e.into()),
     };
     let actor = caller.actor_principals().login().map(str::to_string);
     Ok(Saver {
@@ -114,37 +106,26 @@ pub(crate) async fn resolve_saver(
     })
 }
 
-/// Pin the cluster and the provider/model a freshly adopted launch dispatches with onto its issue
-/// row.
-#[allow(clippy::result_large_err)]
-pub(crate) async fn pin_dispatch(
-    state: &ApiState,
-    key: &str,
-    saver: &Saver,
-) -> Result<(), Response> {
-    crate::issues::store::set_dispatch_target(state.db.pool(), key, Some(&saver.dispatch_target))
-        .await
-        .map_err(|e| AppError::from(e).into_response())?;
-    crate::issues::store::set_agent_dispatch(
-        state.db.pool(),
-        key,
-        saver.provider.as_deref(),
-        saver.model.as_deref(),
-    )
-    .await
-    .map_err(|e| AppError::from(e).into_response())
+impl Saver {
+    /// The dispatch pin a launch this saver mints is written with.
+    pub(crate) fn pin(&self) -> crate::launches::model::DispatchPin<'_> {
+        crate::launches::model::DispatchPin {
+            target: Some(&self.dispatch_target),
+            provider: self.provider.as_deref(),
+            model: self.model.as_deref(),
+        }
+    }
 }
 
 /// Resolve what a launch asked to dispatch onto against what its caller may reach. A refusal is a
 /// 403 naming the eligible set, not a silent fall back to the default: dispatching somebody's run
 /// onto a cluster they did not choose is worse than making them choose again.
-#[allow(clippy::result_large_err)]
 pub(crate) async fn resolve_dispatch_target(
     state: &ApiState,
     caller: &crate::authz::Caller,
     agent: Option<crate::playbooks::dispatch::PackAgent>,
     requested: Option<&str>,
-) -> Result<String, Response> {
+) -> ApiResult<String> {
     // A pack with no recorded substrate reads as the engine default; the startup backfill fills in
     // what it can, and refusing here for want of a stamp would be a lie about the pack.
     let agent = agent.unwrap_or(crate::playbooks::dispatch::PackAgent::new(
@@ -160,8 +141,7 @@ pub(crate) async fn resolve_dispatch_target(
         &mut connected,
         &mut personal,
     )
-    .await
-    .map_err(IntoResponse::into_response)?;
+    .await?;
     let refusal =
         match crate::runs::dispatch_target::resolve(&ctx, &caller.principals, &agent, requested) {
             Ok(target) => return Ok(target),
@@ -177,36 +157,19 @@ pub(crate) async fn resolve_dispatch_target(
             resource: crate::authz::action::ResourceType::DispatchTarget,
             verb: crate::authz::action::Verb::Dispatch,
         };
-        if let Err(denied) = crate::authz::owner::decide(state, caller, action, &resource).await {
-            return Err(denied.into_response());
-        }
+        crate::authz::owner::decide(state, caller, action, &resource).await?;
     }
-    let status = match refusal {
-        crate::runs::dispatch_target::TargetRefusal::Unknown { .. } => StatusCode::NOT_FOUND,
-        crate::runs::dispatch_target::TargetRefusal::Incompatible { .. }
-        | crate::runs::dispatch_target::TargetRefusal::NoneEligible { .. } => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
-        _ => StatusCode::FORBIDDEN,
-    };
-    Err((status, Json(ErrorBody::new(refusal.to_string()))).into_response())
+    Err(refusal.into())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::Db;
-    use crate::daemon::queue::{Override, OverrideSink};
     use crate::identity::auth::{AuthPath, Groups};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use sqlx::PgPool;
-    use std::sync::Arc;
-
-    #[derive(Default)]
-    struct NoSink;
-
-    impl OverrideSink for NoSink {
-        fn submit(&self, _ov: Override) {}
-    }
 
     fn request<'a>() -> SaverRequest<'a> {
         SaverRequest {
@@ -222,7 +185,7 @@ mod tests {
         path: AuthPath,
         ownership: Ownership<'_>,
     ) -> Result<Saver, StatusCode> {
-        let state = ApiState::test(Db::new(pool), Arc::new(NoSink));
+        let state = ApiState::test(Db::new(pool));
         let groups = Groups(vec!["/groups/team-x".to_string()]);
         let caller = crate::authz::resolve_caller(
             state.db.pool(),
@@ -235,14 +198,14 @@ mod tests {
         .expect("resolves");
         resolve_saver(&state, &caller, &groups, ownership, request())
             .await
-            .map_err(|r| r.status())
+            .map_err(|e| e.into_response().status())
     }
 
-    /// A surface that fires later with no session owns to the saver; a credential that names
-    /// nobody cannot own it, and the refusal is the same on every such surface.
+    /// A surface that fires later with no session owns to the saver; a credential that may not own
+    /// cannot own it, and the refusal is the same on every such surface.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_snapshot_surface_refuses_a_credential_that_names_nobody(pool: PgPool) {
-        for path in [AuthPath::UnknownClusterToken, AuthPath::DowngradedSession] {
+    async fn a_snapshot_surface_refuses_a_credential_that_may_not_own(pool: PgPool) {
+        for path in [AuthPath::DowngradedSession, AuthPath::Impersonated] {
             let refused = resolve(pool.clone(), path, Ownership::Snapshot { asked: None })
                 .await
                 .expect_err("cannot own");
@@ -253,7 +216,7 @@ mod tests {
     /// The same credential launches fine under its session: an immediate launch owns nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_session_surface_takes_any_credential_and_snapshots_no_owner(pool: PgPool) {
-        let saver = resolve(pool, AuthPath::UnknownClusterToken, Ownership::Session)
+        let saver = resolve(pool, AuthPath::DowngradedSession, Ownership::Session)
             .await
             .expect("resolved");
         assert_eq!(saver.actor.as_deref(), Some("alice"));

@@ -111,7 +111,13 @@ The output of a task is JSON. It becomes the input of the task's dependents.
   name, in the file that `CRUCIBLE_INPUTS_FILE` names. `CRUCIBLE_TASK` gives the task name. The
   same JSON is also in `CRUCIBLE_INPUTS` if it is 64 KiB or smaller. If it is larger, the
   variable is not set, because Linux rejects an environment string larger than 128 KiB. Read
-  the file.
+  the file. In an edition-2 pack (`edition = 2` at the top of `crucible.toml`), the command
+  gets besides these only `PATH`, `HOME`, `LANG`, `TMPDIR`, the run's identity
+  (`CRUCIBLE_RUN_NAME`, `CRUCIBLE_RUN_DISPLAY_NAME`, `CRUCIBLE_UI_BASE_URL`), and the variables
+  `[workflow].env` names in the manifest (`env = ["GH_TOKEN", "GPUS?"]`). A named variable the
+  engine does not have refuses the run, unless its name ends in `?`: an optional variable is
+  passed when the engine has it and left out when it does not. In an edition-1 pack the
+  command inherits the engine's whole environment, and `[workflow].env` fails the parse.
 - `agent` with `--manifest`: the turn writes one JSON object to `PLAN_TASK_RESULT.json` in the
   workspace root. If the file is missing after a normal turn, this is a measured failure. An
   explicit spawn, harness, or stream error is a transport failure and follows the retry policy.
@@ -261,13 +267,18 @@ the same position, the engine skips it and its dependents, and validity does not
 **Failure.** If a `required` task fails, the plan stops. All tasks that did not dispatch are
 blocked. An advisory failure blocks only its dependents.
 
-**Early completion.** In a playbook, a passing main-graph task can return `"complete": true`,
-with an optional `"reason"` string. This ends the run. No other main-graph task dispatches.
-Tasks that did not dispatch stay unsettled, not blocked. Epilogue tasks still run. The run is
-valid unless a required task already settled with a status other than pass. The shutdown
-outcome is `complete`, with the reason. Both fields are reserved, so `emits` cannot list them.
-A revised task that completes ends its loop without another review. A mapped instance that
-completes ends the run after its node folds.
+**Early completion.** In a playbook, a passing main-graph `command` or `evaluate` task can
+return `"complete": true`, with an optional `"reason"` string. This ends the run. No other
+main-graph task dispatches. Tasks that did not dispatch stay unsettled, not blocked. Epilogue
+tasks still run. The run is valid unless a required task already settled with a status other
+than pass. The shutdown outcome is `complete`, with the reason. Both fields are reserved, so
+`emits` cannot list them. A revised command that completes ends its loop without another
+review. A mapped instance that completes ends the run after its node folds.
+
+An agent task, or any other task whose output a model writes, cannot end the run this way. If
+it returns `"complete": true`, the engine refuses it: the task keeps its own outcome, its row's
+note records the refusal, and the run continues. Put the "nothing to do" decision in a command
+or evaluate task that reads the agent's output.
 
 **Retries apply only to transport failures.** Transport failures retry, up to a limit (2 by
 default). A measured failure does not run again.
@@ -534,7 +545,9 @@ In a playbook, the epilogue runs after the main graph completes or fails. It rea
 reserved `outcome` input: `{"exit", "tasks": {name: {"status", "note", "output", "files"}}}`.
 Each entry is the same as the value that a `join = "settled"` consumer gets, with
 `per_instance`. The engine stages the declared files of each main-graph task under
-`inputs/<name>/` (for a mapped node, under `inputs/<node>[<key>]/`). It stages files from
+`inputs/<name>/` (for a mapped node, under `inputs/<node>[<key>]/`, where `%`, `/`, `\`, NUL,
+and a leading `.` in the key are written `%25`, `%2F`, `%5C`, `%00`, and `%2E`, so
+`llm-d/router` stages under `inputs/<node>[llm-d%2Frouter]/`). It stages files from
 failed tasks and from passing tasks. `files` tells if the files of that task are present. A
 skipped, blocked, or transport-failed task stages no files.
 

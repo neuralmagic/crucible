@@ -143,7 +143,7 @@ impl BuildsQuery {
 pub(crate) async fn list_builds(
     State(state): State<ApiState>,
     Query(q): Query<BuildsQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let query = match q.into_model() {
         Ok(q) => q,
         Err(msg) => {
@@ -171,7 +171,7 @@ pub(crate) async fn list_builds(
 pub(crate) async fn list_issue_builds(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(issue) = crate::issues::store::get_issue(state.db.pool(), &key).await? else {
         return Ok(not_found(format!("issue not found: {key}")));
     };
@@ -226,7 +226,7 @@ pub(crate) async fn rebuild_build(
     Path(id): Path<i64>,
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(build) = crate::builds::store::get_build(state.db.pool(), id).await? else {
         return Ok(not_found(format!("build not found: {id}")));
     };
@@ -325,7 +325,7 @@ async fn rebuild_narrate(
     build: &BuildRow,
     parked_on_this_build: bool,
     actor: Option<&str>,
-) -> Result<(), AppError> {
+) -> ApiResult<()> {
     let reason = format!("forced rebuild: build `{}` reset by admin", build.name);
     if parked_on_this_build {
         crate::issues::transitions::unpark(

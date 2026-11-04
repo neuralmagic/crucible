@@ -29,7 +29,7 @@ pub(crate) struct EventsQuery {
 pub(crate) async fn list_events(
     State(state): State<ApiState>,
     Query(q): Query<EventsQuery>,
-) -> Result<Json<Vec<EventDto>>, AppError> {
+) -> Result<Json<Vec<EventDto>>, ApiError> {
     let limit = q.limit.unwrap_or(EVENTS_TAIL_DEFAULT).min(EVENTS_TAIL_MAX);
     let recent = state.db.events().read_recent(limit).await?;
     Ok(Json(
@@ -67,7 +67,7 @@ pub(crate) async fn events_stream(
     axum::response::sse::Sse<
         impl futures_util::Stream<Item = Result<axum::response::sse::Event, std::convert::Infallible>>,
     >,
-    AppError,
+    ApiError,
 > {
     use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
     use futures_util::StreamExt;

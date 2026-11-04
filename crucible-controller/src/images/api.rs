@@ -5,7 +5,7 @@ use crucible_capability::CapabilityDoc;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 use crate::dto::dto;
 use crate::images::model::{CatalogImage, RepositoryStatus};
 
@@ -59,7 +59,7 @@ pub struct CatalogDto {
         (status = 200, description = "The image catalog: cached rows plus each watched repository's last poll", body = CatalogDto)
     )
 )]
-pub(crate) async fn list_images(State(state): State<ApiState>) -> Result<Response, AppError> {
+pub(crate) async fn list_images(State(state): State<ApiState>) -> ApiResult<Response> {
     let images = crate::images::store::list_images(state.db.pool()).await?;
     let repositories = crate::images::store::list_repositories(state.db.pool()).await?;
     Ok(Json(CatalogDto {

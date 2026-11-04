@@ -246,25 +246,6 @@ pub async fn get_artifact(
     Ok(Some(ArtifactPayload { data, digest }))
 }
 
-/// The recorded digest for one `(owner, kind)` without reading the chunks, or `None` if the
-/// artifact was never stored.
-pub(crate) async fn artifact_digest(
-    pool: &PgPool,
-    owner: &ArtifactOwner,
-    kind: &str,
-) -> Result<Option<String>> {
-    sqlx::query_scalar(
-        r#"SELECT digest FROM artifacts
-           WHERE owner_kind = $1 AND owner_id = $2 AND kind = $3"#,
-    )
-    .bind(owner.owner_kind())
-    .bind(owner.owner_id())
-    .bind(kind)
-    .fetch_optional(pool)
-    .await
-    .context("looking up artifact digest")
-}
-
 /// [`put_artifact`] over an in-memory payload.
 pub async fn put_artifact_bytes(
     pool: &PgPool,

@@ -29,6 +29,37 @@ impl GroundedErrorKind {
     }
 }
 
+/// A turn's ruling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Ruled {
+    pub tier: Disposition,
+    pub rationale: String,
+    /// Absent on a line an older engine wrote; it says how sure the ruling is, not whether one
+    /// was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<String>,
+    /// Required on purpose: a turn that spent money must say so, and a document without this
+    /// fails to decode rather than reading as free.
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub over_budget: bool,
+}
+
+/// A turn that produced no ruling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Failed {
+    pub error: String,
+    pub error_kind: GroundedErrorKind,
+    /// The tail of whatever the agent printed on its way down. A turn that dies during startup
+    /// prints its diagnostic and nothing else.
+    #[serde(default)]
+    pub output_tail: Option<String>,
+    /// Required for the same reason as a ruling's: a turn that broke after billing is not free.
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub over_budget: bool,
+}
+
 /// One grounded ranking turn's result. The two shapes are told apart by their own fields: a ruling
 /// carries `tier`, a failure carries `error`.
 ///
@@ -40,56 +71,8 @@ impl GroundedErrorKind {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum GroundedVerdict {
-    Ruled {
-        tier: Disposition,
-        rationale: String,
-        /// Absent on a line an older engine wrote; it says how sure the ruling is, not whether one
-        /// was made.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        confidence: Option<String>,
-        /// Required on purpose: a turn that spent money must say so, and a document without this
-        /// fails to decode rather than reading as free.
-        cost_usd: f64,
-        #[serde(default)]
-        over_budget: bool,
-    },
-    Failed {
-        error: String,
-        error_kind: GroundedErrorKind,
-        /// The tail of whatever the agent printed on its way down. A turn that dies during startup
-        /// prints its diagnostic and nothing else.
-        #[serde(default)]
-        output_tail: Option<String>,
-        /// Required for the same reason as a ruling's: a turn that broke after billing is not free.
-        cost_usd: f64,
-        #[serde(default)]
-        over_budget: bool,
-    },
-}
-
-/// The ruling shape, derived so the fields stay declarative; fed a `Value` so nothing goes through
-/// serde's `Content` buffer.
-#[derive(Deserialize)]
-struct RuledWire {
-    tier: Disposition,
-    rationale: String,
-    #[serde(default)]
-    confidence: Option<String>,
-    cost_usd: f64,
-    #[serde(default)]
-    over_budget: bool,
-}
-
-/// The failure shape, same treatment.
-#[derive(Deserialize)]
-struct FailedWire {
-    error: String,
-    error_kind: GroundedErrorKind,
-    #[serde(default)]
-    output_tail: Option<String>,
-    cost_usd: f64,
-    #[serde(default)]
-    over_budget: bool,
+    Ruled(Ruled),
+    Failed(Failed),
 }
 
 impl<'de> Deserialize<'de> for GroundedVerdict {
@@ -99,23 +82,13 @@ impl<'de> Deserialize<'de> for GroundedVerdict {
         use serde::de::Error as _;
         let value = serde_json::Value::deserialize(deserializer)?;
         if value.get("error").is_some() {
-            let w: FailedWire = serde_json::from_value(value).map_err(D::Error::custom)?;
-            Ok(GroundedVerdict::Failed {
-                error: w.error,
-                error_kind: w.error_kind,
-                output_tail: w.output_tail,
-                cost_usd: w.cost_usd,
-                over_budget: w.over_budget,
-            })
+            serde_json::from_value(value)
+                .map(GroundedVerdict::Failed)
+                .map_err(D::Error::custom)
         } else {
-            let w: RuledWire = serde_json::from_value(value).map_err(D::Error::custom)?;
-            Ok(GroundedVerdict::Ruled {
-                tier: w.tier,
-                rationale: w.rationale,
-                confidence: w.confidence,
-                cost_usd: w.cost_usd,
-                over_budget: w.over_budget,
-            })
+            serde_json::from_value(value)
+                .map(GroundedVerdict::Ruled)
+                .map_err(D::Error::custom)
         }
     }
 }
@@ -124,24 +97,23 @@ impl GroundedVerdict {
     /// What the turn spent, whichever way it ended. A partial turn is never free.
     pub fn cost_usd(&self) -> f64 {
         match self {
-            GroundedVerdict::Ruled { cost_usd, .. } | GroundedVerdict::Failed { cost_usd, .. } => {
-                *cost_usd
-            }
+            GroundedVerdict::Ruled(r) => r.cost_usd,
+            GroundedVerdict::Failed(f) => f.cost_usd,
         }
     }
 
     pub fn over_budget(&self) -> bool {
         match self {
-            GroundedVerdict::Ruled { over_budget, .. }
-            | GroundedVerdict::Failed { over_budget, .. } => *over_budget,
+            GroundedVerdict::Ruled(r) => r.over_budget,
+            GroundedVerdict::Failed(f) => f.over_budget,
         }
     }
 
     /// The ruling, if the turn produced one.
     pub fn disposition(&self) -> Option<Disposition> {
         match self {
-            GroundedVerdict::Ruled { tier, .. } => Some(*tier),
-            GroundedVerdict::Failed { .. } => None,
+            GroundedVerdict::Ruled(r) => Some(r.tier),
+            GroundedVerdict::Failed(_) => None,
         }
     }
 }
@@ -152,23 +124,23 @@ mod tests {
     use crate::tier::Tier;
 
     fn ruled() -> GroundedVerdict {
-        GroundedVerdict::Ruled {
+        GroundedVerdict::Ruled(Ruled {
             tier: Disposition::Tier(Tier::T1),
             rationale: "needs a live cluster".to_string(),
             confidence: Some("high".to_string()),
             cost_usd: 0.42,
             over_budget: false,
-        }
+        })
     }
 
     fn failed() -> GroundedVerdict {
-        GroundedVerdict::Failed {
+        GroundedVerdict::Failed(Failed {
             error: "the turn never completed: agent spawn failed: boom".to_string(),
             error_kind: GroundedErrorKind::TurnFailed,
             output_tail: Some("could not resolve host".to_string()),
             cost_usd: 0.01,
             over_budget: false,
-        }
+        })
     }
 
     /// The bytes a deployed engine already emits, field for field.
@@ -241,13 +213,13 @@ mod tests {
         let decoded: GroundedVerdict = crate::json::from_str(doc).expect("deserialize");
         assert_eq!(
             decoded,
-            GroundedVerdict::Failed {
+            GroundedVerdict::Failed(Failed {
                 error: "no verdict".to_string(),
                 error_kind: GroundedErrorKind::NoVerdict,
                 output_tail: None,
                 cost_usd: 0.0,
                 over_budget: true,
-            }
+            })
         );
         assert!(decoded.over_budget());
     }

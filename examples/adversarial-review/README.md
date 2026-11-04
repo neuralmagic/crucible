@@ -125,5 +125,4 @@ Two reviewers concurrently: 25.5s wall, against 36s for a single review.
 - Isolated plan tasks discard workspace edits. Carrying edits out of an isolated task is
   the wide tournament's path, not this one.
 - `plan run` reports cost per task but no token counts (`TaskResult.metric`/`secs` are unset).
-- `harness` and `model` are per-task, but the shipped harnesses (`claude`, `hermes`) both
-  serve Anthropic models over Vertex. Cross-vendor panels need a harness that does not exist.
+- `harness` and `model` are per-task.

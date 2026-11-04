@@ -57,6 +57,14 @@ pub(crate) async fn insert_playbook_launch_with(
     .execute(&mut **tx)
     .await
     .context("insert_playbook_launch: insert issue")?;
+    crate::issues::store::set_dispatch_target(&mut **tx, key, launch.dispatch.target).await?;
+    crate::issues::store::set_agent_dispatch(
+        &mut **tx,
+        key,
+        launch.dispatch.provider,
+        launch.dispatch.model,
+    )
+    .await?;
     sqlx::query!(
         "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, \
          advance_dedupe, dedupe_schedule, origin, draft_version, created_by, launcher_groups, \

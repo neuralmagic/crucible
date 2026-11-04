@@ -1,6 +1,7 @@
+use crate::runs::contract::RequestKind;
 use crate::wire_enum::{ParseError, wire_enum};
 #[cfg(feature = "autoresearch")]
-use crucible::deploy::{DigestResolver, ProposeTier, TurnOpts};
+use crucible::deploy::{DigestResolver, TurnOpts};
 #[cfg(feature = "autoresearch")]
 use crucible_contract::Tier;
 use k8s_openapi::api::core::v1::Pod;
@@ -63,6 +64,16 @@ impl WorkKind {
                 noun: "work-kind",
                 value: other.to_string(),
             }),
+        }
+    }
+}
+
+impl From<WorkKind> for RequestKind {
+    fn from(kind: WorkKind) -> Self {
+        match kind {
+            WorkKind::AgentTurn(TurnKind::GroundedRank) => Self::GroundedRank,
+            WorkKind::AgentTurn(TurnKind::Scope) => Self::Scope,
+            WorkKind::Run => Self::Run,
         }
     }
 }
@@ -410,11 +421,9 @@ impl WorkPodSpec {
         };
         // Only the t0/t1 spellings exist on the engine's tier (mirrors `engine::scope_propose`'s
         // filter); anything else, and every non-scope turn, leaves it unset.
-        let tier = match (scope, self.tier) {
-            (true, Some(Tier::T0)) => Some(ProposeTier::T0),
-            (true, Some(Tier::T1)) => Some(ProposeTier::T1),
-            _ => None,
-        };
+        let tier = self
+            .tier
+            .filter(|t| scope && matches!(t, Tier::T0 | Tier::T1));
         Ok(TurnOpts {
             kind,
             name: self.pod_name.clone(),

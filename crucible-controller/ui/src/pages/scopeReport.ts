@@ -5,7 +5,7 @@ import type { components } from '../api/schema';
 import type { Tone } from './approvalEvidence';
 
 export type ScopeReport = components['schemas']['ScopeReportDto'];
-export type ScopeStage = components['schemas']['ScopeStage'];
+export type ScopeStage = components['schemas']['StageResult'];
 
 /** The stage the pipeline stopped on, or null when every recorded stage passed. */
 export function firstFailedStage(stages: ScopeStage[]): ScopeStage | null {

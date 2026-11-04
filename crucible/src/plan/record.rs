@@ -2,10 +2,11 @@
 
 use std::collections::BTreeMap;
 
-use crucible_contract::history::{HistoryEntry, RecordedStatus};
+use crucible_contract::history::HistoryEntry;
+use crucible_contract::session::TaskStatus;
 use serde_json::Value;
 
-use crate::plan::exec::{TaskResult, TaskStatus};
+use crate::plan::exec::TaskResult;
 use crate::plan::ir::{Task, TaskName, ValidPlan};
 use crate::plan::machine::BlockedReason;
 
@@ -51,32 +52,21 @@ pub fn run_entry(
     });
     HistoryEntry {
         task: name.0.clone(),
-        status: settled.map(|r| recorded(r.status)),
+        status: settled.map(|r| r.status),
         output: settled
             .zip(plan.get(name))
             .and_then(|(r, task)| declared_output(task, r)),
     }
 }
 
-fn recorded(status: TaskStatus) -> RecordedStatus {
-    match status {
-        TaskStatus::Pass => RecordedStatus::Pass,
-        TaskStatus::Fail => RecordedStatus::Fail,
-        TaskStatus::Transport => RecordedStatus::Transport,
-        TaskStatus::Skipped => RecordedStatus::Skipped,
-        TaskStatus::NotTaken => RecordedStatus::NotTaken,
-        TaskStatus::Blocked => RecordedStatus::Blocked,
-        TaskStatus::Truncated => RecordedStatus::Truncated,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use crate::plan::exec::{TaskResult, TaskStatus};
+    use crate::plan::exec::TaskResult;
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::machine::BlockedReason;
-    use crate::plan::record::{declared_output, recorded, run_entry};
-    use crucible_contract::history::{HistoryEntry, RecordedStatus};
+    use crate::plan::record::{declared_output, run_entry};
+    use crucible_contract::history::HistoryEntry;
+    use crucible_contract::session::TaskStatus;
     use serde_json::{Value, json};
     use std::collections::BTreeMap;
 
@@ -150,7 +140,7 @@ emits = ["verdict", "dirty"]
             run_entry(&plan, Some(&card), &results),
             HistoryEntry {
                 task: "card".into(),
-                status: Some(RecordedStatus::Pass),
+                status: Some(TaskStatus::Pass),
                 output: Some(json!({"verdict": "ok", "dirty": 0})),
             }
         );
@@ -163,7 +153,7 @@ emits = ["verdict", "dirty"]
             run_entry(&plan, Some(&card), &failed),
             HistoryEntry {
                 task: "card".into(),
-                status: Some(RecordedStatus::Fail),
+                status: Some(TaskStatus::Fail),
                 output: None,
             }
         );
@@ -177,7 +167,7 @@ emits = ["verdict", "dirty"]
                 &BTreeMap::from([(card.clone(), blocked)])
             )
             .status,
-            Some(RecordedStatus::Blocked)
+            Some(TaskStatus::Blocked)
         );
     }
 
@@ -234,7 +224,7 @@ emits = ["verdict", "dirty"]
             TaskStatus::Truncated,
         ] {
             assert_eq!(
-                serde_json::to_value(recorded(status)).unwrap(),
+                serde_json::to_value(status).unwrap(),
                 Value::String(status.as_str().to_owned())
             );
         }

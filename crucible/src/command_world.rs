@@ -9,6 +9,7 @@
 //!   owns the framing, and neither `run_loop` nor the domain scripts see the other half.
 
 use crate::crucible::World;
+use crate::host_env::HostEnv;
 use anyhow::{Context, Result};
 use crucible_vcs::git_memory;
 use serde::{Deserialize, Serialize};
@@ -23,12 +24,13 @@ struct CommandFailed {
     stderr: String,
 }
 
-/// Run a domain command via `sh -c` in the workspace, returning its trimmed stdout. `token`,
-/// when present (restore), is passed as the `CRUCIBLE_TOKEN` env var, the opaque snapshot
-/// token round-trips through the environment, so no shell-quoting of multi-line payloads.
-fn run_cmd(workspace: &Path, cmd: &str, token: Option<&str>) -> Result<String> {
+/// Run a domain command via `sh -c` in the workspace under `env`, returning its trimmed stdout.
+/// `token`, when present (restore), is passed as the `CRUCIBLE_TOKEN` env var, the opaque
+/// snapshot token round-trips through the environment, so no shell-quoting of multi-line payloads.
+fn run_cmd(workspace: &Path, env: &HostEnv, cmd: &str, token: Option<&str>) -> Result<String> {
     let mut c = Command::new("sh");
     c.arg("-c").arg(cmd).current_dir(workspace);
+    env.apply(&mut c);
     if let Some(t) = token {
         c.env("CRUCIBLE_TOKEN", t);
     }
@@ -89,19 +91,21 @@ pub struct CommandWorld {
     pub restore_cmd: Option<String>,
     /// `[workspace].carry_forward`: untracked pipeline outputs a discard must not delete.
     pub carry_forward: Vec<String>,
+    /// What `[world].env` passes to the commands.
+    pub env: HostEnv,
 }
 
 impl World for CommandWorld {
     fn apply(&self) -> Result<()> {
         if let Some(cmd) = &self.apply_cmd {
-            run_cmd(&self.workspace, cmd, None)?;
+            run_cmd(&self.workspace, &self.env, cmd, None)?;
         }
         Ok(())
     }
     fn snapshot(&self, label: &str) -> Result<String> {
         let git = git_memory::snapshot(&self.workspace, label)?;
         let domain = match &self.snapshot_cmd {
-            Some(cmd) => run_cmd(&self.workspace, cmd, None)?
+            Some(cmd) => run_cmd(&self.workspace, &self.env, cmd, None)?
                 .lines()
                 .next_back()
                 .unwrap_or("")
@@ -114,7 +118,7 @@ impl World for CommandWorld {
         let (git, domain) = split_token(snap);
         git_memory::restore(&self.workspace, git, &self.carry_forward)?;
         if let Some(cmd) = &self.restore_cmd {
-            run_cmd(&self.workspace, cmd, Some(domain))?;
+            run_cmd(&self.workspace, &self.env, cmd, Some(domain))?;
         }
         Ok(())
     }
@@ -153,12 +157,14 @@ pub struct CompositeWorld {
     /// Carried paths applied to every component workspace. Composite manifests don't expose
     /// `carry_forward` yet, so this is always empty; it exists so restore has one shape.
     pub carry_forward: Vec<String>,
+    /// What `[world].env` passes to the commands.
+    pub env: HostEnv,
 }
 
 impl World for CompositeWorld {
     fn apply(&self) -> Result<()> {
         if let Some(cmd) = &self.apply_cmd {
-            run_cmd(&self.base_dir, cmd, None)?;
+            run_cmd(&self.base_dir, &self.env, cmd, None)?;
         }
         Ok(())
     }
@@ -173,7 +179,7 @@ impl World for CompositeWorld {
         }
         // One combined external snapshot for the assembled system under test (last stdout line = the token).
         let domain = match &self.snapshot_cmd {
-            Some(cmd) => run_cmd(&self.base_dir, cmd, None)?
+            Some(cmd) => run_cmd(&self.base_dir, &self.env, cmd, None)?
                 .lines()
                 .next_back()
                 .unwrap_or("")
@@ -201,7 +207,7 @@ impl World for CompositeWorld {
                 .with_context(|| format!("restore component `{name}`"))?;
         }
         if let Some(cmd) = &self.restore_cmd {
-            run_cmd(&self.base_dir, cmd, Some(&token.domain))?;
+            run_cmd(&self.base_dir, &self.env, cmd, Some(&token.domain))?;
         }
         Ok(())
     }
@@ -281,14 +287,23 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("cw-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         // No token: plain capture.
-        assert_eq!(run_cmd(&tmp, "echo hello", None).unwrap(), "hello");
+        assert_eq!(
+            run_cmd(&tmp, &HostEnv::default(), "echo hello", None).unwrap(),
+            "hello"
+        );
         // The token arrives as $CRUCIBLE_TOKEN (the restore path).
         assert_eq!(
-            run_cmd(&tmp, "printf '%s' \"$CRUCIBLE_TOKEN\"", Some("ENVTOK")).unwrap(),
+            run_cmd(
+                &tmp,
+                &HostEnv::default(),
+                "printf '%s' \"$CRUCIBLE_TOKEN\"",
+                Some("ENVTOK")
+            )
+            .unwrap(),
             "ENVTOK"
         );
         // Nonzero exit is an error.
-        assert!(run_cmd(&tmp, "exit 3", None).is_err());
+        assert!(run_cmd(&tmp, &HostEnv::default(), "exit 3", None).is_err());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -312,6 +327,7 @@ mod tests {
                 domtok_file.display()
             )),
             carry_forward: vec!["codegen-out/".to_string()],
+            env: HostEnv::default(),
         };
 
         let base = world.snapshot("baseline").unwrap();
@@ -359,6 +375,7 @@ mod tests {
                 domtok_file.display()
             )),
             carry_forward: Vec::new(),
+            env: HostEnv::default(),
         };
 
         // Baseline: a valid JSON token naming both components + the combined domain token.
@@ -406,6 +423,7 @@ mod tests {
             snapshot_cmd: None,
             restore_cmd: None,
             carry_forward: Vec::new(),
+            env: HostEnv::default(),
         };
 
         // No edits yet -> empty diff.
@@ -457,6 +475,7 @@ mod tests {
             snapshot_cmd: None,
             restore_cmd: None,
             carry_forward: Vec::new(),
+            env: HostEnv::default(),
         };
 
         // Baseline pins both components' pristine shas.

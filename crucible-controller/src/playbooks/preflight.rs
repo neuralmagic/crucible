@@ -94,13 +94,7 @@ pub async fn resolve_harness(
 
 /// The capability predicate a harness needs its sandbox to provide.
 fn harness_predicate(harness: Harness) -> Option<&'static str> {
-    match harness {
-        Harness::Claude => Some("agent.claude-code"),
-        Harness::Codex => Some("agent.codex"),
-        Harness::OpenCode => Some("agent.opencode"),
-        Harness::Pi => Some("agent.pi"),
-        Harness::Hermes => None,
-    }
+    harness.spec().sandbox_capability
 }
 
 /// The requirements a pack declares plus the one the effective harness implies.
@@ -584,8 +578,6 @@ mod tests {
             "{:?}",
             out.refusals
         );
-        // Hermes implies nothing the catalog can vouch for.
-        assert!(!preflight(&claude_only, Some(&pinned(Harness::Hermes)), &catalog).refused());
     }
 
     #[test]

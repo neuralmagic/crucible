@@ -5,6 +5,8 @@
 //! content executes, so `crucible check` and `crucible plan exposure` can print a pack's reach
 //! before anything of the pack has run.
 
+use crate::host_env::DeclaredEnv;
+use crate::manifest::edition::Edition;
 use crate::manifest::{CapabilitiesCfg, CredentialContext, Manifest};
 use crate::openshell::gateway::ComputeDriver;
 use crucible_contract::outputs::{BoundSource, ResolvedOutputs, ResolvedTarget};
@@ -39,6 +41,12 @@ pub enum Capability {
     McpServer { name: String, bin: String },
     /// Whether the pack runs commands outside the sandbox, which hold their executor's reach.
     ExternalCommands { present: bool },
+    /// What of the engine's environment a manifest table's commands outside the sandbox hold.
+    HostEnv {
+        table: String,
+        #[serde(flatten)]
+        reach: HostReach,
+    },
     /// A named `[agent.sandbox]` and what it provisions: its image, the declared secrets and
     /// relay files passed in, broker reach, and the egress it adds after the pack's deny list.
     Sandbox {
@@ -48,6 +56,21 @@ pub enum Capability {
         relays: Vec<String>,
         broker: bool,
         egress: Vec<String>,
+    },
+}
+
+/// A host-env capability's reach, by the pack's edition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "env", rename_all = "kebab-case")]
+pub enum HostReach {
+    /// Edition 1: the engine's whole environment.
+    Inherited,
+    /// Edition 2: the base every such command gets, plus `names`, which are required, and
+    /// `optional`, which are passed when the engine has them.
+    Declared {
+        names: Vec<String>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        optional: Vec<String>,
     },
 }
 
@@ -118,6 +141,7 @@ pub fn capabilities(m: &Manifest) -> Vec<Capability> {
     if runs_external_commands(m) {
         out.push(Capability::ExternalCommands { present: true });
     }
+    out.extend(host_env(m));
     out.extend(sandboxes(&m.agent));
     out
 }
@@ -188,7 +212,7 @@ fn egress(m: &Manifest) -> Vec<Capability> {
     let resolved = crate::openshell::policy::resolve_endpoints(
         &m.agent.openshell,
         &harness_defaults,
-        broker_endpoint.as_deref(),
+        broker_endpoint.as_ref(),
     );
     resolved
         .iter()
@@ -214,7 +238,7 @@ fn egress(m: &Manifest) -> Vec<Capability> {
 /// The broker's own allowlist entry, when the pack enables one. The sandbox reaches the loop pod
 /// through the compute driver's alias; both drivers name the same pod, so the disclosure states
 /// the in-cluster one.
-fn broker_endpoint(m: &Manifest) -> Option<String> {
+fn broker_endpoint(m: &Manifest) -> Option<crate::openshell::endpoint::Endpoint> {
     if !m.agent.broker.enabled {
         return None;
     }
@@ -225,20 +249,15 @@ fn broker_endpoint(m: &Manifest) -> Option<String> {
     crate::manifest::broker_endpoint_from_url(&url).ok()
 }
 
-/// Split an openshell `host:port:access[:proto[:enforcement]]` entry. A bracketed IPv6 literal
-/// keeps its colons inside the brackets.
+/// An allowlist entry's host, port, and access, `full` when the entry names none.
 fn parse_endpoint(entry: &str) -> Option<(String, u16, String)> {
-    let (host, rest) = if let Some(after) = entry.strip_prefix('[') {
-        let close = after.find(']')?;
-        (format!("[{}]", &after[..close]), after.get(close + 2..)?)
-    } else {
-        let colon = entry.find(':')?;
-        (entry[..colon].to_string(), entry.get(colon + 1..)?)
-    };
-    let mut fields = rest.split(':');
-    let port: u16 = fields.next()?.parse().ok()?;
-    let access = fields.next().unwrap_or("full").to_string();
-    Some((host, port, access))
+    let ep: crate::openshell::endpoint::Endpoint = entry.parse().ok()?;
+    let access = ep
+        .access
+        .unwrap_or(crate::openshell::endpoint::Access::Full)
+        .as_str()
+        .to_string();
+    Some((ep.host, ep.port, access))
 }
 
 /// Credentials: every `[agent].env` name, plus every declared secret the env does not already
@@ -302,16 +321,73 @@ fn relay_sources(r: &crate::manifest::RelayFile) -> Vec<String> {
 /// Whether the pack runs commands outside the sandbox: workflow `command`/`evaluate` tasks, or
 /// world/judge hooks. They hold their executor's reach, not the sandbox's.
 fn runs_external_commands(m: &Manifest) -> bool {
-    let hooks = [
+    host_tables(m).any(|(_, _, runs)| runs)
+}
+
+/// Whether the pack's host commands inherit the engine's whole environment: an edition-1 pack
+/// that runs any.
+pub fn inherits_engine_env(m: &Manifest) -> bool {
+    m.edition == Edition::One && runs_external_commands(m)
+}
+
+/// Each manifest table that can run commands outside the sandbox, with what it declares for
+/// them and whether it runs any.
+fn host_tables(m: &Manifest) -> impl Iterator<Item = (&'static str, Option<&DeclaredEnv>, bool)> {
+    let world = [
         m.world.apply_cmd.as_ref(),
         m.world.snapshot_cmd.as_ref(),
         m.world.restore_cmd.as_ref(),
-        m.judge.as_ref().map(|j| &j.measure_cmd),
     ];
-    hooks.into_iter().flatten().any(|c| !c.trim().is_empty())
-        || m.workflow
-            .as_ref()
-            .is_some_and(crate::plan::workflow::WorkflowCfg::runs_host_commands)
+    [
+        (
+            "[judge]",
+            m.judge.as_ref().map(|j| &j.env),
+            m.judge
+                .as_ref()
+                .is_some_and(|j| !j.measure_cmd.trim().is_empty()),
+        ),
+        (
+            "[world]",
+            Some(&m.world.env),
+            world.into_iter().flatten().any(|c| !c.trim().is_empty()),
+        ),
+        (
+            "[workflow]",
+            m.workflow.as_ref().map(|w| &w.env),
+            m.workflow
+                .as_ref()
+                .is_some_and(crate::plan::workflow::WorkflowCfg::runs_host_commands),
+        ),
+    ]
+    .into_iter()
+}
+
+/// What each manifest table's host commands hold of the engine's environment: under edition 1,
+/// all of it for every table that runs any; under edition 2, what each table that declares
+/// anything declares.
+fn host_env(m: &Manifest) -> impl Iterator<Item = Capability> + '_ {
+    host_tables(m).filter_map(|(table, env, runs)| {
+        let reach = match m.edition {
+            Edition::One => runs.then_some(HostReach::Inherited)?,
+            Edition::Two => {
+                let env = env.filter(|env| !env.is_empty())?;
+                let names = |required: bool| {
+                    env.iter()
+                        .filter(|decl| decl.required == required)
+                        .map(|decl| decl.name.to_string())
+                        .collect()
+                };
+                HostReach::Declared {
+                    names: names(true),
+                    optional: names(false),
+                }
+            }
+        };
+        Some(Capability::HostEnv {
+            table: table.to_owned(),
+            reach,
+        })
+    })
 }
 
 /// The grants a resolved disclosure covers, by kind. A grant supplied from outside the pack (a
@@ -453,6 +529,25 @@ fn render_capability(cap: &Capability) -> String {
         Capability::ExternalCommands { present: false } => {
             "external    no commands run outside the sandbox".to_string()
         }
+        Capability::HostEnv {
+            table,
+            reach: HostReach::Inherited,
+        } => format!("host-env    {table} commands inherit the engine's whole environment"),
+        Capability::HostEnv {
+            table,
+            reach: HostReach::Declared { names, optional },
+        } => {
+            let declared: Vec<String> = names
+                .iter()
+                .cloned()
+                .chain(optional.iter().map(|name| format!("{name} (optional)")))
+                .collect();
+            format!(
+                "host-env    {table} commands receive {} besides {}",
+                declared.join(", "),
+                crate::host_env::BASE.join(", ")
+            )
+        }
         Capability::Sandbox {
             name,
             image,
@@ -472,7 +567,7 @@ fn render_capability(cap: &Capability) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::exposure::*;
 
     fn manifest(text: &str) -> Manifest {
         toml::from_str(text).expect("manifest parses")
@@ -703,6 +798,132 @@ mod tests {
         );
     }
 
+    fn host_env_of(m: &Manifest) -> Vec<Capability> {
+        capabilities(m)
+            .into_iter()
+            .filter(|c| matches!(c, Capability::HostEnv { .. }))
+            .collect()
+    }
+
+    fn declared(table: &str, names: &[&str], optional: &[&str]) -> Capability {
+        let owned = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect();
+        Capability::HostEnv {
+            table: table.into(),
+            reach: HostReach::Declared {
+                names: owned(names),
+                optional: owned(optional),
+            },
+        }
+    }
+
+    /// An edition-1 pack's host commands hold the engine's whole environment, so each table
+    /// that runs any says so, and one that runs none adds no entry.
+    #[test]
+    fn edition_one_host_commands_are_disclosed_as_inheriting_the_engines_environment() {
+        let m = manifest(&format!(
+            "{OPENSHELL}\n[workflow]\ntype = \"custom\"\nresult = \"t\"\n[[workflow.task]]\nname \
+             = \"t\"\nkind = \"evaluate\"\ncommand = \"true\"\n"
+        ));
+        assert!(inherits_engine_env(&m));
+        let inherited = host_env_of(&m);
+        let entry = |table: &str| Capability::HostEnv {
+            table: table.into(),
+            reach: HostReach::Inherited,
+        };
+        assert_eq!(inherited, [entry("[judge]"), entry("[workflow]")]);
+        assert_eq!(
+            render_capability(&inherited[0]),
+            "host-env    [judge] commands inherit the engine's whole environment"
+        );
+        assert_eq!(
+            serde_json::to_value(&inherited[1]).unwrap(),
+            serde_json::json!({"kind": "host-env", "table": "[workflow]", "env": "inherited"})
+        );
+
+        let world = manifest(
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"openshell\"\ngoal = \"g\"\n[world]\n\
+             apply_cmd = \"./apply.sh\"\n",
+        );
+        assert_eq!(host_env_of(&world), [entry("[world]")]);
+
+        let no_hooks =
+            manifest("[repo]\npath = \".\"\n[agent]\nbackend = \"openshell\"\ngoal = \"g\"\n");
+        assert!(host_env_of(&no_hooks).is_empty());
+        assert!(
+            !inherits_engine_env(&no_hooks),
+            "no host command inherits anything"
+        );
+    }
+
+    /// Under edition 2 a variable a table passes to its host-side commands is reach those
+    /// commands hold, so it is disclosed by table; a table that declares nothing adds no entry.
+    #[test]
+    fn declared_host_variables_are_disclosed_by_table() {
+        let m = manifest(&format!(
+            "edition = 2\n{OPENSHELL}\n[world]\napply_cmd = \"./apply.sh\"\nenv = [\"KUBECONFIG\", \
+             \"KUBE_NAMESPACE\"]\n"
+        ));
+        assert!(!inherits_engine_env(&m));
+        let declared_env = host_env_of(&m);
+        assert_eq!(
+            declared_env,
+            [declared("[world]", &["KUBECONFIG", "KUBE_NAMESPACE"], &[])]
+        );
+        assert_eq!(
+            render_capability(&declared_env[0]),
+            "host-env    [world] commands receive KUBECONFIG, KUBE_NAMESPACE besides PATH, HOME, \
+             LANG, TMPDIR, CRUCIBLE_RUN_NAME, CRUCIBLE_RUN_DISPLAY_NAME, CRUCIBLE_UI_BASE_URL"
+        );
+        assert_eq!(
+            serde_json::to_value(&declared_env[0]).unwrap(),
+            serde_json::json!({
+                "kind": "host-env",
+                "table": "[world]",
+                "env": "declared",
+                "names": ["KUBECONFIG", "KUBE_NAMESPACE"],
+            })
+        );
+    }
+
+    /// A variable passed only when the engine has it is still reach the commands may hold, so
+    /// it is disclosed beside the required ones and marked optional.
+    #[test]
+    fn optional_host_variables_are_disclosed_and_marked_optional() {
+        let m = manifest(&format!(
+            "edition = 2\n{OPENSHELL}\nenv = [\"KUBECONFIG\", \"EPP_ENDPOINT?\"]\n[workflow]\ntype \
+             = \"playbook\"\nfile = \"graph.star\"\nenv = [\"GPUS?\"]\n"
+        ));
+        let declared_env = host_env_of(&m);
+        assert_eq!(
+            declared_env,
+            [
+                declared("[judge]", &["KUBECONFIG"], &["EPP_ENDPOINT"]),
+                declared("[workflow]", &[], &["GPUS"]),
+            ]
+        );
+        assert_eq!(
+            render_capability(&declared_env[0]),
+            "host-env    [judge] commands receive KUBECONFIG, EPP_ENDPOINT (optional) besides \
+             PATH, HOME, LANG, TMPDIR, CRUCIBLE_RUN_NAME, CRUCIBLE_RUN_DISPLAY_NAME, \
+             CRUCIBLE_UI_BASE_URL"
+        );
+        assert_eq!(
+            render_capability(&declared_env[1]),
+            "host-env    [workflow] commands receive GPUS (optional) besides PATH, HOME, LANG, \
+             TMPDIR, CRUCIBLE_RUN_NAME, CRUCIBLE_RUN_DISPLAY_NAME, CRUCIBLE_UI_BASE_URL"
+        );
+        assert_eq!(
+            serde_json::to_value(&declared_env[0]).unwrap(),
+            serde_json::json!({
+                "kind": "host-env",
+                "table": "[judge]",
+                "env": "declared",
+                "names": ["KUBECONFIG"],
+                "optional": ["EPP_ENDPOINT"],
+            })
+        );
+    }
+
     #[test]
     fn a_grant_the_disclosure_does_not_cover_is_refused_naming_both() {
         let m = manifest(&format!("{OPENSHELL}\n[agent.env]\nRIG_API_URL = \"y\"\n"));
@@ -775,14 +996,19 @@ mod tests {
             Some(("github.com".into(), 443, "full".into()))
         );
         assert_eq!(
-            parse_endpoint("api.x:8443:read-only:rest:strict"),
+            parse_endpoint("api.x:8443:read-only:rest:enforce"),
             Some(("api.x".into(), 8443, "read-only".into()))
         );
         assert_eq!(
             parse_endpoint("[::1]:8849:full"),
             Some(("[::1]".into(), 8849, "full".into()))
         );
+        assert_eq!(
+            parse_endpoint("h:443"),
+            Some(("h".into(), 443, "full".into()))
+        );
         assert_eq!(parse_endpoint("garbage"), None);
+        assert_eq!(parse_endpoint("api.x:8443:read-only:rest:strict"), None);
     }
 
     #[test]

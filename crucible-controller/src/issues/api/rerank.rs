@@ -49,7 +49,7 @@ pub(crate) async fn rerank_issue(
     Path(key): Path<String>,
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(issue) = crate::issues::store::get_issue(state.db.pool(), &key).await? else {
         return Ok(not_found(format!("issue not found: {key}")));
     };
@@ -91,7 +91,7 @@ pub(crate) async fn rerank_issues(
     identity: crate::identity::session::Identity,
     _admin: crate::authz::guard::AdminGuard,
     Json(filter): Json<RerankFilter>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let scope = match filter {
         RerankFilter::All => crate::issues::model::RerankScope::All,
         RerankFilter::Unranked => crate::issues::model::RerankScope::Unranked,

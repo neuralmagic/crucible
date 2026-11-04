@@ -152,7 +152,7 @@ pub(crate) async fn launch_pack(
         Ok(Err(refusal)) => {
             return unprocessable(refusal.message);
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let repo = normalize_repo(body.repo.trim()).to_string();
     let path = body.path.unwrap_or_default().trim().to_string();
@@ -162,7 +162,7 @@ pub(crate) async fn launch_pack(
 
     let git = match crate::playbooks::registry::PackGit::resolve(state.pack_pr_app.as_ref()).await {
         Ok(g) => g,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let owned = (repo.clone(), git_ref.clone(), path.clone());
     let fetched = match tokio::task::spawn_blocking(move || {
@@ -189,7 +189,7 @@ pub(crate) async fn launch_pack(
     {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return import_refusal(e),
-        Err(e) => return AppError::from(anyhow::Error::from(e)).into_response(),
+        Err(e) => return ApiError::from(anyhow::Error::from(e)).into_response(),
     };
     let (fetched, preview) = fetched;
     if !preview.diagnostics.is_empty() || preview.graph.is_none() {
@@ -209,7 +209,7 @@ pub(crate) async fn launch_pack(
     let stored =
         match crate::playbooks::packs::store_pack(state.db.pool(), &key, &fetched.pack).await {
             Ok(stored) => stored,
-            Err(e) => return AppError::from(e).into_response(),
+            Err(e) => return ApiError::from(e).into_response(),
         };
     let digest = stored.digest;
     let actor = identity.as_deref().unwrap_or("unknown");
@@ -237,7 +237,7 @@ pub(crate) async fn launch_pack(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = crate::issues::store::set_agent_dispatch(
         state.db.pool(),
@@ -247,7 +247,7 @@ pub(crate) async fn launch_pack(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     state
         .audit(
@@ -402,7 +402,7 @@ pub(crate) async fn adopt_scenario(
         Ok(Err(refusal)) => {
             return unprocessable(refusal.message);
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let (title, text, justification) = (
         body.title.trim().to_string(),
@@ -420,7 +420,7 @@ pub(crate) async fn adopt_scenario(
     .await
     {
         Ok(target) => target,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     let actor = identity.as_deref().unwrap_or("unknown");
 
@@ -440,7 +440,7 @@ pub(crate) async fn adopt_scenario(
     .await
     {
         Ok(key) => key,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     // Pinned before the reconcile kick below, so the first scope turn already dispatches onto the
     // cluster this adoption was authorized for.
@@ -448,7 +448,7 @@ pub(crate) async fn adopt_scenario(
         crate::issues::store::set_dispatch_target(state.db.pool(), &key, Some(&dispatch_target))
             .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = crate::issues::store::set_agent_dispatch(
         state.db.pool(),
@@ -458,7 +458,7 @@ pub(crate) async fn adopt_scenario(
     )
     .await
     {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
 
     // The ledgered human-authorization stamp: the R1 reconcile branch (kind.has_upstream() ==
@@ -612,7 +612,7 @@ pub(crate) async fn adopt_jira(
     .await
     {
         Ok(key) => key,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     // The ledgered human-authorization stamp (the caps bypass is the has_upstream()==false reconcile
@@ -687,7 +687,7 @@ pub(crate) async fn approve_scenario(
         Ok(None) => {
             return not_found(format!("{key}: not tracked"));
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     // The UI approval serves any adopted, non-upstream item (scenario or Jira) — both lack a GitHub
     // draft PR to open the approval against. A GitHub row goes through the draft-PR approval instead.
@@ -702,7 +702,7 @@ pub(crate) async fn approve_scenario(
         Ok(None) => {
             return not_found(format!("{key}: no scope pack awaiting approval"));
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     let actor = identity.as_deref().unwrap_or("unknown").to_string();
@@ -738,7 +738,7 @@ pub(crate) async fn approve_scenario(
             )
                 .into_response();
         }
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     state
         .audit(

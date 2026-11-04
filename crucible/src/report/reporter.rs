@@ -3,42 +3,7 @@
 use crate::args::{Args, Paths};
 use crate::report::session::Row;
 use crucible_contract::LoopPhase;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-/// Cumulative-budget context for one agent turn. Cost is only authoritative at turn
-/// end, so mid-turn the reporters price the streamed token samples (see
-/// [`crate::agent::event::Pricing::provisional`]) and emit provisional budget updates; the
-/// loop's turn-end budget call reconciles them. Without this a run could spend its
-/// whole cap inside one turn before any guard fires.
-#[derive(Clone)]
-pub struct TurnBudget {
-    /// Run spend before this turn started (authoritative).
-    pub spent_before: f64,
-    /// When the run started, so provisional updates carry the run-relative clock.
-    pub started: Instant,
-    /// Effective cost cap resolved by the loop (live control override or the CLI
-    /// arg); 0 means uncapped.
-    pub max_cost: f64,
-    /// Live liveness telemetry for provisional, mid-turn spend. The authoritative
-    /// total still comes from the completed turn and overwrites this estimate.
-    pub(crate) heartbeat: Option<Arc<crate::control::heartbeat::Heartbeat>>,
-}
-
-impl TurnBudget {
-    /// Whether a provisional spend crosses the cap (same threshold as the loop's
-    /// between-iteration guard).
-    pub fn over_cap(&self, spent: f64) -> bool {
-        self.max_cost > 0.0 && spent >= self.max_cost
-    }
-
-    /// Publish a provisional cumulative total while the agent is still running.
-    pub fn record_provisional(&self, iter: u32, spent: f64) {
-        if let Some(heartbeat) = &self.heartbeat {
-            heartbeat.record(iter, spent);
-        }
-    }
-}
+use std::time::Duration;
 
 /// One-line evidence rendering for the human-readable outputs (console rows, RESULTS.md,
 /// PR bodies): `refcheck ✓ calc-diff ✓ tensor-pipe SKIPPED (reason)`.
@@ -103,20 +68,6 @@ pub enum Stop {
     Quit,
 }
 
-/// The outcome of one agent turn the loop needs beyond the streamed events: the
-/// cost to budget on, and whether the CLI reported the turn as an error so the loop
-/// can discard a no-op instead of measuring an unchanged workspace as a success.
-#[derive(Debug, Clone, Default)]
-pub struct AgentTurn {
-    /// The turn's cost (USD).
-    pub cost: f64,
-    /// The `result` event's `is_error` flag, a failed turn (e.g. a credential-less
-    /// "Not logged in" no-op) even when its subtype is "success".
-    pub is_error: bool,
-    /// The failure text the CLI reported (the synthetic message), for the discard note.
-    pub error: Option<String>,
-}
-
 /// Everything the loop needs from its front-end. The loop never prints directly.
 pub trait Reporter {
     /// The run is starting with this goal and objective label.
@@ -127,23 +78,16 @@ pub trait Reporter {
     fn note(&mut self, msg: &str);
     /// A decided row (baseline / keep / discard); `solved` flags a winning fix.
     fn row(&mut self, row: &Row, solved: bool);
-    /// Run the agent subprocess for `it`, streaming its output to the front-end.
-    /// Returns the turn's cost and its error verdict ([`AgentTurn`]) so the loop can
-    /// budget on it and discard a failed no-op turn. `budget` carries the run spend
-    /// so far and the cost cap: reporters stream provisional budget updates from
-    /// mid-turn token samples and may stop a local agent once the provisional spend
-    /// crosses the cap.
-    #[allow(clippy::too_many_arguments)]
-    fn run_agent(
+    /// The candidate turn of `iter` is starting on `model`, in `session` when it has one.
+    fn agent_starting(
         &mut self,
-        args: &Args,
-        p: &Paths,
-        it: u32,
-        prompt: &str,
-        resume_prompt: Option<&str>,
-        session: Option<&str>,
-        budget: TurnBudget,
-    ) -> AgentTurn;
+        _iter: u32,
+        _model: &str,
+        _session: Option<&crate::agent::agent_session::SessionTurn>,
+    ) {
+    }
+    /// One line of the running agent's output.
+    fn agent_line(&mut self, _line: &str, _stream: crate::agent::event::RawStream) {}
     /// Cumulative budget after a turn; lets the front-end draw a gauge / warn.
     fn budget(&mut self, _spent: f64, _elapsed: Duration) {}
     /// Interrupt checkpoint: decide whether to stop.
@@ -206,8 +150,12 @@ pub trait Reporter {
     /// The wait reached a terminal outcome (`granted`/`denied`/`timeout`), closing the
     /// bracket. Deliberately NOT called on a stop-while-parked: a stop doesn't resolve
     /// the ask, and the still-open bracket makes a resume re-park on it.
-    fn approval_resolved(&mut self, outcome: &str, reason: &str) {
-        self.note(&format!("approval {outcome}: {reason}"));
+    fn approval_resolved(
+        &mut self,
+        outcome: crate::control::provisioning::ApprovalOutcome,
+        reason: &str,
+    ) {
+        self.note(&format!("approval {}: {reason}", outcome.as_str()));
     }
     /// The draft PR(s) publish-on-keep opened, reported once after publish so the durable session
     /// log carries them (the controller's pull-ingest folds them onto the kept candidates' `pr_url`).
@@ -225,39 +173,5 @@ pub trait Reporter {
     /// consumer tailing it can tell "the run ended" from "the stream just went quiet".
     fn shutdown(&mut self, outcome: &str, reason: &str) {
         self.note(&format!("run ended: {outcome} ({reason})"));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::report::reporter::*;
-
-    #[test]
-    fn over_cap_matches_the_loop_guard_threshold() {
-        let b = TurnBudget {
-            spent_before: 0.0,
-            started: Instant::now(),
-            max_cost: 0.0,
-            heartbeat: None,
-        };
-        assert!(!b.over_cap(1e9), "0 means uncapped");
-        let b = TurnBudget { max_cost: 5.0, ..b };
-        assert!(!b.over_cap(4.99));
-        assert!(b.over_cap(5.0), ">= like over_budget");
-    }
-
-    #[test]
-    fn provisional_spend_reaches_the_heartbeat() {
-        let heartbeat = Arc::new(crate::control::heartbeat::Heartbeat::new());
-        let budget = TurnBudget {
-            spent_before: 1.0,
-            started: Instant::now(),
-            max_cost: 5.0,
-            heartbeat: Some(Arc::clone(&heartbeat)),
-        };
-
-        budget.record_provisional(2, 1.2345);
-
-        assert!((heartbeat.spent_usd() - 1.235).abs() < 1e-9);
     }
 }

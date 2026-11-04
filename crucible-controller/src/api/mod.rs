@@ -350,7 +350,7 @@ pub(crate) mod tests;
         crate::launches::api::webhooks::CelDiagnosticDto,
         crate::launches::api::webhooks::CelFunctionDto,
         crate::launches::api::webhooks::CelLanguageDto,
-        dto::ValidationErrorBody,
+        ValidationErrorBody,
         crate::playbooks::registry::FieldError,
         ErrorBody,
         crate::daemon::api::overrides::ConfigDto,

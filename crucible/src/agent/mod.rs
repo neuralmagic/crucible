@@ -23,19 +23,19 @@ pub(crate) mod agent_session;
 pub(crate) mod engine;
 pub(crate) mod event;
 pub(crate) mod harness;
-pub(crate) mod hermes_trace;
 pub(crate) mod inference;
 pub(crate) mod relay;
+pub(crate) mod sandbox_env;
 pub(crate) mod tool_chain;
 pub(crate) mod turn;
 
 use crate::agent::event::{AgentEvent, RawStream};
-use crate::agent::harness::HarnessRuntime;
+use crate::agent::harness::backend;
 use crate::args::{Args, Paths};
 #[cfg(feature = "autoresearch")]
 use crate::manifest::AgentBackend;
 use crucible::deadline::{Deadline, Supervised};
-use crucible_harness::OtelCollector;
+use crucible_harness::otel::OtelCollector;
 use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -76,7 +76,7 @@ pub(crate) fn backend_supports_persistent_sessions(
     backend: AgentBackend,
     harness: crate::manifest::Harness,
 ) -> bool {
-    backend == AgentBackend::Command || harness == crate::manifest::Harness::Claude
+    backend == AgentBackend::Command || harness.spec().persistent_sessions
 }
 
 /// A spawned transport: a child process plus the streams a turn reads from it.
@@ -185,11 +185,10 @@ fn local_command(
     session: Option<&crate::agent::agent_session::SessionTurn>,
 ) -> std::io::Result<Command> {
     let argv = match session {
-        Some(session) => args
-            .harness()
-            .backend()
-            .local_session_argv(args, prompt, session)?,
-        None => args.harness().backend().local_argv(args, prompt),
+        Some(session) => {
+            backend(args.harness()).local_session_argv(&args.turn_agent(), prompt, session)?
+        }
+        None => backend(args.harness()).local_argv(&args.turn_agent(), prompt),
     };
     let Some((program, rest)) = argv.split_first() else {
         return Err(std::io::Error::other("harness produced an empty argv"));
@@ -208,7 +207,7 @@ fn local_command(
     // env_script is built from the manifest env, not the process env).
     cmd.env_remove("TRACEPARENT").env_remove("TRACESTATE");
     // Harness defaults first, so a manifest `[agent].env` override takes precedence.
-    for (k, v) in args.harness().backend().local_env() {
+    for (k, v) in backend(args.harness()).local_env() {
         cmd.env(k, v);
     }
     for (k, v) in &args.env {
@@ -251,7 +250,15 @@ pub(crate) fn run_turn_with_session(
     // not a single streamed child, delegate to its module rather than the generic path. It
     // reaches the engine runtime handle itself (see `crate::agent::engine::handle`).
     if source == AgentSource::OpenshellDriver {
-        return crate::openshell::run::turn(args, p, prompt, json, session, deadline, sink);
+        return crate::openshell::run::turn(
+            &args.sandbox_turn(),
+            p,
+            prompt,
+            json,
+            session,
+            deadline,
+            sink,
+        );
     }
     run_turn_with(&source, args, p, prompt, json, session, deadline, sink)
 }
@@ -275,13 +282,13 @@ fn run_turn_with(
     // log, the `otel-log` Tier 2 artifact.
     let collector = if matches!(source, AgentSource::LocalClaude)
         && args.harness().spec().otel_capable
-        && otel_enabled(args)
+        && otel_enabled(&args.env)
     {
         match OtelCollector::start(
             p.state.join("otel.jsonl"),
             "127.0.0.1",
             0,
-            otel_forward(args),
+            otel_forward(&args.env),
         ) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -298,7 +305,7 @@ fn run_turn_with(
     };
     let extra_env = collector
         .as_ref()
-        .map(|c| crucible_harness::otel_env(&c.local_endpoint()))
+        .map(|c| crucible_harness::otel::otel_env(&c.local_endpoint()))
         .unwrap_or_default();
     let meters = collector.as_ref().map(OtelCollector::meters);
 
@@ -320,9 +327,6 @@ fn run_turn_with(
         stderr,
     } = spawned;
 
-    let child_pid = child.id() as i32;
-    crate::process::pid_registry::register(child_pid);
-
     // Drain stderr into a buffer on a thread (keeps the sink single-threaded);
     // replay it through the sink after the process exits.
     let stderr_handle = thread::spawn(move || {
@@ -341,12 +345,13 @@ fn run_turn_with(
         if matches!(source, AgentSource::LocalClaude) {
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
-            let backend = args.harness().backend();
-            let full = tool_io_full(args);
+            let harness = backend(args.harness());
+            let agent = args.turn_agent();
+            let full = tool_io_full(&args.env);
             let pump = StreamPump::new(
-                backend.decoder(args, meters.as_ref(), full),
-                (!full).then(|| backend.decoder(args, None, true)),
-                ToolChain::for_args(args),
+                harness.decoder(&agent, meters.as_ref(), full),
+                (!full).then(|| harness.decoder(&agent, None, true)),
+                ToolChain::declared(args.tool_plugins.as_deref()),
                 args.pricing(),
             );
             let end = pump_stream(out, json, pump, &mut sink);
@@ -356,7 +361,7 @@ fn run_turn_with(
                 child.kill();
             }
         } else {
-            let mut chain = ToolChain::for_args(args);
+            let mut chain = ToolChain::declared(args.tool_plugins.as_deref());
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let ev = line_event(&line, RawStream::Stdout);
                 if let Some(e) = ev.as_ref() {
@@ -375,7 +380,6 @@ fn run_turn_with(
     }
 
     let killed_at = child.wait().ok().and_then(|reaped| reaped.killed_at);
-    crate::process::pid_registry::deregister(child_pid);
 
     if let Ok(errlines) = stderr_handle.join() {
         for line in errlines {
@@ -391,7 +395,7 @@ fn run_turn_with(
     // post-hoc from the local session store. Dead for claude (`backfill_required` is false).
     if matches!(source, AgentSource::LocalClaude)
         && args.harness().spec().backfill_required
-        && let Some(artifacts) = args.harness().backend().local_backfill(p)
+        && let Some(artifacts) = backend(args.harness()).local_backfill(p)
     {
         for ev in &artifacts.events {
             cost.observe(ev);
@@ -496,15 +500,15 @@ mod tests {
     #[test]
     fn tool_io_defaults_compact_and_manifest_env_opts_in() {
         let mut a = args(&[]);
-        assert!(!tool_io_full(&a), "compact by default");
+        assert!(!tool_io_full(&a.env), "compact by default");
         a.env
             .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "full".to_string()));
-        assert!(tool_io_full(&a));
+        assert!(tool_io_full(&a.env));
         // Any value other than "full" stays compact.
         a.env.pop();
         a.env
             .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "yes".to_string()));
-        assert!(!tool_io_full(&a));
+        assert!(!tool_io_full(&a.env));
     }
 
     /// A temp workspace for a real turn (the `command` backend shells out for real).

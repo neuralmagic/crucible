@@ -7,6 +7,7 @@ use crate::deploy::profile::{BuilditCacheCfg, DeployProfile};
 use crucible_contract::agent_servers::{
     BuilderPods, BuilditSite, LocalServer, NotServerName, ServerName, SharedCache, Transport,
 };
+use crucible_contract::oauth::Scope;
 use std::collections::BTreeMap;
 
 /// One MCP server that takes agent tokens.
@@ -155,12 +156,9 @@ impl DeployProfile {
             servers.push(ServerSpec {
                 name: ServerName::parse("kueue")?,
                 url: k.url(),
-                scopes: [
-                    crucible_contract::kueue::SCOPE_READ,
-                    crucible_contract::kueue::SCOPE_SUBMIT,
-                ]
-                .map(String::from)
-                .to_vec(),
+                scopes: [Scope::KueueRead.as_str(), Scope::KueueSubmit.as_str()]
+                    .map(String::from)
+                    .to_vec(),
                 clusters: k.clusters.clone(),
                 requires_kube_user: true,
                 namespaces,
@@ -187,12 +185,9 @@ impl DeployProfile {
             servers.push(ServerSpec {
                 name: ServerName::parse("buildit")?,
                 url: b.url(),
-                scopes: [
-                    crucible_contract::buildit::SCOPE_READ,
-                    crucible_contract::buildit::SCOPE_BUILD,
-                ]
-                .map(String::from)
-                .to_vec(),
+                scopes: [Scope::BuilditRead.as_str(), Scope::BuilditBuild.as_str()]
+                    .map(String::from)
+                    .to_vec(),
                 clusters: b.clusters.clone(),
                 requires_kube_user: false,
                 namespaces: Vec::new(),
@@ -284,12 +279,9 @@ impl DeployProfile {
                     resources.push(PeopleResource {
                         url: k.people_url(cluster),
                         cluster: cluster.clone(),
-                        scopes: [
-                            crucible_contract::kueue::SCOPE_READ,
-                            crucible_contract::kueue::SCOPE_SUBMIT,
-                        ]
-                        .map(String::from)
-                        .to_vec(),
+                        scopes: [Scope::KueueRead.as_str(), Scope::KueueSubmit.as_str()]
+                            .map(String::from)
+                            .to_vec(),
                     });
                 }
             }

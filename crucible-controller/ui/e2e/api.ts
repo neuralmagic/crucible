@@ -1090,7 +1090,6 @@ export const ROUTES: Record<string, Json> = {
     admin: true,
     role: 'admin',
     groups: ['/groups/platform'],
-    mode: 'native',
     downgraded: false,
     proves_groups: true,
     acting_as: null,

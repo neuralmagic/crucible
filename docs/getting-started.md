@@ -109,7 +109,7 @@ It validates the configuration before you spend an agent turn:
 - `measure_cmd` runs one time and prints the contract format;
 - it warns if the gate is unprotected in the workspace that the agent edits.
 
-`crucible scope --pack <dir>` runs one pipeline (ADR-0014 S0): it resolves the goal, runs
+`crucible scope --pack <dir>` runs one pipeline (ADR-0012): it resolves the goal, runs
 `check`, renders `WORKFLOW.png`, and freezes `SCOPE.md` with a `RunIdentity` digest. Add
 `--issue owner/repo#N` to take the goal from a GitHub issue. It fetches the issue through the
 GitHub API and uses `GITHUB_TOKEN` or `GH_TOKEN`.

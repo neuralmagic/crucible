@@ -402,6 +402,18 @@ pub(crate) enum DeployAction {
     RenderTurn(RenderTurnArgs),
 }
 
+/// The tiers a scope turn proposes a pack for; the ranker's other tiers never reach one.
+pub(crate) fn proposed_tier(s: &str) -> Result<crucible_contract::Tier, String> {
+    use crucible_contract::Tier;
+    match Tier::parse_lower(s).map_err(|e| e.to_string())? {
+        tier @ (Tier::T0 | Tier::T1) => Ok(tier),
+        other => Err(format!(
+            "a scope turn proposes a t0 or t1 pack, not {}",
+            other.as_str_lower()
+        )),
+    }
+}
+
 #[derive(clap::Args)]
 pub(crate) struct RenderTurnArgs {
     /// The per-cluster deploy profile (namespaces, secrets, resources, loop image, supervisor image).
@@ -447,8 +459,8 @@ pub(crate) struct RenderTurnArgs {
     pub turn_kind: String,
     /// The issue's confirmed tier, forwarded to the in-pod `crucible scope --propose --tier …`.
     /// `scope` turn kind only; absent = the engine's t0 default.
-    #[arg(long, value_enum)]
-    pub tier: Option<crate::deploy::ProposeTier>,
+    #[arg(long, value_parser = proposed_tier)]
+    pub tier: Option<crucible_contract::Tier>,
     /// Max gaming-review concern→refine→re-review cycles, forwarded to the in-pod
     /// `crucible scope --propose --gaming-refine-rounds …`. `scope` turn kind only.
     #[arg(long, default_value_t = 1)]
@@ -735,5 +747,18 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn a_scope_turn_takes_only_the_tiers_it_proposes_a_pack_for() {
+        use crucible_contract::Tier;
+        assert_eq!(proposed_tier("t0"), Ok(Tier::T0));
+        assert_eq!(proposed_tier("T1"), Ok(Tier::T1));
+        for refused in ["t2", "t3"] {
+            let err = proposed_tier(refused).expect_err("not a proposable tier");
+            assert!(err.contains(refused), "{err}");
+        }
+        assert!(proposed_tier("n").is_err());
+        assert!(proposed_tier("t9").is_err());
     }
 }

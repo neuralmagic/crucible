@@ -7,7 +7,7 @@
 //! and the resolved directory is checked against the run's own files root afterwards — a symlinked
 //! task directory does not get to read the rest of the disk.
 
-use crucible::plan::exec::TaskStatus;
+use crucible_contract::session::TaskStatus;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -59,14 +59,24 @@ pub(crate) fn files_root(scratch_root: &Path, run_id: &str) -> PathBuf {
     state_dir(scratch_root, run_id).join("files")
 }
 
+/// The one path segment `task`'s captured files live under, as the engine names it: a fan-out
+/// instance's key may hold a `/` and is escaped there. `None` when even that is no single segment.
+pub fn task_segment(task: &str) -> Option<String> {
+    let segment = crucible::plan::ir::TaskName(task.to_owned())
+        .dir_name()
+        .into_owned();
+    safe_segment(&segment).then_some(segment)
+}
+
 /// Resolve one task's captured-files directory, or `None` when it does not exist or resolves
-/// outside the run's own files root.
+/// outside the run's own files root. `task` is the name the session log carries.
 fn task_files_dir(scratch_root: &Path, run_id: &str, task: &str) -> Option<PathBuf> {
-    if !safe_segment(run_id) || !safe_segment(task) {
+    if !safe_segment(run_id) {
         return None;
     }
+    let segment = task_segment(task)?;
     let root = files_root(scratch_root, run_id).canonicalize().ok()?;
-    let dir = root.join(task).canonicalize().ok()?;
+    let dir = root.join(segment).canonicalize().ok()?;
     dir.starts_with(&root).then_some(dir)
 }
 
@@ -323,6 +333,27 @@ mod tests {
         assert!(!session_result(no_status, "a").expect("reported").passed());
     }
 
+    /// A raw instance name may hold a `/` in its key, which the engine escaped where it formed the
+    /// directory; a name that climbs anywhere else still has no segment.
+    #[test]
+    fn a_task_segment_escapes_an_instance_key_and_refuses_a_climbing_name() {
+        assert_eq!(
+            task_segment("review[llm-d/llm-d-router]").as_deref(),
+            Some("review[llm-d%2Fllm-d-router]")
+        );
+        assert_eq!(
+            task_segment("review[../..]").as_deref(),
+            Some("review[%2E.%2F..]")
+        );
+        assert_eq!(
+            task_segment("triage[1027]").as_deref(),
+            Some("triage[1027]")
+        );
+        for bad in ["..", ".", "", "a/b", "../../etc", "a/b[c]"] {
+            assert_eq!(task_segment(bad), None, "{bad:?}");
+        }
+    }
+
     #[test]
     fn traversal_segments_are_refused_and_bracketed_names_are_not() {
         for bad in ["..", ".", "", "a/b", "a\\b", "../../etc"] {
@@ -361,6 +392,27 @@ mod tests {
             captured_files(scratch, "run-1", "../../../../etc")
                 .await
                 .is_empty()
+        );
+    }
+
+    /// An instance named after a key holding a separator captured into the engine's escaped
+    /// directory, and its evidence is read from there by the name the session log carries.
+    #[tokio::test]
+    async fn an_instance_whose_key_holds_a_separator_reads_its_escaped_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scratch = root.path();
+        let task_dir = files_root(scratch, "run-1").join("audit[llm-d%2Fllm-d-router]");
+        std::fs::create_dir_all(&task_dir).expect("mkdir");
+        std::fs::write(task_dir.join("out.txt"), "router\n").expect("write");
+
+        let files = captured_files(scratch, "run-1", "audit[llm-d/llm-d-router]").await;
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].content.as_deref(), Some("router\n"));
+        assert!(
+            captured_files(scratch, "run-1", "audit[llm-d%2Fllm-d-router]")
+                .await
+                .is_empty(),
+            "the escaped text is not itself the raw key"
         );
     }
 

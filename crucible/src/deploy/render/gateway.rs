@@ -17,6 +17,7 @@
 //! these objects per run and supplies the per-run addresses and Secret names.
 
 use crate::deploy::profile::DeployProfile;
+use crate::deploy::render::pod::env_var;
 use crate::openshell::gateway::{
     AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, GATEWAY_CLIENT_TLS_DIR_ENV, GATEWAY_URL_ENV,
     SANDBOX_RUNTIME_IMAGE_ENV, SERVE_CLIENT_TLS_SECRET_ENV, SERVE_GATEWAY_ID_ENV,
@@ -229,11 +230,6 @@ pub fn gateway_pod(
 ) -> core::Pod {
     let loop_spec = loop_pod.spec.as_ref();
     let loop_container = loop_spec.and_then(|s| s.containers.first());
-    let plain = |name: &str, value: String| core::EnvVar {
-        name: name.to_string(),
-        value: Some(value),
-        value_from: None,
-    };
     let mut env: Vec<core::EnvVar> = loop_container
         .and_then(|c| c.env.as_ref())
         .into_iter()
@@ -242,12 +238,12 @@ pub fn gateway_pod(
         .cloned()
         .collect();
     env.extend([
-        plain("HOME", GATEWAY_HOME.to_string()),
-        plain(SERVE_GRPC_ENDPOINT_ENV, addresses.url()),
-        plain(SERVE_HOST_IP_ENV, addresses.loop_service.to_string()),
-        plain(SERVE_CLIENT_TLS_SECRET_ENV, names.client_secret.clone()),
-        plain(SERVE_SERVER_TLS_DIR_ENV, SERVER_TLS_DIR.to_string()),
-        plain(SERVE_GATEWAY_ID_ENV, names.gateway_id.clone()),
+        env_var("HOME", GATEWAY_HOME.to_string()),
+        env_var(SERVE_GRPC_ENDPOINT_ENV, addresses.url()),
+        env_var(SERVE_HOST_IP_ENV, addresses.loop_service.to_string()),
+        env_var(SERVE_CLIENT_TLS_SECRET_ENV, names.client_secret.clone()),
+        env_var(SERVE_SERVER_TLS_DIR_ENV, SERVER_TLS_DIR.to_string()),
+        env_var(SERVE_GATEWAY_ID_ENV, names.gateway_id.clone()),
     ]);
     let mut mounts = vec![
         core::VolumeMount {

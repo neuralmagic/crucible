@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0040"
 title = "Retire the stdio MCP server and the personal bearer paths in favor of minted api keys"
-status = "proposed"
+status = "accepted"
 date = "2026-09-15"
 refs = ["ADR-0035"]
 
@@ -50,9 +50,7 @@ cons = [
 [[content.alternatives]]
 text = "Keep the stdio server and the login paths behind deprecation warnings for a release"
 status = "rejected"
-pros = [
-    "Nobody's config breaks on the day the PR lands",
-]
+pros = ["Nobody's config breaks on the day the PR lands"]
 cons = [
     "The paths are already dead against the deployment, so the warning period protects nothing but the code's own weight",
     "Two credentials and two surfaces stay documented, and the co-draft handoff keeps offering a login that cannot succeed",
@@ -61,9 +59,7 @@ cons = [
 [[content.alternatives]]
 text = "Admit the static bearer and the open guard on /mcp so an issuer-less deployment keeps an MCP path"
 status = "rejected"
-pros = [
-    "Local development would keep its MCP loop without a key",
-]
+pros = ["Local development would keep its MCP loop without a key"]
 cons = [
     "Reopens the guard separation [[ADR-0035]] preserved: the MCP surface would take a credential that names nobody",
     "Solves a development convenience with a change to the production surface's admission rule",

@@ -1,17 +1,15 @@
 //! The controller as an OIDC relying party against Keycloak.
 //!
-//! Two credentials are minted or checked here and nowhere else:
+//! The browser login is minted here and nowhere else:
 //!
 //! ```text
 //!   browser  -> /auth/login -> authorization code + PKCE + state + nonce -> /auth/callback
 //!               -> ID token validated against the issuer's cached JWKS -> a native session
-//!   CLI      -> a Keycloak ACCESS token presented as a bearer, validated against the same JWKS,
-//!               required to be typ=Bearer with azp == the public device-flow client
 //! ```
 //!
-//! Discovery, the code exchange, and ID token validation run on [`openidconnect`]; the access-token
-//! path runs on `jsonwebtoken` over the issuer's JWKS, because it turns on two claims
-//! (`typ`, `azp`) that no ID token verifier checks.
+//! Discovery, the code exchange, and ID token validation run on [`openidconnect`]; the groups on the
+//! access token the exchange returns are read with `jsonwebtoken` over the issuer's JWKS, because
+//! that check turns on two claims (`typ`, `azp`) that no ID token verifier checks.
 //!
 //! Everything in here is lazy. The issuer is a separate deployment that may be down when the
 //! controller boots, so discovery happens on first use behind a single-flight TTL cache and a
@@ -56,7 +54,7 @@ const DISCOVERY_TTL: Duration = Duration::from_secs(600);
 /// every request into a request against the issuer.
 const JWKS_MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
-/// How far past its `exp` a bearer JWT is still accepted, for clock skew between the issuer and
+/// How far past its `exp` an access token is still accepted, for clock skew between the issuer and
 /// this process.
 const EXPIRY_LEEWAY: Duration = Duration::from_secs(5);
 
@@ -173,9 +171,6 @@ pub struct OidcCfg {
     /// realm registered it as a scope, because an unregistered scope is `invalid_scope` and breaks
     /// login outright.
     pub scopes: Vec<String>,
-    /// The PUBLIC device-flow client id. A Keycloak access token is accepted as a bearer only when
-    /// its `azp` is this; empty turns the JWT bearer path off.
-    pub device_client_id: Option<String>,
     /// Where the issuer sends the browser after RP-initiated logout.
     pub post_logout_redirect: Option<String>,
 }
@@ -192,7 +187,7 @@ fn env_value(name: &str) -> Option<String> {
 
 impl OidcCfg {
     /// Read the registration off the environment. `None` when no issuer is configured, which is
-    /// what a proxy-mode or local deployment looks like.
+    /// what a local dev or machine-only deployment looks like.
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         let Some(issuer) = env_value("CONTROLLER_OIDC_ISSUER") else {
             return Ok(None);
@@ -219,14 +214,14 @@ impl OidcCfg {
             client_secret: env_value("CONTROLLER_OIDC_CLIENT_SECRET"),
             redirect_url,
             scopes,
-            device_client_id: env_value("CONTROLLER_OIDC_DEVICE_CLIENT_ID"),
             post_logout_redirect: env_value("CONTROLLER_OIDC_POST_LOGOUT_REDIRECT"),
         }))
     }
 }
 
-/// What a validated credential says about the caller. The one shape both the browser callback and
-/// the JWT bearer path produce, so a session and a token can never disagree about what identity is.
+/// What a validated credential says about the caller: the one shape the browser callback and the
+/// offline credential refresh both produce, so a session and a refresh can never disagree about
+/// what identity is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedClaims {
     pub sub: String,
@@ -445,75 +440,24 @@ impl OidcProvider {
     }
 }
 
-/// The claims the JWT bearer path reads. Everything the spec-shaped verifier does not check
-/// (`typ`, `azp`) is checked by hand below, because those two are what separate a CLI's access
-/// token from an ID token or a token minted for a different application on the same realm.
+/// The claims read off the access token the code exchange returns. Everything the spec-shaped
+/// verifier does not check (`typ`, `azp`) is checked by hand below, because those two are what
+/// separate this client's access token from an ID token or a token minted for a different
+/// application on the same realm.
 #[derive(Debug, Deserialize)]
 struct AccessTokenClaims {
-    sub: String,
     #[serde(default)]
     typ: Option<String>,
     #[serde(default)]
     azp: Option<String>,
-    #[serde(default)]
-    preferred_username: Option<String>,
-    #[serde(default)]
-    email: Option<String>,
-    #[serde(default)]
-    email_verified: Option<bool>,
     #[serde(flatten)]
     groups: GroupClaims,
-    /// Present on an ID token and never on an access token; a second, independent reason to refuse.
-    #[serde(default)]
-    nonce: Option<String>,
 }
 
 impl OidcProvider {
-    /// Validate a Keycloak ACCESS token presented as a bearer.
-    ///
-    /// Signature, issuer, and expiry come from the issuer's JWKS. On top of those: `typ` must be
-    /// `Bearer`, `azp` must be the configured public device-flow client, and a token whose `azp` is
-    /// this relying party (or that carries a `nonce`, so an ID token) is refused outright — those
-    /// are credentials minted for the browser, not for a CLI.
-    pub async fn verify_access_token(&self, token: &str) -> Result<VerifiedClaims, OidcError> {
-        let Some(device_client) = self.cfg.device_client_id.as_deref() else {
-            return Err(OidcError::rejected(
-                "this deployment accepts no JWT bearers: no device-flow client is configured",
-            ));
-        };
-        let claims = self.decode_access_token(token).await?;
-        // Keycloak copies the authorization request's nonce onto the access token it mints for a
-        // browser login, so a bearer carrying one came out of the web flow, not the device flow.
-        if claims.nonce.is_some() {
-            return Err(OidcError::rejected(
-                "a token from a browser login is not accepted as a bearer",
-            ));
-        }
-        let azp = claims
-            .azp
-            .as_deref()
-            .ok_or_else(|| OidcError::rejected("the JWT names no authorized party (azp)"))?;
-        if azp == self.cfg.client_id {
-            return Err(OidcError::rejected(
-                "a token minted for the web client is not accepted as a bearer",
-            ));
-        }
-        if azp != device_client {
-            return Err(OidcError::rejected(format!(
-                "the JWT was minted for {azp:?}, not for this deployment's device-flow client"
-            )));
-        }
-        let email = verified_email(claims.email, claims.email_verified);
-        Ok(VerifiedClaims {
-            login: login_from(&claims.preferred_username, &email, &claims.sub),
-            sub: claims.sub,
-            email,
-            groups: claims.groups.normalized(),
-        })
-    }
-
     /// The groups on the access token this relying party was just issued at the code exchange.
-    /// Verified exactly like a bearer, and it must name this client as its authorized party.
+    /// Signature, issuer, and expiry are checked against the JWKS, and it must name this client as
+    /// its authorized party.
     async fn own_access_token_groups(&self, token: &str) -> Result<Vec<String>, OidcError> {
         let claims = self.decode_access_token(token).await?;
         if claims.azp.as_deref() != Some(self.cfg.client_id.as_str()) {
@@ -562,7 +506,7 @@ impl OidcProvider {
             .claims;
         if claims.typ.as_deref() != Some("Bearer") {
             return Err(OidcError::rejected(
-                "only an access token (typ=Bearer) is accepted as a bearer",
+                "the token the code exchange returned is not an access token (typ=Bearer)",
             ));
         }
         Ok(claims)

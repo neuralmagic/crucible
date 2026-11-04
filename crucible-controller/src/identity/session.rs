@@ -2,15 +2,13 @@
 //!
 //! The `sessions` table ships in `migrations/0002_sessions.sql` under the one
 //! [`crate::MIGRATOR`]; the store's own `migrate()` is never called, and the roundtrip test
-//! below pins our DDL to the store crate's queries. Sessions stay lazy under proxy mode: no
-//! `Set-Cookie` and no row unless a handler writes, so bearer/CLI clients see no change. Under
-//! native mode the login itself is the write.
+//! below pins our DDL to the store crate's queries. Sessions stay lazy for bearer callers: no
+//! `Set-Cookie` and no row unless a handler writes. For a browser the login itself is the write.
 //!
 //! [`BoundSession`] is the only way handlers touch a session. It binds the proven
-//! [`crate::identity::session::Identity`] to the session's source-tagged `"identity"` slot, and a source
-//! mismatch flushes the session — which is what makes flipping between the proxy and native
-//! identity models safe in both directions. Durable credentials belong in real tables, never in
-//! session blobs.
+//! [`crate::identity::session::Identity`] to the session's `"identity"` slot, and a mismatch
+//! flushes the session, so a cookie never carries state across an identity change. Durable
+//! credentials belong in real tables, never in session blobs.
 
 #![allow(clippy::disallowed_macros)]
 
@@ -34,9 +32,8 @@ const COOKIE_NAME: &str = "crucible_session";
 const INACTIVITY_DAYS: i64 = 7;
 /// The session slot [`BoundSession`] keeps the caller's identity under.
 const IDENTITY_KEY: &str = "identity";
-/// The session slot the native login's validated claims live under. [`IDENTITY_KEY`] stays the
-/// minimal binding key (login + source) so a proxy-mode session's binding is byte-for-byte what it
-/// always was; the claims a native session additionally carries hang off their own slot.
+/// The session slot the login's validated claims live under. [`IDENTITY_KEY`] stays the minimal
+/// binding key (the login); the claims a login additionally carries hang off their own slot.
 const CLAIMS_KEY: &str = "native_claims";
 /// The session slot the login's serialized ID token lives under, for `/auth/logout` to send the
 /// issuer as `id_token_hint`.
@@ -104,18 +101,6 @@ pub fn spawn_expiry_sweep(store: PostgresStore) {
             }
         }
     });
-}
-
-/// Where a session's identity claim came from. A source mismatch flushes the session, which is
-/// exactly what a deployment flipping between the proxy and native modes needs: neither mode ever
-/// inherits the other's cookie.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum IdentitySource {
-    /// The oauth2-proxy sidecar asserted it in `X-Auth-Request-*`.
-    Proxy,
-    /// This controller minted it from an ID token it validated itself.
-    Native,
 }
 
 /// The validated claims a native session carries. Written once at `/auth/callback` and read by the
@@ -234,7 +219,6 @@ pub async fn establish_native(
         IDENTITY_KEY,
         &SessionIdentity {
             user: claims.login.clone(),
-            source: IdentitySource::Native,
         },
     )
     .await?;
@@ -249,13 +233,13 @@ pub async fn id_token(session: &Session) -> Result<Option<String>, tower_session
     read_slot(session, ID_TOKEN_KEY).await
 }
 
-/// The native claims on this session, if it carries a native identity. `None` for an anonymous
-/// session, and for a proxy-sourced one — the caller then has no controller-minted identity.
+/// The claims a login stamped on this session. `None` for an anonymous session, and for one only
+/// a bearer request's state was ever bound to: [`establish_native`] is the only writer.
 pub async fn native_claims(
     session: &Session,
 ) -> Result<Option<NativeClaims>, tower_sessions::session::Error> {
     let identity: Option<SessionIdentity> = read_slot(session, IDENTITY_KEY).await?;
-    if identity.map(|i| i.source) != Some(IdentitySource::Native) {
+    if identity.is_none() {
         return Ok(None);
     }
     read_slot(session, CLAIMS_KEY).await
@@ -324,10 +308,9 @@ pub async fn end(session: &Session) -> Result<(), tower_sessions::session::Error
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionIdentity {
     pub user: String,
-    pub source: IdentitySource,
 }
 
-/// A session verified against the request's proxy-asserted identity. Handlers that touch session
+/// A session verified against the request's proven identity. Handlers that touch session
 /// state extract this, never a raw [`Session`] — its accessors are the enforcement point.
 ///
 /// Binding rules:
@@ -339,8 +322,8 @@ pub struct SessionIdentity {
 /// * an identified request with an empty session stays row-free on reads; the identity is
 ///   seeded (with a fresh id) only when a handler first writes.
 ///
-/// Store failures reject as 500, never 401: the SPA treats any 401 as "proxy session expired"
-/// and bounces the user through `/oauth2/start`.
+/// Store failures reject as 500, never 401: the SPA treats any 401 as "session expired" and
+/// bounces the user through the sign-in.
 pub struct BoundSession {
     session: Session,
     identity: Option<SessionIdentity>,
@@ -391,10 +374,8 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for BoundSession {
             .map_err(|(_, msg)| internal_error("extracting the session", msg))?;
         let Ok(identity) =
             crate::identity::session::Identity::from_request_parts(parts, state).await;
-        let source = crate::identity::session::identity_source(parts);
         let claimed = identity.as_deref().map(|user| SessionIdentity {
             user: user.to_string(),
-            source,
         });
 
         let stored: Option<SessionIdentity> = read_slot(&session, IDENTITY_KEY)
@@ -440,43 +421,28 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for BoundSession {
 pub struct Resolved {
     pub user: Option<String>,
     pub groups: Vec<String>,
-    /// The issuer's stable subject, on the two paths that carry one (a native session, a validated
-    /// JWT). The secrets registry and the schedule owner are spelled in logins; this is what a
-    /// durable per-user row is keyed by.
+    /// The issuer's stable subject, on the two paths that carry one (a session, an api key). The
+    /// secrets registry and the schedule owner are spelled in logins; this is what a durable
+    /// per-user row is keyed by.
     pub sub: Option<String>,
-    /// Which identity model minted it. A session whose stored source differs is flushed, so a
-    /// deployment flipping between modes never inherits the other mode's cookie.
-    pub source: IdentitySource,
 }
 
 impl Resolved {
-    pub(crate) fn anonymous(source: IdentitySource) -> Self {
+    pub(crate) fn anonymous() -> Self {
         Resolved {
             user: None,
             groups: Vec::new(),
             sub: None,
-            source,
         }
     }
 
-    pub(crate) fn named(source: IdentitySource, user: impl Into<String>) -> Self {
+    pub(crate) fn named(user: impl Into<String>) -> Self {
         Resolved {
             user: Some(user.into()),
             groups: Vec::new(),
             sub: None,
-            source,
         }
     }
-}
-
-/// Which identity model the request's proven identity came from, for the session binding. Requests
-/// the middleware never touched read as `Proxy`, the model every existing deployment runs.
-pub(crate) fn identity_source(parts: &Parts) -> IdentitySource {
-    parts
-        .extensions
-        .get::<Resolved>()
-        .map(|r| r.source)
-        .unwrap_or(IdentitySource::Proxy)
 }
 
 /// Who is making the request: whatever [`crate::identity::auth::require_auth`] proved. `None` for an anonymous caller.
@@ -504,7 +470,8 @@ impl<S: Send + Sync> FromRequestParts<S> for Identity {
     }
 }
 
-/// The identity an oauth2-proxy edge asserted, read off the headers it injects.
+/// A test request's asserted identity header. Only the extractors' no-middleware fallback reads
+/// these: every guard drops the family before a handler runs.
 fn asserted_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers
         .get(name)
@@ -632,97 +599,6 @@ mod tests {
             .await
             .expect("count");
         assert_eq!(live, 0);
-    }
-
-    /// Flipping a deployment from native mode back to proxy mode must not let a controller-minted
-    /// session keep working as a proxy-asserted one: the source tag differs, so the binding flushes
-    /// it and the user signs in again through the sidecar.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn flipping_native_to_proxy_flushes_a_native_session(pool: sqlx::PgPool) {
-        use axum::body::Body;
-        use axum::routing::get;
-        use tower::util::ServiceExt;
-
-        let claims = NativeClaims {
-            sub: "sub-alice".to_string(),
-            login: "alice".to_string(),
-            email: None,
-            groups: vec!["/groups/team-x".to_string()],
-            groups_at: jiff::Timestamp::now().to_string(),
-            downgraded: false,
-        };
-        let store = store(&pool).await.expect("session store");
-        let app = axum::Router::new()
-            .route(
-                "/bound",
-                get(|_bound: BoundSession, session: Session| async move {
-                    match native_claims(&session).await.expect("claims") {
-                        Some(c) => c.login,
-                        None => "flushed".to_string(),
-                    }
-                }),
-            )
-            // Proxy mode: the guard asserts the SAME login, from the other identity model.
-            .layer(axum::middleware::from_fn(
-                |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
-                    req.extensions_mut()
-                        .insert(crate::identity::session::Resolved {
-                            user: Some("alice".to_string()),
-                            groups: Vec::new(),
-                            sub: None,
-                            source: IdentitySource::Proxy,
-                        });
-                    next.run(req).await
-                },
-            ))
-            .route(
-                "/establish",
-                get(move |session: Session| {
-                    let claims = claims.clone();
-                    async move {
-                        establish_native(&session, &claims, None)
-                            .await
-                            .expect("establish");
-                        "signed in"
-                    }
-                }),
-            )
-            .layer(layer(store, false));
-
-        let res = app
-            .clone()
-            .oneshot(
-                axum::http::Request::get("/establish")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("infallible");
-        let cookie = res
-            .headers()
-            .get(axum::http::header::SET_COOKIE)
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.split(';').next().unwrap_or_default().to_string())
-            .expect("the login set a cookie");
-
-        let res = app
-            .oneshot(
-                axum::http::Request::get("/bound")
-                    .header(axum::http::header::COOKIE, &cookie)
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("infallible");
-        assert_eq!(res.status(), axum::http::StatusCode::OK);
-        let body = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        assert_eq!(
-            String::from_utf8_lossy(&body),
-            "flushed",
-            "a native session must not survive the flip back to proxy mode"
-        );
     }
 
     /// The shared-cluster shape: the database user's `search_path` points at its own schema, the

@@ -5,7 +5,7 @@
 //! [`crate::plan::starlark::known_kwargs`], so a constructor cannot be added, renamed, or given a
 //! new argument without the reference following it.
 
-use crate::plan::exec::DeclaredStatus;
+use crate::plan::attempt::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
@@ -812,10 +812,11 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
         Reserved::new(
             crate::plan::ir::COMPLETE_FIELD,
             "bool",
-            "`true` on a passing main-graph task of a playbook ends the run early and valid: \
-             nothing else in the main graph dispatches, undispatched tasks stay unsettled, and \
-             epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it \
-             in `emits`.",
+            "`true` on a passing main-graph `command` or `evaluate` task of a playbook ends the \
+             run early and valid: nothing else in the main graph dispatches, undispatched tasks \
+             stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. \
+             Any other task's `true` is refused on its row and the run continues. A task may not \
+             list it in `emits`.",
         ),
         Reserved::new(
             crate::plan::ir::REASON_FIELD,
@@ -1048,10 +1049,11 @@ fn reserved_rows(rows: Vec<Reserved>) -> serde_json::Value {
 mod tests {
     use std::collections::BTreeSet;
 
-    use crate::plan::exec::{DeclaredStatus, TaskStatus};
+    use crate::plan::attempt::DeclaredStatus;
     use crate::plan::starlark::reference::functions;
     use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals};
     use crate::plan::workflow::WorkflowType;
+    use crucible_contract::session::TaskStatus;
 
     /// The reference is the global surface, per lane, in both directions: a constructor the
     /// evaluator registers but the table omits is undocumented, and one the table names but the

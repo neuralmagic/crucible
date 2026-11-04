@@ -20,11 +20,9 @@ pub mod task;
 
 use crucible_mcp_auth::access::AccessReview;
 use crucible_mcp_auth::guard::PolicyGuard;
+use crucible_mcp_auth::mount::{Mount, mcp_router, stateless_config};
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::server::ResourceServer;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
-};
 use std::sync::Arc;
 
 pub const MCP_PATH: &str = "/mcp";
@@ -87,47 +85,29 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
     };
     let cfg = Arc::new(config);
     let kinds = Arc::new(kinds);
-    let extra_hosts = &allowed_hosts;
-    let mut config = StreamableHttpServerConfig::default()
-        .with_legacy_session_mode(false)
-        .with_json_response(true);
-    for host in extra_hosts {
-        if !config.allowed_hosts.contains(host) {
-            config.allowed_hosts.push(host.clone());
-        }
-    }
-    let service: StreamableHttpService<server::KueueMcp, NeverSessionManager> =
-        StreamableHttpService::new(
-            move || {
-                Ok(server::KueueMcp::new(
-                    client.clone(),
-                    kueue,
-                    cfg.clone(),
-                    kinds.clone(),
-                    namespaces.clone(),
-                ))
-            },
-            Arc::new(NeverSessionManager::default()),
-            config,
-        );
     let guard = PolicyGuard {
         rules: Arc::new(rules),
         policy,
         server: Some(oidc.clone()),
         reviewer,
     };
-    let mcp = axum::Router::new()
-        .fallback_service(service)
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(guard),
-            crucible_mcp_auth::guard::enforce,
-        ))
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::new(auth),
-            auth::authenticate,
-        ));
-    axum::Router::new()
-        .nest_service(MCP_PATH, mcp)
-        .route("/healthz", axum::routing::get(|| async { "ok" }))
-        .merge(crucible_mcp_auth::metadata::router(oidc))
+    mcp_router(
+        move || {
+            Ok(server::KueueMcp::new(
+                client.clone(),
+                kueue,
+                cfg.clone(),
+                kinds.clone(),
+                namespaces.clone(),
+            ))
+        },
+        axum::middleware::from_fn_with_state(Arc::new(auth), auth::authenticate),
+        Mount {
+            path: MCP_PATH,
+            config: stateless_config(&allowed_hosts),
+            guard,
+            metadata: Some(oidc),
+        },
+    )
+    .route("/healthz", axum::routing::get(|| async { "ok" }))
 }

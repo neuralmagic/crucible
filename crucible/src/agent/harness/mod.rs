@@ -1,46 +1,28 @@
 //! The agent-harness boundary: everything that knows which agent CLI runs a turn.
 //!
-//! A harness is the program that turns a prompt into edits + a stream of [`AgentEvent`]s,
-//! claude today, hermes next. Everything downstream of the decoder (session log, SSE, cost,
+//! A harness is the program that turns a prompt into edits + a stream of [`AgentEvent`]s:
+//! claude, codex, opencode, or pi. Everything downstream of the decoder (session log, SSE, cost,
 //! keep/discard) consumes the harness-neutral `AgentEvent`, so the swappable surface is exactly
 //! what lives here: argv construction, env defaults, the sandbox seed files, the stream decoder,
-//! and the post-turn transcript backfill. A backend is a [`HarnessSpec`] of data plus the few
-//! [`Backend`] methods that genuinely differ per CLI; the manifest's `Harness` token
-//! (`[agent].harness` or `--harness`, riding on [`Args`]) selects one through
-//! [`HarnessRuntime::backend`].
+//! and the post-turn transcript backfill. A backend is the [`HarnessSpec`] table entry plus the
+//! few [`Backend`] methods that genuinely differ per CLI; the manifest's `Harness` token
+//! (`[agent].harness` or `--harness`, riding on [`TurnAgent`]) selects one through [`backend`].
 
 pub(crate) mod claude;
 pub(crate) mod codex;
-pub(crate) mod hermes;
 pub(crate) mod opencode;
 pub(crate) mod pi;
 
-use crate::agent::event::{AgentEvent, RawStream};
+use crate::agent::event::AgentEvent;
 use crate::agent::inference::{InferenceEnv, WireApi};
-use crate::args::Args;
+use crate::agent::sandbox_env::sh_quote;
+use crate::args::TurnAgent;
 use crate::manifest::Harness;
 use crate::openshell::provider::CodexAuth;
-use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
-use crucible_harness::{CodexJsonParser, LiveMeters, OpenCodeJsonParser, PiJsonParser};
-use std::time::Duration;
-
-/// How a sandbox turn gets its model credential. Vertex mints a `cloud-platform` access token from
-/// ADC and serves it through the gateway's metadata emulator; Codex seeds either an API key or a
-/// host-refreshed ChatGPT OAuth access token into the sandbox's `auth.json`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AuthProvider {
-    Vertex,
-    Codex,
-    /// A direct Anthropic API key from the environment ([`crate::agent::inference::ANTHROPIC_API_KEY`]),
-    /// relayed into the sandbox; no gateway provider, no metadata emulator.
-    AnthropicKey,
-    /// A direct API key from the environment for whichever API the turn's endpoint speaks
-    /// ([`api_endpoint`]): `OPENAI_API_KEY` or `ANTHROPIC_API_KEY`, relayed into the sandbox
-    /// alongside its base URL. The harnesses that take a provider table (opencode, pi) read the
-    /// key back from that env through their seeded config.
-    ApiKey,
-}
+use crucible::harness::{AuthProvider, HarnessSpec};
+use crucible_harness::line::LineFormat;
+use crucible_harness::otel::LiveMeters;
 
 /// Which credential this turn runs on: the harness's default, unless the environment carries a
 /// direct Anthropic key for a Claude-speaking harness, or nothing at all for a key-authenticated
@@ -51,8 +33,30 @@ pub(crate) fn resolve_auth(
 ) -> AuthProvider {
     match (harness.spec().auth, inference.anthropic_key.as_deref()) {
         (AuthProvider::Vertex, Some(_)) => AuthProvider::AnthropicKey,
-        (AuthProvider::ApiKey, _) if inference.is_ambient() => AuthProvider::Vertex,
+        (auth, _) if auth.runs_on_ambient_vertex() && inference.is_ambient() => {
+            AuthProvider::Vertex
+        }
         (auth, _) => auth,
+    }
+}
+
+/// The GenAI provider name (`gen_ai.system`) of the API a turn on `auth` reaches. A
+/// key-authenticated harness names the API its endpoint speaks.
+pub(crate) fn gen_ai_system(
+    auth: AuthProvider,
+    model: &str,
+    inference: &InferenceEnv,
+    manifest_env: &[(String, String)],
+) -> &'static str {
+    match auth {
+        AuthProvider::Vertex => "gcp.vertex_ai",
+        AuthProvider::AnthropicKey => "anthropic",
+        AuthProvider::Codex => "openai",
+        AuthProvider::ApiKey => match api_endpoint(model, inference, manifest_env) {
+            ApiEndpoint::OpenAi { .. } => "openai",
+            ApiEndpoint::Anthropic { .. } => "anthropic",
+            ApiEndpoint::Vertex(_) => "gcp.vertex_ai",
+        },
     }
 }
 
@@ -143,31 +147,6 @@ pub(crate) struct SeedFile {
     pub dest: &'static str,
 }
 
-/// Where a harness leaves its native session transcript inside the sandbox, for the post-turn
-/// fetch. Claude writes one jsonl per session under a projects tree (newest wins); hermes keeps
-/// a single SQLite db at a fixed path.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TranscriptLocator {
-    /// The newest file matching `<sandbox_root>/<glob>`: claude's `projects/<slug>/<session>.jsonl`
-    /// sits one segment down, codex's `sessions/YYYY/MM/DD/rollout-*.jsonl` three.
-    NewestJsonl {
-        sandbox_root: &'static str,
-        glob: &'static str,
-    },
-    /// One fixed file (hermes's `state.db`).
-    File { sandbox_path: &'static str },
-}
-
-impl TranscriptLocator {
-    /// The `(root, glob)` of a jsonl tree, `None` for a fixed file.
-    pub(crate) fn jsonl_tree(self) -> Option<(&'static str, &'static str)> {
-        match self {
-            TranscriptLocator::NewestJsonl { sandbox_root, glob } => Some((sandbox_root, glob)),
-            TranscriptLocator::File { .. } => None,
-        }
-    }
-}
-
 /// What a harness recovers from its transcript after the turn. For claude this is trace garnish
 /// (tool spans; empty events, no cost, the live stream already carried both); for a backfill
 /// harness (hermes) it is the turn's ONLY source of result events + cost.
@@ -176,54 +155,6 @@ pub(crate) struct TurnArtifacts {
     pub events: Vec<AgentEvent>,
     pub cost_usd: Option<f64>,
     pub tool_calls: Vec<ToolInvocation>,
-}
-
-/// Decodes the harness's stdout, one complete line at a time, into [`AgentEvent`]s. Claude and
-/// codex speak structured json streams; a harness with no machine-readable stream degrades to
-/// [`RawLines`], structure arriving post-hoc via the transcript backfill.
-pub(crate) trait StreamDecoder: Send {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent>;
-}
-
-impl StreamDecoder for StreamJsonParser {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        StreamJsonParser::push(self, line)
-    }
-}
-
-impl StreamDecoder for CodexJsonParser {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        CodexJsonParser::push(self, line)
-    }
-}
-
-impl StreamDecoder for OpenCodeJsonParser {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        OpenCodeJsonParser::push(self, line)
-    }
-}
-
-impl StreamDecoder for PiJsonParser {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        PiJsonParser::push(self, line)
-    }
-}
-
-/// One `Raw` event per non-empty line.
-pub(crate) struct RawLines;
-
-impl StreamDecoder for RawLines {
-    fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        let text = line.trim();
-        if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![AgentEvent::Raw {
-                text: text.to_string(),
-                stream: RawStream::Stdout,
-            }]
-        }
-    }
 }
 
 /// The credential a sandbox turn resolved for its [`AuthProvider`], handed to the backend so it
@@ -245,49 +176,6 @@ impl SandboxAuth {
             SandboxAuth::Gateway | SandboxAuth::AnthropicKey | SandboxAuth::ApiKey => None,
         }
     }
-}
-
-/// What a backend is, as data: the values the shared assembly reads. One per harness, on its
-/// backend type as `SPEC`.
-#[derive(Debug)]
-pub(crate) struct HarnessSpec {
-    /// The `AGENT_TOOL` value, exported first in both the sandbox env script and the local env.
-    pub name: &'static str,
-    /// Binaries always allowed to open egress for this harness (the agent CLIs). OpenShell
-    /// denies network to any binary not listed, but descendants inherit a parent's egress, so a
-    /// tool the agent shells out to (e.g. `kubectl`) does not need its own entry, only the
-    /// root agent does.
-    pub binaries: &'static [&'static str],
-    /// The workspace-relative dir the toolbox skills install into.
-    pub skills_dir: &'static str,
-    /// The env var that relocates the harness's state dir into the sandbox, and its value.
-    pub home_var: &'static str,
-    pub home: &'static str,
-    /// Where the rendered config file ([`Backend::config`]) lands in the sandbox.
-    pub config: &'static str,
-    /// Further sandbox exports, after `AGENT_TOOL` and the home var; unquoted, like them.
-    pub sandbox_env: &'static [(&'static str, &'static str)],
-    /// Local-spawn env defaults after `AGENT_TOOL`, applied before the manifest `[agent].env`.
-    pub local_env: &'static [(&'static str, &'static str)],
-    /// Where this harness's session transcript lives inside the sandbox.
-    pub transcript: TranscriptLocator,
-    /// Hard bound on the whole transcript fetch (find + download). For claude the fetch is pure
-    /// telemetry and must never wedge the turn; for a backfill harness the transcript carries
-    /// the turn's result, so it gets more headroom.
-    pub transcript_fetch_timeout: Duration,
-    /// Which credential the sandbox turn attaches (token mint + provider create/attach + the
-    /// pod-env relay). Claude and hermes both resolve Vertex ADC through the gateway's metadata
-    /// emulator (hermes via its config.yaml `provider: vertex-anthropic`), key-free; codex
-    /// authenticates against the ChatGPT backend instead.
-    pub auth: AuthProvider,
-    /// Whether the harness exports the `claude_code.*` OTEL metrics the in-process collector
-    /// captures. False means the collector never starts (no `otel_summary`; the pricing-table
-    /// estimate stays the cost fallback).
-    pub otel_capable: bool,
-    /// Whether the transcript is the turn's ONLY source of result events + cost. When true the
-    /// post-turn fetch runs unconditionally (not export-gated) and a fetch failure surfaces as
-    /// an [`AgentEvent::Error`], never a silent $0 success (keep/discard integrity).
-    pub backfill_required: bool,
 }
 
 /// One MCP server a seeded config points the agent at. `token`, when set, rides as an
@@ -329,23 +217,23 @@ pub(crate) trait Backend: Sync {
     /// The model this backend hands its turn. Most take the shared `[agent].model` as-is; one that
     /// reads a `[agent.<harness>].model` of its own, or rejects a name from another vendor,
     /// overrides this and its argv builders call it.
-    fn model<'a>(&self, args: &'a Args) -> &'a str {
-        args.model()
+    fn model<'a>(&self, agent: &TurnAgent<'a>) -> &'a str {
+        agent.model
     }
 
     /// The full local-spawn argv (program name first): flags + the prompt as an argument.
-    fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String>;
+    fn local_argv(&self, agent: &TurnAgent<'_>, prompt: &str) -> Vec<String>;
 
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
     /// `mcp_seeded` says whether the turn reaches any MCP server, and so whether
     /// [`Backend::seed_files`] delivered an MCP config, so a harness that takes it on argv
     /// (claude's `--mcp-config`, pi's `-e` for the adapter) can point at it.
-    fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String>;
+    fn sandbox_argv(&self, agent: &TurnAgent<'_>, mcp_seeded: bool) -> Vec<String>;
 
     /// Start or resume a Crucible-managed session locally.
     fn local_session_argv(
         &self,
-        _args: &Args,
+        _agent: &TurnAgent<'_>,
         _prompt: &str,
         _session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
@@ -355,7 +243,7 @@ pub(crate) trait Backend: Sync {
     /// Sandbox counterpart of [`Backend::local_session_argv`].
     fn sandbox_session_argv(
         &self,
-        _args: &Args,
+        _agent: &TurnAgent<'_>,
         _mcp_seeded: bool,
         _session: &crate::agent::agent_session::SessionTurn,
     ) -> std::io::Result<Vec<String>> {
@@ -366,14 +254,14 @@ pub(crate) trait Backend: Sync {
     /// host-side; `None` seeds nothing this turn.
     fn config(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String>;
 
     /// The credential file a harness seeds when its credential cannot ride the gateway as-is:
     /// codex's `auth.json`, pi's Vertex extension.
-    fn credential(&self, _args: &Args, _auth: &SandboxAuth) -> Option<SeedFile> {
+    fn credential(&self, _agent: &TurnAgent<'_>, _auth: &SandboxAuth) -> Option<SeedFile> {
         None
     }
 
@@ -390,10 +278,10 @@ pub(crate) trait Backend: Sync {
     /// (see [`crate::agent::turn::tool_io_full`]).
     fn decoder(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         meters: Option<&LiveMeters>,
         tool_io: bool,
-    ) -> Box<dyn StreamDecoder>;
+    ) -> Box<dyn LineFormat + Send>;
 
     /// Parse the downloaded transcript's in-memory bytes into [`TurnArtifacts`]. The caller reads
     /// the file ONCE (async, see the fetch path) and hands the bytes here; this method is pure and
@@ -423,42 +311,26 @@ pub(crate) trait Backend: Sync {
         env
     }
 
-    /// The agent's env script (sourced before the agent runs in the sandbox): `AGENT_TOOL`, the
-    /// home var, the spec's further exports, then the manifest's `[agent].env`.
-    fn env_script(&self, env: &[(String, String)]) -> String {
-        let spec = self.spec();
-        let mut lines = vec![
-            format!("export AGENT_TOOL={}", spec.name),
-            format!("export {}={}", spec.home_var, spec.home),
-        ];
-        lines.extend(
-            spec.sandbox_env
-                .iter()
-                .map(|(k, v)| format!("export {k}={v}")),
-        );
-        append_manifest_env(lines, env)
-    }
-
     /// Files uploaded into the sandbox before the agent execs: the config at the spec's path when
     /// the backend renders one, then its credential file, then the MCP config. `servers` are
     /// exactly the ones in the turn's scope, each token the raw value or the provider placeholder
     /// the openshell egress proxy resolves.
     fn seed_files(
         &self,
-        args: &Args,
+        agent: &TurnAgent<'_>,
         servers: &[McpServer<'_>],
         auth: &SandboxAuth,
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
         let mut seeds: Vec<SeedFile> = self
-            .config(args, servers, inference)
+            .config(agent, servers, inference)
             .map(|content| SeedFile {
                 content,
                 dest: self.spec().config,
             })
             .into_iter()
             .collect();
-        seeds.extend(self.credential(args, auth));
+        seeds.extend(self.credential(agent, auth));
         if !servers.is_empty() {
             seeds.extend(self.mcp_config(servers));
         }
@@ -474,26 +346,12 @@ fn no_sessions(spec: &HarnessSpec) -> std::io::Error {
 }
 
 /// The manifest's harness token, resolved to its backend.
-pub(crate) trait HarnessRuntime {
-    fn backend(self) -> &'static dyn Backend;
-
-    fn spec(self) -> &'static HarnessSpec
-    where
-        Self: Sized,
-    {
-        self.backend().spec()
-    }
-}
-
-impl HarnessRuntime for Harness {
-    fn backend(self) -> &'static dyn Backend {
-        match self {
-            Harness::Claude => &claude::Claude,
-            Harness::Hermes => &hermes::Hermes,
-            Harness::Codex => &codex::Codex,
-            Harness::OpenCode => &opencode::OpenCode,
-            Harness::Pi => &pi::Pi,
-        }
+pub(crate) fn backend(harness: Harness) -> &'static dyn Backend {
+    match harness {
+        Harness::Claude => &claude::Claude,
+        Harness::Codex => &codex::Codex,
+        Harness::OpenCode => &opencode::OpenCode,
+        Harness::Pi => &pi::Pi,
     }
 }
 
@@ -518,28 +376,13 @@ pub(crate) fn exec_wrapper(workdir_basename: &str, agent_args: &[String]) -> Vec
     v
 }
 
-/// Single-quote a value for `sh` (wrap in `'…'`, escaping embedded single quotes), like
-/// `shlex.quote`.
-pub(crate) fn sh_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// Append the manifest's `[agent].env` as `export k='v'` lines onto a harness's env script, then a
-/// trailing blank line, and join with newlines. Shared tail of every harness's `env_script`, the
-/// harness supplies its own defaults, this stamps the manifest overrides on top.
-pub(crate) fn append_manifest_env(mut lines: Vec<String>, env: &[(String, String)]) -> String {
-    for (k, v) in env {
-        lines.push(format!("export {k}={}", sh_quote(v)));
-    }
-    lines.push(String::new()); // trailing newline
-    lines.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::event::AgentEvent;
+    use crate::agent::sandbox_env::SandboxEnv;
     use clap::Parser;
+    use crucible::harness::TranscriptLocator;
 
     #[test]
     fn npm_installed_harnesses_allow_their_canonical_install_tree() {
@@ -585,12 +428,6 @@ mod tests {
     }
 
     #[test]
-    fn sh_quote_wraps_and_escapes() {
-        assert_eq!(sh_quote("plain"), "'plain'");
-        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
-    }
-
-    #[test]
     fn harness_defaults_to_claude() {
         assert_eq!(Harness::default(), Harness::Claude);
     }
@@ -601,8 +438,6 @@ mod tests {
         struct T {
             harness: Harness,
         }
-        let t: T = toml::from_str("harness = \"hermes\"").expect("parse");
-        assert_eq!(t.harness, Harness::Hermes);
         let t: T = toml::from_str("harness = \"claude\"").expect("parse");
         assert_eq!(t.harness, Harness::Claude);
         let t: T = toml::from_str("harness = \"codex\"").expect("parse");
@@ -663,10 +498,6 @@ mod tests {
             &claude[crate::openshell::policy::DEFAULT_ENDPOINTS.len()..],
             crate::openshell::policy::CLAUDE_ENDPOINTS
         );
-        assert_eq!(
-            endpoints(Harness::Hermes),
-            crate::openshell::policy::DEFAULT_ENDPOINTS
-        );
         let codex = endpoints(Harness::Codex);
         assert_eq!(
             &codex[..crate::openshell::policy::DEFAULT_ENDPOINTS.len()],
@@ -704,12 +535,7 @@ mod tests {
             );
             assert!(!got.iter().any(|e| e.contains("chatgpt.com")));
         }
-        for harness in [
-            Harness::Codex,
-            Harness::OpenCode,
-            Harness::Pi,
-            Harness::Hermes,
-        ] {
+        for harness in [Harness::Codex, Harness::OpenCode, Harness::Pi] {
             assert!(
                 !endpoints(harness)
                     .iter()
@@ -717,6 +543,43 @@ mod tests {
                 "only claude posts to its own log intake: {harness:?}"
             );
         }
+    }
+
+    /// A turn's content logs name the provider its credential reaches, not the vendor of the
+    /// harness that ran it.
+    #[test]
+    fn gen_ai_system_names_the_provider_the_turn_reaches() {
+        let ambient = crate::agent::inference::InferenceEnv::default();
+        let anthropic = crate::agent::inference::InferenceEnv {
+            anthropic_key: Some("k".into()),
+            ..Default::default()
+        };
+        let openai = crate::agent::inference::InferenceEnv {
+            openai_key: Some("k".into()),
+            ..Default::default()
+        };
+        let system =
+            |harness: Harness, model: &str, env: &crate::agent::inference::InferenceEnv| {
+                gen_ai_system(resolve_auth(harness, env), model, env, &[])
+            };
+        assert_eq!(
+            system(Harness::Claude, "claude-opus-4-6", &ambient),
+            "gcp.vertex_ai"
+        );
+        assert_eq!(
+            system(Harness::Claude, "claude-opus-4-6", &anthropic),
+            "anthropic"
+        );
+        assert_eq!(system(Harness::Codex, "gpt-5.6-sol", &ambient), "openai");
+        assert_eq!(system(Harness::OpenCode, "qwen", &openai), "openai");
+        assert_eq!(
+            system(Harness::Pi, "claude-opus-4-6", &anthropic),
+            "anthropic"
+        );
+        assert_eq!(
+            system(Harness::Pi, "claude-opus-4-6", &ambient),
+            "gcp.vertex_ai"
+        );
     }
 
     /// Where a key-authenticated turn goes: a named OpenAI base URL wins outright; otherwise the
@@ -818,15 +681,13 @@ mod tests {
             completed_turns: 0,
         };
         assert!(
-            Harness::Codex
-                .backend()
-                .local_session_argv(&args, "p", &session)
+            crate::agent::harness::backend(Harness::Codex)
+                .local_session_argv(&args.turn_agent(), "p", &session)
                 .is_err()
         );
         assert!(
-            Harness::Codex
-                .backend()
-                .sandbox_session_argv(&args, false, &session)
+            crate::agent::harness::backend(Harness::Codex)
+                .sandbox_session_argv(&args.turn_agent(), false, &session)
                 .is_err()
         );
         assert_eq!(
@@ -840,39 +701,31 @@ mod tests {
     #[test]
     fn each_harness_decodes_its_own_stdout() {
         let mut args = crate::cli::Cli::parse_from(["crucible"]).run;
-        let claude = Harness::Claude.backend().decoder(&args, None, false).push(
+        let claude = crate::agent::harness::backend(Harness::Claude).decoder(&args.turn_agent(), None, false).push(
             r#"{"type":"system","subtype":"init","model":"claude-opus-4-8","tools":[],"agents":[]}"#,
         );
         assert!(
             matches!(&claude[0], AgentEvent::Init { model, .. } if model == "claude-opus-4-8"),
             "{claude:?}"
         );
-        let hermes = Harness::Hermes
-            .backend()
-            .decoder(&args, None, false)
-            .push("plain text");
-        assert!(matches!(&hermes[0], AgentEvent::Raw { .. }), "{hermes:?}");
         args.codex.model = Some("gpt-5.6-terra".to_string());
-        let events = Harness::Codex
-            .backend()
-            .decoder(&args, None, false)
+        let events = crate::agent::harness::backend(Harness::Codex)
+            .decoder(&args.turn_agent(), None, false)
             .push("{\"type\":\"thread.started\",\"thread_id\":\"t1\"}");
         assert!(
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "gpt-5.6-terra"),
             "{events:?}"
         );
         args.model = Some("qwen-3-8-27b".to_string());
-        let events = Harness::OpenCode
-            .backend()
-            .decoder(&args, None, false)
+        let events = crate::agent::harness::backend(Harness::OpenCode)
+            .decoder(&args.turn_agent(), None, false)
             .push(r#"{"type":"step_start","sessionID":"ses_1","part":{"type":"step-start"}}"#);
         assert!(
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "qwen-3-8-27b"),
             "{events:?}"
         );
-        let events = Harness::Pi
-            .backend()
-            .decoder(&args, None, false)
+        let events = crate::agent::harness::backend(Harness::Pi)
+            .decoder(&args.turn_agent(), None, false)
             .push(r#"{"type":"session","version":3,"id":"u","timestamp":"t","cwd":"/w"}"#);
         assert!(
             matches!(&events[0], AgentEvent::Init { model, .. } if model == "qwen-3-8-27b"),
@@ -903,12 +756,6 @@ mod tests {
             assert_eq!(g.matches('/').count() + 1, g.split('/').count());
         }
         assert_eq!(
-            Harness::Hermes.spec().transcript,
-            TranscriptLocator::File {
-                sandbox_path: "/sandbox/.hermes/state.db"
-            }
-        );
-        assert_eq!(
             Harness::OpenCode.spec().transcript,
             TranscriptLocator::File {
                 sandbox_path: "/sandbox/.local/share/opencode/crucible-export.json"
@@ -920,40 +767,18 @@ mod tests {
     /// second, then the spec's own exports, then the manifest's quoted overrides.
     #[test]
     fn env_assembly_reads_every_backend_off_its_spec() {
-        for harness in [
-            Harness::Claude,
-            Harness::Hermes,
-            Harness::Codex,
-            Harness::OpenCode,
-            Harness::Pi,
-        ] {
+        for harness in Harness::all() {
             let spec = harness.spec();
-            let script = harness.backend().env_script(&[("K".into(), "v w".into())]);
+            let script = SandboxEnv::from_manifest([("K", "v w")]).script(spec);
             let lines: Vec<&str> = script.lines().collect();
             assert_eq!(lines[0], format!("export AGENT_TOOL={}", spec.name));
             assert_eq!(lines[1], format!("export {}={}", spec.home_var, spec.home));
             assert_eq!(lines.len(), 3 + spec.sandbox_env.len(), "{script}");
             assert_eq!(lines[lines.len() - 1], "export K='v w'");
-            let local = harness.backend().local_env();
+            let local = crate::agent::harness::backend(*harness).local_env();
             assert_eq!(local[0], ("AGENT_TOOL", spec.name));
             assert_eq!(&local[1..], spec.local_env);
             assert!(spec.home.starts_with(SandboxLayout::HOME), "{harness:?}");
-        }
-    }
-
-    #[test]
-    fn raw_lines_decoder_wraps_nonempty_lines_and_drops_blanks() {
-        let mut d = RawLines;
-        assert!(d.push("").is_empty());
-        assert!(d.push("   ").is_empty());
-        let evs = d.push("  installing deps  ");
-        assert_eq!(evs.len(), 1);
-        match &evs[0] {
-            AgentEvent::Raw { text, stream } => {
-                assert_eq!(text, "installing deps");
-                assert_eq!(*stream, crate::agent::event::RawStream::Stdout);
-            }
-            other => panic!("expected Raw, got {other:?}"),
         }
     }
 
@@ -967,10 +792,6 @@ mod tests {
         };
         assert_eq!(
             resolve_auth(Harness::Claude, &keyed),
-            AuthProvider::AnthropicKey
-        );
-        assert_eq!(
-            resolve_auth(Harness::Hermes, &keyed),
             AuthProvider::AnthropicKey
         );
         assert_eq!(resolve_auth(Harness::Codex, &keyed), AuthProvider::Codex);
@@ -997,15 +818,11 @@ mod tests {
     #[test]
     fn capability_split_between_the_harnesses() {
         assert_eq!(Harness::Claude.spec().auth, AuthProvider::Vertex);
-        // Hermes also authenticates via Vertex ADC (metadata emulator), key-free.
-        assert_eq!(Harness::Hermes.spec().auth, AuthProvider::Vertex);
         // Codex talks to the ChatGPT backend on an OAuth access token instead.
         assert_eq!(Harness::Codex.spec().auth, AuthProvider::Codex);
         assert!(Harness::Claude.spec().otel_capable);
-        assert!(!Harness::Hermes.spec().otel_capable);
         assert!(!Harness::Codex.spec().otel_capable);
         assert!(!Harness::Claude.spec().backfill_required);
-        assert!(Harness::Hermes.spec().backfill_required);
         // The codex `--json` stream carries result + usage, so the rollout is garnish.
         assert!(!Harness::Codex.spec().backfill_required);
         // OpenCode's mirrored stream can lose its tail in a container: the export closes the

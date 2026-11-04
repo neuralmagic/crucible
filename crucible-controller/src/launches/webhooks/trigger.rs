@@ -9,7 +9,7 @@
 //! ```
 
 use crate::client::Db;
-use crate::daemon::queue::{BoxFuture, DiscoverySource, Enqueue};
+use crate::daemon::queue::{BoxFuture, DiscoverySource, WorkQueue};
 use crate::launches::standing::{
     Claim, Claimed, Failed, FailureCause, FireError, LaunchTrigger, Recorded, SweepCfg,
     TriggerFuture,
@@ -18,7 +18,6 @@ use crate::launches::webhooks::transform::{Input, Transform};
 use crate::model::Trigger;
 use anyhow::{Context, Result};
 use jiff::{SignedDuration, Timestamp};
-use std::sync::Arc;
 
 /// Deliveries one sweep settles per webhook; a deeper backlog drains on later passes.
 const SETTLE_CAP: i64 = 32;
@@ -94,7 +93,7 @@ impl WebhookHousekeeping {
 }
 
 impl DiscoverySource for WebhookHousekeeping {
-    fn poll(&self, _enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+    fn poll(&self, _queue: WorkQueue) -> BoxFuture<Result<()>> {
         let db = self.db.clone();
         Box::pin(async move { housekeep(&db, Timestamp::now()).await })
     }
@@ -532,13 +531,9 @@ mod tests {
     }
 
     async fn housekeep(pool: &PgPool) {
-        use crate::daemon::queue::{DiscoverySource, Enqueue, IssueKey};
-        struct NoQueue;
-        impl Enqueue for NoQueue {
-            fn enqueue(&self, _: IssueKey) {}
-        }
+        use crate::daemon::queue::{DiscoverySource, WorkQueue};
         crate::launches::webhooks::trigger::WebhookHousekeeping::new(Db::new(pool.clone()))
-            .poll(std::sync::Arc::new(NoQueue))
+            .poll(WorkQueue::new())
             .await
             .expect("housekeep");
     }

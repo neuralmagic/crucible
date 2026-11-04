@@ -49,8 +49,6 @@ fn turn_specs_convert_bare_repo_slugs_to_clone_urls() {
 use crate::runs::workpod::spec::TurnSpec as _;
 use crate::runs::workpod::*;
 #[cfg(feature = "autoresearch")]
-use crucible::deploy::ProposeTier;
-#[cfg(feature = "autoresearch")]
 use crucible_contract::{Disposition, Tier};
 use std::sync::Mutex;
 
@@ -212,7 +210,7 @@ fn turn_opts_scope_carries_kind_tier_and_the_gaming_bound() {
     assert_eq!(opts.max_cost, 8.0, "max-cost round-trips");
     assert_eq!(
         opts.tier,
-        Some(ProposeTier::T1),
+        Some(Tier::T1),
         "the confirmed tier rides into the render"
     );
     assert_eq!(
@@ -493,7 +491,7 @@ inspecting the checkout, grepping tests
 CRUCIBLE_VERDICT: {\"tier\":\"T1\",\"rationale\":\"needs a new bench in bench/\",\"confidence\":\"low\",\"cost_usd\":0.42,\"over_budget\":false}
 ";
     let v = parse_verdict_logs(logs).expect("verdict");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T1));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T1));
     assert_eq!(v.confidence.as_deref(), Some("low"));
     assert!((v.cost_usd - 0.42).abs() < 1e-9);
 }
@@ -504,7 +502,7 @@ fn parse_verdict_logs_takes_the_last_marker_and_surfaces_error_objects() {
     // Two markers (a retried turn): the LAST wins.
     let logs = "CRUCIBLE_VERDICT: {\"tier\":\"N\",\"rationale\":\"x\",\"cost_usd\":0.1}\nnoise\nCRUCIBLE_VERDICT: {\"tier\":\"stale\",\"rationale\":\"already done in src/a.rs\",\"cost_usd\":0.2}\n";
     let v = parse_verdict_logs(logs).expect("verdict");
-    assert_eq!(v.disposition, Disposition::Stale);
+    assert_eq!(v.tier, Disposition::Stale);
 
     // An error-object marker (no verdict) surfaces as Err — the caller keeps the text tier.
     let logs =
@@ -532,7 +530,7 @@ fn verdict_rides_the_termination_message_envelope() {
         .to_capped_json()
         .expect("cap");
     let v = collect_verdict(Some(&msg), "").expect("verdict from the termination message");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T1));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T1));
     assert_eq!(v.confidence.as_deref(), Some("low"));
     assert!((v.cost_usd - 0.42).abs() < 1e-9);
 
@@ -557,11 +555,11 @@ fn verdict_falls_back_to_the_marker_when_the_message_is_not_our_envelope() {
 
     // No message at all (old image / a pod that wrote nothing) → marker.
     let v = collect_verdict(None, logs).expect("verdict from marker");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::N));
+    assert_eq!(v.tier, Disposition::Tier(Tier::N));
 
     // A non-envelope message (stray log text on the file) → marker.
     let v = collect_verdict(Some("not json at all"), logs).expect("verdict from marker");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::N));
+    assert_eq!(v.tier, Disposition::Tier(Tier::N));
 
     // A well-formed but WRONG-KIND envelope (a scope report where a verdict is expected) →
     // marker, rather than a hard error that would drop the recoverable marker verdict.
@@ -572,7 +570,7 @@ fn verdict_falls_back_to_the_marker_when_the_message_is_not_our_envelope() {
     .to_capped_json()
     .expect("cap");
     let v = collect_verdict(Some(&foreign), logs).expect("verdict from marker");
-    assert_eq!(v.disposition, Disposition::Tier(Tier::N));
+    assert_eq!(v.tier, Disposition::Tier(Tier::N));
 }
 
 /// A scope report rides the termination message while its pack + transcript still ride their log
@@ -605,7 +603,7 @@ fn scope_report_rides_the_message_with_pack_and_transcript_from_logs() {
         .expect("cap");
 
     let report = collect_scope_report(Some(&msg), &logs).expect("report from the message");
-    assert_eq!(report.digest.as_deref(), Some("v1:beef"));
+    assert_eq!(report.digest(), Some("v1:beef"));
     assert!(report.survived());
     assert!(
         !report.raw.is_empty(),
@@ -624,7 +622,7 @@ fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() 
         "{SCOPE_REPORT_MARKER} {{\"stages\":[{{\"name\":\"freeze\",\"passed\":true,\"detail\":\"ok\"}}],\"digest\":\"v1:cafe\",\"cost\":0.2}}\n"
     );
     let report = collect_scope_report(None, &logs).expect("report from marker");
-    assert_eq!(report.digest.as_deref(), Some("v1:cafe"));
+    assert_eq!(report.digest(), Some("v1:cafe"));
 
     // A verdict envelope where a scope report is expected → marker fallback.
     let foreign = Envelope::new(
@@ -634,13 +632,13 @@ fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() 
     .to_capped_json()
     .expect("cap");
     let report = collect_scope_report(Some(&foreign), &logs).expect("report from marker");
-    assert_eq!(report.digest.as_deref(), Some("v1:cafe"));
+    assert_eq!(report.digest(), Some("v1:cafe"));
 }
 
 /// Build a minimal surviving ScopeReport (digest frozen, one passed stage) for the turn
 /// artifact tests.
 #[cfg(feature = "autoresearch")]
-fn survived_report() -> engine::ScopeReport {
+fn survived_report() -> engine::Scraped {
     let env = Envelope::new(
         EnvelopeKind::ScopeReport,
         serde_json::json!({
@@ -815,7 +813,7 @@ async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result
         .await?
     {
         crate::runs::workpod::spec::TurnRunOutcome::Result(r) => {
-            assert_eq!(r.digest.as_deref(), Some("v1:beef"))
+            assert_eq!(r.digest(), Some("v1:beef"))
         }
         crate::runs::workpod::spec::TurnRunOutcome::NoResult { reason } => {
             panic!("expected a report, got: {reason}")
@@ -841,7 +839,7 @@ async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result
         .await?
     {
         crate::runs::workpod::spec::TurnRunOutcome::Result(v) => {
-            assert_eq!(v.disposition, Disposition::Tier(Tier::T2))
+            assert_eq!(v.tier, Disposition::Tier(Tier::T2))
         }
         crate::runs::workpod::spec::TurnRunOutcome::NoResult { reason } => {
             panic!("expected a verdict, got: {reason}")
@@ -1322,7 +1320,7 @@ async fn dispatch_launches_then_a_redrive_collects_and_ledgers_a_verdict(
     let DispatchOutcome::Verdict(v) = out else {
         panic!("expected the collected verdict, got {out:?}");
     };
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T2));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T2));
     assert_eq!(created.lock().expect("lock").len(), 1, "no second pod");
     assert_eq!(
         deleted.lock().expect("lock").len(),
@@ -1631,7 +1629,7 @@ async fn grounded_dispatch_adopts_a_running_turn_never_double_launches(
     let DispatchOutcome::Verdict(v) = out else {
         panic!("expected the adopted verdict, got {out:?}");
     };
-    assert_eq!(v.disposition, Disposition::Tier(Tier::T1));
+    assert_eq!(v.tier, Disposition::Tier(Tier::T1));
     assert_adopted_not_relaunched(&db, "crucible-turn-adopt-me", &created, &deleted, 0.3).await
 }
 
@@ -2373,10 +2371,9 @@ async fn a_mismatched_loop_image_refuses_the_turn_and_parks_the_issue(
         loop_image.clone(),
         Ok(Some("0.0.1".to_string())),
     )]));
-    crate::runs::workpod::install_contracts(Arc::new(ContractRegistry::new(reader.clone())));
-
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:old");
+    let mut cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:old");
+    cfg.runtime.contracts = Some(Arc::new(ContractRegistry::new(reader.clone())));
     let created = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(FakeDispatcher {
         phase: TurnPhase::Succeeded,
@@ -2411,7 +2408,6 @@ async fn a_mismatched_loop_image_refuses_the_turn_and_parks_the_issue(
         None,
     )
     .await;
-    crate::runs::workpod::reset_contracts();
     let out = out?;
     assert!(matches!(out, DispatchOutcome::Failed), "refused: {out:?}");
     assert!(created.lock().expect("lock").is_empty(), "no pod created");
@@ -2492,10 +2488,9 @@ async fn an_unreadable_loop_image_fails_the_turn_without_parking(pool: sqlx::PgP
         loop_image,
         Err(ContractReadError("503 registry unavailable".to_string())),
     )]));
-    crate::runs::workpod::install_contracts(Arc::new(ContractRegistry::new(reader)));
-
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:1");
+    let mut cfg = pod_cfg(&profile, "quay.io/contract-test/sandbox:1");
+    cfg.runtime.contracts = Some(Arc::new(ContractRegistry::new(reader)));
     let created = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(FakeDispatcher {
         phase: TurnPhase::Succeeded,
@@ -2530,7 +2525,6 @@ async fn an_unreadable_loop_image_fails_the_turn_without_parking(pool: sqlx::PgP
         None,
     )
     .await;
-    crate::runs::workpod::reset_contracts();
     let err = out.expect_err("an unreadable target fails the dispatch");
     assert!(
         format!("{err:#}").contains("503 registry unavailable"),
@@ -2567,10 +2561,9 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
         .sandbox_image
         .expect("the fixture pack names a sandbox image");
     let reader = Arc::new(TableReader::new([(pack_sandbox.clone(), Ok(None))]));
-    crate::runs::workpod::install_contracts(Arc::new(ContractRegistry::new(reader)));
-
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "img");
+    let mut cfg = pod_cfg(&profile, "img");
+    cfg.runtime.contracts = Some(Arc::new(ContractRegistry::new(reader)));
     let created_pods = Arc::new(Mutex::new(Vec::new()));
     let created_cms = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(RunBundleDispatcher {
@@ -2584,8 +2577,7 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#8",
-        "owner_repo_8-1",
+        &dispatching(&db, "owner/repo#8", "owner_repo_8-1").await,
         &materialized(&pack),
         &BTreeMap::new(),
         None,
@@ -2593,7 +2585,6 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
         None,
     )
     .await;
-    crate::runs::workpod::reset_contracts();
     let out = out?;
     assert!(matches!(out, RunAdmission::Launched { .. }), "{out:?}");
     assert_eq!(created_pods.lock().expect("lock").len(), 1);
@@ -2634,8 +2625,7 @@ async fn dispatch_run_creates_and_stamps_both_docs_and_owner_refs_the_cm(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -2721,19 +2711,19 @@ async fn dispatch_delivers_the_stored_tree_with_steering_beside_it(
         .await?
         .expect("stored");
     let no_builds = BTreeMap::new();
-    let dispatch = |run_id: &'static str| {
+    let dispatch = |run_id: &'static str| async {
         dispatch_run(
             &db,
             &cfg,
             dispatcher.clone(),
-            "owner/repo#7",
-            run_id,
+            &dispatching(&db, "owner/repo#7", run_id).await,
             &pack,
             &no_builds,
             None,
             RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
             None,
         )
+        .await
     };
 
     let out = dispatch("owner_repo_7-1").await?;
@@ -2777,6 +2767,32 @@ async fn dispatch_delivers_the_stored_tree_with_steering_beside_it(
     );
     assert_eq!(created_pods.lock().expect("lock").len(), 1, "no second pod");
     Ok(())
+}
+
+/// Put `key` at `new`, where every dispatch finds its issue, and build the claim a playbook
+/// dispatch of it makes.
+async fn dispatching<'a>(
+    db: &Db,
+    key: &'a str,
+    run_id: &'a str,
+) -> crate::runs::claim::RunClaim<'a> {
+    sqlx::query(
+        "INSERT INTO issues (key, repo, status, updated_at) \
+         VALUES ($1, 'owner/repo', 'new', '2026-01-01T00:00:00Z') \
+         ON CONFLICT (key) DO UPDATE SET status = 'new'",
+    )
+    .bind(key)
+    .execute(db.pool())
+    .await
+    .expect("seed the dispatched issue");
+    crate::runs::claim::RunClaim {
+        key,
+        from: crate::model::Status::New,
+        run_id,
+        origin: crate::runs::claim::RunOrigin::Playbook {
+            image: crate::runs::model::RunImage::default(),
+        },
+    }
 }
 
 async fn seed_running_issue(db: &Db, key: &str) -> Result<()> {
@@ -2828,8 +2844,7 @@ async fn dispatch_run_launches_tracks_and_returns_the_stamped_pod(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -2951,8 +2966,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(
             &tmp.path().join("loop"),
         )),
@@ -2978,8 +2992,12 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:0199c0de-7c2c-71a5-8000-1",
-        "playbook_survey_0199c0de-42",
+        &dispatching(
+            &db,
+            "playbook:survey:0199c0de-7c2c-71a5-8000-1",
+            "playbook_survey_0199c0de-42",
+        )
+        .await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             &tmp.path().join("playbook"),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -3031,8 +3049,7 @@ async fn dispatch_run_forwards_iteration_and_budget_knobs(pool: sqlx::PgPool) ->
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3076,8 +3093,7 @@ async fn dispatch_run_forwards_the_mapped_pr_repo(pool: sqlx::PgPool) -> Result<
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3132,8 +3148,7 @@ async fn dispatch_run_omits_pr_repo_when_unmapped(pool: sqlx::PgPool) -> Result<
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3217,8 +3232,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(&pack),
         &BTreeMap::new(),
         None,
@@ -3292,8 +3306,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3356,8 +3369,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:1",
-        "playbook_survey_1-42",
+        &dispatching(&db, "playbook:survey:1", "playbook_survey_1-42").await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -3411,8 +3423,7 @@ async fn dispatch_run_caps_at_the_concurrency_limit(pool: sqlx::PgPool) -> Resul
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#3",
-        "owner_repo_3-1",
+        &dispatching(&db, "owner/repo#3", "owner_repo_3-1").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3478,8 +3489,7 @@ async fn dispatch_run_honors_a_runtime_override_tightening_the_cap(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#2",
-        "owner_repo_2-1",
+        &dispatching(&db, "owner/repo#2", "owner_repo_2-1").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -3518,8 +3528,12 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:0199c0de-7c2c-71a5-8000-1",
-        "playbook_survey_0199c0de-42",
+        &dispatching(
+            &db,
+            "playbook:survey:0199c0de-7c2c-71a5-8000-1",
+            "playbook_survey_0199c0de-42",
+        )
+        .await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -3599,8 +3613,12 @@ async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) ->
         &db,
         &cfg,
         dispatcher,
-        "playbook:survey:0199c0de-7c2c-71a5-8000-2",
-        "playbook_survey_0199c0de-43",
+        &dispatching(
+            &db,
+            "playbook:survey:0199c0de-7c2c-71a5-8000-2",
+            "playbook_survey_0199c0de-43",
+        )
+        .await,
         &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
@@ -4323,19 +4341,6 @@ async fn timeout_sweep_honors_the_scaled_scope_deadline(pool: sqlx::PgPool) -> R
 
 // --- queue drain: collection re-drives the backlog, park purges it -----------------------------
 
-/// A test [`crate::daemon::queue::Enqueue`] that records the issue keys the drain re-drives.
-#[cfg(feature = "autoresearch")]
-#[derive(Default)]
-struct RecordingEnqueue {
-    keys: Arc<Mutex<Vec<String>>>,
-}
-#[cfg(feature = "autoresearch")]
-impl crate::daemon::queue::Enqueue for RecordingEnqueue {
-    fn enqueue(&self, key: crate::daemon::queue::IssueKey) {
-        self.keys.lock().expect("lock").push(key.0);
-    }
-}
-
 /// Seed a `queued` work-pod row backdated to `created_at`, so the FIFO drain order is deterministic.
 async fn seed_queued_turn_at(
     db: &Db,
@@ -4401,7 +4406,7 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
 
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "img");
+    let mut cfg = pod_cfg(&profile, "img");
     let kind = WorkKind::AgentTurn(TurnKind::GroundedRank);
 
     // A running turn to collect (issue A) + two queued backlog rows (B eldest, C younger).
@@ -4423,9 +4428,8 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
     )
     .await?;
 
-    let recorder = RecordingEnqueue::default();
-    let keys = recorder.keys.clone();
-    install_enqueue(Arc::new(recorder));
+    let queue = crate::daemon::queue::WorkQueue::new();
+    cfg.runtime.queue = Some(queue.clone());
 
     let dispatcher = Arc::new(FakeDispatcher {
             phase: TurnPhase::Succeeded,
@@ -4438,12 +4442,11 @@ async fn collection_drains_the_eldest_queued_rows_issue(pool: sqlx::PgPool) -> R
     let out = adopt_grounded_turn(&db, &cfg, dispatcher, "owner/repo#1")
         .await?
         .expect("adopted");
-    reset_enqueue();
 
     assert!(matches!(out, DispatchOutcome::Verdict(_)), "{out:?}");
     assert_eq!(
-        keys.lock().expect("lock").as_slice(),
-        &["owner/repo#2"],
+        queue.pending().plain,
+        ["owner/repo#2"],
         "the freed slot re-drives the ELDEST queued row's issue (FIFO), not the younger one"
     );
     // The drain only enqueues — the row is still queued until the reconcile pass promotes it.
@@ -4522,7 +4525,7 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
 
     let db = Db::new(pool);
-    let cfg = pod_cfg(&profile, "img");
+    let mut cfg = pod_cfg(&profile, "img");
     let kind = WorkKind::AgentTurn(TurnKind::GroundedRank);
 
     seed_running_turn(&db, kind, "owner/repo#1", "crucible-turn-a").await?;
@@ -4546,9 +4549,8 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
     )
     .await?;
 
-    let recorder = RecordingEnqueue::default();
-    let keys = recorder.keys.clone();
-    install_enqueue(Arc::new(recorder));
+    let queue = crate::daemon::queue::WorkQueue::new();
+    cfg.runtime.queue = Some(queue.clone());
     let dispatcher = Arc::new(FakeDispatcher {
             phase: TurnPhase::Succeeded,
             message: None,
@@ -4559,7 +4561,6 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
     adopt_grounded_turn(&db, &cfg, dispatcher, "owner/repo#1")
         .await?
         .expect("adopted");
-    reset_enqueue();
 
     assert!(
         crate::runs::work_pods::get_work_pod(db.pool(), "queued-parked")
@@ -4568,8 +4569,8 @@ async fn drain_skips_and_purges_a_parked_issue_queued_row(pool: sqlx::PgPool) ->
         "the parked-issue queued row is purged, not left to wedge the drain"
     );
     assert_eq!(
-        keys.lock().expect("lock").as_slice(),
-        &["owner/repo#8"],
+        queue.pending().plain,
+        ["owner/repo#8"],
         "the drain skips the parked row and re-drives the next drainable issue"
     );
     Ok(())
@@ -4824,8 +4825,7 @@ async fn a_dispatch_with_bindings_records_the_created_pods_uid(pool: sqlx::PgPoo
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -4887,8 +4887,7 @@ async fn a_redeemed_agent_visible_controller_key_refuses_the_dispatch(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -4931,8 +4930,7 @@ async fn the_pod_spec_carries_a_secret_reference_and_no_value(pool: sqlx::PgPool
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5093,8 +5091,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5376,8 +5373,7 @@ async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5529,8 +5525,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
             &db,
             &cfg,
             dispatcher,
-            "owner/repo#7",
-            "owner_repo_7-42",
+            &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
             &materialized(&pack),
             &BTreeMap::new(),
             None,
@@ -5640,8 +5635,7 @@ async fn an_already_exists_create_fails_the_dispatch(pool: sqlx::PgPool) -> Resu
         &db,
         &cfg,
         Arc::new(AlreadyExistsDispatcher),
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5701,8 +5695,7 @@ async fn a_launcher_who_does_not_own_a_bound_secret_is_refused_before_anything_i
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5744,8 +5737,7 @@ async fn a_run_pod_carries_its_id_and_its_display_name(pool: sqlx::PgPool) -> Re
         &db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
@@ -5892,8 +5884,7 @@ async fn dispatch_with_kueue(db: &Db, tmp: &Path, issuer: Option<&str>) -> Vec<K
         db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp)),
         &BTreeMap::new(),
         None,
@@ -6200,8 +6191,7 @@ async fn dispatch_isolated(
         db,
         &cfg,
         dispatcher,
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp)),
         &BTreeMap::new(),
         None,
@@ -6704,8 +6694,7 @@ async fn an_isolated_dispatch_to_a_push_only_cluster_is_refused_before_anything_
         &db,
         &cfg,
         dispatcher.clone(),
-        "owner/repo#7",
-        "owner_repo_7-42",
+        &dispatching(&db, "owner/repo#7", "owner_repo_7-42").await,
         &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,

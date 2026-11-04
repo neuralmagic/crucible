@@ -62,24 +62,21 @@ pub(crate) async fn version(
 /// kept for one release as a back-compat alias — the SPA reads `role` now, but external callers may
 /// still read the old bool.
 ///
-/// `groups` is what the issuer (or, in proxy mode, the SSO edge) asserted for this caller,
-/// normalized. It is empty on the machine paths, and empty on a human path when the IdP emits no
+/// `groups` is what the issuer asserted for this caller, normalized. It is empty on the machine paths, and empty on a human path when the IdP emits no
 /// `groups` claim — which is the difference between `auth.operatorGroups` granting write access and
 /// granting nothing, so it is reported rather than left to be inferred from a role.
 ///
-/// `mode` is which identity model this deployment runs, so the SPA knows whether its sign-in and
-/// sign-out URLs are the sidecar's or the controller's. `downgraded` says a live session's group
-/// refresh was refused, so the SPA can tell a viewer who lost their role from one who never had it.
+/// `downgraded` says a live session's group refresh was refused, so the SPA can tell a viewer who
+/// lost their role from one who never had it.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct Whoami {
     user: Option<String>,
     admin: bool,
     role: crate::identity::auth::Role,
     groups: Vec<String>,
-    mode: crate::identity::auth::AuthMode,
     downgraded: bool,
     /// Whether the presenting credential proves groups (RFC-0003 C-CREDENTIAL-PARITY). False on
-    /// a static token, a cluster token, or a downgraded session, whatever `groups` holds.
+    /// a static token or a downgraded session, whatever `groups` holds.
     proves_groups: bool,
     /// The teams the caller reaches in their own right, with the role held and how: every team
     /// they may act as, whichever one this request acts as.
@@ -109,7 +106,7 @@ pub(crate) struct Features {
     get,
     path = "/api/whoami",
     responses(
-        (status = 200, description = "The authenticated user, role, and back-compat admin flag, or null outside the proxy", body = Whoami)
+        (status = 200, description = "The authenticated user, role, and back-compat admin flag; a null user is anonymous", body = Whoami)
     )
 )]
 pub(crate) async fn whoami(
@@ -132,7 +129,6 @@ pub(crate) async fn whoami(
         admin: role == crate::identity::auth::Role::Admin,
         role,
         groups: actor.group_paths().map(str::to_string).collect(),
-        mode: state.auth_mode,
         downgraded: !caller.path.holds_roles(),
         proves_groups: caller.path.carries_groups(),
         teams,
@@ -185,7 +181,7 @@ pub(crate) async fn get_access(State(state): State<ApiState>) -> Json<AccessDto>
         (status = 200, description = "Dashboard overview with status/tier counts and caps", body = Overview)
     )
 )]
-pub(crate) async fn overview(State(state): State<ApiState>) -> Result<Json<Overview>, AppError> {
+pub(crate) async fn overview(State(state): State<ApiState>) -> Result<Json<Overview>, ApiError> {
     let dto = overview_dto(&state.db, state.caps.as_ref()).await?;
     Ok(Json(dto))
 }
@@ -199,7 +195,7 @@ pub(crate) async fn overview(State(state): State<ApiState>) -> Result<Json<Overv
 )]
 pub(crate) async fn ledger_summary(
     State(state): State<ApiState>,
-) -> Result<Json<LedgerSummaryDto>, AppError> {
+) -> Result<Json<LedgerSummaryDto>, ApiError> {
     Ok(Json(ledger_summary_dto(&state.db).await?))
 }
 
@@ -231,7 +227,7 @@ pub struct LedgerTagDto {
 )]
 pub(crate) async fn ledger_by_tag(
     State(state): State<ApiState>,
-) -> Result<Json<LedgerByTagDto>, AppError> {
+) -> Result<Json<LedgerByTagDto>, ApiError> {
     let day = crate::clock::today_utc();
     let tags = crate::ledger::ledger_day_by_tag(state.db.pool(), &day).await?;
     Ok(Json(LedgerByTagDto {

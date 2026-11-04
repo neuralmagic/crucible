@@ -128,8 +128,6 @@ spec:
             - {name: CONTROLLER_HOOKS_PUBLIC_URL, value: "http://127.0.0.1:8081"}
             - {name: CONTROLLER_WEBHOOK_KEY_FILE, value: /etc/crucible/keys/webhook.key}
             - {name: CONTROLLER_ADMINS, value: "@LAUNCHER@"}
-            - {name: CONTROLLER_AUTH_MODE, value: proxy}
-            - {name: CONTROLLER_KUBE_USER_AUTH, value: "true"}
             - {name: CONTROLLER_SESSION_SECURE, value: "false"}
             - {name: CONTROLLER_LEADER_ELECTION, value: "off"}
             - {name: CONTROLLER_PLAYBOOK_EXECUTOR, value: pod}

@@ -256,10 +256,10 @@ impl Machine {
 
     /// Take `event` from the current state. The first exit-carrying event fixes how the run
     /// ended; later ones cannot change it.
-    pub(crate) fn advance<R: Reporter>(
+    pub(crate) fn advance(
         &mut self,
         event: Event,
-        r: &mut R,
+        r: &mut dyn Reporter,
     ) -> Result<State, IllegalTransition> {
         let to = self.cursor.advance(event)?;
         if let Some(exit) = event.exit() {
@@ -270,12 +270,12 @@ impl Machine {
     }
 
     /// The iteration the loop is on, for the phase it reports.
-    pub(crate) fn set_iter<R: Reporter>(&mut self, iter: u32, r: &mut R) {
+    pub(crate) fn set_iter(&mut self, iter: u32, r: &mut dyn Reporter) {
         self.iter = iter;
         self.publish(r);
     }
 
-    fn publish<R: Reporter>(&mut self, r: &mut R) {
+    fn publish(&mut self, r: &mut dyn Reporter) {
         let phase = self.state().phase(self.exit);
         if let Some(control) = &self.control {
             control.set_phase(phase);
@@ -434,18 +434,6 @@ mod tests {
         }
         fn note(&mut self, _: &str) {}
         fn row(&mut self, _: &crate::report::session::Row, _: bool) {}
-        fn run_agent(
-            &mut self,
-            _: &crate::args::Args,
-            _: &crate::args::Paths,
-            _: u32,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-            _: crate::report::reporter::TurnBudget,
-        ) -> crate::report::reporter::AgentTurn {
-            crate::report::reporter::AgentTurn::default()
-        }
         fn check_interrupt(
             &mut self,
             _: &crate::args::Paths,

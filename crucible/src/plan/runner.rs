@@ -16,7 +16,8 @@ use serde_json::Value;
 
 use crate::crucible::Direction;
 use crate::deadline::{Deadline, Supervised};
-use crate::plan::exec::{Attempt, AttemptOutcome, TaskRunner, own_note};
+use crate::plan::attempt::{Attempt, AttemptOutcome, own_note};
+use crate::plan::exec::TaskRunner;
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
@@ -37,6 +38,8 @@ pub struct ShellRunner {
     /// Stand-in command for `Agent` tasks (receives the prompt and knobs via env). `None`
     /// means agent tasks are refused: `plan run` without `--agent-cmd` is command-only.
     pub agent_cmd: Option<String>,
+    /// What `[workflow].env` passes to `command` and `evaluate` tasks.
+    pub env: crate::host_env::HostEnv,
     /// The run's buildit socket, exported to command and evaluate tasks as
     /// [`BUILDIT_SOCKET_ENV`].
     pub buildit_socket: Option<PathBuf>,
@@ -91,13 +94,19 @@ impl ShellRunner {
     ) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
+        if matches!(
+            task.task,
+            TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+        ) {
+            self.env.apply(&mut cmd);
+        }
         crate::inference::withhold_from_task(&mut cmd);
         cmd.env_remove(BUILDIT_SOCKET_ENV);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
             TaskKind::Agent { .. } => {
-                env_inputs.remove(&TaskName(crate::plan::ir::HISTORY_INPUT.to_string()))
+                env_inputs.remove(&TaskName::reserved(crate::plan::ir::HISTORY_INPUT))
             }
             _ => None,
         };
@@ -487,8 +496,9 @@ fn evaluation_note(
 #[cfg(test)]
 mod tests {
     use crate::crucible::Direction;
-    use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
+    use crate::plan::exec::{ExecCfg, PlanExit, Substrate};
     use crate::plan::runner::*;
+    use crucible_contract::session::TaskStatus;
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
     fn execute(
@@ -507,6 +517,7 @@ mod tests {
         ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: None,
+            env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
         }
     }
@@ -588,6 +599,143 @@ mod tests {
             &mut r,
             |_, _| {},
         )
+    }
+
+    /// A command task runs outside the sandbox, so it gets the base and what `[workflow].env`
+    /// declares, plus the variables the engine sets for it; an engine variable nobody declared,
+    /// a credential say, is not there.
+    #[test]
+    fn a_command_task_sees_only_the_base_its_declared_variables_and_the_engines_own() {
+        let _guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("CRUCIBLE_TEST_UNDECLARED", "leaked");
+            std::env::set_var("CRUCIBLE_TEST_DECLARED", "passed");
+        }
+        let declared: crate::host_env::DeclaredEnv =
+            serde_json::from_value(serde_json::json!(["CRUCIBLE_TEST_DECLARED"])).unwrap();
+        let env = crate::host_env::HostEnv::resolve(
+            crate::manifest::edition::Edition::Two,
+            "[workflow]",
+            &declared,
+        )
+        .unwrap();
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
+            tasks: vec![command(
+                "probe",
+                r#"printf '{"undeclared":"%s","declared":"%s","task":"%s","path":"%s"}\n' "$CRUCIBLE_TEST_UNDECLARED" "$CRUCIBLE_TEST_DECLARED" "$CRUCIBLE_TASK" "$PATH""#,
+                &[],
+            )],
+        }
+        .validate()
+        .unwrap();
+        let mut r = ShellRunner { env, ..runner() };
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        unsafe {
+            std::env::remove_var("CRUCIBLE_TEST_UNDECLARED");
+            std::env::remove_var("CRUCIBLE_TEST_DECLARED");
+        }
+        let probe = out.results[&"probe".into()].output.clone().unwrap();
+        assert_eq!(probe["undeclared"], "", "{probe}");
+        assert_eq!(probe["declared"], "passed", "{probe}");
+        assert_eq!(probe["task"], "probe", "{probe}");
+        assert_ne!(probe["path"], "", "{probe}");
+    }
+
+    /// An edition-1 pack's command task runs with the engine's environment, and still gets the
+    /// variables the engine sets for it.
+    #[test]
+    fn an_edition_one_command_task_inherits_the_engines_environment() {
+        let _guard = crate::test_support::env_lock();
+        unsafe { std::env::set_var("CRUCIBLE_TEST_INHERITED", "kept") };
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
+            tasks: vec![command(
+                "probe",
+                r#"printf '{"inherited":"%s","task":"%s"}\n' "$CRUCIBLE_TEST_INHERITED" "$CRUCIBLE_TASK""#,
+                &[],
+            )],
+        }
+        .validate()
+        .unwrap();
+        let mut r = ShellRunner {
+            env: crate::host_env::HostEnv::inherited(),
+            ..runner()
+        };
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        unsafe { std::env::remove_var("CRUCIBLE_TEST_INHERITED") };
+        let probe = out.results[&"probe".into()].output.clone().unwrap();
+        assert_eq!(probe["inherited"], "kept", "{probe}");
+        assert_eq!(probe["task"], "probe", "{probe}");
+    }
+
+    /// `[workflow].env = ["NAME?"]` passes a variable the engine has to a command task, and one
+    /// it lacks is absent, not empty, while the task still runs.
+    #[test]
+    fn a_command_task_sees_an_optional_variable_the_engine_has_and_runs_without_one_it_lacks() {
+        let _guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("CRUCIBLE_TEST_OPTIONAL_SET", "passed");
+            std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_UNSET");
+        }
+        let declared: crate::host_env::DeclaredEnv = serde_json::from_value(serde_json::json!([
+            "CRUCIBLE_TEST_OPTIONAL_SET?",
+            "CRUCIBLE_TEST_OPTIONAL_UNSET?"
+        ]))
+        .unwrap();
+        let env = crate::host_env::HostEnv::resolve(
+            crate::manifest::edition::Edition::Two,
+            "[workflow]",
+            &declared,
+        );
+        unsafe {
+            std::env::remove_var("CRUCIBLE_TEST_OPTIONAL_SET");
+        }
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
+            tasks: vec![command(
+                "probe",
+                r#"printf '{"set":"%s","unset":"%s"}\n' "$CRUCIBLE_TEST_OPTIONAL_SET" "${CRUCIBLE_TEST_OPTIONAL_UNSET-absent}""#,
+                &[],
+            )],
+        }
+        .validate()
+        .unwrap();
+        let mut r = ShellRunner {
+            env: env.unwrap(),
+            ..runner()
+        };
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let probe = out.results[&"probe".into()].output.clone().unwrap();
+        assert_eq!(probe["set"], "passed", "{probe}");
+        assert_eq!(probe["unset"], "absent", "{probe}");
     }
 
     #[test]
@@ -1254,6 +1402,7 @@ mod tests {
         let mut r = ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: Some("true".into()),
+            env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);

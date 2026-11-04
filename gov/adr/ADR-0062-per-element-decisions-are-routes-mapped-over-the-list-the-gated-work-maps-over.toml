@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0062"
 title = "Per-element decisions are routes mapped over the list the gated work maps over"
-status = "proposed"
+status = "accepted"
 date = "2026-10-07"
 refs = [
     "RFC-0001:C-ROUTE",

@@ -113,64 +113,6 @@ fn client_id(stored: &str) -> Result<ClientId, GrantError> {
 
 /// Where codes and refresh token families live. Every method is single-statement or transactional,
 /// so any number of issuers can share one store.
-#[async_trait::async_trait]
-pub trait GrantStore: Send + Sync {
-    async fn issue_code(&self, grant: &CodeGrant) -> Result<String, GrantError>;
-    /// The code's grant, spent whether or not it is still valid. A spent code presented again by
-    /// `client`, the client it was issued to, revokes the family its redemption started and stops
-    /// one from starting; presented by any other client, it is just unknown.
-    async fn redeem_code(
-        &self,
-        code: &str,
-        client: &ClientId,
-        now: u64,
-    ) -> Result<CodeGrant, GrantError>;
-    /// Start a family for `approved` and return its first refresh token.
-    async fn issue_refresh(&self, approved: &Approved, now: u64) -> Result<String, GrantError>;
-    /// [`GrantStore::issue_refresh`] for the redemption of `code`, which the family is recorded
-    /// against; refused when the code was replayed meanwhile.
-    async fn issue_refresh_for_code(
-        &self,
-        code: &str,
-        approved: &Approved,
-        now: u64,
-    ) -> Result<String, GrantError>;
-    /// Spend `token`, presented by `client`, and issue its family's next one. A token already spent,
-    /// or one issued to another client, revokes the family.
-    async fn rotate_refresh(
-        &self,
-        token: &str,
-        client: &ClientId,
-        now: u64,
-    ) -> Result<(Family, String), GrantError> {
-        self.rotate_refresh_if(token, client, now, &|_| Ok(()))
-            .await
-    }
-    /// [`GrantStore::rotate_refresh`], when `fits` accepts the family: a request it refuses leaves
-    /// `token` unspent and the family untouched.
-    async fn rotate_refresh_if(
-        &self,
-        token: &str,
-        client: &ClientId,
-        now: u64,
-        fits: Fits<'_>,
-    ) -> Result<(Family, String), GrantError>;
-    async fn revoke_family(&self, family: &str, now: u64) -> Result<(), GrantError>;
-    /// Revoke every family and code of `sub`. Returns how many families.
-    async fn revoke_subject(&self, sub: &str, now: u64) -> Result<u64, GrantError>;
-    /// Revoke every family and code of `sub` issued to `client`. Returns how many families.
-    async fn revoke_client(
-        &self,
-        sub: &str,
-        client: &ClientId,
-        now: u64,
-    ) -> Result<u64, GrantError>;
-    /// `sub`'s live families, newest first.
-    async fn live(&self, sub: &str, now: u64) -> Result<Vec<Summary>, GrantError>;
-    /// Delete expired codes and dead families. Returns how many rows went.
-    async fn sweep(&self, now: u64) -> Result<u64, GrantError>;
-}
-
 #[derive(Clone)]
 pub struct PgGrantStore {
     pool: PgPool,
@@ -180,11 +122,8 @@ impl PgGrantStore {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
-}
 
-#[async_trait::async_trait]
-impl GrantStore for PgGrantStore {
-    async fn issue_code(&self, grant: &CodeGrant) -> Result<String, GrantError> {
+    pub async fn issue_code(&self, grant: &CodeGrant) -> Result<String, GrantError> {
         let (code, key) = new_secret()?;
         let json = serde_json::to_value(grant).context("encoding the code grant")?;
         sqlx::query(
@@ -200,7 +139,10 @@ impl GrantStore for PgGrantStore {
         Ok(code)
     }
 
-    async fn redeem_code(
+    /// The code's grant, spent whether or not it is still valid. A spent code presented again by
+    /// `client`, the client it was issued to, revokes the family its redemption started and stops
+    /// one from starting; presented by any other client, it is just unknown.
+    pub async fn redeem_code(
         &self,
         code: &str,
         client: &ClientId,
@@ -253,14 +195,17 @@ impl GrantStore for PgGrantStore {
         Ok(grant)
     }
 
-    async fn issue_refresh(&self, approved: &Approved, now: u64) -> Result<String, GrantError> {
+    /// Start a family for `approved` and return its first refresh token.
+    pub async fn issue_refresh(&self, approved: &Approved, now: u64) -> Result<String, GrantError> {
         let mut tx = self.pool.begin().await.context("opening the grant write")?;
         let (_, token) = start_family(&mut tx, approved, now).await?;
         tx.commit().await.context("committing the approval")?;
         Ok(token)
     }
 
-    async fn issue_refresh_for_code(
+    /// [`PgGrantStore::issue_refresh`] for the redemption of `code`, which the family is recorded
+    /// against; refused when the code was replayed meanwhile.
+    pub async fn issue_refresh_for_code(
         &self,
         code: &str,
         approved: &Approved,
@@ -290,7 +235,21 @@ impl GrantStore for PgGrantStore {
         Ok(token)
     }
 
-    async fn rotate_refresh_if(
+    /// Spend `token`, presented by `client`, and issue its family's next one. A token already spent,
+    /// or one issued to another client, revokes the family.
+    pub async fn rotate_refresh(
+        &self,
+        token: &str,
+        client: &ClientId,
+        now: u64,
+    ) -> Result<(Family, String), GrantError> {
+        self.rotate_refresh_if(token, client, now, &|_| Ok(()))
+            .await
+    }
+
+    /// [`PgGrantStore::rotate_refresh`], when `fits` accepts the family: a request it refuses leaves
+    /// `token` unspent and the family untouched.
+    pub async fn rotate_refresh_if(
         &self,
         token: &str,
         client: &ClientId,
@@ -388,14 +347,15 @@ impl GrantStore for PgGrantStore {
         Ok((family, next))
     }
 
-    async fn revoke_family(&self, family: &str, now: u64) -> Result<(), GrantError> {
+    pub async fn revoke_family(&self, family: &str, now: u64) -> Result<(), GrantError> {
         let mut tx = self.pool.begin().await.context("opening the revocation")?;
         revoke_in(&mut tx, family, now).await?;
         tx.commit().await.context("committing the revocation")?;
         Ok(())
     }
 
-    async fn revoke_subject(&self, sub: &str, now: u64) -> Result<u64, GrantError> {
+    /// Revoke every family and code of `sub`. Returns how many families.
+    pub async fn revoke_subject(&self, sub: &str, now: u64) -> Result<u64, GrantError> {
         let mut tx = self.pool.begin().await.context("opening the sign-out")?;
         sqlx::query("DELETE FROM people_codes WHERE sub = $1")
             .bind(sub)
@@ -423,7 +383,8 @@ impl GrantStore for PgGrantStore {
         Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
     }
 
-    async fn revoke_client(
+    /// Revoke every family and code of `sub` issued to `client`. Returns how many families.
+    pub async fn revoke_client(
         &self,
         sub: &str,
         client: &ClientId,
@@ -461,7 +422,8 @@ impl GrantStore for PgGrantStore {
         Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
     }
 
-    async fn live(&self, sub: &str, now: u64) -> Result<Vec<Summary>, GrantError> {
+    /// `sub`'s live families, newest first.
+    pub async fn live(&self, sub: &str, now: u64) -> Result<Vec<Summary>, GrantError> {
         let rows: Vec<(String, String, String, String, i64, i64)> = sqlx::query_as(
             "SELECT g.client_id, g.client_name, g.resource, g.cluster, g.created_at,
                     g.last_used_at
@@ -493,7 +455,8 @@ impl GrantStore for PgGrantStore {
             .collect()
     }
 
-    async fn sweep(&self, now: u64) -> Result<u64, GrantError> {
+    /// Delete expired codes and dead families. Returns how many rows went.
+    pub async fn sweep(&self, now: u64) -> Result<u64, GrantError> {
         let codes = sqlx::query("DELETE FROM people_codes WHERE expires_at <= $1")
             .bind(at(now.saturating_sub(CODE_KEPT_SECS))?)
             .execute(&self.pool)
@@ -519,7 +482,7 @@ impl GrantStore for PgGrantStore {
 /// Delete expired grants, and idle dynamic registrations with theirs, every [`SWEEP_PERIOD`]. A
 /// failed sweep is logged and retried next period.
 pub fn spawn_sweep(
-    grants: std::sync::Arc<dyn GrantStore>,
+    grants: PgGrantStore,
     dynamic: Option<std::sync::Arc<crate::agent_auth::people::dynamic::Dcr>>,
 ) {
     tokio::spawn(async move {

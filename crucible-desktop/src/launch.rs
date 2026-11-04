@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use crux::ops::Operation;
 use tauri::{AppHandle, Manager};
 
 use crate::settings::Error;
@@ -75,9 +76,15 @@ async fn launch(app: &AppHandle, dir: &Path) -> Result<(String, String, String),
                 .version
         }
     };
-    crux::ops::draft_push(&client, &draft, dir, version, true)
-        .await
-        .map_err(stringify)?;
+    crux::ops::drafts::DraftPush {
+        draft_id: draft.clone(),
+        dir: dir.to_path_buf(),
+        base_version: version,
+        json: true,
+    }
+    .run(&client)
+    .await
+    .map_err(stringify)?;
     let ack: crux::dto::LaunchAck = client
         .launch_draft(
             &draft,

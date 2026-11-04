@@ -1,23 +1,18 @@
 //! The guard on the controller's HTTP API + debug UI. A request authenticates by session cookie or
-//! by bearer; with no expected token and no issuer configured the guard is off (an operator who
-//! trusts the network they bound to) and [`crate::Surface::bind`] forces a loopback bind, since an
-//! open guard has no business answering the world.
+//! by bearer. With no issuer and no expected token the guard is open: every request lands as
+//! `CONTROLLER_DEV_IDENTITY`, and [`crate::Surface::bind`] forces a loopback bind, since an open
+//! guard has no business answering the world. A controller with none of the three refuses to start.
 //!
 //! Which credential proved the caller decides who they may claim to be:
 //!
 //! ```text
-//!   proxy mode
-//!     CONTROLLER_PROXY_TOKEN  -> the SSO edge   -> only the headers the edge injects are kept
-//!   native mode
-//!     crucible_session cookie -> a login this controller ran -> claims off the session
-//!     a Keycloak access token -> validated against the issuer's JWKS -> claims off the token
-//!   both
-//!     CONTROLLER_API_TOKEN    -> machine caller -> configured identity, no groups
-//!     any other bearer        -> cluster token  -> SelfSubjectReview identity, no groups
+//!   crucible_session cookie -> a login this controller ran -> claims off the session
+//!   CONTROLLER_API_TOKEN    -> machine caller -> configured identity, no groups
+//!   crk_ api key            -> its owner -> login and stored groups (require_api_key)
 //! ```
 //!
-//! In native mode the `X-Auth-Request-*` family is dropped off every request before anything else
-//! runs, so nothing a client wrote can reach a handler on any path.
+//! The `X-Auth-Request-*` family is dropped off every request before anything else runs, so nothing
+//! a client wrote can reach a handler on any path.
 //!
 //! What a handler sees is [`Resolved`], stamped as a request extension by [`require_auth`]. The
 //! [`Identity`] and [`Groups`] extractors read that extension; they fall back to the asserted
@@ -30,59 +25,20 @@ use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Redirect, Response};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use crate::identity::api_key::constant_time_eq;
-use crate::identity::session::IdentitySource;
-use crate::identity::session::{Identity, Resolved, asserted_groups, asserted_user};
+use crate::identity::session::{Identity, Resolved, asserted_groups};
 
-/// Which identity model the human surface runs. One release carries both so production can flip and
-/// flip back; the proxy arm is deleted in the release after.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, utoipa::ToSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum AuthMode {
-    /// Identity is the oauth2-proxy sidecar's `X-Auth-Request-*` assertion.
-    #[default]
-    Proxy,
-    /// Identity is a session this controller minted, or a JWT it validated.
-    Native,
-}
-
-impl AuthMode {
-    /// `CONTROLLER_AUTH_MODE`. Unset or unrecognized is `proxy`, the shape every existing deploy
-    /// already runs.
-    pub fn from_env() -> Self {
-        match std::env::var("CONTROLLER_AUTH_MODE")
-            .unwrap_or_default()
-            .trim()
-            .to_lowercase()
-            .as_str()
-        {
-            "native" => AuthMode::Native,
-            _ => AuthMode::Proxy,
-        }
-    }
-}
-
-/// The header the guard stamps the proven identity into, and the prefix of the family it drops.
-const IDENTITY_HEADER: HeaderName = HeaderName::from_static("x-auth-request-user");
+/// The prefix of the header family the guard drops off every request.
 const ASSERTED_PREFIX: &str = "x-auth-request-";
 
-/// The `X-Auth-Request-*` headers oauth2-proxy overwrites on every proxied request, and so the only
-/// ones that survive the proxy path — the edge forwards any other client header untouched. A
-/// deployment's proxy must inject every name listed here.
-const EDGE_ASSERTED_HEADERS: [&str; 3] = [
-    "x-auth-request-user",
-    "x-auth-request-email",
-    "x-auth-request-groups",
-];
-
 /// The issuer's stable subject for the caller, when the credential that proved them carries one:
-/// a native session and a validated bearer JWT do, the header, static-token, and cluster-token
-/// paths do not. It is the key everything durable about a person hangs off, so a route that stores
-/// or reads one asks for this rather than deriving it from a login.
+/// a session and an api key do, the static-token and open paths do not. It is the key everything
+/// durable about a person hangs off, so a route that stores or reads one asks for this rather than
+/// deriving it from a login.
 pub struct Subject(pub(crate) Option<String>);
 
 impl Subject {
@@ -127,31 +83,22 @@ impl<S: Send + Sync> FromRequestParts<S> for Groups {
 ///
 /// Two distinctions matter. Only the paths [`AuthPath::carries_groups`] names hold validated group
 /// claims, so a route that acts on group membership refuses the others outright instead of silently
-/// seeing an empty group list. And only the paths [`AuthPath::may_own`] names name a person the
-/// controller knows, so a cluster token whose OpenShift username is nobody's SSO login owns nothing.
+/// seeing an empty group list. And only the paths [`AuthPath::may_own`] names stand for a person
+/// whose standing is confirmed, so a downgraded or impersonated session owns nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPath {
-    /// The SSO edge's own token: identity and groups are the edge's assertion.
-    Edge,
     /// A session this controller minted at `/auth/callback`.
     Session,
     /// The same session after a definitively refused group refresh. The login stands; the groups
     /// are gone and so is every role they or the login carried, until the user signs in again.
     DowngradedSession,
-    /// A Keycloak access token the controller validated against the issuer's JWKS.
-    Jwt,
     /// `CONTROLLER_API_TOKEN`: a machine caller, with at most a configured identity and no groups.
     StaticToken,
-    /// Any other bearer, resolved to a username by the cluster's its `SelfSubjectReview`, and matching a `users`
-    /// row. No groups.
-    ClusterToken,
-    /// A valid cluster token whose OpenShift username matches no `users` row, so it names nobody
-    /// this controller has an SSO identity for.
-    UnknownClusterToken,
     /// An opaque `crk_…` key its owner minted, carrying their login and the groups their `users`
-    /// row holds. It authenticates only on the MCP surface, which runs its own guard.
+    /// row holds.
     ApiKey,
-    /// No expected token configured — the guard is off and the surface is loopback-bound.
+    /// No issuer and no expected token: the guard is off, every request is the dev identity, and
+    /// the surface is loopback-bound.
     Open,
     /// An administrator's session viewing as another user: that user's login and the groups their
     /// last sign-in stamped, read-only.
@@ -164,32 +111,21 @@ impl AuthPath {
     pub fn carries_groups(self) -> bool {
         matches!(
             self,
-            AuthPath::Edge
-                | AuthPath::Session
-                | AuthPath::Jwt
-                | AuthPath::ApiKey
-                | AuthPath::Impersonated
+            AuthPath::Session | AuthPath::ApiKey | AuthPath::Impersonated
         )
     }
 
     /// Whether this credential may own a secret or a schedule at all.
     pub fn may_own(self) -> bool {
-        !matches!(
-            self,
-            AuthPath::UnknownClusterToken | AuthPath::DowngradedSession | AuthPath::Impersonated
-        )
+        !matches!(self, AuthPath::DowngradedSession | AuthPath::Impersonated)
     }
 
     /// The path's name as an audit row spells it.
     pub fn as_str(self) -> &'static str {
         match self {
-            AuthPath::Edge => "edge",
             AuthPath::Session => "session",
             AuthPath::DowngradedSession => "downgraded_session",
-            AuthPath::Jwt => "jwt",
             AuthPath::StaticToken => "static_token",
-            AuthPath::ClusterToken => "cluster_token",
-            AuthPath::UnknownClusterToken => "unknown_cluster_token",
             AuthPath::ApiKey => "api_key",
             AuthPath::Open => "open",
             AuthPath::Impersonated => "impersonated",
@@ -241,21 +177,14 @@ pub(crate) fn expected_token() -> Option<SharedToken> {
     SharedToken::from_env("CONTROLLER_API_TOKEN")
 }
 
-/// What the auth middleware checks against: the mode, the SSO edge's own token, the static machine
-/// token, the cluster-token path that resolves any OTHER bearer to an OpenShift username via
-/// its `SelfSubjectReview`, and (native mode) the issuer the sessions and JWT bearers are proved against.
+/// What the auth middleware checks against: the static machine token, its configured identity,
+/// the dev identity an open guard lands everyone as, and the issuer sessions are proved against.
 pub(crate) struct BearerGuard {
-    pub(crate) mode: AuthMode,
     pub(crate) expected: Option<SharedToken>,
-    pub(crate) proxy: Option<SharedToken>,
     pub(crate) static_identity: Option<HeaderValue>,
     /// `CONTROLLER_DEV_IDENTITY`: the login every request lands as while the guard is open.
     pub(crate) dev_identity: Option<HeaderValue>,
-    pub(crate) kube: Option<crate::identity::kube_user::KubeUserAuth>,
     pub(crate) oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
-    /// The pool the `users` table is read through, to tell a cluster token that names a known SSO
-    /// login from one that names nobody. `None` leaves every cluster token unlinked.
-    pub(crate) users: Option<sqlx::PgPool>,
     /// The offline credential a live session's groups are re-read through. `None` — no issuer, no
     /// mounted key — leaves a session's groups exactly as its login stamped them.
     pub(crate) refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
@@ -266,14 +195,10 @@ pub(crate) struct BearerGuard {
 impl Default for BearerGuard {
     fn default() -> Self {
         BearerGuard {
-            mode: AuthMode::default(),
             expected: None,
-            proxy: None,
             static_identity: None,
             dev_identity: None,
-            kube: None,
             oidc: None,
-            users: None,
             refresh: None,
             refresh_after: crate::identity::oidc::users::DEFAULT_SESSION_GROUP_REFRESH,
         }
@@ -281,32 +206,34 @@ impl Default for BearerGuard {
 }
 
 impl BearerGuard {
-    /// Read the credentials off the environment.
+    /// Read the credentials off the environment. A guard that could name nobody — no issuer, no
+    /// static token, no dev identity — refuses to build, so an unconfigured deployment fails
+    /// closed rather than starting open.
     pub(crate) fn from_env(
-        kube: Option<crate::identity::kube_user::KubeUserAuth>,
         oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
         users: Option<sqlx::PgPool>,
     ) -> anyhow::Result<Self> {
         let mut guard = BearerGuard::new(
             expected_token(),
-            SharedToken::from_env("CONTROLLER_PROXY_TOKEN"),
             std::env::var("CONTROLLER_API_TOKEN_IDENTITY").ok(),
-            kube,
-            AuthMode::from_env(),
         )?;
         guard.oidc = oidc.clone();
-        guard.users = users.clone();
         let keys = crate::identity::oidc::credentials::CredentialKeys::from_env()?;
         guard.refresh = users.and_then(|pool| {
             crate::identity::oidc::credentials::OwnerRefresh::from_parts(pool, oidc, keys)
         });
         guard.refresh_after = crate::identity::oidc::users::session_group_refresh_interval();
-        if guard.mode == AuthMode::Native && guard.oidc.is_none() {
+        if guard.oidc.is_none()
+            && std::env::var("CONTROLLER_AUTH_MODE")
+                .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("native"))
+        {
             anyhow::bail!(
-                "CONTROLLER_AUTH_MODE=native without CONTROLLER_OIDC_ISSUER: native mode has no identity provider to run a login against"
+                "CONTROLLER_AUTH_MODE=native without CONTROLLER_OIDC_ISSUER: there is no identity provider to run a login against"
             );
         }
-        guard.with_dev_identity(std::env::var("CONTROLLER_DEV_IDENTITY").ok())
+        guard
+            .with_dev_identity(std::env::var("CONTROLLER_DEV_IDENTITY").ok())?
+            .named_or_closed()
     }
 
     /// Land every request on an open guard as `login`. Errors on a closed guard.
@@ -329,29 +256,21 @@ impl BearerGuard {
         Ok(self)
     }
 
-    /// Refuse the combinations that would silently hand a machine caller the edge's power to name
-    /// a person, and reject an identity the header can't carry at boot instead of per request.
-    pub(crate) fn new(
-        expected: Option<SharedToken>,
-        proxy: Option<SharedToken>,
-        static_identity: Option<String>,
-        kube: Option<crate::identity::kube_user::KubeUserAuth>,
-        mode: AuthMode,
-    ) -> anyhow::Result<Self> {
-        if mode == AuthMode::Native && proxy.is_some() {
+    /// Refuse an open guard with no dev identity: it would admit every request as nobody.
+    pub(crate) fn named_or_closed(self) -> anyhow::Result<Self> {
+        if self.is_open() && self.dev_identity.is_none() {
             anyhow::bail!(
-                "CONTROLLER_PROXY_TOKEN is set in native mode, where there is no SSO edge to hold it and no header assertion is trusted"
+                "no identity is configured: set CONTROLLER_OIDC_ISSUER for logins, CONTROLLER_API_TOKEN for machine callers, or CONTROLLER_DEV_IDENTITY to run an open local dev controller"
             );
         }
-        match (&expected, &proxy) {
-            (None, Some(_)) => anyhow::bail!(
-                "CONTROLLER_PROXY_TOKEN is set without CONTROLLER_API_TOKEN, so the guard is off and every request would be trusted to name itself"
-            ),
-            (Some(api), Some(proxy)) if proxy.matches(&api.0) => anyhow::bail!(
-                "CONTROLLER_PROXY_TOKEN equals CONTROLLER_API_TOKEN, so any machine caller could assert an identity and its groups"
-            ),
-            _ => {}
-        }
+        Ok(self)
+    }
+
+    /// Reject an identity the header can't carry at boot instead of per request.
+    pub(crate) fn new(
+        expected: Option<SharedToken>,
+        static_identity: Option<String>,
+    ) -> anyhow::Result<Self> {
         let static_identity = static_identity
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
@@ -361,22 +280,10 @@ impl BearerGuard {
                 })
             })
             .transpose()?;
-        if static_identity.is_some() && proxy.is_none() && mode == AuthMode::Proxy {
-            anyhow::bail!(
-                "CONTROLLER_API_TOKEN_IDENTITY is set without CONTROLLER_PROXY_TOKEN, so an SSO edge still presenting the API token upstream would land every logged-in user as that identity"
-            );
-        }
         Ok(BearerGuard {
-            mode,
             expected,
-            proxy,
             static_identity,
-            dev_identity: None,
-            kube,
-            oidc: None,
-            users: None,
-            refresh: None,
-            refresh_after: crate::identity::oidc::users::DEFAULT_SESSION_GROUP_REFRESH,
+            ..BearerGuard::default()
         })
     }
 
@@ -386,87 +293,35 @@ impl BearerGuard {
     pub(crate) fn is_open(&self) -> bool {
         self.expected.is_none() && self.oidc.is_none()
     }
-
-    /// The identity model this deployment runs.
-    pub(crate) fn mode(&self) -> AuthMode {
-        self.mode
-    }
-
-    /// The session source a request authenticated in this mode is bound under.
-    fn source(&self) -> IdentitySource {
-        match self.mode() {
-            AuthMode::Proxy => IdentitySource::Proxy,
-            AuthMode::Native => IdentitySource::Native,
-        }
-    }
-
-    /// Whether the cluster-token username names somebody who has signed in through the issuer. In
-    /// proxy mode there are no logins to check against, so every cluster token stays linked and the
-    /// path behaves exactly as it did before native mode existed.
-    async fn cluster_token_path(&self, user: &str) -> AuthPath {
-        if self.mode() == AuthMode::Proxy {
-            return AuthPath::ClusterToken;
-        }
-        let Some(pool) = &self.users else {
-            return AuthPath::UnknownClusterToken;
-        };
-        match crate::identity::oidc::users::is_known_login(pool, user).await {
-            Ok(true) => AuthPath::ClusterToken,
-            Ok(false) => AuthPath::UnknownClusterToken,
-            Err(e) => {
-                tracing::warn!(error = %format!("{e:#}"), "users lookup failed; the cluster token owns nothing this request");
-                AuthPath::UnknownClusterToken
-            }
-        }
-    }
 }
 
-/// Middleware: 401 any request that doesn't carry a credential the guard recognizes. With no
-/// expected token and no issuer, every request passes, as `CONTROLLER_DEV_IDENTITY` when one is
-/// set, and the surface is loopback-bound.
+/// Middleware: 401 any request that doesn't carry a credential the guard recognizes. The whole
+/// `X-Auth-Request-*` family is dropped before anything else runs. With no expected token and no
+/// issuer, every request passes as `CONTROLLER_DEV_IDENTITY`, and the surface is loopback-bound.
 ///
-/// Which credential it is decides who the caller may claim to be.
-///
-/// In native mode the whole `X-Auth-Request-*` family is dropped before anything else runs, and the
-/// credentials are: the session cookie this controller minted (its claims come off the session, and
-/// a non-GET additionally needs a same-origin `Sec-Fetch-Site` or `Origin`, because the cookie is
-/// `SameSite=Lax` and every tenant on the cluster's apps wildcard is same-site), a Keycloak access
-/// token validated against the issuer's JWKS, the static token, and a cluster token.
-///
-/// In proxy mode the SSO edge's own token (`CONTROLLER_PROXY_TOKEN`) is the only one that may carry
-/// `X-Auth-Request-*`, and only the [`EDGE_ASSERTED_HEADERS`] the edge overwrites after a login.
-///
-/// On both: the static token gets the configured `CONTROLLER_API_TOKEN_IDENTITY` (no identity
-/// configured = anonymous); a cluster token gets the name the API server returned for it
-/// (its `SelfSubjectReview`). Both drop every `X-Auth-Request-*` header the client wrote first, groups included —
-/// nothing that reaches a handler is caller-asserted. A static-token request that arrives wearing
-/// edge assertions while an identity is pinned is 401: that is an edge presenting the wrong bearer,
-/// not the machine caller. Anything the API server rejects is 401; an API server that can't answer
-/// is 503, fail closed, and so is an unreachable issuer.
+/// The credentials: the session cookie this controller minted (its claims come off the session,
+/// and a non-GET additionally needs a same-origin `Sec-Fetch-Site` or `Origin`, because the cookie
+/// is `SameSite=Lax` and every tenant on the cluster's apps wildcard is same-site), and the static
+/// token, which gets the configured `CONTROLLER_API_TOKEN_IDENTITY` (no identity configured =
+/// anonymous). An api key is checked by [`require_api_key`] before this guard sees it. A session
+/// store that cannot answer is 500, and an unreachable issuer during a group refresh keeps the
+/// groups the session had.
 pub(crate) async fn require_auth(
     State(guard): State<Arc<BearerGuard>>,
     mut req: Request,
     next: Next,
 ) -> Response {
-    let native = guard.mode() == AuthMode::Native;
-    if native {
-        for name in asserted_headers(req.headers()) {
-            req.headers_mut().remove(&name);
-        }
+    for name in asserted_headers(req.headers()) {
+        req.headers_mut().remove(&name);
     }
-    let source = guard.source();
 
     if guard.is_open() {
         let resolved = match &guard.dev_identity {
-            Some(value) => {
-                let Ok(name) = value.to_str().map(str::to_string) else {
-                    return unauthorized();
-                };
-                stamp_identity(req.headers_mut(), Some(value.clone()));
-                Resolved::named(source, name)
-            }
-            None if native => Resolved::anonymous(source),
-            None => resolved_from_headers(req.headers(), source),
+            Some(value) => match value.to_str() {
+                Ok(name) => Resolved::named(name),
+                Err(_) => return unauthorized(),
+            },
+            None => Resolved::anonymous(),
         };
         admit(&mut req, AuthPath::Open, resolved);
         return next.run(req).await;
@@ -481,8 +336,8 @@ pub(crate) async fn require_auth(
         .map(str::to_string);
 
     let Some(presented) = presented else {
-        // No bearer. A native deployment's browsers authenticate by the cookie this controller set.
-        if !native {
+        // No bearer: a browser authenticates by the cookie its login set, which needs an issuer.
+        if guard.oidc.is_none() {
             return unauthorized();
         }
         let session = req.extensions().get::<tower_sessions::Session>().cloned();
@@ -507,7 +362,6 @@ pub(crate) async fn require_auth(
                                 user: Some(view.login.clone()),
                                 groups: view.groups.clone(),
                                 sub: Some(view.sub.clone()),
-                                source,
                             };
                             req.extensions_mut().insert(view);
                             admit(&mut req, AuthPath::Impersonated, resolved);
@@ -526,7 +380,6 @@ pub(crate) async fn require_auth(
                     user: Some(claims.login),
                     groups: claims.groups,
                     sub: Some(claims.sub),
-                    source,
                 };
                 admit(&mut req, path, resolved);
                 next.run(req).await
@@ -537,84 +390,20 @@ pub(crate) async fn require_auth(
         };
     };
 
-    if guard.proxy.as_ref().is_some_and(|p| p.matches(&presented)) {
-        keep_only_edge_asserted(req.headers_mut());
-        let resolved = resolved_from_headers(req.headers(), source);
-        admit(&mut req, AuthPath::Edge, resolved);
-        return next.run(req).await;
-    }
     if guard
         .expected
         .as_ref()
         .is_some_and(|e| e.matches(&presented))
     {
-        if guard.static_identity.is_some() && has_asserted_header(req.headers()) {
-            return unauthorized();
-        }
-        stamp_identity(req.headers_mut(), guard.static_identity.clone());
         let resolved = match &guard.static_identity {
             Some(value) => match value.to_str() {
-                Ok(name) => Resolved::named(source, name),
+                Ok(name) => Resolved::named(name),
                 Err(_) => return unauthorized(),
             },
-            None => Resolved::anonymous(source),
+            None => Resolved::anonymous(),
         };
         admit(&mut req, AuthPath::StaticToken, resolved);
         return next.run(req).await;
-    }
-
-    // A JWT is the issuer's word and never the cluster's, so it is never handed to its `SelfSubjectReview`.
-    if native && looks_like_jwt(&presented) {
-        let Some(oidc) = &guard.oidc else {
-            return unauthorized();
-        };
-        return match oidc.verify_access_token(&presented).await {
-            Ok(claims) => {
-                stamp_identity(req.headers_mut(), None);
-                let resolved = Resolved {
-                    user: Some(claims.login),
-                    groups: claims.groups,
-                    sub: Some(claims.sub),
-                    source,
-                };
-                admit(&mut req, AuthPath::Jwt, resolved);
-                next.run(req).await
-            }
-            Err(crate::identity::oidc::OidcError::Unavailable(why)) => {
-                tracing::warn!(error = %why, "jwt bearer check failed closed");
-                issuer_unavailable()
-            }
-            Err(crate::identity::oidc::OidcError::Rejected(why)) => {
-                tracing::debug!(reason = %why, "jwt bearer refused");
-                unauthorized()
-            }
-        };
-    }
-
-    if let Some(kube) = &guard.kube {
-        use crate::identity::kube_user::LookupError;
-        match kube.lookup(&presented).await {
-            Ok(user) => {
-                let Ok(value) = HeaderValue::from_str(&user) else {
-                    // A username the header can't carry can't become an identity; fail closed.
-                    return unauthorized();
-                };
-                stamp_identity(req.headers_mut(), Some(value));
-                let path = guard.cluster_token_path(&user).await;
-                admit(&mut req, path, Resolved::named(source, user));
-                return next.run(req).await;
-            }
-            Err(LookupError::Unauthorized) => return unauthorized(),
-            Err(LookupError::Unavailable(why)) => {
-                tracing::warn!(error = %why, "cluster-token bearer check failed closed");
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    [(header::CONTENT_TYPE, "application/json")],
-                    r#"{"status":"error","error":"the cluster API could not verify the bearer; retry"}"#,
-                )
-                    .into_response();
-            }
-        }
     }
     unauthorized()
 }
@@ -672,8 +461,8 @@ pub struct KeyGuard {
 /// Middleware: admit a request only on an API key its owner minted.
 ///
 /// Deliberately not part of [`require_auth`]. The surfaces this guards are reached by agents
-/// holding one long-lived credential, and none of the human paths — the session cookie, the edge's
-/// header assertions, the static machine token, a cluster token — mean anything there. Keeping the
+/// holding one long-lived credential, and none of the human paths — the session cookie, the static
+/// machine token — mean anything there. Keeping the
 /// two guards apart means a bug in either cannot widen the other, and it is the same shape
 /// `/metrics` and the run evidence routes already use: merged outside the human guard, carrying
 /// their own credential check.
@@ -704,7 +493,7 @@ pub async fn require_api_key(
         };
 
     // The client wrote no identity that survives: every X-Auth-Request-* header goes, exactly as
-    // native mode drops them, so the key is the only thing naming this caller.
+    // `require_auth` drops them, so the key is the only thing naming this caller.
     for name in asserted_headers(req.headers()) {
         req.headers_mut().remove(&name);
     }
@@ -712,7 +501,6 @@ pub async fn require_api_key(
         user: Some(authenticated.login),
         groups: authenticated.groups,
         sub: Some(authenticated.sub),
-        source: IdentitySource::Native,
     };
     admit(&mut req, AuthPath::ApiKey, resolved);
 
@@ -740,16 +528,6 @@ fn key_refused(why: &str) -> Response {
 fn admit(req: &mut Request, path: AuthPath, resolved: Resolved) {
     req.extensions_mut().insert(path);
     req.extensions_mut().insert(resolved);
-}
-
-/// The identity an oauth2-proxy edge asserted, read off the headers it injects.
-fn resolved_from_headers(headers: &HeaderMap, source: IdentitySource) -> Resolved {
-    Resolved {
-        user: asserted_user(headers),
-        groups: asserted_groups(headers),
-        sub: None,
-        source,
-    }
 }
 
 /// Re-read a live session's groups from its owner's offline credential, at most once per
@@ -898,18 +676,6 @@ fn same_origin(req: &Request) -> bool {
     origin_authority.eq_ignore_ascii_case(authority)
 }
 
-/// Whether the presented bearer is shaped like a JWT (three non-empty dot-separated segments).
-/// A cluster token (`sha256~…`) never is, which is what keeps the two bearer paths from trying
-/// each other's credentials.
-pub(crate) fn looks_like_jwt(token: &str) -> bool {
-    let mut segments = token.split('.');
-    let three = [segments.next(), segments.next(), segments.next()];
-    segments.next().is_none()
-        && three
-            .iter()
-            .all(|s| s.is_some_and(|s| !s.is_empty() && !s.contains('~')))
-}
-
 fn cross_origin() -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -919,47 +685,12 @@ fn cross_origin() -> Response {
         .into_response()
 }
 
-fn issuer_unavailable() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(header::CONTENT_TYPE, "application/json")],
-        r#"{"status":"error","error":"the identity provider could not verify the bearer; retry"}"#,
-    )
-        .into_response()
-}
-
-fn has_asserted_header(headers: &HeaderMap) -> bool {
-    headers
-        .keys()
-        .any(|name| name.as_str().starts_with(ASSERTED_PREFIX))
-}
-
 fn asserted_headers(headers: &HeaderMap) -> Vec<HeaderName> {
     headers
         .keys()
         .filter(|name| name.as_str().starts_with(ASSERTED_PREFIX))
         .cloned()
         .collect()
-}
-
-/// Drop every `X-Auth-Request-*` header the client wrote, then stamp the identity this path proved.
-fn stamp_identity(headers: &mut HeaderMap, identity: Option<HeaderValue>) {
-    for name in asserted_headers(headers) {
-        headers.remove(&name);
-    }
-    if let Some(value) = identity {
-        headers.insert(IDENTITY_HEADER, value);
-    }
-}
-
-/// Drop the asserted headers the edge does not inject: those reach the upstream exactly as the
-/// client wrote them.
-fn keep_only_edge_asserted(headers: &mut HeaderMap) {
-    for name in asserted_headers(headers) {
-        if !EDGE_ASSERTED_HEADERS.contains(&name.as_str()) {
-            headers.remove(&name);
-        }
-    }
 }
 
 /// A browser asking for a page rather than a client asking for data: a safe method, outside
@@ -1276,39 +1007,6 @@ mod tests {
                 ))
         }
 
-        /// A stand-in API server: one good token, everything else 401.
-        pub(super) async fn kube_auth() -> crate::identity::kube_user::KubeUserAuth {
-            let app = axum::Router::new().route(
-                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
-                axum::routing::post(|headers: axum::http::HeaderMap| async move {
-                    let auth = headers
-                        .get("authorization")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default();
-                    if auth == "Bearer sha256~mine" {
-                        (
-                            StatusCode::OK,
-                            r#"{"status":{"userInfo":{"username":"wynn"}}}"#.to_string(),
-                        )
-                    } else {
-                        (StatusCode::UNAUTHORIZED, String::new())
-                    }
-                }),
-            );
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            let url = format!("http://{}", listener.local_addr().expect("addr"));
-            tokio::spawn(async move {
-                axum::serve(listener, app).await.expect("serve");
-            });
-            crate::identity::kube_user::KubeUserAuth::new(
-                &url,
-                std::path::Path::new("/nonexistent"),
-            )
-            .expect("client")
-        }
-
         async fn call(app: axum::Router, req: HttpRequest<Body>) -> (StatusCode, String) {
             let res = app.oneshot(req).await.expect("infallible");
             let status = res.status();
@@ -1350,7 +1048,6 @@ mod tests {
         fn pinned() -> BearerGuard {
             BearerGuard {
                 expected: token("s3cr3t"),
-                proxy: token("edge"),
                 static_identity: Some(HeaderValue::from_static("crucible-cd")),
                 ..BearerGuard::default()
             }
@@ -1365,16 +1062,13 @@ mod tests {
             assert_eq!(body, "crucible-cd|");
         }
 
-        /// An edge presenting the static token instead of its own (a skewed proxy, or a client
-        /// imitating one) would otherwise land every logged-in human as the pinned machine
-        /// identity, whatever role that name holds. 401 instead.
+        /// Asserted headers on a static-token request name nobody: the request still lands as the
+        /// configured identity, with no groups.
         #[tokio::test]
-        async fn a_pinned_identity_refuses_a_request_wearing_edge_assertions() {
-            for asserted in CLAIMS {
-                let (status, _) =
-                    call(app(pinned()), req(Some("Bearer s3cr3t"), &[asserted])).await;
-                assert_eq!(status, StatusCode::UNAUTHORIZED, "header {}", asserted.0);
-            }
+        async fn the_static_token_ignores_every_asserted_header() {
+            let (status, body) = call(app(pinned()), req(Some("Bearer s3cr3t"), &CLAIMS)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, "crucible-cd|");
         }
 
         /// With no identity configured the static token is anonymous — a viewer, not whoever the
@@ -1388,26 +1082,22 @@ mod tests {
         }
 
         /// A header the guard doesn't know about yet must not survive either: the family goes, not
-        /// a hand-maintained list of three names.
+        /// a hand-maintained list of names, on a closed guard and an open one alike.
         #[tokio::test]
         async fn the_whole_asserted_header_family_is_dropped() {
-            let guard = BearerGuard {
-                expected: token("s3cr3t"),
-                ..BearerGuard::default()
-            };
-            let (status, body) = call(
-                header_echo_app(guard),
-                req(
-                    Some("Bearer s3cr3t"),
-                    &[
-                        ("x-auth-request-preferred-username", "admin"),
-                        ("x-auth-request-access-token", "gho_whatever"),
-                    ],
-                ),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(body, "", "no x-auth-request-* header reaches the handler");
+            let asserted = [
+                ("x-auth-request-user", "admin"),
+                ("x-auth-request-preferred-username", "admin"),
+                ("x-auth-request-access-token", "gho_whatever"),
+            ];
+            let open = BearerGuard::default()
+                .with_dev_identity(Some("wren".into()))
+                .expect("an open guard takes a dev identity");
+            for (guard, bearer) in [(static_only(), Some("Bearer s3cr3t")), (open, None)] {
+                let (status, body) = call(header_echo_app(guard), req(bearer, &asserted)).await;
+                assert_eq!(status, StatusCode::OK);
+                assert_eq!(body, "", "no x-auth-request-* header reaches the handler");
+            }
         }
 
         /// Each credential stamps the path it authenticated on, which is what lets a route hold a
@@ -1427,61 +1117,25 @@ mod tests {
                     ))
             }
 
-            let cases = [
-                ("Bearer edge", "Edge"),
-                ("Bearer s3cr3t", "StaticToken"),
-                ("Bearer sha256~mine", "ClusterToken"),
-            ];
-            for (bearer, expected) in cases {
-                let guard = BearerGuard {
-                    kube: Some(kube_auth().await),
-                    ..pinned()
-                };
-                let (status, body) = call(path_echo_app(guard), req(Some(bearer), &[])).await;
-                assert_eq!(status, StatusCode::OK, "{bearer}");
-                assert_eq!(body, expected, "{bearer}");
-            }
+            let (status, body) =
+                call(path_echo_app(pinned()), req(Some("Bearer s3cr3t"), &[])).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, "StaticToken");
 
-            // No expected token: the guard is off, and the surface is loopback-bound.
+            // No issuer and no expected token: the guard is off, and the surface is loopback-bound.
             let (status, body) = call(path_echo_app(BearerGuard::default()), req(None, &[])).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body, "Open");
         }
 
-        /// The SSO edge's own token is the one credential that may name a person, because the edge
-        /// overwrites the identity headers after a login.
+        /// A cluster token or a JWT is no credential here: anything but the static token, a
+        /// session, or an api key is 401.
         #[tokio::test]
-        async fn the_proxy_token_keeps_the_edges_assertion() {
-            let (status, body) = call(app(pinned()), req(Some("Bearer edge"), &CLAIMS)).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(body, "admin|/groups/finance,/groups/sre");
-        }
-
-        /// oauth2-proxy overwrites only the headers it is configured to inject and forwards the
-        /// rest of the client's request untouched, so anything outside that set is still the
-        /// client's word on the proxy path.
-        #[tokio::test]
-        async fn the_proxy_token_drops_headers_the_edge_does_not_inject() {
-            let (status, body) = call(
-                header_echo_app(pinned()),
-                req(
-                    Some("Bearer edge"),
-                    &[
-                        ("x-auth-request-user", "alice"),
-                        ("x-auth-request-preferred-username", "admin"),
-                        ("x-auth-request-access-token", "gho_whatever"),
-                    ],
-                ),
-            )
-            .await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(body, "x-auth-request-user");
-        }
-
-        #[tokio::test]
-        async fn without_kube_auth_a_foreign_bearer_is_401() {
-            let (status, _) = call(app(static_only()), req(Some("Bearer sha256~mine"), &[])).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        async fn a_foreign_bearer_is_401() {
+            for bearer in ["Bearer sha256~mine", "Bearer aGVhZGVy.cGF5bG9hZA.c2ln"] {
+                let (status, _) = call(app(static_only()), req(Some(bearer), &CLAIMS)).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{bearer}");
+            }
         }
 
         #[tokio::test]
@@ -1492,142 +1146,47 @@ mod tests {
             }
         }
 
-        #[tokio::test]
-        async fn a_cluster_token_resolves_to_the_api_servers_identity() {
-            let guard = BearerGuard {
-                expected: token("s3cr3t"),
-                kube: Some(kube_auth().await),
-                ..BearerGuard::default()
-            };
-            let (status, body) = call(app(guard), req(Some("Bearer sha256~mine"), &[])).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(
-                body, "wynn|",
-                "identity comes from the SelfSubjectReview, not the client"
-            );
-        }
-
-        /// The whole point of stripping: a valid cluster token must not carry someone ELSE's
-        /// asserted name — or any groups — past the guard.
-        #[tokio::test]
-        async fn a_cluster_token_cannot_smuggle_an_identity_or_groups() {
-            let guard = BearerGuard {
-                expected: token("s3cr3t"),
-                kube: Some(kube_auth().await),
-                ..BearerGuard::default()
-            };
-            let (status, body) = call(app(guard), req(Some("Bearer sha256~mine"), &CLAIMS)).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(body, "wynn|");
-        }
-
-        #[tokio::test]
-        async fn a_rejected_cluster_token_is_401() {
-            let guard = BearerGuard {
-                expected: token("s3cr3t"),
-                kube: Some(kube_auth().await),
-                ..BearerGuard::default()
-            };
-            let (status, _) = call(app(guard), req(Some("Bearer sha256~stolen"), &[])).await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED);
-        }
-
-        #[tokio::test]
-        async fn an_unreachable_api_server_fails_closed_as_503() {
-            let guard = BearerGuard {
-                expected: token("s3cr3t"),
-                kube: Some(
-                    crate::identity::kube_user::KubeUserAuth::new(
-                        "http://127.0.0.1:9",
-                        std::path::Path::new("/nonexistent"),
-                    )
-                    .expect("client"),
-                ),
-                ..BearerGuard::default()
-            };
-            let (status, _) = call(app(guard), req(Some("Bearer sha256~mine"), &[])).await;
-            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        }
-
-        /// A proxy token equal to the API token would make the whole distinction a no-op, and a
-        /// proxy token with the guard off would trust every caller to name itself. Neither boots.
         #[test]
-        fn misconfigured_credentials_refuse_to_build() {
-            // `BearerGuard` holds live credentials and so has no Debug; unwrap the refusal by hand.
-            let refusal = |guard: anyhow::Result<BearerGuard>| match guard {
+        fn an_identity_the_header_cannot_carry_refuses_to_build() {
+            let refusal = match BearerGuard::new(token("s3cr3t"), Some("bad\nname".into())) {
                 Ok(_) => panic!("expected a refusal"),
                 Err(e) => e.to_string(),
             };
-            assert!(
-                refusal(BearerGuard::new(
-                    token("same"),
-                    token("same"),
-                    None,
-                    None,
-                    AuthMode::Proxy
-                ))
-                .contains("equals CONTROLLER_API_TOKEN")
-            );
-            assert!(
-                refusal(BearerGuard::new(
-                    None,
-                    token("edge"),
-                    None,
-                    None,
-                    AuthMode::Proxy
-                ))
-                .contains("without CONTROLLER_API_TOKEN")
-            );
-            assert!(
-                refusal(BearerGuard::new(
-                    token("s3cr3t"),
-                    token("edge"),
-                    Some("bad\nname".into()),
-                    None,
-                    AuthMode::Proxy
-                ))
-                .contains("not a valid header value")
-            );
-            // A pinned identity with no edge token to tell the edge apart is the skew that lands
-            // every logged-in user on that identity.
-            assert!(
-                refusal(BearerGuard::new(
-                    token("s3cr3t"),
-                    None,
-                    Some("crucible-cd".into()),
-                    None,
-                    AuthMode::Proxy
-                ))
-                .contains("without CONTROLLER_PROXY_TOKEN")
-            );
+            assert!(refusal.contains("not a valid header value"), "{refusal}");
         }
 
         #[test]
         fn a_blank_configured_identity_is_no_identity() {
-            let guard = BearerGuard::new(
-                token("s3cr3t"),
-                None,
-                Some("  ".into()),
-                None,
-                AuthMode::Proxy,
-            )
-            .expect("guard builds");
+            let guard = BearerGuard::new(token("s3cr3t"), Some("  ".into())).expect("guard builds");
             assert!(guard.static_identity.is_none());
             assert!(!guard.is_open());
             assert!(
-                BearerGuard::new(None, None, None, None, AuthMode::Proxy)
+                BearerGuard::new(None, None)
                     .expect("guard builds")
                     .is_open()
             );
         }
 
-        /// Guard off is the loopback-only trusted-network mode: no credential to sort callers by,
-        /// so headers pass exactly as they arrive.
-        #[tokio::test]
-        async fn no_expected_token_still_means_open() {
-            let (status, body) = call(app(BearerGuard::default()), req(None, &[])).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(body, "anonymous|");
+        /// No issuer, no static token, no dev identity: a guard that would admit every request as
+        /// nobody refuses to build, so a deployment that forgot its issuer does not start open.
+        #[test]
+        fn an_open_guard_without_a_dev_identity_refuses_to_build() {
+            let refusal = match BearerGuard::default().named_or_closed() {
+                Ok(_) => panic!("expected a refusal"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                refusal.contains("CONTROLLER_OIDC_ISSUER")
+                    && refusal.contains("CONTROLLER_DEV_IDENTITY"),
+                "{refusal}"
+            );
+            assert!(static_only().named_or_closed().is_ok());
+            assert!(
+                BearerGuard::default()
+                    .with_dev_identity(Some("wren".into()))
+                    .and_then(BearerGuard::named_or_closed)
+                    .is_ok()
+            );
         }
 
         #[tokio::test]
@@ -1667,10 +1226,9 @@ mod tests {
         }
     }
 
-    /// Native mode: identity is a cookie this controller minted or a JWT it validated, and nothing
-    /// a client wrote in the `X-Auth-Request-*` family is read on any path.
+    /// A deployment with an issuer: identity is a cookie this controller minted or an api key, and
+    /// nothing a client wrote in the `X-Auth-Request-*` family is read on any path.
     mod native {
-        use super::bearer_guard::kube_auth;
         use super::*;
         use axum::body::Body;
         use axum::http::Request as HttpRequest;
@@ -1880,14 +1438,9 @@ mod tests {
         }
 
         fn native_guard() -> BearerGuard {
-            let mut guard = BearerGuard::new(
-                SharedToken::new("s3cr3t"),
-                None,
-                Some("crucible-cd".into()),
-                None,
-                AuthMode::Native,
-            )
-            .expect("guard builds");
+            let mut guard =
+                BearerGuard::new(SharedToken::new("s3cr3t"), Some("crucible-cd".into()))
+                    .expect("guard builds");
             // An issuer the guard never reaches in these tests; its presence is what makes the
             // deployment a native one rather than an open one.
             guard.oidc = Some(Arc::new(
@@ -1897,7 +1450,6 @@ mod tests {
                     client_secret: None,
                     redirect_url: "http://localhost/auth/callback".to_string(),
                     scopes: vec!["openid".to_string()],
-                    device_client_id: Some("crucible-cli".to_string()),
                     post_logout_redirect: None,
                 })
                 .expect("provider"),
@@ -2094,7 +1646,7 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
         }
 
-        /// The whole point of native mode: no path reads a header a client could have written.
+        /// No path reads a header a client could have written.
         #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
         async fn asserted_headers_are_ignored_on_every_native_path(pool: PgPool) {
             let app = app(&pool, native_guard()).await;
@@ -2142,216 +1694,11 @@ mod tests {
             assert_eq!(body, "");
         }
 
-        /// A cluster token proves an OpenShift username, which need not be an SSO login. A `user:`
-        /// principal is an SSO login, so a name nobody has signed in under owns nothing.
-        #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-        async fn a_cluster_token_owns_nothing_until_its_login_has_signed_in(pool: PgPool) {
-            let guard = BearerGuard {
-                kube: Some(kube_auth().await),
-                users: Some(pool.clone()),
-                ..native_guard()
-            };
-            let app = app(&pool, guard).await;
-            let probe = || {
-                HttpRequest::get("/probe")
-                    .header(header::AUTHORIZATION, "Bearer sha256~mine")
-                    .body(Body::empty())
-                    .expect("request")
-            };
-
-            let (status, body, _) = call(&app, probe()).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(
-                body, "wynn||UnknownClusterToken",
-                "nobody has signed in as wynn"
-            );
-
-            crate::identity::oidc::users::record_login(
-                &pool,
-                "sub-wynn",
-                "wynn",
-                None,
-                jiff::Timestamp::now(),
-            )
-            .await
-            .expect("login");
-            let (status, body, _) = call(&app, probe()).await;
-            assert_eq!(status, StatusCode::OK);
-            assert_eq!(body, "wynn||ClusterToken");
-        }
-
-        /// A deployment with no issuer configured cannot validate a JWT, so it must not fall
-        /// through to handing that JWT to the cluster's its `SelfSubjectReview` as if it were a cluster token.
-        #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-        async fn a_jwt_bearer_without_an_issuer_is_401_and_never_a_cluster_token(pool: PgPool) {
-            let guard = BearerGuard {
-                oidc: None,
-                kube: Some(kube_auth().await),
-                ..native_guard()
-            };
-            let app = app(&pool, guard).await;
-            let (status, _, _) = call(
-                &app,
-                HttpRequest::get("/probe")
-                    .header(header::AUTHORIZATION, "Bearer aGVhZGVy.cGF5bG9hZA.c2ln")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await;
-            assert_eq!(status, StatusCode::UNAUTHORIZED);
-        }
-
-        /// Criterion: `Identity` and `Groups` keep their shape, so every role check answers the
-        /// same in both modes. The real `/api/whoami` is the probe — same logins, same groups, same
-        /// role lists, one identity model each, and the only field allowed to differ is `mode`.
-        #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-        async fn every_role_check_answers_the_same_in_both_modes(pool: PgPool) {
-            struct NoSink;
-            impl crate::daemon::queue::OverrideSink for NoSink {
-                fn submit(&self, _ov: crate::daemon::queue::Override) {}
-            }
-            let state = |mode: AuthMode| crate::api::state::ApiState {
-                roles: Roles::new(
-                    vec!["alice".to_string()],
-                    vec!["bob".to_string()],
-                    vec!["team-x".to_string()],
-                ),
-                auth_mode: mode,
-                ..crate::api::state::ApiState::test(
-                    crate::client::Db::new(pool.clone()),
-                    Arc::new(NoSink),
-                )
-            };
-
-            let proxy_app = crate::api::router(state(AuthMode::Proxy)).layer(
-                axum::middleware::from_fn_with_state(
-                    Arc::new(
-                        BearerGuard::new(
-                            SharedToken::new("s3cr3t"),
-                            SharedToken::new("edge"),
-                            None,
-                            None,
-                            AuthMode::Proxy,
-                        )
-                        .expect("guard builds"),
-                    ),
-                    require_auth,
-                ),
-            );
-
-            let native_app = |login: &'static str, groups: Vec<String>| {
-                let pool = pool.clone();
-                let state = state(AuthMode::Native);
-                async move {
-                    let store = crate::identity::session::store(&pool)
-                        .await
-                        .expect("session store");
-                    crate::api::router(state)
-                        .layer(axum::middleware::from_fn_with_state(
-                            Arc::new(native_guard()),
-                            require_auth,
-                        ))
-                        .route(
-                            "/establish",
-                            get(move |session: tower_sessions::Session| async move {
-                                crate::identity::session::establish_native(
-                                    &session,
-                                    &crate::identity::session::NativeClaims {
-                                        sub: format!("sub-{login}"),
-                                        login: login.to_string(),
-                                        email: None,
-                                        groups,
-                                        groups_at: jiff::Timestamp::now().to_string(),
-                                        downgraded: false,
-                                    },
-                                    None,
-                                )
-                                .await
-                                .expect("establish");
-                                "signed in"
-                            }),
-                        )
-                        .layer(crate::identity::session::layer(store, false))
-                }
-            };
-
-            for (login, groups) in [
-                ("alice", ""),
-                ("bob", ""),
-                ("mallory", ""),
-                ("mallory", "/groups/team-x"),
-                ("alice", "/groups/team-x"),
-            ] {
-                let mut edge = HttpRequest::get("/api/whoami")
-                    .header(header::AUTHORIZATION, "Bearer edge")
-                    .header("x-auth-request-user", login);
-                if !groups.is_empty() {
-                    edge = edge.header("x-auth-request-groups", groups);
-                }
-                let (status, proxy_body, _) =
-                    call(&proxy_app, edge.body(Body::empty()).expect("request")).await;
-                assert_eq!(status, StatusCode::OK);
-
-                let group_list: Vec<String> = groups
-                    .split(',')
-                    .map(|g| g.trim().to_string())
-                    .filter(|g| !g.is_empty())
-                    .collect();
-                let app = native_app(login, group_list).await;
-                let cookie = {
-                    let (status, _, cookie) = call(
-                        &app,
-                        HttpRequest::get("/establish")
-                            .body(Body::empty())
-                            .expect("request"),
-                    )
-                    .await;
-                    assert_eq!(status, StatusCode::OK);
-                    cookie.expect("session cookie")
-                };
-                let (status, native_body, _) = call(
-                    &app,
-                    HttpRequest::get("/api/whoami")
-                        .header(header::COOKIE, &cookie)
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await;
-                assert_eq!(status, StatusCode::OK);
-
-                let mut proxy: serde_json::Value =
-                    serde_json::from_str(&proxy_body).expect("proxy whoami");
-                let mut native: serde_json::Value =
-                    serde_json::from_str(&native_body).expect("native whoami");
-                assert_eq!(proxy["mode"], serde_json::json!("proxy"));
-                assert_eq!(native["mode"], serde_json::json!("native"));
-                proxy["mode"] = serde_json::Value::Null;
-                native["mode"] = serde_json::Value::Null;
-                assert_eq!(
-                    proxy, native,
-                    "{login} with groups {groups:?} must resolve identically in both modes"
-                );
-            }
-        }
-
-        /// The two modes never share a credential: native mode has no SSO edge to hold a proxy
-        /// token, and an issuer alone keeps the guard closed even with no API token set.
+        /// An issuer alone keeps the guard closed even with no API token set, and refuses a dev
+        /// identity.
         #[test]
-        fn native_mode_refuses_a_proxy_token_and_stays_closed_without_an_api_token() {
-            let refusal = match BearerGuard::new(
-                SharedToken::new("s3cr3t"),
-                SharedToken::new("edge"),
-                None,
-                None,
-                AuthMode::Native,
-            ) {
-                Ok(_) => panic!("expected a refusal"),
-                Err(e) => e.to_string(),
-            };
-            assert!(refusal.contains("no SSO edge"), "{refusal}");
-
-            let mut guard =
-                BearerGuard::new(None, None, None, None, AuthMode::Native).expect("guard builds");
+        fn an_issuer_alone_keeps_the_guard_closed() {
+            let mut guard = BearerGuard::new(None, None).expect("guard builds");
             assert!(
                 guard.is_open(),
                 "no issuer and no token is the loopback shape"
@@ -2365,6 +1712,24 @@ mod tests {
                 guard.with_dev_identity(Some("wren".into())).is_err(),
                 "an issuer alone refuses a dev identity"
             );
+        }
+
+        /// A bearer that is neither the static token nor an api key is refused on a deployment with
+        /// logins: device-flow JWTs and cluster tokens are no credentials here.
+        #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+        async fn a_jwt_or_cluster_token_bearer_is_401(pool: PgPool) {
+            let app = app(&pool, native_guard()).await;
+            for bearer in ["Bearer aGVhZGVy.cGF5bG9hZA.c2ln", "Bearer sha256~mine"] {
+                let (status, _, _) = call(
+                    &app,
+                    HttpRequest::get("/probe")
+                        .header(header::AUTHORIZATION, bearer)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{bearer}");
+            }
         }
     }
 }

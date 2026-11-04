@@ -16,8 +16,8 @@
 use crate::client::Db;
 use crate::runs::model::{NewCandidate, NewRun, TaskResult};
 use anyhow::{Context, Result};
-use crucible::plan::exec::TaskStatus;
 use crucible_contract::session::PlanTaskWire;
+use crucible_contract::session::TaskStatus;
 use crucible_contract::{BlockedReasonKind, TaskBlocked};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -113,8 +113,7 @@ enum Ev {
 struct TaskResultWire {
     #[serde(default)]
     task: String,
-    #[serde(default)]
-    status: String,
+    status: TaskStatus,
     #[serde(default)]
     iter: u32,
     #[serde(default)]
@@ -479,14 +478,14 @@ fn parse_session(content: &str) -> ParsedRun {
                 }
                 let output = output.filter(|o| !o.is_null());
                 if let Some(output) = &output
-                    && status == "pass"
+                    && status == TaskStatus::Pass
                 {
                     run.result.insert(task.clone(), output.clone());
                 }
                 run.task_results.push(TaskResult {
                     iter: iter.into(),
                     task,
-                    status,
+                    status: status.as_str().to_string(),
                     note,
                     // NaN/inf would poison the column; drop those to NULL rather than store them.
                     cost_usd: Some(cost_usd).filter(|c| c.is_finite()),
@@ -1686,6 +1685,47 @@ mod tests {
         .fetch_one(db.pool())
         .await?;
         assert!((ledger.t - 2.5).abs() < 1e-9, "no double-charge");
+        Ok(())
+    }
+
+    /// The ledger is a function of the evidence: folding the same session log again reproduces the
+    /// run row and every candidate row field for field, and folding it under another run id
+    /// produces the same candidates.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn folding_the_same_session_reproduces_the_same_rows(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, sample_log())?;
+        let rows = |run_id: &'static str| {
+            let db = db.clone();
+            async move {
+                let run = crate::runs::store::get_run(db.pool(), run_id)
+                    .await?
+                    .expect("the run row");
+                let candidates =
+                    crate::runs::store::list_candidates_for_run(db.pool(), run_id).await?;
+                anyhow::Ok((run, candidates))
+            }
+        };
+
+        adopt_session_file(&db, "det-1", None, &path, "s3://b/det").await?;
+        let first = rows("det-1").await?;
+        adopt_session_file(&db, "det-1", None, &path, "s3://b/det").await?;
+        assert_eq!(rows("det-1").await?, first);
+
+        adopt_session_file(&db, "det-2", None, &path, "s3://b/det").await?;
+        let (_, other) = rows("det-2").await?;
+        let strip = |c: &[crate::runs::model::Candidate]| {
+            c.iter()
+                .map(|c| crate::runs::model::Candidate {
+                    run_id: String::new(),
+                    ..c.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(strip(&other), strip(&first.1));
+        assert!(!first.1.is_empty());
         Ok(())
     }
 

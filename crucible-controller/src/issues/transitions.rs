@@ -3,8 +3,10 @@
 //! calling that CAS directly (`claim_issue` stays public for the ~40 sites that carry a custom
 //! reason/evidence string these fixed-shape helpers can't reproduce).
 
+use crate::client::Db;
 use crate::event_log::{self, Event, EventLog};
 use crate::model::{ParkReason, ParkedBy, Status};
+use crate::runs::contract::{ContractRegistry, ContractRejection};
 use crate::runs::workpod::WorkPodState;
 use anyhow::Result;
 use sqlx::PgPool;
@@ -197,4 +199,70 @@ pub async fn park_and_purge(
         tracing::debug!(issue_key = %key, purged, "park deleted queued work pods");
     }
     Ok(())
+}
+
+/// Record a refusal on `issue_key`'s ledger and park the issue. The event carries the rejection
+/// as its reason and the structured evidence; the park keeps the item off every automatic retry
+/// until a human unparks it or a restart finds the target matching again.
+pub async fn refuse(db: &Db, issue_key: &str, rejection: &ContractRejection) -> anyhow::Result<()> {
+    let issue = crate::issues::store::get_issue(db.pool(), issue_key).await?;
+    let status = issue
+        .as_ref()
+        .map(|i| i.status.as_str())
+        .unwrap_or(crate::model::Status::New.as_str());
+    db.events()
+        .append(&crate::event_log::Event::now(
+            issue_key,
+            status,
+            status,
+            Some(&rejection.to_string()),
+            Some(&rejection.evidence()),
+        ))
+        .await?;
+    if let Some(issue) = issue
+        && issue.status != crate::model::Status::Parked
+    {
+        park(
+            db.pool(),
+            db.events(),
+            issue_key,
+            issue.status,
+            &rejection.park_reason(),
+            ParkedBy::Machine,
+        )
+        .await?;
+    }
+    if let Some(m) = db.metrics() {
+        m.record_turn(rejection.request.as_str(), "contract-rejected");
+    }
+    Ok(())
+}
+
+/// Unpark every issue a contract rejection parked whose target now matches: the pin changed and
+/// this restart's check found the new image compatible.
+pub async fn release_parked(db: &Db, registry: &ContractRegistry) -> anyhow::Result<usize> {
+    let snapshot = registry.snapshot();
+    let mut released = 0;
+    for (key, reason) in crate::runs::store::contract_parked(db.pool()).await? {
+        let ParkReason::ContractRejected { image, .. } = ParkReason::parse(&reason) else {
+            continue;
+        };
+        let matches = snapshot
+            .images
+            .iter()
+            .any(|r| r.reference == image && r.matches);
+        if matches
+            && unpark(
+                db.pool(),
+                db.events(),
+                &key,
+                Some("dispatch image contract now matches the controller"),
+                None,
+            )
+            .await?
+        {
+            released += 1;
+        }
+    }
+    Ok(released)
 }

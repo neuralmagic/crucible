@@ -166,36 +166,38 @@ const MAX_DEAD_TURN_ATTEMPTS: u32 = 3;
 /// call before the reporter (and its owning process) tears down. A clean exit reports it
 /// once at the tail of `run_loop_body` itself (it knows the [`LoopExit`] reason); an error
 /// exit is the only case the wrapper needs to catch.
-pub(crate) fn run_loop<R: Reporter>(
+pub(crate) fn run_loop<R: Reporter + Send>(
     args: &Args,
     p: &Paths,
     prep: &Prepared,
-    reporter: R,
+    mut reporter: R,
     world: &Arc<dyn World>,
     judge: &Arc<dyn Judge>,
     runtime: LoopRuntime,
 ) -> (R, Result<Outcome>) {
-    let mut runner = crate::runloop::graph::LoopTaskRunner::new(
-        args,
-        p,
-        reporter,
-        Arc::clone(world),
-        Arc::clone(judge),
-        runtime.control.clone(),
-        runtime.heartbeat.clone(),
-    );
-    let outcome = run_loop_body(args, p, prep, &mut runner, world, judge, runtime);
+    let outcome = {
+        let mut runner = crate::runloop::graph::LoopTaskRunner::new(
+            args,
+            p,
+            &mut reporter,
+            Arc::clone(world),
+            Arc::clone(judge),
+            runtime.control.clone(),
+            runtime.heartbeat.clone(),
+        );
+        run_loop_body(args, p, prep, &mut runner, world, judge, runtime)
+    };
     if let Err(e) = &outcome {
-        runner.r.shutdown("error", &format!("{e:#}"));
+        reporter.shutdown("error", &format!("{e:#}"));
     }
-    (runner.r, outcome)
+    (reporter, outcome)
 }
 
-fn run_loop_body<R: Reporter>(
+fn run_loop_body(
     args: &Args,
     p: &Paths,
     prep: &Prepared,
-    runner: &mut crate::runloop::graph::LoopTaskRunner<R>,
+    runner: &mut crate::runloop::graph::LoopTaskRunner<'_>,
     world: &Arc<dyn World>,
     judge: &Arc<dyn Judge>,
     runtime: LoopRuntime,
@@ -280,7 +282,7 @@ fn run_loop_body<R: Reporter>(
             run.pending_block = approval.repark;
         }
         if let (Some(ledger), Some(replay)) = (ledger, replay) {
-            replay_admissions(ledger, control.as_deref(), replay, &mut runner.r);
+            replay_admissions(ledger, control.as_deref(), replay, &mut *runner.r);
         }
         // Recompute the identity fresh (from the live manifest/workspace) and hard-warn, never
         // abort, when it differs from what the original run recorded. Scores across this resume
@@ -303,7 +305,7 @@ fn run_loop_body<R: Reporter>(
             && let Some(cfg) = &prep.preflight
             && !run.segment.baseline_score.is_finite()
         {
-            machine.advance(Event::PreflightStarted, &mut runner.r)?;
+            machine.advance(Event::PreflightStarted, &mut *runner.r)?;
             update_control_progress(
                 control.as_deref(),
                 start_iter.saturating_sub(1),
@@ -314,18 +316,18 @@ fn run_loop_body<R: Reporter>(
                 cfg,
                 &prep.preflight_modes,
                 &p.workspace,
-                &mut runner.r,
+                &mut *runner.r,
             );
             match preflight {
                 Ok(seeded) => {
-                    machine.advance(Event::PreflightPassed, &mut runner.r)?;
+                    machine.advance(Event::PreflightPassed, &mut *runner.r)?;
                     preflight_baseline = seeded;
                 }
                 Err(e)
                     if e.downcast_ref::<crate::runloop::preflight::PreflightStopped>()
                         .is_some() =>
                 {
-                    machine.advance(Event::Stopped, &mut runner.r)?;
+                    machine.advance(Event::Stopped, &mut *runner.r)?;
                     let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
                     runner.r.shutdown(outcome, reason);
                     return Ok(Outcome::default());
@@ -369,7 +371,7 @@ fn run_loop_body<R: Reporter>(
         }
 
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
-        machine.advance(Event::Resumed, &mut runner.r)?;
+        machine.advance(Event::Resumed, &mut *runner.r)?;
         run
     } else {
         runner.r.start(&prep.goal, &judge.objective());
@@ -377,24 +379,24 @@ fn run_loop_body<R: Reporter>(
         start_iter = 1;
 
         if let Some(cfg) = &prep.preflight {
-            machine.advance(Event::PreflightStarted, &mut runner.r)?;
+            machine.advance(Event::PreflightStarted, &mut *runner.r)?;
             update_control_progress(control.as_deref(), 0, f64::INFINITY, 0.0);
             let preflight = crate::runloop::preflight::run(
                 cfg,
                 &prep.preflight_modes,
                 &p.workspace,
-                &mut runner.r,
+                &mut *runner.r,
             );
             match preflight {
                 Ok(seeded) => {
-                    machine.advance(Event::PreflightPassed, &mut runner.r)?;
+                    machine.advance(Event::PreflightPassed, &mut *runner.r)?;
                     preflight_baseline = seeded;
                 }
                 Err(e)
                     if e.downcast_ref::<crate::runloop::preflight::PreflightStopped>()
                         .is_some() =>
                 {
-                    machine.advance(Event::Stopped, &mut runner.r)?;
+                    machine.advance(Event::Stopped, &mut *runner.r)?;
                     let (outcome, reason) = LoopExit::Stopped.shutdown_reason();
                     runner.r.shutdown(outcome, reason);
                     return Ok(Outcome::default());
@@ -416,7 +418,7 @@ fn run_loop_body<R: Reporter>(
         }
 
         if machine.state() == State::Setup {
-            machine.advance(Event::BaselineStarted, &mut runner.r)?;
+            machine.advance(Event::BaselineStarted, &mut *runner.r)?;
         }
         update_control_progress(control.as_deref(), 0, f64::INFINITY, 0.0);
         let (segment, base_row) = Segment::baseline(
@@ -450,7 +452,7 @@ fn run_loop_body<R: Reporter>(
         run.rows.push(base_row);
         write_results(p, &prep.goal, &prep.prior, &run.rows)?;
         update_control_progress(control.as_deref(), 0, run.segment.best_score, run.spent);
-        machine.advance(Event::BaselineMeasured, &mut runner.r)?;
+        machine.advance(Event::BaselineMeasured, &mut *runner.r)?;
         run
     };
 
@@ -473,16 +475,18 @@ fn run_loop_body<R: Reporter>(
         // serial diff scoring, engine top_k) on both loop paths. The winner diff travels
         // as text: the candidate worktrees are removed before seed time, so re-deriving a
         // diff from one silently yields nothing.
-        machine.advance(Event::WideStarted, &mut runner.r)?;
+        machine.advance(Event::WideStarted, &mut *runner.r)?;
         let result = crate::runloop::graph::run_wide_tournament(
             &wide_cfg,
             args,
             p,
             prep,
-            &mut runner.r,
+            &mut *runner.r,
             world,
             judge,
             run.segment.baseline_score,
+            args.max_time()
+                .map(|cap| cap.saturating_sub(started.elapsed().saturating_sub(run.parked_total))),
         )?;
         let winner = result.winners.first().copied();
         let winner_diff = winner.and_then(|id| result.diffs.get(&id).cloned());
@@ -525,7 +529,7 @@ fn run_loop_body<R: Reporter>(
                 .r
                 .note("wide round produced no winners — deep loop starts from baseline");
         }
-        machine.advance(Event::WideDone, &mut runner.r)?;
+        machine.advance(Event::WideDone, &mut *runner.r)?;
     }
 
     // How this run ends. Each early exit sets it before breaking; a loop that runs out of
@@ -541,29 +545,29 @@ fn run_loop_body<R: Reporter>(
     let mut bad_marker_seen: Option<Option<std::time::SystemTime>> = None;
     let mut it = start_iter;
     while it <= args.iterations {
-        machine.set_iter(it, &mut runner.r);
+        machine.set_iter(it, &mut *runner.r);
         if control.as_deref().is_some_and(|c| c.is_paused()) {
-            machine.advance(Event::Paused, &mut runner.r)?;
-            wait_if_paused(control.as_deref(), &mut runner.r);
-            machine.advance(Event::Unpaused, &mut runner.r)?;
+            machine.advance(Event::Paused, &mut *runner.r)?;
+            wait_if_paused(control.as_deref(), &mut *runner.r);
+            machine.advance(Event::Unpaused, &mut *runner.r)?;
         }
         // The agent blocked on a pending approval last turn (it had no frozen-regime fallback).
         // Park here (idle, budget-paused) until the approval lands as a re-scope (the broker
         // fires it over the control bridge) or we're told to stop. The drain below then
         // re-baselines into the granted regime.
         if let Some(pp) = run.pending_block.take() {
-            machine.advance(Event::ApprovalPending, &mut runner.r)?;
+            machine.advance(Event::ApprovalPending, &mut *runner.r)?;
             let parked = park_for_approval(
                 control.as_deref(),
                 ledger,
-                &mut runner.r,
+                &mut *runner.r,
                 &mut run.parked_total,
                 args.max_park(),
             );
             match parked {
                 // The re-scope drain below re-baselines.
                 ParkOutcome::Resumed => {
-                    machine.advance(Event::ApprovalGranted, &mut runner.r)?;
+                    machine.advance(Event::ApprovalGranted, &mut *runner.r)?;
                 }
                 ParkOutcome::Denied(why) => {
                     // `block` means the agent had no frozen-regime fallback, a denial leaves
@@ -579,11 +583,11 @@ fn run_loop_body<R: Reporter>(
                         run.spent,
                     );
                     world.restore(run.segment.best_snap.as_str())?;
-                    machine.advance(Event::ApprovalDenied, &mut runner.r)?;
+                    machine.advance(Event::ApprovalDenied, &mut *runner.r)?;
                     break;
                 }
                 ParkOutcome::Stopped => {
-                    machine.advance(Event::Stopped, &mut runner.r)?;
+                    machine.advance(Event::Stopped, &mut *runner.r)?;
                     break;
                 }
             }
@@ -591,10 +595,12 @@ fn run_loop_body<R: Reporter>(
         // An approved judge-changing grant arrived (via the control channel / MCP): re-baseline
         // into the new regime and open a fresh segment before this iteration measures.
         if let Some((rescope_key, new_regime)) = control.as_ref().and_then(|c| c.take_rescope()) {
-            machine.advance(Event::Rescoped, &mut runner.r)?;
+            machine.advance(Event::Rescoped, &mut *runner.r)?;
             // Close any open approval bracket: a rescope IS the grant. Harmless when no
             // wait was open (the classifier treats an unmatched resolve as a no-op).
-            runner.r.approval_resolved("granted", &new_regime);
+            runner
+                .r
+                .approval_resolved(provisioning::ApprovalOutcome::Granted, &new_regime);
             runner.r.note(&format!(
                 "control: re-scoping to '{new_regime}' — re-baselining a new comparable segment"
             ));
@@ -626,7 +632,9 @@ fn run_loop_body<R: Reporter>(
         // A denial that arrived while *continuing* (the agent had a fallback, so the loop never
         // parked) just means the regime change won't happen; note it and stay in the frozen regime.
         if let Some((deny_key, reason)) = control.as_ref().and_then(|c| c.take_deny()) {
-            runner.r.approval_resolved("denied", &reason);
+            runner
+                .r
+                .approval_resolved(provisioning::ApprovalOutcome::Denied, &reason);
             runner.r.note(&format!(
                 "approval not granted ({reason}) — staying in the frozen regime"
             ));
@@ -677,33 +685,34 @@ fn run_loop_body<R: Reporter>(
                     crate::control::distress::HANDLE,
                     provisioning::WaitMode::Block,
                 );
-                machine.advance(Event::DistressMarked, &mut runner.r)?;
+                machine.advance(Event::DistressMarked, &mut *runner.r)?;
                 let parked = park_for_distress(
                     p,
                     &run.rows,
-                    &mut runner.r,
+                    &mut *runner.r,
                     &mut run.parked_total,
                     args.max_park(),
                 );
                 match parked {
                     DistressOutcome::Cleared => {
-                        machine.advance(Event::DistressCleared, &mut runner.r)?;
-                        runner
-                            .r
-                            .approval_resolved("granted", "distress cleared by operator");
+                        machine.advance(Event::DistressCleared, &mut *runner.r)?;
+                        runner.r.approval_resolved(
+                            provisioning::ApprovalOutcome::Granted,
+                            "distress cleared by operator",
+                        );
                         runner.r.note("distress cleared, resuming");
                         // The head re-checks budget/interrupts before the next turn runs.
                         continue;
                     }
                     DistressOutcome::Stopped => {
-                        machine.advance(Event::Stopped, &mut runner.r)?;
+                        machine.advance(Event::Stopped, &mut *runner.r)?;
                         break;
                     }
                     DistressOutcome::TimedOut => {
                         runner
                             .r
                             .note("distress park timed out, stopping with state preserved");
-                        machine.advance(Event::ParkTimedOut, &mut runner.r)?;
+                        machine.advance(Event::ParkTimedOut, &mut *runner.r)?;
                         break;
                     }
                 }
@@ -722,7 +731,7 @@ fn run_loop_body<R: Reporter>(
             _ => {}
         }
         if matches!(runner.r.check_interrupt(p, &run.rows), Stop::Quit) {
-            machine.advance(Event::Interrupted, &mut runner.r)?;
+            machine.advance(Event::Interrupted, &mut *runner.r)?;
             break;
         }
         if over_budget(
@@ -731,12 +740,12 @@ fn run_loop_body<R: Reporter>(
             run.spent,
             started,
             run.parked_total,
-            &mut runner.r,
+            &mut *runner.r,
         ) {
-            machine.advance(Event::OverBudget, &mut runner.r)?;
+            machine.advance(Event::OverBudget, &mut *runner.r)?;
             break;
         }
-        machine.advance(Event::TurnStarted, &mut runner.r)?;
+        machine.advance(Event::TurnStarted, &mut *runner.r)?;
         // One span per loop round, entered for the iteration's whole body on this thread: the
         // turn span, gate evaluations, and broker traceparent files all nest under it, so a trace
         // groups by iteration and `iter` is queryable directly.
@@ -790,6 +799,9 @@ fn run_loop_body<R: Reporter>(
                 best_score: run.segment.best_score,
                 best_tiebreak: run.segment.best_tiebreak,
                 spent_before: run.spent,
+                time_left: args.max_time().map(|cap| {
+                    cap.saturating_sub(started.elapsed().saturating_sub(run.parked_total))
+                }),
                 workflow: args.workflow.as_ref(),
             },
             runner,
@@ -822,19 +834,19 @@ fn run_loop_body<R: Reporter>(
                     } else {
                         Event::Discarded
                     },
-                    &mut runner.r,
+                    &mut *runner.r,
                 )?;
                 *d
             }
             IterStep::Discarded { reason } => {
-                machine.advance(Event::Discarded, &mut runner.r)?;
+                machine.advance(Event::Discarded, &mut *runner.r)?;
                 let mut row = Row {
                     iter: it,
                     decision: "discarded".to_string(),
                     note: reason,
                     ..Default::default()
                 };
-                fold_distress_notes(&mut runner.r, &mut row.note);
+                fold_distress_notes(&mut *runner.r, &mut row.note);
                 runner.r.row(&row, false);
                 run.rows.push(row);
                 world.restore(run.segment.best_snap.as_str())?;
@@ -862,23 +874,23 @@ fn run_loop_body<R: Reporter>(
                     runner.r.note(&format!(
                         "{dead_turns} consecutive turns died before starting — the run is stalled"
                     ));
-                    machine.advance(Event::Stalled, &mut runner.r)?;
+                    machine.advance(Event::Stalled, &mut *runner.r)?;
                     break;
                 }
                 runner.r.note(&format!(
                     "turn never started (attempt {dead_turns}/{MAX_DEAD_TURN_ATTEMPTS}) — re-running iter {it} without consuming it"
                 ));
-                machine.advance(Event::TurnNeverStarted, &mut runner.r)?;
+                machine.advance(Event::TurnNeverStarted, &mut *runner.r)?;
                 continue;
             }
             IterStep::Escalated => {
                 update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
                 world.restore(run.segment.best_snap.as_str())?;
-                machine.advance(Event::Escalated, &mut runner.r)?;
+                machine.advance(Event::Escalated, &mut *runner.r)?;
                 break;
             }
             IterStep::Parked(pp) => {
-                machine.advance(Event::Parked, &mut runner.r)?;
+                machine.advance(Event::Parked, &mut *runner.r)?;
                 update_control_progress(control.as_deref(), it, run.segment.best_score, run.spent);
                 run.pending_block = Some(pp);
                 write_results(p, &prep.goal, &prep.prior, &run.rows)?;
@@ -886,11 +898,11 @@ fn run_loop_body<R: Reporter>(
                 continue;
             }
             IterStep::Stopped => {
-                machine.advance(Event::Stopped, &mut runner.r)?;
+                machine.advance(Event::Stopped, &mut *runner.r)?;
                 break;
             }
         };
-        fold_distress_notes(&mut runner.r, &mut row.note);
+        fold_distress_notes(&mut *runner.r, &mut row.note);
 
         if verdict.keep {
             if let Some(s) = reading.score {
@@ -928,7 +940,7 @@ fn run_loop_body<R: Reporter>(
         // Snapshot durable state per decided iteration so cross-run memory survives a killed pod
         // (the end-of-run publish below only fires on a clean exit). No branch push mid-run.
         publish::publish_progress(
-            &mut runner.r,
+            &mut *runner.r,
             &publish::Record {
                 args,
                 paths: p,
@@ -962,19 +974,19 @@ fn run_loop_body<R: Reporter>(
             run.spent,
             started,
             run.parked_total,
-            &mut runner.r,
+            &mut *runner.r,
         ) {
-            machine.advance(Event::OverBudget, &mut runner.r)?;
+            machine.advance(Event::OverBudget, &mut *runner.r)?;
             break;
         }
         if verdict.keep && verdict.solved && !args.no_early_stop {
-            machine.advance(Event::Solved, &mut runner.r)?;
+            machine.advance(Event::Solved, &mut *runner.r)?;
             break;
         }
         it += 1;
     }
     if machine.state() == State::Head {
-        machine.advance(Event::IterationsExhausted, &mut runner.r)?;
+        machine.advance(Event::IterationsExhausted, &mut *runner.r)?;
     }
     let exit = machine.exit()?;
 
@@ -988,7 +1000,7 @@ fn run_loop_body<R: Reporter>(
         LoopExit::Finished | LoopExit::Budget | LoopExit::Solved
     ) && let Some(workflow) = args.workflow.as_ref().filter(|w| w.has_epilogue())
     {
-        machine.advance(Event::EpilogueStarted, &mut runner.r)?;
+        machine.advance(Event::EpilogueStarted, &mut *runner.r)?;
         let kept = run
             .rows
             .iter()
@@ -1017,7 +1029,7 @@ fn run_loop_body<R: Reporter>(
                         p,
                         workflow,
                         &kept,
-                        &mut runner.r,
+                        &mut *runner.r,
                     );
                     match epilogue {
                         Ok((rows, cost)) => {
@@ -1037,7 +1049,7 @@ fn run_loop_body<R: Reporter>(
                 }
             }
         }
-        machine.advance(Event::EpilogueDone, &mut runner.r)?;
+        machine.advance(Event::EpilogueDone, &mut *runner.r)?;
     }
 
     runner
@@ -1068,9 +1080,9 @@ fn run_loop_body<R: Reporter>(
         .and_then(|base| world.publish_components(base, run.segment.best_snap.as_str()))
         .map(|pc| publish::composite_targets(pc, &args.component_pr_repos))
         .unwrap_or_default();
-    machine.advance(Event::PublishStarted, &mut runner.r)?;
+    machine.advance(Event::PublishStarted, &mut *runner.r)?;
     let prs = publish::publish(
-        &mut runner.r,
+        &mut *runner.r,
         &publish::Record {
             args,
             paths: p,
@@ -1107,12 +1119,12 @@ fn run_loop_body<R: Reporter>(
         .collect();
     runner.r.pr_links(&pr_links);
     if args.watch_feedback {
-        spawn_feedback_watcher(&mut runner.r, &prs, p);
+        spawn_feedback_watcher(&mut *runner.r, &prs, p);
     }
 
     let (shutdown_outcome, shutdown_reason) = exit.shutdown_reason();
     runner.r.shutdown(shutdown_outcome, shutdown_reason);
-    machine.advance(Event::Shutdown, &mut runner.r)?;
+    machine.advance(Event::Shutdown, &mut *runner.r)?;
 
     Ok(Outcome {
         improved,
@@ -1129,7 +1141,7 @@ fn run_loop_body<R: Reporter>(
 /// Best-effort: a spawn failure only logs (the PR still opened; a human can always run
 /// `watch-pr` themselves). Known limitation: in a container the child dies with the pod
 /// unless the runtime keeps orphaned processes around.
-fn spawn_feedback_watcher<R: Reporter>(r: &mut R, prs: &[publish::PrLink], p: &Paths) {
+fn spawn_feedback_watcher(r: &mut dyn Reporter, prs: &[publish::PrLink], p: &Paths) {
     if prs.is_empty() {
         return;
     }
@@ -1232,7 +1244,7 @@ fn restore_kept_best(
     }
 }
 
-fn wait_if_paused<R: Reporter>(control: Option<&control::bridge::ControlState>, r: &mut R) {
+fn wait_if_paused(control: Option<&control::bridge::ControlState>, r: &mut dyn Reporter) {
     let Some(control) = control else {
         return;
     };
@@ -1267,13 +1279,13 @@ fn update_control_progress(
     }
 }
 
-fn over_budget<R: Reporter>(
+fn over_budget(
     args: &Args,
     control: Option<&control::bridge::ControlState>,
     spent: f64,
     started: Instant,
     parked_total: Duration,
-    r: &mut R,
+    r: &mut dyn Reporter,
 ) -> bool {
     let max_cost = live_max_cost(args, control);
     if max_cost > 0.0 && spent >= max_cost {
@@ -1314,10 +1326,10 @@ enum ParkOutcome {
 /// budget-paused (the caller accumulates `parked_total` to exclude it from the time cap). The
 /// broker drives the approval+capture and sends the terminal `rescope`/`deny` over the control
 /// bridge. With no control bridge nothing could deliver an outcome, so we note and proceed.
-fn park_for_approval<R: Reporter>(
+fn park_for_approval(
     control: Option<&control::bridge::ControlState>,
     ledger: Option<&crate::control::admission::AdmissionLedger>,
-    r: &mut R,
+    r: &mut dyn Reporter,
     parked_total: &mut Duration,
     timeout: Option<Duration>,
 ) -> ParkOutcome {
@@ -1335,7 +1347,7 @@ fn park_for_approval<R: Reporter>(
             break ParkOutcome::Resumed;
         }
         if let Some((deny_key, reason)) = control.take_deny() {
-            r.approval_resolved("denied", &reason);
+            r.approval_resolved(provisioning::ApprovalOutcome::Denied, &reason);
             if let Some(ledger) = ledger {
                 let _ = ledger.settle(&deny_key, AdmissionOutcome::Applied, "drained by the park");
             }
@@ -1346,7 +1358,7 @@ fn park_for_approval<R: Reporter>(
         }
         if timeout.is_some_and(|cap| start.elapsed() >= cap) {
             let why = "park timed out waiting for approval";
-            r.approval_resolved("timeout", why);
+            r.approval_resolved(provisioning::ApprovalOutcome::Timeout, why);
             break ParkOutcome::Denied(why.into());
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -1363,10 +1375,11 @@ fn park_for_approval<R: Reporter>(
 /// Fold the turn's info/warn distress notes onto the row being written: they are per-turn signals,
 /// so RESULTS.md carries them next to the outcome they happened during. Consumed on read, hence
 /// one call per row-emitting path.
-fn fold_distress_notes<R: Reporter>(r: &mut R, note: &mut String) {
-    for (severity, reason) in crate::control::distress::drain_notes() {
-        r.note(&format!("distress[{severity}]: {reason}"));
-        note.push_str(&format!("; distress[{severity}]: {reason}"));
+fn fold_distress_notes(r: &mut dyn Reporter, note: &mut String) {
+    for pending in crate::control::distress::drain_notes() {
+        let line = format!("distress[{}]: {}", pending.severity, pending.reason);
+        r.note(&line);
+        note.push_str(&format!("; {line}"));
     }
 }
 
@@ -1384,10 +1397,10 @@ enum DistressOutcome {
 /// Suspend the loop while the broker's distress marker exists. Idle and budget-paused: the caller
 /// folds the elapsed time into `parked_total`, so suspended wall-clock burns no time budget. The
 /// engine never deletes the marker: the operator's `rm` is the resume grant.
-fn park_for_distress<R: Reporter>(
+fn park_for_distress(
     p: &Paths,
     rows: &[Row],
-    r: &mut R,
+    r: &mut dyn Reporter,
     parked_total: &mut Duration,
     timeout: Option<Duration>,
 ) -> DistressOutcome {
@@ -1416,8 +1429,12 @@ fn write_turn_meta(iter: u32, spent_usd: f64) {
     if !dir.is_dir() {
         return;
     }
-    let body = serde_json::json!({ "iter": iter, "spent_usd": spent_usd }).to_string();
-    let _ = std::fs::write(dir.join("turn-meta.json"), body);
+    let Ok(body) =
+        serde_json::to_string(&crucible_contract::distress::TurnMeta { iter, spent_usd })
+    else {
+        return;
+    };
+    let _ = std::fs::write(dir.join(crucible_contract::distress::TURN_META_FILE), body);
 }
 
 /// Fill the contract's prompt slots: `{{GOAL}}`, `{{STATUS}}` (the objective status line, aliased by
@@ -1593,11 +1610,11 @@ fn fingerprint(goal: &str, objective: &str, regime: &str) -> String {
 /// Re-arm what a resumed run still owes: the budget and pause levels the in-memory
 /// `ControlState` lost, plus any re-scope or denial granted but never drained. Stale
 /// stops and un-granted approves are closed out.
-fn replay_admissions<R: Reporter>(
+fn replay_admissions(
     ledger: &crate::control::admission::AdmissionLedger,
     control: Option<&control::bridge::ControlState>,
     replay: crate::control::admission::ResumeReplay,
-    r: &mut R,
+    r: &mut dyn Reporter,
 ) {
     if replay.skipped_lines > 0 {
         r.note(&format!(
@@ -1700,7 +1717,7 @@ fn write_results(p: &Paths, goal: &str, prior: &str, rows: &[Row]) -> Result<()>
 mod tests {
     use super::*;
     use crate::control::recovery::{ResumeFold, resume_finished};
-    use crate::report::reporter::{AgentTurn, Stop, TurnBudget};
+    use crate::report::reporter::Stop;
     use crate::report::session::Row;
     use crate::runloop::step::{TurnVerdict, drain_turn_markers};
     use crucible_contract::LoopPhase;
@@ -2235,18 +2252,6 @@ mod tests {
             self.notes.push(msg.to_string());
         }
         fn row(&mut self, _: &Row, _: bool) {}
-        fn run_agent(
-            &mut self,
-            _: &Args,
-            _: &Paths,
-            _: u32,
-            _: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-            _: TurnBudget,
-        ) -> AgentTurn {
-            AgentTurn::default()
-        }
         fn check_interrupt(&mut self, _: &Paths, _: &[Row]) -> Stop {
             match &mut self.quit_after {
                 Some(0) => Stop::Quit,
@@ -2262,9 +2267,9 @@ mod tests {
             self.waits
                 .push((handle.to_string(), trace_id.to_string(), mode));
         }
-        fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+        fn approval_resolved(&mut self, outcome: provisioning::ApprovalOutcome, reason: &str) {
             self.resolved
-                .push((outcome.to_string(), reason.to_string()));
+                .push((outcome.as_str().to_string(), reason.to_string()));
         }
     }
 
@@ -2492,8 +2497,8 @@ mod tests {
         let root = crate::control::distress::testing::Root::new("loop-notes");
         std::fs::write(
             root.dir.join("distress-notes.jsonl"),
-            "{\"severity\":\"info\",\"reason\":\"cache warm\"}\n\
-             {\"severity\":\"warn\",\"reason\":\"flaky node\"}\n",
+            "{\"severity\":\"info\",\"reason\":\"cache warm\",\"ts_ms\":1}\n\
+             {\"severity\":\"warn\",\"reason\":\"flaky node\",\"ts_ms\":2}\n",
         )
         .unwrap();
         let mut r = NoteCapture::default();
@@ -2582,10 +2587,15 @@ mod tests {
     fn a_marker_parks_the_head_and_the_operator_rm_resumes_the_run() {
         let (f, root) = distress_fixture("loop-head-park", 2);
         let marker = root.dir.join("distress");
-        let r = RecordingReporter {
-            distress_after_turn: Some((1, marker.clone(), "torch skew".into())),
-            ..Default::default()
-        };
+        f.agent.runs(
+            Some(1),
+            &format!(
+                "printf '%s' '{}' > '{}'",
+                serde_json::json!({ "reason": "torch skew", "evidence": ["log-3"], "ts_ms": 42 }),
+                marker.display()
+            ),
+        );
+        let r = RecordingReporter::default();
         // The operator's `oc exec ... rm`, once the loop is actually parked on it.
         let clear = marker.clone();
         let operator = std::thread::spawn(move || {
@@ -2611,7 +2621,12 @@ mod tests {
         );
         outcome.expect("a granted distress resumes, it does not error");
         operator.join().unwrap();
-        assert_eq!(r.agent_calls, 2, "both iterations still run: {:?}", r.notes);
+        assert_eq!(
+            f.agent.calls(),
+            2,
+            "both iterations still run: {:?}",
+            r.notes
+        );
         let distressed: Vec<&Row> = r
             .rows
             .iter()
@@ -2689,7 +2704,7 @@ mod tests {
         );
         outcome.expect("a bad byte must never wedge a paid run");
 
-        assert_eq!(r.agent_calls, 3, "every iteration still ran");
+        assert_eq!(f.agent.calls(), 3, "every iteration still ran");
         assert_eq!(
             r.notes.iter().filter(|n| n.contains("unreadable")).count(),
             1,
@@ -2764,7 +2779,7 @@ mod tests {
             "one marker, one row: {results}"
         );
         assert_eq!(r.waits.len(), 1, "it still parks: no grant was given");
-        assert_eq!(r.agent_calls, 1, "iteration 2 runs after the grant");
+        assert_eq!(f.agent.calls(), 1, "iteration 2 runs after the grant");
     }
 
     // --- run_loop's shutdown emission: one Reporter::shutdown call per exit path ---
@@ -2834,8 +2849,7 @@ mod tests {
     }
 
     /// Records every `Reporter` call `run_loop` tests care about, plus scripted knobs:
-    /// `stop_now` fails `check_interrupt` on the very first checkpoint; `agent_cost`/
-    /// `write_escalation` let a test drive the budget/escalation exit paths from `run_agent`.
+    /// `stop_now` fails `check_interrupt` on the very first checkpoint.
     #[derive(Default)]
     struct RecordingReporter {
         shutdowns: Vec<(String, String)>,
@@ -2843,21 +2857,9 @@ mod tests {
         notes: Vec<String>,
         rows: Vec<Row>,
         stop_now: bool,
-        agent_cost: f64,
-        agent_is_error: bool,
-        agent_error: Option<String>,
-        /// Scripted turns, popped per `run_agent` call; when empty the `agent_*` knobs apply.
-        agent_turns: std::collections::VecDeque<AgentTurn>,
-        agent_calls: u32,
-        /// Every prompt the loop rendered, so a test can see what the turn actually carried.
-        prompts: Vec<String>,
-        escalation_path: Option<std::path::PathBuf>,
         recoveries: Vec<(crate::report::session::RecoveryClass, u32, String)>,
         waits: Vec<(String, String, provisioning::WaitMode)>,
         resolved: Vec<(String, String)>,
-        /// Plays the agent calling `distress(severity=error)`: after this many turns, write the
-        /// broker's park marker at the given path with the given reason.
-        distress_after_turn: Option<(u32, std::path::PathBuf, String)>,
         /// `(fingerprint, baseline_score, regime)` per segment boundary.
         segments: Vec<(String, f64, String)>,
     }
@@ -2871,43 +2873,6 @@ mod tests {
         }
         fn row(&mut self, row: &Row, _: bool) {
             self.rows.push(row.clone());
-        }
-        fn run_agent(
-            &mut self,
-            _: &Args,
-            _: &Paths,
-            _: u32,
-            prompt: &str,
-            _: Option<&str>,
-            _: Option<&str>,
-            _: TurnBudget,
-        ) -> AgentTurn {
-            self.agent_calls += 1;
-            self.prompts.push(prompt.to_string());
-            if let Some((turn, path, reason)) = &self.distress_after_turn
-                && self.agent_calls == *turn
-            {
-                std::fs::write(
-                    path,
-                    serde_json::json!({ "reason": reason, "evidence": ["log-3"], "ts_ms": 42 })
-                        .to_string(),
-                )
-                .expect("plant the park marker");
-            }
-            if let Some(path) = &self.escalation_path {
-                let _ = std::fs::write(
-                    path,
-                    r#"{"category":"harness-limitation","reason":"gate is broken","evidence":""}"#,
-                );
-            }
-            if let Some(turn) = self.agent_turns.pop_front() {
-                return turn;
-            }
-            AgentTurn {
-                cost: self.agent_cost,
-                is_error: self.agent_is_error,
-                error: self.agent_error.clone(),
-            }
         }
         fn check_interrupt(&mut self, _: &Paths, _: &[Row]) -> Stop {
             if self.stop_now {
@@ -2933,9 +2898,9 @@ mod tests {
             self.waits
                 .push((handle.to_string(), trace_id.to_string(), mode));
         }
-        fn approval_resolved(&mut self, outcome: &str, reason: &str) {
+        fn approval_resolved(&mut self, outcome: provisioning::ApprovalOutcome, reason: &str) {
             self.resolved
-                .push((outcome.to_string(), reason.to_string()));
+                .push((outcome.as_str().to_string(), reason.to_string()));
         }
         fn segment(&mut self, fingerprint: &str, baseline_score: f64, regime: &str) {
             self.segments
@@ -2945,6 +2910,98 @@ mod tests {
 
     /// A scratch workspace + the `Args`/`Paths`/`Prepared` triple `run_loop` needs, wired to a
     /// `FakeWorld`/scripted `FakeJudge` so the loop runs with no subprocess, no git, no gate.
+    /// The agent on the far edge: the `command` backend running a script that plays whatever
+    /// turns a test wrote into its directory. Turn `n` runs `turn-<n>.sh` if present, then
+    /// prints `turn-<n>.json`, else `default.json`; every turn records the prompt it got.
+    struct StandIn {
+        dir: std::path::PathBuf,
+    }
+
+    const STAND_IN: &str = r#"d="$STAND_IN_DIR"
+n=$(( $(cat "$d/calls" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$d/calls"
+printf '%s' "$CRUCIBLE_PROMPT" > "$d/prompt-$n"
+if [ -f "$d/each.sh" ]; then . "$d/each.sh"; fi
+if [ -f "$d/turn-$n.sh" ]; then . "$d/turn-$n.sh"; fi
+if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.json" ]; then cat "$d/default.json"; fi
+"#;
+
+    impl StandIn {
+        fn new(dir: std::path::PathBuf, args: &mut Args) -> Self {
+            std::fs::create_dir_all(&dir).expect("stand-in dir");
+            std::fs::write(dir.join("agent.sh"), STAND_IN).expect("stand-in script");
+            args.agent_cmd = Some(format!("sh {}", dir.join("agent.sh").display()));
+            args.env
+                .push(("STAND_IN_DIR".into(), dir.display().to_string()));
+            StandIn { dir }
+        }
+
+        fn result(cost: f64, error: Option<&str>) -> String {
+            serde_json::json!({
+                "v": 1,
+                "kind": "result",
+                "is_error": error.is_some(),
+                "cost_usd": cost,
+                "error": error,
+            })
+            .to_string()
+        }
+
+        /// The provider error a turn dies on before it reports: a transport death.
+        fn died(message: &str) -> String {
+            serde_json::json!({
+                "v": 1,
+                "kind": "error",
+                "error_type": "provider",
+                "message": message,
+            })
+            .to_string()
+        }
+
+        /// Turn `n` dies in transport, or every turn without a script of its own when `None`.
+        fn dies(&self, n: Option<u32>, message: &str) {
+            let name = n.map_or("default.json".to_string(), |n| format!("turn-{n}.json"));
+            std::fs::write(self.dir.join(name), Self::died(message)).expect("dying turn");
+        }
+
+        /// What every turn without a script of its own prints.
+        fn every_turn(&self, cost: f64, error: Option<&str>) {
+            std::fs::write(self.dir.join("default.json"), Self::result(cost, error))
+                .expect("default turn");
+        }
+
+        /// What turn `n` prints.
+        fn turn(&self, n: u32, cost: f64, error: Option<&str>) {
+            std::fs::write(
+                self.dir.join(format!("turn-{n}.json")),
+                Self::result(cost, error),
+            )
+            .expect("scripted turn");
+        }
+
+        /// Shell every turn runs, or only turn `n` when given.
+        fn runs(&self, n: Option<u32>, script: &str) {
+            let name = n.map_or("each.sh".to_string(), |n| format!("turn-{n}.sh"));
+            std::fs::write(self.dir.join(name), script).expect("turn script");
+        }
+
+        fn calls(&self) -> u32 {
+            std::fs::read_to_string(self.dir.join("calls"))
+                .ok()
+                .and_then(|n| n.trim().parse().ok())
+                .unwrap_or(0)
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            (1..=self.calls())
+                .map(|n| {
+                    std::fs::read_to_string(self.dir.join(format!("prompt-{n}")))
+                        .unwrap_or_default()
+                })
+                .collect()
+        }
+    }
+
     struct Fixture {
         /// The iteration head reads the distress marker and stamps `turn-meta.json` under the
         /// process-global `FORGE_STORAGE_ROOT`, so two concurrent loops fight over one directory.
@@ -2954,6 +3011,7 @@ mod tests {
         args: Args,
         paths: Paths,
         prepared: Prepared,
+        agent: StandIn,
     }
 
     /// Minimal `tempfile`-shaped scratch dir (no `tempfile` dependency in this crate): a directory
@@ -2988,7 +3046,7 @@ mod tests {
         let state = workspace.join("state");
         let escalation = workspace.join("ESCALATION.json");
         let provisioning = workspace.join("PROVISIONING_PENDING.json");
-        let args = Args {
+        let mut args = Args {
             manifest: None,
             state_dir: None,
             agent_cmd: None,
@@ -3016,7 +3074,6 @@ mod tests {
             model: Some("test-model".into()),
             price: None,
             harness: None,
-            hermes: Default::default(),
             codex: Default::default(),
             disallowed_tools: Vec::new(),
             reasoning_effort: None,
@@ -3036,8 +3093,12 @@ mod tests {
             workflow: None,
             workflow_frozen_injects: Vec::new(),
             workflow_toolbox_exclude: Vec::new(),
+            workflow_env: Default::default(),
             buildit_socket: None,
             watch_feedback: false,
+            sandbox_run_id: None,
+            gateway_boot: Default::default(),
+            engine: None,
         };
         let paths = Paths {
             workspace,
@@ -3070,12 +3131,14 @@ mod tests {
                 digest: "v2:0".into(),
             },
         };
+        let agent = StandIn::new(dir.path().join("stand-in"), &mut args);
         Fixture {
             _lock,
             _dir: dir,
             args,
             paths,
             prepared,
+            agent,
         }
     }
 
@@ -3101,14 +3164,18 @@ mod tests {
             LoopRuntime::default(),
         );
         outcome.expect("run_loop should finish cleanly");
-        assert_eq!(r.prompts.len(), 3, "one prompt per iteration");
+        assert_eq!(f.agent.prompts().len(), 3, "one prompt per iteration");
         assert!(
-            r.prompts[0].contains("## SEED (pack-declared starting diff)"),
+            f.agent.prompts()[0].contains("## SEED (pack-declared starting diff)"),
             "iter 1 gets the seed: {}",
-            r.prompts[0]
+            f.agent.prompts()[0]
         );
-        assert!(r.prompts[0].contains("--- a/x.py"), "{}", r.prompts[0]);
-        for (i, prompt) in r.prompts.iter().enumerate().skip(1) {
+        assert!(
+            f.agent.prompts()[0].contains("--- a/x.py"),
+            "{}",
+            f.agent.prompts()[0]
+        );
+        for (i, prompt) in f.agent.prompts().iter().enumerate().skip(1) {
             assert!(
                 !prompt.contains("## SEED") && !prompt.contains("--- a/x.py"),
                 "iter {} must not carry the seed: {prompt}",
@@ -3392,17 +3459,17 @@ mod tests {
 
     #[test]
     fn shutdown_emitted_once_on_budget() {
-        let f = fixture(3, 1.0, false);
+        let mut f = fixture(3, 1.0, false);
         let world = world_of(FakeWorld);
         let judge = judge_of(FakeJudge {
             keep: false,
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_cost: 5.0, // over the 1.0 cap after the first iteration's turn
-            ..Default::default()
-        };
+        // A vendor-billed model, so the turn is charged the cost its harness reports.
+        f.args.model = Some("claude-opus-4-6".into());
+        f.agent.every_turn(5.0, None);
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3431,10 +3498,15 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            escalation_path: Some(f.paths.escalation.clone()),
-            ..Default::default()
-        };
+        f.agent.runs(
+            None,
+            &format!(
+                "printf '%s' '{}' > '{}'",
+                r#"{"category":"harness-limitation","reason":"gate is broken","evidence":""}"#,
+                f.paths.escalation.display()
+            ),
+        );
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3456,61 +3528,96 @@ mod tests {
         assert_eq!(r.shutdowns[0].0, "escalated");
     }
 
+    /// A turn whose own result says it failed left nothing worth measuring, but its transport
+    /// held: the candidate is discarded with the CLI's reason and the run moves on to the next
+    /// iteration instead of retrying the turn.
     #[test]
-    fn is_error_turn_is_discarded_before_measuring() {
-        // The agent turn came back is_error (the credential-less "Not logged in" no-op).
-        // Even with a judge that would keep AND solve on the very first measure, the loop
-        // must never measure: it discards the iteration with the reason and runs to a
-        // clean finish. A measured turn would have exited "solved", so a "finished" exit
-        // with no solve is proof the measure was skipped.
-        let f = fixture(1, 0.0, false);
-        let world = world_of(FakeWorld);
+    fn an_is_error_turn_is_discarded_and_the_next_iteration_runs() {
+        let f = fixture(2, 0.0, false);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: true,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_is_error: true,
-            agent_error: Some("Not logged in".into()),
-            ..Default::default()
-        };
+        f.agent.turn(1, 0.0, Some("Not logged in"));
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
             &f.prepared,
             r,
-            &world,
+            &world_of(FakeWorld),
             &judge,
             LoopRuntime::default(),
         );
-        let outcome =
-            outcome.expect("a failed agent turn is a discarded iteration, not a run error");
-        assert!(
-            !outcome.solved,
-            "an is_error turn must never be measured/solved"
-        );
-        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
-        assert_eq!(r.shutdowns[0].0, "finished");
+        let outcome = outcome.expect("a failed turn is a discarded iteration, not a run error");
+        assert_eq!(f.agent.calls(), 2, "the failed turn was not retried");
         assert!(
             r.notes
                 .iter()
-                .any(|n| n.contains("agent turn failed") && n.contains("Not logged in")),
+                .any(|n| n.contains("agent turn failed (discarding iter 1)")
+                    && n.contains("Not logged in")),
             "the discard note carries the CLI's reason: {:?}",
+            r.notes
+        );
+        let decided: Vec<(u32, &str)> = r
+            .rows
+            .iter()
+            .filter(|row| row.iter > 0)
+            .map(|row| (row.iter, row.decision.as_str()))
+            .collect();
+        assert_eq!(decided.first().map(|(it, _)| *it), Some(1), "{decided:?}");
+        assert!(
+            decided.iter().any(|(it, d)| *it == 2 && *d == "keep"),
+            "iteration 2 ran and was measured: {decided:?}"
+        );
+        assert!(outcome.solved, "the next iteration's candidate was kept");
+    }
+
+    /// `--max-time` bounds the turn itself, not only the gap between iterations: a turn that
+    /// hangs is killed, with everything it started, when the run's wall clock runs out, and the
+    /// run then stops on its time cap.
+    #[test]
+    fn a_hung_turn_is_killed_when_the_runs_wall_clock_runs_out() {
+        let mut f = fixture(3, 0.0, false);
+        f.args.max_time = "2s".into();
+        f.agent.runs(Some(1), "sleep 60");
+        let judge = judge_of(FakeJudge {
+            keep: true,
+            solved: false,
+            fail_baseline: false,
+        });
+        let started = std::time::Instant::now();
+        let (r, outcome) = run_loop(
+            &f.args,
+            &f.paths,
+            &f.prepared,
+            RecordingReporter::default(),
+            &world_of(FakeWorld),
+            &judge,
+            LoopRuntime::default(),
+        );
+        outcome.expect("a time stop is a clean exit, not an error");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the hung turn held the run for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(f.agent.calls(), 1, "no turn ran after the ceiling");
+        assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
+        assert_eq!(r.shutdowns[0].0, "budget");
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("wall-clock ceiling ended iter 1")),
+            "{:?}",
             r.notes
         );
     }
 
     /// The run-6 signature: a transport-class death before the agent produced anything.
-    fn dead_turn() -> AgentTurn {
-        AgentTurn {
-            cost: 0.0,
-            is_error: true,
-            error: Some(
-                "applying the sandbox egress policy: timed out waiting for policy version 1".into(),
-            ),
-        }
-    }
+    const DEAD_TURN: &str =
+        "applying the sandbox egress policy: timed out waiting for policy version 1";
 
     #[test]
     fn a_transport_death_is_retried_inside_the_turn_and_the_iteration_still_decides() {
@@ -3523,10 +3630,8 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_turns: [dead_turn(), AgentTurn::default()].into(),
-            ..Default::default()
-        };
+        f.agent.dies(Some(1), DEAD_TURN);
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3538,7 +3643,8 @@ mod tests {
         );
         outcome.expect("a retried dead turn is a clean finish, not an error");
         assert_eq!(
-            r.agent_calls, 2,
+            f.agent.calls(),
+            2,
             "the turn was retried once inside the task"
         );
         assert_eq!(
@@ -3570,18 +3676,10 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_turns: [
-                dead_turn(),
-                dead_turn(),
-                AgentTurn::default(),
-                dead_turn(),
-                dead_turn(),
-                AgentTurn::default(),
-            ]
-            .into(),
-            ..Default::default()
-        };
+        for n in [1, 2, 4, 5] {
+            f.agent.dies(Some(n), DEAD_TURN);
+        }
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3592,7 +3690,7 @@ mod tests {
             LoopRuntime::default(),
         );
         outcome.expect("the streak resets, so the run finishes");
-        assert_eq!(r.agent_calls, 6, "every scripted turn ran");
+        assert_eq!(f.agent.calls(), 6, "every scripted turn ran");
         assert_eq!(r.shutdowns[0].0, "finished");
     }
 
@@ -3650,54 +3748,20 @@ mod tests {
     }
 
     #[test]
-    fn discards_an_is_error_turn_before_measuring() {
-        let f = fixture(1, 0.0, false);
-        let judge = judge_of(FakeJudge {
-            keep: true,
-            solved: true,
-            fail_baseline: false,
-        });
-        let r = RecordingReporter {
-            agent_is_error: true,
-            agent_error: Some("Not logged in".into()),
-            ..Default::default()
-        };
-        let (r, outcome) = run_loop(
-            &f.args,
-            &f.paths,
-            &f.prepared,
-            r,
-            &world_of(FakeWorld),
-            &judge,
-            LoopRuntime::default(),
-        );
-        let outcome = outcome.expect("a failed turn is a discarded iteration, not a run error");
-        assert!(!outcome.solved, "an is_error turn must never be measured");
-        assert_eq!(r.shutdowns[0].0, "finished");
-        assert!(
-            r.notes
-                .iter()
-                .any(|n| n.contains("agent turn failed") && n.contains("Not logged in")),
-            "the discard note carries the CLI's reason: {:?}",
-            r.notes
-        );
-    }
-
-    #[test]
     fn budget_stop_still_measures_the_over_cap_turn() {
         // The iteration template carries no plan-level budget (f64::MAX) by design: the
         // driver owns the cap and checks it between rounds, so a turn that blows the cap
         // is still measured and decided (a keep!) before the run stops on budget.
-        let f = fixture(3, 1.0, false);
+        let mut f = fixture(3, 1.0, false);
         let judge = judge_of(FakeJudge {
             keep: true,
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_cost: 5.0, // over the 1.0 cap after the first turn
-            ..Default::default()
-        };
+        // A vendor-billed model, so the turn is charged the cost its harness reports.
+        f.args.model = Some("claude-opus-4-6".into());
+        f.agent.every_turn(5.0, None);
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3720,10 +3784,15 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            escalation_path: Some(f.paths.escalation.clone()),
-            ..Default::default()
-        };
+        f.agent.runs(
+            None,
+            &format!(
+                "printf '%s' '{}' > '{}'",
+                r#"{"category":"harness-limitation","reason":"gate is broken","evidence":""}"#,
+                f.paths.escalation.display()
+            ),
+        );
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3750,11 +3819,8 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let r = RecordingReporter {
-            agent_is_error: true,
-            agent_error: Some("request timed out".into()),
-            ..Default::default()
-        };
+        f.agent.dies(None, "request timed out");
+        let r = RecordingReporter::default();
         let (r, outcome) = run_loop(
             &f.args,
             &f.paths,
@@ -3766,7 +3832,7 @@ mod tests {
         );
         outcome.expect("a stall is a clean exit, not an error");
         // 3 in-task turn attempts (1 + 2 transport retries) per dead iteration attempt.
-        assert_eq!(r.agent_calls, 3 * MAX_DEAD_TURN_ATTEMPTS);
+        assert_eq!(f.agent.calls(), 3 * MAX_DEAD_TURN_ATTEMPTS);
         assert_eq!(r.shutdowns.len(), 1, "one shutdown: {:?}", r.shutdowns);
         assert_eq!(r.shutdowns[0].0, "stalled");
         assert!(
@@ -3982,14 +4048,14 @@ mod tests {
         );
         outcome.expect("run finishes");
         assert!(
-            r.prompts[0].contains("hoist the dup check"),
+            f.agent.prompts()[0].contains("hoist the dup check"),
             "the first turn carried it: {}",
-            r.prompts[0]
+            f.agent.prompts()[0]
         );
         assert!(
-            !r.prompts[1].contains("hoist the dup check"),
+            !f.agent.prompts()[1].contains("hoist the dup check"),
             "and only that turn: {}",
-            r.prompts[1]
+            f.agent.prompts()[1]
         );
         assert!(
             ledger.peek_steers().is_empty(),
@@ -4025,14 +4091,10 @@ mod tests {
             solved: false,
             fail_baseline: false,
         });
-        let mut r = RecordingReporter::default();
+        let r = RecordingReporter::default();
         // The first turn dies in transport (never started); the second runs.
-        r.agent_turns.push_back(AgentTurn {
-            cost: 0.0,
-            is_error: true,
-            error: Some("Connection reset by peer".into()),
-        });
-        let (r, outcome) = run_loop(
+        f.agent.dies(Some(1), "Connection reset by peer");
+        let (_, outcome) = run_loop(
             &f.args,
             &f.paths,
             &f.prepared,
@@ -4046,9 +4108,10 @@ mod tests {
         );
         outcome.expect("run finishes");
 
-        assert!(r.prompts.len() >= 2);
+        assert!(f.agent.prompts().len() >= 2);
         assert!(
-            r.prompts[0].contains("try cache-first") && r.prompts[1].contains("try cache-first"),
+            f.agent.prompts()[0].contains("try cache-first")
+                && f.agent.prompts()[1].contains("try cache-first"),
             "the re-run of the dead iteration carries the steer again"
         );
         assert!(
@@ -4111,7 +4174,7 @@ mod tests {
         )
         .unwrap();
         let mut r = NoteCapture::default();
-        let v = drain_turn_markers(&mut r, &f.paths, None, 1, &AgentTurn::default(), &[]);
+        let v = drain_turn_markers(&mut r, &f.paths, None, &[]);
         assert!(matches!(v, TurnVerdict::Proceed));
         assert_eq!(
             r.waits,
@@ -4123,7 +4186,7 @@ mod tests {
             r#"{"mode":"block","trace_id":"t2","handle":"h2"}"#,
         )
         .unwrap();
-        let v = drain_turn_markers(&mut r, &f.paths, None, 1, &AgentTurn::default(), &[]);
+        let v = drain_turn_markers(&mut r, &f.paths, None, &[]);
         assert!(matches!(v, TurnVerdict::Park(_)));
         assert_eq!(r.waits.len(), 2, "block mode opens the bracket too");
         assert_eq!(r.waits[1].2, provisioning::WaitMode::Block);
@@ -4184,7 +4247,7 @@ mod tests {
             format!("{err:#}").contains("libnvrtc.so not found"),
             "the stderr tail rides the error: {err:#}"
         );
-        assert_eq!(r.agent_calls, 0, "no iteration may be burned");
+        assert_eq!(f.agent.calls(), 0, "no iteration may be burned");
         assert_eq!(r.rows.len(), 1, "just the refusal row: {:?}", r.rows);
         assert_eq!(r.rows[0].decision, "preflight-failed");
         assert_eq!(r.rows[0].iter, 0);

@@ -162,19 +162,15 @@ impl PlaybookRunsQuery {
 pub(crate) async fn list_playbook_runs(
     State(state): State<ApiState>,
     Query(q): Query<PlaybookRunsQuery>,
-) -> Result<Response, AppError> {
-    let filter = match q.into_filter() {
-        Ok(filter) => filter,
-        Err(msg) => return Ok(bad_request(msg)),
-    };
+) -> ApiResult<Json<Vec<PlaybookRunDto>>> {
+    let filter = q.into_filter().map_err(ApiError::BadRequest)?;
     let rows =
         crate::launches::store::list_playbook_runs(state.db.pool(), &filter, RUNS_LIMIT).await?;
     Ok(Json(
         rows.into_iter()
             .map(PlaybookRunDto::from)
             .collect::<Vec<_>>(),
-    )
-    .into_response())
+    ))
 }
 
 /// Where a launch's engine is. A launch is authorized, then dispatched; nothing else stands
@@ -259,7 +255,7 @@ pub struct RerunOfDto {
 pub(crate) async fn get_playbook_run(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let rows =
         crate::launches::store::list_playbook_runs(state.db.pool(), &LaunchFilter::key(&key), 1)
             .await?;
@@ -307,14 +303,14 @@ pub(crate) async fn get_playbook_run(
 }
 
 /// Fold the launch's history into its dispatch state: a run means the engine started, and the
-/// failed attempts are the events [`crate::runs::launch::PLAYBOOK_DISPATCH_FAILED`] stamps.
+/// failed attempts are the events [`crate::runs::claim::PLAYBOOK_DISPATCH_FAILED`] stamps.
 fn dispatch_state(
     events: &[crate::event_log::EventRecord],
     runs: &[crate::runs::model::Run],
 ) -> LaunchDispatchDto {
     let failed: Vec<&crate::event_log::EventRecord> = events
         .iter()
-        .filter(|e| e.reason.as_deref() == Some(crate::runs::launch::PLAYBOOK_DISPATCH_FAILED))
+        .filter(|e| e.reason.as_deref() == Some(crate::runs::claim::PLAYBOOK_DISPATCH_FAILED))
         .collect();
     let last = failed.last();
     let state = if !runs.is_empty() {
@@ -503,7 +499,7 @@ pub(crate) async fn create_one_shot(
     .await
     {
         Ok(s) => s,
-        Err(refusal) => return refusal,
+        Err(refusal) => return refusal.into_response(),
     };
     if let Err(denied) = crate::authz::owner::decide_create(
         &state,
@@ -578,7 +574,7 @@ pub(crate) async fn create_one_shot(
 pub(crate) async fn list_one_shots(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
-) -> Result<Json<Vec<OneShotView>>, AppError> {
+) -> Result<Json<Vec<OneShotView>>, ApiError> {
     let rows =
         crate::launches::one_shots::list(state.db.pool(), crate::launches::one_shots::LIST_LIMIT)
             .await?;
@@ -649,12 +645,12 @@ pub(crate) async fn cancel_one_shot(
                 .into_response();
         }
         Ok(CancelOutcome::Unknown) => return not_found(format!("no one-shot {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     }
     let canceled = match crate::launches::one_shots::get(state.db.pool(), &id).await {
         Ok(Some(row)) => row,
         Ok(None) => return not_found(format!("no one-shot {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
 
     state

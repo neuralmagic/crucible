@@ -2,8 +2,11 @@
 
 use anyhow::{Context, Result, anyhow};
 use clap::ValueEnum;
-use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::batch::v1::{Job, JobSpec};
+use k8s_openapi::api::core::v1::{self as core, Pod};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy)]
 pub enum CacheVolume<'a> {
@@ -26,24 +29,21 @@ pub struct Resources {
 }
 
 impl Resources {
-    fn json(&self) -> Option<serde_json::Value> {
-        fn map(kvs: &[(String, String)]) -> Option<serde_json::Value> {
+    fn requirements(&self) -> Option<core::ResourceRequirements> {
+        let map = |kvs: &[(String, String)]| {
             (!kvs.is_empty()).then(|| {
-                serde_json::Value::Object(
-                    kvs.iter()
-                        .map(|(k, v)| (k.clone(), serde_json::json!(v)))
-                        .collect(),
-                )
+                kvs.iter()
+                    .map(|(k, v)| (k.clone(), Quantity(v.clone())))
+                    .collect::<BTreeMap<_, _>>()
             })
-        }
-        let mut out = serde_json::Map::new();
-        if let Some(r) = map(&self.requests) {
-            out.insert("requests".to_string(), r);
-        }
-        if let Some(l) = map(&self.limits) {
-            out.insert("limits".to_string(), l);
-        }
-        (!out.is_empty()).then_some(serde_json::Value::Object(out))
+        };
+        let requests = map(&self.requests);
+        let limits = map(&self.limits);
+        (requests.is_some() || limits.is_some()).then(|| core::ResourceRequirements {
+            requests,
+            limits,
+            ..Default::default()
+        })
     }
 }
 
@@ -313,182 +313,167 @@ impl Backend {
         }
     }
 
-    pub fn pod_spec(&self, name: &str, namespace: &str, opts: &PodOpts<'_>) -> Result<Pod> {
-        let mut container = match self {
-            Backend::Buildkit => serde_json::json!({
-                "name": "builder",
-                "image": "moby/buildkit:rootless",
-                "command": ["sleep", "7200"],
-                "env": [
-                    // unprivileged pods can't unshare a pid namespace
-                    { "name": "BUILDKITD_FLAGS", "value": "--oci-worker-no-process-sandbox" },
-                    { "name": "HOME", "value": "/home/user" }
-                ],
-                "securityContext": {
-                    "runAsUser": 1000,
-                    "runAsGroup": 1000,
-                    // rootlesskit needs syscalls the default profile masks
-                    "seccompProfile": { "type": "Unconfined" }
-                },
-                "volumeMounts": [{
-                    "name": "buildkit-storage",
-                    "mountPath": "/home/user/.local/share/buildkit"
-                }]
-            }),
-            Backend::Kaniko => serde_json::json!({
-                "name": "builder",
-                "image": "gcr.io/kaniko-project/executor:debug",
-                "command": ["/busybox/sh", "-c", "sleep 7200"]
-            }),
-            Backend::Buildah => serde_json::json!({
-                "name": "builder",
-                "image": "quay.io/buildah/stable:latest",
-                "command": ["sleep", "7200"],
-                // uid 1000 so buildah gets its own userns for layer unpack
-                "securityContext": {
-                    "runAsUser": 1000,
-                    "runAsGroup": 1000
-                },
-                "env": [
-                    { "name": "BUILDAH_ISOLATION", "value": "chroot" },
-                    { "name": "STORAGE_DRIVER", "value": "vfs" },
-                    { "name": "CONTAINERS_STORAGE_CONF", "value": "/tmp/storage.conf" },
-                    { "name": "HOME", "value": "/home/build" }
-                ],
-                "volumeMounts": [{
-                    "name": "containers-storage",
-                    "mountPath": "/home/build/.local/share/containers"
-                }]
-            }),
-        };
-        if let Some(res) = opts.resources.json() {
-            container["resources"] = res;
-        }
-        let mut volumes = match self {
-            Backend::Buildkit => {
-                serde_json::json!([{ "name": "buildkit-storage", "emptyDir": {} }])
-            }
-            Backend::Kaniko => serde_json::json!([]),
-            Backend::Buildah => {
-                serde_json::json!([{ "name": "containers-storage", "emptyDir": {} }])
-            }
-        };
+    pub fn pod_spec(&self, name: &str, namespace: &str, opts: &PodOpts<'_>) -> Pod {
+        let mut container = self.pod_builder_container();
+        container.resources = opts.resources.requirements();
+        let mut volumes = self.storage_volumes();
         if let Some(cache) = opts.cache {
             self.apply_cache(&mut container, &mut volumes, cache);
         }
-        let mut spec = serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Pod",
-            "metadata": {
-                "name": name,
-                "namespace": namespace,
-                "labels": { "app": "buildit", "buildit/backend": self.label() },
-                // Ubuntu nodes' default AppArmor profile denies the mount
-                // syscalls rootless builders need ("remount /: permission
-                // denied" and friends). unconfined or bust.
-                "annotations": {
-                    "container.apparmor.security.beta.kubernetes.io/builder": "unconfined"
-                }
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(self.labels()),
+                annotations: Some(BTreeMap::from([apparmor_unconfined("builder")])),
+                ..Default::default()
             },
-            "spec": {
-                "restartPolicy": "Never",
-                "activeDeadlineSeconds": 7200,
-                "containers": [container],
-                "volumes": volumes
-            }
-        });
-        if matches!(opts.cache, Some(CacheVolume::Pvc(_))) {
-            // fresh PVC filesystems are root:root 0755 (unlike 0777 emptyDirs);
-            // fsGroup lets the uid-1000 builders write to them
-            spec["spec"]["securityContext"] = serde_json::json!({ "fsGroup": 1000 });
+            spec: Some(core::PodSpec {
+                restart_policy: Some("Never".to_string()),
+                active_deadline_seconds: Some(7200),
+                containers: vec![container],
+                volumes: Some(volumes),
+                security_context: matches!(opts.cache, Some(CacheVolume::Pvc(_))).then(|| {
+                    core::PodSecurityContext {
+                        fs_group: Some(1000),
+                        ..Default::default()
+                    }
+                }),
+                init_containers: self.cache_perm_fix(opts.cache).map(|fix| vec![fix]),
+                node_selector: opts.node.map(hostname_selector),
+                affinity: preferred_nodes(opts.idle_nodes),
+                ..Default::default()
+            }),
+            ..Default::default()
         }
-        if let Some(init) = self.cache_perm_fix(opts.cache) {
-            spec["spec"]["initContainers"] = serde_json::json!([init]);
+    }
+
+    fn labels(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("app".to_string(), "buildit".to_string()),
+            ("buildit/backend".to_string(), self.label().to_string()),
+        ])
+    }
+
+    /// The long-lived builder the interactive mode execs into.
+    fn pod_builder_container(&self) -> core::Container {
+        let sleep = Some(vec!["sleep".to_string(), "7200".to_string()]);
+        match self {
+            Backend::Buildkit => core::Container {
+                name: "builder".to_string(),
+                image: Some("moby/buildkit:rootless".to_string()),
+                command: sleep,
+                env: Some(vec![
+                    env("BUILDKITD_FLAGS", "--oci-worker-no-process-sandbox"),
+                    env("HOME", "/home/user"),
+                ]),
+                security_context: Some(run_as_1000(true)),
+                volume_mounts: Some(vec![mount(
+                    "buildkit-storage",
+                    "/home/user/.local/share/buildkit",
+                )]),
+                ..Default::default()
+            },
+            Backend::Kaniko => core::Container {
+                name: "builder".to_string(),
+                image: Some("gcr.io/kaniko-project/executor:debug".to_string()),
+                command: Some(vec![
+                    "/busybox/sh".to_string(),
+                    "-c".to_string(),
+                    "sleep 7200".to_string(),
+                ]),
+                ..Default::default()
+            },
+            Backend::Buildah => core::Container {
+                name: "builder".to_string(),
+                image: Some("quay.io/buildah/stable:latest".to_string()),
+                command: sleep,
+                security_context: Some(run_as_1000(false)),
+                env: Some(buildah_env()),
+                volume_mounts: Some(vec![mount(
+                    "containers-storage",
+                    "/home/build/.local/share/containers",
+                )]),
+                ..Default::default()
+            },
         }
-        if let Some(node) = opts.node {
-            spec["spec"]["nodeSelector"] = serde_json::json!({ "kubernetes.io/hostname": node });
+    }
+
+    /// The backend's own layer store, an emptyDir unless a cache volume replaces it.
+    fn storage_volumes(&self) -> Vec<core::Volume> {
+        match self {
+            Backend::Buildkit => vec![empty_dir("buildkit-storage")],
+            Backend::Kaniko => Vec::new(),
+            Backend::Buildah => vec![empty_dir("containers-storage")],
         }
-        if !opts.idle_nodes.is_empty() {
-            spec["spec"]["affinity"] = serde_json::json!({
-                "nodeAffinity": {
-                    "preferredDuringSchedulingIgnoredDuringExecution": [{
-                        "weight": 100,
-                        "preference": {
-                            "matchExpressions": [{
-                                "key": "kubernetes.io/hostname",
-                                "operator": "In",
-                                "values": opts.idle_nodes
-                            }]
-                        }
-                    }]
-                }
-            });
-        }
-        serde_json::from_value(spec).context("building pod spec")
     }
 
     // point the backend's cache volume at the PVC or hostPath; for kaniko
     // also add the mount (it has no storage volume otherwise) and cache flags
     fn apply_cache(
         &self,
-        container: &mut serde_json::Value,
-        volumes: &mut serde_json::Value,
+        container: &mut core::Container,
+        volumes: &mut Vec<core::Volume>,
         cache: CacheVolume<'_>,
     ) {
         let vol_name = self.cache_volume_name();
-        let source = match cache {
-            CacheVolume::Pvc(name) => {
-                serde_json::json!({ "persistentVolumeClaim": { "claimName": name } })
-            }
-            CacheVolume::HostPath(path) => {
-                serde_json::json!({ "hostPath": { "path": path, "type": "DirectoryOrCreate" } })
-            }
-        };
-        let vols = volumes.as_array_mut().expect("volumes is a json array");
-        vols.retain(|v| v["name"] != vol_name);
-        let mut vol = serde_json::json!({ "name": vol_name });
-        for (k, v) in source.as_object().expect("source is a json object") {
-            vol[k] = v.clone();
-        }
-        vols.push(vol);
+        volumes.retain(|v| v.name != vol_name);
+        volumes.push(match cache {
+            CacheVolume::Pvc(name) => core::Volume {
+                name: vol_name.to_string(),
+                persistent_volume_claim: Some(core::PersistentVolumeClaimVolumeSource {
+                    claim_name: name.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            CacheVolume::HostPath(path) => core::Volume {
+                name: vol_name.to_string(),
+                host_path: Some(core::HostPathVolumeSource {
+                    path: path.to_string(),
+                    type_: Some("DirectoryOrCreate".to_string()),
+                }),
+                ..Default::default()
+            },
+        });
         if let Backend::Kaniko = self {
-            let mounts = container["volumeMounts"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default();
-            let mut mounts = mounts;
-            mounts.push(serde_json::json!({
-                "name": vol_name,
-                "mountPath": self.cache_mount_path()
-            }));
-            container["volumeMounts"] = serde_json::json!(mounts);
+            container
+                .volume_mounts
+                .get_or_insert_with(Vec::new)
+                .push(mount(vol_name, self.cache_mount_path()));
             // kaniko: cache-dir holds base images; layer cache goes to the
             // registry (push failures there are warnings, not errors)
-            if let Some(cmd) = container["command"].as_array_mut() {
-                cmd.push(serde_json::json!("--cache=true"));
-                cmd.push(serde_json::json!(format!(
-                    "--cache-dir={}",
-                    self.cache_mount_path()
-                )));
+            if let Some(cmd) = &mut container.command {
+                cmd.push("--cache=true".to_string());
+                cmd.push(format!("--cache-dir={}", self.cache_mount_path()));
             }
         }
     }
 
     // hostPath dirs come up root:root 0755 and fsGroup doesn't touch them,
     // so rootless builders need a one-shot chmod before they can write
-    fn cache_perm_fix(&self, cache: Option<CacheVolume<'_>>) -> Option<serde_json::Value> {
+    fn cache_perm_fix(&self, cache: Option<CacheVolume<'_>>) -> Option<core::Container> {
         match (cache, self) {
             (Some(CacheVolume::HostPath(_)), Backend::Buildkit | Backend::Buildah) => {
-                Some(serde_json::json!({
-                    "name": "fix-cache-perms",
-                    "image": "busybox:1.36",
-                    "command": ["chmod", "1777", self.cache_mount_path()],
-                    "securityContext": { "runAsUser": 0, "runAsGroup": 0 },
-                    "volumeMounts": [{
-                        "name": self.cache_volume_name(),
-                        "mountPath": self.cache_mount_path()
-                    }]
-                }))
+                Some(core::Container {
+                    name: "fix-cache-perms".to_string(),
+                    image: Some("busybox:1.36".to_string()),
+                    command: Some(vec![
+                        "chmod".to_string(),
+                        "1777".to_string(),
+                        self.cache_mount_path().to_string(),
+                    ]),
+                    security_context: Some(core::SecurityContext {
+                        run_as_user: Some(0),
+                        run_as_group: Some(0),
+                        ..Default::default()
+                    }),
+                    volume_mounts: Some(vec![mount(
+                        self.cache_volume_name(),
+                        self.cache_mount_path(),
+                    )]),
+                    ..Default::default()
+                })
             }
             _ => None,
         }
@@ -504,7 +489,7 @@ impl Backend {
         target: Option<&str>,
         build_args: &[String],
         labels: &[(String, String)],
-    ) -> serde_json::Value {
+    ) -> core::Container {
         let df = format!("/workspace/{dockerfile}");
         let mut container = match self {
             Backend::Buildkit => {
@@ -535,23 +520,21 @@ impl Backend {
                     df = shell_quote(dockerfile),
                     img = shell_quote(image),
                 );
-                serde_json::json!({
-                    "image": "moby/buildkit:rootless",
-                    "command": ["sh", "-c", script],
-                    "env": [
-                        { "name": "BUILDKITD_FLAGS", "value": "--oci-worker-no-process-sandbox" },
-                        { "name": "HOME", "value": "/home/user" },
-                        { "name": "DOCKER_CONFIG", "value": "/auth" }
-                    ],
-                    "securityContext": {
-                        "runAsUser": 1000,
-                        "runAsGroup": 1000,
-                        "seccompProfile": { "type": "Unconfined" }
-                    },
-                    "volumeMounts": [
-                        { "name": "buildkit-storage", "mountPath": "/home/user/.local/share/buildkit" }
-                    ]
-                })
+                core::Container {
+                    image: Some("moby/buildkit:rootless".to_string()),
+                    command: Some(sh(script)),
+                    env: Some(vec![
+                        env("BUILDKITD_FLAGS", "--oci-worker-no-process-sandbox"),
+                        env("HOME", "/home/user"),
+                        env("DOCKER_CONFIG", "/auth"),
+                    ]),
+                    security_context: Some(run_as_1000(true)),
+                    volume_mounts: Some(vec![mount(
+                        "buildkit-storage",
+                        "/home/user/.local/share/buildkit",
+                    )]),
+                    ..Default::default()
+                }
             }
             Backend::Kaniko => {
                 let mut command = vec![
@@ -570,11 +553,12 @@ impl Backend {
                 for (k, v) in labels {
                     command.push(format!("--label={k}={v}"));
                 }
-                serde_json::json!({
-                    "image": "gcr.io/kaniko-project/executor:debug",
-                    "command": command,
-                    "env": [{ "name": "DOCKER_CONFIG", "value": "/auth" }]
-                })
+                core::Container {
+                    image: Some("gcr.io/kaniko-project/executor:debug".to_string()),
+                    command: Some(command),
+                    env: Some(vec![env("DOCKER_CONFIG", "/auth")]),
+                    ..Default::default()
+                }
             }
             Backend::Buildah => {
                 let mut args: String = target
@@ -597,44 +581,32 @@ impl Backend {
                     img = shell_quote(image),
                     df = shell_quote(&df),
                 );
-                serde_json::json!({
-                    "image": "quay.io/buildah/stable:latest",
-                    "command": ["sh", "-c", script],
-                    "env": [
-                        { "name": "BUILDAH_ISOLATION", "value": "chroot" },
-                        { "name": "STORAGE_DRIVER", "value": "vfs" },
-                        { "name": "CONTAINERS_STORAGE_CONF", "value": "/tmp/storage.conf" },
-                        { "name": "HOME", "value": "/home/build" }
-                    ],
-                    "securityContext": { "runAsUser": 1000, "runAsGroup": 1000 },
-                    "volumeMounts": [
-                        { "name": "containers-storage", "mountPath": "/home/build/.local/share/containers" }
-                    ]
-                })
+                core::Container {
+                    image: Some("quay.io/buildah/stable:latest".to_string()),
+                    command: Some(sh(script)),
+                    env: Some(buildah_env()),
+                    security_context: Some(run_as_1000(false)),
+                    volume_mounts: Some(vec![mount(
+                        "containers-storage",
+                        "/home/build/.local/share/containers",
+                    )]),
+                    ..Default::default()
+                }
             }
         };
-        container["name"] = serde_json::json!("builder");
+        container.name = "builder".to_string();
         // carry failure logs in the message when there's no digest to report
-        container["terminationMessagePolicy"] = serde_json::json!("FallbackToLogsOnError");
-        let mounts = container["volumeMounts"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        container.termination_message_policy = Some("FallbackToLogsOnError".to_string());
         let mut all = vec![
-            serde_json::json!({ "name": "workspace", "mountPath": "/workspace" }),
-            serde_json::json!({ "name": "auth", "mountPath": "/auth", "readOnly": true }),
+            mount("workspace", "/workspace"),
+            read_only_mount("auth", "/auth"),
         ];
-        all.extend(mounts);
-        container["volumeMounts"] = serde_json::json!(all);
+        all.extend(container.volume_mounts.take().unwrap_or_default());
+        container.volume_mounts = Some(all);
         container
     }
 
-    pub fn job_spec(
-        &self,
-        name: &str,
-        namespace: &str,
-        args: &crate::job::DetachArgs<'_>,
-    ) -> Result<Job> {
+    pub fn job_spec(&self, name: &str, namespace: &str, args: &crate::job::DetachArgs<'_>) -> Job {
         let mut builder = self.job_builder_container(
             args.image,
             args.dockerfile,
@@ -642,108 +614,186 @@ impl Backend {
             args.build_args,
             args.labels,
         );
-        if let Some(res) = args.resources.json() {
-            builder["resources"] = res;
-        }
-
-        let mut backend_volumes = serde_json::json!(match self {
-            Backend::Buildkit => {
-                vec![serde_json::json!({ "name": "buildkit-storage", "emptyDir": {} })]
-            }
-            Backend::Kaniko => vec![],
-            Backend::Buildah => {
-                vec![serde_json::json!({ "name": "containers-storage", "emptyDir": {} })]
-            }
-        });
+        builder.resources = args.resources.requirements();
+        let mut backend_volumes = self.storage_volumes();
         if let Some(cache) = args.cache {
             self.apply_cache(&mut builder, &mut backend_volumes, cache);
         }
         let mut volumes = vec![
-            serde_json::json!({ "name": "workspace", "emptyDir": {} }),
-            serde_json::json!({
-                "name": "auth",
-                "secret": {
-                    "secretName": name,
-                    "items": [{ "key": ".dockerconfigjson", "path": "config.json" }]
-                }
-            }),
-        ];
-        if let Some(extra) = backend_volumes.as_array() {
-            volumes.extend(extra.iter().cloned());
-        }
-        let mut spec = serde_json::json!({
-            "apiVersion": "batch/v1",
-            "kind": "Job",
-            "metadata": {
-                "name": name,
-                "namespace": namespace,
-                "labels": { "app": "buildit", "buildit/backend": self.label() },
-                "annotations": { "buildit/image": args.image }
+            empty_dir("workspace"),
+            core::Volume {
+                name: "auth".to_string(),
+                secret: Some(core::SecretVolumeSource {
+                    secret_name: Some(name.to_string()),
+                    items: Some(vec![core::KeyToPath {
+                        key: ".dockerconfigjson".to_string(),
+                        path: "config.json".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
             },
-            "spec": {
+        ];
+        volumes.extend(backend_volumes);
+        let fetch_context = core::Container {
+            name: "fetch-context".to_string(),
+            image: Some("gcr.io/go-containerregistry/crane:debug".to_string()),
+            command: Some(sh(
+                "crane export \"$CTX_REF\" - | tar -x -C /workspace".to_string()
+            )),
+            env: Some(vec![
+                env("DOCKER_CONFIG", "/auth"),
+                env("CTX_REF", args.ctx_ref),
+            ]),
+            volume_mounts: Some(vec![
+                mount("workspace", "/workspace"),
+                read_only_mount("auth", "/auth"),
+            ]),
+            ..Default::default()
+        };
+        let mut init = vec![fetch_context];
+        if let Some(fix) = self.cache_perm_fix(args.cache) {
+            init.insert(0, fix);
+        }
+        Job {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(namespace.to_string()),
+                labels: Some(self.labels()),
+                annotations: Some(BTreeMap::from([(
+                    "buildit/image".to_string(),
+                    args.image.to_string(),
+                )])),
+                ..Default::default()
+            },
+            spec: Some(JobSpec {
                 // retries are safe: the context is content-addressed in the registry
-                "backoffLimit": 2,
-                "ttlSecondsAfterFinished": 3600,
-                "activeDeadlineSeconds": 7200,
-                "template": {
-                    "metadata": {
-                        "labels": { "app": "buildit", "buildit/backend": self.label() },
-                        "annotations": {
-                            "container.apparmor.security.beta.kubernetes.io/builder": "unconfined",
-                            "container.apparmor.security.beta.kubernetes.io/fetch-context": "unconfined"
-                        }
-                    },
-                    "spec": {
-                        "restartPolicy": "Never",
+                backoff_limit: Some(2),
+                ttl_seconds_after_finished: Some(3600),
+                active_deadline_seconds: Some(7200),
+                template: core::PodTemplateSpec {
+                    metadata: Some(ObjectMeta {
+                        labels: Some(self.labels()),
+                        annotations: Some(BTreeMap::from([
+                            apparmor_unconfined("builder"),
+                            apparmor_unconfined("fetch-context"),
+                        ])),
+                        ..Default::default()
+                    }),
+                    spec: Some(core::PodSpec {
+                        restart_policy: Some("Never".to_string()),
                         // emptyDir is root:root 0755; fsGroup lets uid-1000 builders read/write it
-                        "securityContext": { "fsGroup": 1000 },
-                        "initContainers": [{
-                            "name": "fetch-context",
-                            "image": "gcr.io/go-containerregistry/crane:debug",
-                            "command": ["sh", "-c", "crane export \"$CTX_REF\" - | tar -x -C /workspace"],
-                            "env": [
-                                { "name": "DOCKER_CONFIG", "value": "/auth" },
-                                { "name": "CTX_REF", "value": args.ctx_ref }
-                            ],
-                            "volumeMounts": [
-                                { "name": "workspace", "mountPath": "/workspace" },
-                                { "name": "auth", "mountPath": "/auth", "readOnly": true }
-                            ]
-                        }],
-                        "containers": [builder],
-                        "volumes": volumes
-                    }
-                }
-            }
-        });
-        if let Some(init) = self.cache_perm_fix(args.cache) {
-            let inits = spec["spec"]["template"]["spec"]["initContainers"]
-                .as_array_mut()
-                .expect("job template has initContainers");
-            inits.insert(0, init);
+                        security_context: Some(core::PodSecurityContext {
+                            fs_group: Some(1000),
+                            ..Default::default()
+                        }),
+                        init_containers: Some(init),
+                        containers: vec![builder],
+                        volumes: Some(volumes),
+                        node_selector: args.node.map(hostname_selector),
+                        affinity: preferred_nodes(args.idle_nodes),
+                        ..Default::default()
+                    }),
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
         }
-        if let Some(node) = args.node {
-            spec["spec"]["template"]["spec"]["nodeSelector"] =
-                serde_json::json!({ "kubernetes.io/hostname": node });
-        }
-        if !args.idle_nodes.is_empty() {
-            spec["spec"]["template"]["spec"]["affinity"] = serde_json::json!({
-                "nodeAffinity": {
-                    "preferredDuringSchedulingIgnoredDuringExecution": [{
-                        "weight": 100,
-                        "preference": {
-                            "matchExpressions": [{
-                                "key": "kubernetes.io/hostname",
-                                "operator": "In",
-                                "values": args.idle_nodes
-                            }]
-                        }
-                    }]
-                }
-            });
-        }
-        serde_json::from_value(spec).context("building job spec")
     }
+}
+
+fn env(name: &str, value: &str) -> core::EnvVar {
+    core::EnvVar {
+        name: name.to_string(),
+        value: Some(value.to_string()),
+        value_from: None,
+    }
+}
+
+fn sh(script: String) -> Vec<String> {
+    vec!["sh".to_string(), "-c".to_string(), script]
+}
+
+fn mount(name: &str, path: &str) -> core::VolumeMount {
+    core::VolumeMount {
+        name: name.to_string(),
+        mount_path: path.to_string(),
+        ..Default::default()
+    }
+}
+
+fn read_only_mount(name: &str, path: &str) -> core::VolumeMount {
+    core::VolumeMount {
+        read_only: Some(true),
+        ..mount(name, path)
+    }
+}
+
+fn empty_dir(name: &str) -> core::Volume {
+    core::Volume {
+        name: name.to_string(),
+        empty_dir: Some(core::EmptyDirVolumeSource::default()),
+        ..Default::default()
+    }
+}
+
+/// uid 1000 so a rootless builder gets its own userns for layer unpack; buildkit's rootlesskit
+/// also needs syscalls the default seccomp profile masks.
+fn run_as_1000(seccomp_unconfined: bool) -> core::SecurityContext {
+    core::SecurityContext {
+        run_as_user: Some(1000),
+        run_as_group: Some(1000),
+        seccomp_profile: seccomp_unconfined.then(|| core::SeccompProfile {
+            type_: "Unconfined".to_string(),
+            localhost_profile: None,
+        }),
+        ..Default::default()
+    }
+}
+
+fn buildah_env() -> Vec<core::EnvVar> {
+    vec![
+        env("BUILDAH_ISOLATION", "chroot"),
+        env("STORAGE_DRIVER", "vfs"),
+        env("CONTAINERS_STORAGE_CONF", "/tmp/storage.conf"),
+        env("HOME", "/home/build"),
+    ]
+}
+
+// Ubuntu nodes' default AppArmor profile denies the mount syscalls rootless
+// builders need ("remount /: permission denied" and friends). unconfined or bust.
+fn apparmor_unconfined(container: &str) -> (String, String) {
+    (
+        format!("container.apparmor.security.beta.kubernetes.io/{container}"),
+        "unconfined".to_string(),
+    )
+}
+
+fn hostname_selector(node: &str) -> BTreeMap<String, String> {
+    BTreeMap::from([("kubernetes.io/hostname".to_string(), node.to_string())])
+}
+
+fn preferred_nodes(idle_nodes: &[String]) -> Option<core::Affinity> {
+    (!idle_nodes.is_empty()).then(|| core::Affinity {
+        node_affinity: Some(core::NodeAffinity {
+            preferred_during_scheduling_ignored_during_execution: Some(vec![
+                core::PreferredSchedulingTerm {
+                    weight: 100,
+                    preference: core::NodeSelectorTerm {
+                        match_expressions: Some(vec![core::NodeSelectorRequirement {
+                            key: "kubernetes.io/hostname".to_string(),
+                            operator: "In".to_string(),
+                            values: Some(idle_nodes.to_vec()),
+                        }]),
+                        ..Default::default()
+                    },
+                },
+            ]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
 }
 
 fn shell_quote(s: &str) -> String {
@@ -873,9 +923,7 @@ mod tests {
                 node: None,
             };
             let cmd = |target| {
-                let job = backend
-                    .job_spec("buildit-abc123", "builds", &args(target))
-                    .unwrap();
+                let job = backend.job_spec("buildit-abc123", "builds", &args(target));
                 job.spec.unwrap().template.spec.unwrap().containers[0]
                     .command
                     .as_deref()
@@ -907,25 +955,23 @@ mod tests {
             limits: vec![("memory".to_string(), "8Gi".to_string())],
         };
         for backend in [Backend::Buildkit, Backend::Buildah, Backend::Kaniko] {
-            let job = backend
-                .job_spec(
-                    "buildit-abc123",
-                    "builds",
-                    &crate::job::DetachArgs {
-                        image: "quay.io/acme/foo:tag",
-                        dockerfile: "Dockerfile",
-                        target: None,
-                        build_args: &["FOO=bar".to_string()],
-                        ctx_ref: "quay.io/acme/foo:buildit-ctx-deadbeef0123",
-                        authfile: b"",
-                        idle_nodes: &["node-a".to_string()],
-                        resources: &resources,
-                        labels: &[("team".to_string(), "infra".to_string())],
-                        cache: Some(crate::backend::CacheVolume::HostPath("/mnt/nvme/c")),
-                        node: Some("nvme-node-1"),
-                    },
-                )
-                .unwrap();
+            let job = backend.job_spec(
+                "buildit-abc123",
+                "builds",
+                &crate::job::DetachArgs {
+                    image: "quay.io/acme/foo:tag",
+                    dockerfile: "Dockerfile",
+                    target: None,
+                    build_args: &["FOO=bar".to_string()],
+                    ctx_ref: "quay.io/acme/foo:buildit-ctx-deadbeef0123",
+                    authfile: b"",
+                    idle_nodes: &["node-a".to_string()],
+                    resources: &resources,
+                    labels: &[("team".to_string(), "infra".to_string())],
+                    cache: Some(crate::backend::CacheVolume::HostPath("/mnt/nvme/c")),
+                    node: Some("nvme-node-1"),
+                },
+            );
             let spec = job.spec.unwrap();
             assert_eq!(spec.backoff_limit, Some(2));
             assert_eq!(spec.ttl_seconds_after_finished, Some(3600));
@@ -1005,9 +1051,7 @@ mod tests {
                 node: Some("nvme-node-1"),
                 ..opts(&[], &empty)
             };
-            let pod = backend
-                .pod_spec("buildit-abc123", "builds", &pvc_opts)
-                .unwrap();
+            let pod = backend.pod_spec("buildit-abc123", "builds", &pvc_opts);
             let spec = pod.spec.unwrap();
             assert_eq!(
                 spec.node_selector.as_ref().unwrap()["kubernetes.io/hostname"],
@@ -1026,9 +1070,7 @@ mod tests {
                 cache: Some(crate::backend::CacheVolume::HostPath("/mnt/nvme/cache")),
                 ..opts(&[], &empty)
             };
-            let pod = backend
-                .pod_spec("buildit-abc123", "builds", &hp_opts)
-                .unwrap();
+            let pod = backend.pod_spec("buildit-abc123", "builds", &hp_opts);
             let spec = pod.spec.unwrap();
             let vols = spec.volumes.unwrap();
             assert!(
@@ -1060,9 +1102,7 @@ mod tests {
             limits: vec![],
         };
         for backend in [Backend::Buildkit, Backend::Buildah, Backend::Kaniko] {
-            let pod = backend
-                .pod_spec("buildit-abc123", "builds", &opts(&[], &cpu2))
-                .unwrap();
+            let pod = backend.pod_spec("buildit-abc123", "builds", &opts(&[], &cpu2));
             let res = pod.spec.as_ref().unwrap().containers[0]
                 .resources
                 .as_ref()
@@ -1078,9 +1118,7 @@ mod tests {
 
             let idle = vec!["node-a".to_string(), "node-b".to_string()];
             let none = Resources::default();
-            let pod = backend
-                .pod_spec("buildit-abc123", "builds", &opts(&idle, &none))
-                .unwrap();
+            let pod = backend.pod_spec("buildit-abc123", "builds", &opts(&idle, &none));
             let affinity = pod.spec.unwrap().affinity.unwrap();
             let prefs = affinity
                 .node_affinity

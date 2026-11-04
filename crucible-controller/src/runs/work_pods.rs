@@ -553,8 +553,8 @@ pub(crate) async fn record_pod_artifact(
     Ok(())
 }
 
-/// The upload pointer for one (pod, kind), or `None`. The fold reads it to resolve + validate a Tier 1
-/// manifest entry against the stored bytes.
+/// The upload pointer for one (pod, kind), or `None`.
+#[cfg(test)]
 #[tracing::instrument(name = "db.pod_artifact", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod = %pod, kind = %kind), err)]
 pub(crate) async fn pod_artifact(
     ex: impl PgExecutor<'_>,
@@ -577,138 +577,6 @@ pub(crate) async fn pod_artifact(
         bytes: r.get("bytes"),
         created_at: r.get("created_at"),
     }))
-}
-
-/// The terminal runs the MLflow exporter still owes a push: a run whose bookkeeping row is absent
-/// or not yet `exported`. `running` runs are skipped — the export is post-fold, over a finished
-/// run's evidence. Ordered oldest-first so a backlog drains in creation order; `limit` bounds one
-/// sweep's batch.
-#[tracing::instrument(name = "db.runs_awaiting_mlflow_export", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
-pub(crate) async fn runs_awaiting_mlflow_export(
-    ex: impl PgExecutor<'_>,
-    limit: i64,
-) -> Result<Vec<String>> {
-    let rows = sqlx::query(
-        r#"
-        SELECT r.run_id
-        FROM runs r
-        LEFT JOIN mlflow_exports m ON m.run_id = r.run_id
-        WHERE r.status != 'running'
-          AND (m.state IS NULL OR m.state != 'exported')
-        ORDER BY r.created_at, r.seq
-        LIMIT $1
-        "#,
-    )
-    .bind(limit)
-    .fetch_all(ex)
-    .await
-    .context("runs_awaiting_mlflow_export")?;
-    Ok(rows.iter().map(|r| r.get::<String, _>("run_id")).collect())
-}
-
-/// Claim a run for an export attempt: upsert its `mlflow_exports` row to `pending` and bump the
-/// attempt counter. Idempotent per sweep; the terminal `mark_mlflow_exported`/`mark_mlflow_failed`
-/// records the outcome.
-#[tracing::instrument(name = "db.mark_mlflow_pending", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
-pub(crate) async fn mark_mlflow_pending(ex: impl PgExecutor<'_>, run_id: &str) -> Result<()> {
-    let now = crate::clock::now_rfc3339();
-    sqlx::query(
-        r#"
-        INSERT INTO mlflow_exports (run_id, state, attempts, created_at, updated_at)
-        VALUES ($1, 'pending', 1, $2, $3)
-        ON CONFLICT(run_id) DO UPDATE SET
-            state = 'pending', attempts = mlflow_exports.attempts + 1, updated_at = excluded.updated_at
-        "#,
-    )
-    .bind(run_id)
-    .bind(&now)
-    .bind(&now)
-    .execute(ex)
-    .await
-    .context("mark_mlflow_pending")?;
-    Ok(())
-}
-
-/// Record a successful export: `exported` plus the tracking-server ids, error cleared. The
-/// idempotency stop — a later sweep skips this run.
-#[tracing::instrument(name = "db.mark_mlflow_exported", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
-pub(crate) async fn mark_mlflow_exported(
-    ex: impl PgExecutor<'_>,
-    run_id: &str,
-    mlflow_run_id: &str,
-    experiment_id: &str,
-) -> Result<()> {
-    let now = crate::clock::now_rfc3339();
-    sqlx::query(
-        r#"
-        UPDATE mlflow_exports
-        SET state = 'exported', mlflow_run_id = $1, experiment_id = $2, error = NULL, updated_at = $3
-        WHERE run_id = $4
-        "#,
-    )
-    .bind(mlflow_run_id)
-    .bind(experiment_id)
-    .bind(now)
-    .bind(run_id)
-    .execute(ex)
-    .await
-    .context("mark_mlflow_exported")?;
-    Ok(())
-}
-
-/// Record a failed export: `failed` with the error preserved, so the next sweep retries loudly
-/// (the ADR's allow-failure ethos — a failed export marks the row and comes back later).
-#[tracing::instrument(name = "db.mark_mlflow_failed", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
-pub(crate) async fn mark_mlflow_failed(
-    ex: impl PgExecutor<'_>,
-    run_id: &str,
-    error: &str,
-) -> Result<()> {
-    let now = crate::clock::now_rfc3339();
-    sqlx::query(
-        r#"UPDATE mlflow_exports SET state = 'failed', error = $1, updated_at = $2 WHERE run_id = $3"#,
-    )
-    .bind(error)
-    .bind(now)
-    .bind(run_id)
-    .execute(ex)
-    .await
-    .context("mark_mlflow_failed")?;
-    Ok(())
-}
-
-/// One run's export bookkeeping row, or `None` if no sweep has touched it yet.
-#[cfg(test)]
-#[tracing::instrument(name = "db.mlflow_export", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
-pub(crate) async fn mlflow_export(
-    ex: impl PgExecutor<'_>,
-    run_id: &str,
-) -> Result<Option<crate::runs::model::MlflowExportRow>> {
-    let row = sqlx::query(
-        r#"SELECT run_id, state, mlflow_run_id, experiment_id, attempts, error, created_at, updated_at
-           FROM mlflow_exports WHERE run_id = $1"#,
-    )
-    .bind(run_id)
-    .fetch_optional(ex)
-    .await
-    .context("mlflow_export")?;
-    row.map(|r| {
-        let state = r
-            .get::<String, _>("state")
-            .parse::<crate::runs::model::MlflowExportState>()
-            .map_err(anyhow::Error::msg)?;
-        Ok(crate::runs::model::MlflowExportRow {
-            run_id: r.get("run_id"),
-            state,
-            mlflow_run_id: r.get("mlflow_run_id"),
-            experiment_id: r.get("experiment_id"),
-            attempts: r.get("attempts"),
-            error: r.get("error"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        })
-    })
-    .transpose()
 }
 
 /// Stash a redispatch justification on the issue row so the awaiting-approval reconcile detects the
@@ -788,55 +656,6 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         assert_eq!(n, 1, "overwrite, not insert");
-        Ok(())
-    }
-
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn mlflow_bookkeeping_is_idempotent_and_resumable(pool: PgPool) -> Result<()> {
-        use crate::runs::model::MlflowExportState;
-
-        // Two terminal runs + one still running; the running one is never a candidate.
-        sqlx::query("INSERT INTO runs (run_id, status) VALUES ('run-a', 'done'), ('run-b', 'failed'), ('run-live', 'running')")
-            .execute(&pool)
-            .await?;
-
-        // Both terminal runs are awaiting export; the running one is excluded.
-        let mut awaiting = runs_awaiting_mlflow_export(&pool, 10).await?;
-        awaiting.sort();
-        assert_eq!(awaiting, vec!["run-a".to_string(), "run-b".to_string()]);
-
-        // Claim + succeed run-a: it leaves the awaiting set (the idempotency stop).
-        mark_mlflow_pending(&pool, "run-a").await?;
-        mark_mlflow_exported(&pool, "run-a", "mlrun-a", "exp-1").await?;
-        let a = mlflow_export(&pool, "run-a").await?.expect("row");
-        assert_eq!(a.state, MlflowExportState::Exported);
-        assert_eq!(a.mlflow_run_id.as_deref(), Some("mlrun-a"));
-        assert_eq!(a.attempts, 1);
-        assert_eq!(
-            runs_awaiting_mlflow_export(&pool, 10).await?,
-            vec!["run-b".to_string()]
-        );
-
-        // Claim + fail run-b: it stays awaiting (resumable) with the error and a bumped attempt.
-        mark_mlflow_pending(&pool, "run-b").await?;
-        mark_mlflow_failed(&pool, "run-b", "connection refused").await?;
-        let b = mlflow_export(&pool, "run-b").await?.expect("row");
-        assert_eq!(b.state, MlflowExportState::Failed);
-        assert_eq!(b.error.as_deref(), Some("connection refused"));
-        assert_eq!(
-            runs_awaiting_mlflow_export(&pool, 10).await?,
-            vec!["run-b".to_string()]
-        );
-
-        // A retry sweep re-claims it (attempts increments), then succeeds and clears the error.
-        mark_mlflow_pending(&pool, "run-b").await?;
-        let b = mlflow_export(&pool, "run-b").await?.expect("row");
-        assert_eq!(b.attempts, 2, "retry bumped the attempt counter");
-        mark_mlflow_exported(&pool, "run-b", "mlrun-b", "exp-1").await?;
-        let b = mlflow_export(&pool, "run-b").await?.expect("row");
-        assert_eq!(b.state, MlflowExportState::Exported);
-        assert_eq!(b.error, None, "success clears the prior failure detail");
-        assert!(runs_awaiting_mlflow_export(&pool, 10).await?.is_empty());
         Ok(())
     }
 }

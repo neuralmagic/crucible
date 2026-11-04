@@ -65,7 +65,7 @@ async fn resource_of(
 ) -> Result<Resource, Response> {
     let owner = crate::authz::transfer::owner_of(state.db.pool(), owned, id)
         .await
-        .map_err(|e| AppError::from(e).into_response())?
+        .map_err(|e| ApiError::from(e).into_response())?
         .ok_or_else(|| not_found(format!("no {} {id:?}", owned.rtype.as_str())))?;
     attach(
         state.db.pool(),
@@ -73,7 +73,7 @@ async fn resource_of(
         Resource::new(owned.rtype, id, owner),
     )
     .await
-    .map_err(|e| AppError::from(e).into_response())
+    .map_err(|e| ApiError::from(e).into_response())
 }
 
 fn event(caller: &Caller, owned: Owned, id: &str, rule: String) -> AuditEvent {
@@ -100,7 +100,7 @@ pub async fn list(state: &ApiState, caller: &Caller, owned: Owned, id: &str) -> 
     }
     let rows = match store::shares_of(state.db.pool(), owned.rtype.as_str(), id).await {
         Ok(rows) => rows,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let now = jiff::Timestamp::now();
     let shares: Vec<ShareDto> = rows
@@ -181,20 +181,20 @@ pub async fn grant(
     };
     let mut tx = match state.db.pool().begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let prior = match store::upsert_share(&mut tx, &row).await {
         Ok(prior) => prior,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let mut audit = event(caller, owned, id, decision.reason());
     audit.prior = prior.as_ref().map(share_json);
     audit.result = Some(share_json(&row));
     if let Err(e) = store::audit(&mut tx, &audit, &now).await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     let status = if prior.is_some() {
         StatusCode::OK
@@ -204,7 +204,7 @@ pub async fn grant(
     match ShareDto::from_row(row, jiff::Timestamp::now()) {
         Some(dto) => (status, Json(dto)).into_response(),
         None => {
-            AppError::from(anyhow::anyhow!("the share's role did not read back")).into_response()
+            ApiError::from(anyhow::anyhow!("the share's role did not read back")).into_response()
         }
     }
 }
@@ -231,21 +231,21 @@ pub async fn revoke(
     };
     let mut tx = match state.db.pool().begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let prior = match store::delete_share(&mut tx, owned.rtype.as_str(), id, grantee).await {
         Ok(Some(prior)) => prior,
         Ok(None) => return not_found(format!("no share of {id} with {grantee}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let now = crate::clock::now_rfc3339();
     let mut audit = event(caller, owned, id, rule);
     audit.prior = Some(share_json(&prior));
     if let Err(e) = store::audit(&mut tx, &audit, &now).await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
+        return ApiError::from(e).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
 }

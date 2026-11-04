@@ -883,8 +883,11 @@ mod tests {
         self, BUILDIT, CLUSTER, EcKey, ISSUER, KUEUE, POD, PREFIX, PROFILE, Spire, now, serve_jwks,
     };
     use crucible::deploy::profile::KubeName;
-    use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
+    use crucible_contract::oauth::Scope;
     use std::collections::HashMap;
+
+    const SCOPE_READ: &str = Scope::KueueRead.as_str();
+    const SCOPE_SUBMIT: &str = Scope::KueueSubmit.as_str();
 
     fn with(claims: Value, edit: impl FnOnce(&mut serde_json::Map<String, Value>)) -> Value {
         let mut claims = claims;

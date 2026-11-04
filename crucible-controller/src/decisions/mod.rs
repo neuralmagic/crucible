@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use utoipa::ToSchema;
 
-use crate::api::state::{ApiState, AppError, ErrorBody};
+use crate::api::state::{ApiError, ApiState, ErrorBody};
 use crate::authz::Caller;
 use crate::authz::action::{Action, ResourceType, Verb};
 use crate::authz::decision::Resource;
@@ -111,11 +111,11 @@ async fn open_request(
             .await
         {
             Ok(issue) => issue.flatten(),
-            Err(e) => return AppError::from(anyhow::Error::from(e)).into_response(),
+            Err(e) => return ApiError::from(anyhow::Error::from(e)).into_response(),
         };
     let (decision, opened) = match store::open(pool, &run_id, launch.as_deref(), &request).await {
         Ok(found) => found,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     if opened {
         publish(&db, &decision, "open").await;
@@ -134,7 +134,7 @@ async fn poll_request(
     match store::get(db.pool(), &id).await {
         Ok(Some(d)) if d.run_id == run_id => Json(d.state()).into_response(),
         Ok(_) => refuse(StatusCode::NOT_FOUND, format!("no decision request {id}")),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -379,7 +379,7 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionRequestDto {
 pub(crate) async fn list_decisions(State(state): State<ApiState>, caller: Caller) -> Response {
     let open = match store::list_open(state.db.pool()).await {
         Ok(open) => open,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let mut answerable = Vec::new();
     for d in open {
@@ -419,7 +419,7 @@ pub(crate) async fn get_decision(
             Json(dto(d, can)).into_response()
         }
         Ok(None) => refuse(StatusCode::NOT_FOUND, format!("no decision request {id}")),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 
@@ -498,11 +498,11 @@ pub(crate) async fn answer_decision(
     let d = match store::get(pool, &id).await {
         Ok(Some(d)) => d,
         Ok(None) => return refuse(StatusCode::NOT_FOUND, format!("no decision request {id}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let owner = match run_owner(pool, &d.run_id).await {
         Ok(owner) => owner,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     let resource = Resource::new(ResourceType::Run, &d.run_id, owner);
     let decision =
@@ -533,7 +533,7 @@ pub(crate) async fn answer_decision(
     };
     let mut tx = match pool.begin().await {
         Ok(tx) => tx,
-        Err(e) => return AppError::from(anyhow::Error::from(e)).into_response(),
+        Err(e) => return ApiError::from(anyhow::Error::from(e)).into_response(),
     };
     let recorded = match store::answer(
         &mut tx,
@@ -546,7 +546,7 @@ pub(crate) async fn answer_decision(
     .await
     {
         Ok(recorded) => recorded,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return ApiError::from(e).into_response(),
     };
     match recorded {
         Ok(true) => {
@@ -558,10 +558,10 @@ pub(crate) async fn answer_decision(
             event.result = serde_json::to_value(&submitted).ok();
             let now = crate::clock::now_rfc3339();
             if let Err(e) = crate::authz::store::audit(&mut tx, &event, &now).await {
-                return AppError::from(e).into_response();
+                return ApiError::from(e).into_response();
             }
             if let Err(e) = tx.commit().await {
-                return AppError::from(anyhow::Error::from(e)).into_response();
+                return ApiError::from(anyhow::Error::from(e)).into_response();
             }
         }
         Ok(false) => {}
@@ -583,7 +583,7 @@ pub(crate) async fn answer_decision(
             Json(dto(answered, false)).into_response()
         }
         Ok(None) => refuse(StatusCode::NOT_FOUND, format!("no decision request {id}")),
-        Err(e) => AppError::from(e).into_response(),
+        Err(e) => ApiError::from(e).into_response(),
     }
 }
 

@@ -4,7 +4,7 @@
 //! are opaque to the server, and the size cap is the `DefaultBodyLimit` layer on the routes,
 //! applied before the JSON is buffered or parsed.
 
-use crate::api::state::{ApiState, AppError, Json};
+use crate::api::state::{ApiError, ApiResult, ApiState, Json};
 use crate::identity::session::BoundSession;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -31,7 +31,7 @@ pub struct PrefsDto {
         (status = 200, description = "The caller's session-stored UI preferences; `{}` when none were ever saved", body = PrefsDto)
     )
 )]
-pub(crate) async fn get_prefs(bound: BoundSession) -> Result<Json<PrefsDto>, AppError> {
+pub(crate) async fn get_prefs(bound: BoundSession) -> Result<Json<PrefsDto>, ApiError> {
     let prefs = bound
         .get::<serde_json::Value>(PREFS_KEY)
         .await?
@@ -52,7 +52,7 @@ pub(crate) async fn get_prefs(bound: BoundSession) -> Result<Json<PrefsDto>, App
 pub(crate) async fn put_prefs(
     mut bound: BoundSession,
     Json(body): Json<PrefsDto>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if bound.identity().is_none() {
         return Ok((
             StatusCode::FORBIDDEN,
@@ -76,7 +76,7 @@ async fn get_document(
     state: &ApiState,
     bound: &BoundSession,
     kind: &str,
-) -> Result<serde_json::Value, AppError> {
+) -> ApiResult<serde_json::Value> {
     let Some(identity) = bound.identity() else {
         return Ok(serde_json::json!({}));
     };
@@ -92,7 +92,7 @@ async fn put_document(
     bound: &BoundSession,
     kind: &str,
     doc: &serde_json::Value,
-) -> Result<Option<Response>, AppError> {
+) -> Result<Option<Response>, ApiError> {
     let Some(identity) = bound.identity() else {
         return Ok(Some(
             (
@@ -116,7 +116,7 @@ async fn put_document(
 pub(crate) async fn get_editor_prefs(
     State(state): State<ApiState>,
     bound: BoundSession,
-) -> Result<Json<EditorPrefsDto>, AppError> {
+) -> Result<Json<EditorPrefsDto>, ApiError> {
     let prefs = get_document(&state, &bound, crate::identity::user_prefs::EDITOR_KIND).await?;
     Ok(Json(EditorPrefsDto { prefs }))
 }
@@ -135,7 +135,7 @@ pub(crate) async fn put_editor_prefs(
     State(state): State<ApiState>,
     bound: BoundSession,
     Json(body): Json<EditorPrefsDto>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Some(refusal) = put_document(
         &state,
         &bound,
@@ -167,7 +167,7 @@ pub struct NoticePrefsDto {
 pub(crate) async fn get_notice_prefs(
     State(state): State<ApiState>,
     bound: BoundSession,
-) -> Result<Json<NoticePrefsDto>, AppError> {
+) -> Result<Json<NoticePrefsDto>, ApiError> {
     let prefs = get_document(&state, &bound, crate::identity::user_prefs::NOTICES_KIND).await?;
     Ok(Json(NoticePrefsDto { prefs }))
 }
@@ -186,7 +186,7 @@ pub(crate) async fn put_notice_prefs(
     State(state): State<ApiState>,
     bound: BoundSession,
     Json(body): Json<NoticePrefsDto>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Some(refusal) = put_document(
         &state,
         &bound,
@@ -218,7 +218,7 @@ pub struct PickerPrefsDto {
 pub(crate) async fn get_picker_prefs(
     State(state): State<ApiState>,
     bound: BoundSession,
-) -> Result<Json<PickerPrefsDto>, AppError> {
+) -> Result<Json<PickerPrefsDto>, ApiError> {
     let prefs = get_document(&state, &bound, crate::identity::user_prefs::PICKERS_KIND).await?;
     Ok(Json(PickerPrefsDto { prefs }))
 }
@@ -237,7 +237,7 @@ pub(crate) async fn put_picker_prefs(
     State(state): State<ApiState>,
     bound: BoundSession,
     Json(body): Json<PickerPrefsDto>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if let Some(refusal) = put_document(
         &state,
         &bound,

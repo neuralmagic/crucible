@@ -9,9 +9,3 @@ pub const PORT: u16 = 8848;
 
 /// Where a loop pod mounts the shared cache's write token, when its builds may write.
 pub const CACHE_TOKEN_FILE: &str = "/etc/buildit-cache/token";
-
-/// OAuth scope to read builds' status and logs.
-pub const SCOPE_READ: &str = "buildit.read";
-
-/// OAuth scope to build, run, push, and clean.
-pub const SCOPE_BUILD: &str = "buildit.build";

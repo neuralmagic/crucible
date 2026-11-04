@@ -62,5 +62,8 @@ changed = [
     "C-SETTLED-JOIN: an all-join task gets no entry for an optional dependency that settled not taken (RFC-0001:C-ROUTE)",
     "C-PLAYBOOK-RESUME: a resume reads the manifest variant the interrupted run read",
     "C-SETTLED-JOIN: a failing evaluation's own note is recorded with its threshold and log handles, and a declared status fails or skips a task whatever its exit status or grade but never passes one",
+    "C-PLAYBOOK-LANE: only a command or evaluate task may declare early completion; any other task's declaration is refused on its session row and the run continues",
+    '''C-TASK-FILES: a mapped instance's key may hold a separator or a dot; its captured and staged directory escapes %, /, \, NUL, and a leading . as %25, %2F, %5C, %00, and %2E, and the key stays raw in names, rows, inputs, and resume''',
+    "C-SETTLED-JOIN: an instance is staged under its own name with its key escaped",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

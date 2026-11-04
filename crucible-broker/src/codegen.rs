@@ -364,14 +364,17 @@ struct SpokeEnv {
 /// feature (the mounted spoke-kubeconfig Secret in a pod, a kubeconfig file path on a laptop);
 /// BROKER_CODEGEN_KUBE_CONTEXT is the laptop-parity context selector.
 fn spoke_from_env() -> Option<SpokeEnv> {
-    let path = env_nonempty("BROKER_CODEGEN_KUBECONFIG")?;
+    let run = crate::build::run_env();
+    let path = run.codegen_kubeconfig?;
     Some(SpokeEnv {
         name: env_or("BROKER_CODEGEN_CLUSTER", "spoke"),
-        tier: env_or("BROKER_CODEGEN_CLUSTER_TIER", "public"),
+        tier: run
+            .codegen_cluster_tier
+            .unwrap_or_else(|| "public".to_string()),
         target: KubeTarget::Kubeconfig {
             path: Some(PathBuf::from(path)),
             context: env_nonempty("BROKER_CODEGEN_KUBE_CONTEXT"),
-            proxy_url: env_nonempty("BROKER_CODEGEN_PROXY_URL"),
+            proxy_url: run.codegen_proxy_url,
         },
     })
 }

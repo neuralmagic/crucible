@@ -254,7 +254,7 @@ goal = "Write a haiku about molten metal."
 | `local` | The harness CLI on this machine, under your login. |
 | `openshell` | An OpenShell sandbox from `sandbox_image`, with deny-by-default egress. |
 
-The harness is `claude`, `codex`, `opencode`, `pi`, or `hermes`. The `--harness` and
+The harness is `claude`, `codex`, `opencode`, or `pi`. The `--harness` and
 `--model` options of `plan run` override the manifest for one run. A task can set its own
 values with `agent(..., harness = "codex", model = "...")`. A real run costs money.
 `--max-cost` limits that cost.

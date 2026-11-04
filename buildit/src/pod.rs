@@ -106,7 +106,7 @@ impl BuilderPod {
         backend: Backend,
         opts: &crate::backend::PodOpts<'_>,
     ) -> Result<Self> {
-        let spec = backend.pod_spec(&unique_name(), namespace, opts)?;
+        let spec = backend.pod_spec(&unique_name(), namespace, opts);
         Self::create_from(client, namespace, &spec).await
     }
 

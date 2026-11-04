@@ -10,6 +10,7 @@ use crate::refine::RoundRecord;
 
 /// Which stage of `ingest [-> propose] -> validate -> freeze` a result belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum StageName {
     Ingest,
@@ -38,6 +39,7 @@ impl std::fmt::Display for StageName {
 /// One stage's result, independent of how the pipeline renders it (console lines or one JSON
 /// object).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct StageResult {
     pub name: StageName,
     pub passed: bool,
@@ -47,6 +49,7 @@ pub struct StageResult {
 /// The whole pipeline's result as one JSON object, for `--json`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct ScopeReport {
+    #[serde(default)]
     pub stages: Vec<StageResult>,
     pub digest: Option<String>,
     /// The `--propose` turn's cost (USD), summed across refine rounds; `None` outside `--propose`.

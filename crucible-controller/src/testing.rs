@@ -30,7 +30,7 @@ pub fn write_exec(path: &std::path::Path, body: &str) {
 
 /// A `ControllerCfg` for tests that drive the daemon against a temp state dir and a fresh test
 /// ledger, every field set explicitly rather than taken from the clap defaults.
-#[cfg(test)]
+#[cfg(all(test, feature = "autoresearch"))]
 pub(crate) fn controller_cfg(
     state_dir: &std::path::Path,
     repos: Vec<String>,
@@ -77,7 +77,7 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
     crate::config::ControllerCfg {
         secret_provider: None,
         owner_refresh: None,
-        auth_mode: crate::identity::auth::AuthMode::Proxy,
+        runtime: Default::default(),
         schedule_owner_ttl_secs: 604800,
         local_secret_allowlist: Vec::new(),
         state_dir: state_dir.to_path_buf(),
@@ -235,6 +235,7 @@ pub(crate) async fn launch_playbook(
             created_by: Some("wren"),
             launcher_groups: None,
             rerun: None,
+            dispatch: Default::default(),
         },
         &crate::playbooks::exposure::Extraction::Absent,
     )

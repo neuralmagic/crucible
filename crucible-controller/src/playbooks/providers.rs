@@ -56,48 +56,45 @@ wire_enum!(ProviderKind, "provider kind", both, {
 });
 
 impl ProviderKind {
+    /// The agent protocol a fixed kind's models are reached through; `None` for the custom kind,
+    /// whose registration names it.
+    pub fn protocol(self) -> Option<InferenceProtocol> {
+        match self {
+            ProviderKind::Anthropic | ProviderKind::Vertex => Some(InferenceProtocol::Messages),
+            ProviderKind::OpenAi => Some(InferenceProtocol::Responses),
+            ProviderKind::Custom => None,
+        }
+    }
+
     /// The harness a registration of this kind runs when it names none; `None` for the custom
     /// kind, whose protocol says.
     pub fn default_harness(self) -> Option<Harness> {
-        match self {
-            ProviderKind::Anthropic | ProviderKind::Vertex => Some(Harness::Claude),
-            ProviderKind::OpenAi => Some(Harness::Codex),
-            ProviderKind::Custom => None,
-        }
+        self.protocol().and_then(InferenceProtocol::default_harness)
     }
 
     /// Every harness that can run this kind's models, the default first; `None` for the custom
-    /// kind, whose protocol says.
-    pub fn harnesses(self) -> Option<&'static [Harness]> {
-        match self {
-            ProviderKind::Anthropic => Some(&[Harness::Claude, Harness::OpenCode, Harness::Pi]),
-            ProviderKind::Vertex => Some(&[Harness::Claude, Harness::Hermes]),
-            ProviderKind::OpenAi => Some(&[Harness::Codex, Harness::OpenCode, Harness::Pi]),
-            ProviderKind::Custom => None,
+    /// kind, whose protocol says. A vertex provider's models run under the harnesses that take
+    /// the ambient Vertex credential.
+    pub fn harnesses(self) -> Option<Vec<Harness>> {
+        let mut harnesses = self.protocol()?.harnesses();
+        if self == ProviderKind::Vertex {
+            harnesses.retain(|h| h.spec().auth.runs_on_ambient_vertex());
         }
+        Some(harnesses)
     }
 }
 
-/// The manifest spelling of a harness.
+/// The manifest spelling of a harness, case-insensitively.
 pub fn parse_harness(name: &str) -> Option<Harness> {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "claude" => Some(Harness::Claude),
-        "hermes" => Some(Harness::Hermes),
-        "codex" => Some(Harness::Codex),
-        "opencode" => Some(Harness::OpenCode),
-        "pi" => Some(Harness::Pi),
-        _ => None,
-    }
+    let name = name.trim();
+    Harness::all()
+        .iter()
+        .copied()
+        .find(|h| h.as_str().eq_ignore_ascii_case(name))
 }
 
 pub fn harness_name(harness: Harness) -> &'static str {
-    match harness {
-        Harness::Claude => "claude",
-        Harness::Hermes => "hermes",
-        Harness::Codex => "codex",
-        Harness::OpenCode => "opencode",
-        Harness::Pi => "pi",
-    }
+    harness.as_str()
 }
 
 /// The harness a registration runs when it names none: the kind's, else its protocol's.
@@ -108,14 +105,10 @@ pub fn default_harness(kind: ProviderKind, protocol: Option<InferenceProtocol>) 
 }
 
 /// The harnesses a registration may name, the default first: the kind's, else its protocol's.
-pub fn allowed_harnesses(
-    kind: ProviderKind,
-    protocol: Option<InferenceProtocol>,
-) -> &'static [Harness] {
-    match kind.harnesses() {
-        Some(harnesses) => harnesses,
-        None => protocol.map_or(&[Harness::Claude], InferenceProtocol::harnesses),
-    }
+pub fn allowed_harnesses(kind: ProviderKind, protocol: Option<InferenceProtocol>) -> Vec<Harness> {
+    kind.harnesses().unwrap_or_else(|| {
+        protocol.map_or_else(|| vec![Harness::Claude], InferenceProtocol::harnesses)
+    })
 }
 
 /// The API a custom provider speaks. An agent protocol has a default harness (plus the others that
@@ -127,11 +120,11 @@ pub fn allowed_harnesses(
 #[serde(rename_all = "snake_case")]
 #[derive(strum::EnumIter)]
 pub enum InferenceProtocol {
-    /// The Anthropic Messages API; Claude Code speaks it, as do opencode and pi.
+    /// The Anthropic Messages API.
     Messages,
     /// The OpenAI Chat Completions API; opencode and pi speak it. The current Codex CLI does not.
     ChatCompletions,
-    /// The OpenAI Responses API (harmony); Codex speaks it over its `responses` wire API, pi too.
+    /// The OpenAI Responses API (harmony).
     Responses,
     /// The System One decision API, which a route task asks.
     SystemOne,
@@ -148,20 +141,36 @@ wire_enum!(InferenceProtocol, "inference protocol", both, {
 });
 
 impl InferenceProtocol {
-    /// The harness that serves the protocol when a registration names none; `None` for a decision
-    /// protocol, which runs no harness.
+    /// The harness that serves the protocol when a registration names none, the one a stored row
+    /// without a harness has always resolved to; `None` for a decision protocol, which runs no
+    /// harness.
     pub fn default_harness(self) -> Option<Harness> {
-        self.harnesses().first().copied()
+        match self {
+            InferenceProtocol::Messages => Some(Harness::Claude),
+            InferenceProtocol::ChatCompletions => Some(Harness::OpenCode),
+            InferenceProtocol::Responses => Some(Harness::Codex),
+            InferenceProtocol::SystemOne | InferenceProtocol::Decisions => None,
+        }
     }
 
-    /// Every harness that speaks the protocol, the default first. Empty for a decision protocol.
-    pub fn harnesses(self) -> &'static [Harness] {
-        match self {
-            InferenceProtocol::Messages => &[Harness::Claude, Harness::OpenCode, Harness::Pi],
-            InferenceProtocol::ChatCompletions => &[Harness::OpenCode, Harness::Pi],
-            InferenceProtocol::Responses => &[Harness::Codex, Harness::Pi],
-            InferenceProtocol::SystemOne | InferenceProtocol::Decisions => &[],
-        }
+    /// Every harness the engine's table says speaks the protocol, the default first and the rest
+    /// in CLI order. Empty for a decision protocol.
+    pub fn harnesses(self) -> Vec<Harness> {
+        let default = self.default_harness();
+        default
+            .into_iter()
+            .chain(
+                Harness::all()
+                    .iter()
+                    .copied()
+                    .filter(|h| Some(*h) != default && self.offered(*h)),
+            )
+            .collect()
+    }
+
+    fn offered(self, harness: Harness) -> bool {
+        harness.speaks(self.wire())
+            && !(self == InferenceProtocol::ChatCompletions && harness == Harness::Codex)
     }
 
     pub fn serves(self, role: ModelRole) -> bool {
@@ -840,10 +849,11 @@ fn provider_binds(new: &NewProvider<'_>) -> Result<ProviderBinds> {
 }
 
 /// The harnesses spelled for a refusal: `claude, opencode, pi`.
-pub fn harness_list(harnesses: &[Harness]) -> String {
+pub fn harness_list(harnesses: impl AsRef<[Harness]>) -> String {
     harnesses
+        .as_ref()
         .iter()
-        .map(|h| harness_name(*h))
+        .map(|h| h.as_str())
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1433,6 +1443,33 @@ mod tests {
         assert_eq!(Decisions.credential_key(), Some("OPENAI_API_KEY"));
     }
 
+    /// The harnesses offered for a protocol are the engine's: whatever its table says speaks it,
+    /// so opencode, which speaks the Responses API through its provider table, is offered for a
+    /// Responses provider.
+    #[test]
+    fn the_harnesses_offered_for_a_protocol_are_the_engines() {
+        use InferenceProtocol::{ChatCompletions, Messages, Responses};
+        assert_eq!(
+            allowed_harnesses(ProviderKind::Custom, Some(Responses)),
+            &[Harness::Codex, Harness::OpenCode, Harness::Pi]
+        );
+        assert!(allowed_harnesses(ProviderKind::OpenAi, None).contains(&Harness::OpenCode));
+        for protocol in [Messages, Responses] {
+            for harness in Harness::all() {
+                assert_eq!(
+                    protocol.harnesses().contains(harness),
+                    harness.speaks(protocol.wire()),
+                    "{harness:?} {protocol:?}"
+                );
+            }
+        }
+        for harness in ChatCompletions.harnesses() {
+            assert!(harness.speaks(ChatCompletions.wire()), "{harness:?}");
+        }
+        assert_eq!(parse_harness(" OpenCode "), Some(Harness::OpenCode));
+        assert_eq!(parse_harness("hermes"), None);
+    }
+
     /// Every protocol the registry stores is one the engine's inference document spells the same
     /// way, so a stored row and the binding rendered from it never disagree.
     #[test]
@@ -1491,10 +1528,11 @@ mod tests {
         );
         assert_eq!(
             allowed_harnesses(ProviderKind::Vertex, None),
-            &[Harness::Claude, Harness::Hermes]
+            &[Harness::Claude, Harness::OpenCode, Harness::Pi],
+            "every harness that takes the ambient Vertex credential, codex excluded"
         );
         assert_eq!(
-            harness_list(&[Harness::OpenCode, Harness::Pi]),
+            harness_list([Harness::OpenCode, Harness::Pi]),
             "opencode, pi"
         );
 

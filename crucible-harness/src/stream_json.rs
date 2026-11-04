@@ -7,8 +7,9 @@
 //! viewer never loses output to schema drift, and so a startup failure claude prints as bare
 //! text reaches the turn's log instead of being dropped.
 
+use crate::line::{LineFormat, raw};
 use crate::otel::{CostHandle, LiveMeters, RateHandle};
-use crucible_contract::event::{AgentEvent, RawStream, Tokens};
+use crucible_contract::event::{AgentEvent, Tokens};
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -89,58 +90,50 @@ impl StreamJsonParser {
         self.tool_io = on;
         self
     }
+}
 
-    /// Decode one line of claude `stream-json`, returning every [`AgentEvent`] it completed.
-    pub fn push(&mut self, line: &str) -> Vec<AgentEvent> {
-        let mut out = Vec::new();
-        let line = line.trim();
-        if line.is_empty() {
-            return out;
-        }
-        let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            out.push(raw(line));
-            return out;
-        };
-
+impl LineFormat for StreamJsonParser {
+    fn line(&mut self, msg: &Value, text: &str, out: &mut Vec<AgentEvent>) {
         match msg.get("type").and_then(Value::as_str) {
-            Some("system") => self.system(&msg, &mut out),
+            Some("system") => self.system(msg, out),
             Some("result") => {
-                self.end_block(&mut out);
-                let is_error = bool_field(&msg, "is_error");
+                self.end_block(out);
+                let is_error = bool_field(msg, "is_error");
                 // Only capture the CLI's text on the error path (`result`, or `error` when the
                 // CLI splits them out); a clean turn's final message would fatten every line.
                 let error = is_error
                     .then(|| {
-                        let r = str_field(&msg, "result");
+                        let r = str_field(msg, "result");
                         if r.is_empty() {
-                            str_field(&msg, "error")
+                            str_field(msg, "error")
                         } else {
                             r
                         }
                     })
                     .filter(|s| !s.is_empty());
-                let cost_usd = f64_field(&msg, "total_cost_usd");
+                let cost_usd = f64_field(msg, "total_cost_usd");
                 self.stream_cost = self.stream_cost.max(cost_usd);
-                out.extend(turn_tokens(&msg, cost_usd));
+                out.extend(turn_tokens(msg, cost_usd));
                 out.push(AgentEvent::Result {
-                    subtype: str_field(&msg, "subtype"),
+                    subtype: str_field(msg, "subtype"),
                     is_error,
-                    turns: u64_field(&msg, "num_turns") as u32,
+                    turns: u64_field(msg, "num_turns") as u32,
                     cost_usd,
                     error,
                 });
             }
-            Some("stream_event") => self.stream_event(&msg, &mut out),
+            Some("stream_event") => self.stream_event(msg, out),
             // `user` echoes carry the tool results.
-            Some("user") => self.tool_results(&msg, &mut out),
+            Some("user") => self.tool_results(msg, out),
             // `assistant` echoes duplicate the text already streamed via `stream_event`, and
             // `rate_limit_event` carries nothing the turn accounts for.
             Some("assistant") | Some("rate_limit_event") => {}
-            _ => out.push(raw(line)),
+            _ => out.push(raw(text)),
         }
-        out
     }
+}
 
+impl StreamJsonParser {
     /// `system/init` -> [`AgentEvent::Init`]; `system/api_retry` -> [`AgentEvent::Retry`].
     fn system(&mut self, msg: &Value, out: &mut Vec<AgentEvent>) {
         match msg.get("subtype").and_then(Value::as_str) {
@@ -569,17 +562,10 @@ fn array_len(v: &Value, key: &str) -> u32 {
         .map_or(0, |a| a.len() as u32)
 }
 
-/// An undecoded stdout line, kept verbatim so nothing the agent printed is lost.
-fn raw(line: &str) -> AgentEvent {
-    AgentEvent::Raw {
-        text: line.to_string(),
-        stream: RawStream::Stdout,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crucible_contract::event::RawStream;
 
     /// Feed a sequence of lines and collect every event produced, in order.
     fn run(lines: &[&str]) -> Vec<AgentEvent> {

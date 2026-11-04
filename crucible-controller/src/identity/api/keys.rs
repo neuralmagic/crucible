@@ -8,7 +8,7 @@
 //! does in a browser, once, deliberately.
 
 use crate::api::dto::{bad_request, forbidden, not_found};
-use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::api::state::{ApiResult, ApiState, ErrorBody, Json};
 use crate::identity::api_key::ApiKey;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -75,7 +75,7 @@ pub(crate) async fn list_keys(
     State(state): State<ApiState>,
     subject: crate::identity::auth::Subject,
     path: crate::identity::auth::AuthPath,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if path == crate::identity::auth::AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -100,7 +100,7 @@ pub(crate) async fn mint_key(
     subject: crate::identity::auth::Subject,
     path: crate::identity::auth::AuthPath,
     Json(body): Json<MintBody>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if path == crate::identity::auth::AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -168,7 +168,7 @@ pub(crate) async fn revoke_key(
     subject: crate::identity::auth::Subject,
     path: crate::identity::auth::AuthPath,
     Path(id): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     if path == crate::identity::auth::AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }

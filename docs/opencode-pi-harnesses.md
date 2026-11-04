@@ -27,7 +27,7 @@ relays the key into the sandbox. The environment selects the API of the turn:
 
 With a controller, these values come from the agent binding of the run in
 `CRUCIBLE_INFERENCE`. The controller renders the binding from the provider of the launch
-([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)).
+([ADR-0065](./adr/ADR-0065.md)).
 The engine sets the variables in the sandbox from the endpoint, protocol, and key of the
 binding. A custom provider with the `chat_completions` protocol becomes `OPENAI_BASE_URL` and
 `OPENAI_API_KEY`. If a turn has neither key, the engine rejects it before the sandbox starts.
@@ -69,7 +69,7 @@ idle signal of the session. In a container, that signal can arrive before the la
 `bash` wrapper. It runs `opencode run`, then `opencode export <session>` into
 `/sandbox/.local/share/opencode/crucible-export.json`. That export is the transcript of the
 turn. It is the only source of the result, the token usage, and the tool spans
-(`backfill_required`, as for hermes). A missing export is a transcript error, never a $0
+(`backfill_required`). A missing export is a transcript error, never a $0
 success.
 
 The `--mode json` stream of Pi comes from its own process and is complete. Pi ends the turn

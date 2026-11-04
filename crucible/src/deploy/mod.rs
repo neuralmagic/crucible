@@ -21,8 +21,8 @@ pub mod spire;
 pub use profile::DeployProfile;
 pub use render::{
     DigestResolver, MANAGED_BY_LABEL, PACK_TARBALL_KEY, PackDelivery, PackPath, PackPathError,
-    PlaybookLaunch, ProposeTier, RUN_INPUTS_KEY, RegistryDigests, RenderOpts, RerunLaunch,
-    TurnKind, TurnOpts, render_turn,
+    PlaybookLaunch, RUN_INPUTS_KEY, RegistryDigests, RenderOpts, RerunLaunch, TurnKind, TurnOpts,
+    render_turn,
 };
 
 use crate::manifest::{self, CompositeManifest, Manifest};

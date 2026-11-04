@@ -381,12 +381,12 @@ impl GatewaySweep {
 impl crate::daemon::queue::DiscoverySource for GatewaySweep {
     fn poll(
         &self,
-        _enqueue: std::sync::Arc<dyn crate::daemon::queue::Enqueue>,
+        _queue: crate::daemon::queue::WorkQueue,
     ) -> crate::daemon::queue::BoxFuture<Result<()>> {
         let db = self.db.clone();
         let cfg = self.cfg.clone();
         Box::pin(async move {
-            sweep_orphan_gateways(&db, active_dispatcher().as_ref(), &cfg).await;
+            sweep_orphan_gateways(&db, cfg.runtime.dispatcher.as_ref(), &cfg).await;
             Ok(())
         })
     }

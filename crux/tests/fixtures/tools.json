@@ -1,0 +1,1283 @@
+[
+  {
+    "description": "Adopt a scenario: create a controller issue with no upstream. Returns the new key. A 422 names the field that failed, verbatim.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "affected_repos": {
+          "description": "Repos this touches. The first is the clone target.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "authoritative": {
+          "default": false,
+          "description": "Whether the body is authoritative (skips grounded ranking).",
+          "type": "boolean"
+        },
+        "body": {
+          "description": "The full ask, as prose. This is what the scoping turn reads.",
+          "type": "string"
+        },
+        "codegen_contract": {
+          "default": null,
+          "description": "A configured broker contract name (see `crucible_contracts`). Omit for local measure.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_ref": {
+          "default": null,
+          "description": "Branch or tag to clone. Omit for the repo's default branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "justification": {
+          "description": "Why the controller should spend money on this.",
+          "type": "string"
+        },
+        "title": {
+          "description": "One-line title.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "body",
+        "affected_repos",
+        "justification"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_adopt"
+  },
+  {
+    "description": "One issue's approval gate: the PR URL to act on and the pack digest under it, plus whether anyone has approved.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Issue key.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_approval"
+  },
+  {
+    "description": "Every scope currently awaiting approval, plus the PRs already kept.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_approvals"
+  },
+  {
+    "description": "Approve a scenario or jira issue's scope pack, opening the approval to a run. GitHub issues approve on their draft PR instead; use crucible_approval for that URL.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Issue key.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_approve"
+  },
+  {
+    "description": "Start a draft from a blueprint: version 1 is its pack. Bindings of the owning team's secrets carry when you are in that team; every other declared secret comes back as a placeholder with its reason. Bind each with crucible_secret_bind at scope_kind `playbook`, scope_id = draft_id; a launch with one unbound is refused. Author it from there like any draft, starting with crucible_draft_pull.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "description": {
+          "default": null,
+          "description": "Omit for the blueprint's.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "draft_id": {
+          "description": "The new draft's id: a lowercase slug no draft or playbook holds.",
+          "type": "string"
+        },
+        "id": {
+          "description": "The blueprint's id, as crucible_blueprints lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_blueprint_use"
+  },
+  {
+    "description": "List the blueprints you can read: ID OWNER REV PUBLIC SECRETS DESCRIPTION. A blueprint is a registered playbook offered as a starting point; SECRETS counts what crucible_blueprint_use would carry for you and what it would leave to bind.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_blueprints"
+  },
+  {
+    "description": "Change an issue's priority. Higher runs sooner.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "type": "string"
+        },
+        "priority": {
+          "description": "The new priority. Higher runs sooner.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "reason": {
+          "default": null,
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key",
+        "priority"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_bump"
+  },
+  {
+    "description": "The broker contract names this controller accepts — the only legal values for crucible_adopt's codegen_contract.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_contracts"
+  },
+  {
+    "description": "Create a draft pack in the authoring studio, seeded from a registered playbook or a minimal skeleton. Returns version 1, its diagnostics, and the studio link; author with crucible_draft_pull and crucible_draft_push from there, test-fire it with crucible_draft_launch, and promote it with crucible_draft_graduate.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "draft_id": {
+          "description": "Lowercase slug; the studio page and every launch of the draft are keyed by it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "template": {
+          "default": null,
+          "description": "A registered playbook id to seed version 1 from; omitted opens on a minimal skeleton.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id",
+        "description"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_create"
+  },
+  {
+    "description": "Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin only. Gone is gone; the id is free for crucible_draft_create again.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_delete"
+  },
+  {
+    "description": "Read a draft pack's files at one save inline: the whole `{path: content}` map, the version, who saved it, and its diagnostics. Use crucible_draft_pull instead for anything bigger than a one-file look — it puts the same files on disk. The version this returns is the base_version a save needs.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "version": {
+          "default": null,
+          "description": "Which save to read. Omit for the newest — which is what a save must be based on.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_files"
+  },
+  {
+    "description": "Graduate a draft to a registered playbook: push its newest compiling version as a branch under repo/path and open the export PR. Returns the PR URL. The draft retires itself once that merged pack is imported. A draft already graduated is refused with the open PR in the refusal.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "path": {
+          "default": null,
+          "description": "The pack directory inside that repo. Omit for the repo root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "description": "`owner/repo` the export PR opens against.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "draft_id",
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_graduate"
+  },
+  {
+    "description": "Test-fire a draft pack. Runs the newest save, validated against its stored schema and held to the same admin cost ceiling a registered launch is. Costs money against max_cost. Returns the issue key to watch it by with crucible_playbook_run. Pass schema_digest to be refused rather than launched if a save landed since you read it. Pass provider (and optionally model) to run the pack's agent tasks on a registered inference provider instead of the crucible.toml [agent] harness and model.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "dispatch_target": {
+          "default": null,
+          "description": "Cluster to dispatch onto. Omit for the controller's default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "max_cost": {
+          "description": "Dollar ceiling for this launch. The controller refuses anything above the admin cap.",
+          "format": "double",
+          "type": "number"
+        },
+        "max_time": {
+          "description": "Wall-clock ceiling, e.g. `30m`, `2h`.",
+          "type": "string"
+        },
+        "model": {
+          "default": null,
+          "description": "The model to ask that provider for, replacing the manifest's `[agent].model`. Needs\n`provider`; omit for the provider's default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {},
+          "description": "The form values the newest save's schema accepts, as strings. Read the schema digest and\nthe diagnostics from crucible_draft_preview first.",
+          "type": "object"
+        },
+        "provider": {
+          "default": null,
+          "description": "Registered inference provider id the run's agent talks to (see GET /api/config/providers),\nreplacing the pack manifest's `[agent]` harness. Omit to resolve through the configured\ndefaults.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "schema_digest": {
+          "default": null,
+          "description": "The schema digest these values were filled against, from crucible_draft_preview. A save\nthat landed since is refused rather than launched against a schema that moved.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id",
+        "max_cost",
+        "max_time"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_launch"
+  },
+  {
+    "description": "What a draft version compiled to, without launching it: the schema digest its params are validated against and the engine's diagnostics. Read this before crucible_draft_launch — a version with no schema digest never compiled and cannot be launched.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "version": {
+          "default": null,
+          "description": "Which save to compile. Omit for the newest — which is what a launch runs.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_preview"
+  },
+  {
+    "description": "Publish a draft with no review: register its newest compiling version as a registered playbook. The draft stays live and publishing it again re-pins the same playbook. Only principals the active policy grants playbook_draft:publish may; everyone else graduates through crucible_draft_graduate.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "playbook": {
+          "default": null,
+          "description": "The playbook id to publish into. Omit to re-pin the one this draft last published into,\nelse the registered pack it was seeded from.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_publish"
+  },
+  {
+    "description": "Write a draft pack's files at one save into a local directory, so you can read, edit and run them with ordinary tools. Returns the version it wrote, which is the base_version crucible_draft_push needs. Prefer this to crucible_draft_files for anything beyond a glance: the files may hold edits a human made in the studio.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "dir": {
+          "description": "The local directory to write the pack into. Created if it does not exist.",
+          "type": "string"
+        },
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "version": {
+          "default": null,
+          "description": "Which save to pull. Omit for the newest — which is what a save must be based on.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "draft_id",
+        "dir"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_pull"
+  },
+  {
+    "description": "Save a local directory back as the next draft version. The directory IS the pack: its whole tree is the save, so a file you deleted on disk is deleted from the pack. Returns the new version, its diagnostics and the studio link. If another editor saved since base_version, nothing is written and the refusal names the version to re-pull and merge onto.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "base_version": {
+          "description": "The version this directory was pulled at, from crucible_draft_pull. A save whose base is\nno longer the newest is refused, not merged.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "dir": {
+          "description": "The local directory holding the pack. Its whole tree is the save.",
+          "type": "string"
+        },
+        "draft_id": {
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "draft_id",
+        "dir",
+        "base_version"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_push"
+  },
+  {
+    "description": "Save a draft pack from an inline file map: the whole map, compiled on save, appended as the next version. A path missing from the map is deleted from the pack, so every file has to be resent — use crucible_draft_push instead for anything bigger than a one-file touch. If another editor saved since base_version, nothing is written and the refusal names the version to re-read and merge onto.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "base_version": {
+          "description": "The version these edits were made against, from crucible_draft_files. A save whose base is\nno longer the newest is refused, not merged.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "draft_id": {
+          "type": "string"
+        },
+        "files": {
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The whole pack, `{path: content}`. A path missing from the map is deleted from the pack.",
+          "type": "object"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "draft_id",
+        "base_version",
+        "files"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_draft_save"
+  },
+  {
+    "description": "A run's task graph in dependency order, each task with its LATEST status, cost, duration and note. Set mermaid=true for a flowchart.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "mermaid": {
+          "default": false,
+          "description": "Emit a mermaid flowchart instead of the ASCII table.",
+          "type": "boolean"
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_graph"
+  },
+  {
+    "description": "One issue in full: provenance, the whole park reason, every scope with its approval PR and pack digest, each run and candidate, and the state-transition trail.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "body_max": {
+          "default": 6000,
+          "description": "Cut the issue body at this many chars. Default 6000.",
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Issue key, e.g. `owner/repo#12` or `scenario:<uuid>`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_issue"
+  },
+  {
+    "description": "List controller issues as a compact table: KEY STATUS TIER REF CONTRACT UPSTREAM TITLE. Scenario issues have no upstream. Filter by kind/status; newest first, capped at `limit` rows (default 50).",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "description": "Return the controller's raw JSON instead of the compact table.",
+          "type": "boolean"
+        },
+        "kind": {
+          "default": null,
+          "description": "Input kind: `github`, `scenario`, or `jira`. Omit for all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "limit": {
+          "default": null,
+          "description": "Max rows. Default 50, applied by this server: the controller returns every match.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "status": {
+          "default": null,
+          "description": "Status, one of `new`, `scoped`, `awaiting-approval`, `building`, `running`, `pr-open`,\n`parked`, `done`. Omit for all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_issues"
+  },
+  {
+    "description": "Launch a playbook. Costs money against max_cost, which the controller caps at the admin ceiling. Returns the issue key to watch it by with crucible_playbook_run. Pass provider (and optionally model) to run the pack's agent tasks on a registered inference provider instead of the crucible.toml [agent] harness and model.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "dispatch_target": {
+          "default": null,
+          "description": "Cluster to dispatch onto. Omit for the controller's default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "description": "Playbook id, as `crucible_playbooks` lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "max_cost": {
+          "description": "Dollar ceiling for this launch. The controller refuses anything above the admin cap.",
+          "format": "double",
+          "type": "number"
+        },
+        "max_time": {
+          "description": "Wall-clock ceiling, e.g. `30m`, `2h`.",
+          "type": "string"
+        },
+        "model": {
+          "default": null,
+          "description": "The model to ask that provider for, replacing the manifest's `[agent].model`. Needs\n`provider`; omit for the provider's default.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "params": {
+          "default": null,
+          "description": "The parameters object its schema accepts. Read `crucible_playbook_schema` first."
+        },
+        "provider": {
+          "default": null,
+          "description": "Registered inference provider id the run's agent talks to (see GET /api/config/providers),\nreplacing the pack manifest's `[agent]` harness. Omit to resolve through the configured\ndefaults.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "max_cost",
+        "max_time"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_launch"
+  },
+  {
+    "description": "Park an issue: stop working it, and record why.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "type": "string"
+        },
+        "reason": {
+          "description": "Why. Required, and it lands in the event log against your name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_park"
+  },
+  {
+    "description": "The admin caps a launch's max_cost and max_time are bounded by. Read before crucible_launch or crucible_draft_launch: asking for more than either is a 422.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_playbook_caps"
+  },
+  {
+    "description": "Propose a playbook pack import: fetch it at a ref, compile it server-side, and store the preview. Returns the import id, the pinned rev, the schema digest, the engine's diagnostics and a preview URL to hand a human. An admin registers it from there.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "description": {
+          "default": null,
+          "description": "The description you propose. Prefills the review page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_ref": {
+          "default": null,
+          "description": "Branch or tag to fetch. Omit for the repo's default branch.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "default": null,
+          "description": "The registry id you propose registering this pack under. Prefills the review page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "path": {
+          "default": null,
+          "description": "The pack directory inside the repo. Omit for the repo root.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "repo": {
+          "description": "`owner/repo` or a clone URL.",
+          "type": "string"
+        },
+        "variant": {
+          "default": null,
+          "description": "The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the base\nmanifest.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "repo"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_playbook_import"
+  },
+  {
+    "description": "One playbook launch whole: its params, caps, and any refusal, as JSON.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "description": "Issue key.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_playbook_run"
+  },
+  {
+    "description": "Playbook launches as a table: KEY PLAYBOOK STATUS N COST/CAP AGENT BY WHY. AGENT is the provider and model the launch pinned, or a dash for the platform default. WHY names what stopped one — a secrets refusal, a park, or a drifted schema.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "playbook": {
+          "default": null,
+          "description": "Only launches of this playbook id.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "default": null,
+          "description": "Status, e.g. `running`, `done`, `parked`. Omit for all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_playbook_runs"
+  },
+  {
+    "description": "The JSON Schema a playbook's params are validated against. Read this before crucible_launch; guessing field names is how a launch 422s.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "Playbook id, as `crucible_playbooks` lists it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_playbook_schema"
+  },
+  {
+    "description": "List registered playbooks: ID REPO REV BY DESCRIPTION. These are what crucible_launch can start.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_playbooks"
+  },
+  {
+    "description": "Wake the controller's reconcile loop. Takes no issue key (it is a full pass), returns before the pass runs, and repeated calls coalesce.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_reconcile"
+  },
+  {
+    "description": "Re-dispatch an issue's run. Costs money; the justification is recorded.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "justification": {
+          "description": "Why this is worth the spend. Recorded against your identity.",
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "key",
+        "justification"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_redispatch"
+  },
+  {
+    "description": "One run with its candidates, as JSON.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "run_id": {
+          "description": "Run id, as `crucible_runs` lists it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_run"
+  },
+  {
+    "description": "One window of a run's engine output, resumable by cursor. A running pod is read live; once it finishes its ingested session is served, which is the only copy that outlives the pod. Returns at most 200 lines and reports the cursor to resume from, so read it in windows rather than expecting the whole log.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "cursor": {
+          "default": null,
+          "description": "Line to resume from, as a previous window's `cursor=` line reported it. Omit to start at\nthe first line the controller served.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "limit": {
+          "default": null,
+          "description": "Lines in this window. Capped at 200, which is also the default.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "run_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "run_id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_run_log"
+  },
+  {
+    "description": "The runs leaderboard: RUN NAME STATUS REPO ISSUE BEST COST CLUSTER CREATED. Filter by status, repo, or the cluster it was dispatched to.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "dispatch_target": {
+          "default": null,
+          "description": "Only runs dispatched to this cluster target.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "limit": {
+          "default": null,
+          "description": "Max rows. The controller's own default is 50.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "repo": {
+          "default": null,
+          "description": "Repository, `owner/repo`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "default": null,
+          "description": "Status, e.g. `running`, `finished`, `incomplete`. Omit for all.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_runs"
+  },
+  {
+    "description": "Recurrences: ID PLAYBOOK CRON STATE NEXT LAST FAILS OWNER. STATE is `blocked` when the owner must sign in again — enabled, and still will not fire.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_schedules"
+  },
+  {
+    "description": "Bind a secret to a scope so a run there receives it. A draft's launch is refused until every `[[secret]]` its manifest declares is bound at scope_kind `playbook`, scope_id = the draft id, by someone who owns the secret. projection is the env var name or the absolute file path the value arrives as.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "declared_name": {
+          "default": null,
+          "description": "The manifest's `[[secret]] name` this binding satisfies. Omit for the secret's own name.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "projection": {
+          "description": "The environment variable name, or the absolute file path.",
+          "type": "string"
+        },
+        "projection_kind": {
+          "description": "`env` or `file`.",
+          "type": "string"
+        },
+        "scope_id": {
+          "type": "string"
+        },
+        "scope_kind": {
+          "description": "`repo`, `playbook`, or `domain`. A draft is a `playbook` scope under its draft id.",
+          "type": "string"
+        },
+        "secret_id": {
+          "description": "The secret's id, as crucible_secrets lists it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "secret_id",
+        "scope_kind",
+        "scope_id",
+        "projection_kind",
+        "projection"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_secret_bind"
+  },
+  {
+    "description": "List the secrets the caller owns: id, name, kind, visibility, mode, owner. Never a value. The id is what crucible_secret_bind takes.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_secrets"
+  },
+  {
+    "description": "One turn with its result and error text intact.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "pod": {
+          "description": "The turn's pod name.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pod"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_turn"
+  },
+  {
+    "description": "List work-pod turns: POD KIND STATE ISSUE CREATED. Filter by issue, kind, or state. Use crucible_turn for one turn's full failure chain.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "issue": {
+          "default": null,
+          "description": "Only turns for this issue key.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "kind": {
+          "default": null,
+          "description": "Work kind: `grounded-rank`, `scope`, or `run`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "default": null,
+          "description": "Lifecycle state: `queued`, `running`, `succeeded`, `failed`, `collected`, `swept`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_turns"
+  },
+  {
+    "description": "Unpark an issue so the controller picks it up again.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "key": {
+          "type": "string"
+        },
+        "reason": {
+          "default": null,
+          "description": "Why it should run again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "key"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_unpark"
+  },
+  {
+    "description": "One tracker watch with its full authorization, as JSON.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "Watch id, as `crucible_watches` lists it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_watch"
+  },
+  {
+    "description": "Tracker watches: ID PLAYBOOK TRACKER QUERY STATE SWEPT LAUNCHED FAILS OWNER. A watch launches its playbook once per item its query matches, never again for the same item. STATE is `blocked` when the owner must sign in again.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_watches"
+  },
+  {
+    "description": "One webhook with its verifier, transform, and authorization, as JSON.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "Webhook id, as `crucible_webhooks` lists it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_webhook"
+  },
+  {
+    "description": "A webhook's recorded deliveries, newest first: ID RECEIVED OUTCOME LAUNCH REASON. OUTCOME is queued until processed, then launched, filtered, duplicate, throttled, or failed.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "id": {
+          "description": "Webhook id, as `crucible_webhooks` lists it.",
+          "type": "string"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "name": "crucible_webhook_deliveries"
+  },
+  {
+    "description": "Webhooks: ID PLAYBOOK VERIFIER STATE RATE DELIVERED FAILS OWNER. A webhook launches its playbook from deliveries a sender outside the controller posts. STATE is `blocked` when the owner must sign in again.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "json": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_webhooks"
+  },
+  {
+    "description": "The endpoint and credential this session actually uses, and who the controller says that makes you. Run this first when a mutation 403s.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "name": "crucible_whoami"
+  }
+]

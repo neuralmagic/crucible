@@ -3,9 +3,8 @@
 //! They are mounted INSIDE the session layer and OUTSIDE the auth guard: signing in is what a
 //! caller with no credential does, so a guard that demanded one first would be a loop.
 //!
-//! Both modes answer here. In proxy mode `/auth/login` and `/auth/logout` are thin redirects onto
-//! the sidecar's own endpoints and `/auth/callback` is a no-op, so the SPA can hold one set of URLs
-//! across the flip and back.
+//! A controller with no issuer runs no login: `/auth/login` answers 404 naming why, `/auth/logout`
+//! and `/auth/callback` send the browser home.
 
 use axum::Router;
 use axum::extract::{Query, State};
@@ -17,28 +16,16 @@ use std::sync::Arc;
 use tower_sessions::Session;
 
 use crate::identity::api_key::constant_time_eq;
-use crate::identity::auth::AuthMode;
 use crate::identity::oidc::{OidcError, OidcProvider};
 
-/// What the routes need: the mode, the issuer (native), the pool the `users` row is written to, and
-/// the sidecar's path prefix (proxy).
+/// What the routes need: the issuer, and the pool the `users` row is written to.
 #[derive(Clone)]
 pub struct AuthState {
-    pub mode: AuthMode,
     pub oidc: Option<Arc<OidcProvider>>,
     pub pool: sqlx::PgPool,
     /// The chart-mounted key the offline credential is sealed under. `None` — no key mounted —
     /// stores no credential, and scheduled launches stay on the schedule-row snapshot.
     pub credential_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
-    /// `auth.proxyPrefix` — where the sidecar's `/start` and `/sign_out` live. Empty is legal: a
-    /// deployment whose registered redirect URI is a bare `/callback` runs with no prefix.
-    pub proxy_prefix: String,
-}
-
-impl AuthState {
-    fn native(&self) -> Option<Arc<OidcProvider>> {
-        self.oidc.clone().filter(|_| self.mode == AuthMode::Native)
-    }
 }
 
 pub fn router(state: AuthState) -> Router {
@@ -120,17 +107,19 @@ fn session_error(context: &str, e: impl std::fmt::Display) -> Response {
     refused(StatusCode::INTERNAL_SERVER_ERROR, "session store error")
 }
 
-/// Start a login. Proxy mode hands the browser to the sidecar; native mode builds the
-/// authorization request, parks its PKCE verifier, nonce, and state on the session, and redirects.
+/// Start a login: build the authorization request, park its PKCE verifier, nonce, and state on the
+/// session, and redirect.
 async fn login(
     State(state): State<AuthState>,
     session: Session,
     Query(query): Query<LoginQuery>,
 ) -> Response {
     let redirect_to = safe_redirect(query.rd);
-    let Some(oidc) = state.native() else {
-        let encoded = urlencode(&redirect_to);
-        return Redirect::to(&format!("{}/start?rd={encoded}", state.proxy_prefix)).into_response();
+    let Some(oidc) = state.oidc.clone() else {
+        return refused(
+            StatusCode::NOT_FOUND,
+            "this controller runs no login: CONTROLLER_OIDC_ISSUER is not configured",
+        );
     };
     let (url, flow) = match oidc.authorize(redirect_to).await {
         Ok(ok) => ok,
@@ -149,8 +138,7 @@ async fn callback(
     session: Session,
     Query(query): Query<CallbackQuery>,
 ) -> Response {
-    let Some(oidc) = state.native() else {
-        // Proxy mode owns its own callback under the sidecar's prefix; this route is inert.
+    let Some(oidc) = state.oidc.clone() else {
         return Redirect::to("/").into_response();
     };
     if query.is_empty() {
@@ -259,10 +247,10 @@ async fn record_login(
     tx.commit().await.context("committing the login write")
 }
 
-/// End a session here, then at the issuer. Proxy mode hands the browser to the sidecar's sign-out.
+/// End a session here, then at the issuer.
 async fn logout(State(state): State<AuthState>, session: Session) -> Response {
-    let Some(oidc) = state.native() else {
-        return Redirect::to(&format!("{}/sign_out", state.proxy_prefix)).into_response();
+    let Some(oidc) = state.oidc.clone() else {
+        return Redirect::to("/").into_response();
     };
     let hint = match crate::identity::session::id_token(&session).await {
         Ok(hint) => hint,
@@ -337,11 +325,9 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_login_write_waits_on_the_credential_lock(pool: sqlx::PgPool) {
         let state = AuthState {
-            mode: AuthMode::Native,
             oidc: None,
             pool: pool.clone(),
             credential_keys: None,
-            proxy_prefix: String::new(),
         };
         let claims = crate::identity::oidc::VerifiedClaims {
             sub: "sub-alice".to_string(),

@@ -24,15 +24,60 @@ use std::sync::Arc;
 /// The reserved cluster name for the controller's own cluster.
 pub const HUB_CLUSTER: &str = "hub";
 
-/// Resolves a personal dispatch target (`personal:<secret id>`) to its kubeconfig YAML.
+/// Resolves a personal dispatch target (`personal:<secret id>`) to its kubeconfig YAML: look the
+/// secret up by the id inside the target name and read its current bytes with the hub's Vault
+/// identity.
 ///
 /// The bytes come out of Vault and are handed straight to `kube`'s in-memory kubeconfig parser —
-/// they are never written to the controller's disk, and never leave through a run API. `Ok(None)`
-/// is a target that no longer exists, which is how a revocation reads once the registry row is
-/// gone.
-#[async_trait::async_trait]
-pub trait PersonalKubeconfigs: Send + Sync {
-    async fn kubeconfig(&self, target: &str) -> Result<Option<String>>;
+/// they are never written to the controller's disk, and never leave through a run API. Deleting the
+/// registry row is the revocation: the lookup misses, the resolver answers `None`, and
+/// [`ClusterClients::evict`] drops whatever client the target had cached.
+pub struct RegistryKubeconfigs {
+    pool: sqlx::PgPool,
+    vault: Arc<crate::secrets::vault::VaultClient>,
+}
+
+impl RegistryKubeconfigs {
+    pub fn new(pool: sqlx::PgPool, vault: Arc<crate::secrets::vault::VaultClient>) -> Self {
+        RegistryKubeconfigs { pool, vault }
+    }
+
+    async fn kubeconfig(&self, target: &str) -> Result<Option<String>> {
+        let Some(id) = personal_secret_id(target) else {
+            return Ok(None);
+        };
+        let Some(secret) = crate::secrets::store::get(&self.pool, id).await? else {
+            return Ok(None);
+        };
+        // The kind and consumer are re-checked at resolution, not just at listing: a row whose
+        // kind was changed out from under a pinned target must stop resolving, not keep working.
+        if secret.kind != crate::secrets::SecretKind::Kubeconfig
+            || secret.consumer != crate::secrets::ConsumerClass::Hub
+        {
+            bail!(
+                "secret {} is not a hub-consumed kubeconfig, so it is not a dispatch target",
+                secret.name
+            );
+        }
+        let owner = secret.owner.clone();
+        let name = secret.name.to_string();
+        let (value, version) = crate::secrets::read::current_value(&self.vault, &secret).await?;
+        let mut conn = self.pool.acquire().await?;
+        crate::secrets::store::audit(
+            &mut conn,
+            &crate::secrets::store::NewAudit {
+                secret_id: Some(id),
+                secret_name: &name,
+                owner: &owner,
+                action: crate::secrets::AuditAction::HubRead,
+                actor: None,
+                subject: None,
+                detail: Some(&format!("dispatch target resolved at version {version}")),
+            },
+        )
+        .await?;
+        Ok(Some(value))
+    }
 }
 
 /// The shared client registry; clients are built lazily. Shared via [`std::sync::Arc`].
@@ -41,7 +86,7 @@ pub struct ClusterClients {
     cache: tokio::sync::RwLock<HashMap<String, kube::Client>>,
     /// How a `personal:` target's kubeconfig is fetched. `None` on a deployment with no secrets
     /// registry, where personal targets cannot exist at all.
-    personal: Option<Arc<dyn PersonalKubeconfigs>>,
+    personal: Option<RegistryKubeconfigs>,
 }
 
 impl ClusterClients {
@@ -56,7 +101,7 @@ impl ClusterClients {
     /// Install the personal-target resolver. Separate from [`ClusterClients::new`] because the
     /// registry it reads needs a database pool and a Vault client, neither of which exists when the
     /// shared clients are first built.
-    pub fn with_personal(mut self, personal: Arc<dyn PersonalKubeconfigs>) -> Self {
+    pub fn with_personal(mut self, personal: RegistryKubeconfigs) -> Self {
         self.personal = Some(personal);
         self
     }

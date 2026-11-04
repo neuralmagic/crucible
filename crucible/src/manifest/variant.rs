@@ -305,4 +305,52 @@ dir = "e2e"
         let base = effective_text(MANIFEST, None).unwrap();
         assert!(!base.contains("[variant"), "{base}");
     }
+
+    /// The controller reads a pack's manifest through [`effective_text`], so the edition and
+    /// every table's `env` list, required and optional entries alike, come through it whichever
+    /// variant is read, and a variant that replaces `[agent]` leaves them alone.
+    #[test]
+    fn effective_text_keeps_the_edition_and_every_declared_env_list() {
+        let manifest = r#"
+edition = 2
+[repo]
+path = "."
+[agent]
+backend = "openshell"
+goal = "g"
+[judge]
+measure_cmd = "./m"
+direction = "higher"
+env = ["KUBECONFIG", "EPP_ENDPOINT?"]
+[world]
+apply_cmd = "./a"
+env = ["REGISTRY_AUTH_FILE", "KUBE_NAMESPACE?"]
+[workflow]
+type = "custom"
+file = "workflow.star"
+env = ["GH_TOKEN", "GPUS?"]
+[variant.offline.agent]
+backend = "command"
+agent_cmd = "true"
+goal = "g"
+"#;
+        let env = |env: &crate::host_env::DeclaredEnv| -> Vec<String> {
+            env.iter().map(ToString::to_string).collect()
+        };
+        for variant in [None, Some(name("offline"))] {
+            let text = effective_text(manifest, variant.as_ref()).unwrap();
+            let m = crate::manifest::Manifest::parse_variant(&text, None, "effective text")
+                .unwrap_or_else(|e| panic!("{variant:?}: {e:#}\n{text}"));
+            assert_eq!(m.edition, crate::manifest::edition::Edition::Two);
+            assert_eq!(
+                env(&m.judge.as_ref().unwrap().env),
+                ["KUBECONFIG", "EPP_ENDPOINT?"]
+            );
+            assert_eq!(env(&m.world.env), ["REGISTRY_AUTH_FILE", "KUBE_NAMESPACE?"]);
+            assert_eq!(
+                env(&m.workflow.as_ref().unwrap().env),
+                ["GH_TOKEN", "GPUS?"]
+            );
+        }
+    }
 }

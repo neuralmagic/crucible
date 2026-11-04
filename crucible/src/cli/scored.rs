@@ -1,7 +1,6 @@
 //! The scored loop's run path: a `crucible.toml` builds the [`World`] + [`Judge`], anchors every
 //! path, picks a front-end, and calls [`crate::runloop::driver::run_loop`].
 
-use crate::agent::harness::HarnessRuntime;
 use crate::args::{Args, Paths, Prepared, Ui};
 use crate::control;
 use crate::control::recovery::{RecoveryPlan, ResumeRecovery, classify_session, plan_recovery};
@@ -90,6 +89,7 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     m.resolve_workflow(&manifest_dir)?;
+    crate::cli::setup::warn_inherited_env(crate::exposure::inherits_engine_env(&m));
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = args
         .state_dir
@@ -142,7 +142,8 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
     // Cross-run memory: seed the prior run's tried-ideas ledger for this goal from S3 (best-effort),
     // so a fresh run (or a future harness version) inherits history instead of re-walking dead ends.
-    let prior = publish::fetch_prior_results(&args.results_bucket, &goal).unwrap_or_default();
+    let prior = publish::fetch_prior_results(args.engine.as_ref(), &args.results_bucket, &goal)
+        .unwrap_or_default();
     if !prior.is_empty() {
         let n = prior.lines().count();
         eprintln!("seeded {n} prior tried-idea row(s) from S3 (cross-run memory)");
@@ -183,8 +184,14 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
+    args.workflow_env = m
+        .workflow
+        .as_ref()
+        .map(crate::plan::workflow::WorkflowCfg::host_env)
+        .transpose()?
+        .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
-    let world = m.build_world(workspace.clone());
+    let world = m.build_world(workspace.clone())?;
     let judge = m.build_judge(workspace, frozen_injects)?;
 
     drive_loop(args, p, prep, world, judge, &m.mcp)
@@ -207,6 +214,7 @@ fn read_seed_diff(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<Option
 /// co-locate under the base so the agent has one cwd / one sandbox upload tree spanning both repos.
 fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     let m = manifest::CompositeManifest::load_frozen(&manifest_path)?;
+    crate::cli::setup::warn_inherited_env(m.edition == manifest::edition::Edition::One);
     let manifest_dir = manifest_path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -281,7 +289,8 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
     args.component_pr_repos = m.component_pr_repos();
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;
-    let prior = publish::fetch_prior_results(&args.results_bucket, &goal).unwrap_or_default();
+    let prior = publish::fetch_prior_results(args.engine.as_ref(), &args.results_bucket, &goal)
+        .unwrap_or_default();
     let prep = Prepared {
         run_id: publish::run_id(&goal),
         prior,
@@ -302,6 +311,12 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = Vec::new();
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
+    args.workflow_env = m
+        .workflow
+        .as_ref()
+        .map(crate::plan::workflow::WorkflowCfg::host_env)
+        .transpose()?
+        .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
     let world = m.build_world(&manifest_dir)?;
     let judge = m.build_judge(&manifest_dir)?;
@@ -363,7 +378,7 @@ fn drive_loop(
     // A signal would otherwise kill the process with this span still open and the batch unflushed,
     // so every rolled loop pod loses its run span. Installed here, where the span exists, rather
     // than behind a static.
-    crate::agent::engine::abort_on_signal(run_span.clone());
+    crate::agent::engine::abort_on_signal(run_span.clone(), args.engine.as_ref());
 
     // The liveness beat runs for the whole loop, parented to the run span so its beats hang off the
     // run in Tempo. Declared AFTER `run_span` so the guard's Drop runs first and the beat is joined
@@ -525,7 +540,7 @@ fn start_mcp<R: report::reporter::Reporter>(
 fn install_ctrlc() -> Result<()> {
     ctrlc::set_handler(|| {
         STOP.store(true, Ordering::SeqCst);
-        crate::process::pid_registry::kill_all();
+        crucible::deadline::terminate_live_children();
         eprintln!("\n[crucible] interrupt received — wrapping up the current step…");
     })
     .context("installing Ctrl+C handler")

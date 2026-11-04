@@ -1,16 +1,17 @@
 #[cfg(feature = "autoresearch")]
-use crate::issues::engine::{self, GroundedVerdict};
+use crate::issues::engine;
 use crate::runs::workpod::*;
 #[cfg(feature = "autoresearch")]
 use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::PodStatus;
+#[cfg(feature = "autoresearch")]
+use crucible_contract::verdict::Ruled;
 
 /// Scrape the verdict off a turn pod's logs: the last `CRUCIBLE_VERDICT:` marker line, robust to the
 /// podman/git chatter ahead of it. The marker's payload is the same verdict JSON the local
 /// subprocess arm parses, so an `{"error":…}` object surfaces as `Err` (the caller keeps the text
 /// tier) via the shared [`engine::verdict_from_json_line`] decoder.
 #[cfg(feature = "autoresearch")]
-pub(crate) fn parse_verdict_logs(logs: &str) -> Result<GroundedVerdict> {
+pub(crate) fn parse_verdict_logs(logs: &str) -> Result<Ruled> {
     let line = logs
         .lines()
         .rev()
@@ -24,18 +25,21 @@ pub(crate) fn parse_verdict_logs(logs: &str) -> Result<GroundedVerdict> {
 /// `CRUCIBLE_SCOPE_TRANSCRIPT:` line (gzip+base64) just before it — attached when present, and
 /// strictly best-effort: a missing or garbled transcript never fails the report.
 #[cfg(feature = "autoresearch")]
-pub(crate) fn parse_scope_report_logs(logs: &str) -> Result<engine::ScopeReport> {
+pub(crate) fn parse_scope_report_logs(logs: &str) -> Result<engine::Scraped> {
     let line = logs
         .lines()
         .rev()
         .find_map(|l| l.trim().strip_prefix(SCOPE_REPORT_MARKER))
         .context("no CRUCIBLE_SCOPE_REPORT marker line in the scope turn pod's logs")?;
-    let mut report: engine::ScopeReport =
-        serde_json::from_str(line.trim()).context("parsing scope report from pod logs")?;
-    report.raw = line.trim().to_string();
-    report.transcript_gz = parse_scope_transcript_logs(logs);
-    (report.pack_tgz, report.pack_error) = parse_scope_pack_logs(logs);
-    Ok(report)
+    let report = serde_json::from_str(line.trim()).context("parsing scope report from pod logs")?;
+    let (pack_tgz, pack_error) = parse_scope_pack_logs(logs);
+    Ok(engine::Scraped {
+        report,
+        raw: line.trim().to_string(),
+        transcript_gz: parse_scope_transcript_logs(logs),
+        pack_tgz,
+        pack_error,
+    })
 }
 
 /// The pack marker's decoded payload (gzip'd tar of the surviving pack dir), plus the reason it's
@@ -213,56 +217,6 @@ fn cap_session_tail(payload: String) -> String {
         cut += i + 1;
     }
     payload[cut..].to_string()
-}
-
-/// A turn pod's terminal phase, as the dispatcher observed it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnPhase {
-    Succeeded,
-    Failed,
-    TimedOut,
-}
-
-/// The terminal outcome [`PodDispatcher::await_terminal`] observed: the pod's [`TurnPhase`] plus the
-/// kubelet-captured termination message when present. Turn pods are single-container, so `message` is
-/// that container's `state.terminated.message`; it is `None` on a timeout, on an OOM/eviction that
-/// wrote nothing, or from an old engine image that only emits the marker (the controller then falls
-/// back to the marker scrape).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TerminalState {
-    pub phase: TurnPhase,
-    pub message: Option<String>,
-}
-
-impl TerminalState {
-    /// The kubelet termination envelope, available only for a terminal pod.
-    #[cfg(feature = "autoresearch")]
-    pub(crate) fn termination_message(&self) -> Option<&str> {
-        match self.phase {
-            TurnPhase::TimedOut => None,
-            TurnPhase::Succeeded | TurnPhase::Failed => self.message.as_deref(),
-        }
-    }
-
-    /// The current container-waiting reason, available only while the pod is non-terminal.
-    pub(crate) fn waiting_detail(&self) -> Option<&str> {
-        match self.phase {
-            TurnPhase::TimedOut => self.message.as_deref(),
-            TurnPhase::Succeeded | TurnPhase::Failed => None,
-        }
-    }
-}
-
-/// The kubelet-captured termination message from pod status. Turn pods are single-container, so this
-/// reads the first container status carrying a terminated state; an empty message (an OOM/eviction
-/// that never wrote the file) collapses to `None`.
-pub(crate) fn terminated_message(status: Option<&PodStatus>) -> Option<String> {
-    status?
-        .container_statuses
-        .as_ref()?
-        .iter()
-        .find_map(|cs| cs.state.as_ref()?.terminated.as_ref()?.message.clone())
-        .filter(|m| !m.trim().is_empty())
 }
 
 #[cfg(test)]

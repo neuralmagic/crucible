@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -68,6 +69,228 @@ impl From<&str> for TaskName {
     fn from(s: &str) -> Self {
         TaskName(s.to_string())
     }
+}
+
+impl TaskName {
+    /// A name as an author wrote it. It must be one path component, since a task's files live
+    /// under `state/files/<name>` and are staged under `inputs/<name>`, and free of the brackets
+    /// a mapped node's instance names are made of.
+    pub fn declared(raw: &str) -> Result<TaskName, TaskNameError> {
+        path_component(raw)?;
+        Ok(TaskName(raw.to_owned()))
+    }
+
+    /// One item of the mapped node `node`, named `node[key]`. The key is the item, never its
+    /// position: a list that comes back reordered or shorter still names the same work the same
+    /// way, which is what makes a folded result on resume safe to match.
+    pub fn instance(node: &TaskName, key: &ItemKey) -> TaskName {
+        TaskName(format!("{}[{}]", node.0, key.0))
+    }
+
+    /// One round of a revise loop, `task[round-N]`. It shares the instance naming, so a reader
+    /// groups rounds under their task the way it groups a fan-out's items.
+    pub fn round(task: &TaskName, round: u32) -> TaskName {
+        TaskName(format!("{}[round-{round}]", task.0))
+    }
+
+    /// One of the executor's reserved input keys ([`RESERVED_INPUTS`], [`FILES_INPUT`]), which
+    /// no declared task may be named after.
+    pub fn reserved(key: &'static str) -> TaskName {
+        TaskName(key.to_owned())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The node and bracketed key this name is an instance or round of; `None` for a declared
+    /// name. A declared name may not contain a bracket, so the split is exact.
+    pub fn instance_of(&self) -> Option<(&str, &str)> {
+        let (node, rest) = self.0.split_once('[')?;
+        Some((node, rest.strip_suffix(']')?))
+    }
+
+    pub fn is_instance_of(&self, node: &TaskName) -> bool {
+        self.instance_of().is_some_and(|(n, _)| n == node.0)
+    }
+
+    /// The one path component this task's captured and staged files live under: the name, with
+    /// an instance's key escaped by [`escape_key`]. Everything else names the task by its raw
+    /// name.
+    pub fn dir_name(&self) -> Cow<'_, str> {
+        match self.instance_of() {
+            Some((node, key)) => match escape_key(key) {
+                Cow::Borrowed(_) => Cow::Borrowed(&self.0),
+                Cow::Owned(escaped) => Cow::Owned(format!("{node}[{escaped}]")),
+            },
+            None => Cow::Borrowed(&self.0),
+        }
+    }
+
+    /// The task whose files live under directory `dir`: the inverse of [`TaskName::dir_name`].
+    /// A `%` that starts none of [`escape_key`]'s escapes is kept as written.
+    pub fn from_dir_name(dir: &str) -> TaskName {
+        match TaskName(dir.to_owned()).instance_of() {
+            Some((node, key)) => TaskName(format!("{node}[{}]", unescape_key(key))),
+            None => TaskName(dir.to_owned()),
+        }
+    }
+
+    /// The node a settled row belongs to: a mapped instance `x[key]` and a revise round
+    /// `x[round-N]` both belong to `x`; a declared name belongs to itself.
+    pub fn node(&self) -> TaskName {
+        match self.instance_of() {
+            Some((node, _)) => TaskName(node.to_owned()),
+            None => self.clone(),
+        }
+    }
+}
+
+/// One item of a mapped node's list, as the key its instance is named with. Any string but an
+/// empty one or one holding the brackets an instance's name is made of; where the key forms a
+/// directory it is escaped ([`TaskName::dir_name`]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ItemKey(String);
+
+impl ItemKey {
+    pub fn new(raw: &str) -> Result<ItemKey, ItemKeyError> {
+        if raw.is_empty() {
+            return Err(ItemKeyError::Empty);
+        }
+        if raw.contains(['[', ']']) {
+            return Err(ItemKeyError::Bracket {
+                key: raw.to_owned(),
+            });
+        }
+        Ok(ItemKey(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ItemKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Why [`ItemKey::new`] refused an item.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ItemKeyError {
+    #[error("an empty item names no instance")]
+    Empty,
+    #[error(
+        "item {key:?} contains `[` or `]`, which delimit the key in an instance's name \
+         `node[item]`"
+    )]
+    Bracket { key: String },
+}
+
+/// What [`escape_key`] writes for each character it escapes; `.` only where it leads the key.
+const KEY_ESCAPES: [(char, &str); 5] = [
+    ('%', "%25"),
+    ('/', "%2F"),
+    ('\\', "%5C"),
+    ('\0', "%00"),
+    ('.', "%2E"),
+];
+
+/// A fan-out key as part of one path component. `%`, `/`, `\`, NUL, and a leading `.` become
+/// `%25`, `%2F`, `%5C`, `%00`, and `%2E`; every other character is kept. Every `%` in the result
+/// starts an escape, so two keys never escape to the same text.
+fn escape_key(key: &str) -> Cow<'_, str> {
+    if !key.starts_with('.') && !key.contains(['%', '/', '\\', '\0']) {
+        return Cow::Borrowed(key);
+    }
+    let mut escaped = String::with_capacity(key.len() + 6);
+    for (at, c) in key.char_indices() {
+        match KEY_ESCAPES.iter().find(|(raw, _)| *raw == c) {
+            Some((_, escape)) if c != '.' || at == 0 => escaped.push_str(escape),
+            _ => escaped.push(c),
+        }
+    }
+    Cow::Owned(escaped)
+}
+
+/// Undo [`escape_key`]. Every `%` it wrote starts one of [`KEY_ESCAPES`], so reading them left to
+/// right recovers the key exactly.
+fn unescape_key(escaped: &str) -> Cow<'_, str> {
+    if !escaped.contains('%') {
+        return Cow::Borrowed(escaped);
+    }
+    let mut key = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some(at) = rest.find('%') {
+        key.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        match KEY_ESCAPES
+            .iter()
+            .find(|(_, escape)| tail.starts_with(escape))
+        {
+            Some((raw, escape)) => {
+                key.push(*raw);
+                rest = &tail[escape.len()..];
+            }
+            None => {
+                key.push('%');
+                rest = &tail[1..];
+            }
+        }
+    }
+    key.push_str(rest);
+    Cow::Owned(key)
+}
+
+fn path_component(raw: &str) -> Result<(), TaskNameError> {
+    if raw.trim().is_empty() {
+        return Err(TaskNameError::Empty);
+    }
+    if raw.contains(['[', ']']) {
+        return Err(TaskNameError::Bracket {
+            name: raw.to_owned(),
+        });
+    }
+    if matches!(raw, "." | "..") {
+        return Err(TaskNameError::DotComponent {
+            name: raw.to_owned(),
+        });
+    }
+    if let Some(separator) = raw.chars().find(|c| matches!(c, '/' | '\\')) {
+        return Err(TaskNameError::Separator {
+            name: raw.to_owned(),
+            separator,
+            suggest: raw.replace(['/', '\\'], "-"),
+        });
+    }
+    Ok(())
+}
+
+/// Why [`TaskName::declared`] refused a name.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TaskNameError {
+    #[error("a task has an empty name")]
+    Empty,
+    #[error(
+        "task name {name:?} contains `[` or `]`. Those are reserved for a mapped node's \
+         instances, which are named `node[item]`."
+    )]
+    Bracket { name: String },
+    #[error(
+        "task name {name:?} is a relative path component; a task's files are kept in a \
+         directory named after it"
+    )]
+    DotComponent { name: String },
+    #[error(
+        "task name {name:?} contains {separator:?}; a task's files are kept in a directory \
+         named after it, so the name is one path component (try {suggest:?})"
+    )]
+    Separator {
+        name: String,
+        separator: char,
+        suggest: String,
+    },
 }
 
 /// A field name a task promises to include in its JSON output.
@@ -388,6 +611,12 @@ impl TaskKind {
     }
 
     /// Whether an attempt of this kind asks a model, and so draws on the run's cost ceiling.
+    /// Whether a passing result of this kind may end a playbook run early: a command or evaluate
+    /// task may, a model's output may not.
+    pub fn may_complete_early(&self) -> bool {
+        matches!(self, TaskKind::Command { .. } | TaskKind::Evaluate { .. })
+    }
+
     pub fn spends(&self) -> bool {
         match self {
             TaskKind::Agent { .. }
@@ -821,8 +1050,8 @@ pub enum PlanError {
     NoTasks,
     #[error("plan budget.usd must be a positive number, got {usd}")]
     NonPositiveBudget { usd: f64 },
-    #[error("task #{index} has an empty name")]
-    EmptyTaskName { index: usize },
+    #[error(transparent)]
+    TaskName(#[from] TaskNameError),
     #[error("duplicate task name {task:?}")]
     DuplicateTask { task: String },
     #[error("task {task:?} depends on itself")]
@@ -945,11 +1174,6 @@ pub enum PlanError {
         first: String,
         second: String,
     },
-    #[error(
-        "task {task:?} contains `[` or `]`; those are reserved for a mapped node's instance \
-         names, which are synthesized as `node[item]`"
-    )]
-    BracketInTaskName { task: String },
     #[error(
         "task {task:?} maps over {reference} but does not depend on {producer:?}; a fan-out \
          reads its items from a dependency's output"
@@ -1625,14 +1849,7 @@ impl Plan {
             }
         }
         for (i, t) in self.tasks.iter().enumerate() {
-            if t.name.0.trim().is_empty() {
-                return Err(PlanError::EmptyTaskName { index: i });
-            }
-            if t.name.0.contains(['[', ']']) {
-                return Err(PlanError::BracketInTaskName {
-                    task: t.name.0.clone(),
-                });
-            }
+            TaskName::declared(&t.name.0)?;
             if index.insert(&t.name, i).is_some() {
                 return Err(PlanError::DuplicateTask {
                     task: t.name.0.clone(),
@@ -4800,6 +5017,157 @@ emits = ["lines"]
     }
     /// A plan that arrives as JSON never passes through the starlark front end, so the
     /// structural facts about a mapped node are checked here or nowhere.
+    /// A task's files live under `state/files/<name>` and are staged under `inputs/<name>`, so a
+    /// name that climbs, roots, or nests a path would put them outside that directory or on top
+    /// of another task's. The JSON route is what a plan file or the controller hands the engine,
+    /// so the rule holds there as well as at compile.
+    #[test]
+    fn a_task_name_that_is_not_one_path_component_does_not_validate() {
+        let refuse = |name: &str| -> PlanError {
+            let json = serde_json::to_string(&plan(vec![agent(name, &[])])).unwrap();
+            Plan::from_json_str(&json)
+                .unwrap()
+                .validate()
+                .expect_err(name)
+        };
+        for name in ["", "  "] {
+            assert_eq!(refuse(name), PlanError::TaskName(TaskNameError::Empty));
+        }
+        for name in [".", ".."] {
+            assert_eq!(
+                refuse(name),
+                PlanError::TaskName(TaskNameError::DotComponent { name: name.into() })
+            );
+        }
+        for (name, separator, suggest) in [
+            ("/x", '/', "-x"),
+            ("a/b", '/', "a-b"),
+            ("../escape", '/', "..-escape"),
+            ("a\\b", '\\', "a-b"),
+        ] {
+            let error = refuse(name);
+            assert_eq!(
+                error,
+                PlanError::TaskName(TaskNameError::Separator {
+                    name: name.into(),
+                    separator,
+                    suggest: suggest.into(),
+                })
+            );
+            assert!(
+                error.to_string().contains(&format!("{suggest:?}")),
+                "{error}"
+            );
+        }
+        for name in ["review", "review-1.final", "...", ".hidden", "a b"] {
+            plan(vec![agent(name, &[])])
+                .validate()
+                .unwrap_or_else(|error| panic!("{name:?}: {error}"));
+        }
+    }
+
+    /// A fan-out key is runtime data: a list a producer returned may hold a repo slug, a
+    /// relative path, or a dotfile, and each names an instance. Only an empty item and one with
+    /// the brackets an instance's name is made of are refused.
+    #[test]
+    fn an_item_key_is_any_string_but_an_empty_one_or_one_with_a_bracket() {
+        for key in [
+            "llm-d/llm-d-router",
+            "..",
+            ".",
+            "../../escape",
+            "/abs",
+            "a\\b",
+            "50%",
+            "nul\0byte",
+            "  ",
+        ] {
+            assert_eq!(ItemKey::new(key).unwrap().as_str(), key);
+        }
+        assert_eq!(ItemKey::new(""), Err(ItemKeyError::Empty));
+        for key in ["a[b", "a]b", "[x]"] {
+            let error = ItemKey::new(key).unwrap_err();
+            assert_eq!(error, ItemKeyError::Bracket { key: key.into() });
+            assert!(error.to_string().contains(&format!("{key:?}")), "{error}");
+        }
+    }
+
+    fn instance_dir(key: &str) -> String {
+        TaskName::instance(&"audit".into(), &ItemKey::new(key).unwrap())
+            .dir_name()
+            .into_owned()
+    }
+
+    /// The escape table: `%`, `/`, `\`, NUL, and a leading `.` are percent-encoded, nothing else
+    /// is, and the instance's name keeps the raw key.
+    #[test]
+    fn an_instance_directory_escapes_its_key_into_one_path_component() {
+        for (key, dir) in [
+            ("alpha", "audit[alpha]"),
+            ("llm-d/llm-d-router", "audit[llm-d%2Fllm-d-router]"),
+            ("..", "audit[%2E.]"),
+            (".", "audit[%2E]"),
+            ("../../escape", "audit[%2E.%2F..%2Fescape]"),
+            (".hidden", "audit[%2Ehidden]"),
+            ("a.b", "audit[a.b]"),
+            ("/abs", "audit[%2Fabs]"),
+            ("a\\b", "audit[a%5Cb]"),
+            ("50%", "audit[50%25]"),
+            ("a%2Fb", "audit[a%252Fb]"),
+            ("nul\0byte", "audit[nul%00byte]"),
+            ("é/ü", "audit[é%2Fü]"),
+        ] {
+            assert_eq!(instance_dir(key), dir, "{key:?}");
+            let name = TaskName::instance(&"audit".into(), &ItemKey::new(key).unwrap());
+            assert_eq!(name.as_str(), format!("audit[{key}]"), "the name stays raw");
+            assert_eq!(name.instance_of(), Some(("audit", key)));
+        }
+        for declared in ["audit", "review-1.final", "history"] {
+            assert_eq!(TaskName::from(declared).dir_name(), declared);
+        }
+        assert_eq!(TaskName::round(&"fix".into(), 2).dir_name(), "fix[round-2]");
+    }
+
+    /// Decoding the escape recovers every key, so no two keys share a directory and none climbs
+    /// out of the one it is joined onto.
+    #[test]
+    fn distinct_keys_escape_to_distinct_directories_and_back() {
+        let keys = [
+            "a/b", "a%2Fb", "a%252Fb", "%2Fa", "/a", ".a", "%2Ea", "a\\b", "a%5Cb", "a\0", "a%00",
+            "..", "%2E.", ".", "%", "%%", "%zz", "plain",
+        ];
+        let mut dirs = std::collections::BTreeSet::new();
+        for key in keys {
+            let dir = instance_dir(key);
+            let escaped = dir
+                .strip_prefix("audit[")
+                .and_then(|d| d.strip_suffix(']'))
+                .unwrap();
+            assert_eq!(
+                TaskName::from_dir_name(&dir),
+                TaskName::instance(&"audit".into(), &ItemKey::new(key).unwrap()),
+                "{dir}"
+            );
+            assert!(!escaped.contains(['/', '\\', '\0']), "{dir}");
+            assert!(!escaped.starts_with('.'), "{dir}");
+            assert!(dirs.insert(dir.clone()), "{key:?} shares {dir}");
+            let root = std::path::Path::new("files");
+            assert_eq!(
+                root.join(&dir).parent(),
+                Some(root),
+                "{dir} is one component"
+            );
+        }
+        for name in ["audit", "fix[round-2]", "audit[plain]"] {
+            assert_eq!(TaskName::from_dir_name(name), TaskName::from(name));
+        }
+        assert_eq!(
+            TaskName::from_dir_name("audit[50%zz]"),
+            TaskName::from("audit[50%zz]"),
+            "a % that starts no escape is kept as written"
+        );
+    }
+
     #[test]
     fn validate_checks_a_mapped_node_on_the_json_route() {
         let mapped = |over: Option<OutputRef>, max_fanout: Option<u32>, deps: &[&str]| {
@@ -4822,9 +5190,9 @@ emits = ["lines"]
 
         assert_eq!(
             refuse(vec![agent("audit[x]", &[])]),
-            PlanError::BracketInTaskName {
-                task: "audit[x]".into()
-            }
+            PlanError::TaskName(TaskNameError::Bracket {
+                name: "audit[x]".into()
+            })
         );
         assert_eq!(
             refuse(vec![

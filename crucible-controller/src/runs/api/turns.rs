@@ -106,7 +106,7 @@ impl TurnsQuery {
 pub(crate) async fn list_turns(
     State(state): State<ApiState>,
     Query(q): Query<TurnsQuery>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let (state_filter, kind_filter, limit) = match q.into_filters() {
         Ok(f) => f,
         Err(msg) => {
@@ -139,7 +139,7 @@ pub(crate) async fn list_turns(
 pub(crate) async fn get_turn(
     State(state): State<ApiState>,
     Path(pod_name): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     match crate::runs::work_pods::get_work_pod(state.db.pool(), &pod_name).await? {
         Some(row) => Ok(Json(WorkPodDto::from(row)).into_response()),
         None => Ok(not_found(format!("turn not found: {pod_name}"))),

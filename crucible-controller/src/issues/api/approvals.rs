@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 pub(crate) async fn get_approvals(
     State(state): State<ApiState>,
     caller: crate::authz::Caller,
-) -> Result<Json<ApprovalsDto>, AppError> {
+) -> Result<Json<ApprovalsDto>, ApiError> {
     let imports = crate::playbooks::imports::pending(state.db.pool()).await?;
     #[cfg(feature = "autoresearch")]
     let (awaiting, prs) = if crate::authz::entitlement::autoresearch(&state, &caller) {
@@ -66,7 +66,7 @@ pub(crate) async fn get_approvals(
 pub(crate) async fn get_scope_evidence(
     State(state): State<ApiState>,
     Path(scope_id): Path<i64>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(scope) = crate::issues::store::get_scope_by_id(state.db.pool(), scope_id).await?
     else {
         return Ok(not_found(format!("scope not found: {scope_id}")));
@@ -105,7 +105,7 @@ pub(crate) async fn get_scope_evidence(
 pub(crate) async fn get_scope_report(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     let Some(row) = crate::issues::store::latest_scope_report(state.db.pool(), &key).await? else {
         return Ok(not_found(format!("no scope report for: {key}")));
     };
@@ -131,7 +131,7 @@ pub(crate) async fn get_scope_report(
 pub(crate) async fn get_scope_transcript(
     State(state): State<ApiState>,
     Path(key): Path<String>,
-) -> Result<Response, AppError> {
+) -> ApiResult<Response> {
     use anyhow::Context as _;
     use std::io::Read as _;
     let Some(row) = crate::issues::store::latest_scope_transcript(state.db.pool(), &key).await?

@@ -9,6 +9,8 @@
 
 use crate::manifest::Harness;
 use anyhow::{Context, Result};
+use crucible::harness::ApiFamily;
+use crucible::openshell::endpoint::Endpoint;
 use crucible_contract::inference::{
     InferenceBinding, InferenceProtocol, InferenceRole, TokenPrice,
 };
@@ -82,32 +84,13 @@ pub struct AgentSelection {
     pub price: Option<TokenPrice>,
 }
 
-/// Whether `harness` is a client of `protocol`.
-pub fn speaks(harness: Harness, protocol: InferenceProtocol) -> bool {
-    match protocol {
-        InferenceProtocol::Messages => matches!(
-            harness,
-            Harness::Claude | Harness::Hermes | Harness::OpenCode | Harness::Pi
-        ),
-        InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => {
-            matches!(harness, Harness::Codex | Harness::OpenCode | Harness::Pi)
-        }
-        InferenceProtocol::SystemOne | InferenceProtocol::Decisions => false,
-    }
-}
-
 impl AgentSelection {
     /// `preferred` when it speaks the binding's protocol, else the harness that does.
     pub fn harness(&self, preferred: Harness) -> Harness {
-        if speaks(preferred, self.protocol) {
+        if preferred.speaks(self.protocol) {
             return preferred;
         }
-        match self.protocol {
-            InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => Harness::Codex,
-            InferenceProtocol::Messages
-            | InferenceProtocol::SystemOne
-            | InferenceProtocol::Decisions => Harness::Claude,
-        }
+        Harness::default_for(self.protocol)
     }
 }
 
@@ -226,10 +209,10 @@ impl InferenceEnv {
     /// families (opencode, pi) takes the OpenAI one first, the same precedence
     /// `crate::agent::harness::api_endpoint` resolves its provider by.
     pub fn base_url_for(&self, harness: Harness) -> Option<&str> {
-        match harness {
-            Harness::Claude | Harness::Hermes => self.anthropic_base_url.as_deref(),
-            Harness::Codex => self.openai_base_url.as_deref(),
-            Harness::OpenCode | Harness::Pi => self
+        match harness.spec().api {
+            ApiFamily::Anthropic => self.anthropic_base_url.as_deref(),
+            ApiFamily::OpenAi => self.openai_base_url.as_deref(),
+            ApiFamily::Both => self
                 .openai_base_url
                 .as_deref()
                 .or(self.anthropic_base_url.as_deref()),
@@ -237,7 +220,7 @@ impl InferenceEnv {
     }
 
     /// The egress entry the sandbox needs for the harness's custom base URL, if there is one.
-    pub fn egress_endpoint_for(&self, harness: Harness) -> Result<Option<String>> {
+    pub fn egress_endpoint_for(&self, harness: Harness) -> Result<Option<Endpoint>> {
         self.base_url_for(harness).map(egress_endpoint).transpose()
     }
 }
@@ -276,7 +259,7 @@ impl VertexConfig {
 }
 
 /// A base URL as the sandbox policy's `host:port:full` entry.
-pub fn egress_endpoint(base_url: &str) -> Result<String> {
+pub fn egress_endpoint(base_url: &str) -> Result<Endpoint> {
     crate::manifest::broker_endpoint_from_url(base_url)
 }
 
@@ -340,7 +323,7 @@ mod tests {
         assert_eq!(env.anthropic_base_url, None);
         assert_eq!(
             crate::agent::harness::resolve_auth(Harness::Claude, &env),
-            crate::agent::harness::AuthProvider::Vertex
+            crucible::harness::AuthProvider::Vertex
         );
         assert_eq!(env.selection.unwrap().model, "the-model");
     }
@@ -354,7 +337,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             crate::agent::harness::resolve_auth(Harness::Claude, &env),
-            crate::agent::harness::AuthProvider::AnthropicKey
+            crucible::harness::AuthProvider::AnthropicKey
         );
     }
 
@@ -384,7 +367,10 @@ mod tests {
                 "an OpenAI key is not an Anthropic key"
             );
             assert_eq!(
-                env.egress_endpoint_for(Harness::Codex).unwrap().as_deref(),
+                env.egress_endpoint_for(Harness::Codex)
+                    .unwrap()
+                    .map(|e| e.to_string())
+                    .as_deref(),
                 Some("vllm.internal:8000:full")
             );
         }
@@ -486,7 +472,6 @@ mod tests {
         };
         let messages = select(InferenceProtocol::Messages);
         assert_eq!(messages.harness(Harness::Claude), Harness::Claude);
-        assert_eq!(messages.harness(Harness::Hermes), Harness::Hermes);
         assert_eq!(messages.harness(Harness::Codex), Harness::Claude);
         for protocol in [
             InferenceProtocol::ChatCompletions,
@@ -494,21 +479,14 @@ mod tests {
         ] {
             assert_eq!(select(protocol).harness(Harness::Codex), Harness::Codex);
             assert_eq!(select(protocol).harness(Harness::Claude), Harness::Codex);
-            assert_eq!(select(protocol).harness(Harness::Hermes), Harness::Codex);
         }
         for both in [Harness::OpenCode, Harness::Pi] {
             assert_eq!(messages.harness(both), both);
             assert_eq!(select(InferenceProtocol::Responses).harness(both), both);
         }
-        for harness in [
-            Harness::Claude,
-            Harness::Hermes,
-            Harness::Codex,
-            Harness::OpenCode,
-            Harness::Pi,
-        ] {
-            assert!(!speaks(harness, InferenceProtocol::SystemOne));
-            assert!(!speaks(harness, InferenceProtocol::Decisions));
+        for harness in Harness::all().iter().copied() {
+            assert!(!harness.speaks(InferenceProtocol::SystemOne));
+            assert!(!harness.speaks(InferenceProtocol::Decisions));
         }
     }
 
@@ -548,11 +526,15 @@ mod tests {
     #[test]
     fn a_base_url_becomes_an_egress_entry_on_its_own_port() {
         assert_eq!(
-            egress_endpoint("http://vllm.internal:8000/v1").unwrap(),
+            egress_endpoint("http://vllm.internal:8000/v1")
+                .unwrap()
+                .to_string(),
             "vllm.internal:8000:full"
         );
         assert_eq!(
-            egress_endpoint("https://proxy.corp/v1").unwrap(),
+            egress_endpoint("https://proxy.corp/v1")
+                .unwrap()
+                .to_string(),
             "proxy.corp:443:full"
         );
         assert!(egress_endpoint("vllm.internal/v1").is_err());
@@ -581,7 +563,10 @@ mod tests {
             Some("http://vllm.internal:8000/v1")
         );
         assert_eq!(
-            env.egress_endpoint_for(Harness::Codex).unwrap().as_deref(),
+            env.egress_endpoint_for(Harness::Codex)
+                .unwrap()
+                .map(|e| e.to_string())
+                .as_deref(),
             Some("vllm.internal:8000:full")
         );
         assert_eq!(

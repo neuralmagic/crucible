@@ -31,19 +31,24 @@ fn contract_version_is_semver() {
 
 #[test]
 fn wire_versions_are_pinned_to_contract_version() {
+    use crucible_contract::history::HISTORY_WIRE_VERSION;
+    use crucible_contract::inference::INFERENCE_WIRE_VERSION;
     use crucible_contract::{
-        ADMISSION_WIRE_VERSION, CONTRACT_VERSION, IDENTITY_FORMAT_VERSION, SCHEMA_VERSION,
-        WIRE_VERSION,
+        ADMISSION_WIRE_VERSION, CONTRACT_VERSION, IDENTITY_FORMAT_VERSION, OUTPUTS_WIRE_VERSION,
+        SCHEMA_VERSION, WIRE_VERSION,
     };
     let wire = (
         SCHEMA_VERSION,
         ADMISSION_WIRE_VERSION,
         WIRE_VERSION,
         IDENTITY_FORMAT_VERSION,
+        OUTPUTS_WIRE_VERSION,
+        INFERENCE_WIRE_VERSION,
+        HISTORY_WIRE_VERSION,
     );
     assert_eq!(
         (CONTRACT_VERSION, wire),
-        ("1.22.0", (1, 1, 1, "v2")),
+        ("1.22.0", (1, 1, 1, "v2", 1, 1, 1)),
         "a wire version changed without bumping CONTRACT_VERSION"
     );
 }

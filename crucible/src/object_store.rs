@@ -59,7 +59,11 @@ pub(crate) fn parse_s3_uri(uri: &str) -> Result<(String, String), ObjectUriError
 /// of `crucible-controller` (that crate has no aws-sdk and never learns the bucket layout). Nothing
 /// is appended to the URI: the caller passes the exact key it wants. Reuses the same IRSA creds the
 /// publisher uses (GetObject is in the role's policy).
-pub fn fetch_object(uri: &str, dest: &std::path::Path) -> Result<()> {
+pub fn fetch_object(
+    uri: &str,
+    dest: &std::path::Path,
+    engine: &tokio::runtime::Handle,
+) -> Result<()> {
     if let Backend::File { root } = backend(uri)? {
         // The file URI IS the object path; a plain copy is the whole fetch.
         std::fs::copy(&root, dest)
@@ -73,7 +77,7 @@ pub fn fetch_object(uri: &str, dest: &std::path::Path) -> Result<()> {
         }
         .into());
     }
-    crate::agent::engine::handle()?.block_on(async {
+    engine.block_on(async {
         let conf = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
         let client = aws_sdk_s3::Client::new(&conf);
         let out = client
@@ -123,11 +127,12 @@ mod tests {
         let src = dir.path().join("summary.txt");
         std::fs::write(&src, "investigation").unwrap();
         let dest = dir.path().join("fetched.txt");
-        fetch_object(&format!("file://{}", src.display()), &dest).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        fetch_object(&format!("file://{}", src.display()), &dest, rt.handle()).unwrap();
         assert_eq!(std::fs::read_to_string(&dest).unwrap(), "investigation");
-        assert!(fetch_object("file://relative/path", &dest).is_err());
+        assert!(fetch_object("file://relative/path", &dest, rt.handle()).is_err());
         assert!(
-            fetch_object("s3://bucket", &dest).is_err(),
+            fetch_object("s3://bucket", &dest, rt.handle()).is_err(),
             "an s3 URI with no key"
         );
     }

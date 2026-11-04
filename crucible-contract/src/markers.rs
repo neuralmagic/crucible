@@ -59,6 +59,10 @@ pub const ENV_RUN_NAME: &str = "CRUCIBLE_RUN_NAME";
 /// show it; links keep [`ENV_RUN_NAME`], the id.
 pub const ENV_RUN_DISPLAY_NAME: &str = "CRUCIBLE_RUN_DISPLAY_NAME";
 
+/// Env var carrying the controller UI's base URL as a person reaches it. A run's report links the
+/// run's page under `<url>/runs/{run}`; absent means the report carries no link.
+pub const ENV_UI_BASE_URL: &str = "CRUCIBLE_UI_BASE_URL";
+
 /// Env var carrying the controller's base URL as a pod reaches it. A run pod uploads its evidence
 /// under `<url>/api/evidence/runs/{run}/{kind}` and a rerun fetches its parent's from there.
 /// Absent means the pod has no controller to deliver to.

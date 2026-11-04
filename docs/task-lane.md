@@ -6,7 +6,7 @@ consolidate the open dependabot PRs, fix flaky tests every night, regenerate doc
 issue backlog. You need one manifest. You do not need Rust or a gate script.
 
 To use the task lane, omit `[judge]`. No other setting is necessary
-([ADR-0026](./adr/0026-no-judge-task-lane.md)).
+([ADR-0021](./adr/ADR-0021.md)).
 
 ## The minimal manifest
 

@@ -462,7 +462,7 @@ impl Gateway {
         &self,
         name: &str,
         image: Option<&str>,
-        providers: &[String],
+        providers: &[ProviderName],
         labels: &[(String, String)],
         read_only_paths: &[String],
         resources: &crate::manifest::SandboxResources,
@@ -492,7 +492,7 @@ impl Gateway {
         let policy = sandbox_filesystem_policy(read_only_paths, resources.gpus);
         let request = scoped(CreateSandboxRequest {
             spec: Some(SandboxSpec {
-                providers: providers.to_vec(),
+                providers: providers.iter().map(|p| p.as_str().to_string()).collect(),
                 template,
                 policy,
                 resource_requirements: (resources.gpus > 0).then_some(ResourceRequirements {
@@ -1439,11 +1439,37 @@ fn is_deny_action(action: &str) -> bool {
 /// provider `provider`'s credential placeholders resolved at the egress proxy. The endpoint is
 /// upgraded to `protocol: rest` if it was L4-only — placeholder rewrite happens in the L7 relay,
 /// a CONNECT tunnel never sees the header.
+/// A gateway provider's name: one of the engine's fixed providers, or the grant provider of an
+/// agent server.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderName(std::borrow::Cow<'static, str>);
+
+impl ProviderName {
+    pub const fn new(name: &'static str) -> Self {
+        ProviderName(std::borrow::Cow::Borrowed(name))
+    }
+
+    /// The provider carrying the agent server `server`'s token grant.
+    pub fn for_server(server: &str) -> Self {
+        ProviderName(std::borrow::Cow::Owned(format!("crucible-{server}")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ProviderName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 #[derive(Debug)]
 pub struct EndpointCredentialBinding {
     pub host: String,
-    pub port: u32,
-    pub provider: String,
+    pub port: u16,
+    pub provider: ProviderName,
 }
 
 /// Build the incremental `UpdateConfig` merge operations: one add-rule per endpoint, each rule
@@ -1484,13 +1510,13 @@ fn build_merge_operations_with_tls_skip(
             }
             if let Some(b) = credential_bindings
                 .iter()
-                .find(|b| endpoint.host == b.host && endpoint.port == b.port)
+                .find(|b| endpoint.host == b.host && endpoint.port == u32::from(b.port))
             {
                 if endpoint.protocol.is_empty() {
                     endpoint.protocol = "rest".to_string();
                 }
                 endpoint.credential_binding = Some(NetworkCredentialBinding {
-                    provider: b.provider.clone(),
+                    provider: b.provider.as_str().to_string(),
                 });
             }
             let rule_name = generated_rule_name(&endpoint.host, endpoint.port);
@@ -1518,32 +1544,16 @@ struct InvalidTlsSkipEndpoint {
 fn parse_tls_skip_endpoint(
     spec: &str,
 ) -> std::result::Result<(String, u32), InvalidTlsSkipEndpoint> {
-    let mut parts = spec.split(':');
-    let host = parts
-        .next()
-        .filter(|host| !host.is_empty() && !host.contains(char::is_whitespace))
-        .ok_or_else(|| InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        })?;
-    let port = parts
-        .next()
-        .ok_or_else(|| InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        })?
-        .parse::<u32>()
-        .map_err(|_| InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        })?;
-    if parts.next().is_some() || port == 0 || port > 65535 {
-        return Err(InvalidTlsSkipEndpoint {
-            spec: spec.to_string(),
-        });
+    let invalid = || InvalidTlsSkipEndpoint {
+        spec: spec.to_string(),
+    };
+    let ep: EgressEndpoint = spec.parse().map_err(|_| invalid())?;
+    if ep.access.is_some() || ep.protocol.is_some() {
+        return Err(invalid());
     }
-    Ok((host.to_string(), port))
+    Ok((ep.host, ep.port.into()))
 }
 
-/// The rule name the CLI generates for an endpoint (`allow_<host>_<port>`, host punctuation
-/// mapped to `_`). Kept byte-identical so a stored policy lines up with the CLI's.
 fn generated_rule_name(host: &str, port: u32) -> String {
     let sanitized: String = host
         .replace(['.', '-'], "_")
@@ -1615,36 +1625,10 @@ impl GrpcError {
 
 /// A rejected endpoint spec. The offending spec is named once here rather than re-interpolated
 /// into every message.
-#[derive(Debug, thiserror::Error, PartialEq)]
-#[error("endpoint '{spec}' {problem}")]
-pub struct EndpointSpecError {
-    spec: String,
-    problem: EndpointProblem,
-}
+use crate::openshell::endpoint::{
+    Access, Endpoint as EgressEndpoint, EndpointSpecError, Enforcement, Protocol,
+};
 
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub enum EndpointProblem {
-    #[error("must be host:port[:access[:protocol[:enforcement]]]")]
-    Shape,
-    #[error("has an invalid host segment")]
-    Host,
-    #[error("has a non-numeric port")]
-    NonNumericPort,
-    #[error("port must be in 1..=65535")]
-    PortRange,
-    #[error("access must be read-only, read-write, or full")]
-    Access,
-    #[error("protocol must be rest, websocket, sql, or mcp")]
-    Protocol,
-    #[error("an mcp endpoint's access must be full (every known MCP method) or omitted")]
-    McpAccess,
-    #[error("enforcement must be enforce or audit")]
-    Enforcement,
-    #[error("cannot set enforcement without a protocol")]
-    EnforcementWithoutProtocol,
-}
-
-/// The MCP protocol revisions a `full` MCP endpoint accepts: every one the pinned OpenShell knows.
 const MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
 
 /// An MCP endpoint that allows every known method, under any of [`MCP_PROTOCOL_VERSIONS`].
@@ -1660,60 +1644,39 @@ fn full_mcp() -> McpOptions {
 }
 
 fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError> {
-    let reject = |problem| EndpointSpecError {
-        spec: spec.to_owned(),
-        problem,
-    };
-    let parts: Vec<&str> = spec.split(':').collect();
-    if !(2..=5).contains(&parts.len()) {
-        return Err(reject(EndpointProblem::Shape));
-    }
-    let host = parts[0].trim();
-    if host.is_empty() || host.contains(char::is_whitespace) || host.contains('/') {
-        return Err(reject(EndpointProblem::Host));
-    }
-    let port: u32 = parts[1]
-        .trim()
-        .parse()
-        .map_err(|_| reject(EndpointProblem::NonNumericPort))?;
-    if port == 0 || port > 65535 {
-        return Err(reject(EndpointProblem::PortRange));
-    }
-    let access = parts.get(2).copied().unwrap_or("").trim();
-    let protocol = parts.get(3).copied().unwrap_or("").trim();
-    let enforcement = parts.get(4).copied().unwrap_or("").trim();
-    let access_preset = openshell_policy::network_access_preset_from_str(access)
-        .ok_or_else(|| reject(EndpointProblem::Access))?;
-    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql" | "mcp") {
-        return Err(reject(EndpointProblem::Protocol));
-    }
-    let enforcement_mode = openshell_policy::network_enforcement_mode_from_str(enforcement)
-        .ok_or_else(|| reject(EndpointProblem::Enforcement))?;
-    if enforcement_mode != NetworkEnforcementMode::Unspecified && protocol.is_empty() {
-        return Err(reject(EndpointProblem::EnforcementWithoutProtocol));
-    }
-    // OpenShell rejects an MCP method wildcard, so `full` on an MCP endpoint is its
-    // method-profile switch rather than the generic `*` access preset.
-    let (access_preset, mcp) = match (protocol, access_preset) {
-        ("mcp", NetworkAccessPreset::Full | NetworkAccessPreset::Unspecified) => {
-            (NetworkAccessPreset::Unspecified, Some(full_mcp()))
-        }
-        ("mcp", _) => return Err(reject(EndpointProblem::McpAccess)),
-        (_, preset) => (preset, None),
-    };
-    Ok(NetworkEndpoint {
-        host: host.to_string(),
-        port,
-        ports: vec![port],
-        protocol: protocol.to_string(),
-        enforcement: enforcement_mode.into(),
-        access: access_preset.into(),
-        mcp,
-        ..NetworkEndpoint::default()
-    })
+    spec.parse().map(|ep: EgressEndpoint| network_endpoint(&ep))
 }
 
-/// Dedupe while preserving first-seen order, dropping empties (matches the CLI's binary dedupe).
+/// The gateway's wire form of an endpoint. OpenShell rejects an MCP method wildcard, so `full`
+/// on an MCP endpoint is its method-profile switch rather than the generic `*` access preset.
+fn network_endpoint(ep: &EgressEndpoint) -> NetworkEndpoint {
+    let access = match ep.access {
+        None => NetworkAccessPreset::Unspecified,
+        Some(Access::ReadOnly) => NetworkAccessPreset::ReadOnly,
+        Some(Access::ReadWrite) => NetworkAccessPreset::ReadWrite,
+        Some(Access::Full) => NetworkAccessPreset::Full,
+    };
+    let enforcement = match ep.enforcement {
+        None => NetworkEnforcementMode::Unspecified,
+        Some(Enforcement::Enforce) => NetworkEnforcementMode::Enforce,
+        Some(Enforcement::Audit) => NetworkEnforcementMode::Audit,
+    };
+    let (access, mcp) = match ep.protocol {
+        Some(Protocol::Mcp) => (NetworkAccessPreset::Unspecified, Some(full_mcp())),
+        _ => (access, None),
+    };
+    NetworkEndpoint {
+        host: ep.host.clone(),
+        port: ep.port.into(),
+        ports: vec![ep.port.into()],
+        protocol: ep.protocol.map(Protocol::as_str).unwrap_or("").to_string(),
+        enforcement: enforcement.into(),
+        access: access.into(),
+        mcp,
+        ..NetworkEndpoint::default()
+    }
+}
+
 fn dedup(values: &[String]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for v in values {
@@ -1768,7 +1731,8 @@ pub(crate) mod in_process;
 
 #[cfg(test)]
 mod tests {
-    use crate::openshell::grpc::in_process::{ProfileGateway, Unary, Writes, unary};
+    use crate::openshell::endpoint::EndpointProblem;
+    use crate::openshell::grpc::in_process::{FakeGateway, Writes};
     use crate::openshell::grpc::*;
     use openshell_core::proto::NetworkAccessPreset;
 
@@ -2125,7 +2089,7 @@ pYBZ
         let binding = EndpointCredentialBinding {
             host: "crucible-kueue.crucible-system.svc.cluster.local".to_string(),
             port: 8850,
-            provider: "crucible-kueue".to_string(),
+            provider: ProviderName::new("crucible-kueue"),
         };
         let ops = build_merge_operations(
             &["/usr/local/bin/claude".to_string()],
@@ -2246,7 +2210,7 @@ pYBZ
         let binding = EndpointCredentialBinding {
             host: "host.openshell.internal".to_string(),
             port: 8849,
-            provider: "crucible-broker".to_string(),
+            provider: ProviderName::new("crucible-broker"),
         };
         let ops = build_merge_operations(
             &["/usr/local/bin/claude".to_string()],
@@ -2283,7 +2247,7 @@ pYBZ
         let binding = EndpointCredentialBinding {
             host: "h".to_string(),
             port: 8849,
-            provider: "crucible-broker".to_string(),
+            provider: ProviderName::new("crucible-broker"),
         };
         let ops = build_merge_operations(
             &[],
@@ -2321,7 +2285,7 @@ pYBZ
                 .map(|h| EndpointCredentialBinding {
                     host: (*h).to_string(),
                     port: 443,
-                    provider: "ci-gcp".to_string(),
+                    provider: ProviderName::new("ci-gcp"),
                 })
                 .collect();
         let endpoints: Vec<String> = crate::openshell::policy::DEFAULT_ENDPOINTS
@@ -3015,106 +2979,6 @@ pYBZ
         );
     }
 
-    #[derive(Clone)]
-    struct FakeGateway {
-        create: Result<&'static str, tonic::Code>,
-        phase: SandboxPhase,
-        deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    }
-
-    impl tonic::server::NamedService for FakeGateway {
-        const NAME: &'static str = "openshell.v1.OpenShell";
-    }
-
-    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for FakeGateway {
-        type Response = tonic::codegen::http::Response<tonic::body::Body>;
-        type Error = std::convert::Infallible;
-        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
-
-        fn poll_ready(
-            &mut self,
-            _: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Result<(), Self::Error>> {
-            std::task::Poll::Ready(Ok(()))
-        }
-
-        fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
-            use openshell_core::proto::{
-                DeleteSandboxResponse, DeletionOutcome, Sandbox, SandboxResponse, SandboxStatus,
-            };
-            let this = self.clone();
-            Box::pin(async move {
-                Ok(match req.uri().path() {
-                    "/openshell.v1.OpenShell/CreateSandbox" => {
-                        let create = this.create;
-                        unary(
-                            Unary(move |_: tonic::Request<CreateSandboxRequest>| async move {
-                                create
-                                    .map(|id| {
-                                        tonic::Response::new(SandboxResponse {
-                                            sandbox: Some(Sandbox {
-                                                metadata: Some(
-                                                    openshell_core::proto::datamodel::v1::ObjectMeta {
-                                                        id: id.to_string(),
-                                                        ..Default::default()
-                                                    },
-                                                ),
-                                                ..Sandbox::default()
-                                            }),
-                                            ..SandboxResponse::default()
-                                        })
-                                    })
-                                    .map_err(|code| tonic::Status::new(code, "create refused"))
-                            }),
-                            req,
-                        )
-                        .await
-                    }
-                    "/openshell.v1.OpenShell/GetSandbox" => {
-                        let phase = this.phase;
-                        unary(
-                            Unary(move |_: tonic::Request<GetSandboxRequest>| async move {
-                                Ok(tonic::Response::new(SandboxResponse {
-                                    sandbox: Some(Sandbox {
-                                        status: Some(SandboxStatus {
-                                            phase: phase.into(),
-                                            ..SandboxStatus::default()
-                                        }),
-                                        ..Sandbox::default()
-                                    }),
-                                    ..SandboxResponse::default()
-                                }))
-                            }),
-                            req,
-                        )
-                        .await
-                    }
-                    "/openshell.v1.OpenShell/DeleteSandbox" => {
-                        let deleted = this.deleted.clone();
-                        unary(
-                            Unary(move |r: tonic::Request<DeleteSandboxRequest>| {
-                                let deleted = deleted.clone();
-                                async move {
-                                    deleted
-                                        .lock()
-                                        .map_err(|e| tonic::Status::internal(e.to_string()))?
-                                        .push(r.into_inner().name);
-                                    Ok(tonic::Response::new(DeleteSandboxResponse {
-                                        outcome: DeletionOutcome::Completed.into(),
-                                        ..DeleteSandboxResponse::default()
-                                    }))
-                                }
-                            }),
-                            req,
-                        )
-                        .await
-                    }
-                    _ => tonic::Status::unimplemented(req.uri().path().to_string()).into_http(),
-                })
-            })
-        }
-    }
-
     /// Drive `Gateway::create_sandbox` against a real gRPC server on a loopback port and return
     /// the create's outcome plus every name the server was asked to delete.
     fn create_against(
@@ -3122,29 +2986,13 @@ pYBZ
         phase: SandboxPhase,
     ) -> (Result<Option<String>>, Vec<String>) {
         let _guard = crate::test_support::env_lock();
-        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let fake = FakeGateway {
-            create,
-            phase,
-            deleted: deleted.clone(),
-        };
+        let fake = FakeGateway::new().creating(create).in_phase(phase);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .unwrap();
         let result = rt.block_on(async {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-            tokio::spawn(
-                tonic::transport::Server::builder()
-                    .add_service(fake)
-                    .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
-            );
-            let gw = Gateway {
-                channel: Endpoint::from_shared(format!("http://{addr}"))
-                    .unwrap()
-                    .connect_lazy(),
-            };
+            let gw = fake.serve().await;
             gw.create_sandbox(
                 "ci-leak",
                 None,
@@ -3155,8 +3003,7 @@ pYBZ
             )
             .await
         });
-        let deleted = deleted.lock().unwrap().clone();
-        (result, deleted)
+        (result, fake.deleted())
     }
 
     #[test]
@@ -3250,7 +3097,7 @@ pYBZ
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_imports_converge_on_one_write() {
         let profile = grant_profile("Kueue access with controller-issued agent tokens");
-        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gateway = FakeGateway::new().hold_first_reads(TURNS);
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| {
             let profile = profile.clone();
@@ -3270,7 +3117,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_updates_of_a_stale_profile_converge_on_one_write() {
-        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gateway = FakeGateway::new().hold_first_reads(TURNS);
         gateway.seed_profile(grant_profile("an older description"));
         let profile = grant_profile("the current description");
         let gw = gateway.serve().await;
@@ -3290,7 +3137,7 @@ pYBZ
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_stored_token_grant_profile_matches_without_a_write() {
         let profile = grant_profile("Kueue access with controller-issued agent tokens");
-        let gateway = ProfileGateway::new();
+        let gateway = FakeGateway::new();
         gateway.seed_profile(profile.clone());
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| {
@@ -3303,7 +3150,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_profile_that_keeps_changing_fails_after_bounded_writes() {
-        let gateway = ProfileGateway::new().with_rival_writer();
+        let gateway = FakeGateway::new().with_rival_writer();
         gateway.seed_profile(grant_profile("an older description"));
         let gw = gateway.serve().await;
         let err = gw
@@ -3329,7 +3176,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_rejected_import_fails_with_its_diagnostics() {
-        let gateway = ProfileGateway::new().rejecting_imports();
+        let gateway = FakeGateway::new().rejecting_imports();
         let gw = gateway.serve().await;
         let err = gw
             .ensure_provider_profile(grant_profile("Kueue access"))
@@ -3348,7 +3195,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn parallel_turns_on_a_fresh_gateway_share_one_token_grant_provider() {
-        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gateway = FakeGateway::new().hold_first_reads(TURNS);
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| async move {
             gw.ensure_provider_profile(grant_profile("Kueue access"))
@@ -3368,7 +3215,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_minted_providers_converge_on_one_create() {
-        let gateway = ProfileGateway::new();
+        let gateway = FakeGateway::new();
         let gw = gateway.serve().await;
         all_succeed(&gw, |gw| async move {
             gw.ensure_minted_provider("kueue", "kueue-grant").await
@@ -3386,7 +3233,7 @@ pYBZ
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn creating_a_taken_provider_name_reports_it() {
-        let gateway = ProfileGateway::new();
+        let gateway = FakeGateway::new();
         gateway.seed_provider("broker");
         let gw = gateway.serve().await;
         let taken = gw

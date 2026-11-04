@@ -1,16 +1,12 @@
-//! The engine half of the broker's `distress` tool: two handoff files under `forge::storage_root()`
-//! (the same channel as `turn-token`/`turn-traceparent`).
-//!
-//! ```text
-//!   <storage>/distress             the park marker; while it exists the loop is suspended
-//!   <storage>/distress-notes.jsonl info/warn notes, consumed into the next decided row
-//! ```
+//! The engine half of the broker's `distress` tool: the marker and the notes under
+//! `forge::storage_root()` (the same channel as `turn-token`/`turn-traceparent`), as
+//! [`crucible_contract::distress`] spells them.
 //!
 //! The marker is read, never deleted: clearing the file is the operator's resume grant, so the
 //! engine deleting it would grant itself the thing it is waiting for. Notes are the opposite,
 //! consumed on read like `CANDIDATE.md`, so a note lands on exactly one row.
 
-use serde::Deserialize;
+use crucible_contract::distress::{MARKER_FILE, Marker, NOTES_FILE, Note};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
@@ -18,21 +14,12 @@ use std::time::SystemTime;
 /// and refuses to re-park: no rescope will ever arrive for a distress.
 pub(crate) const HANDLE: &str = "distress";
 
-/// The broker's park marker. `turn_token` is written too but the engine has no use for it.
-#[derive(Debug, Clone, Deserialize)]
-pub(crate) struct Marker {
-    pub reason: String,
-    #[serde(default)]
-    pub evidence: Vec<String>,
-    pub ts_ms: u64,
-}
-
 fn marker_path() -> PathBuf {
-    forge::storage_root().join("distress")
+    forge::storage_root().join(MARKER_FILE)
 }
 
 fn notes_path() -> PathBuf {
-    forge::storage_root().join("distress-notes.jsonl")
+    forge::storage_root().join(NOTES_FILE)
 }
 
 /// The park marker, if the broker wrote one. `None` = no distress (also the degraded answer when
@@ -56,15 +43,10 @@ pub(crate) fn marker_mtime() -> Option<SystemTime> {
         .ok()
 }
 
-/// Take the pending info/warn notes as `(severity, reason)`, deleting the file. Torn or malformed
-/// lines are skipped rather than failing the batch: the writer appends without locking, so a line
-/// can be half-written when the engine reads, and a lost status note must not cost an iteration.
-pub(crate) fn drain_notes() -> Vec<(String, String)> {
-    #[derive(Deserialize)]
-    struct Note {
-        severity: String,
-        reason: String,
-    }
+/// Take the pending info/warn notes, deleting the file. Torn or malformed lines are skipped
+/// rather than failing the batch: the writer appends without locking, so a line can be
+/// half-written when the engine reads, and a lost status note must not cost an iteration.
+pub(crate) fn drain_notes() -> Vec<Note> {
     let path = notes_path();
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
@@ -72,7 +54,6 @@ pub(crate) fn drain_notes() -> Vec<(String, String)> {
     let _ = std::fs::remove_file(&path);
     raw.lines()
         .filter_map(|l| serde_json::from_str::<Note>(l).ok())
-        .map(|n| (n.severity, n.reason))
         .collect()
 }
 
@@ -128,6 +109,7 @@ mod tests {
         assert_eq!(m.reason, "torch skew");
         assert_eq!(m.evidence, vec!["log-3".to_string()]);
         assert_eq!(m.ts_ms, 1234);
+        assert_eq!(m.turn_token, "t-1");
         assert!(
             root.dir.join("distress").exists(),
             "reading must not clear the marker: the operator's rm is the grant"
@@ -169,12 +151,16 @@ mod tests {
              {\"severity\":\"warn\",\"reason\":\"flaky node\",\"ts_ms\":2}\n",
         )
         .unwrap();
-        let notes = drain_notes();
+        let drained = drain_notes();
+        let notes: Vec<(String, &str)> = drained
+            .iter()
+            .map(|n| (n.severity.to_string(), n.reason.as_str()))
+            .collect();
         assert_eq!(
             notes,
             vec![
-                ("info".to_string(), "cache warm".to_string()),
-                ("warn".to_string(), "flaky node".to_string()),
+                ("info".to_string(), "cache warm"),
+                ("warn".to_string(), "flaky node"),
             ]
         );
         assert!(!root.dir.join("distress-notes.jsonl").exists());

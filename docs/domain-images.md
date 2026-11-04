@@ -51,8 +51,6 @@ turn needs. `examples/selfhost` (Rust) is the example: `docker/Containerfile.run
   is on the `[agent.openshell].endpoints` allowlist of the manifest *and* the binary that
   fetches is in `[agent.openshell].binaries` (for example, `/usr/local/cargo/bin/cargo`).
   Files that are already in the image cache need neither.
-- Add the sandbox base to `tools/base-image-allowlist.txt`. The build-graph lint fails on an
-  unknown base.
 
 ## Build
 
