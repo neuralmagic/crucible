@@ -1,0 +1,29 @@
+# git-smoke: a run fetches, pushes and opens a draft pull request through its crucible-git, once
+# from a command task and once from an agent turn, as the run's GitHub App. Neither holds the
+# token. Needs a deploy profile with [git] on the dispatch cluster, and the `github-app` secret
+# bound to a `mint://github-app/<owner>` secret for the owner of params.repo.
+
+[agent]
+backend       = "openshell"
+harness       = "claude"
+model         = "claude-opus-4-6"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-cc@sha256:36a11bb264a7268962eaf982986a631e7a2673848b468f8c8fd636c559770333"
+goal          = "Push a branch and open a draft pull request through the run's crucible-git."
+
+[workspace]
+inject = ["smoke.py"]
+
+[[secret]]
+name = "github-app"
+kind = "opaque"
+path = "/var/run/crucible-git/token"
+
+[[capabilities.secret]]
+name    = "/var/run/crucible-git/token"
+context = "broker"
+system  = "github.com"
+scope   = "read params.repo, push crucible-git-smoke/* branches to it and open draft pull requests on it, through crucible-git only"
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
