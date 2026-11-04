@@ -240,15 +240,16 @@ pub struct DraftCompileDto {
 impl DraftCompileDto {
     pub(crate) fn from_saved(
         s: SavedVersion,
-        cap: &crate::playbooks::dispatch::DispatchCapability,
+        state: &ApiState,
         catalog: &[crate::images::model::CatalogImage],
     ) -> Self {
-        let dispatch = PackDispatchDto::new(s.agent.as_ref(), cap, catalog);
+        let dispatch = PackDispatchDto::new(s.agent.as_ref(), &state.dispatch, catalog);
         let mut diagnostics = s.diagnostics;
         diagnostics.extend(crate::playbooks::drafts::dispatch_diagnostics(
             s.graph.as_ref(),
             s.agent.as_ref(),
-            cap,
+            &state.dispatch,
+            &state.clusters.names(),
         ));
         DraftCompileDto {
             version: s.version,
@@ -390,11 +391,7 @@ pub(crate) async fn create_playbook_draft(
     };
     (
         StatusCode::CREATED,
-        Json(DraftCompileDto::from_saved(
-            saved,
-            &state.dispatch,
-            &catalog,
-        )),
+        Json(DraftCompileDto::from_saved(saved, &state, &catalog)),
     )
         .into_response()
 }
@@ -592,12 +589,9 @@ pub(crate) async fn get_playbook_draft_preview(
     }
     let catalog = crate::images::store::list_images(state.db.pool()).await?;
     match crate::playbooks::drafts::preview(state.db.pool(), &id, query.version).await? {
-        Some(saved) => Ok(Json(DraftCompileDto::from_saved(
-            saved,
-            &state.dispatch,
-            &catalog,
-        ))
-        .into_response()),
+        Some(saved) => {
+            Ok(Json(DraftCompileDto::from_saved(saved, &state, &catalog)).into_response())
+        }
         None => Ok(not_found(format!("no draft {id:?} at that version"))),
     }
 }
@@ -779,12 +773,7 @@ pub(crate) async fn save_playbook_draft(
     )
     .await
     {
-        Ok(saved) => Json(DraftCompileDto::from_saved(
-            saved,
-            &state.dispatch,
-            &catalog,
-        ))
-        .into_response(),
+        Ok(saved) => Json(DraftCompileDto::from_saved(saved, &state, &catalog)).into_response(),
         Err(e) => draft_refusal(e),
     }
 }

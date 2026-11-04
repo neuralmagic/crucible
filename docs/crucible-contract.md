@@ -102,6 +102,9 @@ wide       = 0                                # u32. N parallel propose turns be
 approaches = ["...", "..."]                   # REQUIRED when wide > 0: one distinct approach string per candidate slot
 policy     = "top-k"                          # only v1 policy. default "top-k"
 policy_k   = 1                                # how many wide-round winners seed the deep loop. default 1, must be in 1..=wide
+
+[dispatch]                                    # optional. Read by the controller, never by the engine.
+target = "cluster-a"                          # the one shared cluster every launch of this pack dispatches to
 ```
 
 Rules:
@@ -114,6 +117,13 @@ Rules:
   stages one side isn't a control); `runs` must be `>= 1`.
 - `[search]`, if present with `wide > 0`, requires `approaches.len() >= wide` (hard error,
   diversity is engineered, not auto-generated) and `policy_k` in `1..=wide`.
+- `[dispatch].target`, if present, is a shared cluster name (`hub` or a clusters-directory
+  entry: letters, digits, `.`, `-`, `_`). A personal target cannot be pinned. The controller sends
+  every launch of the pack there (draft test-fire, registered launch, schedule, one-shot, watch,
+  webhook) and refuses a launch that names a different `dispatch_target`, a caller the cluster
+  policy fences off the pinned cluster, a pin the controller cannot reach, and local mode. A
+  draft whose pin names a cluster the controller cannot reach carries a `dispatch` diagnostic on
+  `crucible.toml`.
 - **Edition.** `edition` is 1 when absent; 1 and 2 are the editions this engine runs, and any
   other value fails the parse naming them. An `env` list in `[judge]`, `[world]`, or
   `[workflow]` needs edition 2 and fails the parse of an edition-1 manifest (§3).

@@ -651,6 +651,16 @@ pub struct DraftCompile {
     pub schema_digest: Option<String>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(default)]
+    pub dispatch: PackDispatch,
+}
+
+/// What a pack's manifest says about where it runs.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PackDispatch {
+    /// `[dispatch] target`: the cluster every launch of the pack lands on.
+    #[serde(default)]
+    pub pinned_target: Option<String>,
 }
 
 /// Where a registered pack came from.

@@ -51,6 +51,9 @@ export function PackDispatchNotice({ dispatch }: PackDispatchNoticeProps) {
             <MetaRow label="sandbox image">{dispatch.sandbox_image}</MetaRow>
           )}
           {resources === null ? null : <MetaRow label="resources">{resources}</MetaRow>}
+          {dispatch.pinned_target === null || dispatch.pinned_target === undefined ? null : (
+            <MetaRow label="dispatches to">{`[dispatch] target = ${dispatch.pinned_target}`}</MetaRow>
+          )}
           {image.tags.length === 0 ? null : <MetaRow label="channel">{image.tags.join(', ')}</MetaRow>}
           {image.digest === null || image.digest === undefined ? null : (
             <MetaRow label="resolved digest">
