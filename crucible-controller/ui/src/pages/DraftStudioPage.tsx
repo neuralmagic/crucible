@@ -35,6 +35,7 @@ import { FileTreePanel } from '../editor/FileTreePanel';
 import { CloneDraftDialog } from './CloneDraftDialog';
 import { DeleteDraftDialog } from './DeleteDraftDialog';
 import { RenameDraftDialog } from './RenameDraftDialog';
+import { MigrateDraftSection } from './MigrateDraftSection';
 import { PlaybookParamFields } from './PlaybookParamFields';
 import { SharesSection } from './SharesSection';
 import { PackDispatchNotice } from './PackDispatchNotice';
@@ -477,6 +478,15 @@ function DraftStudio({ id }: { id: string }) {
       </div>
 
       {saveError === null ? null : <FormError>{saveError}</FormError>}
+
+      <MigrateDraftSection
+        id={id}
+        edition={files.data?.edition}
+        baseVersion={state.base}
+        writable={writable}
+        dirty={isDirty(state)}
+        onMigrated={handleReload}
+      />
 
       {stale === null ? null : (
         <Section>
