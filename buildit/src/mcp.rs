@@ -93,6 +93,8 @@ const MAX_CACHES: usize = 8;
 const FACTS_MOUNT: &str = "/buildit";
 const CCACHE_CONF: &str = "ccache.conf";
 const CCACHE_STATS: &str = "ccache-stats.log";
+/// Where in the facts mount a build's steps are stamped (`step::build_args`).
+const STEPS_LOG: &str = "steps.log";
 const CCACHE_USER: &str = "buildit";
 const CACHES_FILE: &str = "caches";
 const MAX_FACTS: u64 = 64 * 1024;
@@ -1711,7 +1713,8 @@ impl Broker {
                 pod.exec_with_stdin(&write, conf.as_bytes()).await?;
             }
             let limit = build_limit(requested, self.deadline_secs, used)?;
-            let args = step::build_args(limit, &bud);
+            let steps = format!("{}/{STEPS_LOG}", id.facts_dir());
+            let args = step::build_args(limit, &steps, &bud);
             let log = id.log(LogName::Build);
             step::launch(&pod, &log, Some(step::CONTAINER_STDOUT), &[], args).await?;
             step::snapshot(&pod, &log)
@@ -4862,7 +4865,7 @@ mod tests {
 
         let read = serde_json::json!({
             "build_id": b,
-            "cmd": ["sh", "-c", "cat /buildit/ccache-stats.log; test -e /etc/ccache.conf || echo no-conf; ls /objs; touch /objs/x 2>/dev/null || echo caches-read-only"],
+            "cmd": ["sh", "-c", "cat /buildit/ccache-stats.log /buildit/steps.log; test -e /etc/ccache.conf || echo no-conf; ls /objs; touch /objs/x 2>/dev/null || echo caches-read-only"],
         });
         let ran = call(&addr, "tok-b", "run", read).await.unwrap();
         let id = serde_json::json!({ "build_id": b, "which": "run:1", "tail_lines": 50 });
@@ -4883,6 +4886,17 @@ mod tests {
         assert!(
             out.contains("a.o") && out.contains("caches-read-only"),
             "run sees the build's caches, read-only: {out}"
+        );
+        let stamped = |prefix: &str| {
+            out.lines().any(|l| {
+                l.split_once(' ').is_some_and(|(at, text)| {
+                    at.parse::<u128>().is_ok() && text.starts_with(prefix)
+                })
+            })
+        };
+        assert!(
+            stamped("STEP 1/") && stamped("COMMIT ") && stamped("END 0"),
+            "the build's steps are stamped under /buildit: {out}"
         );
 
         for token in ["tok-a", "tok-b"] {

@@ -15,9 +15,9 @@ caches, unchanged:
 After calling `build`, poll `status` every 30 seconds until it is no longer running. If a build
 fails, read the end of its log with `logs` and stop. When one succeeds, call `run` with its
 build_id, cmd
-`["sh", "-c", "mkdir -p /trace && cp /src/vllm/build/temp.*/.ninja_log /trace/ninja_log && cp /buildit/ccache-stats.log /trace/ccache-stats.log"]`
-and fetch_paths `["/trace"]`, then copy the two fetched files to `traces/<name>.ninja_log` and
-`traces/<name>.ccache-stats.log`.
+`["sh", "-c", "mkdir -p /trace && cp /src/vllm/build/temp.*/.ninja_log /trace/ninja_log && cp /buildit/ccache-stats.log /buildit/steps.log /trace/"]`
+and fetch_paths `["/trace"]`, then copy the three fetched files to `traces/<name>.ninja_log`,
+`traces/<name>.ccache-stats.log` and `traces/<name>.steps.log`.
 
 1. Check out vLLM at `vllm_ref` (below) into `build/vllm/`:
    `git init -q build/vllm && git -C build/vllm fetch -q --depth 1 https://github.com/vllm-project/vllm.git <vllm_ref> && git -C build/vllm checkout -q --detach FETCH_HEAD`

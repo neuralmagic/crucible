@@ -6,7 +6,7 @@ params = {
 }
 
 BUILDS = ["checkout", "edit1", "edit2", "edit3"]
-LOGS = ["traces/%s.%s" % (b, log) for b in BUILDS for log in ["ninja_log", "ccache-stats.log"]]
+LOGS = ["traces/%s.%s" % (b, log) for b in BUILDS for log in ["ninja_log", "ccache-stats.log", "steps.log"]]
 
 build = agent(
     name = "build",
