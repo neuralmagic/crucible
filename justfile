@@ -103,6 +103,19 @@ dev-pg:
     fi
     echo "DATABASE_URL=postgres://postgres:ci@localhost:55432/crucible"
 
+# A throwaway SeaweedFS S3 gateway for the controller's object-storage tests.
+dev-s3:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! docker inspect crucible-test-seaweedfs >/dev/null 2>&1; then
+        docker run -d --name crucible-test-seaweedfs -p 58333:8333 \
+            chrislusf/seaweedfs:4.00 server -s3 -s3.port=8333 -dir=/data >/dev/null
+        echo "created crucible-test-seaweedfs"
+    else
+        docker start crucible-test-seaweedfs >/dev/null
+    fi
+    echo "CRUCIBLE_TEST_S3_ENDPOINT=http://127.0.0.1:58333"
+
 # See docs/controller-local.md.
 # Run the controller on this machine: embedded Postgres, no auth, no Vault, no cluster.
 controller-local port="8870" user=env_var("USER"):

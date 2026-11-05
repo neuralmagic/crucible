@@ -96,6 +96,29 @@ jobs:
       - name: Start Postgres
         uses: ./.github/actions/postgres
 
+      # The artifact store's object-storage tests (crucible-controller/src/runs/blob_store.rs)
+      # run against a real S3 gateway. CRUCIBLE_REQUIRE_S3_TESTS turns their skip into a failure.
+      - name: Start SeaweedFS
+        env:
+          SEAWEEDFS_IMAGE: chrislusf/seaweedfs:4.00
+        run: |
+          set -eu
+          name="crucible-ci-seaweedfs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker run -d --rm --name "$name" -p 127.0.0.1::8333 "$SEAWEEDFS_IMAGE" \
+            server -s3 -s3.port=8333 -dir=/data
+          port=$(docker port "$name" 8333/tcp | head -n1 | cut -d: -f2)
+          {
+            echo "CRUCIBLE_TEST_S3_ENDPOINT=http://127.0.0.1:${port}"
+            echo "CRUCIBLE_REQUIRE_S3_TESTS=1"
+          } >> "$GITHUB_ENV"
+          for _ in $(seq 1 60); do
+            curl -s -o /dev/null "http://127.0.0.1:${port}/" && exit 0
+            sleep 1
+          done
+          echo "seaweedfs never became ready" >&2
+          docker logs "$name" 2>&1 | tail -50 >&2
+          exit 1
+
       # The Vault client's e2e suite (crucible-controller/tests/vault_e2e.rs) talks to a real
       # Vault — no mocks. This container IS `vault server -dev`: in-memory, auto-unsealed, root
       # token known. The tests provision their own KV v2 mount, AppRole/JWT roles, and policies on

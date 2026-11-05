@@ -255,7 +255,7 @@ fn dispatch_triage(cfg: crucible_controller::ControllerCfg, full: bool) -> Resul
     }
     let rt = cli_runtime()?;
     let summaries = rt.block_on(async {
-        let db = crucible_controller::Db::open(cfg.db_url()).await?;
+        let db = cfg.open_db().await?;
         let mut summaries = Vec::with_capacity(cfg.repos.len());
         for repo in &cfg.repos {
             summaries.push(crucible_controller::triage_repo(&db, repo, full).await?);
@@ -289,7 +289,7 @@ fn dispatch_rank_compare(
 ) -> Result<()> {
     let rt = cli_runtime()?;
     let summary = rt.block_on(async {
-        let db = crucible_controller::Db::open(cfg.db_url()).await?;
+        let db = cfg.open_db().await?;
         crucible_controller::issues::compare::run_compare(
             &db,
             &cfg,
@@ -375,7 +375,7 @@ fn dispatch_db_adopt(
 ) -> Result<()> {
     let rt = cli_runtime()?;
     let (rid, outcome) = rt.block_on(async {
-        let db = crucible_controller::Db::open(cfg.db_url()).await?;
+        let db = cfg.open_db().await?;
         let scope_id = match &issue {
             Some(key) => {
                 Some(crucible_controller::runs::ingest::adopt_scope_for_issue(&db, key).await?)
@@ -567,7 +567,8 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     // `/metrics` renders it.
     let metrics =
         crucible_controller::Metrics::new().context("building the controller metrics registry")?;
-    let db = crucible_controller::Db::open(cfg.db_url())
+    let db = cfg
+        .open_db()
         .await
         .context("opening the controller ledger")?
         .with_metrics(metrics.clone());

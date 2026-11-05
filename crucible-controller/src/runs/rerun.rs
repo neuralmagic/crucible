@@ -93,13 +93,13 @@ pub(crate) async fn preview(
     from: &[String],
 ) -> Result<RerunPreviewDto, RerunRefusal> {
     let (dispatch, launch) = parent(db, run_id).await?;
-    let session = crate::runs::blob_store::get_run_session(db.pool(), run_id)
+    let session = crate::runs::blob_store::get_run_session(db.blobs(), run_id)
         .await?
         .ok_or_else(|| RerunRefusal::NotFinished(run_id.to_string()))?;
 
     if dispatch == crate::runs::model::RunDispatch::Pod
         && crate::runs::blob_store::get_run_bundle(
-            db.pool(),
+            db.blobs(),
             run_id,
             crucible_contract::ArtifactKind::RunCommits,
         )
@@ -213,7 +213,7 @@ pub(crate) async fn materialize_parent(
     parent_run: &str,
     dest: &Path,
 ) -> Result<()> {
-    let session = crate::runs::blob_store::get_run_session(db.pool(), parent_run)
+    let session = crate::runs::blob_store::get_run_session(db.blobs(), parent_run)
         .await?
         .with_context(|| format!("run {parent_run} has no stored session log"))?;
     let local = crate::runs::task_evidence::run_dir(scratch_root, parent_run)
@@ -223,13 +223,13 @@ pub(crate) async fn materialize_parent(
         None
     } else {
         let files = crate::runs::blob_store::get_run_bundle(
-            db.pool(),
+            db.blobs(),
             parent_run,
             crucible_contract::ArtifactKind::RunFiles,
         )
         .await?;
         let commits = crate::runs::blob_store::get_run_bundle(
-            db.pool(),
+            db.blobs(),
             parent_run,
             crucible_contract::ArtifactKind::RunCommits,
         )
@@ -316,6 +316,7 @@ struct UnsafeEntry(String);
 #[cfg(test)]
 mod tests {
     use crate::client::Db;
+    use crate::runs::blob_store::BlobStore;
     use crate::runs::model::NewRun;
     use crate::runs::rerun::{RerunRefusal, admit, materialize_parent, preview, unpack};
     use crate::testing::fixtures::write_playbook_pack;
@@ -387,9 +388,13 @@ mod tests {
         crate::runs::store::set_run_dispatch(pool, run_id, crate::runs::model::RunDispatch::Local)
             .await
             .unwrap();
-        crate::runs::blob_store::put_run_session(pool, run_id, log.as_bytes())
-            .await
-            .unwrap();
+        crate::runs::blob_store::put_run_session(
+            &BlobStore::new(pool.clone()),
+            run_id,
+            log.as_bytes(),
+        )
+        .await
+        .unwrap();
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -421,7 +426,7 @@ mod tests {
         .await
         .unwrap();
         crate::runs::blob_store::put_run_session(
-            &pool,
+            &BlobStore::new(pool.clone()),
             "run-pod-parent",
             session(WORKFLOW).as_bytes(),
         )
@@ -444,7 +449,7 @@ mod tests {
         })
         .to_string();
         crate::runs::blob_store::put_run_bundle(
-            &pool,
+            &BlobStore::new(pool.clone()),
             "run-pod-parent",
             crucible_contract::ArtifactKind::RunCommits,
             tar_gz(&[
@@ -629,7 +634,7 @@ mod tests {
         })
         .to_string();
         crate::runs::blob_store::put_run_bundle(
-            &pool,
+            &BlobStore::new(pool.clone()),
             "run-pod",
             crucible_contract::ArtifactKind::RunCommits,
             tar_gz(&[
@@ -641,7 +646,7 @@ mod tests {
         .await
         .unwrap();
         crate::runs::blob_store::put_run_bundle(
-            &pool,
+            &BlobStore::new(pool.clone()),
             "run-pod",
             crucible_contract::ArtifactKind::RunFiles,
             tar_gz(&[("scan/targets.json", b"[]")]),

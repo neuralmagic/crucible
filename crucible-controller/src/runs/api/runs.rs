@@ -233,7 +233,7 @@ pub(crate) async fn get_run_graph(
     let read = tasks.iter().any(|t| !t.over.is_empty() || t.kind == ROUTE);
     let session = match read {
         true => {
-            crate::runs::task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id)
+            crate::runs::task_evidence::run_session(state.db.blobs(), &state.scratch_dir, &run_id)
                 .await?
         }
         false => None,
@@ -569,7 +569,7 @@ pub(crate) async fn get_artifact(
     crate::runs::artifacts::serve_artifact(
         state.db.metrics(),
         Some(&state.contracts),
-        state.db.pool(),
+        state.db.blobs(),
         run.session_uri.as_deref(),
         &run_id,
         &path,

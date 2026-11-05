@@ -99,13 +99,14 @@ pub fn sibling_db_url(url: &str, name: &str) -> Result<String> {
     Ok(parsed.into())
 }
 
-/// The controller's ledger handle: a Postgres pool plus the event log every transition appends to,
-/// and an optional metrics registry. The registry is `None` for the many test constructions and
+/// The controller's ledger handle: a Postgres pool, the artifact payload store, the event log every
+/// transition appends to, and an optional metrics registry. The registry is `None` for the many test constructions and
 /// attached once at startup ([`Db::with_metrics`]) so the choke points re-export what they ingest;
 /// it's a cheap `Arc` clone, so every `Db` clone shares the one registry.
 #[derive(Clone)]
 pub struct Db {
     pool: PgPool,
+    blobs: crate::runs::blob_store::BlobStore,
     events: EventLog,
     metrics: Option<crate::metrics::Metrics>,
 }
@@ -116,6 +117,7 @@ impl Db {
     pub(crate) fn new(pool: PgPool) -> Self {
         let events = EventLog::new(pool.clone());
         Db {
+            blobs: crate::runs::blob_store::BlobStore::new(pool.clone()),
             pool,
             events,
             metrics: None,
@@ -144,6 +146,19 @@ impl Db {
 
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Store new artifact payloads in `objects` instead of Postgres.
+    pub fn with_object_store(
+        mut self,
+        objects: crate::runs::blob_store::objects::ObjectStore,
+    ) -> Self {
+        self.blobs = self.blobs.with_objects(objects);
+        self
+    }
+
+    pub fn blobs(&self) -> &crate::runs::blob_store::BlobStore {
+        &self.blobs
     }
 
     pub fn events(&self) -> &EventLog {

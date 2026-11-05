@@ -355,7 +355,7 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
 
 /// Store the session a local run published as its artifact, as the pod path does, then fold it.
 async fn complete(db: &Db, key: &str, run_id: &str, session: &str) -> Result<()> {
-    crate::runs::blob_store::put_run_session(db.pool(), run_id, session.as_bytes()).await?;
+    crate::runs::blob_store::put_run_session(db.blobs(), run_id, session.as_bytes()).await?;
     crate::runs::completion::complete_run(db, key, None, run_id, None, session, None).await?;
     Ok(())
 }

@@ -37,6 +37,7 @@ pub(crate) fn controller_cfg(
 ) -> crate::config::ControllerCfg {
     crate::config::ControllerCfg {
         db: crate::test_ledger_url(),
+        evidence_bucket: None,
         repos,
         ..cfg_with(state_dir)
     }
@@ -83,6 +84,7 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         state_dir: state_dir.to_path_buf(),
         scratch_dir: None,
         db: "postgres://unused.invalid/none".to_string(),
+        evidence_bucket: None,
         repos: vec![],
         allowed_orgs: vec![],
         pod_namespace: "default".to_string(),

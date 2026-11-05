@@ -394,7 +394,7 @@ impl PodDispatcher for FakePodDispatcher {
             .to_string();
         if !self.held {
             crucible_controller::runs::blob_store::put_run_session(
-                &self.pool,
+                &crucible_controller::runs::blob_store::BlobStore::new(self.pool.clone()),
                 &run_id,
                 self.session.as_bytes(),
             )
@@ -423,11 +423,12 @@ impl PodDispatcher for FakePodDispatcher {
             .fetch_optional(&self.pool)
             .await?;
         let uploaded = match run_id {
-            Some(run_id) => {
-                crucible_controller::runs::blob_store::get_run_session(&self.pool, &run_id)
-                    .await?
-                    .is_some()
-            }
+            Some(run_id) => crucible_controller::runs::blob_store::get_run_session(
+                &crucible_controller::runs::blob_store::BlobStore::new(self.pool.clone()),
+                &run_id,
+            )
+            .await?
+            .is_some(),
             None => false,
         };
         Ok(TerminalState {
@@ -569,6 +570,7 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         state_dir: state_dir.to_path_buf(),
         scratch_dir: None,
         db: test_ledger_url(),
+        evidence_bucket: None,
         repos,
         allowed_orgs: vec![],
         pod_namespace: "default".to_string(),
@@ -1816,7 +1818,7 @@ impl LaunchRig {
             .expect("the key was dispatched");
         let run_id = self.launcher.launches.lock().expect("launches")[n].clone();
         crucible_controller::runs::blob_store::put_run_session(
-            self.db.pool(),
+            self.db.blobs(),
             &run_id,
             self.launcher.session.as_bytes(),
         )

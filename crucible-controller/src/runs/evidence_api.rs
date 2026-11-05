@@ -119,7 +119,7 @@ async fn upload(
         run_id: run_id.clone(),
     };
     match crate::runs::blob_store::put_artifact(
-        state.db.pool(),
+        state.db.blobs(),
         &owner,
         kind.as_str(),
         kind.max_bytes(),
@@ -206,7 +206,7 @@ async fn evidence_bytes(
         run_id: run_id.to_string(),
     };
     if let Some(payload) =
-        crate::runs::blob_store::get_artifact(state.db.pool(), &owner, kind.as_str()).await?
+        crate::runs::blob_store::get_artifact(state.db.blobs(), &owner, kind.as_str()).await?
     {
         if payload.data.starts_with(&[0x1f, 0x8b]) {
             return Ok(Some(payload.data));
@@ -272,7 +272,7 @@ async fn upload_turn(
     }
     let owner = ArtifactOwner::PodEvidence { pod: pod.clone() };
     let stored = match crate::runs::blob_store::put_artifact(
-        state.db.pool(),
+        state.db.blobs(),
         &owner,
         kind.as_str(),
         kind.max_bytes(),
@@ -339,7 +339,7 @@ fn refuse(status: StatusCode, error: String) -> Response {
 mod tests {
     use crate::client::Db;
     use crate::identity::auth::{BearerGuard, HumanOrKeyGuard, SharedToken};
-    use crate::runs::blob_store::ArtifactOwner;
+    use crate::runs::blob_store::{ArtifactOwner, BlobStore};
     use crate::runs::evidence_api::{EvidenceState, router};
     use crate::runs::pod_token::{Subject, mint, revoke};
     use axum::body::{Body, to_bytes};
@@ -428,7 +428,7 @@ mod tests {
             let stored: EvidenceStored = serde_json::from_slice(&resp).expect("json");
             assert_eq!(stored.digest, crucible_contract::content_digest(&body));
             let held = crate::runs::blob_store::get_artifact(
-                &pool,
+                &BlobStore::new(pool.clone()),
                 &ArtifactOwner::Run {
                     run_id: "run-b".to_string(),
                 },
@@ -440,7 +440,7 @@ mod tests {
             assert_eq!(held.data, body);
         }
         assert_eq!(
-            crate::runs::blob_store::get_run_session(&pool, "run-b")
+            crate::runs::blob_store::get_run_session(&BlobStore::new(pool.clone()), "run-b")
                 .await
                 .expect("session")
                 .as_deref(),
@@ -505,7 +505,7 @@ mod tests {
         let app = app(&pool, scratch.path());
         for run in ["run-a", "run-c"] {
             crate::runs::blob_store::put_run_bundle(
-                &pool,
+                &BlobStore::new(pool.clone()),
                 run,
                 ArtifactKind::RunFiles,
                 gz(run.as_bytes()),
@@ -559,9 +559,13 @@ mod tests {
             );
         }
         assert_eq!(
-            crate::runs::blob_store::get_run_bundle(&pool, "run-a", ArtifactKind::RunFiles)
-                .await
-                .expect("get"),
+            crate::runs::blob_store::get_run_bundle(
+                &BlobStore::new(pool.clone()),
+                "run-a",
+                ArtifactKind::RunFiles
+            )
+            .await
+            .expect("get"),
             Some(gz(b"run-a")),
             "the parent's evidence is untouched"
         );
@@ -571,9 +575,13 @@ mod tests {
     async fn a_human_reads_evidence_and_never_uploads_it(pool: PgPool) {
         let scratch = tempfile::tempdir().expect("scratch");
         let app = app(&pool, scratch.path());
-        crate::runs::blob_store::put_run_session(&pool, "run-a", b"{\"v\":1}\n")
-            .await
-            .expect("seed");
+        crate::runs::blob_store::put_run_session(
+            &BlobStore::new(pool.clone()),
+            "run-a",
+            b"{\"v\":1}\n",
+        )
+        .await
+        .expect("seed");
 
         let (status, got) = call(
             &app,
@@ -832,10 +840,11 @@ mod tests {
             let owner = ArtifactOwner::PodEvidence {
                 pod: pod.to_string(),
             };
-            let held = crate::runs::blob_store::get_artifact(&pool, &owner, kind)
-                .await
-                .expect("read")
-                .expect("stored under the pod");
+            let held =
+                crate::runs::blob_store::get_artifact(&BlobStore::new(pool.clone()), &owner, kind)
+                    .await
+                    .expect("read")
+                    .expect("stored under the pod");
             assert_eq!(held.data, body);
         }
 

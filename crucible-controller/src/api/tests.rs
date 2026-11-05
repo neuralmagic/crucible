@@ -10432,7 +10432,7 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
         "{\"v\":1,\"kind\":\"task_result\",\"task\":\"triage[1027]\",\"status\":\"pass\",",
         "\"iter\":1,\"attempts\":2,\"output\":{\"classification\":\"feature\"}}\n",
     );
-    crate::runs::blob_store::put_run_session(db.pool(), "run-ev", session.as_bytes()).await?;
+    crate::runs::blob_store::put_run_session(db.blobs(), "run-ev", session.as_bytes()).await?;
 
     let files = scratch
         .join("local-runs")
@@ -10683,7 +10683,7 @@ async fn a_run_lists_and_serves_the_files_its_tasks_captured(pool: PgPool) -> Re
     assert!(empty["files"].as_array().expect("files").is_empty());
 
     crate::runs::blob_store::put_run_bundle(
-        &pool,
+        &crate::runs::blob_store::BlobStore::new(pool.clone()),
         "run-pod",
         crucible_contract::ArtifactKind::RunFiles,
         run_files_bundle(&[
@@ -10792,7 +10792,7 @@ async fn slash_instance_run(db: &Db, run_id: &str, pod: Option<&str>) -> Result<
         "{\"v\":1,\"kind\":\"task_result\",\"task\":\"review[llm-d/llm-d-router]\",",
         "\"status\":\"pass\",\"iter\":0,\"attempts\":1,\"output\":{\"verdict\":\"ok\"}}\n",
     );
-    crate::runs::blob_store::put_run_session(db.pool(), run_id, session.as_bytes()).await?;
+    crate::runs::blob_store::put_run_session(db.blobs(), run_id, session.as_bytes()).await?;
     Ok(())
 }
 
@@ -10954,7 +10954,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
 
     // Once the run's session is ingested it outlives the pod, so the log is served from the store.
     crate::runs::blob_store::put_run_session(
-        &pool,
+        &crate::runs::blob_store::BlobStore::new(pool.clone()),
         "run-pod",
         b"task scan: pass\ntask roundup: pass\n",
     )
@@ -10972,7 +10972,7 @@ async fn run_log_serves_local_output_and_points_a_pod_run_at_its_pod(pool: PgPoo
 
     // The engine log kept at completion is the pod's own output and wins over the session.
     crate::runs::blob_store::put_run_engine_log(
-        &pool,
+        &crate::runs::blob_store::BlobStore::new(pool.clone()),
         "run-pod",
         "gateway_boot: driver=kubernetes\ntriage[a]: transport retries exhausted\n",
     )

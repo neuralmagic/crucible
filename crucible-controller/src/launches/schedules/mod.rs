@@ -127,7 +127,7 @@ impl ScheduleStore {
             }
             CursorSpec::File { from, path } => {
                 let bundle = crate::runs::blob_store::get_run_bundle(
-                    self.db.pool(),
+                    self.db.blobs(),
                     run_id,
                     crucible_contract::ArtifactKind::RunFiles,
                 )
@@ -3197,7 +3197,7 @@ mod tests {
 
         let body = br#"{"seen": [{"pr": 12345, "head_sha": "ab12"}]}"#;
         crate::runs::blob_store::put_run_bundle(
-            &pool,
+            &crate::runs::blob_store::BlobStore::new(pool.clone()),
             "run-1",
             crucible_contract::ArtifactKind::RunFiles,
             run_files(&[("rollup/STATE.json", body), ("rollup/REPORT.md", b"# hi")]),
@@ -3271,7 +3271,7 @@ mod tests {
         for (run_id, bundle, expected) in cases {
             if let Some(bundle) = bundle {
                 crate::runs::blob_store::put_run_bundle(
-                    &pool,
+                    &crate::runs::blob_store::BlobStore::new(pool.clone()),
                     run_id,
                     crucible_contract::ArtifactKind::RunFiles,
                     bundle,

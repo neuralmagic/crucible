@@ -265,7 +265,7 @@ async fn walk_local(root: &std::path::Path) -> Vec<ArtifactEntry> {
 pub(crate) async fn serve_artifact(
     metrics: Option<&Metrics>,
     contracts: Option<&crate::runs::contract::ContractRegistry>,
-    pool: &sqlx::PgPool,
+    blobs: &crate::runs::blob_store::BlobStore,
     session_uri: Option<&str>,
     run_id: &str,
     raw_path: &str,
@@ -305,7 +305,7 @@ pub(crate) async fn serve_artifact(
 
     // Fetch: the artifact store for a db:// prefix, local path off the filesystem, s3:// via the
     // engine subprocess into a temp dir.
-    let (path, guard) = match fetch_artifact(pool, contracts, prefix, &artifact.rel()).await {
+    let (path, guard) = match fetch_artifact(blobs, contracts, prefix, &artifact.rel()).await {
         Ok(f) => f,
         Err(FetchError::NotFound) => {
             record("not_found");
@@ -410,13 +410,13 @@ pub(crate) enum FetchError {
 /// `s3://` goes through the engine subprocess into a temp dir. The `TempDir` guard must outlive
 /// every read of the returned path.
 pub(crate) async fn fetch_artifact(
-    pool: &sqlx::PgPool,
+    blobs: &crate::runs::blob_store::BlobStore,
     contracts: Option<&crate::runs::contract::ContractRegistry>,
     prefix: &str,
     rel: &str,
 ) -> Result<(PathBuf, Option<tempfile::TempDir>), FetchError> {
     if let Some(run_id) = crate::runs::blob_store::run_id_of_session_uri(prefix) {
-        fetch_db_session(pool, run_id, rel).await
+        fetch_db_session(blobs, run_id, rel).await
     } else if prefix.starts_with("s3://") {
         fetch_s3(contracts, prefix, rel).await
     } else {
@@ -427,14 +427,14 @@ pub(crate) async fn fetch_artifact(
 /// Materialize a store-backed run session to a temp file (the flow render shells a subprocess over
 /// a path, and the proxy streams a file). Only `session.jsonl` exists under a `db://` prefix.
 async fn fetch_db_session(
-    pool: &sqlx::PgPool,
+    blobs: &crate::runs::blob_store::BlobStore,
     run_id: &str,
     rel: &str,
 ) -> Result<(PathBuf, Option<tempfile::TempDir>), FetchError> {
     if rel != "session.jsonl" {
         return Err(FetchError::NotFound);
     }
-    let session = crate::runs::blob_store::get_run_session(pool, run_id)
+    let session = crate::runs::blob_store::get_run_session(blobs, run_id)
         .await
         .map_err(|e| FetchError::Fetch(format!("reading stored session for {run_id}: {e:#}")))?
         .ok_or(FetchError::NotFound)?;
@@ -527,7 +527,8 @@ impl Stream for GuardedStream {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::artifacts::*;
+    use crate::runs::blob_store::BlobStore;
     use axum::body::to_bytes;
 
     #[test]
@@ -673,7 +674,16 @@ mod tests {
             ),
             ("diffs/one.diff", "text/plain", "@@ diff"),
         ] {
-            let resp = serve_artifact(None, None, &pool, Some(&uri), "run-1", path, None).await;
+            let resp = serve_artifact(
+                None,
+                None,
+                &BlobStore::new(pool.clone()),
+                Some(&uri),
+                "run-1",
+                path,
+                None,
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK, "serving {path}");
             let ct = resp
                 .headers()
@@ -704,7 +714,16 @@ mod tests {
             .to_string_lossy()
             .to_string();
 
-        let resp = serve_artifact(None, None, &pool, Some(&uri), "run-1", "flow.html", None).await;
+        let resp = serve_artifact(
+            None,
+            None,
+            &BlobStore::new(pool.clone()),
+            Some(&uri),
+            "run-1",
+            "flow.html",
+            None,
+        )
+        .await;
         let csp = resp
             .headers()
             .get(header::CONTENT_SECURITY_POLICY)
@@ -713,8 +732,16 @@ mod tests {
             .to_string();
         assert_eq!(csp, "sandbox allow-scripts");
 
-        let resp =
-            serve_artifact(None, None, &pool, Some(&uri), "run-1", "summary.json", None).await;
+        let resp = serve_artifact(
+            None,
+            None,
+            &BlobStore::new(pool.clone()),
+            Some(&uri),
+            "run-1",
+            "summary.json",
+            None,
+        )
+        .await;
         assert!(
             resp.headers()
                 .get(header::CONTENT_SECURITY_POLICY)
@@ -734,7 +761,7 @@ mod tests {
         let resp = serve_artifact(
             None,
             None,
-            &pool,
+            &BlobStore::new(pool.clone()),
             Some(&uri),
             "run-1",
             "diffs/../secret",
@@ -752,14 +779,31 @@ mod tests {
             .join("session.jsonl")
             .to_string_lossy()
             .to_string();
-        let resp =
-            serve_artifact(None, None, &pool, Some(&uri), "run-1", "summary.json", None).await;
+        let resp = serve_artifact(
+            None,
+            None,
+            &BlobStore::new(pool.clone()),
+            Some(&uri),
+            "run-1",
+            "summary.json",
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn no_session_uri_is_404(pool: sqlx::PgPool) {
-        let resp = serve_artifact(None, None, &pool, None, "run-1", "session.jsonl", None).await;
+        let resp = serve_artifact(
+            None,
+            None,
+            &BlobStore::new(pool.clone()),
+            None,
+            "run-1",
+            "session.jsonl",
+            None,
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
@@ -784,7 +828,7 @@ mod tests {
         let resp = serve_artifact(
             None,
             None,
-            &pool,
+            &BlobStore::new(pool.clone()),
             Some(&uri),
             "run-1",
             "codegen-out/plots/latency.svg",
@@ -886,15 +930,19 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn serves_a_store_backed_session_and_404s_its_siblings(pool: sqlx::PgPool) {
         let session = "{\"v\":1,\"kind\":\"shutdown\",\"outcome\":\"finished\"}\n";
-        crate::runs::blob_store::put_run_session(&pool, "run-db", session.as_bytes())
-            .await
-            .expect("store");
+        crate::runs::blob_store::put_run_session(
+            &BlobStore::new(pool.clone()),
+            "run-db",
+            session.as_bytes(),
+        )
+        .await
+        .expect("store");
         let uri = crate::runs::blob_store::run_session_uri("run-db");
 
         let resp = serve_artifact(
             None,
             None,
-            &pool,
+            &BlobStore::new(pool.clone()),
             Some(&uri),
             "run-db",
             "session.jsonl",
@@ -915,7 +963,7 @@ mod tests {
         let resp = serve_artifact(
             None,
             None,
-            &pool,
+            &BlobStore::new(pool.clone()),
             Some(&uri),
             "run-db",
             "summary.json",
@@ -929,7 +977,7 @@ mod tests {
         let resp = serve_artifact(
             None,
             None,
-            &pool,
+            &BlobStore::new(pool.clone()),
             Some(&missing),
             "run-none",
             "session.jsonl",
@@ -959,8 +1007,16 @@ mod tests {
             .join("session.jsonl")
             .to_string_lossy()
             .to_string();
-        let first =
-            serve_artifact(None, None, &pool, Some(&uri), "run-1", "summary.json", None).await;
+        let first = serve_artifact(
+            None,
+            None,
+            &BlobStore::new(pool.clone()),
+            Some(&uri),
+            "run-1",
+            "summary.json",
+            None,
+        )
+        .await;
         let etag = first
             .headers()
             .get(header::ETAG)
@@ -971,7 +1027,7 @@ mod tests {
         let resp = serve_artifact(
             None,
             None,
-            &pool,
+            &BlobStore::new(pool.clone()),
             Some(&uri),
             "run-1",
             "summary.json",
@@ -985,7 +1041,7 @@ mod tests {
         let resp = serve_artifact(
             None,
             None,
-            &pool,
+            &BlobStore::new(pool.clone()),
             Some(&uri),
             "run-1",
             "summary.json",

@@ -20,7 +20,7 @@ pub async fn run_once(cfg: &ControllerCfg) -> Result<()> {
         .context("validating the grounded-rank executor configuration")?;
     cfg.validate_scope()
         .context("validating the scope executor configuration")?;
-    let db = Db::open(cfg.db_url()).await.context("opening ledger")?;
+    let db = cfg.open_db().await.context("opening ledger")?;
     #[cfg(feature = "autoresearch")]
     if cfg.autoresearch_enabled() {
         crate::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)

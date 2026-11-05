@@ -62,6 +62,8 @@ sqlx = { version = "0.9", default-features = false, features = [
     "json",
 ] }
 uuid.workspace = true
+aws-config = "1"
+aws-sdk-s3 = { version = "1", default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 # Compile-time SQL assembly: a query spliced from `const` column lists stays `&'static str`.
 const_format = "0.2"
 jsonschema.workspace = true

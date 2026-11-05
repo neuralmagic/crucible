@@ -55,10 +55,9 @@ pub(crate) fn parse_s3_uri(uri: &str) -> Result<(String, String), ObjectUriError
 }
 
 /// Download one published object at an exact `s3://bucket/key` URI to a local file, the general
-/// GetObject the controller's artifact proxy shells (`crucible fetch`), keeping every S3 client out
-/// of `crucible-controller` (that crate has no aws-sdk and never learns the bucket layout). Nothing
-/// is appended to the URI: the caller passes the exact key it wants. Reuses the same IRSA creds the
-/// publisher uses (GetObject is in the role's policy).
+/// GetObject the controller's artifact proxy shells (`crucible fetch`), so the controller never
+/// learns the results bucket layout. Nothing is appended to the URI: the caller passes the exact
+/// key it wants. Reuses the same IRSA creds the publisher uses (GetObject is in the role's policy).
 pub fn fetch_object(
     uri: &str,
     dest: &std::path::Path,

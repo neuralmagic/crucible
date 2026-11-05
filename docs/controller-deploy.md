@@ -24,7 +24,8 @@ describes the secrets registry. To try the controller on a laptop first, see
 | Scratch space | `CONTROLLER_SCRATCH_DIR` | Repository checkouts and the flow cache. The controller can create them again. An `emptyDir` is sufficient. |
 | A public URL | `CONTROLLER_PUBLIC_URL` | The base URL for the UI, the MCP handoff, and emitted links. |
 
-All durable state is in Postgres. You can replace the controller pod at any time.
+All durable state is in Postgres, except run evidence when you set an evidence bucket (below).
+You can replace the controller pod at any time.
 
 ## Running it
 
@@ -55,6 +56,31 @@ The admission caps limit what the daemon can spend without a person:
 
 You can disable autopilot at run time on the admin page. This pauses only the spend that the
 daemon starts.
+
+## Run evidence storage
+
+Each run's evidence (session log, captured files, git memory, engine log, and scope packs and
+transcripts) is stored as gzipped chunks in Postgres by default. A captured-files tar can reach
+256 MiB, so a busy deployment should put these payloads in an S3-compatible bucket instead:
+
+| Variable | Notes |
+| --- | --- |
+| `CONTROLLER_EVIDENCE_BUCKET` | `s3://bucket[/prefix]`. Unset keeps payloads in Postgres. |
+| `AWS_ENDPOINT_URL` | For Ceph RGW, SeaweedFS, MinIO, and other S3-compatible servers. Setting it switches to path-style addressing. |
+| `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Or any other source in the standard AWS credential chain, such as IRSA. |
+
+The controller needs `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
+`s3:AbortMultipartUpload` on `<prefix>/artifacts/*`, and `s3:ListBucket` on the bucket for its
+startup check. It refuses to start if the bucket is unreachable.
+
+Postgres keeps one metadata row per payload (owner, kind, digest, size, object key), and every
+read checks the size and sha256 digest. Payloads stored before the bucket was set are still
+read from Postgres. When one is rewritten, the new copy goes to the bucket and the old chunks
+are deleted. If you remove the bucket setting later, payloads already in the bucket can no
+longer be read.
+
+Add a lifecycle rule that aborts incomplete multipart uploads after a day. An upload aborts
+itself when it fails, but not if the controller is killed mid-upload.
 
 ## The autoresearch lane
 

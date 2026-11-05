@@ -105,7 +105,7 @@ pub(crate) async fn get_run_flow_enriched(
 
     // `_guard` keeps an S3 temp download alive through the render below.
     let (session_path, _guard) = match fetch_artifact(
-        state.db.pool(),
+        state.db.blobs(),
         Some(&state.contracts),
         prefix,
         "session.jsonl",

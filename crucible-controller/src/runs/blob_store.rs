@@ -1,11 +1,15 @@
-//! Payload storage over Postgres (migration `0004_shared_state.sql`): artifact bodies as ordered
-//! gzipped chunks, pack tarballs, steering appends, and the autopilot flag. This module owns the
-//! bytes; the existing `pod_artifacts` pointer rows stay where they are.
+//! Payload storage (migration `0004_shared_state.sql`): artifact bodies, pack tarballs, steering
+//! appends, and the autopilot flag. This module owns the bytes; the existing `pod_artifacts`
+//! pointer rows stay where they are.
+//!
+//! An artifact's `artifacts` row is always in Postgres. Its bytes are ordered gzipped chunks in
+//! `artifact_chunks`, or, when the [`BlobStore`] has an [`ObjectStore`], one object named by the
+//! row's `object_key`. Reads follow the row, so rows written before a bucket was configured stay
+//! readable from Postgres.
 //!
 //! [`put_artifact`] is streaming-friendly: it consumes the body piece by piece, hashes inline,
-//! enforces the caller's cap mid-stream, and lands every chunk in one transaction, so a torn or
-//! oversize upload leaves nothing behind. [`get_artifact`] concatenates the chunks and verifies
-//! the digest before handing the payload back.
+//! and enforces the caller's cap mid-stream, so a torn or oversize upload leaves no row behind.
+//! [`get_artifact`] verifies the size and digest before handing the payload back.
 
 #![allow(clippy::disallowed_macros)]
 
@@ -17,6 +21,10 @@ use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::fmt::Write as _;
+
+pub mod objects;
+
+use objects::ObjectStore;
 
 /// Chunk size for `artifact_chunks.data`: large enough to keep row count low, small enough to
 /// bound per-row TOAST and WAL cost.
@@ -44,6 +52,33 @@ pub fn run_id_of_session_uri(uri: &str) -> Option<&str> {
     let rest = uri.strip_prefix(DB_SESSION_URI_PREFIX)?;
     let run_id = rest.split('/').next().unwrap_or(rest);
     (!run_id.is_empty()).then_some(run_id)
+}
+
+/// Where artifact payloads go: the ledger pool, plus the bucket when one is configured.
+#[derive(Clone, Debug)]
+pub struct BlobStore {
+    pool: PgPool,
+    objects: Option<ObjectStore>,
+}
+
+impl BlobStore {
+    /// Payload bytes in `artifact_chunks`.
+    pub fn new(pool: PgPool) -> Self {
+        BlobStore {
+            pool,
+            objects: None,
+        }
+    }
+
+    /// New payload bytes go to `objects`; rows already in `artifact_chunks` stay readable.
+    pub fn with_objects(mut self, objects: ObjectStore) -> Self {
+        self.objects = Some(objects);
+        self
+    }
+
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
 }
 
 /// Whose payload an `artifacts` row holds. The variants mirror the `owner_kind` CHECK constraint.
@@ -117,9 +152,36 @@ pub enum PutArtifactError {
 }
 
 /// Store one artifact payload from a stream of byte pieces. Replaces any prior payload for the
-/// same `(owner, kind)`. Everything happens in one transaction: an error (including the cap)
-/// rolls the whole write back.
+/// same `(owner, kind)`. An error (including the cap) leaves the prior payload in place.
 pub async fn put_artifact<S, B, E>(
+    blobs: &BlobStore,
+    owner: &ArtifactOwner,
+    kind: &str,
+    max_bytes: u64,
+    stream: S,
+) -> Result<StoredArtifact, PutArtifactError>
+where
+    S: Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    match &blobs.objects {
+        None => put_chunked(&blobs.pool, owner, kind, max_bytes, stream).await,
+        Some(objects) => {
+            Box::pin(put_object(
+                &blobs.pool,
+                objects,
+                owner,
+                kind,
+                max_bytes,
+                stream,
+            ))
+            .await
+        }
+    }
+}
+
+async fn put_chunked<S, B, E>(
     pool: &PgPool,
     owner: &ArtifactOwner,
     kind: &str,
@@ -132,13 +194,7 @@ where
     E: std::fmt::Display,
 {
     let mut tx = pool.begin().await.context("begin put_artifact")?;
-    sqlx::query("DELETE FROM artifacts WHERE owner_kind = $1 AND owner_id = $2 AND kind = $3")
-        .bind(owner.owner_kind())
-        .bind(owner.owner_id())
-        .bind(kind)
-        .execute(&mut *tx)
-        .await
-        .context("clearing prior artifact")?;
+    let prior_objects = take_prior_objects(&mut tx, owner, kind).await?;
     let row = sqlx::query(
         r#"INSERT INTO artifacts (owner_kind, owner_id, kind, digest, bytes, created_at)
            VALUES ($1, $2, $3, '', 0, $4) RETURNING id"#,
@@ -178,7 +234,101 @@ where
         .await
         .context("finalizing artifact row")?;
     tx.commit().await.context("commit put_artifact")?;
+    for key in prior_objects {
+        tracing::warn!(
+            key,
+            "no evidence bucket is configured to delete a replaced artifact object"
+        );
+    }
     Ok(StoredArtifact { id, digest, bytes })
+}
+
+/// The bytes go to a fresh object first, then one transaction swaps the row to name it. The
+/// replaced object is deleted only after that commit, so a reader never sees a row whose object
+/// is gone.
+async fn put_object<S, B, E>(
+    pool: &PgPool,
+    objects: &ObjectStore,
+    owner: &ArtifactOwner,
+    kind: &str,
+    max_bytes: u64,
+    stream: S,
+) -> Result<StoredArtifact, PutArtifactError>
+where
+    S: Stream<Item = Result<B, E>> + Unpin,
+    B: AsRef<[u8]>,
+    E: std::fmt::Display,
+{
+    let key = objects.new_key();
+    let uploaded = objects.upload(&key, max_bytes, stream).await?;
+    let recorded = record_object(pool, owner, kind, &key, &uploaded).await;
+    let (id, prior) = match recorded {
+        Ok(recorded) => recorded,
+        Err(e) => {
+            delete_unreferenced(objects, &key).await;
+            return Err(e.into());
+        }
+    };
+    for prior in prior {
+        delete_unreferenced(objects, &prior).await;
+    }
+    Ok(StoredArtifact {
+        id,
+        digest: uploaded.digest,
+        bytes: uploaded.bytes,
+    })
+}
+
+async fn record_object(
+    pool: &PgPool,
+    owner: &ArtifactOwner,
+    kind: &str,
+    key: &str,
+    uploaded: &objects::Uploaded,
+) -> Result<(i64, Vec<String>)> {
+    let mut tx = pool.begin().await.context("begin put_artifact")?;
+    let prior = take_prior_objects(&mut tx, owner, kind).await?;
+    let id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO artifacts (owner_kind, owner_id, kind, digest, bytes, created_at, object_key)
+           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id"#,
+    )
+    .bind(owner.owner_kind())
+    .bind(owner.owner_id())
+    .bind(kind)
+    .bind(&uploaded.digest)
+    .bind(i64::try_from(uploaded.bytes).context("artifact byte count exceeds i64")?)
+    .bind(crate::clock::now_rfc3339())
+    .bind(key)
+    .fetch_one(&mut *tx)
+    .await
+    .context("inserting artifact row")?;
+    tx.commit().await.context("commit put_artifact")?;
+    Ok((id, prior))
+}
+
+/// Delete the `(owner, kind)` row, returning the object keys it named.
+async fn take_prior_objects(
+    tx: &mut Transaction<'_, Postgres>,
+    owner: &ArtifactOwner,
+    kind: &str,
+) -> Result<Vec<String>> {
+    let keys: Vec<Option<String>> = sqlx::query_scalar(
+        r#"DELETE FROM artifacts WHERE owner_kind = $1 AND owner_id = $2 AND kind = $3
+           RETURNING object_key"#,
+    )
+    .bind(owner.owner_kind())
+    .bind(owner.owner_id())
+    .bind(kind)
+    .fetch_all(&mut **tx)
+    .await
+    .context("clearing prior artifact")?;
+    Ok(keys.into_iter().flatten().collect())
+}
+
+async fn delete_unreferenced(objects: &ObjectStore, key: &str) {
+    if let Err(e) = objects.delete(key).await {
+        tracing::warn!(key, error = %format!("{e:#}"), "deleting an unreferenced artifact object");
+    }
 }
 
 async fn insert_chunk(
@@ -198,40 +348,41 @@ async fn insert_chunk(
 }
 
 /// Read one artifact payload back whole, or `None` if the `(owner, kind)` was never stored.
-/// Errs if the concatenated chunks disagree with the recorded size or digest.
+/// Errs if the payload disagrees with the recorded size or digest, or if the row names an object
+/// and no bucket is configured.
 pub async fn get_artifact(
-    pool: &PgPool,
+    blobs: &BlobStore,
     owner: &ArtifactOwner,
     kind: &str,
 ) -> Result<Option<ArtifactPayload>> {
     let row = sqlx::query(
-        r#"SELECT id, digest, bytes FROM artifacts
+        r#"SELECT id, digest, bytes, object_key FROM artifacts
            WHERE owner_kind = $1 AND owner_id = $2 AND kind = $3"#,
     )
     .bind(owner.owner_kind())
     .bind(owner.owner_id())
     .bind(kind)
-    .fetch_optional(pool)
+    .fetch_optional(&blobs.pool)
     .await
     .context("looking up artifact")?;
     let Some(row) = row else { return Ok(None) };
     let id: i64 = row.get("id");
     let digest: String = row.get("digest");
     let bytes: i64 = row.get("bytes");
+    let object_key: Option<String> = row.get("object_key");
 
-    let chunks =
-        sqlx::query("SELECT data FROM artifact_chunks WHERE artifact_id = $1 ORDER BY seq")
-            .bind(id)
-            .fetch_all(pool)
-            .await
-            .context("reading artifact chunks")?;
-    let mut data = Vec::with_capacity(usize::try_from(bytes).unwrap_or(0));
-    for chunk in chunks {
-        data.extend_from_slice(&chunk.get::<Vec<u8>, _>("data"));
-    }
+    let data = match (object_key, &blobs.objects) {
+        (Some(key), Some(objects)) => Box::pin(objects.get(&key)).await?,
+        (Some(key), None) => anyhow::bail!(
+            "artifact {}/{}/{kind} is in object storage at {key}, and no evidence bucket is configured",
+            owner.owner_kind(),
+            owner.owner_id(),
+        ),
+        (None, _) => read_chunks(&blobs.pool, id, bytes).await?,
+    };
     ensure!(
-        data.len() as i64 == bytes,
-        "artifact {}/{}/{kind}: {} chunk bytes but the row records {bytes}",
+        i64::try_from(data.len()).ok() == Some(bytes),
+        "artifact {}/{}/{kind}: {} payload bytes but the row records {bytes}",
         owner.owner_kind(),
         owner.owner_id(),
         data.len(),
@@ -246,21 +397,39 @@ pub async fn get_artifact(
     Ok(Some(ArtifactPayload { data, digest }))
 }
 
+async fn read_chunks(pool: &PgPool, id: i64, bytes: i64) -> Result<Vec<u8>> {
+    let chunks =
+        sqlx::query("SELECT data FROM artifact_chunks WHERE artifact_id = $1 ORDER BY seq")
+            .bind(id)
+            .fetch_all(pool)
+            .await
+            .context("reading artifact chunks")?;
+    let mut data = Vec::with_capacity(usize::try_from(bytes).unwrap_or(0));
+    for chunk in chunks {
+        data.extend_from_slice(&chunk.get::<Vec<u8>, _>("data"));
+    }
+    Ok(data)
+}
+
 /// [`put_artifact`] over an in-memory payload.
 pub async fn put_artifact_bytes(
-    pool: &PgPool,
+    blobs: &BlobStore,
     owner: &ArtifactOwner,
     kind: &str,
     max_bytes: u64,
     data: Vec<u8>,
 ) -> Result<StoredArtifact, PutArtifactError> {
     let stream = futures_util::stream::iter([Ok::<Vec<u8>, std::convert::Infallible>(data)]);
-    put_artifact(pool, owner, kind, max_bytes, stream).await
+    put_artifact(blobs, owner, kind, max_bytes, stream).await
 }
 
 /// Store a run's session NDJSON (gzipped at rest, like every ingested artifact). Replaces any
 /// prior session for the run.
-pub async fn put_run_session(pool: &PgPool, run_id: &str, ndjson: &[u8]) -> Result<StoredArtifact> {
+pub async fn put_run_session(
+    blobs: &BlobStore,
+    run_id: &str,
+    ndjson: &[u8],
+) -> Result<StoredArtifact> {
     use std::io::Write as _;
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     enc.write_all(ndjson).context("gzip run session")?;
@@ -270,7 +439,7 @@ pub async fn put_run_session(pool: &PgPool, run_id: &str, ndjson: &[u8]) -> Resu
     };
     let cap = crucible_contract::ArtifactKind::RunSession.max_bytes();
     put_artifact_bytes(
-        pool,
+        blobs,
         &owner,
         crucible_contract::ArtifactKind::RunSession.as_str(),
         cap,
@@ -282,7 +451,11 @@ pub async fn put_run_session(pool: &PgPool, run_id: &str, ndjson: &[u8]) -> Resu
 
 /// Store a pod run's own output, gzipped at rest, keeping the last [`RUN_ENGINE_LOG_KEEP`] bytes
 /// on a line boundary. Replaces any prior copy for the run.
-pub async fn put_run_engine_log(pool: &PgPool, run_id: &str, text: &str) -> Result<StoredArtifact> {
+pub async fn put_run_engine_log(
+    blobs: &BlobStore,
+    run_id: &str,
+    text: &str,
+) -> Result<StoredArtifact> {
     use std::io::Write as _;
     let kept = engine_log_tail(text);
     let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -292,7 +465,7 @@ pub async fn put_run_engine_log(pool: &PgPool, run_id: &str, text: &str) -> Resu
     let owner = ArtifactOwner::Run {
         run_id: run_id.to_string(),
     };
-    put_artifact_bytes(pool, &owner, RUN_ENGINE_LOG_KIND, u64::MAX, gz)
+    put_artifact_bytes(blobs, &owner, RUN_ENGINE_LOG_KIND, u64::MAX, gz)
         .await
         .map_err(anyhow::Error::from)
 }
@@ -310,11 +483,11 @@ fn engine_log_tail(text: &str) -> &str {
 }
 
 /// A pod run's stored engine output, or `None` for a run that finished before it was kept.
-pub async fn get_run_engine_log(pool: &PgPool, run_id: &str) -> Result<Option<String>> {
+pub async fn get_run_engine_log(blobs: &BlobStore, run_id: &str) -> Result<Option<String>> {
     let owner = ArtifactOwner::Run {
         run_id: run_id.to_string(),
     };
-    let Some(payload) = get_artifact(pool, &owner, RUN_ENGINE_LOG_KIND).await? else {
+    let Some(payload) = get_artifact(blobs, &owner, RUN_ENGINE_LOG_KIND).await? else {
         return Ok(None);
     };
     Ok(Some(gunzip_maybe(&payload.data)?))
@@ -323,7 +496,7 @@ pub async fn get_run_engine_log(pool: &PgPool, run_id: &str) -> Result<Option<St
 /// Store one of a run's tarred state directories, its captured files or its git memory: the
 /// gzipped tar the loop POSTed, kept exactly as ingested. Replaces any prior bundle of that kind.
 pub async fn put_run_bundle(
-    pool: &PgPool,
+    blobs: &BlobStore,
     run_id: &str,
     kind: crucible_contract::ArtifactKind,
     tar_gz: Vec<u8>,
@@ -331,32 +504,32 @@ pub async fn put_run_bundle(
     let owner = ArtifactOwner::Run {
         run_id: run_id.to_string(),
     };
-    put_artifact_bytes(pool, &owner, kind.as_str(), kind.max_bytes(), tar_gz)
+    put_artifact_bytes(blobs, &owner, kind.as_str(), kind.max_bytes(), tar_gz)
         .await
         .map_err(anyhow::Error::from)
 }
 
 /// Read a run's bundle of `kind` back as the gzipped tar bytes, or `None` if never stored.
 pub async fn get_run_bundle(
-    pool: &PgPool,
+    blobs: &BlobStore,
     run_id: &str,
     kind: crucible_contract::ArtifactKind,
 ) -> Result<Option<Vec<u8>>> {
     let owner = ArtifactOwner::Run {
         run_id: run_id.to_string(),
     };
-    Ok(get_artifact(pool, &owner, kind.as_str())
+    Ok(get_artifact(blobs, &owner, kind.as_str())
         .await?
         .map(|payload| payload.data))
 }
 
 /// Read a run's stored session back as NDJSON text, or `None` if never stored.
-pub async fn get_run_session(pool: &PgPool, run_id: &str) -> Result<Option<String>> {
+pub async fn get_run_session(blobs: &BlobStore, run_id: &str) -> Result<Option<String>> {
     let owner = ArtifactOwner::Run {
         run_id: run_id.to_string(),
     };
     let Some(payload) = get_artifact(
-        pool,
+        blobs,
         &owner,
         crucible_contract::ArtifactKind::RunSession.as_str(),
     )
@@ -595,7 +768,9 @@ impl Chunker {
 
 #[cfg(test)]
 mod tests {
+    use crate::runs::blob_store::objects::BucketUri;
     use crate::runs::blob_store::*;
+    use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region, SharedCredentialsProvider};
     use futures_util::stream;
 
     #[test]
@@ -608,19 +783,6 @@ mod tests {
         assert!(kept.len() <= RUN_ENGINE_LOG_KEEP);
         assert!(kept.starts_with('x') && kept.ends_with('\n'));
         assert_eq!(kept.len() % line.len(), 0, "cut on a line boundary");
-    }
-
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_run_engine_log_round_trips_and_replaces(pool: sqlx::PgPool) {
-        assert_eq!(get_run_engine_log(&pool, "run-x").await.unwrap(), None);
-        put_run_engine_log(&pool, "run-x", "first\n").await.unwrap();
-        put_run_engine_log(&pool, "run-x", "gateway_boot: ok\nagent: exit 0\n")
-            .await
-            .unwrap();
-        assert_eq!(
-            get_run_engine_log(&pool, "run-x").await.unwrap().as_deref(),
-            Some("gateway_boot: ok\nagent: exit 0\n")
-        );
     }
 
     fn feed(chunker: &mut Chunker, data: &[u8], piece: usize) -> Vec<Vec<u8>> {
@@ -689,13 +851,26 @@ mod tests {
         }
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn artifact_roundtrips_across_multiple_chunks(pool: sqlx::PgPool) {
-        // Big enough for two full chunks plus a tail, streamed in awkward piece sizes.
+    async fn artifact_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM artifacts")
+            .fetch_one(pool)
+            .await
+            .expect("count artifacts")
+    }
+
+    async fn chunk_rows(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM artifact_chunks")
+            .fetch_one(pool)
+            .await
+            .expect("count chunks")
+    }
+
+    /// A payload over one Postgres chunk and one multipart part, streamed in awkward pieces.
+    async fn roundtrips_a_multi_chunk_payload(blobs: &BlobStore) -> StoredArtifact {
         let data = payload(2 * ARTIFACT_CHUNK_BYTES + 12345);
         let owner = pod_owner();
         let stored = put_artifact(
-            &pool,
+            blobs,
             &owner,
             "run-session",
             data.len() as u64,
@@ -705,39 +880,29 @@ mod tests {
         .expect("put");
         assert_eq!(stored.bytes, data.len() as u64);
         assert_eq!(stored.digest, content_digest(&data));
-
-        let back = get_artifact(&pool, &owner, "run-session")
+        let back = get_artifact(blobs, &owner, "run-session")
             .await
             .expect("get")
             .expect("stored");
         assert_eq!(back.data, data);
         assert_eq!(back.digest, stored.digest);
-
-        let chunk_count: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM artifact_chunks WHERE artifact_id = $1")
-                .bind(stored.id)
-                .fetch_one(&pool)
-                .await
-                .expect("count");
-        assert_eq!(chunk_count, 3);
+        stored
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn put_replaces_a_prior_payload_for_the_same_owner_and_kind(pool: sqlx::PgPool) {
+    async fn replaces_a_prior_payload(blobs: &BlobStore) {
         let owner = pod_owner();
-        let first = payload(ARTIFACT_CHUNK_BYTES + 7);
         put_artifact(
-            &pool,
+            blobs,
             &owner,
             "scope-pack",
             u64::MAX,
-            ok_stream(first, 4096),
+            ok_stream(payload(ARTIFACT_CHUNK_BYTES + 7), 4096),
         )
         .await
         .expect("first put");
         let second = payload(99);
         put_artifact(
-            &pool,
+            blobs,
             &owner,
             "scope-pack",
             u64::MAX,
@@ -745,56 +910,49 @@ mod tests {
         )
         .await
         .expect("second put");
-
-        let back = get_artifact(&pool, &owner, "scope-pack")
+        let back = get_artifact(blobs, &owner, "scope-pack")
             .await
             .expect("get")
             .expect("stored");
         assert_eq!(back.data, second);
-
-        // No orphan rows from the replaced payload.
-        let artifact_count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifacts")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(artifact_count, 1);
-        let chunk_count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifact_chunks")
-            .fetch_one(&pool)
-            .await
-            .expect("count");
-        assert_eq!(chunk_count, 1);
+        assert_eq!(artifact_rows(blobs.pool()).await, 1);
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn oversize_put_rolls_back_and_stores_nothing(pool: sqlx::PgPool) {
+    /// Ten MiB against a nine MiB cap: one multipart part is already up when the cap trips.
+    async fn refuses_an_oversize_put_and_keeps_the_prior_payload(blobs: &BlobStore) {
         let owner = pod_owner();
-        let data = payload(1024);
-        let err = put_artifact(&pool, &owner, "scope-pack", 1023, ok_stream(data, 100))
+        put_artifact_bytes(blobs, &owner, "scope-pack", u64::MAX, b"prior".to_vec())
             .await
-            .expect_err("over the cap");
+            .expect("prior put");
+        let cap = 9 * 1024 * 1024;
+        let err = put_artifact(
+            blobs,
+            &owner,
+            "scope-pack",
+            cap,
+            ok_stream(payload(10 * 1024 * 1024), 1024 * 1024),
+        )
+        .await
+        .expect_err("over the cap");
         match err {
-            PutArtifactError::TooLarge { limit } => assert_eq!(limit, 1023),
+            PutArtifactError::TooLarge { limit } => assert_eq!(limit, cap),
             other => panic!("expected TooLarge, got {other:?}"),
         }
-        assert!(
-            get_artifact(&pool, &owner, "scope-pack")
-                .await
-                .expect("get")
-                .is_none()
-        );
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifacts")
-            .fetch_one(&pool)
+        let back = get_artifact(blobs, &owner, "scope-pack")
             .await
-            .expect("count");
-        assert_eq!(count, 0, "the aborted transaction left no row");
+            .expect("get")
+            .expect("prior kept");
+        assert_eq!(back.data, b"prior");
+        assert_eq!(artifact_rows(blobs.pool()).await, 1);
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn stream_error_rolls_back_and_stores_nothing(pool: sqlx::PgPool) {
+    async fn refuses_a_failed_stream_and_stores_nothing(blobs: &BlobStore) {
         let owner = pod_owner();
-        let pieces: Vec<Result<Vec<u8>, String>> =
-            vec![Ok(payload(10)), Err("connection reset".to_string())];
-        let err = put_artifact(&pool, &owner, "scope-pack", u64::MAX, stream::iter(pieces))
+        let pieces: Vec<Result<Vec<u8>, String>> = vec![
+            Ok(payload(9 * 1024 * 1024)),
+            Err("connection reset".to_string()),
+        ];
+        let err = put_artifact(blobs, &owner, "scope-pack", u64::MAX, stream::iter(pieces))
             .await
             .expect_err("stream errored");
         match err {
@@ -802,86 +960,465 @@ mod tests {
             other => panic!("expected Source, got {other:?}"),
         }
         assert!(
-            get_artifact(&pool, &owner, "scope-pack")
+            get_artifact(blobs, &owner, "scope-pack")
                 .await
                 .expect("get")
                 .is_none()
         );
+        assert_eq!(artifact_rows(blobs.pool()).await, 0);
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn get_verifies_the_digest_against_the_chunks(pool: sqlx::PgPool) {
-        let owner = pod_owner();
-        let data = payload(64);
-        let stored = put_artifact(&pool, &owner, "scope-pack", u64::MAX, ok_stream(data, 16))
-            .await
-            .expect("put");
-        // Corrupt one chunk behind the store's back; the read must refuse the payload.
-        sqlx::query("UPDATE artifact_chunks SET data = $1 WHERE artifact_id = $2 AND seq = 0")
-            .bind(vec![0xAAu8; 64])
-            .bind(stored.id)
-            .execute(&pool)
-            .await
-            .expect("corrupt");
-        // Same length, different bytes → digest mismatch.
-        let err = get_artifact(&pool, &owner, "scope-pack")
-            .await
-            .expect_err("digest mismatch");
-        assert!(err.to_string().contains("digest mismatch"), "{err:#}");
-    }
-
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn owners_do_not_collide_across_kinds(pool: sqlx::PgPool) {
-        // The same id under two owner kinds, and two kinds under one owner, stay distinct.
+    async fn keeps_owners_and_kinds_apart(blobs: &BlobStore) {
         let pod = ArtifactOwner::PodEvidence {
             pod: "same-id".to_string(),
         };
         let run = ArtifactOwner::Run {
             run_id: "same-id".to_string(),
         };
-        put_artifact(
-            &pool,
-            &pod,
-            "scope-pack",
-            u64::MAX,
-            ok_stream(vec![1u8; 4], 4),
-        )
-        .await
-        .expect("pod put");
-        put_artifact(
-            &pool,
-            &run,
-            "scope-pack",
-            u64::MAX,
-            ok_stream(vec![2u8; 4], 4),
-        )
-        .await
-        .expect("run put");
-        put_artifact(
-            &pool,
-            &pod,
-            "otel-log",
-            u64::MAX,
-            ok_stream(vec![3u8; 4], 4),
-        )
-        .await
-        .expect("second kind put");
+        for (owner, kind, byte) in [
+            (&pod, "scope-pack", 1u8),
+            (&run, "scope-pack", 2),
+            (&pod, "otel-log", 3),
+        ] {
+            put_artifact(blobs, owner, kind, u64::MAX, ok_stream(vec![byte; 4], 4))
+                .await
+                .expect("put");
+        }
+        for (owner, kind, byte) in [
+            (&pod, "scope-pack", 1u8),
+            (&run, "scope-pack", 2),
+            (&pod, "otel-log", 3),
+        ] {
+            let got = get_artifact(blobs, owner, kind)
+                .await
+                .expect("get")
+                .expect("row");
+            assert_eq!(got.data, vec![byte; 4], "{owner:?} {kind}");
+        }
+    }
 
-        let a = get_artifact(&pool, &pod, "scope-pack")
+    async fn roundtrips_an_empty_payload(blobs: &BlobStore) {
+        let owner = pod_owner();
+        let stored = put_artifact_bytes(blobs, &owner, "otel-log", u64::MAX, Vec::new())
+            .await
+            .expect("put");
+        assert_eq!(stored.bytes, 0);
+        let back = get_artifact(blobs, &owner, "otel-log")
             .await
             .expect("get")
             .expect("row");
-        let b = get_artifact(&pool, &run, "scope-pack")
+        assert!(back.data.is_empty());
+        assert_eq!(back.digest, content_digest(b""));
+    }
+
+    async fn roundtrips_a_gzipped_run_session(blobs: &BlobStore) {
+        assert!(
+            get_run_session(blobs, "run-s")
+                .await
+                .expect("get")
+                .is_none()
+        );
+        let ndjson = "{\"v\":1,\"kind\":\"shutdown\",\"outcome\":\"finished\"}\n";
+        let stored = put_run_session(blobs, "run-s", ndjson.as_bytes())
             .await
-            .expect("get")
-            .expect("row");
-        let c = get_artifact(&pool, &pod, "otel-log")
+            .expect("put");
+        let owner = ArtifactOwner::Run {
+            run_id: "run-s".to_string(),
+        };
+        let raw = get_artifact(
+            blobs,
+            &owner,
+            crucible_contract::ArtifactKind::RunSession.as_str(),
+        )
+        .await
+        .expect("get")
+        .expect("row");
+        assert!(raw.data.starts_with(&[0x1f, 0x8b]), "gzip at rest");
+        assert_eq!(stored.bytes, raw.data.len() as u64);
+        assert_eq!(
+            get_run_session(blobs, "run-s").await.expect("get"),
+            Some(ndjson.to_string())
+        );
+        put_run_session(blobs, "run-s", b"second\n")
             .await
-            .expect("get")
-            .expect("row");
-        assert_eq!(a.data, vec![1u8; 4]);
-        assert_eq!(b.data, vec![2u8; 4]);
-        assert_eq!(c.data, vec![3u8; 4]);
+            .expect("replace");
+        assert_eq!(
+            get_run_session(blobs, "run-s").await.expect("get"),
+            Some("second\n".to_string())
+        );
+    }
+
+    async fn roundtrips_a_run_engine_log_and_bundle(blobs: &BlobStore) {
+        assert_eq!(get_run_engine_log(blobs, "run-x").await.unwrap(), None);
+        put_run_engine_log(blobs, "run-x", "first\n").await.unwrap();
+        put_run_engine_log(blobs, "run-x", "gateway_boot: ok\nagent: exit 0\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            get_run_engine_log(blobs, "run-x").await.unwrap().as_deref(),
+            Some("gateway_boot: ok\nagent: exit 0\n")
+        );
+        let kind = crucible_contract::ArtifactKind::RunFiles;
+        assert_eq!(get_run_bundle(blobs, "run-x", kind).await.unwrap(), None);
+        put_run_bundle(blobs, "run-x", kind, payload(4096))
+            .await
+            .unwrap();
+        assert_eq!(
+            get_run_bundle(blobs, "run-x", kind).await.unwrap(),
+            Some(payload(4096))
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_roundtrips_a_multi_chunk_payload(pool: PgPool) {
+        let blobs = BlobStore::new(pool);
+        let stored = roundtrips_a_multi_chunk_payload(&blobs).await;
+        let chunks: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM artifact_chunks WHERE artifact_id = $1")
+                .bind(stored.id)
+                .fetch_one(blobs.pool())
+                .await
+                .expect("count");
+        assert_eq!(chunks, 3);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_replaces_a_prior_payload_without_orphan_chunks(pool: PgPool) {
+        let blobs = BlobStore::new(pool);
+        replaces_a_prior_payload(&blobs).await;
+        assert_eq!(chunk_rows(blobs.pool()).await, 1);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_refuses_an_oversize_put_and_keeps_the_prior_payload(pool: PgPool) {
+        let blobs = BlobStore::new(pool);
+        refuses_an_oversize_put_and_keeps_the_prior_payload(&blobs).await;
+        assert_eq!(chunk_rows(blobs.pool()).await, 1);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_refuses_a_failed_stream_and_stores_nothing(pool: PgPool) {
+        let blobs = BlobStore::new(pool);
+        refuses_a_failed_stream_and_stores_nothing(&blobs).await;
+        assert_eq!(chunk_rows(blobs.pool()).await, 0);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_keeps_owners_and_kinds_apart(pool: PgPool) {
+        keeps_owners_and_kinds_apart(&BlobStore::new(pool)).await;
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_roundtrips_an_empty_payload(pool: PgPool) {
+        roundtrips_an_empty_payload(&BlobStore::new(pool)).await;
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_roundtrips_a_gzipped_run_session(pool: PgPool) {
+        roundtrips_a_gzipped_run_session(&BlobStore::new(pool)).await;
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn postgres_roundtrips_a_run_engine_log_and_bundle(pool: PgPool) {
+        roundtrips_a_run_engine_log_and_bundle(&BlobStore::new(pool)).await;
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn get_verifies_the_digest_against_the_chunks(pool: PgPool) {
+        let blobs = BlobStore::new(pool);
+        let owner = pod_owner();
+        let stored = put_artifact(
+            &blobs,
+            &owner,
+            "scope-pack",
+            u64::MAX,
+            ok_stream(payload(64), 16),
+        )
+        .await
+        .expect("put");
+        // Same length, different bytes: only the digest can catch it.
+        sqlx::query("UPDATE artifact_chunks SET data = $1 WHERE artifact_id = $2 AND seq = 0")
+            .bind(vec![0xAAu8; 64])
+            .bind(stored.id)
+            .execute(blobs.pool())
+            .await
+            .expect("corrupt");
+        let err = get_artifact(&blobs, &owner, "scope-pack")
+            .await
+            .expect_err("digest mismatch");
+        assert!(err.to_string().contains("digest mismatch"), "{err:#}");
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_row_in_object_storage_is_refused_without_a_bucket(pool: PgPool) {
+        sqlx::query(
+            r#"INSERT INTO artifacts (owner_kind, owner_id, kind, digest, bytes, created_at, object_key)
+               VALUES ('run-session', 'run-o', 'run-files', 'sha256:00', 3, '2026-11-05T00:00:00Z', 'artifacts/k')"#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed");
+        let err = get_run_bundle(
+            &BlobStore::new(pool),
+            "run-o",
+            crucible_contract::ArtifactKind::RunFiles,
+        )
+        .await
+        .expect_err("no bucket");
+        assert!(
+            err.to_string().contains("no evidence bucket is configured"),
+            "{err:#}"
+        );
+    }
+
+    /// A per-test bucket on the S3-compatible server at `CRUCIBLE_TEST_S3_ENDPOINT`, and a raw
+    /// client to inspect it with.
+    struct S3Env {
+        blobs: BlobStore,
+        raw: aws_sdk_s3::Client,
+        bucket: String,
+    }
+
+    fn s3_required() -> bool {
+        std::env::var("CRUCIBLE_REQUIRE_S3_TESTS")
+            .map(|v| !v.trim().is_empty() && v != "0")
+            .unwrap_or(false)
+    }
+
+    fn s3_sdk_config() -> Option<aws_config::SdkConfig> {
+        let Some(endpoint) = std::env::var("CRUCIBLE_TEST_S3_ENDPOINT")
+            .ok()
+            .filter(|v| !v.is_empty())
+        else {
+            assert!(
+                !s3_required(),
+                "CRUCIBLE_REQUIRE_S3_TESTS is set but CRUCIBLE_TEST_S3_ENDPOINT is not"
+            );
+            eprintln!("skipping: CRUCIBLE_TEST_S3_ENDPOINT is unset (see `just dev-s3`)");
+            return None;
+        };
+        let key = |var: &str| std::env::var(var).unwrap_or_else(|_| "crucible-test".to_string());
+        let creds = Credentials::new(
+            key("CRUCIBLE_TEST_S3_ACCESS_KEY"),
+            key("CRUCIBLE_TEST_S3_SECRET_KEY"),
+            None,
+            None,
+            "crucible-test",
+        );
+        Some(
+            aws_config::SdkConfig::builder()
+                .endpoint_url(endpoint)
+                .region(Region::new("us-east-1"))
+                .credentials_provider(SharedCredentialsProvider::new(creds))
+                .behavior_version(BehaviorVersion::latest())
+                .build(),
+        )
+    }
+
+    impl S3Env {
+        async fn new(pool: PgPool, prefix: &str) -> Option<S3Env> {
+            let conf = s3_sdk_config()?;
+            let raw = aws_sdk_s3::Client::from_conf(
+                aws_sdk_s3::config::Builder::from(&conf)
+                    .force_path_style(true)
+                    .build(),
+            );
+            let bucket = format!("crucible-test-{}", uuid::Uuid::now_v7().simple());
+            raw.create_bucket()
+                .bucket(&bucket)
+                .send()
+                .await
+                .expect("create bucket");
+            let location: BucketUri = format!("s3://{bucket}/{prefix}").parse().expect("uri");
+            let objects = ObjectStore::from_sdk_config(&conf, location);
+            objects.check().await.expect("bucket reachable");
+            Some(S3Env {
+                blobs: BlobStore::new(pool).with_objects(objects),
+                raw,
+                bucket,
+            })
+        }
+
+        async fn keys(&self) -> Vec<String> {
+            let out = self
+                .raw
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .send()
+                .await
+                .expect("list objects");
+            out.contents()
+                .iter()
+                .filter_map(|o| o.key().map(str::to_string))
+                .collect()
+        }
+
+        async fn uploads_in_progress(&self) -> usize {
+            self.raw
+                .list_multipart_uploads()
+                .bucket(&self.bucket)
+                .send()
+                .await
+                .expect("list multipart uploads")
+                .uploads()
+                .len()
+        }
+
+        async fn object_key_of(&self, id: i64) -> String {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT object_key FROM artifacts WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(self.blobs.pool())
+            .await
+            .expect("row")
+            .expect("object key")
+        }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_roundtrips_a_multi_part_payload_under_the_prefix(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "evidence/").await else {
+            return;
+        };
+        let stored = roundtrips_a_multi_chunk_payload(&env.blobs).await;
+        let key = env.object_key_of(stored.id).await;
+        assert!(key.starts_with("evidence/artifacts/"), "{key}");
+        assert_eq!(env.keys().await, vec![key]);
+        assert_eq!(
+            chunk_rows(env.blobs.pool()).await,
+            0,
+            "no bytes in Postgres"
+        );
+        assert_eq!(env.uploads_in_progress().await, 0);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_replaces_a_prior_payload_and_deletes_its_object(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        replaces_a_prior_payload(&env.blobs).await;
+        assert_eq!(env.keys().await.len(), 1);
+        assert_eq!(chunk_rows(env.blobs.pool()).await, 0);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_refuses_an_oversize_put_and_aborts_its_upload(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        refuses_an_oversize_put_and_keeps_the_prior_payload(&env.blobs).await;
+        assert_eq!(env.keys().await.len(), 1, "only the prior payload's object");
+        assert_eq!(env.uploads_in_progress().await, 0);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_refuses_a_failed_stream_and_aborts_its_upload(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        refuses_a_failed_stream_and_stores_nothing(&env.blobs).await;
+        assert!(env.keys().await.is_empty());
+        assert_eq!(env.uploads_in_progress().await, 0);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_keeps_owners_and_kinds_apart(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        keeps_owners_and_kinds_apart(&env.blobs).await;
+        assert_eq!(env.keys().await.len(), 3);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_roundtrips_an_empty_payload(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        roundtrips_an_empty_payload(&env.blobs).await;
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_roundtrips_a_gzipped_run_session(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        roundtrips_a_gzipped_run_session(&env.blobs).await;
+        assert_eq!(env.keys().await.len(), 1);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_roundtrips_a_run_engine_log_and_bundle(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        roundtrips_a_run_engine_log_and_bundle(&env.blobs).await;
+        assert_eq!(env.keys().await.len(), 2);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_get_verifies_the_digest_against_the_object(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        let owner = pod_owner();
+        let stored = put_artifact_bytes(&env.blobs, &owner, "scope-pack", u64::MAX, payload(64))
+            .await
+            .expect("put");
+        env.raw
+            .put_object()
+            .bucket(&env.bucket)
+            .key(env.object_key_of(stored.id).await)
+            .body(vec![0xAAu8; 64].into())
+            .send()
+            .await
+            .expect("overwrite behind the store");
+        let err = get_artifact(&env.blobs, &owner, "scope-pack")
+            .await
+            .expect_err("digest mismatch");
+        assert!(err.to_string().contains("digest mismatch"), "{err:#}");
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_reads_a_row_written_to_postgres_and_moves_it_on_rewrite(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        let postgres = BlobStore::new(env.blobs.pool().clone());
+        put_run_session(&postgres, "run-old", b"before the bucket\n")
+            .await
+            .expect("put to postgres");
+        assert_eq!(
+            get_run_session(&env.blobs, "run-old").await.expect("get"),
+            Some("before the bucket\n".to_string())
+        );
+        assert!(env.keys().await.is_empty());
+
+        put_run_session(&env.blobs, "run-old", b"after\n")
+            .await
+            .expect("rewrite");
+        assert_eq!(chunk_rows(env.blobs.pool()).await, 0);
+        assert_eq!(env.keys().await.len(), 1);
+        assert_eq!(
+            get_run_session(&env.blobs, "run-old").await.expect("get"),
+            Some("after\n".to_string())
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn s3_check_refuses_a_missing_bucket(pool: PgPool) {
+        let Some(env) = S3Env::new(pool, "").await else {
+            return;
+        };
+        let conf = s3_sdk_config().expect("endpoint");
+        let missing: BucketUri = format!("s3://{}-missing", env.bucket).parse().expect("uri");
+        let err = ObjectStore::from_sdk_config(&conf, missing)
+            .check()
+            .await
+            .expect_err("missing bucket");
+        assert!(err.to_string().contains("is not reachable"), "{err:#}");
     }
 
     #[test]
@@ -903,49 +1440,6 @@ mod tests {
         assert_eq!(run_id_of_session_uri("db://run-session/"), None);
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn run_session_round_trips_gzipped_and_replaces(pool: sqlx::PgPool) {
-        assert!(
-            get_run_session(&pool, "run-s")
-                .await
-                .expect("get")
-                .is_none()
-        );
-        let ndjson = "{\"v\":1,\"kind\":\"shutdown\",\"outcome\":\"finished\"}\n";
-        let stored = put_run_session(&pool, "run-s", ndjson.as_bytes())
-            .await
-            .expect("put");
-        // Stored gzipped: the recorded size is the compressed payload's, not the text's.
-        let owner = ArtifactOwner::Run {
-            run_id: "run-s".to_string(),
-        };
-        let raw = get_artifact(
-            &pool,
-            &owner,
-            crucible_contract::ArtifactKind::RunSession.as_str(),
-        )
-        .await
-        .expect("get")
-        .expect("row");
-        assert!(raw.data.starts_with(&[0x1f, 0x8b]), "gzip at rest");
-        assert_eq!(stored.bytes, raw.data.len() as u64);
-
-        assert_eq!(
-            get_run_session(&pool, "run-s").await.expect("get"),
-            Some(ndjson.to_string())
-        );
-
-        // A re-put replaces in place.
-        put_run_session(&pool, "run-s", b"second\n")
-            .await
-            .expect("replace");
-        assert_eq!(
-            get_run_session(&pool, "run-s").await.expect("get"),
-            Some("second\n".to_string())
-        );
-    }
-
-    /// A pack write stores the tree's own tarball beside the tree, and a replacement moves both.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_pack_roundtrips_and_replaces_with_its_tree(pool: sqlx::PgPool) {
         assert!(
