@@ -44,7 +44,8 @@ pub struct ShellRunner {
     /// [`BUILDIT_SOCKET_ENV`].
     pub buildit_socket: Option<PathBuf>,
     /// Whether the run's `crucible-git` serves GitHub to command and evaluate tasks, which then
-    /// get [`crucible_contract::git::task_env`].
+    /// get [`crucible_contract::git::task_env`], each variable as the loop container holds it when
+    /// it does, so an edition-2 task sees what an edition-1 task inherits.
     pub github: bool,
 }
 
@@ -140,7 +141,7 @@ impl ShellRunner {
                 }
                 if self.github {
                     for (name, value) in crucible_contract::git::task_env() {
-                        cmd.env(name, value);
+                        cmd.env(name, std::env::var(name).unwrap_or(value));
                     }
                 }
             }

@@ -879,6 +879,15 @@ pub(crate) async fn dispatch_run(
                 .await
                 .context("recording the run's agent tools")?;
         }
+        if crate::runs::workpod::git_sidecar::granted(&delivery)?.is_some() {
+            for var in delivery.absorb_github()? {
+                tracing::warn!(
+                    %issue_key,
+                    variable = %var,
+                    "an agent-visible GitHub token reaches the sandbox as bound, outside crucible-git"
+                );
+            }
+        }
         let reads_run = match &opts {
             RunRenderOpts::Playbook {
                 rerun: Some(rerun), ..
@@ -1021,7 +1030,7 @@ pub(crate) async fn dispatch_run(
                 .create_secret(&cluster, &namespace, object)
                 .await
                 .context("creating the run Secret")?;
-            if let Some(token) = &delivery.git_token {
+            if let Some(token) = delivery.git_token.as_ref().filter(|t| t.minted) {
                 crate::secrets::refresh::record(db.pool(), &pod_name, &cluster, &namespace, token)
                     .await
                     .context("recording the run's GitHub token for refresh")?;

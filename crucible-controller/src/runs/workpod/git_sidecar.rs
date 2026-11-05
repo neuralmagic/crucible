@@ -47,7 +47,7 @@ pub enum SidecarError {
 }
 
 /// The granted `git` server in the delivery's plain env, if any.
-fn granted(
+pub(crate) fn granted(
     delivery: &crate::secrets::deliver::Delivery,
 ) -> Result<Option<AgentServer>, SidecarError> {
     let Some((_, raw)) = delivery

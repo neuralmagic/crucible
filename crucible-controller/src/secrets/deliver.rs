@@ -45,16 +45,32 @@ pub enum DeliverError {
     },
     #[error("two deliveries both claim Secret key {key}")]
     KeyCollision { key: String },
-    #[error("{first} and {second} are both GitHub App token files; crucible-git pushes with one")]
-    TwoAppTokenFiles { first: String, second: String },
+    #[error("{first} and {second} are both GitHub credentials; crucible-git lends the run one")]
+    TwoGithubCredentials { first: String, second: String },
 }
 
-/// Where the run's GitHub App token sits in its Secret, and the registry row it is minted from,
-/// so the refresh can re-mint it in place.
+/// The run's GitHub credential, held by `crucible-git`: where it sits in the run's Secret, the
+/// registry row it comes from, and whether it is minted, so the refresh re-mints it in place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitToken {
     pub key: String,
     pub secret_id: String,
+    pub minted: bool,
+}
+
+/// The variables GitHub's own tools read a token from. A binding projected as one of them, or
+/// any minted GitHub App token, is the run's GitHub credential.
+const GITHUB_ENV: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
+
+/// A binding that carries a GitHub credential, as [`assemble`] delivered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GithubBinding {
+    pub key: String,
+    pub secret_id: String,
+    pub minted: bool,
+    pub kind: ProjectionKind,
+    pub projection: String,
+    pub agent_visible: bool,
 }
 
 /// One run's secret delivery: the object to create, and how the pod refers to it.
@@ -73,8 +89,11 @@ pub struct Delivery {
     /// sandbox, so naming what may cross rather than what may not leaves a forgotten list
     /// withholding every secret instead of leaking each one.
     pub agent_visible: Vec<String>,
-    /// The run's minted GitHub App token bound as a file. It is mounted into the `crucible-git`
-    /// container alone, never the loop's, so no task can read it.
+    /// The bindings that carry a GitHub credential, delivered as bound until
+    /// [`Delivery::absorb_github`] hands them to `crucible-git`.
+    pub github: Vec<GithubBinding>,
+    /// The run's GitHub credential once `crucible-git` holds it: mounted into that container
+    /// alone, never the loop's, so no task can read it.
     pub git_token: Option<GitToken>,
 }
 
@@ -125,15 +144,7 @@ impl Delivery {
                 });
             }
         }
-        if let (Some(first), Some(second)) = (&self.git_token, &other.git_token) {
-            return Err(DeliverError::TwoAppTokenFiles {
-                first: first.key.clone(),
-                second: second.key.clone(),
-            });
-        }
-        if other.git_token.is_some() {
-            self.git_token = other.git_token;
-        }
+        self.github.extend(other.github);
         self.data.extend(other.data);
         self.env.extend(other.env);
         self.files.extend(other.files);
@@ -187,29 +198,65 @@ pub fn assemble(
                     });
                 }
                 seen_paths.insert(projection.to_string(), name.clone());
-                let app_token = matches!(
-                    crate::secrets::minter::Minter::of(row.mode, &row.vault_path),
-                    Ok(Some(crate::secrets::minter::Minter::GithubApp(_)))
-                );
-                match (app_token, &delivery.git_token) {
-                    (false, _) => delivery.files.push((projection.to_string(), name.clone())),
-                    (true, None) => {
-                        delivery.git_token = Some(GitToken {
-                            key: name.clone(),
-                            secret_id: row.id.clone(),
-                        })
-                    }
-                    (true, Some(first)) => {
-                        return Err(DeliverError::TwoAppTokenFiles {
-                            first: first.key.clone(),
-                            second: name,
-                        });
-                    }
-                }
+                delivery.files.push((projection.to_string(), name.clone()));
             }
+        }
+        let minted = matches!(
+            crate::secrets::minter::Minter::of(row.mode, &row.vault_path),
+            Ok(Some(crate::secrets::minter::Minter::GithubApp(_)))
+        );
+        let github_env =
+            mint.item.projection_kind == ProjectionKind::Env && GITHUB_ENV.contains(&projection);
+        if minted || github_env {
+            delivery.github.push(GithubBinding {
+                key: name,
+                secret_id: row.id.clone(),
+                minted,
+                kind: mint.item.projection_kind,
+                projection: projection.to_string(),
+                agent_visible: row.visibility == Visibility::AgentVisible,
+            });
         }
     }
     Ok(delivery)
+}
+
+impl Delivery {
+    /// Hand the run's GitHub credential to `crucible-git`, for a run granted it: the binding leaves
+    /// the loop container, and a variable it was projected as holds the placeholder instead, so
+    /// the pack's tools still find it set. An agent-visible env binding stays as bound, since the
+    /// sandbox reaches GitHub directly; each one kept is returned so the dispatch can say so.
+    pub fn absorb_github(&mut self) -> Result<Vec<String>, DeliverError> {
+        let mut kept = Vec::new();
+        for binding in std::mem::take(&mut self.github) {
+            if binding.agent_visible && binding.kind == ProjectionKind::Env {
+                kept.push(binding.projection);
+                continue;
+            }
+            if let Some(first) = &self.git_token {
+                return Err(DeliverError::TwoGithubCredentials {
+                    first: first.key.clone(),
+                    second: binding.key,
+                });
+            }
+            match binding.kind {
+                ProjectionKind::Env => {
+                    self.env.retain(|(var, _)| var != &binding.projection);
+                    self.plain_env.push((
+                        binding.projection.clone(),
+                        crucible_contract::git::PLACEHOLDER_TOKEN.to_string(),
+                    ));
+                }
+                ProjectionKind::File => self.files.retain(|(path, _)| path != &binding.projection),
+            }
+            self.git_token = Some(GitToken {
+                key: binding.key,
+                secret_id: binding.secret_id,
+                minted: binding.minted,
+            });
+        }
+        Ok(kept)
+    }
 }
 
 /// The Secret key a provider credential lands in: the secret's registry name, then the variable,
