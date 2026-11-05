@@ -200,6 +200,54 @@ pub async fn dir_files(
     Ok(files)
 }
 
+/// How many captured files one task's evidence lists.
+const MAX_FILES: usize = 64;
+
+/// One file a task captured into the run's state directory.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapturedFile {
+    /// The path the task declared, relative to its capture directory.
+    pub name: String,
+    pub size_bytes: u64,
+    /// The file's text, for UTF-8 content under [`crate::runs::task_evidence::MAX_INLINE_BYTES`]; `None` for anything bigger
+    /// or not decodable.
+    pub content: Option<String>,
+}
+
+/// Every file one task captured, path-sorted, each with its size and — for decodable text under
+/// the cap — its content. `bundle` is the run's stored `run-files` tar; without one, a local run's
+/// own directory is read. A task that captured nothing and a traversal attempt both read the same:
+/// no files.
+pub async fn captured_files(
+    bundle: Option<&[u8]>,
+    scratch_root: &Path,
+    run_id: &str,
+    task: &str,
+) -> anyhow::Result<Vec<CapturedFile>> {
+    let Some(dir) = crate::runs::task_evidence::task_segment(task)
+        .filter(|_| crate::runs::task_evidence::safe_segment(run_id))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut files: Vec<CapturedFile> = dir_files(
+        bundle,
+        scratch_root,
+        run_id,
+        &dir,
+        crate::runs::task_evidence::MAX_INLINE_BYTES,
+    )
+    .await?
+    .into_iter()
+    .map(|(file, body)| CapturedFile {
+        name: file.path,
+        size_bytes: file.size_bytes,
+        content: body.and_then(|bytes| String::from_utf8(bytes).ok()),
+    })
+    .collect();
+    files.truncate(MAX_FILES);
+    Ok(files)
+}
+
 /// The files a local run captured, walked off the scratch disk. Empty for a run that captured
 /// nothing, and for a pod run, whose files only ever existed on the pod.
 pub async fn list_local(scratch_root: &Path, run_id: &str) -> Vec<RunFile> {
@@ -576,6 +624,117 @@ mod tests {
         assert_eq!(
             read_local(scratch.path(), "run-1", "roundup/LEAK.md").await,
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn files_are_read_under_the_runs_own_directory_only() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scratch = root.path();
+        let task_dir =
+            crate::runs::task_evidence::files_root(scratch, "run-1").join("triage[1027]");
+        std::fs::create_dir_all(&task_dir).expect("mkdir");
+        std::fs::write(task_dir.join("TRIAGE.md"), "# triage\n").expect("write");
+        std::fs::write(task_dir.join("blob.bin"), [0xff_u8, 0xfe, 0x00]).expect("write");
+        std::fs::create_dir(task_dir.join("nested")).expect("mkdir");
+
+        let files = captured_files(None, scratch, "run-1", "triage[1027]")
+            .await
+            .expect("read");
+        assert_eq!(files.len(), 2, "the directory is not a file: {files:?}");
+        assert_eq!(files[0].name, "TRIAGE.md");
+        assert_eq!(files[0].content.as_deref(), Some("# triage\n"));
+        assert_eq!(files[1].name, "blob.bin");
+        assert_eq!(files[1].content, None, "not decodable as text");
+
+        // A traversal in either segment reads nothing, however the join would have resolved.
+        assert!(
+            captured_files(None, scratch, "run-1", "..")
+                .await
+                .expect("read")
+                .is_empty()
+        );
+        assert!(
+            captured_files(None, scratch, "..", "triage[1027]")
+                .await
+                .expect("read")
+                .is_empty()
+        );
+        assert!(
+            captured_files(None, scratch, "run-1", "../../../../etc")
+                .await
+                .expect("read")
+                .is_empty()
+        );
+    }
+
+    /// An instance named after a key holding a separator captured into the engine's escaped
+    /// directory, and its evidence is read from there by the name the session log carries.
+    #[tokio::test]
+    async fn an_instance_whose_key_holds_a_separator_reads_its_escaped_directory() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scratch = root.path();
+        let task_dir = crate::runs::task_evidence::files_root(scratch, "run-1")
+            .join("audit[llm-d%2Fllm-d-router]");
+        std::fs::create_dir_all(&task_dir).expect("mkdir");
+        std::fs::write(task_dir.join("out.txt"), "router\n").expect("write");
+
+        let files = captured_files(None, scratch, "run-1", "audit[llm-d/llm-d-router]")
+            .await
+            .expect("read");
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].content.as_deref(), Some("router\n"));
+        assert!(
+            captured_files(None, scratch, "run-1", "audit[llm-d%2Fllm-d-router]")
+                .await
+                .expect("read")
+                .is_empty(),
+            "the escaped text is not itself the raw key"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_task_directory_reads_nothing() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scratch = root.path();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("mkdir");
+        std::fs::write(outside.join("SECRET.md"), "not yours\n").expect("write");
+        let files = crate::runs::task_evidence::files_root(scratch, "run-1");
+        std::fs::create_dir_all(&files).expect("mkdir");
+        std::os::unix::fs::symlink(&outside, files.join("escape")).expect("symlink");
+
+        assert!(
+            captured_files(None, scratch, "run-1", "escape")
+                .await
+                .expect("read")
+                .is_empty()
+        );
+    }
+
+    /// A task may declare a file under a subdirectory, and it is listed by the path it declared.
+    #[tokio::test]
+    async fn a_declared_file_under_a_subdirectory_is_listed_by_its_declared_path() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let scratch = root.path();
+        let task_dir = crate::runs::task_evidence::files_root(scratch, "run-1").join("collect");
+        std::fs::create_dir_all(task_dir.join("evidence")).expect("mkdir");
+        std::fs::write(task_dir.join("evidence/probe.json"), "{}").expect("write");
+        std::fs::write(task_dir.join("REPORT.md"), "# r\n").expect("write");
+
+        let files = captured_files(None, scratch, "run-1", "collect")
+            .await
+            .expect("read");
+        let names: Vec<(&str, Option<&str>)> = files
+            .iter()
+            .map(|f| (f.name.as_str(), f.content.as_deref()))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("REPORT.md", Some("# r\n")),
+                ("evidence/probe.json", Some("{}"))
+            ]
         );
     }
 }

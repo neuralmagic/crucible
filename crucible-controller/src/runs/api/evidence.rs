@@ -19,7 +19,7 @@ dto! {
     // --- per-task evidence and the run's engine log -------------------------------------------------
 
     /// One file a task captured, as the panel reads it.
-    pub struct EvidenceFileDto: From<f: task_evidence::CapturedFile> {
+    pub struct EvidenceFileDto: From<f: crate::runs::run_files::CapturedFile> {
         pub name: String,
         pub size_bytes: u64,
         /// The file's text; null for a file that is not decodable text or is over the inline cap, which
@@ -102,9 +102,13 @@ pub(crate) async fn get_task_evidence(
         crucible_contract::ArtifactKind::RunFiles,
     )
     .await?;
-    let files =
-        task_evidence::captured_files(bundle.as_deref(), &state.scratch_dir, &run_id, &task)
-            .await?;
+    let files = crate::runs::run_files::captured_files(
+        bundle.as_deref(),
+        &state.scratch_dir,
+        &run_id,
+        &task,
+    )
+    .await?;
     let summed = |pick: fn(&crate::runs::model::TaskResult) -> Option<f64>| {
         let vals: Vec<f64> = mine.iter().filter_map(|r| pick(r)).collect();
         (!vals.is_empty()).then(|| vals.iter().sum())
