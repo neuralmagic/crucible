@@ -15,7 +15,9 @@
 #   - the Job exists in the workload namespace, carries that run, launcher and queue, runs an
 #     image pushed to PUSH_REPO by digest, succeeded, and its log carries the nonce;
 #   - the agent's whoami reported the same run and kube_user;
-#   - no kueue token rode the loop pod's env, its Secrets, or any log.
+#   - the agent's ANTHROPIC_API_KEY held the gateway's placeholder and its env script no key;
+#   - no kueue token rode the loop pod's env, its Secrets, or any log, and the Anthropic key
+#     appears in no log.
 #
 # The launch is made with an api key seeded for the caller's Kubernetes user, which is also seeded
 # in the controller's ledger as a hub link would record it.
@@ -504,4 +506,18 @@ fi
 if grep -q CRUCIBLE_KUEUE_TOKEN "$WORK/controller.log" "$WORK/run-log.json"; then
     fail "a static kueue token appears in the run's logs"
 fi
+
+log "checking the Anthropic key never reached the sandbox or a log"
+if [ "$SMOKE" = 1 ]; then
+    keyenv=$(grep -o 'KEYENV [a-z]* [0-9]*' "$WORK/run-log.json" | sort -u || true)
+    [ "$keyenv" = "KEYENV placeholder 0" ] \
+        || fail "the agent's ANTHROPIC_API_KEY and env script reported [${keyenv:-nothing}], not a placeholder and no key"
+fi
+kc -n "$LOOP_NS" logs "$POD" --all-containers > "$WORK/loop.log" 2>/dev/null || true
+(umask 077; kc -n "$LOOP_NS" get secret "$ANTHROPIC_KEY_SECRET" -o jsonpath='{.data.api-key}' \
+    | base64 -d > "$WORK/api-key")
+[ -s "$WORK/api-key" ] || fail "could not read the Anthropic key back from $LOOP_NS/$ANTHROPIC_KEY_SECRET"
+leaked=$(grep -lF -f "$WORK/api-key" "$WORK/controller.log" "$WORK/run-log.json" "$WORK/loop.log" || true)
+rm -f "$WORK/api-key"
+[ -z "$leaked" ] || fail "the Anthropic key appears in $leaked"
 log "PASS"

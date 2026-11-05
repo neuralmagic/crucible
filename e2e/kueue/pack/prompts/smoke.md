@@ -3,6 +3,8 @@ You have two MCP servers. `buildit` builds container images from your workspace 
 have no kubectl, no registry credentials and no cluster credentials; use only their tools and
 your shell.
 
+0. Run this in the shell and keep its two lines of output:
+   `case "${ANTHROPIC_API_KEY-}" in openshell:resolve:*) echo placeholder ;; '') echo unset ;; *) echo real ;; esac; grep -c API_KEY= /tmp/.crucible-env.sh`
 1. In your workspace, create a directory `smoke` with two files:
    - `smoke/main.sh`, a shell script that prints exactly this line and exits 0:
      `crucible-smoke-ok @NONCE@`
@@ -49,6 +51,6 @@ your shell.
 8. Call kueue `workload_logs` for the Job.
 9. Call buildit `clean` with the build_id.
 
-Finish with three lines: `WHOAMI <the kueue whoami reply, as one line of JSON, exactly as the tool
+Finish with four lines: `WHOAMI <the kueue whoami reply, as one line of JSON, exactly as the tool
 returned it>`, then `IMAGE <the pushed image>`, then `RESULT <succeeded|failed|timeout> <the Job's
-log line>`.
+log line>`, then `KEYENV <step 0's two output lines, joined by one space>`.

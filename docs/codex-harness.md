@@ -40,8 +40,7 @@ Crucible supports both Codex login methods. `[agent.codex].auth` selects the met
 digits, and underscore). If it is not set, the unnamed default key is used. The manifest
 names a key, not the variable that holds it. The host resolves `api_key = "WORK"` to
 `OPENAI_API_KEY_WORK`, and an unset `api_key` to `OPENAI_API_KEY`. A manifest cannot reach
-other host credentials. An openshell provider that can deliver the key can later replace this
-resolution, and the manifest does not change.
+other host credentials.
 
 A Kubernetes deploy profile supplies keys under those names. You can rotate each key
 separately:
@@ -60,8 +59,9 @@ key = "OPENAI_API_KEY"
 
 To select a key for new turns, change `api_key` in the manifest, or select a deployment
 profile with that manifest. Use dedicated project-scoped keys, and rotate their Kubernetes
-Secrets separately. The engine does not export the selected key into the sandbox environment,
-but Codex can read it from its seeded auth file.
+Secrets separately. The selected key never enters the sandbox. Its seeded auth file and its
+environment carry an OpenShell placeholder, and the egress proxy swaps in the key on traffic to
+api.openai.com, or to `OPENAI_BASE_URL` when one is set.
 
 ## ChatGPT OAuth: `CODEX_CREDENTIALS` and the single-refresher rule
 

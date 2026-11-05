@@ -12,6 +12,7 @@ use crate::secrets::{ProjectionKind, SecretName};
 /// it. The value is not here and never will be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrantItem {
+    pub binding_id: String,
     pub secret_id: String,
     pub declared_name: SecretName,
     pub projection_kind: ProjectionKind,
@@ -31,6 +32,7 @@ pub struct GrantMint {
 pub fn mint_from(binding: &crate::secrets::store::BindingRow, secret: &SecretRow) -> GrantMint {
     GrantMint {
         item: GrantItem {
+            binding_id: binding.id.clone(),
             secret_id: secret.id.clone(),
             declared_name: binding.declared_name.clone(),
             projection_kind: binding.projection_kind,
