@@ -85,6 +85,8 @@ dto! {
         pub owner_signin_required: bool,
         pub owner_refresh_error: Option<String>,
         pub owner_refresh_at: Option<String>,
+        /// The cluster every firing dispatches to; null takes the controller default.
+        pub dispatch_target: Option<String>,
         /// The inference provider every firing pins on its issue; null resolves through the configured
         /// defaults at dispatch.
         pub agent_provider: Option<String>,

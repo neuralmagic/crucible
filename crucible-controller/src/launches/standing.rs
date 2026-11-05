@@ -338,6 +338,8 @@ pub(crate) struct Authorized {
     pub params_schema: Option<serde_json::Value>,
     /// The draft version a draft-head firing freezes.
     pub draft_version: Option<i64>,
+    /// That draft version's stored `[agent]` requirements, which carry its `[dispatch]` pin.
+    pub draft_agent_requirements: Option<serde_json::Value>,
     pub adopted_tar_gz: Option<Vec<u8>>,
     pub adopted_tar_bytes: Option<i64>,
 }
@@ -354,12 +356,13 @@ pub(crate) async fn authorized(
                COALESCE(p.description, d.description) AS description,
                COALESCE(c.adopted_params_schema, dv.params_schema) AS params_schema,
                dv.version AS draft_version,
+               dv.agent_requirements AS draft_agent_requirements,
                c.adopted_tar_gz, c.adopted_tar_bytes
         FROM playbook_standing_launches c
         LEFT JOIN playbooks p ON p.id = c.playbook AND c.target_kind = 'adopted'
         LEFT JOIN playbook_drafts d ON d.id = c.playbook AND c.target_kind = 'draft_head'
         LEFT JOIN LATERAL (
-            SELECT version, params_schema FROM playbook_draft_versions
+            SELECT version, params_schema, agent_requirements FROM playbook_draft_versions
             WHERE draft_id = c.playbook AND schema_digest IS NOT NULL
             ORDER BY version DESC LIMIT 1
         ) dv ON c.target_kind = 'draft_head'
@@ -447,6 +450,21 @@ pub(crate) async fn fire(
             .map_err(|e| format!("{noun} adopted pack: {e:#}"))?
     {
         return Err(format!("{noun} adopted {refusal}").into());
+    }
+    if let Some(pinned) = draft_pin(row).map_err(|e| format!("{noun} draft pin: {e:#}"))?
+        && core.dispatch_target.as_deref() != Some(pinned.as_str())
+    {
+        return Err(format!(
+            "{noun} was saved to dispatch to {}, but draft {} version {} pins [dispatch] target \
+             {:?}; save it again to authorize that target",
+            core.dispatch_target
+                .as_deref()
+                .unwrap_or("the controller default"),
+            core.playbook,
+            row.draft_version.unwrap_or_default(),
+            pinned.as_str()
+        )
+        .into());
     }
     let max_time =
         MaxTime::parse(&core.max_time).map_err(|e| format!("{noun} stored max_time: {e}"))?;
@@ -537,6 +555,17 @@ pub(crate) async fn fire(
         .await
         .map_err(|e| format!("{noun} binding lookup: {e:#}"))?;
     Ok(binds.then(|| owner_stale(core, now, owner_ttl)).flatten())
+}
+
+/// The `[dispatch]` pin of the draft version a draft-head firing launches. An adopted pack was
+/// frozen at save, where its pin was already resolved into the stored target.
+fn draft_pin(row: &Authorized) -> Result<Option<crucible::manifest::ClusterName>> {
+    let Some(value) = row.draft_agent_requirements.clone() else {
+        return Ok(None);
+    };
+    let requirements: crate::playbooks::dispatch::AgentRequirements =
+        serde_json::from_value(value).context("decoding the draft version's agent requirements")?;
+    Ok(requirements.pinned_target)
 }
 
 /// The values this firing launches with, after overlaying the trigger's per-firing params. The

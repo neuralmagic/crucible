@@ -1034,6 +1034,11 @@ fn compiled(saved: &dto::DraftCompile, studio_url: &str) -> String {
             .as_deref()
             .unwrap_or("none (this version did not compile)")
     );
+    if let Some(target) = &saved.dispatch.pinned_target {
+        out.push_str(&format!(
+            "dispatching to {target} (pinned by crucible.toml)\n"
+        ));
+    }
     out.push_str(&diagnostics(&saved.diagnostics));
     out.push_str(&format!("studio: {studio_url}\n"));
     out
@@ -2897,6 +2902,31 @@ mod tests {
             out.ends_with("studio: https://c/playbooks/drafts/calibrate\n"),
             "{out}"
         );
+    }
+
+    /// A pinned pack's preview names the cluster every launch will land on before anyone
+    /// launches, and an unpinned one says nothing about a target it has not chosen.
+    #[test]
+    fn a_preview_of_a_pinned_pack_names_the_cluster_it_dispatches_to() {
+        let saved: dto::DraftCompile = serde_json::from_str(
+            r#"{"version":4,"saved_by":"wren","saved_at":"2026-10-28T09:00:00Z",
+               "schema_digest":"sha256:abc","diagnostics":[],
+               "dispatch":{"backend":"openshell","pinned_target":"cluster-a"}}"#,
+        )
+        .expect("the preview fixture parses");
+        let out = draft_preview("triage", &saved, "https://c/playbooks/drafts/triage");
+        assert!(
+            out.contains("dispatching to cluster-a (pinned by crucible.toml)\n"),
+            "{out}"
+        );
+
+        let unpinned: dto::DraftCompile = serde_json::from_str(
+            r#"{"version":5,"schema_digest":"sha256:abc","diagnostics":[],
+               "dispatch":{"backend":"openshell","pinned_target":null}}"#,
+        )
+        .expect("the unpinned fixture parses");
+        let out = draft_preview("triage", &unpinned, "https://c/playbooks/drafts/triage");
+        assert!(!out.contains("dispatching to"), "{out}");
     }
 
     /// The PR is the whole answer to a graduation: an agent that cannot read the URL back has no

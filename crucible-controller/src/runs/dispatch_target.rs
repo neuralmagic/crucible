@@ -27,6 +27,7 @@ use crate::authz::model::{Principal, Principals};
 use crate::playbooks::dispatch::{DispatchCapability, PackAgent};
 use crate::runs::clusters::personal_name;
 use anyhow::{Result, bail};
+use crucible::manifest::ClusterName;
 use std::collections::BTreeMap;
 
 /// What sort of credential backs a target, which is also what decides who may see it.
@@ -80,6 +81,16 @@ pub enum TargetRefusal {
     NoneEligible { detail: String },
     #[error("choosing a dispatch target needs an authenticated caller")]
     Anonymous,
+    #[error(
+        "dispatch target {requested:?} contradicts the pack, which pins [dispatch] target \
+         {pinned:?} in crucible.toml; omit the target or name {pinned:?}"
+    )]
+    Pinned { requested: String, pinned: String },
+    #[error(
+        "the pack pins [dispatch] target {pinned:?} in crucible.toml, which is not a cluster \
+         this controller can reach"
+    )]
+    PinnedUnknown { pinned: String },
 }
 
 /// Render an eligible-target list for a refusal message. An empty set says so rather than trailing
@@ -239,9 +250,11 @@ pub fn eligible(
     if ctx.capability.is_local() {
         return Vec::new();
     }
+    let pinned = agent.pinned_target.as_ref().map(ClusterName::as_str);
     let mut out: Vec<EligibleTarget> = ctx
         .connected
         .iter()
+        .filter(|name| pinned.is_none_or(|p| p == name.as_str()))
         .filter(|name| ctx.policy.admits(name, caller))
         .filter(|name| (ctx.rules)(&target_resource(name, None)))
         .map(|name| EligibleTarget {
@@ -251,10 +264,13 @@ pub fn eligible(
                 crate::runs::clusters::HUB_CLUSTER => TargetKind::Hub,
                 _ => TargetKind::Spoke,
             },
-            default: name == ctx.default,
+            default: pinned.unwrap_or(ctx.default) == name.as_str(),
             owner: None,
         })
         .collect();
+    if pinned.is_some() {
+        return out;
+    }
     out.extend(
         ctx.personal
             .iter()
@@ -308,6 +324,29 @@ pub fn resolve(
 
     let eligible_targets = eligible(ctx, caller, agent);
     let names: Vec<String> = eligible_targets.iter().map(|t| t.name.clone()).collect();
+
+    if let Some(pinned) = agent.pinned_target.as_ref().map(ClusterName::as_str) {
+        if let Some(requested) = requested.map(str::trim).filter(|r| !r.is_empty())
+            && requested != pinned
+        {
+            return Err(TargetRefusal::Pinned {
+                requested: requested.to_string(),
+                pinned: pinned.to_string(),
+            });
+        }
+        if names.iter().any(|n| n == pinned) {
+            return Ok(pinned.to_string());
+        }
+        return Err(match ctx.connected.iter().any(|n| n == pinned) {
+            true => TargetRefusal::NotAuthorized {
+                name: pinned.to_string(),
+                eligible: names,
+            },
+            false => TargetRefusal::PinnedUnknown {
+                pinned: pinned.to_string(),
+            },
+        });
+    }
 
     let Some(requested) = requested.map(str::trim).filter(|r| !r.is_empty()) else {
         // The configured default has to survive the caller's own policy: a deployment that fences
@@ -430,6 +469,165 @@ mod tests {
 
     fn agent(backend: &str) -> PackAgent {
         PackAgent::new(backend.to_string(), None)
+    }
+
+    fn pinned(cluster: &str) -> PackAgent {
+        PackAgent {
+            pinned_target: Some(ClusterName::try_from(cluster.to_string()).expect("cluster name")),
+            ..agent("local")
+        }
+    }
+
+    /// A pinned pack is offered its pin alone, as the default, whatever else the caller reaches:
+    /// the launch form has nothing to choose, and the controller default does not apply.
+    #[test]
+    fn a_pinned_pack_is_offered_only_its_pin_as_the_default() {
+        let connected = vec![
+            "hub".to_string(),
+            "cluster-a".to_string(),
+            "wharf".to_string(),
+        ];
+        let policy = ClusterPolicy::default();
+        let personal = [PersonalTarget {
+            name: personal_name("secret-id"),
+            label: "my-cluster".to_string(),
+            owner: Principal::parse("user:alice").expect("principal"),
+        }];
+        let ctx = ctx(&connected, &policy, &personal);
+        let offered = eligible(&ctx, &caller("alice", &[]), &pinned("cluster-a"));
+        assert_eq!(
+            offered
+                .iter()
+                .map(|t| (t.name.as_str(), t.default))
+                .collect::<Vec<_>>(),
+            [("cluster-a", true)],
+            "neither the hub default nor the caller's personal target is offered"
+        );
+    }
+
+    /// Omitting the target or naming the pin both land on the pin; naming anything else is
+    /// refused with both names, never silently overridden in either direction.
+    #[test]
+    fn a_pinned_pack_lands_on_its_pin_and_refuses_a_contradicting_target() {
+        let connected = vec!["hub".to_string(), "cluster-a".to_string()];
+        let policy = ClusterPolicy::default();
+        let ctx = ctx(&connected, &policy, &[]);
+        let who = caller("alice", &[]);
+        let agent = pinned("cluster-a");
+
+        assert_eq!(resolve(&ctx, &who, &agent, None).expect("pin"), "cluster-a");
+        assert_eq!(
+            resolve(&ctx, &who, &agent, Some("  ")).expect("blank is no choice"),
+            "cluster-a"
+        );
+        assert_eq!(
+            resolve(&ctx, &who, &agent, Some("cluster-a")).expect("naming the pin"),
+            "cluster-a"
+        );
+        let refusal = resolve(&ctx, &who, &agent, Some("hub")).expect_err("contradicts the pin");
+        assert_eq!(
+            refusal,
+            TargetRefusal::Pinned {
+                requested: "hub".to_string(),
+                pinned: "cluster-a".to_string(),
+            }
+        );
+        let message = refusal.to_string();
+        assert!(message.contains("\"hub\""), "{message}");
+        assert!(
+            message.contains("[dispatch] target \"cluster-a\""),
+            "{message}"
+        );
+        assert!(
+            matches!(
+                resolve(&ctx, &who, &agent, Some(&personal_name("secret-id"))),
+                Err(TargetRefusal::Pinned { .. })
+            ),
+            "a personal target contradicts a pin like any other name"
+        );
+    }
+
+    /// A pin the controller cannot reach refuses every launch, and says the pack is why rather
+    /// than blaming whatever the caller asked for.
+    #[test]
+    fn a_pin_this_controller_cannot_reach_refuses_every_launch() {
+        let connected = vec!["hub".to_string()];
+        let policy = ClusterPolicy::default();
+        let ctx = ctx(&connected, &policy, &[]);
+        let who = caller("alice", &[]);
+        let agent = pinned("cluster-z");
+
+        assert!(eligible(&ctx, &who, &agent).is_empty());
+        let refusal = resolve(&ctx, &who, &agent, None).expect_err("unreachable pin");
+        assert_eq!(
+            refusal,
+            TargetRefusal::PinnedUnknown {
+                pinned: "cluster-z".to_string()
+            }
+        );
+        assert!(refusal.to_string().contains("crucible.toml"), "{refusal}");
+        assert!(
+            matches!(
+                resolve(&ctx, &who, &agent, Some("cluster-z")),
+                Err(TargetRefusal::PinnedUnknown { .. })
+            ),
+            "naming the unreachable pin does not make it reachable"
+        );
+    }
+
+    /// The pin is a pack's declaration, not an authorization: a caller fenced off the pinned
+    /// cluster is refused, not redirected to one they may use.
+    #[test]
+    fn a_pin_does_not_override_the_cluster_policy() {
+        let connected = vec!["hub".to_string(), "cluster-a".to_string()];
+        let policy = ClusterPolicy::parse(&["cluster-a=group:/groups/builders".to_string()])
+            .expect("parses");
+        let ctx = ctx(&connected, &policy, &[]);
+        let agent = pinned("cluster-a");
+
+        assert_eq!(
+            resolve(&ctx, &caller("alice", &["/groups/builders"]), &agent, None).expect("member"),
+            "cluster-a"
+        );
+        let outsider = caller("bob", &[]);
+        assert!(eligible(&ctx, &outsider, &agent).is_empty());
+        match resolve(&ctx, &outsider, &agent, None).expect_err("fenced") {
+            TargetRefusal::NotAuthorized { name, eligible } => {
+                assert_eq!(name, "cluster-a");
+                assert!(
+                    eligible.is_empty(),
+                    "nothing else may stand in: {eligible:?}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+
+        let refuse_pin = |r: &Resource| r.id != "cluster-a";
+        let ruled = TargetContext {
+            rules: &refuse_pin,
+            ..ctx
+        };
+        assert!(matches!(
+            resolve(&ruled, &caller("alice", &["/groups/builders"]), &agent, None),
+            Err(TargetRefusal::NotAuthorized { name, .. }) if name == "cluster-a"
+        ));
+    }
+
+    /// Local mode has no cluster to honor a pin with, so a pinned pack is refused there before
+    /// any target is considered.
+    #[test]
+    fn local_mode_refuses_a_pinned_pack() {
+        let connected = vec!["hub".to_string()];
+        let policy = ClusterPolicy::default();
+        let mut ctx = ctx(&connected, &policy, &[]);
+        ctx.capability = DispatchCapability::new(PlaybookExecutor::Local, false);
+        let refusal =
+            resolve(&ctx, &caller("alice", &[]), &pinned("hub"), None).expect_err("refused");
+        assert!(
+            matches!(&refusal, TargetRefusal::NoneEligible { detail }
+                if detail.contains("[dispatch] target \"hub\"")),
+            "{refusal:?}"
+        );
     }
 
     /// The policy set decides per target beside the cluster policy: a shared cluster it refuses
