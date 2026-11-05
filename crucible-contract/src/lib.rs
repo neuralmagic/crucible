@@ -18,6 +18,7 @@ pub mod driver_env;
 pub mod emits;
 pub mod envelope;
 pub mod event;
+pub mod git;
 pub mod history;
 pub mod identity;
 pub mod inference;
