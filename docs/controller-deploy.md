@@ -90,7 +90,9 @@ A minimal set of objects:
   relay); `pods/finalizers` update (the pod's ConfigMap and Secret block its deletion, which
   OpenShift's owner-reference admission checks); `configmaps` and `secrets` create/delete (the
   pack ConfigMap and the run Secret, which holds the pod token and the delivered secrets, both
-  owner-referenced to the pod); and `leases` get/create/update/patch for leader election;
+  owner-referenced to the pod); `secrets` list/patch, with which the leader re-mints a running
+  run's GitHub App token into its Secret every 25 minutes; and `leases` get/create/update/patch
+  for leader election;
 - a **Secret** for `CONTROLLER_API_TOKEN` and one for `GITHUB_TOKEN`, referenced by env;
 - a **Service** on the API port;
 - the **Deployment**, env from the table above, `emptyDir` at `CONTROLLER_SCRATCH_DIR`.
@@ -373,6 +375,46 @@ builds read only.
 ```bash
 openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out agent-signing.pem
 oc create secret generic crucible-agent-signing-key --from-file=agent-signing.pem
+```
+
+`[git]` runs `crucible-git` as a sidecar of the loop pod of each run on `clusters`, and makes it
+the only holder of the run's GitHub credential. At dispatch the controller takes the binding that
+carries one, a minted `mint://github-app/<owner>` secret bound as a file or any broker-only
+binding projected as `GH_TOKEN` or `GITHUB_TOKEN` (a personal access token, say), out of the loop
+container and mounts
+it into the sidecar alone, by directory. A variable the binding was projected as still exists in the
+loop container, holding the placeholder `crucible-git`, so a pack's tools find it set and its
+scripts need no change. A minted token is re-minted into the run's Secret by the leader every 25
+minutes, so a long run never pushes with a lapsed one; a personal access token does not expire
+hourly and is not refreshed. A run binding two GitHub credentials is refused. An agent-visible
+binding projected as `GH_TOKEN` or `GITHUB_TOKEN` stays as bound, with a warning at dispatch: the
+sandbox reaches GitHub directly, outside `crucible-git`. A minted token under any other variable
+is the pack's own and stays as bound, as on a cluster without `[git]`, where a run gets every
+binding exactly as bound.
+
+The run's command and evaluate tasks use stock `gh` and `git` against `github.com`. The pod maps
+GitHub's hostnames to loopback, where `crucible-git` serves them over TLS with a CA it mints for the
+run; tasks trust that CA (`SSL_CERT_FILE` and friends) and hold a placeholder `GH_TOKEN`, which
+`crucible-git` replaces with the run's credential. Sandboxes reach it at `url` with run tokens: git there
+needs no credential (`http://host.openshell.internal:8853/git/<owner>/<repo>.git`), and the
+`open_pr` tool opens pull requests.
+
+The credential goes only as far as the run's `[outputs.draft-pr]` bound allows, a personal access
+token included, however much more its owner could reach: reads of a bound or
+public repository; pushes, and opening a pull request (spending the bound's count), on a bound one;
+labels, reviewers and edits on pull requests the run opened. GraphQL is parsed and scoped field by
+field the same way. A task's request carrying a credential of its own, such as the engine's own
+clone or publish push, is relayed with it untouched, and one carrying none that the bound does not
+lend the token to goes out anonymously, so public downloads work as they would without
+`crucible-git`. The pod needs the safe sysctl
+`net.ipv4.ip_unprivileged_port_start` for `crucible-git` to bind 443, and `run_jwks_uri` must be
+https.
+
+```toml
+[git]
+clusters     = ["spoke-a"]
+run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
+url          = "http://host.openshell.internal:8853/mcp"            # optional
 ```
 
 ## Observability
