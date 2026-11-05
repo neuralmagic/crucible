@@ -43,6 +43,10 @@ pub struct ShellRunner {
     /// The run's buildit socket, exported to command and evaluate tasks as
     /// [`BUILDIT_SOCKET_ENV`].
     pub buildit_socket: Option<PathBuf>,
+    /// Whether the run's `crucible-git` serves GitHub to command and evaluate tasks, which then
+    /// get [`crucible_contract::git::task_env`], each variable as the loop container holds it when
+    /// it does, so an edition-2 task sees what an edition-1 task inherits.
+    pub github: bool,
 }
 
 impl TaskRunner for ShellRunner {
@@ -134,6 +138,11 @@ impl ShellRunner {
                 cmd.arg(command);
                 if let Some(socket) = &self.buildit_socket {
                     cmd.env(BUILDIT_SOCKET_ENV, socket);
+                }
+                if self.github {
+                    for (name, value) in crucible_contract::git::task_env() {
+                        cmd.env(name, std::env::var(name).unwrap_or(value));
+                    }
                 }
             }
             TaskKind::Agent {
@@ -519,6 +528,7 @@ mod tests {
             agent_cmd: None,
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
+            github: false,
         }
     }
 
@@ -1404,6 +1414,7 @@ mod tests {
             agent_cmd: Some("true".into()),
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
+            github: false,
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
@@ -1463,6 +1474,7 @@ mod tests {
         let mut r = ShellRunner {
             agent_cmd: Some(show.into()),
             buildit_socket: Some("/runs/r1/pack/state/buildit.sock".into()),
+            github: false,
             ..runner()
         };
         let seen =

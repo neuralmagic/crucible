@@ -6,7 +6,7 @@
 //! servers, nothing: no provider, no egress entry, no `.mcp.json` entry.
 
 use crate::openshell::grpc::ProviderName;
-use crate::openshell::{buildit, provider};
+use crate::openshell::{buildit, git, provider};
 use anyhow::{Context, Result};
 use crucible::openshell::endpoint::{Access, Endpoint, Protocol};
 use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS, LocalServer, Transport};
@@ -35,6 +35,16 @@ pub enum AgentServersError {
         reason: String,
     },
 }
+
+/// git and its HTTP remote helpers, where Fedora/UBI and Debian images install them. An entry the
+/// sandbox image lacks is inert.
+const GIT_BINARIES: [&str; 5] = [
+    "/usr/bin/git",
+    "/usr/libexec/git-core/git-remote-http",
+    "/usr/libexec/git-core/git-remote-https",
+    "/usr/lib/git-core/git-remote-http",
+    "/usr/lib/git-core/git-remote-https",
+];
 
 /// One granted server, with the host and port its URL names.
 #[derive(Debug)]
@@ -93,8 +103,25 @@ impl Granted {
                 socket,
             }
             .ensure_running(),
+            Transport::Local(LocalServer::Git(_)) => git::Git { port: self.port }.wait_ready(),
         }
     }
+}
+
+/// Whether the run's `crucible-git` serves this pod's command and evaluate tasks as GitHub, once
+/// it is ready: false when the controller granted none.
+pub fn run_git() -> Result<bool> {
+    let servers = AgentServers::from_env().context("reading the run's agent servers")?;
+    let Some(granted) = servers
+        .iter()
+        .find(|g| matches!(g.server.transport, Transport::Local(LocalServer::Git(_))))
+    else {
+        return Ok(false);
+    };
+    granted
+        .start_local(None)
+        .with_context(|| format!("waiting for the run's {}", granted.server.name))?;
+    Ok(true)
 }
 
 /// The socket a command or evaluate task reaches the run's buildit on, once it is running: none
@@ -201,6 +228,23 @@ impl AgentServers {
 
     /// The token-grant provider profile for `granted`. Its endpoint binds the injected token to
     /// that server alone, on requests from `binaries`.
+    /// Add the sandbox binaries a granted server is reached by beyond the harness's own: git's
+    /// HTTP transport for `crucible-git`.
+    pub fn add_binaries(&self, binaries: &mut Vec<String>) {
+        let git = self
+            .servers
+            .iter()
+            .any(|g| matches!(g.server.transport, Transport::Local(LocalServer::Git(_))));
+        if !git {
+            return;
+        }
+        for bin in GIT_BINARIES {
+            if !binaries.iter().any(|b| b == bin) {
+                binaries.push(bin.to_string());
+            }
+        }
+    }
+
     pub fn token_grant_profile(
         &self,
         granted: &Granted,
