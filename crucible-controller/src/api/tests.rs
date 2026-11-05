@@ -10719,6 +10719,89 @@ async fn a_run_lists_and_serves_the_files_its_tasks_captured(pool: PgPool) -> Re
     Ok(())
 }
 
+/// A pod run's files exist only in the bundle it uploaded, so one task's evidence is read from
+/// there, nested declared paths included, and holds nothing another task captured.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn task_evidence_serves_a_pod_runs_files_from_its_stored_bundle(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: "run-pod".to_string(),
+            scope: None,
+            issue: None,
+            identity_digest: None,
+            status: "done".to_string(),
+            pod: Some("loop-abc".to_string()),
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    crate::runs::task_results::upsert_task_result(
+        db.pool(),
+        "run-pod",
+        &crate::runs::model::TaskResult {
+            iter: 0,
+            task: "collect".to_string(),
+            status: "pass".to_string(),
+            note: String::new(),
+            cost_usd: None,
+            secs: None,
+            blocked: None,
+            links: Vec::new(),
+            agent: None,
+            repairs: Vec::new(),
+            output: None,
+        },
+    )
+    .await?;
+    let app = router(ApiState {
+        scratch_dir: dir.path().to_path_buf(),
+        ..ApiState::test(db)
+    });
+
+    let (status, before) = get_json_value(&app, "/api/runs/run-pod/tasks/collect/evidence").await;
+    assert_eq!(status, StatusCode::OK, "{before}");
+    assert!(before["files"].as_array().expect("files").is_empty());
+
+    crate::runs::blob_store::put_run_bundle(
+        &pool,
+        "run-pod",
+        crucible_contract::ArtifactKind::RunFiles,
+        run_files_bundle(&[
+            ("collect/HEALTH_EVIDENCE.json", b"{\"nodes\":3}"),
+            ("collect/evidence/probe.json", b"{}"),
+            ("assemble/HEALTH_REPORT.md", b"# report\n"),
+        ]),
+    )
+    .await?;
+    let (status, ev) = get_json_value(&app, "/api/runs/run-pod/tasks/collect/evidence").await;
+    assert_eq!(status, StatusCode::OK, "{ev}");
+    let files: Vec<(&str, u64, &str)> = ev["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| {
+            (
+                f["name"].as_str().expect("name"),
+                f["size_bytes"].as_u64().expect("size"),
+                f["content"].as_str().expect("content"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        files,
+        [
+            ("HEALTH_EVIDENCE.json", 11, "{\"nodes\":3}"),
+            ("evidence/probe.json", 2, "{}"),
+        ],
+        "{ev}"
+    );
+    Ok(())
+}
+
 /// The human surface exactly as `serve` mounts it, run evidence routes included, over `scratch`.
 async fn human_app_over(db: Db, pool: PgPool, scratch: &std::path::Path) -> Router {
     let store = crate::identity::session::store(&pool)

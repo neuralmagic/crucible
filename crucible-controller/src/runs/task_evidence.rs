@@ -1,7 +1,6 @@
-//! What one task of a run actually did, read back off the evidence the run left behind: the files
-//! it captured under a local run's `state/files/<task>/`, and the `task_result` line its session
-//! log carries. Behind `GET /api/runs/{run_id}/tasks/{task}/evidence` and
-//! `GET /api/runs/{run_id}/log`.
+//! What one task of a run actually did, read back off the evidence the run left behind: the
+//! `task_result` line its session log carries, and where a local run keeps its state. Behind
+//! `GET /api/runs/{run_id}/tasks/{task}/evidence` and `GET /api/runs/{run_id}/log`.
 //!
 //! Every path here is built from caller-supplied text, so the segments are checked before the join
 //! and the resolved directory is checked against the run's own files root afterwards — a symlinked
@@ -16,19 +15,6 @@ pub const MAX_INLINE_BYTES: u64 = 256 * 1024;
 
 /// How much of the engine log a run's log response carries, counted from the end.
 pub const MAX_LOG_BYTES: u64 = 512 * 1024;
-
-/// How many captured files one task's evidence lists.
-const MAX_FILES: usize = 64;
-
-/// One file a task captured into the run's state directory.
-#[derive(Debug, Clone, PartialEq)]
-pub struct CapturedFile {
-    pub name: String,
-    pub size_bytes: u64,
-    /// The file's text, for UTF-8 content under [`MAX_INLINE_BYTES`]; `None` for anything bigger
-    /// or not decodable.
-    pub content: Option<String>,
-}
 
 /// A path segment that cannot leave the directory it is joined onto: no separators, no `.`/`..`,
 /// no NUL, not empty. Task names carry brackets (`triage[1027]`) and run ids carry colons, so the
@@ -66,63 +52,6 @@ pub fn task_segment(task: &str) -> Option<String> {
         .dir_name()
         .into_owned();
     safe_segment(&segment).then_some(segment)
-}
-
-/// Resolve one task's captured-files directory, or `None` when it does not exist or resolves
-/// outside the run's own files root. `task` is the name the session log carries.
-fn task_files_dir(scratch_root: &Path, run_id: &str, task: &str) -> Option<PathBuf> {
-    if !safe_segment(run_id) {
-        return None;
-    }
-    let segment = task_segment(task)?;
-    let root = files_root(scratch_root, run_id).canonicalize().ok()?;
-    let dir = root.join(segment).canonicalize().ok()?;
-    dir.starts_with(&root).then_some(dir)
-}
-
-/// Every file one task captured, name-sorted, each with its size and — for decodable text under
-/// the cap — its content. A task that captured nothing, a pod run (whose files never touch this
-/// machine), and a traversal attempt all read the same: no files.
-pub async fn captured_files(scratch_root: &Path, run_id: &str, task: &str) -> Vec<CapturedFile> {
-    let Some(dir) = task_files_dir(scratch_root, run_id, task) else {
-        return Vec::new();
-    };
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return Vec::new();
-    };
-    let mut files = Vec::new();
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if !safe_segment(name) {
-            continue;
-        }
-        // Symlinks are skipped rather than followed: the file the run captured is a regular file,
-        // and a link is a way out of the directory.
-        let Ok(meta) = entry.metadata().await else {
-            continue;
-        };
-        if !meta.is_file() || meta.file_type().is_symlink() {
-            continue;
-        }
-        let size_bytes = meta.len();
-        let content = if size_bytes <= MAX_INLINE_BYTES {
-            tokio::fs::read(entry.path())
-                .await
-                .ok()
-                .and_then(|bytes| String::from_utf8(bytes).ok())
-        } else {
-            None
-        };
-        files.push(CapturedFile {
-            name: name.to_string(),
-            size_bytes,
-            content,
-        });
-    }
-    files.sort_by(|a, b| a.name.cmp(&b.name));
-    files.truncate(MAX_FILES);
-    files
 }
 
 /// The tail of `bytes` within [`MAX_LOG_BYTES`], plus whether the head was dropped.
@@ -362,72 +291,6 @@ mod tests {
         for good in ["triage[1027]", "playbook_triage-local_01a0", "REPORT.md"] {
             assert!(safe_segment(good), "{good:?} is an ordinary name");
         }
-    }
-
-    #[tokio::test]
-    async fn files_are_read_under_the_runs_own_directory_only() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let scratch = root.path();
-        let task_dir = files_root(scratch, "run-1").join("triage[1027]");
-        std::fs::create_dir_all(&task_dir).expect("mkdir");
-        std::fs::write(task_dir.join("TRIAGE.md"), "# triage\n").expect("write");
-        std::fs::write(task_dir.join("blob.bin"), [0xff_u8, 0xfe, 0x00]).expect("write");
-        std::fs::create_dir(task_dir.join("nested")).expect("mkdir");
-
-        let files = captured_files(scratch, "run-1", "triage[1027]").await;
-        assert_eq!(files.len(), 2, "the directory is not a file: {files:?}");
-        assert_eq!(files[0].name, "TRIAGE.md");
-        assert_eq!(files[0].content.as_deref(), Some("# triage\n"));
-        assert_eq!(files[1].name, "blob.bin");
-        assert_eq!(files[1].content, None, "not decodable as text");
-
-        // A traversal in either segment reads nothing, however the join would have resolved.
-        assert!(captured_files(scratch, "run-1", "..").await.is_empty());
-        assert!(
-            captured_files(scratch, "..", "triage[1027]")
-                .await
-                .is_empty()
-        );
-        assert!(
-            captured_files(scratch, "run-1", "../../../../etc")
-                .await
-                .is_empty()
-        );
-    }
-
-    /// An instance named after a key holding a separator captured into the engine's escaped
-    /// directory, and its evidence is read from there by the name the session log carries.
-    #[tokio::test]
-    async fn an_instance_whose_key_holds_a_separator_reads_its_escaped_directory() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let scratch = root.path();
-        let task_dir = files_root(scratch, "run-1").join("audit[llm-d%2Fllm-d-router]");
-        std::fs::create_dir_all(&task_dir).expect("mkdir");
-        std::fs::write(task_dir.join("out.txt"), "router\n").expect("write");
-
-        let files = captured_files(scratch, "run-1", "audit[llm-d/llm-d-router]").await;
-        assert_eq!(files.len(), 1, "{files:?}");
-        assert_eq!(files[0].content.as_deref(), Some("router\n"));
-        assert!(
-            captured_files(scratch, "run-1", "audit[llm-d%2Fllm-d-router]")
-                .await
-                .is_empty(),
-            "the escaped text is not itself the raw key"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_symlinked_task_directory_reads_nothing() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let scratch = root.path();
-        let outside = root.path().join("outside");
-        std::fs::create_dir_all(&outside).expect("mkdir");
-        std::fs::write(outside.join("SECRET.md"), "not yours\n").expect("write");
-        let files = files_root(scratch, "run-1");
-        std::fs::create_dir_all(&files).expect("mkdir");
-        std::os::unix::fs::symlink(&outside, files.join("escape")).expect("symlink");
-
-        assert!(captured_files(scratch, "run-1", "escape").await.is_empty());
     }
 
     #[tokio::test]
