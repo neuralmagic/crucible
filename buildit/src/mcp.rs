@@ -5015,6 +5015,7 @@ mod tests {
         );
         let stamped = |prefix: &str| {
             out.lines().any(|l| {
+                let l = l.split_once(':').map_or(l, |(_, line)| line);
                 l.split_once(' ').is_some_and(|(at, text)| {
                     at.parse::<u128>().is_ok() && text.starts_with(prefix)
                 })
