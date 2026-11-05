@@ -1,0 +1,6 @@
+1793822645861849608 STEP 1/11: FROM docker.io/vllm/vllm-openai:v0.32.0@sha256:befccf0e7e4089aa23926bb6f887a85c0d46c2a99e6de5c5ffdf5cb7957c5b34
+1793822765861849608 STEP 3/11: RUN set -eu;     v=$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr . -);
+1793822825861849608 STEP 5/11: RUN grep -v '^torch' /tmp/requirements/build/cuda.txt > /tmp/build-reqs.txt
+1793822885861849608 STEP 11/11: RUN TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" MAX_JOBS="$MAX_JOBS" python3 setup.py build_ext --inplace
+1793822959360402370 COMMIT localhost/buildit/buildit-3eb1b001e49882a2:latest
+1793822974360402370 END 0

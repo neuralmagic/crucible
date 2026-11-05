@@ -39,10 +39,8 @@ export function logBody(log: RunLog): string {
   return log.location ?? 'no output recorded for this run';
 }
 
-/// The path the log body is read under, which is what routes it to the editor: real output earns
-/// the find widget and line numbers, a location hint stays prose. Plain `.log` in both dispatches,
-/// because a pod run's session is NDJSON and the JSON grammar would mark every line after the
-/// first as a syntax error.
+/// The path the log body is read under when it is output, which the log viewer reads with search,
+/// line numbers and its ANSI colours; a location hint has none and stays prose.
 export function logPath(log: RunLog): string | null {
   return (log.text ?? '') === '' ? null : 'run.log';
 }

@@ -141,10 +141,13 @@ describe('inlineKind', () => {
     expect(inlineKind('REPORT.md')).toBe('markdown');
     expect(inlineKind('VERDICT.JSON')).toBe('json');
     expect(inlineKind('out.txt')).toBe('text');
-    expect(inlineKind('agent.log')).toBe('text');
+    expect(inlineKind('agent.log')).toBe('log');
+    expect(inlineKind('BUILD.LOG')).toBe('log');
     expect(inlineKind('chart.png')).toBe('image');
     expect(inlineKind('photo.JPEG')).toBe('image');
     expect(inlineKind('diagram.svg')).toBe('image');
+    expect(inlineKind('build-trace.html')).toBe('html');
+    expect(inlineKind('REPORT.HTM')).toBe('html');
     expect(inlineKind('bundle.tar.gz')).toBeNull();
     expect(inlineKind('Makefile')).toBeNull();
     expect(inlineKind('dir.d/README')).toBeNull();
@@ -250,7 +253,9 @@ describe('downloadName', () => {
 describe('textKind', () => {
   it('drops images so a text surface never gets bytes', () => {
     expect(textKind('a.md')).toBe('markdown');
+    expect(textKind('build.log')).toBe('log');
     expect(textKind('a.png')).toBeNull();
+    expect(textKind('trace.html')).toBeNull();
     expect(textKind('a.bin')).toBeNull();
   });
 });

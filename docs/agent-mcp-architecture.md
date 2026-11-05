@@ -422,7 +422,10 @@ The steps are these:
    `client_assertion_type`, `client_assertion`, `audience`, `scope`. Any other field, for example
    `client_id` or `resource`, is refused (`crucible-controller/src/agent_auth/mod.rs:149`).
 9. The supervisor injects the token as a bearer header only on egress to the host and port of the
-   provider endpoint. The agent never sees the token.
+   provider endpoint, from a binary the provider's profile lists. The profile lists the same
+   binaries as the sandbox policy: OpenShell injects a grant only when the profile's own rule
+   admits the request, and with binary identity required, a rule admits only the binaries it names.
+   The agent never sees the token.
 
 ### 3.2 What the token endpoint checks
 
@@ -1569,6 +1572,15 @@ starts it before it creates the providers (`Granted::start_local`,
 `[buildit] url`, by default `http://host.openshell.internal:8848/mcp`, which is the loop Service.
 The supervisor injects a token for that audience on egress to that host and port only.
 
+The engine runs the `buildit` first on its PATH. That is the loop image's own unless
+`[buildit] image` names another: the `buildit-bin` init container then copies that image's
+`/usr/local/bin/buildit` into an emptyDir the loop container mounts read-only at
+`/opt/crucible/buildit/bin`, and the wrapper puts that directory first on PATH, so the engine and
+the run's own tasks run it. The shared cache runs from the same image unless `[buildit.cache]
+image` names one. `docker.yml` publishes `ghcr.io/neuralmagic/crucible-buildit` from every main
+build (`docker/Containerfile.buildit`), and the controller reads the deploy profile at each
+dispatch, so moving the pin rolls buildit for the next runs with no new loop image.
+
 The engine starts it with these arguments (`Buildit::args`, `crucible/src/openshell/buildit.rs`):
 
 | Argument | Value |
@@ -1604,7 +1616,11 @@ For `build`, `buildit` downloads the build context with
 `openshell sandbox download <sandbox> <workdir>/<context> <dest>` through the run's gateway
 (`buildit/src/sandbox.rs:101`). The context path must be relative, without `..`. It may not
 contain `.git`, `.mcp.json`, `.claude`, `.buildit`, `.kube` or `.jira`. `sanitize` then deletes
-those names, special files, and symlinks that resolve outside the context (`sandbox.rs:207`). `run`
+those names but `.git`, special files, and symlinks that resolve outside the context
+(`sandbox.rs:207`). Of each `.git` directory it keeps `HEAD`, `index`, `objects`, `packed-refs`,
+`refs` and `shallow`, so a build can read the checkout's history (vLLM's `setup.py` takes its
+version from it), and deletes the rest: the config, where remote URLs and http headers can carry
+credentials, the hooks and the logs. `run`
 writes requested output paths back to `<workdir>/.buildit/<build id>/` in the sandbox with
 `openshell sandbox upload`.
 
@@ -1903,7 +1919,8 @@ tokens, the controller does not read them.
 | `[buildit.cache] token_secret` | required with `[buildit.cache]` | The loop-namespace Secret whose `token` key is the shared cache's write token ([8.7](#87-the-shared-cache)). |
 | `[buildit.cache] write` | `true` | Builds get the token and may write to the shared cache. `false`: they read only. |
 | `[buildit.cache] size_gib` | `200` | The cache's claim size; it keeps 90% of it before dropping the least recently read blobs. |
-| `[buildit.cache] storage_class`, `image` | the cluster's, the loop image | The claim's StorageClass and the image `buildit cache` runs from. |
+| `[buildit.cache] storage_class`, `image` | the cluster's, `[buildit] image` or else the loop image | The claim's StorageClass and the image `buildit cache` runs from. |
+| `[buildit] image` | the loop image's `buildit` | An image holding `/usr/local/bin/buildit` that loop pods run instead ([8.1](#81-where-it-runs)). |
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
 | `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `scopes` (default none), `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |

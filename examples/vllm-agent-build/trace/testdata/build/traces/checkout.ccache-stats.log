@@ -1,0 +1,60 @@
+# /src/vllm/csrc/cumem_allocator.cpp
+cache_miss
+direct_cache_miss
+local_storage_miss
+local_storage_read_miss
+local_storage_read_miss
+local_storage_write
+local_storage_write
+preprocessed_cache_miss
+remote_storage_miss
+remote_storage_read_miss
+remote_storage_read_miss
+remote_storage_write
+remote_storage_write
+# /src/vllm/csrc/spinloop.cpp
+cache_miss
+direct_cache_miss
+local_storage_miss
+local_storage_read_miss
+local_storage_read_miss
+local_storage_write
+local_storage_write
+preprocessed_cache_miss
+remote_storage_miss
+remote_storage_read_miss
+remote_storage_read_miss
+remote_storage_write
+remote_storage_write
+# /src/vllm/csrc/fs_io.cpp
+cache_miss
+direct_cache_miss
+local_storage_miss
+local_storage_read_miss
+local_storage_read_miss
+local_storage_write
+local_storage_write
+preprocessed_cache_miss
+remote_storage_miss
+remote_storage_read_miss
+remote_storage_read_miss
+remote_storage_write
+remote_storage_write
+# /src/vllm/csrc/custom_all_gather_reduce_scatter_ops.cpp
+cache_miss
+direct_cache_miss
+local_storage_miss
+local_storage_read_miss
+local_storage_read_miss
+local_storage_write
+local_storage_write
+preprocessed_cache_miss
+remote_storage_miss
+remote_storage_read_miss
+remote_storage_read_miss
+remote_storage_write
+remote_storage_write
+# /src/vllm/csrc/cuda_utils_kernels.cu
+cache_miss
+direct_cache_miss
+local_storage_miss

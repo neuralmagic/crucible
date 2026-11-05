@@ -1,6 +1,7 @@
 // Pure feed helpers: fold session lines into display rows (coalescing streamed agent text), and the
 // scroll math that drives auto-follow. Kept free of React so they stay unit-testable.
 
+import { ansiPlain } from '../logs/ansi';
 import { parseSessionLine, type AgentEvent, type SessionLine } from './session';
 
 /// One rendered row. Streamed assistant `text` and `thinking` deltas are merged into a single
@@ -202,8 +203,11 @@ export function rowCategory(row: FeedRow): FeedCategory {
 export function rowMatches(row: FeedRow, query: string): boolean {
   const q = query.trim().toLowerCase();
   if (q === '') return true;
-  if (row.kind === 'text' || row.kind === 'thinking' || row.kind === 'pod') {
+  if (row.kind === 'text' || row.kind === 'thinking') {
     return row.text.toLowerCase().includes(q);
+  }
+  if (row.kind === 'pod') {
+    return ansiPlain(row.text).toLowerCase().includes(q);
   }
   const view = describeLine(row.line);
   return [view.tag, view.title, view.detail ?? ''].some((s) => s.toLowerCase().includes(q));

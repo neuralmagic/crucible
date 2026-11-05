@@ -17,6 +17,7 @@ mod step;
 mod task;
 
 use std::collections::BTreeMap;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -251,6 +252,9 @@ pub struct BuildArgs {
         conflicts_with = "image"
     )]
     pub caches: Vec<mcp::CacheSpec>,
+    /// Point ccache in every RUN step at the server's shared cache; needs ccache 4.4 or later
+    #[arg(long, requires = "server", conflicts_with = "image")]
+    pub ccache: bool,
     #[command(flatten)]
     pub server: ServerOpt,
 }
@@ -333,6 +337,7 @@ impl BuildArgs {
             build_args,
             timeout_s: self.timeout,
             caches: self.caches.clone(),
+            ccache: self.ccache,
         })
     }
 
@@ -391,6 +396,7 @@ async fn main() -> Result<ExitCode> {
     // stderr for logs, stdout stays clean for the digest-pinned ref
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::stderr().is_terminal())
         .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
