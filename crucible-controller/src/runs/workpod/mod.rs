@@ -34,6 +34,7 @@ mod core;
 pub(crate) mod dispatcher;
 mod drain;
 pub mod gateway;
+mod git_sidecar;
 pub(crate) mod kube_dispatcher;
 mod markers;
 pub(crate) mod retry;

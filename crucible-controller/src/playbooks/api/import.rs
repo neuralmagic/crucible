@@ -751,7 +751,7 @@ pub(crate) async fn create_draft_from_git(
             git_ref: import.git_ref,
             path: import.path,
             rev: import.rev,
-            draft: DraftCompileDto::from_saved(saved, &state.dispatch, &catalog),
+            draft: DraftCompileDto::from_saved(saved, &state, &catalog),
             ignored_paths: proposed.ignored,
         }),
     )
@@ -830,11 +830,7 @@ pub(crate) async fn draft_from_pack_import(
     };
     (
         StatusCode::CREATED,
-        Json(DraftCompileDto::from_saved(
-            saved,
-            &state.dispatch,
-            &catalog,
-        )),
+        Json(DraftCompileDto::from_saved(saved, &state, &catalog)),
     )
         .into_response()
 }

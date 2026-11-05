@@ -17,6 +17,7 @@ pub mod manifest;
 pub mod minter;
 pub mod provider;
 pub mod read;
+pub mod refresh;
 pub mod store;
 pub mod vault;
 

@@ -54,6 +54,7 @@ mod openshell {
 
     pub mod agent_servers;
     pub mod buildit;
+    pub mod git;
     pub mod provider;
     pub mod run;
     pub mod sandbox;
