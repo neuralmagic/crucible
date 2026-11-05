@@ -96,10 +96,6 @@ pub fn add(
     if jwks.scheme() != "https" {
         return Err(SidecarError::InsecureJwks(jwks.to_string()));
     }
-    let local_port = git::LOCAL_BIND
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .unwrap_or(8854);
     let run_id = pod.metadata.name.clone().unwrap_or_default();
     let Some(spec) = pod.spec.as_mut() else {
         return Err(SidecarError::NoLoop);
@@ -204,10 +200,12 @@ pub fn add(
             command: Some(vec!["crucible-git".to_string()]),
             args: Some(args),
             volume_mounts: Some(mounts),
+            // The kubelet probes the pod IP, so the sandbox listener; the CA is written before
+            // any listener binds, so the loop starts only once tasks can trust it.
             startup_probe: Some(core::Probe {
                 tcp_socket: Some(core::TCPSocketAction {
-                    host: Some("127.0.0.1".to_string()),
-                    port: IntOrString::Int(local_port),
+                    host: None,
+                    port: IntOrString::Int(i32::from(port)),
                 }),
                 period_seconds: Some(1),
                 failure_threshold: Some(30),
