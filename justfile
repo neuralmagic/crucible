@@ -109,7 +109,7 @@ dev-s3:
     set -euo pipefail
     if ! docker inspect crucible-test-seaweedfs >/dev/null 2>&1; then
         docker run -d --name crucible-test-seaweedfs -p 58333:8333 \
-            chrislusf/seaweedfs:4.00 server -s3 -s3.port=8333 -dir=/data >/dev/null
+            chrislusf/seaweedfs:4.00 server -s3 -s3.port=8333 -dir=/data -master.volumeSizeLimitMB=64 >/dev/null
         echo "created crucible-test-seaweedfs"
     else
         docker start crucible-test-seaweedfs >/dev/null

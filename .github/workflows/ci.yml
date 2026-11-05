@@ -105,7 +105,7 @@ jobs:
           set -eu
           name="crucible-ci-seaweedfs-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           docker run -d --rm --name "$name" -p 127.0.0.1::8333 "$SEAWEEDFS_IMAGE" \
-            server -s3 -s3.port=8333 -dir=/data
+            server -s3 -s3.port=8333 -dir=/data -master.volumeSizeLimitMB=64
           port=$(docker port "$name" 8333/tcp | head -n1 | cut -d: -f2)
           {
             echo "CRUCIBLE_TEST_S3_ENDPOINT=http://127.0.0.1:${port}"

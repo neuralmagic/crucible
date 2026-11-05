@@ -1171,13 +1171,15 @@ mod tests {
         );
     }
 
-    /// A per-test bucket on the S3-compatible server at `CRUCIBLE_TEST_S3_ENDPOINT`, and a raw
-    /// client to inspect it with.
+    /// A per-test key prefix in a shared bucket on the S3-compatible server at
+    /// `CRUCIBLE_TEST_S3_ENDPOINT`, and a raw client to inspect it with.
     struct S3Env {
         blobs: BlobStore,
         raw: aws_sdk_s3::Client,
-        bucket: String,
+        root: String,
     }
+
+    const S3_TEST_BUCKET: &str = "crucible-test-evidence";
 
     fn s3_required() -> bool {
         std::env::var("CRUCIBLE_REQUIRE_S3_TESTS")
@@ -1216,26 +1218,30 @@ mod tests {
     }
 
     impl S3Env {
-        async fn new(pool: PgPool, prefix: &str) -> Option<S3Env> {
+        async fn new(pool: PgPool) -> Option<S3Env> {
             let conf = s3_sdk_config()?;
             let raw = aws_sdk_s3::Client::from_conf(
                 aws_sdk_s3::config::Builder::from(&conf)
                     .force_path_style(true)
                     .build(),
             );
-            let bucket = format!("crucible-test-{}", uuid::Uuid::now_v7().simple());
-            raw.create_bucket()
-                .bucket(&bucket)
-                .send()
-                .await
-                .expect("create bucket");
-            let location: BucketUri = format!("s3://{bucket}/{prefix}").parse().expect("uri");
+            if let Err(create) = raw.create_bucket().bucket(S3_TEST_BUCKET).send().await {
+                raw.head_bucket()
+                    .bucket(S3_TEST_BUCKET)
+                    .send()
+                    .await
+                    .unwrap_or_else(|head| panic!("create bucket: {create:?}; head: {head:?}"));
+            }
+            let root = format!("t-{}", uuid::Uuid::now_v7().simple());
+            let location: BucketUri = format!("s3://{S3_TEST_BUCKET}/{root}/")
+                .parse()
+                .expect("uri");
             let objects = ObjectStore::from_sdk_config(&conf, location);
             objects.check().await.expect("bucket reachable");
             Some(S3Env {
                 blobs: BlobStore::new(pool).with_objects(objects),
                 raw,
-                bucket,
+                root,
             })
         }
 
@@ -1243,7 +1249,8 @@ mod tests {
             let out = self
                 .raw
                 .list_objects_v2()
-                .bucket(&self.bucket)
+                .bucket(S3_TEST_BUCKET)
+                .prefix(format!("{}/", self.root))
                 .send()
                 .await
                 .expect("list objects");
@@ -1256,7 +1263,8 @@ mod tests {
         async fn uploads_in_progress(&self) -> usize {
             self.raw
                 .list_multipart_uploads()
-                .bucket(&self.bucket)
+                .bucket(S3_TEST_BUCKET)
+                .prefix(format!("{}/", self.root))
                 .send()
                 .await
                 .expect("list multipart uploads")
@@ -1278,12 +1286,15 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_roundtrips_a_multi_part_payload_under_the_prefix(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "evidence/").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         let stored = roundtrips_a_multi_chunk_payload(&env.blobs).await;
         let key = env.object_key_of(stored.id).await;
-        assert!(key.starts_with("evidence/artifacts/"), "{key}");
+        assert!(
+            key.starts_with(&format!("{}/artifacts/", env.root)),
+            "{key}"
+        );
         assert_eq!(env.keys().await, vec![key]);
         assert_eq!(
             chunk_rows(env.blobs.pool()).await,
@@ -1295,7 +1306,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_replaces_a_prior_payload_and_deletes_its_object(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         replaces_a_prior_payload(&env.blobs).await;
@@ -1305,7 +1316,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_refuses_an_oversize_put_and_aborts_its_upload(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         refuses_an_oversize_put_and_keeps_the_prior_payload(&env.blobs).await;
@@ -1315,7 +1326,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_refuses_a_failed_stream_and_aborts_its_upload(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         refuses_a_failed_stream_and_stores_nothing(&env.blobs).await;
@@ -1325,7 +1336,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_keeps_owners_and_kinds_apart(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         keeps_owners_and_kinds_apart(&env.blobs).await;
@@ -1334,7 +1345,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_roundtrips_an_empty_payload(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         roundtrips_an_empty_payload(&env.blobs).await;
@@ -1342,7 +1353,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_roundtrips_a_gzipped_run_session(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         roundtrips_a_gzipped_run_session(&env.blobs).await;
@@ -1351,7 +1362,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_roundtrips_a_run_engine_log_and_bundle(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         roundtrips_a_run_engine_log_and_bundle(&env.blobs).await;
@@ -1360,7 +1371,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_get_verifies_the_digest_against_the_object(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         let owner = pod_owner();
@@ -1369,7 +1380,7 @@ mod tests {
             .expect("put");
         env.raw
             .put_object()
-            .bucket(&env.bucket)
+            .bucket(S3_TEST_BUCKET)
             .key(env.object_key_of(stored.id).await)
             .body(vec![0xAAu8; 64].into())
             .send()
@@ -1383,7 +1394,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_reads_a_row_written_to_postgres_and_moves_it_on_rewrite(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         let postgres = BlobStore::new(env.blobs.pool().clone());
@@ -1409,11 +1420,13 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn s3_check_refuses_a_missing_bucket(pool: PgPool) {
-        let Some(env) = S3Env::new(pool, "").await else {
+        let Some(env) = S3Env::new(pool).await else {
             return;
         };
         let conf = s3_sdk_config().expect("endpoint");
-        let missing: BucketUri = format!("s3://{}-missing", env.bucket).parse().expect("uri");
+        let missing: BucketUri = format!("s3://{S3_TEST_BUCKET}-{}", env.root)
+            .parse()
+            .expect("uri");
         let err = ObjectStore::from_sdk_config(&conf, missing)
             .check()
             .await
