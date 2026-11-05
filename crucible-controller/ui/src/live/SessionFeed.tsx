@@ -9,6 +9,7 @@ import {
   type FeedRow,
   type LineTone,
 } from './feed';
+import { AnsiText } from '../logs/AnsiText';
 import { useFollowScroll } from './useFollowScroll';
 
 const TONE_ACCENT: Record<LineTone, string> = {
@@ -143,7 +144,7 @@ function FeedRowView({ row }: { row: FeedRow }) {
       <div className="flex items-baseline gap-2.5 border-l-2 border-l-transparent px-3.5 py-0.5">
         <span className="w-24 shrink-0 text-label uppercase tracking-label text-ink-3">pod</span>
         <div className="min-w-0 flex-1 whitespace-pre-wrap wrap-anywhere font-mono text-ink-2">
-          {row.text}
+          <AnsiText text={row.text} />
         </div>
       </div>
     );

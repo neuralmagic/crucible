@@ -11,7 +11,8 @@ where it printed nothing show. Load the JSON at https://ui.perfetto.dev.
 `run_logged` runs the build itself, timing each line it prints for `chrome_trace(lines=...)`.
 `html` renders a trace as one self-contained page; from the command line:
 
-    python3 buildtrace.py html --ninja-log build/.ninja_log --ccache-stats stats.log -o trace.html
+    python3 buildtrace.py html --ninja-log build/.ninja_log --ccache-stats stats.log \
+        --steps-log steps.log -o trace.html
     python3 buildtrace.py html --trace build-trace.json -o trace.html
 """
 
@@ -35,6 +36,8 @@ MS = 1_000_000
 QUIET_NS = 1_000 * MS
 RUN_GAP_NS = 5_000 * MS
 LABEL_CHARS = 120
+PHASE_CHARS = 60
+STEP_LINE = re.compile(r"^STEP (\d+/\d+): (.*)$")
 QUIETEST = 10
 MAX_INSTANTS = 2000
 OBJECT = re.compile(r"(?:^|/)CMakeFiles/[^/]+\.dir/(.+)\.(?:o|obj)$")
@@ -144,8 +147,8 @@ def ninja_jobs(build_dir: Path, since_ns: int) -> list[Job]:
 
 def ninja_log_jobs(log: Path, since_ns: int | None = None) -> list[Job]:
     """The jobs ninja logged in LOG with a stamp at or after SINCE_NS, on wall-clock time; without
-    SINCE_NS, the jobs of the log's last ninja run, the lines whose run start lies within
-    RUN_GAP_NS of the latest one.
+    SINCE_NS, the jobs of the log's last ninja run, the lines stamped no more than RUN_GAP_NS
+    before it started.
 
     A log line gives a job's start and end in ms from its ninja run's start, and a stamp in ns:
     the output's mtime, near the job's end, in older logs; the job's start in newer ones. The
@@ -169,7 +172,7 @@ def ninja_log_jobs(log: Path, since_ns: int | None = None) -> list[Job]:
             continue
         latest[parts[3]] = (start_ms, end_ms, mtime_ns)
     if since_ns is None and latest:
-        since_ns = _last_run_start(list(latest.values()), version) - RUN_GAP_NS
+        since_ns = _last_run_start(list(latest.values())) - RUN_GAP_NS
     rows = {out: r for out, r in latest.items() if r[2] >= (since_ns or 0)}
     if not rows:
         return []
@@ -180,10 +183,10 @@ def ninja_log_jobs(log: Path, since_ns: int | None = None) -> list[Job]:
     )
 
 
-def _last_run_start(rows: list[tuple[int, int, int]], version: int) -> int:
-    """The latest run's start: each line dated by its start (newer logs) or end (older ones)."""
-    stamped_at_start = version >= START_STAMPED_FROM
-    return max(stamp - (start if stamped_at_start else end) * MS for start, end, stamp in rows)
+def _last_run_start(rows: list[tuple[int, int, int]]) -> int:
+    """The latest run's start, or up to its shortest job before it: a line is stamped at its
+    job's start, or at its end for a restat output, so stamp - end never passes its run's start."""
+    return max(stamp - end * MS for _, end, stamp in rows)
 
 
 def _run_start(rows: list[tuple[int, int, int]], version: int) -> int:
@@ -384,14 +387,47 @@ def _escape(text: str) -> str:
     )
 
 
+def build_steps(steps_log: Path) -> list[Span]:
+    """The Dockerfile steps buildit stamped in STEPS_LOG, `<unix ns> <line>` for each STEP and
+    COMMIT line and then `<unix ns> END <exit code>`, each step a phase until the next line."""
+    try:
+        lines = steps_log.read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    marks: list[tuple[int, str]] = []
+    for line in lines:
+        at, _, text = line.partition(" ")
+        if at.isdigit() and text:
+            marks.append((int(at), text))
+    marks.sort(key=lambda mark: mark[0])
+    return [
+        Span(step_label(text), at, until, {"line": text[:LABEL_CHARS]})
+        for (at, text), (until, _) in zip(marks, marks[1:], strict=False)
+        if not text.startswith("END")
+    ]
+
+
+def step_label(line: str) -> str:
+    """`STEP 3/11: RUN apt-get …` as `3/11 RUN apt-get …`, and a COMMIT line as `commit`."""
+    step = STEP_LINE.match(line)
+    if step is None:
+        return "commit" if line.startswith("COMMIT") else line[:PHASE_CHARS]
+    return f"{step[1]} {step[2]}"[:PHASE_CHARS].rstrip()
+
+
 def logs_trace(
-    ninja_log: Path, stats_log: Path | None, facts: dict[str, object]
+    ninja_log: Path,
+    stats_log: Path | None,
+    facts: dict[str, object],
+    steps_log: Path | None = None,
 ) -> dict[str, object]:
-    """The trace of a build known only by its ninja log and, optionally, ccache's stats log."""
+    """The trace of a build known by its ninja log and, optionally, ccache's stats log and the
+    steps buildit stamped. With steps, the timeline starts at the first one."""
     jobs = ninja_log_jobs(ninja_log)
     outcomes = ccache_outcomes(stats_log) if stats_log is not None else []
-    origin = jobs[0].start_ns if jobs else 0
-    return chrome_trace(Timeline(origin_ns=origin), jobs, outcomes, facts)
+    steps = build_steps(steps_log) if steps_log is not None else []
+    origin = steps[0].start_ns if steps else jobs[0].start_ns if jobs else 0
+    return chrome_trace(Timeline(origin_ns=origin, spans=steps), jobs, outcomes, facts)
 
 
 def main(argv: Sequence[str]) -> int:
@@ -402,6 +438,7 @@ def main(argv: Sequence[str]) -> int:
     source.add_argument("--trace", type=Path, help="a Chrome trace this module wrote")
     source.add_argument("--ninja-log", type=Path, help="a build dir's .ninja_log")
     page.add_argument("--ccache-stats", type=Path, help="ccache's stats_log for the same build")
+    page.add_argument("--steps-log", type=Path, help="the steps buildit stamped for the same build")
     page.add_argument("--title", default="Build trace")
     page.add_argument("--fact", action="append", default=[], metavar="KEY=VALUE")
     page.add_argument("-o", "--out", type=Path, required=True)
@@ -411,7 +448,7 @@ def main(argv: Sequence[str]) -> int:
         trace = json.loads(args.trace.read_text())
         trace["otherData"] = {**trace.get("otherData", {}), **facts}
     else:
-        trace = logs_trace(args.ninja_log, args.ccache_stats, facts)
+        trace = logs_trace(args.ninja_log, args.ccache_stats, facts, args.steps_log)
     args.out.write_text(html(trace, args.title))
     return 0
 
