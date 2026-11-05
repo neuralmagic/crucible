@@ -125,6 +125,12 @@ If the controller runs loops in other clusters (spokes):
   the broker contract of the pack.
 - `CONTROLLER_CLUSTER_POLICY` limits which users can target which cluster
   (`name=group:/path;user:login`, comma-separated).
+- A pack whose runs need one cluster (a build that reaches a mirror only that cluster can see)
+  pins it in its manifest with `[dispatch] target = "<cluster>"`. Every launch of that pack goes
+  there, and a launch or schedule that names another target is refused. The pin does not bypass
+  `CONTROLLER_CLUSTER_POLICY`: a caller fenced off the pinned cluster cannot launch the pack.
+  A draft-head schedule saved before its draft added a pin fails its firing until it is saved
+  again.
 - If the hub cannot reach a spoke, the spoke sends reports to the hub.
   `crucible-controller cluster-snapshot` runs on the spoke as a CronJob and posts to the push
   endpoint of the hub with a bearer token that the hub lists in `CONTROLLER_PUSH_TOKENS`.

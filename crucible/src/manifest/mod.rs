@@ -6,6 +6,7 @@ mod backend;
 mod broker;
 mod capability;
 mod deploy;
+mod dispatch;
 pub mod edition;
 mod git_ref;
 mod judge;
@@ -31,6 +32,7 @@ pub use backend::{AgentBackend, UnknownBackend};
 pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broker_url};
 pub use capability::{CapabilitiesCfg, CredentialContext};
 pub use deploy::DeployCfg;
+pub use dispatch::{ClusterName, ClusterNameError, DispatchCfg};
 pub use git_ref::{GitRef, GitRefError, RepoOverridesCfg};
 pub use judge::JudgeCfg;
 pub use mcp::McpCfg;
@@ -357,6 +359,9 @@ pub struct Manifest {
     /// TOML.
     #[serde(skip)]
     pub launch: launch::LaunchSettings,
+    /// The cluster the controller dispatches every launch of this pack to.
+    #[serde(default)]
+    pub dispatch: DispatchCfg,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.

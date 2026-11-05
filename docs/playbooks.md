@@ -429,6 +429,18 @@ A registration runs one variant of the pack's manifest
 every variant of each pack. Every launch of the registration then runs that variant. To run
 another variant of the same pack, register it again under another id.
 
+A launch runs on the controller's default cluster unless it passes `--dispatch-target`. A pack
+that only works on one cluster names it in `crucible.toml`, and then every launch lands there
+without the flag:
+
+```toml
+[dispatch]
+target = "cluster-a"
+```
+
+`crux draft-preview` prints `dispatching to cluster-a (pinned by crucible.toml)`. A launch that
+asks for another cluster is refused.
+
 ### Let your own agent write it
 
 If an agent writes the pack, give it the co-draft skill before it starts. The controller

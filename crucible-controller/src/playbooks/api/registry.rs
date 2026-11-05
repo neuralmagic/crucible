@@ -142,6 +142,9 @@ pub struct PackDispatchDto {
     /// True when a launch here runs as a supervised subprocess on the controller's machine rather
     /// than a work pod.
     pub local_mode: bool,
+    /// `[dispatch] target`: the cluster every launch of this pack dispatches to; null when the
+    /// pack pins none and the launch chooses.
+    pub pinned_target: Option<String>,
 }
 
 /// `[agent.resources]` as the sandbox is scheduled with it; zero and nulls are no request.
@@ -186,6 +189,7 @@ impl PackDispatchDto {
                 dispatchable: false,
                 refusal: Some(UNREADABLE_MANIFEST.to_string()),
                 local_mode: cap.is_local(),
+                pinned_target: None,
             };
         };
         let refusal = cap.refusal(agent);
@@ -201,6 +205,7 @@ impl PackDispatchDto {
             dispatchable: refusal.is_none(),
             refusal,
             local_mode: cap.is_local(),
+            pinned_target: agent.pinned_target.as_ref().map(ToString::to_string),
         }
     }
 }
