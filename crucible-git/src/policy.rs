@@ -1,24 +1,25 @@
-//! What a task may do to GitHub through the HTTPS proxy, decided per decrypted request.
+//! What a caller may borrow the run's token for, decided per request.
 //!
-//! | host                      | allowed                                                         |
-//! |---------------------------|-----------------------------------------------------------------|
-//! | github.com                | git smart-HTTP: fetch a bound or public repo, push a bound one  |
-//! | raw / codeload            | GET a bound or public repo's files                               |
-//! | api.github.com            | GET a bound or public repo; a few account-free GETs             |
-//! |                           | POST pulls (spends the draft-pr count), labels, reviewers,       |
-//! |                           | PATCH pulls, on a bound repo                                     |
-//! | api.github.com /graphql   | queries of a bound or public `repository`, `viewer`, `rateLimit`, |
-//! |                           | and `node(s)` it created; `createPullRequest` on a bound repo     |
-//! |                           | (spends the count); label, reviewer and update mutations on pull  |
-//! |                           | requests it created                                              |
+//! | host                      | allowed                                                          |
+//! |---------------------------|------------------------------------------------------------------|
+//! | github.com                | git smart-HTTP: fetch a bound or public repo, push a bound one   |
+//! | raw / codeload            | GET a bound or public repo's files                                |
+//! | api.github.com            | GET a bound or public repo; a few account-free GETs              |
+//! |                           | POST pulls on a bound repo (spends the draft-pr count); labels,   |
+//! |                           | reviewers and PATCH on pull requests the run opened               |
+//! | api.github.com /graphql   | queries of a bound or public `repository`, `viewer`'s own login,  |
+//! |                           | `rateLimit`, and `node(s)` the run opened; `createPullRequest` on |
+//! |                           | a bound repo (spends the count); label, reviewer and update       |
+//! |                           | mutations on pull requests the run opened                         |
 //!
-//! Anything else is refused, including any GraphQL top-level field not listed.
+//! Anything else is refused: a path that is not canonical, any GraphQL top-level field not listed,
+//! and any selection beneath an allowed field that crosses to another owner's repositories.
 
 use crate::allow::Allow;
 use crate::github::GitHub;
 use crate::graphql::{Field, Kind};
 use axum::http::{Method, StatusCode};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 pub enum Verdict {
@@ -33,14 +34,24 @@ fn deny(why: impl Into<String>) -> Verdict {
     Verdict::Deny(StatusCode::FORBIDDEN, why.into())
 }
 
-/// What the policy learns while the run goes: which repositories are public, the node ids of the
-/// bound repositories, and the pull requests this run created through GraphQL.
+const READ: Verdict = Verdict::Allow {
+    scope: crate::SCOPE_READ,
+};
+const WRITE: Verdict = Verdict::Allow {
+    scope: crate::SCOPE_WRITE,
+};
+
+/// What the policy learns while the run goes: which repositories are public, and the node ids of
+/// the bound repositories.
 #[derive(Default)]
 pub struct State {
     public: Mutex<HashMap<String, bool>>,
     node_ids: Mutex<HashMap<String, String>>,
-    created: Mutex<HashSet<String>>,
 }
+
+/// Visibility lookups kept before the cache starts over, so a caller naming endless repositories
+/// cannot grow it without bound.
+const PUBLIC_CACHE_LIMIT: usize = 512;
 
 const ACCOUNT_FREE: [&str; 4] = ["/", "/meta", "/rate_limit", "/zen"];
 
@@ -52,9 +63,73 @@ const PR_FOLLOW_UPS: [&str; 5] = [
     "markPullRequestReadyForReview",
 ];
 
+/// What a caller may select under `viewer`: who it is, and nothing it can reach.
+const VIEWER_FIELDS: [&str; 5] = ["login", "name", "id", "databaseId", "__typename"];
+
+/// Fields that lead from an allowed object to other owners, repositories or searches. Refused
+/// anywhere beneath an allowed field.
+const CROSSING: [&str; 19] = [
+    "repository",
+    "repositories",
+    "repositoryOwner",
+    "organization",
+    "organizations",
+    "user",
+    "users",
+    "viewer",
+    "search",
+    "node",
+    "enterprise",
+    "forks",
+    "parent",
+    "templateRepository",
+    "starredRepositories",
+    "watching",
+    "pinnedItems",
+    "topRepositories",
+    "contributionsCollection",
+];
+
+/// Whether the decision reads the response: a GraphQL request, or a REST pull request create,
+/// whose result names the pull request the run now owns.
+pub fn reads_response(host: &str, method: &Method, path: &str) -> bool {
+    needs_body(host, method, path) || create_pull_target(host, method, path).is_some()
+}
+
 /// Whether the decision reads the request body: only a GraphQL document.
 pub fn needs_body(host: &str, method: &Method, path: &str) -> bool {
     host == "api.github.com" && method == Method::POST && path.split('?').next() == Some("/graphql")
+}
+
+fn create_pull_target(host: &str, method: &Method, path: &str) -> Option<String> {
+    if host != "api.github.com" || method != Method::POST {
+        return None;
+    }
+    let rest = path.split('?').next()?.strip_prefix("/repos/")?;
+    let (repo, tail) = repo_of(rest)?;
+    (tail == ["pulls"]).then_some(repo)
+}
+
+/// Whether `path` names exactly what it spells: no empty, `.` or `..` segment, no encoded
+/// separator, and nothing a URL parser would rewrite. The decision reads the path as written and
+/// the upstream request is built from it, so the two must not be able to disagree.
+fn canonical(path: &str) -> bool {
+    let bare = path.split('?').next().unwrap_or("");
+    if !bare.starts_with('/') || bare.contains('\\') {
+        return false;
+    }
+    let lowered = bare.to_ascii_lowercase();
+    if lowered.contains("%2e") || lowered.contains("%2f") || lowered.contains("%5c") {
+        return false;
+    }
+    let segments: Vec<&str> = bare[1..].split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate() {
+        if *seg == "." || *seg == ".." || (seg.is_empty() && i != last) {
+            return false;
+        }
+    }
+    url::Url::parse(&format!("https://h{path}")).is_ok_and(|u| u.path() == bare)
 }
 
 /// `owner/name` from the first two segments of `path`, the name without `.git`.
@@ -82,6 +157,9 @@ pub async fn decide(
     path: &str,
     body: Option<&[u8]>,
 ) -> Verdict {
+    if !canonical(path) {
+        return deny("the request path is not canonical");
+    }
     let read = matches!(*method, Method::GET | Method::HEAD);
     match host {
         "github.com" => {
@@ -118,9 +196,7 @@ async fn api(
     }
     let read = matches!(*method, Method::GET | Method::HEAD);
     if read && ACCOUNT_FREE.contains(&bare) {
-        return Verdict::Allow {
-            scope: crate::SCOPE_READ,
-        };
+        return READ;
     }
     let Some(rest) = bare.strip_prefix("/repos/") else {
         return deny(format!("crucible-git does not forward {method} {bare}"));
@@ -132,61 +208,59 @@ async fn api(
         return readable(state, gh, allow, &repo).await;
     }
     let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+    let follow_up = |n: &str| match n.parse::<u64>() {
+        Ok(n) if allow.opened_number(&repo, n) => None,
+        _ => Some(deny(format!(
+            "{method} {bare} may only touch pull requests this run opened"
+        ))),
+    };
     match (method.clone(), tail.as_slice()) {
         (Method::POST, ["pulls"]) => match allow.open(&repo).await {
-            Ok(()) => Verdict::Allow {
-                scope: crate::SCOPE_WRITE,
-            },
+            Ok(()) => WRITE,
             Err(e) => Verdict::Deny(e.status(), e.to_string()),
         },
-        (Method::POST | Method::DELETE, ["issues", _, "labels", ..])
-        | (Method::POST | Method::DELETE, ["pulls", _, "requested_reviewers"])
-        | (Method::PATCH, ["pulls", _]) => writable(allow, &repo).await,
+        (Method::POST | Method::DELETE, ["issues", n, "labels"])
+        | (Method::DELETE, ["issues", n, "labels", _])
+        | (Method::POST | Method::DELETE, ["pulls", n, "requested_reviewers"])
+        | (Method::PATCH, ["pulls", n]) => match follow_up(n) {
+            Some(refused) => refused,
+            None => writable(allow, &repo).await,
+        },
         _ => deny(format!("crucible-git does not forward {method} {bare}")),
     }
 }
 
 async fn writable(allow: &Allow, repo: &str) -> Verdict {
     match allow.repo(repo).await {
-        Ok(()) => Verdict::Allow {
-            scope: crate::SCOPE_WRITE,
-        },
+        Ok(()) => WRITE,
         Err(e) => Verdict::Deny(e.status(), e.to_string()),
     }
 }
 
-/// A bound repository, or a public one.
+/// A bound repository, or a public one. A repository the App cannot see and a private one are
+/// refused alike, so the answer tells a caller nothing about which.
 async fn readable(state: &State, gh: &GitHub, allow: &Allow, repo: &str) -> Verdict {
     if allow.repo(repo).await.is_ok() {
-        return Verdict::Allow {
-            scope: crate::SCOPE_READ,
-        };
+        return READ;
     }
-    let cached = state.public.lock().ok().and_then(|m| m.get(repo).copied());
+    let key = repo.to_ascii_lowercase();
+    let cached = state.public.lock().ok().and_then(|m| m.get(&key).copied());
     let public = match cached {
         Some(p) => p,
-        None => match gh.is_public(repo).await {
-            Ok(p) => {
-                if let Ok(mut m) = state.public.lock() {
-                    m.insert(repo.to_string(), p);
+        None => {
+            let p = gh.is_public(repo).await.unwrap_or(false);
+            if let Ok(mut m) = state.public.lock() {
+                if m.len() >= PUBLIC_CACHE_LIMIT {
+                    m.clear();
                 }
-                p
+                m.insert(key, p);
             }
-            Err(e) => {
-                return Verdict::Deny(
-                    StatusCode::BAD_GATEWAY,
-                    format!("could not tell whether {repo} is public: {e:#}"),
-                );
-            }
-        },
+            p
+        }
     };
     match public {
-        true => Verdict::Allow {
-            scope: crate::SCOPE_READ,
-        },
-        false => deny(format!(
-            "{repo} is private and outside this run's [outputs.draft-pr] target"
-        )),
+        true => READ,
+        false => deny(format!("{repo} is not readable by this run")),
     }
 }
 
@@ -195,6 +269,16 @@ async fn graphql(state: &State, gh: &GitHub, allow: &Allow, body: &[u8]) -> Verd
         Ok(op) => op,
         Err(e) => return deny(e.to_string()),
     };
+    if let Some(field) = op
+        .fields
+        .iter()
+        .find(|f| f.nested.iter().any(|n| CROSSING.contains(&n.as_str())))
+    {
+        return deny(format!(
+            "{} selects a field that reaches other repositories",
+            field.name
+        ));
+    }
     match op.kind {
         Kind::Subscription => deny("crucible-git does not forward GraphQL subscriptions"),
         Kind::Query => {
@@ -203,18 +287,15 @@ async fn graphql(state: &State, gh: &GitHub, allow: &Allow, body: &[u8]) -> Verd
                     return Verdict::Deny(status, why);
                 }
             }
-            Verdict::Allow {
-                scope: crate::SCOPE_READ,
-            }
+            READ
         }
         Kind::Mutation => mutation(state, gh, allow, &op.fields).await,
     }
 }
 
-/// A top-level query field: a bound or public repository, the caller itself, the rate limit, or
-/// a pull request this run created.
+/// A top-level query field: a bound or public repository, the caller's own identity, the rate
+/// limit, or a pull request this run opened.
 async fn query_field(state: &State, gh: &GitHub, allow: &Allow, field: &Field) -> Verdict {
-    let created = || state.created.lock().map(|c| c.clone()).unwrap_or_default();
     let arg = |k: &str| {
         field
             .args
@@ -223,8 +304,14 @@ async fn query_field(state: &State, gh: &GitHub, allow: &Allow, field: &Field) -
             .map(str::to_string)
     };
     match field.name.as_str() {
-        "viewer" | "rateLimit" | "__typename" => Verdict::Allow {
-            scope: crate::SCOPE_READ,
+        "rateLimit" | "__typename" => READ,
+        "viewer" => match field
+            .nested
+            .iter()
+            .all(|n| VIEWER_FIELDS.contains(&n.as_str()))
+        {
+            true => READ,
+            false => deny("viewer may only select its own login, name and ids"),
         },
         "repository" => match (arg("owner"), arg("name")) {
             (Some(owner), Some(name))
@@ -235,10 +322,8 @@ async fn query_field(state: &State, gh: &GitHub, allow: &Allow, field: &Field) -
             _ => deny("a repository query needs a literal or variable owner and name"),
         },
         "node" => match arg("id") {
-            Some(id) if created().contains(&id) => Verdict::Allow {
-                scope: crate::SCOPE_READ,
-            },
-            _ => deny("a node query may only read pull requests this run created"),
+            Some(id) if allow.opened_node(&id) => READ,
+            _ => deny("a node query may only read pull requests this run opened"),
         },
         "nodes" => {
             let ids: Vec<String> = field
@@ -251,12 +336,9 @@ async fn query_field(state: &State, gh: &GitHub, allow: &Allow, field: &Field) -
                         .collect()
                 })
                 .unwrap_or_default();
-            let created = created();
-            match !ids.is_empty() && ids.iter().all(|id| created.contains(id)) {
-                true => Verdict::Allow {
-                    scope: crate::SCOPE_READ,
-                },
-                false => deny("a nodes query may only read pull requests this run created"),
+            match !ids.is_empty() && ids.iter().all(|id| allow.opened_node(id)) {
+                true => READ,
+                false => deny("a nodes query may only read pull requests this run opened"),
             }
         }
         other => deny(format!(
@@ -294,9 +376,7 @@ async fn mutation(state: &State, gh: &GitHub, allow: &Allow, fields: &[Field]) -
                 ));
             }
             match allow.open(&target).await {
-                Ok(()) => Verdict::Allow {
-                    scope: crate::SCOPE_WRITE,
-                },
+                Ok(()) => WRITE,
                 Err(e) => Verdict::Deny(e.status(), e.to_string()),
             }
         }
@@ -306,23 +386,20 @@ async fn mutation(state: &State, gh: &GitHub, allow: &Allow, fields: &[Field]) -
                     .iter()
                     .all(|f| PR_FOLLOW_UPS.contains(&f.name.as_str())) =>
         {
-            let created = state.created.lock().map(|c| c.clone()).unwrap_or_default();
             for field in fields {
                 let input = input(field);
                 let ids: Vec<&str> = ["pullRequestId", "labelableId", "assignableId"]
                     .iter()
                     .filter_map(|k| input.get(*k).and_then(|v| v.as_str()))
                     .collect();
-                if ids.is_empty() || !ids.iter().all(|id| created.contains(*id)) {
+                if ids.is_empty() || !ids.iter().all(|id| allow.opened_node(id)) {
                     return deny(format!(
-                        "{} may only touch pull requests this run created",
+                        "{} may only touch pull requests this run opened",
                         field.name
                     ));
                 }
             }
-            Verdict::Allow {
-                scope: crate::SCOPE_WRITE,
-            }
+            WRITE
         }
         fields => deny(format!(
             "crucible-git does not forward the mutation {}",
@@ -335,16 +412,35 @@ async fn mutation(state: &State, gh: &GitHub, allow: &Allow, fields: &[Field]) -
     }
 }
 
-/// Record a pull request created through GraphQL, from the response body.
-pub fn record_created(state: &State, response: &[u8]) {
-    let id = serde_json::from_slice::<serde_json::Value>(response)
-        .ok()
-        .and_then(|v| {
-            v.pointer("/data/createPullRequest/pullRequest/id")
-                .and_then(|id| id.as_str().map(str::to_string))
-        });
-    if let (Some(id), Ok(mut created)) = (id, state.created.lock()) {
-        created.insert(id);
+/// Remember the pull request a lent request opened, from GitHub's response: a REST create on
+/// `path`, or a GraphQL `createPullRequest` on the bound repository.
+pub async fn record_created(
+    allow: &Allow,
+    host: &str,
+    method: &Method,
+    path: &str,
+    response: &[u8],
+) {
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(response) else {
+        return;
+    };
+    if let Some(repo) = create_pull_target(host, method, path) {
+        allow.record(
+            &repo,
+            doc.get("number").and_then(|n| n.as_u64()),
+            doc.get("node_id").and_then(|n| n.as_str()),
+        );
+        return;
+    }
+    let Some(pr) = doc.pointer("/data/createPullRequest/pullRequest") else {
+        return;
+    };
+    if let Ok(Some(target)) = allow.target().await {
+        allow.record(
+            &target,
+            pr.get("number").and_then(|n| n.as_u64()),
+            pr.get("id").and_then(|n| n.as_str()),
+        );
     }
 }
 

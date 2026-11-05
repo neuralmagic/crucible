@@ -27,6 +27,9 @@ use std::sync::Arc;
 /// The largest request body buffered for a decision (a GraphQL document).
 const DECIDED_BODY_LIMIT: usize = 1024 * 1024;
 
+/// The largest response buffered to learn which pull request a request opened.
+const READ_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
+
 /// Request headers never forwarded: hop-by-hop, framing reqwest redoes, and the proxy's own.
 const DROPPED_REQUEST: [HeaderName; 7] = [
     header::HOST,
@@ -182,12 +185,26 @@ impl Relay {
                 out = out.header(name, value);
             }
         }
-        if graphql {
-            let bytes = match resp.bytes().await {
-                Ok(b) => b,
-                Err(e) => return refuse(StatusCode::BAD_GATEWAY, format!("reading {host}: {e}")),
-            };
-            policy::record_created(&self.policy, &bytes);
+        if !own && policy::reads_response(host, &parts.method, &path) {
+            let mut bytes = Vec::new();
+            let mut stream = resp.bytes_stream();
+            while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+                match chunk {
+                    Ok(c) if bytes.len() + c.len() <= READ_RESPONSE_LIMIT => {
+                        bytes.extend_from_slice(&c)
+                    }
+                    Ok(_) => {
+                        return refuse(
+                            StatusCode::BAD_GATEWAY,
+                            format!("{host} answered too much"),
+                        );
+                    }
+                    Err(e) => {
+                        return refuse(StatusCode::BAD_GATEWAY, format!("reading {host}: {e}"));
+                    }
+                }
+            }
+            policy::record_created(&self.allow, host, &parts.method, &path, &bytes).await;
             return out
                 .body(Body::from(bytes))
                 .unwrap_or_else(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));

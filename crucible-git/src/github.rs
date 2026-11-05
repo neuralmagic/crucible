@@ -179,6 +179,7 @@ impl GitHub {
             )
             .await
             .context("opening the pull request")?;
+        allow.record(pr.repo, Some(created.number), created.node_id.as_deref());
         Ok(OpenedPr {
             url: created.html_url,
             number: created.number,
@@ -265,6 +266,8 @@ struct Pull {
     number: u64,
     #[serde(default)]
     draft: bool,
+    #[serde(default)]
+    node_id: Option<String>,
 }
 
 #[derive(Deserialize)]

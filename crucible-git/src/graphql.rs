@@ -14,11 +14,13 @@ pub enum Kind {
     Subscription,
 }
 
-/// One top-level field: its name (never its alias) and its arguments.
+/// One top-level field: its name (never its alias), its arguments, and the name of every field
+/// selected beneath it, through fragments too.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field {
     pub name: String,
     pub args: Map<String, Value>,
+    pub nested: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +41,8 @@ pub enum Unreadable {
     NoSuchOperation(String),
     #[error("the GraphQL operation reaches its top level through a fragment")]
     Fragment,
+    #[error("the GraphQL document spreads a fragment it does not define, or one that recurses")]
+    UnknownFragment,
 }
 
 /// The operation `body` (a GraphQL-over-HTTP JSON request) runs.
@@ -59,14 +63,19 @@ pub fn operation(body: &[u8]) -> Result<Operation, Unreadable> {
     if let Some(error) = tree.errors().next() {
         return Err(Unreadable::Syntax(error.message().to_string()));
     }
-    let operations: Vec<cst::OperationDefinition> = tree
-        .document()
-        .definitions()
-        .filter_map(|d| match d {
-            cst::Definition::OperationDefinition(op) => Some(op),
-            _ => None,
-        })
-        .collect();
+    let mut operations = Vec::new();
+    let mut fragments = std::collections::HashMap::new();
+    for definition in tree.document().definitions() {
+        match definition {
+            cst::Definition::OperationDefinition(op) => operations.push(op),
+            cst::Definition::FragmentDefinition(f) => {
+                if let Some(name) = f.fragment_name().and_then(|n| n.name()) {
+                    fragments.insert(name.text().to_string(), f);
+                }
+            }
+            _ => {}
+        }
+    }
     let chosen = match (wanted, operations.as_slice()) {
         (None, [only]) => only.clone(),
         (None, _) => return Err(Unreadable::Ambiguous),
@@ -100,12 +109,61 @@ pub fn operation(body: &[u8]) -> Result<Operation, Unreadable> {
                 args.insert(n.text().to_string(), value(&v, &variables));
             }
         }
+        let mut nested = Vec::new();
+        if let Some(set) = field.selection_set() {
+            collect(&set, &fragments, &mut Vec::new(), &mut nested)?;
+        }
         fields.push(Field {
             name: name.text().to_string(),
             args,
+            nested,
         });
     }
     Ok(Operation { kind, fields })
+}
+
+/// Every field name selected in `set`, following inline fragments and named ones; `seen` guards
+/// against a fragment that spreads itself.
+fn collect(
+    set: &cst::SelectionSet,
+    fragments: &std::collections::HashMap<String, cst::FragmentDefinition>,
+    seen: &mut Vec<String>,
+    out: &mut Vec<String>,
+) -> Result<(), Unreadable> {
+    for selection in set.selections() {
+        match selection {
+            cst::Selection::Field(f) => {
+                if let Some(name) = f.name() {
+                    out.push(name.text().to_string());
+                }
+                if let Some(inner) = f.selection_set() {
+                    collect(&inner, fragments, seen, out)?;
+                }
+            }
+            cst::Selection::InlineFragment(frag) => {
+                if let Some(inner) = frag.selection_set() {
+                    collect(&inner, fragments, seen, out)?;
+                }
+            }
+            cst::Selection::FragmentSpread(spread) => {
+                let name = spread
+                    .fragment_name()
+                    .and_then(|n| n.name())
+                    .map(|n| n.text().to_string())
+                    .ok_or(Unreadable::UnknownFragment)?;
+                if seen.contains(&name) {
+                    return Err(Unreadable::UnknownFragment);
+                }
+                let def = fragments.get(&name).ok_or(Unreadable::UnknownFragment)?;
+                seen.push(name);
+                if let Some(inner) = def.selection_set() {
+                    collect(&inner, fragments, seen, out)?;
+                }
+                seen.pop();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A literal argument as JSON, a variable as its value in the request.

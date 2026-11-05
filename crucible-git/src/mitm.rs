@@ -67,8 +67,13 @@ impl Mitm {
         let mut bundle = SYSTEM_ROOTS
             .iter()
             .find_map(|p| std::fs::read_to_string(p).ok())
-            .unwrap_or_default();
-        if !bundle.ends_with('\n') && !bundle.is_empty() {
+            .with_context(|| {
+                format!(
+                    "no system roots at any of {}; tasks would trust the run CA alone",
+                    SYSTEM_ROOTS.join(", ")
+                )
+            })?;
+        if !bundle.ends_with('\n') {
             bundle.push('\n');
         }
         bundle.push_str(&ca);

@@ -1021,6 +1021,11 @@ pub(crate) async fn dispatch_run(
                 .create_secret(&cluster, &namespace, object)
                 .await
                 .context("creating the run Secret")?;
+            if let Some(token) = &delivery.git_token {
+                crate::secrets::refresh::record(db.pool(), &pod_name, &cluster, &namespace, token)
+                    .await
+                    .context("recording the run's GitHub token for refresh")?;
+            }
         }
         if let Some(mut cm) = cm {
             stamp_run_configmap(&mut cm, &created_pod, issue_key);

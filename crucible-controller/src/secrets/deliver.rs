@@ -57,13 +57,6 @@ pub struct GitToken {
     pub secret_id: String,
 }
 
-/// The label on a run Secret that carries a minted GitHub App token.
-pub const GIT_TOKEN_LABEL: &str = "crucible.io/git-token";
-/// The annotation naming that token's Secret key.
-pub const GIT_TOKEN_KEY_ANNOTATION: &str = "crucible.io/git-token-key";
-/// The annotation naming the registry secret the token is minted from.
-pub const GIT_TOKEN_SECRET_ANNOTATION: &str = "crucible.io/git-token-secret";
-
 /// One run's secret delivery: the object to create, and how the pod refers to it.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Delivery {
@@ -381,16 +374,6 @@ pub fn secret_object(
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             owner_references: pod_owner_reference(pod).map(|r| vec![r]),
-            labels: delivery
-                .git_token
-                .as_ref()
-                .map(|_| BTreeMap::from([(GIT_TOKEN_LABEL.to_string(), "true".to_string())])),
-            annotations: delivery.git_token.as_ref().map(|t| {
-                BTreeMap::from([
-                    (GIT_TOKEN_KEY_ANNOTATION.to_string(), t.key.clone()),
-                    (GIT_TOKEN_SECRET_ANNOTATION.to_string(), t.secret_id.clone()),
-                ])
-            }),
             ..Default::default()
         },
         string_data: Some(delivery.data.clone()),

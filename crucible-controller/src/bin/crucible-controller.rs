@@ -893,7 +893,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             tokio::spawn(crucible_controller::secrets::refresh::watch_loop(
                 db.clone(),
                 clusters.clone(),
-                cfg.pod_namespace.clone(),
                 provider,
             ));
         }
