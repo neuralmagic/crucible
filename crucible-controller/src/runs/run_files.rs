@@ -144,6 +144,62 @@ pub fn read_bundle(tar_gz: &[u8], key: &str) -> Result<Option<Vec<u8>>> {
     Ok(None)
 }
 
+/// Every file one capture directory holds, each with its bytes when it is no bigger than
+/// `inline_cap`: out of the stored bundle when the run has one, off the scratch disk otherwise.
+/// `dir` is the directory as the engine named it, so a fan-out instance's key arrives escaped.
+pub async fn dir_files(
+    bundle: Option<&[u8]>,
+    scratch_root: &Path,
+    run_id: &str,
+    dir: &str,
+    inline_cap: u64,
+) -> Result<Vec<(RunFile, Option<Vec<u8>>)>> {
+    let Some(tar_gz) = bundle else {
+        let mut files = Vec::new();
+        for file in list_local(scratch_root, run_id).await {
+            if split_dir(&file.key).map(|(d, _)| d) != Some(dir) {
+                continue;
+            }
+            let body = if file.size_bytes <= inline_cap {
+                read_local(scratch_root, run_id, &file.key).await
+            } else {
+                None
+            };
+            files.push((file, body));
+        }
+        return Ok(files);
+    };
+    let mut archive = tar::Archive::new(flate2::read::MultiGzDecoder::new(tar_gz));
+    let mut files = Vec::new();
+    for e in archive.entries().context("reading the run-files tar")? {
+        let mut e = e.context("reading a run-files tar entry")?;
+        if !e.header().entry_type().is_file() {
+            continue;
+        }
+        let path = e.path().context("decoding a run-files tar entry path")?;
+        let Some(key) = path.to_str().map(str::to_owned) else {
+            continue;
+        };
+        if split_dir(&key).map(|(d, _)| d) != Some(dir) {
+            continue;
+        }
+        let Some(file) = entry(&key, e.header().size().unwrap_or(0)) else {
+            continue;
+        };
+        let body = if file.size_bytes <= inline_cap {
+            let mut buf = Vec::new();
+            e.read_to_end(&mut buf)
+                .with_context(|| format!("reading {key} out of the run-files tar"))?;
+            Some(buf)
+        } else {
+            None
+        };
+        files.push((file, body));
+    }
+    files.sort_by(|a, b| a.0.key.cmp(&b.0.key));
+    Ok(files)
+}
+
 /// The files a local run captured, walked off the scratch disk. Empty for a run that captured
 /// nothing, and for a pod run, whose files only ever existed on the pod.
 pub async fn list_local(scratch_root: &Path, run_id: &str) -> Vec<RunFile> {
@@ -429,6 +485,76 @@ mod tests {
         assert_eq!(
             read_local(scratch.path(), "run-1", "roundup/../../../etc/passwd").await,
             None
+        );
+    }
+
+    /// One directory out of a pod run's bundle: its nested declared paths, nothing from a sibling
+    /// task or a fan-out instance of the same name, and no bytes for a file over the inline cap.
+    #[tokio::test]
+    async fn a_bundles_directory_holds_only_that_directorys_files() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let gz = bundle(&[
+            ("collect/evidence/probe.json", b"{}"),
+            ("collect/HEALTH.json", b"0123456789"),
+            ("collector/OTHER.md", b"x"),
+            ("collect[a]/REPORT.md", b"y"),
+            ("assemble/REPORT.md", b"z"),
+        ]);
+        let files = dir_files(Some(&gz), scratch.path(), "run-1", "collect", 4)
+            .await
+            .expect("read");
+        let seen: Vec<(&str, u64, Option<&[u8]>)> = files
+            .iter()
+            .map(|(f, body)| (f.path.as_str(), f.size_bytes, body.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("HEALTH.json", 10, None),
+                ("evidence/probe.json", 2, Some(&b"{}"[..])),
+            ]
+        );
+
+        let instance = dir_files(Some(&gz), scratch.path(), "run-1", "collect[a]", 1024)
+            .await
+            .expect("read");
+        assert_eq!(instance.len(), 1);
+        assert_eq!(instance[0].0.instance.as_deref(), Some("a"));
+        assert_eq!(instance[0].1.as_deref(), Some(&b"y"[..]));
+    }
+
+    /// A stored bundle is the run's files, whatever this machine also happens to hold.
+    #[tokio::test]
+    async fn a_stored_bundle_wins_over_the_scratch_disk() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let root = crate::runs::task_evidence::files_root(scratch.path(), "run-1");
+        tokio::fs::create_dir_all(root.join("collect"))
+            .await
+            .expect("mkdir");
+        tokio::fs::write(root.join("collect/STALE.md"), b"local")
+            .await
+            .expect("write");
+        let gz = bundle(&[("collect/HEALTH.json", b"{}")]);
+
+        let stored = dir_files(Some(&gz), scratch.path(), "run-1", "collect", 1024)
+            .await
+            .expect("read");
+        assert_eq!(
+            stored
+                .iter()
+                .map(|(f, _)| f.key.as_str())
+                .collect::<Vec<_>>(),
+            ["collect/HEALTH.json"]
+        );
+        let local = dir_files(None, scratch.path(), "run-1", "collect", 1024)
+            .await
+            .expect("read");
+        assert_eq!(
+            local
+                .iter()
+                .map(|(f, _)| f.key.as_str())
+                .collect::<Vec<_>>(),
+            ["collect/STALE.md"]
         );
     }
 

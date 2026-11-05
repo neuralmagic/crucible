@@ -53,9 +53,8 @@ pub struct TaskEvidenceDto {
 }
 
 /// `GET /api/runs/{run_id}/tasks/{task}/evidence` — one task's result payload, note, timing and
-/// captured files. The files are read out of the local run's own `state/files/<task>/` and nowhere
-/// else; a pod run's files never reach this machine, so it answers with the result alone. A task
-/// the run neither planned nor reported on is a 404, and a run id or task name that could leave the
+/// captured files. The files are read out of the run's stored `run-files` bundle, or a local run's
+/// own `state/files/<task>/` when none is stored. A task the run neither planned nor reported on is a 404, and a run id or task name that could leave the
 /// run's directory is a 400. A fan-out instance is named by its raw key, `/` included, and arrives
 /// percent-encoded as one segment.
 #[utoipa::path(
@@ -97,7 +96,15 @@ pub(crate) async fn get_task_evidence(
         .as_deref()
         .and_then(|s| task_evidence::session_result(s, &task));
 
-    let files = task_evidence::captured_files(&state.scratch_dir, &run_id, &task).await;
+    let bundle = crate::runs::blob_store::get_run_bundle(
+        state.db.pool(),
+        &run_id,
+        crucible_contract::ArtifactKind::RunFiles,
+    )
+    .await?;
+    let files =
+        task_evidence::captured_files(bundle.as_deref(), &state.scratch_dir, &run_id, &task)
+            .await?;
     let summed = |pick: fn(&crate::runs::model::TaskResult) -> Option<f64>| {
         let vals: Vec<f64> = mine.iter().filter_map(|r| pick(r)).collect();
         (!vals.is_empty()).then(|| vals.iter().sum())
