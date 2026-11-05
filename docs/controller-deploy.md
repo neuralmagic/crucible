@@ -383,7 +383,13 @@ directory, so no task or sandbox can read it. `crucible-git` reaches only the re
 run's `[outputs.draft-pr]` target admits, for fetches as well as pushes, and each pull request it
 opens spends that bound's count. Sandboxes reach it at `url` with run tokens, so git there needs no
 credential: clone `http://host.openshell.internal:8853/git/<owner>/<repo>.git`. The run's command
-and evaluate tasks reach it on loopback at `$CRUCIBLE_GIT_URL`, without a token.
+and evaluate tasks use stock `gh` and `git` against `github.com`: the pod maps GitHub's hostnames
+to loopback, where `crucible-git` serves them over TLS with a CA it mints for the run, tasks trust
+that CA (`SSL_CERT_FILE` and friends) and hold a placeholder `GH_TOKEN`, and each request leaves
+with the run's App token. REST writes are limited to opening, labelling and requesting review on
+pull requests in the bound repository; GraphQL mutations to creating one there and following up on
+the ones the run created. GraphQL queries are not repository-scoped. The pod needs the safe sysctl
+`net.ipv4.ip_unprivileged_port_start` for `crucible-git` to bind 443.
 
 ```toml
 [git]

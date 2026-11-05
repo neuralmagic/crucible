@@ -41,7 +41,7 @@ pub fn router(gh: Arc<GitHub>, allow: Arc<Allow>) -> Router {
 }
 
 /// Which of the three endpoints, and whether it writes.
-fn endpoint(rest: &str, query: Option<&str>) -> Option<&'static str> {
+pub fn endpoint(rest: &str, query: Option<&str>) -> Option<&'static str> {
     let service = query
         .into_iter()
         .flat_map(|q| q.split('&'))

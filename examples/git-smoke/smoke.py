@@ -1,14 +1,12 @@
-"""git-smoke's command side: push and open a pull request through $CRUCIBLE_GIT_URL, then check
-both writers' evidence against GitHub as crucible-git sees it."""
+"""git-smoke's command side, with stock `git` and `gh` against github.com: in the run pod both
+reach GitHub through crucible-git, the same commands work anywhere `gh auth login` has run."""
 
 import argparse
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import time
-import urllib.request
 from pathlib import Path
 
 LABEL = "crucible-git-smoke"
@@ -19,73 +17,34 @@ def params() -> dict:
         return json.load(f)["params"]
 
 
-def base_url() -> str:
-    url = os.environ.get("CRUCIBLE_GIT_URL")
-    if not url:
-        sys.exit("CRUCIBLE_GIT_URL is unset: the run has no crucible-git ([git] in the deploy profile)")
-    return url
-
-
-def git(*args: str, cwd: str | None = None) -> str:
-    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
-
-
-def mcp(method: str, params: dict, rid: int) -> dict:
-    body = json.dumps({"jsonrpc": "2.0", "id": rid, "method": method, "params": params}).encode()
-    req = urllib.request.Request(
-        base_url() + "/mcp",
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
-    )
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        reply = json.load(resp)
-    if "error" in reply:
-        raise RuntimeError(f"{method}: {reply['error']}")
-    return reply["result"]
-
-
-def open_pr(repo: str, base: str, head: str, title: str, body: str, labels: list[str] | None = None) -> dict:
-    mcp(
-        "initialize",
-        {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "git-smoke", "version": "1"}},
-        1,
-    )
-    result = mcp(
-        "tools/call",
-        {"name": "open_pr", "arguments": {"repo": repo, "base": base, "head": head, "title": title, "body": body, "labels": labels or []}},
-        2,
-    )
-    if result.get("isError"):
-        raise RuntimeError(f"open_pr: {result['content']}")
-    return json.loads(result["content"][0]["text"])
-
-
-def remote(repo: str) -> str:
-    return f"{base_url()}/git/{repo}.git"
+def run(*args: str, cwd: str | None = None) -> str:
+    return subprocess.run(list(args), cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
 
 
 def push(args: argparse.Namespace) -> None:
     p = params()
     repo, base = p["repo"], p["base"]
-    run = os.environ.get("CRUCIBLE_RUN_DISPLAY_NAME", "run")
+    name = os.environ.get("CRUCIBLE_RUN_DISPLAY_NAME", "run")
     branch = f"crucible-git-smoke/{args.who}-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
     with tempfile.TemporaryDirectory() as tmp:
-        git("clone", "-q", "--depth", "1", "--branch", base, remote(repo), tmp)
-        git("checkout", "-q", "-b", branch, cwd=tmp)
-        git("-c", "user.name=crucible-git smoke", "-c", "user.email=smoke@crucible.invalid",
-            "commit", "-q", "--allow-empty", "-m", f"crucible-git smoke ({run}, {args.who})", cwd=tmp)
-        sha = git("rev-parse", "HEAD", cwd=tmp)
-        git("push", "-q", "origin", branch, cwd=tmp)
-    pr = open_pr(repo, base, branch, f"crucible-git smoke: {args.who}", f"Opened by run {run}'s {args.who} through crucible-git.")
-    out = {"branch": branch, "sha": sha, "pr": pr["url"]}
+        run("git", "clone", "-q", "--depth", "1", "--branch", base, f"https://github.com/{repo}.git", tmp)
+        run("git", "checkout", "-q", "-b", branch, cwd=tmp)
+        run("git", "-c", "user.name=crucible-git smoke", "-c", "user.email=smoke@crucible.invalid",
+            "commit", "-q", "--allow-empty", "-m", f"crucible-git smoke ({name}, {args.who})", cwd=tmp)
+        sha = run("git", "rev-parse", "HEAD", cwd=tmp)
+        run("git", "push", "-q", "origin", branch, cwd=tmp)
+    url = run("gh", "pr", "create", "--repo", repo, "--draft", "--base", base, "--head", branch,
+              "--title", f"crucible-git smoke: {args.who}",
+              "--body", f"Opened by run {name}'s {args.who} with stock gh through crucible-git.",
+              "--label", LABEL).splitlines()[-1]
+    out = {"branch": branch, "sha": sha, "pr": url}
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(out, indent=2) + "\n")
     print(json.dumps(out))
 
 
 def check(args: argparse.Namespace) -> None:
-    p = params()
-    repo, base = p["repo"], p["base"]
+    repo = params()["repo"]
     failures, prs = [], []
     for path in args.evidence:
         try:
@@ -96,12 +55,12 @@ def check(args: argparse.Namespace) -> None:
         if "error" in ev:
             failures.append(f"{path}: {ev['error']}")
             continue
-        heads = git("ls-remote", remote(repo), f"refs/heads/{ev['branch']}").split()
+        heads = run("git", "ls-remote", f"https://github.com/{repo}.git", f"refs/heads/{ev['branch']}").split()
         if not heads or heads[0] != ev["sha"]:
             failures.append(f"{path}: {ev['branch']} is {heads[:1]} on GitHub, not {ev['sha']}")
-        again = open_pr(repo, base, ev["branch"], "unused", "unused", [LABEL])
-        if not again["existing"] or again["url"] != ev["pr"] or not again["draft"] or again["labels"] != [LABEL]:
-            failures.append(f"{path}: open_pr did not find {ev['pr']} again: {again}")
+        pr = json.loads(run("gh", "pr", "view", ev["pr"], "--json", "isDraft,headRefName,url"))
+        if not pr["isDraft"] or pr["headRefName"] != ev["branch"]:
+            failures.append(f"{path}: {ev['pr']} is not a draft from {ev['branch']}: {pr}")
         prs.append(ev["pr"])
     print(json.dumps({"pass": not failures, "score": 1.0 if not failures else 0.0, "prs": prs, "failures": failures}))
 

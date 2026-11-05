@@ -141,6 +141,9 @@ impl ShellRunner {
                 }
                 if let Some(url) = &self.git_url {
                     cmd.env(crucible_contract::git::ENV_URL, url);
+                    for (name, value) in crucible_contract::git::task_env() {
+                        cmd.env(name, value);
+                    }
                 }
             }
             TaskKind::Agent {

@@ -48,6 +48,7 @@ impl GitHub {
     pub fn new(token_file: Option<PathBuf>, web: Url, api: Url) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("crucible-git/", env!("CARGO_PKG_VERSION")))
+            .dns_resolver(std::sync::Arc::new(PastHostsFile::new()?))
             .build()
             .context("building the GitHub client")?;
         Ok(Self {
@@ -188,6 +189,25 @@ impl GitHub {
         })
     }
 
+    /// Whether `repo` is public, as the App installation sees it.
+    pub async fn is_public(&self, repo: &str) -> Result<bool> {
+        Ok(!self.repo(repo).await?.private)
+    }
+
+    /// `repo`'s GraphQL node id.
+    pub async fn node_id(&self, repo: &str) -> Result<String> {
+        Ok(self.repo(repo).await?.node_id)
+    }
+
+    async fn repo(&self, repo: &str) -> Result<RepoInfo> {
+        let token = self.token().await?;
+        let url = self
+            .api
+            .join(&format!("repos/{repo}"))
+            .context("building the repository URL")?;
+        self.call(self.http.get(url), &token).await
+    }
+
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
@@ -245,4 +265,37 @@ struct Pull {
     number: u64,
     #[serde(default)]
     draft: bool,
+}
+
+#[derive(Deserialize)]
+struct RepoInfo {
+    private: bool,
+    node_id: String,
+}
+
+/// Resolves through DNS alone: the pod maps GitHub's hostnames to `crucible-git` itself in
+/// `/etc/hosts`, and its own requests must reach GitHub.
+struct PastHostsFile(hickory_resolver::TokioResolver);
+
+impl PastHostsFile {
+    fn new() -> Result<Self> {
+        let mut builder = hickory_resolver::TokioResolver::builder_tokio()
+            .context("reading the system resolver configuration")?;
+        builder.options_mut().use_hosts_file = hickory_resolver::config::ResolveHosts::Never;
+        Ok(Self(builder.build().context("building the DNS resolver")?))
+    }
+}
+
+impl reqwest::dns::Resolve for PastHostsFile {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let resolver = self.0.clone();
+        Box::pin(async move {
+            let lookup = resolver.lookup_ip(name.as_str()).await?;
+            let addrs: Vec<std::net::SocketAddr> = lookup
+                .iter()
+                .map(|ip| std::net::SocketAddr::new(ip, 0))
+                .collect();
+            Ok(Box::new(addrs.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
 }

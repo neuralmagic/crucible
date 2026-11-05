@@ -5,12 +5,15 @@
 //!
 //! ```text
 //!   sandbox ──run token──▶ --bind        ─┐  /git/<owner>/<repo>.git/…  ─▶ github.com
-//!   task    ──────────────▶ --local-bind ─┘  /mcp  open_pr              ─▶ api.github.com
+//!   task    ──────────────▶ --local-bind ─┤  /mcp  open_pr              ─▶ api.github.com
+//!   task    ──TLS (SNI)───▶ --tls-bind   ─┘  plain gh and git (HTTPS)   ─▶ GitHub
 //! ```
 
 mod allow;
 mod github;
 mod mcp;
+mod mitm;
+mod policy;
 mod proxy;
 
 use anyhow::{Context, Result};
@@ -66,6 +69,13 @@ struct ServeArgs {
     /// The run's output bounds, as the loop writes them at setup.
     #[arg(long)]
     bounds_file: PathBuf,
+    /// Where GitHub's hostnames are served over TLS to the run's tasks: the loopback address the
+    /// pod maps them to. Needs `--ca-dir`.
+    #[arg(long, requires = "ca_dir")]
+    tls_bind: Option<String>,
+    /// Where to write the run CA and the bundle tasks trust.
+    #[arg(long)]
+    ca_dir: Option<PathBuf>,
     #[arg(long, default_value = "https://github.com")]
     github_url: Url,
     #[arg(long, default_value = "https://api.github.com")]
@@ -175,7 +185,18 @@ async fn serve(args: ServeArgs) -> Result<()> {
     let run_layer = axum::middleware::from_fn_with_state(run, as_run);
     let local_app = proxy::router(gh.clone(), allow.clone())
         .layer(run_layer.clone())
-        .merge(mcp::router(gh, allow, &[], run_layer, None));
+        .merge(mcp::router(gh.clone(), allow.clone(), &[], run_layer, None));
+    let tls = match (&args.tls_bind, &args.ca_dir) {
+        (Some(bind), Some(dir)) => {
+            let mitm = mitm::Mitm::new(gh, allow).context("starting the GitHub TLS listener")?;
+            mitm.write(dir)?;
+            let listener = tokio::net::TcpListener::bind(bind)
+                .await
+                .with_context(|| format!("binding {bind}"))?;
+            Some(mitm::serve(Arc::new(mitm), listener))
+        }
+        _ => None,
+    };
 
     let sandbox_listener = tokio::net::TcpListener::bind(&args.bind)
         .await
@@ -189,9 +210,24 @@ async fn serve(args: ServeArgs) -> Result<()> {
         args.bind,
         args.local_bind
     );
+    let tls = async {
+        match tls {
+            Some(tls) => tls.await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::try_join!(
-        axum::serve(sandbox_listener, sandbox_app).into_future(),
-        axum::serve(local_listener, local_app).into_future(),
+        async {
+            axum::serve(sandbox_listener, sandbox_app)
+                .await
+                .context("serving sandboxes")
+        },
+        async {
+            axum::serve(local_listener, local_app)
+                .await
+                .context("serving tasks")
+        },
+        tls,
     )
     .map(|_| ())
     .context("serving crucible-git")

@@ -83,6 +83,16 @@ impl Allow {
         Ok(())
     }
 
+    /// The single repository the bound names, when it names one.
+    pub async fn target(&self) -> Result<Option<String>, Refused> {
+        let loaded = self.load().await?;
+        match resolve_target(&loaded.bound, None, &loaded.params) {
+            Ok(target) => Ok(target),
+            Err(BoundViolation::NoTarget { .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Spend one pull request of the bound's count on `repo`.
     pub async fn open(&self, repo: &str) -> Result<(), Refused> {
         let loaded = self.load().await?;
