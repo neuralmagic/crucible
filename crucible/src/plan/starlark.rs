@@ -5955,6 +5955,10 @@ fail("evaluating this source is a bug")
         assert_eq!(schema["properties"]["topics"]["type"], "array");
         assert_eq!(schema["properties"]["topics"]["items"]["type"], "string");
         assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["x-order"],
+            serde_json::json!(["paper_url", "verifier", "max_steps", "split", "topics"])
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

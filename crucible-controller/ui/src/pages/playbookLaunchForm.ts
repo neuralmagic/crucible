@@ -150,6 +150,10 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     return { kind: 'unrenderable', reason: 'the schema required list is not an array of names' };
   }
   const required = new Set<string>(requiredRaw ?? []);
+  const orderRaw = schema['x-order'];
+  if (orderRaw !== undefined && !(Array.isArray(orderRaw) && orderRaw.every((n) => typeof n === 'string'))) {
+    return { kind: 'unrenderable', reason: 'the schema x-order is not an array of names' };
+  }
 
   const specs: ParamFieldSpec[] = [];
   for (const [name, raw] of Object.entries(properties)) {
@@ -188,6 +192,11 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       description: description.ok ? description.value : null,
       multiline: multiline.value,
     });
+  }
+  if (orderRaw !== undefined) {
+    const rank = new Map<string, number>(orderRaw.map((name: string, index: number) => [name, index]));
+    const last = orderRaw.length;
+    specs.sort((a, b) => (rank.get(a.name) ?? last) - (rank.get(b.name) ?? last));
   }
   return { kind: 'form', specs };
 }

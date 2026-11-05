@@ -91,6 +91,24 @@ describe('parseParamsSchema', () => {
     expect(validateParam(log, 'line one\nline two')).toBeNull();
   });
 
+  it('orders fields by x-order, the declaration order a JSONB round trip loses', () => {
+    const specs = specsOf({
+      type: 'object',
+      properties: {
+        pr: { type: 'string' },
+        context: { type: 'string' },
+        target_branch: { type: 'string' },
+        target_release: { type: 'string' },
+      },
+      'x-order': ['pr', 'target_release', 'target_branch', 'context'],
+    });
+    expect(specs.map((s) => s.name)).toEqual(['pr', 'target_release', 'target_branch', 'context']);
+  });
+
+  it('refuses an x-order that is not a list of names', () => {
+    expect(parseParamsSchema({ type: 'object', properties: {}, 'x-order': 'pr' }).kind).toBe('unrenderable');
+  });
+
   it('renders an empty form for a pack that declares no params', () => {
     expect(specsOf({ type: 'object' })).toEqual([]);
   });
