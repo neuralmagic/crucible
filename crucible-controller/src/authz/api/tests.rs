@@ -958,8 +958,20 @@ async fn a_draft_is_owned_by_its_creator_or_a_team_they_act_in(pool: PgPool) {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let (status, body) = call(&app, draft("alice", "ours", Some("team:llm-d"))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
-    // bob is only a member: create on a team-owned resource needs maintainer.
-    let (status, body) = call(&app, draft("bob", "not-yet", Some("team:llm-d"))).await;
+    // A member starts drafts for the team; deleting one stays with maintainers and owners.
+    let (status, body) = call(&app, draft("bob", "bobs", Some("team:llm-d"))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = call(
+        &app,
+        as_user(
+            "DELETE",
+            "/api/playbook-drafts/bobs",
+            Some("bob"),
+            &[],
+            None,
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["rule"], "no-rule");
     let (status, body) = call(&app, draft("alice", "theirs", Some("team:other"))).await;
@@ -1247,8 +1259,8 @@ async fn draft_reads_and_writes_are_scoped_to_what_the_caller_may_read(pool: PgP
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["owner"], "team:llm-d");
 
-    // A save on a draft bob may read but not update is the structured denial; on one he may not
-    // read it is not-found. Both write an audit row under `playbook_draft:update`.
+    // A member saves the team's draft. A delete bob may read but not perform is the structured
+    // denial; a save on a draft he may not read is not-found. Each denial writes an audit row.
     let save = |user: &str, id: &str| {
         as_user(
             "POST",
@@ -1259,13 +1271,25 @@ async fn draft_reads_and_writes_are_scoped_to_what_the_caller_may_read(pool: PgP
         )
     };
     let (status, body) = call(&app, save("bob", "ours")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &app,
+        as_user(
+            "DELETE",
+            "/api/playbook-drafts/ours",
+            Some("bob"),
+            &[],
+            None,
+        ),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     assert_eq!(body["rule"], "no-rule");
     assert!(
         body["error"]
             .as_str()
             .expect("error")
-            .contains("playbook_draft:update"),
+            .contains("playbook_draft:delete"),
         "{body}"
     );
     let (status, body) = call(&app, save("bob", "mine")).await;
@@ -1285,7 +1309,7 @@ async fn draft_reads_and_writes_are_scoped_to_what_the_caller_may_read(pool: PgP
         vec![
             (
                 "user:bob".into(),
-                "playbook_draft:update".into(),
+                "playbook_draft:delete".into(),
                 "ours".into()
             ),
             (

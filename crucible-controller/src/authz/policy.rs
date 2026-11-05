@@ -409,7 +409,7 @@ mod tests {
         assert!(ids.contains(&"runs-never-approve".to_string()));
         assert!(ids.contains(&"everyone-read-public-blueprints".to_string()));
         assert!(ids.contains(&"team-member-bind-carried".to_string()));
-        assert_eq!(ids.len(), 23);
+        assert_eq!(ids.len(), 28);
     }
 
     #[test]
@@ -937,5 +937,292 @@ mod tests {
         active.swap(Engine::load(&text).expect("loads"));
         assert_ne!(active.current().digest(), before);
         assert!(active.current().policy_ids().contains(&"extra".to_string()));
+    }
+
+    /// A subject and the resource it acts on, built per resource type. A case with a `base`
+    /// lists only what it holds beyond that case, so a share or a carried secret reads as the
+    /// grant it adds.
+    struct Case {
+        name: &'static str,
+        base: Option<&'static str>,
+        subject: Subject,
+        resource: fn(ResourceType) -> Resource,
+    }
+
+    fn tagged(login: &str, tags: &[(&str, &str)]) -> Subject {
+        Subject::user(
+            login,
+            false,
+            true,
+            tags.iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        )
+    }
+
+    fn acme(rtype: ResourceType) -> Resource {
+        Resource::new(rtype, "r", Principal::Team(slug("acme")))
+    }
+
+    fn alices(rtype: ResourceType) -> Resource {
+        Resource::new(rtype, "r", Principal::User("alice".into()))
+    }
+
+    fn platforms(rtype: ResourceType) -> Resource {
+        Resource::platform(rtype, "r")
+    }
+
+    fn cases() -> Vec<Case> {
+        let shared = |name, base, share| Case {
+            name,
+            base,
+            subject: user("bob"),
+            resource: match share {
+                ShareRole::Viewer => |r| Resource {
+                    share: Some(ShareRole::Viewer),
+                    ..alices(r)
+                },
+                ShareRole::Launcher => |r| Resource {
+                    share: Some(ShareRole::Launcher),
+                    ..alices(r)
+                },
+                ShareRole::Editor => |r| Resource {
+                    share: Some(ShareRole::Editor),
+                    ..alices(r)
+                },
+            },
+        };
+        vec![
+            Case {
+                name: "team-member",
+                base: None,
+                subject: tagged("kim", &[("team:acme", "member")]),
+                resource: acme,
+            },
+            Case {
+                name: "team-maintainer",
+                base: None,
+                subject: tagged("kim", &[("team:acme", "maintainer")]),
+                resource: acme,
+            },
+            Case {
+                name: "team-owner",
+                base: None,
+                subject: tagged("kim", &[("team:acme", "owner")]),
+                resource: acme,
+            },
+            Case {
+                name: "team-firing",
+                base: None,
+                subject: Subject::team(&slug("acme"), TeamRole::Maintainer, false),
+                resource: acme,
+            },
+            Case {
+                name: "team-member-carried",
+                base: Some("team-member"),
+                subject: tagged("kim", &[("team:acme", "member")]),
+                resource: |r| Resource {
+                    origin_owner: Some(Principal::Team(slug("acme"))),
+                    ..acme(r)
+                },
+            },
+            Case {
+                name: "team-outsider",
+                base: None,
+                subject: user("zed"),
+                resource: acme,
+            },
+            Case {
+                name: "public-blueprint",
+                base: Some("team-outsider"),
+                subject: user("zed"),
+                resource: |r| Resource {
+                    public: true,
+                    ..acme(r)
+                },
+            },
+            Case {
+                name: "group-member",
+                base: None,
+                subject: tagged("kim", &[("group:/groups/acme", "owner")]),
+                resource: |r| Resource::new(r, "r", Principal::Group("/groups/acme".into())),
+            },
+            Case {
+                name: "user-owner",
+                base: None,
+                subject: user("alice"),
+                resource: alices,
+            },
+            Case {
+                name: "publisher-owner",
+                base: Some("user-owner"),
+                subject: tagged("alice", &[("team:playbook-publishers", "member")]),
+                resource: alices,
+            },
+            Case {
+                name: "other-user",
+                base: None,
+                subject: user("bob"),
+                resource: alices,
+            },
+            shared("share-viewer", Some("other-user"), ShareRole::Viewer),
+            shared("share-launcher", Some("share-viewer"), ShareRole::Launcher),
+            shared("share-editor", Some("share-launcher"), ShareRole::Editor),
+            Case {
+                name: "platform-user",
+                base: None,
+                subject: user("zed"),
+                resource: platforms,
+            },
+            Case {
+                name: "platform-operator",
+                base: Some("platform-user"),
+                subject: tagged("op", &[("team:platform-operators", "member")]),
+                resource: platforms,
+            },
+            Case {
+                name: "run-own-tree",
+                base: None,
+                subject: Subject::run("r1"),
+                resource: |r| Resource {
+                    run: Some("r1".into()),
+                    ..alices(r)
+                },
+            },
+        ]
+    }
+
+    /// Who the default policy set lets do what, one line per action. A platform, policy set, or
+    /// autoresearch resource is only ever owned by the platform administrators, so only the
+    /// platform cases are asked about it. An action no case reaches is listed as admin only,
+    /// marked unbound when no route decides it.
+    fn access_matrix(engine: &Engine) -> String {
+        let cases = cases();
+        let bound: std::collections::BTreeSet<Action> = crate::authz::bindings::bindings()
+            .map(|b| b.action)
+            .collect();
+        let mut out = String::from(
+            "# Generated from default.cedar by authz::policy::tests::the_access_matrix_is_the_pinned_one.\n\
+             # Review the diff, then accept it with CONTROLLER_UPDATE_POLICY_MATRIX=1.\n",
+        );
+        for action in Action::all() {
+            let platform_only = matches!(
+                action.resource,
+                ResourceType::Platform | ResourceType::PolicySet | ResourceType::Autoresearch
+            );
+            let allowed = |case: &Case| {
+                let resource = (case.resource)(action.resource);
+                (!platform_only || resource.owner == Principal::platform())
+                    && engine
+                        .authorize(&case.subject, action, &resource, 0)
+                        .allowed
+            };
+            let holders: Vec<&str> = cases
+                .iter()
+                .filter(|case| allowed(case))
+                .filter(|case| {
+                    case.base.is_none_or(|base| {
+                        !cases.iter().find(|c| c.name == base).is_some_and(allowed)
+                    })
+                })
+                .map(|case| case.name)
+                .collect();
+            let line = match (holders.is_empty(), bound.contains(&action)) {
+                (false, _) => holders.join(" "),
+                (true, true) => "admin only".to_string(),
+                (true, false) => "admin only, unbound".to_string(),
+            };
+            out.push_str(&format!("{action}: {line}\n"));
+        }
+        out
+    }
+
+    /// The access matrix is pinned so a policy change shows up in review as who gained or lost
+    /// what, and a new action or route lands visibly as admin only until a rule grants it.
+    #[test]
+    fn the_access_matrix_is_the_pinned_one() {
+        let engine = Engine::load(DEFAULT_POLICY).expect("default");
+        let actual = access_matrix(&engine);
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/authz/default.matrix");
+        if std::env::var_os("CONTROLLER_UPDATE_POLICY_MATRIX").is_some() {
+            std::fs::write(&path, &actual).expect("write the matrix");
+            return;
+        }
+        let expected = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "{}: {e}; run with CONTROLLER_UPDATE_POLICY_MATRIX=1",
+                path.display()
+            )
+        });
+        assert!(
+            expected == actual,
+            "{} differs from what default.cedar grants; review the change, then run with \
+             CONTROLLER_UPDATE_POLICY_MATRIX=1 to accept it",
+            path.display()
+        );
+    }
+
+    #[test]
+    fn a_platform_admin_holds_every_action_on_every_owner() {
+        let engine = Engine::load(DEFAULT_POLICY).expect("default");
+        let admin = Subject::probe_platform_admin();
+        for action in Action::all() {
+            for build in [acme, alices, platforms] {
+                let d = engine.authorize(&admin, action, &build(action.resource), 0);
+                assert!(d.allowed, "{action}: {}", d.reason());
+            }
+        }
+    }
+
+    /// The collaboration a team needs from its members, named so the intent survives a
+    /// regenerated matrix.
+    #[test]
+    fn team_members_collaborate_on_drafts_and_one_shots_and_stop_at_ownership() {
+        let engine = Engine::load(DEFAULT_POLICY).expect("default");
+        let at = |role: &str| tagged("kim", &[("team:acme", role)]);
+        let may = |role: &str, resource: ResourceType, verb: Verb| {
+            engine
+                .authorize(&at(role), act(resource, verb), &acme(resource), 0)
+                .allowed
+        };
+        use ResourceType::{OneShot, PackImport, PlaybookDraft, Secret, StandingLaunch};
+        for verb in [Verb::Read, Verb::Create, Verb::Update, Verb::Launch] {
+            assert!(may("member", PlaybookDraft, verb), "member draft {verb:?}");
+        }
+        assert!(may("member", OneShot, Verb::Create));
+        for verb in [
+            Verb::Delete,
+            Verb::Share,
+            Verb::Transfer,
+            Verb::Approve,
+            Verb::Publish,
+        ] {
+            assert!(!may("member", PlaybookDraft, verb), "member draft {verb:?}");
+        }
+        assert!(!may("member", StandingLaunch, Verb::Create));
+        assert!(!may("member", Secret, Verb::Update));
+
+        for resource in [PlaybookDraft, StandingLaunch, OneShot, PackImport] {
+            assert!(may("maintainer", resource, Verb::Delete), "{resource:?}");
+        }
+        assert!(may("maintainer", PlaybookDraft, Verb::Approve));
+        assert!(may("maintainer", PackImport, Verb::Approve));
+        for verb in [Verb::Delete, Verb::Share, Verb::Transfer] {
+            assert!(
+                !may("maintainer", Secret, verb),
+                "maintainer secret {verb:?}"
+            );
+        }
+        assert!(!may("maintainer", PlaybookDraft, Verb::Publish));
+        assert!(!may("maintainer", PlaybookDraft, Verb::Share));
+
+        let outsider = engine.authorize(
+            &user("zed"),
+            act(PlaybookDraft, Verb::Update),
+            &acme(PlaybookDraft),
+            0,
+        );
+        assert!(!outsider.allowed, "{}", outsider.reason());
     }
 }

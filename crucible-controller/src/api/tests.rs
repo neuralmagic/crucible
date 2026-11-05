@@ -9853,9 +9853,8 @@ async fn graduation_opens_a_pr_and_the_import_retires_the_draft(pool: PgPool) ->
     Ok(())
 }
 
-/// A team holding no platform role runs its own draft: a maintainer authors it, a member launches
-/// it, only the owner graduates or deletes it, and a caller outside the team is told it does not
-/// exist.
+/// A team holding no platform role runs its own draft: members author and launch it, a maintainer
+/// graduates or deletes it, and a caller outside the team is told it does not exist.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
@@ -9895,13 +9894,9 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-    let (status, body) = send_as(&app, "POST", "/api/playbook-drafts", "kim", draft.clone()).await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "a member does not create: {body}"
-    );
-    assert_eq!(body["rule"], "no-rule");
+    let kims = serde_json::json!({"id": "kims", "description": "d", "owner": "team:mlr"});
+    let (status, body) = send_as(&app, "POST", "/api/playbook-drafts", "kim", kims).await;
+    assert_eq!(status, StatusCode::CREATED, "a member creates: {body}");
     let (status, body) = send_as(&app, "POST", "/api/playbook-drafts", "dana", draft).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
@@ -9910,11 +9905,7 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
     let save = serde_json::json!({"files": files});
     let versions = "/api/playbook-drafts/studio/versions";
     let (status, body) = send_as(&app, "POST", versions, "kim", save.clone()).await;
-    assert_eq!(
-        status,
-        StatusCode::FORBIDDEN,
-        "a member does not save: {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "a member saves: {body}");
     let (status, body) = send_as(&app, "POST", versions, "mallory", save.clone()).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     let (status, body) = send_as(&app, "POST", versions, "dana", save).await;
@@ -9922,10 +9913,13 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
 
     // The controls a page enables come from the same decision the writes are held to.
     for (user, expected) in [
-        ("kim", serde_json::json!(["read", "launch"])),
+        (
+            "kim",
+            serde_json::json!(["read", "create", "update", "launch"]),
+        ),
         (
             "dana",
-            serde_json::json!(["read", "create", "update", "launch"]),
+            serde_json::json!(["read", "create", "update", "delete", "launch", "approve"]),
         ),
         (
             "reed",
@@ -9971,7 +9965,7 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
     let target = serde_json::json!({"repo": "owner/packs", "path": "packs/studio"});
     let (refusals, log) = with_forge_stubs(dir.path(), || async {
         let mut refusals = Vec::new();
-        for user in ["kim", "dana", "mallory"] {
+        for user in ["kim", "mallory"] {
             refusals.push((
                 user,
                 send_as(&app, "POST", graduate_uri, user, target.clone()).await,
@@ -9999,29 +9993,27 @@ async fn a_team_with_no_platform_role_authors_and_launches_its_draft(pool: PgPoo
     }
     assert!(log.is_empty(), "a refused graduation pushes nothing: {log}");
     let ((status, body), log) = with_forge_stubs(dir.path(), || {
-        send_as(&app, "POST", graduate_uri, "reed", target.clone())
+        send_as(&app, "POST", graduate_uri, "dana", target.clone())
     })
     .await;
-    assert_eq!(status, StatusCode::OK, "the owner graduates: {body}");
+    assert_eq!(status, StatusCode::OK, "a maintainer graduates: {body}");
     assert_eq!(body["pr_url"], "https://github.com/owner/packs/pull/7");
     assert!(log.contains("crucible-pack/draft_studio"), "{log}");
 
     let uri = "/api/playbook-drafts/studio";
-    for user in ["kim", "dana"] {
-        let (status, body) = send_as(&app, "DELETE", uri, user, serde_json::Value::Null).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{user}: {body}");
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("playbook_draft:delete"),
-            "{body}"
-        );
-    }
+    let (status, body) = send_as(&app, "DELETE", uri, "kim", serde_json::Value::Null).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("playbook_draft:delete"),
+        "{body}"
+    );
     let (status, body) = send_as(&app, "DELETE", uri, "mallory", serde_json::Value::Null).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    let (status, body) = send_as(&app, "DELETE", uri, "reed", serde_json::Value::Null).await;
-    assert!(status.is_success(), "the owner deletes: {status} {body}");
+    let (status, body) = send_as(&app, "DELETE", uri, "dana", serde_json::Value::Null).await;
+    assert!(status.is_success(), "a maintainer deletes: {status} {body}");
     Ok(())
 }
 
