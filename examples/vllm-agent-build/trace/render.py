@@ -1,5 +1,5 @@
-"""Render each build the agent reported as traces/<name>.html, from the ninja log and ccache stats
-log it fetched out of the build, and traces/index.html comparing them."""
+"""Render each build the agent reported as traces/<name>.html, from the ninja log, ccache stats log
+and Dockerfile step times it fetched out of the build, and traces/index.html comparing them."""
 
 import html
 import json
@@ -16,15 +16,17 @@ rows = []
 for b in report["builds"]:
     name = b["name"]
     facts = {k: b[k] for k in ("build_id", "status", "seconds") if k in b}
+    steps = inputs / "traces" / f"{name}.steps.log"
     trace = buildtrace.logs_trace(
         inputs / "traces" / f"{name}.ninja_log",
         inputs / "traces" / f"{name}.ccache-stats.log",
         facts,
+        steps if steps.exists() else None,
     )
     (out / f"{name}.html").write_text(buildtrace.html(trace, f"vLLM build: {name}"))
     ninja = trace["otherData"]["ninja"]
     rows.append((name, b.get("seconds"), ninja["ninja_s"], ninja["jobs"]))
-    print(f"traces/{name}.html: {ninja}")
+    print(f"traces/{name}.html: {ninja}", file=sys.stderr)
 
 def cell(text: object) -> str:
     return f"<td>{html.escape(str(text))}</td>"
@@ -51,4 +53,14 @@ body = "".join(
     "<tr><th>Build</th><th>Build call</th><th>ninja</th><th>Jobs by result</th></tr>"
     f"{body}</table><p style='color:var(--flow-muted)'>Each build's trace is"
     " traces/&lt;build&gt;.html in the run's captured files.</p></body></html>"
+)
+print(
+    json.dumps(
+        {
+            "builds": [
+                {"name": name, "seconds": seconds, "ninja_s": ninja_s, "jobs": jobs}
+                for name, seconds, ninja_s, jobs in rows
+            ]
+        }
+    )
 )

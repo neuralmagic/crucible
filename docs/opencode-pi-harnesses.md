@@ -16,8 +16,10 @@ model = "qwen-3-8-27b"
 
 ## Auth and the endpoint
 
-Both harnesses authenticate with an API key from the environment of the loop. The engine
-relays the key into the sandbox. The environment selects the API of the turn:
+Both harnesses authenticate with an API key from the environment of the loop. The key never
+enters the sandbox: the sandbox gets an OpenShell placeholder under the key's variable, and
+the egress proxy swaps in the key on traffic to the turn's endpoint alone. The environment
+selects the API of the turn:
 
 | Environment | Endpoint |
 | --- | --- |
@@ -30,7 +32,9 @@ With a controller, these values come from the agent binding of the run in
 ([ADR-0065](./adr/ADR-0065.md)).
 The engine sets the variables in the sandbox from the endpoint, protocol, and key of the
 binding. A custom provider with the `chat_completions` protocol becomes `OPENAI_BASE_URL` and
-`OPENAI_API_KEY`. If a turn has neither key, the engine rejects it before the sandbox starts.
+the placeholder for `OPENAI_API_KEY`. If a turn has neither key, the engine rejects it before
+the sandbox starts. The endpoint must be in the egress allowlist and must not be in
+`tls_skip_endpoints`: the proxy can inject the key only into traffic it inspects.
 
 The seeded configuration registers the endpoint as a provider named `crucible`, with the
 model under it, so the CLI does not use its own model catalog. OpenCode gets an

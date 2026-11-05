@@ -310,6 +310,7 @@ impl Args {
             sandbox_image: self.sandbox_image.as_deref(),
             sandbox_resources: &self.sandbox_resources,
             relay: &self.relay,
+            relayed_secrets: &self.relayed_secrets,
             mcp: &self.mcp,
             mcp_scope: &self.mcp_scope,
             compute_driver: self.compute_driver,
@@ -355,6 +356,8 @@ pub(crate) struct SandboxTurn<'a> {
     pub sandbox_image: Option<&'a str>,
     pub sandbox_resources: &'a manifest::SandboxResources,
     pub relay: &'a [manifest::RelayFile],
+    /// The declared secrets `agent.env` carries, `[[secret]].name -> env var`.
+    pub relayed_secrets: &'a std::collections::BTreeMap<String, String>,
     pub mcp: &'a [crate::control::mcp::Server],
     pub mcp_scope: &'a [String],
     pub compute_driver: openshell::gateway::ComputeDriver,

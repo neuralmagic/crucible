@@ -889,6 +889,14 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         else {
             return Ok(());
         };
+        // Live runs' GitHub App tokens are re-minted by the leader alone (ADR-0051).
+        if let Some(provider) = cfg.secret_provider.clone() {
+            tokio::spawn(crucible_controller::secrets::refresh::watch_loop(
+                db.clone(),
+                clusters.clone(),
+                provider,
+            ));
+        }
 
         // Convert legacy pack bytes to stored trees before anything below reads a pack. A failure
         // leaves rows on their legacy bytes, which every reader still falls back to.

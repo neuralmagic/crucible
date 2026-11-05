@@ -199,9 +199,11 @@ fn anchor_of(token: &str) -> Option<(&str, u32, u32)> {
     Some((path, line.parse().ok()?, col.parse().ok()?))
 }
 
-/// What one save's `[agent]` earns when it is judged against where this deployment would dispatch
-/// it. Empty for a workflow that spawns no agent turn, and for a save the engine made no graph of
-/// — nothing there is launchable yet, so the compile diagnostics are the whole story.
+/// What one save's `[agent]` and `[dispatch]` earn when they are judged against where this
+/// deployment would dispatch them. Empty for a save the engine made no graph of — nothing there
+/// is launchable yet, so the compile diagnostics are the whole story. The spawn verdict applies
+/// only to a workflow that spawns an agent turn; a pin naming a cluster outside `connected`
+/// applies to every workflow, since every launch of the pack would be refused.
 ///
 /// Derived per request rather than stored with the version: the verdict is half deployment
 /// configuration, and a version row that baked it in would answer for the controller that wrote
@@ -210,30 +212,42 @@ pub fn dispatch_diagnostics(
     graph: Option<&WorkflowGraphDto>,
     agent: Option<&crate::playbooks::dispatch::PackAgent>,
     cap: &crate::playbooks::dispatch::DispatchCapability,
+    connected: &[String],
 ) -> Vec<Diagnostic> {
-    let Some(graph) = graph else {
+    let (Some(graph), Some(agent)) = (graph, agent) else {
         return Vec::new();
     };
-    if !graph
+    let dispatch = |message: String| Diagnostic {
+        file: Some("crucible.toml".to_string()),
+        line: None,
+        col: None,
+        message,
+        kind: DiagnosticKind::Dispatch,
+    };
+    let pin = agent.pinned_target.as_ref().and_then(|pinned| {
+        let pinned = pinned.as_str();
+        if cap.is_local() {
+            return Some(dispatch(format!(
+                "[dispatch] target {pinned:?} cannot be honored: this deployment runs playbooks \
+                 as a local subprocess (CONTROLLER_PLAYBOOK_EXECUTOR=local)"
+            )));
+        }
+        (!connected.iter().any(|c| c == pinned)).then(|| {
+            dispatch(format!(
+                "[dispatch] target {pinned:?} is not a cluster this controller can reach, so \
+                 every launch of this pack would be refused"
+            ))
+        })
+    });
+    let spawns_agent = graph
         .nodes
         .iter()
-        .any(|n| n.kind == crate::playbooks::plan_graph::TaskKind::Agent)
-    {
-        return Vec::new();
-    }
-    let Some(agent) = agent else {
-        return Vec::new();
-    };
-    cap.spawn_defect(agent)
-        .into_iter()
-        .map(|defect| Diagnostic {
-            file: Some("crucible.toml".to_string()),
-            line: None,
-            col: None,
-            message: defect.to_string(),
-            kind: DiagnosticKind::Dispatch,
-        })
-        .collect()
+        .any(|n| n.kind == crate::playbooks::plan_graph::TaskKind::Agent);
+    let spawn = spawns_agent
+        .then(|| cap.spawn_defect(agent))
+        .flatten()
+        .map(|defect| dispatch(defect.to_string()));
+    pin.into_iter().chain(spawn).collect()
 }
 
 /// What a draft is based on: a registered pack, or the import row whose frozen tarball seeded it.
@@ -1685,6 +1699,10 @@ mod tests {
     use crate::playbooks::drafts::*;
     use crucible_contract::content_digest;
 
+    fn hub() -> Vec<String> {
+        vec!["hub".to_string()]
+    }
+
     fn skeleton() -> BTreeMap<String, String> {
         BTreeMap::from([
             ("crucible.toml".to_string(), SKELETON_MANIFEST.to_string()),
@@ -1755,7 +1773,8 @@ mod tests {
             "a draft starts repo-less: its workspace is what [workspace].inject lists"
         );
         assert!(
-            dispatch_diagnostics(created.graph.as_ref(), created.agent.as_ref(), &pod).is_empty(),
+            dispatch_diagnostics(created.graph.as_ref(), created.agent.as_ref(), &pod, &hub())
+                .is_empty(),
             "a workflow with no agent task spawns nothing to complain about"
         );
 
@@ -1775,7 +1794,8 @@ mod tests {
         assert!(saved.diagnostics.is_empty(), "{:?}", saved.diagnostics);
         assert!(saved.schema_digest.is_some(), "the tree compiles");
 
-        let dispatch = dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &pod);
+        let dispatch =
+            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &pod, &hub());
         let [d] = dispatch.as_slice() else {
             panic!("expected one dispatch diagnostic, got {dispatch:?}");
         };
@@ -1783,7 +1803,8 @@ mod tests {
         assert_eq!(d.file.as_deref(), Some("crucible.toml"));
         assert!(d.message.contains("sandbox_image"), "{}", d.message);
         assert!(
-            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &local).is_empty(),
+            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &local, &hub())
+                .is_empty(),
             "local mode spawns the agent on this machine, where the default backend is the point"
         );
 
@@ -1800,8 +1821,108 @@ mod tests {
             .expect("save");
         assert!(saved.diagnostics.is_empty(), "{:?}", saved.diagnostics);
         assert!(
-            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &pod).is_empty(),
+            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &pod, &hub())
+                .is_empty(),
             "the declared substrate is dispatchable"
+        );
+    }
+
+    /// A pin is checked against what this controller reaches, on a workflow that spawns no agent
+    /// turn too: a command-only pack pinned to a cluster nobody mounted would be refused at every
+    /// launch, so the save says so on the manifest, and pinning a connected cluster clears it.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_save_pinned_to_an_unreachable_cluster_reports_it_on_the_manifest(pool: PgPool) {
+        let pod = crate::playbooks::dispatch::DispatchCapability::new(
+            crate::config::PlaybookExecutor::Pod,
+            true,
+        );
+        let local = crate::playbooks::dispatch::DispatchCapability::new(
+            crate::config::PlaybookExecutor::Local,
+            false,
+        );
+        let connected = vec!["hub".to_string(), "cluster-a".to_string()];
+        create(
+            &pool,
+            "pinned",
+            "a pinned pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("the skeleton compiles");
+
+        let mut files = skeleton();
+        files.insert(
+            "crucible.toml".to_string(),
+            format!("{SKELETON_MANIFEST}\n[dispatch]\ntarget = \"cluster-z\"\n"),
+        );
+        let saved = save_version(&pool, "pinned", files.clone(), None, None)
+            .await
+            .expect("save");
+        assert!(saved.diagnostics.is_empty(), "{:?}", saved.diagnostics);
+        assert_eq!(
+            saved
+                .agent
+                .as_ref()
+                .and_then(|a| a.pinned_target.as_ref())
+                .map(|p| p.as_str()),
+            Some("cluster-z"),
+            "the pin is read off the saved manifest"
+        );
+        let dispatch =
+            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &pod, &connected);
+        let [d] = dispatch.as_slice() else {
+            panic!("expected one dispatch diagnostic, got {dispatch:?}");
+        };
+        assert_eq!(d.kind, DiagnosticKind::Dispatch);
+        assert_eq!(d.file.as_deref(), Some("crucible.toml"));
+        assert!(
+            d.message.contains("[dispatch] target \"cluster-z\""),
+            "{}",
+            d.message
+        );
+        assert!(
+            d.message
+                .contains("not a cluster this controller can reach"),
+            "{}",
+            d.message
+        );
+
+        let local_mode =
+            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &local, &hub());
+        let [d] = local_mode.as_slice() else {
+            panic!("local mode cannot honor any pin, got {local_mode:?}");
+        };
+        assert!(
+            d.message.contains("CONTROLLER_PLAYBOOK_EXECUTOR=local"),
+            "{}",
+            d.message
+        );
+
+        files.insert(
+            "crucible.toml".to_string(),
+            format!("{SKELETON_MANIFEST}\n[dispatch]\ntarget = \"cluster-a\"\n"),
+        );
+        let saved = save_version(&pool, "pinned", files, None, None)
+            .await
+            .expect("save");
+        assert!(
+            dispatch_diagnostics(saved.graph.as_ref(), saved.agent.as_ref(), &pod, &connected)
+                .is_empty(),
+            "a pin naming a connected cluster is dispatchable"
+        );
+        let stored = preview(&pool, "pinned", None)
+            .await
+            .expect("preview")
+            .expect("head version");
+        assert_eq!(
+            stored
+                .agent
+                .and_then(|a| a.pinned_target)
+                .map(|p| p.to_string()),
+            Some("cluster-a".to_string()),
+            "the pin survives the agent_requirements round trip"
         );
     }
 
@@ -1814,7 +1935,7 @@ mod tests {
             true,
         );
         let agent = crate::playbooks::dispatch::PackAgent::new("local", None);
-        assert!(dispatch_diagnostics(None, Some(&agent), &pod).is_empty());
+        assert!(dispatch_diagnostics(None, Some(&agent), &pod, &hub()).is_empty());
     }
 
     #[test]

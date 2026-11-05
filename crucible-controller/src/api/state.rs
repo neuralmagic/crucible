@@ -530,9 +530,10 @@ impl From<crate::runs::dispatch_target::TargetRefusal> for ApiError {
         let message = refusal.to_string();
         match refusal {
             TargetRefusal::Unknown { .. } => ApiError::NotFound(message),
-            TargetRefusal::Incompatible { .. } | TargetRefusal::NoneEligible { .. } => {
-                ApiError::Unprocessable(message)
-            }
+            TargetRefusal::Incompatible { .. }
+            | TargetRefusal::NoneEligible { .. }
+            | TargetRefusal::Pinned { .. }
+            | TargetRefusal::PinnedUnknown { .. } => ApiError::Unprocessable(message),
             TargetRefusal::NotAuthorized { .. } | TargetRefusal::Anonymous => {
                 ApiError::Forbidden(message)
             }

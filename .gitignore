@@ -4,6 +4,7 @@ target/
 /workspace/
 /state/
 *.log
+!examples/*/trace/testdata/**/*.log
 # Example domains: the engine creates a workspace + state under each example's manifest dir.
 examples/*/workspace/
 e2e/*/pack/workspace/
