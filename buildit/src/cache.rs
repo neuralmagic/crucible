@@ -26,6 +26,8 @@ const READ_CHUNK: usize = 256 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
 const PRUNE_EVERY: Duration = Duration::from_secs(60);
 const STALE_UPLOAD: Duration = Duration::from_secs(3600);
+/// How much of a refused upload the server reads before it answers.
+const DRAIN_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Args, Debug, Clone)]
 pub struct CacheArgs {
@@ -217,6 +219,7 @@ async fn write_blob(
         return StatusCode::BAD_REQUEST.into_response();
     };
     if !store.may_write(&headers) {
+        drain(body, DRAIN_LIMIT).await;
         return unauthorized();
     }
     let declared = headers
@@ -297,6 +300,18 @@ async fn place(upload: &Path, dest: &Path) -> std::io::Result<()> {
 fn mark_used(path: &Path) {
     if let Ok(f) = std::fs::File::options().append(true).open(path) {
         let _ = f.set_modified(SystemTime::now());
+    }
+}
+
+/// Reads and drops up to `limit` bytes of `body`.
+async fn drain(body: Body, limit: u64) {
+    let mut stream = body.into_data_stream();
+    let mut total = 0u64;
+    while let Some(Ok(chunk)) = stream.next().await {
+        total += chunk.len() as u64;
+        if total > limit {
+            break;
+        }
     }
 }
 
@@ -383,6 +398,33 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, router(Arc::new(store))).await });
         format!("http://{addr}")
+    }
+
+    /// A refused upload is read before the refusal, so a client still sending its body reads the
+    /// 401 instead of a reset connection.
+    #[tokio::test]
+    async fn a_refused_upload_is_read_before_the_401() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let dir = tempfile::tempdir().unwrap();
+        let url = serve(store(dir.path(), 1 << 30, 1 << 30)).await;
+        let addr = url.trim_start_matches("http://");
+        let chunk = vec![7u8; 64 * 1024];
+        let chunks = 15;
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "PUT /store/k.tar HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer nope\r\n\
+             Content-Length: {}\r\n\r\n",
+            chunk.len() * chunks
+        );
+        conn.write_all(head.as_bytes()).await.unwrap();
+        for _ in 0..chunks {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            conn.write_all(&chunk).await.unwrap();
+        }
+        let mut reply = [0u8; 64];
+        let n = conn.read(&mut reply).await.unwrap();
+        let reply = String::from_utf8_lossy(&reply[..n]);
+        assert!(reply.starts_with("HTTP/1.1 401"), "{reply}");
     }
 
     fn basic(user: &str, password: &str) -> String {
