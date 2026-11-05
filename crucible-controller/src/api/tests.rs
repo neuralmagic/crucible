@@ -10767,7 +10767,7 @@ async fn task_evidence_serves_a_pod_runs_files_from_its_stored_bundle(pool: PgPo
     assert!(before["files"].as_array().expect("files").is_empty());
 
     crate::runs::blob_store::put_run_bundle(
-        &pool,
+        &crate::runs::blob_store::BlobStore::new(pool.clone()),
         "run-pod",
         crucible_contract::ArtifactKind::RunFiles,
         run_files_bundle(&[

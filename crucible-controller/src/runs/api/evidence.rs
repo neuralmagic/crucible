@@ -97,7 +97,7 @@ pub(crate) async fn get_task_evidence(
         .and_then(|s| task_evidence::session_result(s, &task));
 
     let bundle = crate::runs::blob_store::get_run_bundle(
-        state.db.pool(),
+        state.db.blobs(),
         &run_id,
         crucible_contract::ArtifactKind::RunFiles,
     )
