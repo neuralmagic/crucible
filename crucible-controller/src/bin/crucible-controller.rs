@@ -652,6 +652,14 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     let dispatcher = std::sync::Arc::new(crucible_controller::KubePodDispatcher::new(
         clusters.clone(),
     ));
+    if let Some(provider) = cfg.secret_provider.clone() {
+        tokio::spawn(crucible_controller::secrets::refresh::watch_loop(
+            db.clone(),
+            clusters.clone(),
+            cfg.pod_namespace.clone(),
+            provider,
+        ));
+    }
     cfg.runtime.dispatcher = dispatcher.clone();
     // The contract check only refuses launches, never serving, so it runs in the background: an
     // unreachable registry must not hold the API listener shut past the liveness probe's patience.

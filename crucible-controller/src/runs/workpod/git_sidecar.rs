@@ -154,7 +154,7 @@ pub fn add(
             ..Default::default()
         });
     }
-    if let Some(key) = &delivery.git_token {
+    if let Some(token) = &delivery.git_token {
         args.extend([
             "--token-file".to_string(),
             format!("{}/{}", git::TOKEN_DIR, git::TOKEN_FILE_NAME),
@@ -164,7 +164,7 @@ pub fn add(
             secret: Some(core::SecretVolumeSource {
                 secret_name: Some(secret.to_string()),
                 items: Some(vec![core::KeyToPath {
-                    key: key.clone(),
+                    key: token.key.clone(),
                     path: git::TOKEN_FILE_NAME.to_string(),
                     mode: None,
                 }]),

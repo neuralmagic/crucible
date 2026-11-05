@@ -49,6 +49,21 @@ pub enum DeliverError {
     TwoAppTokenFiles { first: String, second: String },
 }
 
+/// Where the run's GitHub App token sits in its Secret, and the registry row it is minted from,
+/// so the refresh can re-mint it in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitToken {
+    pub key: String,
+    pub secret_id: String,
+}
+
+/// The label on a run Secret that carries a minted GitHub App token.
+pub const GIT_TOKEN_LABEL: &str = "crucible.io/git-token";
+/// The annotation naming that token's Secret key.
+pub const GIT_TOKEN_KEY_ANNOTATION: &str = "crucible.io/git-token-key";
+/// The annotation naming the registry secret the token is minted from.
+pub const GIT_TOKEN_SECRET_ANNOTATION: &str = "crucible.io/git-token-secret";
+
 /// One run's secret delivery: the object to create, and how the pod refers to it.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Delivery {
@@ -65,9 +80,9 @@ pub struct Delivery {
     /// sandbox, so naming what may cross rather than what may not leaves a forgotten list
     /// withholding every secret instead of leaking each one.
     pub agent_visible: Vec<String>,
-    /// The Secret key of the run's minted GitHub App token bound as a file. It is mounted into the
-    /// `crucible-git` container alone, never the loop's, so no task can read it.
-    pub git_token: Option<String>,
+    /// The run's minted GitHub App token bound as a file. It is mounted into the `crucible-git`
+    /// container alone, never the loop's, so no task can read it.
+    pub git_token: Option<GitToken>,
 }
 
 impl Delivery {
@@ -119,8 +134,8 @@ impl Delivery {
         }
         if let (Some(first), Some(second)) = (&self.git_token, &other.git_token) {
             return Err(DeliverError::TwoAppTokenFiles {
-                first: first.clone(),
-                second: second.clone(),
+                first: first.key.clone(),
+                second: second.key.clone(),
             });
         }
         if other.git_token.is_some() {
@@ -185,10 +200,15 @@ pub fn assemble(
                 );
                 match (app_token, &delivery.git_token) {
                     (false, _) => delivery.files.push((projection.to_string(), name.clone())),
-                    (true, None) => delivery.git_token = Some(name.clone()),
+                    (true, None) => {
+                        delivery.git_token = Some(GitToken {
+                            key: name.clone(),
+                            secret_id: row.id.clone(),
+                        })
+                    }
                     (true, Some(first)) => {
                         return Err(DeliverError::TwoAppTokenFiles {
-                            first: first.clone(),
+                            first: first.key.clone(),
                             second: name,
                         });
                     }
@@ -361,6 +381,16 @@ pub fn secret_object(
             name: Some(name.to_string()),
             namespace: Some(namespace.to_string()),
             owner_references: pod_owner_reference(pod).map(|r| vec![r]),
+            labels: delivery
+                .git_token
+                .as_ref()
+                .map(|_| BTreeMap::from([(GIT_TOKEN_LABEL.to_string(), "true".to_string())])),
+            annotations: delivery.git_token.as_ref().map(|t| {
+                BTreeMap::from([
+                    (GIT_TOKEN_KEY_ANNOTATION.to_string(), t.key.clone()),
+                    (GIT_TOKEN_SECRET_ANNOTATION.to_string(), t.secret_id.clone()),
+                ])
+            }),
             ..Default::default()
         },
         string_data: Some(delivery.data.clone()),
