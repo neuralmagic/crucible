@@ -78,6 +78,12 @@ and carries the informer's facts:
 `before_base_s` and `after_compile_s` subtract builder-pod timestamps from loop-pod ones; with a
 cached base step, `before_base_s` and `copy_s` are null.
 
+`informer.py build --trace FILE` also writes the build as a Chrome trace: its phases, each job
+ninja ran, what ccache did with each compile, and when `setup.py` printed each line. `python3
+bench/buildtrace.py html --trace FILE -o trace.html` renders it as one page; `--ninja-log` and
+`--ccache-stats` render a build the informer did not run. `informer.py build --no-shared` ignores
+the shared cache.
+
 ## Params
 
 | param | default |

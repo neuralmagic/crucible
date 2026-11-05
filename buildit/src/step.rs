@@ -15,6 +15,9 @@
 //! <log>.published  JSON `Published`, the broker-side outcome of the fetch
 //! ```
 //!
+//! A build also stamps each `STEP` and `COMMIT` line of its log, and its end, into a steps file:
+//! `<unix ns> <line>`, then `<unix ns> END <exit record>` once the runner has exited.
+//!
 //! A build also copies its exit record to the termination log and mirrors its log to the
 //! container's stdout, so both outlive the pod's deadline.
 #![allow(clippy::disallowed_macros)]
@@ -53,14 +56,19 @@ stage() {
 term=
 case $mode in
 build)
-  secs=$1; term=$2; shift 2
+  secs=$1; term=$2; steps=$3; shift 3
+  {
+    tail -n +1 -f -s 0.1 --pid=$$ "$log" 2> /dev/null | grep --line-buffered -E '^(STEP |COMMIT )' \
+      | while IFS= read -r l; do printf '%s %s\n' "$(date +%s%N)" "$l"; done
+    printf '%s END %s\n' "$(date +%s%N)" "$(head -n 1 "$log.exit" 2> /dev/null)"
+  } >> "$steps" &
   stage "$secs" "$@"; c=$?
   ;;
 run)
   fs=$1; rs=$2; ctr=$3; img=$4; fetch=$5; shift 5
   stage "$fs" buildah from --pull-never --name "$ctr" "$img"; c=$?
   if [ "$c" -eq 0 ]; then
-    stage "$rs" buildah run "$ctr" -- "$@"; c=$?
+    stage "$rs" buildah run "$@"; c=$?
     if [ -s "$log.paths" ] && [ ! -e "$log.exit" ]; then
       buildah unshare sh -c "$fetch" sh "$ctr" "$log.paths" > "$log.tar.part" 2> "$log.fetch-err" \
         && mv "$log.tar.part" "$log.tar"
@@ -269,21 +277,25 @@ fn sh(script: &str, args: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-pub fn build_args(limit: Duration, cmd: &[String]) -> Vec<String> {
+/// `steps` is the file the build stamps its steps into.
+pub fn build_args(limit: Duration, steps: &str, cmd: &[String]) -> Vec<String> {
     let mut args = vec![
         "build".to_string(),
         limit.as_secs().to_string(),
         TERMINATION_LOG.to_string(),
+        steps.to_string(),
     ];
     args.extend_from_slice(cmd);
     args
 }
 
+/// Each of `volumes` is a `buildah run --volume` spec, mounted into the run's container.
 pub fn run_args(
     from_limit: Duration,
     run_limit: Duration,
     ctr: &str,
     image: &str,
+    volumes: &[String],
     cmd: &[String],
 ) -> Vec<String> {
     let mut args = vec![
@@ -294,6 +306,10 @@ pub fn run_args(
         image.to_string(),
         FETCH.to_string(),
     ];
+    for volume in volumes {
+        args.extend(["--volume".to_string(), volume.clone()]);
+    }
+    args.extend([ctr.to_string(), "--".to_string()]);
     args.extend_from_slice(cmd);
     args
 }
@@ -591,9 +607,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn launch(log: &std::path::Path, secs: &str, cmd: &[&str]) {
         use std::path::Path;
-        let (mirror, term) = (ext(log, "mirror"), ext(log, "term"));
+        let (mirror, term, steps) = (ext(log, "mirror"), ext(log, "term"), ext(log, "steps"));
         let mut args = vec![Path::new(crate::step::RUNNER), log, &mirror];
-        args.extend([Path::new("build"), Path::new(secs), &term]);
+        args.extend([Path::new("build"), Path::new(secs), &term, &steps]);
         args.extend(cmd.iter().map(Path::new));
         let started = std::time::Instant::now();
         let out = sh_script(crate::step::LAUNCH, &args);
@@ -665,6 +681,36 @@ mod tests {
                 timed_out: true
             }
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_build_stamps_its_steps_and_its_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("logs/build.log");
+        let script = "echo 'STEP 1/2: FROM base'; echo noise; sleep 1; \
+                      echo 'STEP 2/2: RUN make'; echo 'COMMIT img'; exit 4";
+        launch(&log, "30", &["sh", "-c", script]);
+        let steps = ext(&log, "steps");
+        wait_for("the stamped steps", || read(&steps).lines().count() == 4);
+        let stamped: Vec<(u128, String)> = read(&steps)
+            .lines()
+            .map(|line| {
+                let (at, text) = line.split_once(' ').unwrap();
+                (at.parse().unwrap(), text.to_string())
+            })
+            .collect();
+        let texts: Vec<&str> = stamped.iter().map(|(_, t)| t.as_str()).collect();
+        assert!(texts.contains(&"STEP 1/2: FROM base"), "{texts:?}");
+        assert!(texts.contains(&"STEP 2/2: RUN make"), "{texts:?}");
+        assert!(texts.contains(&"COMMIT img"), "{texts:?}");
+        assert!(texts.contains(&"END 4"), "{texts:?}");
+        let at = |text: &str| stamped.iter().find(|(_, t)| t == text).unwrap().0;
+        assert!(
+            at("STEP 2/2: RUN make") - at("STEP 1/2: FROM base") >= 900_000_000,
+            "{stamped:?}"
+        );
+        assert!(at("END 4") >= at("STEP 2/2: RUN make"), "{stamped:?}");
     }
 
     #[cfg(target_os = "linux")]

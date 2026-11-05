@@ -49,6 +49,8 @@ import {
   useDataTable,
 } from '../ui';
 import { CodeSurface } from '../editor/CodeSurface';
+import { AnsiText } from '../logs/AnsiText';
+import { LogView } from '../logs/LogView';
 import type { SpecItem, StatusTone } from '../ui';
 import {
   decisionTone,
@@ -76,6 +78,7 @@ import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView
 import {
   downloadName,
   imageMimeType,
+  inlineKind,
   listedFiles,
   parseRunFilePath,
   prettyJson,
@@ -1217,7 +1220,8 @@ const FILE_PANES = ['list', 'content'];
 
 /// The files the run's tasks declared and captured — a playbook's reports and findings land here,
 /// not in the artifact store. Master-detail: pick a file on the left, read it on the right —
-/// markdown renders, json and text show as code, an image renders inline, anything else downloads.
+/// markdown renders, json and text show as code, a log reads in the log viewer, an image renders
+/// inline, anything else downloads.
 /// The selected file is the URL, so the address bar is always a link someone else can open.
 
 function CopyLinkButton({ route, className }: { route: RunFileRoute; className?: string }) {
@@ -1494,7 +1498,49 @@ function RunFileContent({
   if (mediaType !== null) {
     return <RunFileImage runId={runId} fileKey={fileKey} mediaType={mediaType} />;
   }
+  if (inlineKind(path) === 'html') {
+    return <RunFileHtml runId={runId} fileKey={fileKey} />;
+  }
   return <RunFileText runId={runId} fileKey={fileKey} kind={textKind(path)} />;
+}
+
+/// A captured html page, rendered like flow.html: srcDoc in a sandboxed iframe, so its scripts
+/// run at an opaque origin with no reach into the controller's cookies or API, and with the same
+/// theme bridge, so a page that styles itself with the --flow-* tokens follows the app's theme.
+function RunFileHtml({ runId, fileKey }: { runId: string; fileKey: string }) {
+  const theme = useAppTheme();
+  const brand = useAppBrand();
+  const query = useQuery({
+    queryKey: ['run-file', runId, fileKey],
+    queryFn: () => fetchRunFile(runId, fileKey),
+  });
+  if (query.isPending) {
+    return (
+      <div className="px-2 py-1.5">
+        <Spinner label="Loading file" />
+      </div>
+    );
+  }
+  if (query.isError) {
+    return (
+      <div className="px-2 py-1.5">
+        <Mono tone="ink-3">{formatError(query.error)}</Mono>
+      </div>
+    );
+  }
+  const tokens = getComputedStyle(document.documentElement);
+  return (
+    <iframe
+      key={`${brand}-${theme}`}
+      className="min-h-0 w-full flex-1 border-0 bg-surface"
+      title={fileKey}
+      sandbox="allow-scripts"
+      srcDoc={injectFlowTheme(
+        query.data ?? '',
+        flowThemeStyle(theme, (token) => tokens.getPropertyValue(token)),
+      )}
+    />
+  );
 }
 
 function RunFileText({
@@ -1539,6 +1585,9 @@ function RunFileText({
       </div>
     );
   }
+  if (kind === 'log') {
+    return <LogView text={query.data ?? ''} testId="run-file-log" />;
+  }
   return (
     <div className="min-h-0 flex-1">
       <CodeSurface
@@ -1579,7 +1628,17 @@ function ArtifactInline({ runId, path, kind }: { runId: string; path: string; ki
   }
   return (
     <pre className="m-0 max-h-120 overflow-auto bg-surface px-4.5 py-3 font-mono text-data whitespace-pre-wrap text-ink">
-      {query.data ? (kind === 'json' ? prettyJson(query.data) : query.data) : ''}
+      {kind === 'log' ? (
+        <AnsiText text={query.data ?? ''} />
+      ) : query.data ? (
+        kind === 'json' ? (
+          prettyJson(query.data)
+        ) : (
+          query.data
+        )
+      ) : (
+        ''
+      )}
     </pre>
   );
 }
