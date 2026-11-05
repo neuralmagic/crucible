@@ -7,7 +7,7 @@ You hold no GitHub credential and need none: the sandbox reaches the run's cruci
 2. Create the branch `crucible-git-smoke/agent-<UTC timestamp, digits only>` from it, add one
    empty commit (`git commit --allow-empty -m "crucible-git smoke"`), and push it to `origin`.
 3. Call the `git` MCP server's `open_pr` tool with that repo, the base branch, your branch as
-   `head`, a short title, and a body naming this run.
+   `head`, a short title, and a body naming this run. Leave `draft` unset: it must be a draft.
 4. Write `evidence/agent.json`:
    `{"branch": "<branch>", "sha": "<pushed commit sha>", "pr": "<url open_pr returned>"}`.
 
