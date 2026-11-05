@@ -490,6 +490,13 @@ pub(crate) fn prep_plan_runner_with_params(
     let state = state_dir(manifest_path);
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
     let p = crate::args::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
+    // Before the workspace clone: crucible-git reads the draft-pr bound to authorize it.
+    let frozen = frozen_projection(
+        &m,
+        m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
+        &manifest::launch::split(params).0,
+        &p.session_log,
+    )?;
     let launched_ref = m.launch.repo_ref();
     if workspace.exists() {
         if let Some(r) = launched_ref
@@ -537,12 +544,6 @@ pub(crate) fn prep_plan_runner_with_params(
         &p,
         &m.agent.toolbox_exclude,
         harness.spec().skills_dir,
-    )?;
-    let frozen = frozen_projection(
-        &m,
-        m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
-        &manifest::launch::split(params).0,
-        &p.session_log,
     )?;
     apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
     start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(&p, e))?;
