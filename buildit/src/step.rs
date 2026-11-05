@@ -704,6 +704,8 @@ mod tests {
         let (mirror, term, steps) = (ext(log, "mirror"), ext(log, "term"), ext(log, "steps"));
         let mut args = vec![Path::new(crate::step::RUNNER), log, &mirror];
         args.extend([Path::new("build"), Path::new(secs), &term, &steps]);
+        args.extend(["", "", ""].map(Path::new));
+        args.extend([crate::step::RESTORE, crate::step::SAVE].map(Path::new));
         args.extend(cmd.iter().map(Path::new));
         let started = std::time::Instant::now();
         let out = sh_script(crate::step::LAUNCH, &args);
