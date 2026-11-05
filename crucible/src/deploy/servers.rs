@@ -191,8 +191,7 @@ impl DeployProfile {
                 let cache = b.cache.as_ref().filter(|c| c.clusters.contains(cluster))?;
                 Some(SharedCache {
                     url: BuilditCacheCfg::url(&self.cluster.loop_namespace),
-                    write: cache.write,
-                    agent_writes: cache.write && cache.agent_writes,
+                    writers: cache.writers,
                 })
             };
             servers.push(ServerSpec {

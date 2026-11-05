@@ -28,10 +28,10 @@ storage_driver = "overlay"
 that allows overlay mounts in a user namespace (5.13 and later). Launch on a cluster the cache
 serves: a run elsewhere builds without it.
 
-The run's own builds, the ones `seed` starts on the run's socket, may write the shared cache.
-Agents' builds only read it unless `agent_writes = true`. So the seed fills the cache from a known
-ref and a known Dockerfile, every agent's `checkout` build is served from it, and an agent's `edit`
-compiles its one changed object and stores nothing.
+With `writers = "run"`, the default, only the run's own builds write the shared cache: the ones
+`seed` starts on the run's socket. Agents' builds only read it. So the seed fills the cache from a
+known ref and a known Dockerfile, every agent's `checkout` build is served from it, and an agent's
+`edit` compiles its one changed object and stores nothing.
 
 ## The pack
 

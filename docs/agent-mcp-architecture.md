@@ -1772,21 +1772,22 @@ recently read blobs past its limit.
 
 The cache serves the dispatch clusters in `[buildit.cache] clusters`, each one of `[buildit]
 clusters`, and is deployed on each. The controller puts it in the buildit site of a run on one of
-them (`BuilditSite.cache`): the Service URL and, with `write`, the token file
-`/etc/buildit-cache/token`. Runs on other clusters are told nothing of it. With `write`, every loop
-pod mounts the token Secret there, as an optional volume so a cluster without the Secret still
-starts its runs. The loop passes the site to buildit as `--cache-url` and `--cache-token-file`, and
-`--cache-agent-writes` with `agent_writes`. buildit writes `/buildit/cache.json` into each build
-before `bud`: `{"url": ...}`, with `"token"` when the build may write. The run's own builds, on its
-socket ([8.6](#86-the-runs-own-socket)), may; a sandbox's builds may only with `agent_writes`, and
-otherwise read only. A build with `ccache: true` gets the same choice in its `/etc/ccache.conf`,
-which is how `examples/vllm-agent-build` seeds the cache from a command task before its agents
-fan out. A build uses the cache only if its `RUN` steps read that file, as the vLLM bench's
-informer does for ccache and its build store.
+them (`BuilditSite.cache`): the Service URL and `writers`. Runs on other clusters are told nothing
+of it. Unless `writers` is `none`, every loop pod mounts the token Secret at
+`/etc/buildit-cache/token`, as an optional volume so a cluster without the Secret still starts its
+runs, and the loop passes buildit `--cache-token-file` and `--cache-writers` with the URL.
 
-Warning: with `agent_writes`, `RUN` steps of agents' builds can read the token, so any run's agent
-on the cluster can store objects that other runs' builds then use. Set it only where runs trust
-each other.
+buildit writes `/buildit/cache.json` into each build before `bud`: `{"url": ...}`, with `"token"`
+when the build may write. With `writers = "run"` only the run's own builds, on its socket
+([8.6](#86-the-runs-own-socket)), may; with `"all"`, sandboxes' builds may too. A build with
+`ccache: true` gets the same choice in its `/etc/ccache.conf`, which is how
+`examples/vllm-agent-build` seeds the cache from a command task before its agents fan out. A build
+uses the cache only if its `RUN` steps read that file, as the vLLM bench's informer does for ccache
+and its build store.
+
+Warning: with `writers = "all"`, `RUN` steps of agents' builds can read the token, so any run's
+agent on the cluster can store objects that other runs' builds then use. Set it only where runs
+trust each other.
 
 ## 9. Configuration reference and feature flags
 
@@ -1922,8 +1923,7 @@ tokens, the controller does not read them.
 | `[buildit] quota` | `{ pods = "16", "requests.nvidia.com/gpu" = "0", "requests.amd.com/gpu" = "0" }` | The builder namespace's ResourceQuota `hard` limits. |
 | `[buildit.cache] clusters` | the hub | The dispatch clusters the shared cache is deployed on and serves, each one of `[buildit] clusters`. |
 | `[buildit.cache] token_secret` | required with `[buildit.cache]` | The loop-namespace Secret whose `token` key is the shared cache's write token ([8.7](#87-the-shared-cache)). |
-| `[buildit.cache] write` | `true` | The builds a run's own tasks start get the token and may write to the shared cache. `false`: every build reads only. |
-| `[buildit.cache] agent_writes` | `false` | With `write`, agents' builds get the token too. |
+| `[buildit.cache] writers` | `"run"` | The builds that may write to the shared cache: `"none"`, `"run"` (those a run's own command and evaluate tasks start) or `"all"` (agents' builds too). |
 | `[buildit.cache] size_gib` | `200` | The cache's claim size; it keeps 90% of it before dropping the least recently read blobs. |
 | `[buildit.cache] storage_class`, `image` | the cluster's, `[buildit] image` or else the loop image | The claim's StorageClass and the image `buildit cache` runs from. |
 | `[buildit] image` | the loop image's `buildit` | An image holding `/usr/local/bin/buildit` that loop pods run instead ([8.1](#81-where-it-runs)). |

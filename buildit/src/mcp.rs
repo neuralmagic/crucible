@@ -217,16 +217,16 @@ pub struct McpArgs {
     /// Registry authfile `push` uses, read on each push and piped to the builder pod for it alone
     #[arg(long, env = "MCP_PUSH_AUTHFILE", requires = "push_repo")]
     pub push_authfile: Option<PathBuf>,
-    /// A `buildit cache` every build may use, named to it in /buildit/cache.json
+    /// A `buildit cache` every build reads, named to it in /buildit/cache.json
     #[arg(long, env = "MCP_CACHE_URL")]
     pub cache_url: Option<url::Url>,
-    /// The cache's write token, read for each build; with it, the run's own builds on its socket
-    /// may write to the cache
+    /// The cache's write token, read again for each build that may write. Without it no build
+    /// writes
     #[arg(long, env = "MCP_CACHE_TOKEN_FILE", requires = "cache_url")]
     pub cache_token_file: Option<PathBuf>,
-    /// Give sandboxes' builds the token too, so an agent's build may write to the cache
-    #[arg(long, env = "MCP_CACHE_AGENT_WRITES", requires = "cache_token_file")]
-    pub cache_agent_writes: bool,
+    /// The builds that get the write token
+    #[arg(long, env = "MCP_CACHE_WRITERS", value_enum, default_value_t = CacheWriters::Run)]
+    pub cache_writers: CacheWriters,
     /// Also serve the tools on this unix socket, without tokens, to one caller: the run itself.
     /// Its builds are apart from every sandbox's, under the same policy and limits
     #[arg(long, env = "MCP_SOCKET", requires = "socket_workdir")]
@@ -353,7 +353,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         shared_cache: args.cache_url.map(|url| SharedCache {
             url,
             token_file: args.cache_token_file,
-            agent_writes: args.cache_agent_writes,
+            writers: args.cache_writers,
         }),
         run_caller: socket.as_ref().map(|(_, caller)| caller.sandbox.clone()),
     });
@@ -719,33 +719,46 @@ pub struct Broker {
     run_caller: Option<SandboxName>,
 }
 
-/// The `buildit cache` builds are told about, and the token that lets them write to it.
+/// The builds that get the shared cache's write token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum CacheWriters {
+    /// The builds the run starts on its socket.
+    Run,
+    /// The run's builds and every sandbox's.
+    All,
+}
+
+/// Who started a build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Starter {
+    /// The run, on its socket.
+    Run,
+    Sandbox,
+}
+
+/// The `buildit cache` builds are told about, and the token that lets some of them write to it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedCache {
     url: url::Url,
     token_file: Option<PathBuf>,
-    /// Whether sandboxes' builds get the token as well as the run's own.
-    agent_writes: bool,
+    writers: CacheWriters,
 }
 
 impl SharedCache {
-    /// /buildit/cache.json: the cache's URL, and the write token when the build gets one
-    /// ([`Self::token_for`]). A build without a token reads only.
-    fn document(&self, run: bool) -> Vec<u8> {
+    /// /buildit/cache.json: the cache's URL, and the write token if the build may write.
+    fn document(&self, starter: Starter) -> Vec<u8> {
         let mut doc = serde_json::json!({ "url": self.url.as_str() });
-        if let Some(t) = self.token_for(run) {
+        if let Some(t) = self.token_for(starter) {
             doc["token"] = serde_json::Value::String(t);
         }
         doc.to_string().into_bytes()
     }
 
-    /// The token a build may write with: a readable token, given to the run's own builds, and to
-    /// sandboxes' builds only with `agent_writes`.
-    fn token_for(&self, run: bool) -> Option<String> {
-        if run || self.agent_writes {
-            self.token()
-        } else {
-            None
+    /// The write token for a build `starter` started, if it may write.
+    fn token_for(&self, starter: Starter) -> Option<String> {
+        match (self.writers, starter) {
+            (CacheWriters::All, _) | (CacheWriters::Run, Starter::Run) => self.token(),
+            (CacheWriters::Run, Starter::Sandbox) => None,
         }
     }
 
@@ -765,12 +778,12 @@ impl SharedCache {
             })
     }
 
-    /// ccache's remote storage URL for the cache: the build's write token as the basic-auth
-    /// password, or read-only without one.
-    fn ccache_storage(&self, run: bool) -> String {
+    /// ccache's remote storage URL for the cache: the write token as the basic-auth password, or
+    /// read-only for a build that may not write.
+    fn ccache_storage(&self, starter: Starter) -> String {
         let mut url = self.url.clone();
         url.set_path(&format!("{}/ccache", self.url.path().trim_end_matches('/')));
-        match self.token_for(run) {
+        match self.token_for(starter) {
             Some(token) => {
                 let _ = url.set_username(CCACHE_USER);
                 let _ = url.set_password(Some(&token));
@@ -790,14 +803,13 @@ fn read_only_volumes(specs: &str) -> Vec<String> {
         .collect()
 }
 
-/// The /etc/ccache.conf of a build that asks for ccache; `run` is whether the run itself started
-/// it.
-fn ccache_conf(cache: Option<&SharedCache>, run: bool) -> String {
+/// The /etc/ccache.conf of a build that asks for ccache.
+fn ccache_conf(cache: Option<&SharedCache>, starter: Starter) -> String {
     let mut conf = format!("stats_log = {FACTS_MOUNT}/{CCACHE_STATS}\n");
     if let Some(cache) = cache {
         conf.push_str(&format!(
             "secondary_storage = {}\n",
-            cache.ccache_storage(run)
+            cache.ccache_storage(starter)
         ));
     }
     conf
@@ -1722,16 +1734,20 @@ impl Broker {
             let file = format!("{}/{CACHES_FILE}", StepLog::dir(&id.0));
             let write = argv(["sh", "-c", r#"cat > "$1""#, "sh", &file]);
             pod.exec_with_stdin(&write, specs.as_bytes()).await?;
-            let run = self.run_caller.as_ref() == Some(&caller.sandbox);
+            let starter = if self.run_caller.as_ref() == Some(&caller.sandbox) {
+                Starter::Run
+            } else {
+                Starter::Sandbox
+            };
             if let Some(cache) = &self.shared_cache {
                 let file = format!("{}/{CACHE_FILE}", id.facts_dir());
                 let write = argv(["sh", "-c", r#"umask 077 && cat > "$1""#, "sh", &file]);
-                pod.exec_with_stdin(&write, &cache.document(run)).await?;
+                pod.exec_with_stdin(&write, &cache.document(starter)).await?;
             }
             if p.ccache {
                 let file = format!("{}/{CCACHE_CONF}", id.facts_dir());
                 let write = argv(["sh", "-c", r#"umask 022 && cat > "$1""#, "sh", &file]);
-                let conf = ccache_conf(self.shared_cache.as_ref(), run);
+                let conf = ccache_conf(self.shared_cache.as_ref(), starter);
                 pod.exec_with_stdin(&write, conf.as_bytes()).await?;
             }
             let limit = build_limit(requested, self.deadline_secs, used)?;
@@ -2499,12 +2515,12 @@ mod tests {
 
     use crate::mcp::{
         ANNOTATION_LAYOUT, BUSY_SCRIPT, Broker, BuildId, BuildParams, BuilditMcp, BuilditRules,
-        CacheSpec, Caller, KUEUE_GATE, LABEL_QUEUE, LAYOUT_SHARED, Launcher, LogsParams, MCP_PATH,
-        PodView, PushParams, PushTarget, REUSE_SLACK, ResourceServer, ResourceServerConfig,
-        Response, SCOPE_BUILD, SCOPE_READ, SharedCache, StatusCode, TokenLine, ToolPolicy,
-        TrustedIssuer, alive, annotated_digest, annotation, argv, bind_socket, bud_argv,
-        build_limit, cache_volumes, ccache_conf, held, hosts, parse_tokens, push_argv,
-        read_only_volumes, reusable, router, run_sandbox, socket_router, unpack,
+        CacheSpec, CacheWriters, Caller, KUEUE_GATE, LABEL_QUEUE, LAYOUT_SHARED, Launcher,
+        LogsParams, MCP_PATH, PodView, PushParams, PushTarget, REUSE_SLACK, ResourceServer,
+        ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, SharedCache, Starter, StatusCode,
+        TokenLine, ToolPolicy, TrustedIssuer, alive, annotated_digest, annotation, argv,
+        bind_socket, bud_argv, build_limit, cache_volumes, ccache_conf, held, hosts, parse_tokens,
+        push_argv, read_only_volumes, reusable, router, run_sandbox, socket_router, unpack,
     };
     use crate::pod::BuilderPod;
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
@@ -4192,44 +4208,45 @@ mod tests {
     fn a_build_is_told_the_cache_url_and_the_token_only_when_it_may_write() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token");
-        let cache = |token_file: Option<&Path>, agent_writes| SharedCache {
+        let cache = |token_file: Option<&Path>, writers| SharedCache {
             url: url::Url::parse("http://buildit-cache.crucible-system.svc:8850").unwrap(),
             token_file: token_file.map(Path::to_path_buf),
-            agent_writes,
+            writers,
         };
-        let doc = |c: &SharedCache, run| -> serde_json::Value {
-            serde_json::from_slice(&c.document(run)).unwrap()
+        let doc = |c: &SharedCache, starter| -> serde_json::Value {
+            serde_json::from_slice(&c.document(starter)).unwrap()
         };
         let url = "http://buildit-cache.crucible-system.svc:8850/";
         std::fs::write(&token, "  tok-1\n").unwrap();
-        let tasks_write = cache(Some(&token), false);
+        let run_writes = cache(Some(&token), CacheWriters::Run);
         assert_eq!(
-            doc(&tasks_write, true),
-            serde_json::json!({ "url": url, "token": "tok-1" }),
-            "the run's own build writes"
+            doc(&run_writes, Starter::Run),
+            serde_json::json!({ "url": url, "token": "tok-1" })
         );
         assert_eq!(
-            doc(&tasks_write, false),
-            serde_json::json!({ "url": url }),
-            "a sandbox's build reads only"
+            doc(&run_writes, Starter::Sandbox),
+            serde_json::json!({ "url": url })
         );
-        assert_eq!(
-            doc(&cache(Some(&token), true), false)["token"],
-            "tok-1",
-            "unless agents may write"
-        );
+        let all_write = cache(Some(&token), CacheWriters::All);
+        assert_eq!(doc(&all_write, Starter::Sandbox)["token"], "tok-1");
         std::fs::write(&token, "tok-2").unwrap();
         assert_eq!(
-            doc(&tasks_write, true)["token"],
+            doc(&run_writes, Starter::Run)["token"],
             "tok-2",
             "re-read per build"
         );
         std::fs::write(&token, "\n").unwrap();
-        assert_eq!(doc(&tasks_write, true), serde_json::json!({ "url": url }));
-        std::fs::remove_file(&token).unwrap();
-        assert_eq!(doc(&tasks_write, true), serde_json::json!({ "url": url }));
         assert_eq!(
-            doc(&cache(None, true), true),
+            doc(&run_writes, Starter::Run),
+            serde_json::json!({ "url": url })
+        );
+        std::fs::remove_file(&token).unwrap();
+        assert_eq!(
+            doc(&run_writes, Starter::Run),
+            serde_json::json!({ "url": url })
+        );
+        assert_eq!(
+            doc(&cache(None, CacheWriters::All), Starter::Run),
             serde_json::json!({ "url": url })
         );
     }
@@ -4238,45 +4255,40 @@ mod tests {
     fn a_build_that_asks_for_ccache_gets_a_conf_for_the_cache_it_may_use() {
         let dir = tempfile::tempdir().unwrap();
         let token = dir.path().join("token");
-        let cache = |url: &str, token_file: Option<&Path>, agent_writes| SharedCache {
+        let cache = |url: &str, token_file: Option<&Path>, writers| SharedCache {
             url: url::Url::parse(url).unwrap(),
             token_file: token_file.map(Path::to_path_buf),
-            agent_writes,
+            writers,
         };
         let stats = "stats_log = /buildit/ccache-stats.log\n";
-        assert_eq!(
-            ccache_conf(None, true),
-            stats,
-            "no cache: only the per-object log"
-        );
+        assert_eq!(ccache_conf(None, Starter::Run), stats);
 
-        let read_only = cache("http://cache.example.svc:8850/", None, true);
+        let read_only = cache("http://cache.example.svc:8850/", None, CacheWriters::All);
         assert_eq!(
-            ccache_conf(Some(&read_only), true),
+            ccache_conf(Some(&read_only), Starter::Run),
             format!("{stats}secondary_storage = http://cache.example.svc:8850/ccache|read-only\n")
         );
 
         std::fs::write(&token, "  t0k/en+1\n").unwrap();
-        let writable = cache("http://cache.example.svc:8850/shared/", Some(&token), false);
+        let shared = "http://cache.example.svc:8850/shared/";
+        let run_writes = cache(shared, Some(&token), CacheWriters::Run);
         assert_eq!(
-            writable.ccache_storage(true),
+            run_writes.ccache_storage(Starter::Run),
             "http://buildit:t0k%2Fen+1@cache.example.svc:8850/shared/ccache",
             "the token is the basic-auth password, escaped"
         );
         assert_eq!(
-            writable.ccache_storage(false),
-            "http://cache.example.svc:8850/shared/ccache|read-only",
-            "a sandbox's build reads only"
+            run_writes.ccache_storage(Starter::Sandbox),
+            "http://cache.example.svc:8850/shared/ccache|read-only"
         );
-        let agents_write = cache("http://cache.example.svc:8850/shared/", Some(&token), true);
+        let all_write = cache(shared, Some(&token), CacheWriters::All);
         assert_eq!(
-            agents_write.ccache_storage(false),
-            "http://buildit:t0k%2Fen+1@cache.example.svc:8850/shared/ccache",
-            "a sandbox's build writes when agents may"
+            all_write.ccache_storage(Starter::Sandbox),
+            "http://buildit:t0k%2Fen+1@cache.example.svc:8850/shared/ccache"
         );
         std::fs::write(&token, "\n").unwrap();
         assert_eq!(
-            writable.ccache_storage(true),
+            run_writes.ccache_storage(Starter::Run),
             "http://cache.example.svc:8850/shared/ccache|read-only",
             "an empty token reads only"
         );
@@ -4630,7 +4642,7 @@ mod tests {
             shared_cache: Some(SharedCache {
                 url: url::Url::parse("http://cache.example:8850").unwrap(),
                 token_file: Some(cache_token.clone()),
-                agent_writes: false,
+                writers: CacheWriters::Run,
             }),
             ..Arc::into_inner(broker_with(client, &file, Some(&work), 900, true)).unwrap()
         };
@@ -4870,7 +4882,7 @@ mod tests {
             shared_cache: Some(SharedCache {
                 url: url::Url::parse(&cache_url).unwrap(),
                 token_file: Some(cache_token.clone()),
-                agent_writes: false,
+                writers: CacheWriters::Run,
             }),
             run_caller: Some(run_caller.clone()),
             ..Arc::into_inner(broker_with(client, &file, Some(&work), 900, true)).unwrap()
@@ -5100,7 +5112,7 @@ mod tests {
             shared_cache: Some(SharedCache {
                 url: url::Url::parse(&cache_url).unwrap(),
                 token_file: Some(cache_token.clone()),
-                agent_writes: true,
+                writers: CacheWriters::All,
             }),
             ..Arc::into_inner(broker_with(client, &file, Some(&work), 900, true)).unwrap()
         };

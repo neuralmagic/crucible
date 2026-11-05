@@ -9,7 +9,7 @@
 
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
-use crucible_contract::agent_servers::BuilderPods;
+use crucible_contract::agent_servers::{BuilderPods, CacheWriters};
 use forge::fleet::{ClusterEntry, ClusterIdentity, FleetFile};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -424,7 +424,7 @@ pub struct BuilditCfg {
     pub image: Option<String>,
 }
 
-/// `[buildit.cache]`: where the shared cache runs, its storage, and whether builds may write to it.
+/// `[buildit.cache]`: where the shared cache runs, its storage, and which builds may write to it.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuilditCacheCfg {
@@ -437,17 +437,13 @@ pub struct BuilditCacheCfg {
     )]
     pub clusters: Vec<String>,
     /// The Secret in the loop namespace whose `token` key is the cache's write token, a URL-safe
-    /// string. The cache and, with `write`, every loop pod mount it.
+    /// string. The cache mounts it, and so does every loop pod unless `writers` is `none`.
     pub token_secret: KubeName,
-    /// Whether the builds a run's own tasks start get the write token, so a pack can seed the
-    /// cache. Without it every build reads only. Default true.
-    #[serde(default = "yes")]
-    pub write: bool,
-    /// Whether agents' builds get the write token too. A build's `RUN` steps can read it, so an
-    /// agent could store objects other runs' builds then use: set it only on a cluster whose runs
-    /// trust each other. Default false: agents' builds read only.
+    /// The builds that may write to the cache: `none`, `run` or `all`. Default `run`. `all`
+    /// includes agents' builds, whose `RUN` steps can read the token, so an agent could store
+    /// objects other runs' builds use; set it only where runs trust each other.
     #[serde(default)]
-    pub agent_writes: bool,
+    pub writers: CacheWriters,
     /// The cache's PersistentVolumeClaim size in GiB; it keeps 90% of it before it drops the
     /// least recently used blobs. Default 200.
     #[serde(default = "default_cache_gib")]
@@ -475,10 +471,6 @@ impl BuilditCacheCfg {
     pub fn keep_gib(&self) -> u64 {
         self.size_gib.saturating_mul(9) / 10
     }
-}
-
-fn yes() -> bool {
-    true
 }
 
 fn default_cache_gib() -> u64 {
