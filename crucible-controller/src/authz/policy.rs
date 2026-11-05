@@ -1125,7 +1125,7 @@ mod tests {
                         !cases
                             .iter()
                             .find(|c| c.name == base)
-                            .is_some_and(|c| allowed(c))
+                            .is_some_and(allowed)
                     })
                 })
                 .map(|case| case.name)
