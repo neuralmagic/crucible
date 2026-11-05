@@ -34,6 +34,10 @@ pub const ANTHROPIC_API_KEY: &str = "ANTHROPIC_API_KEY";
 pub const ANTHROPIC_BASE_URL: &str = "ANTHROPIC_BASE_URL";
 /// The base URL an OpenAI-speaking service is reached at, in place of `api.openai.com`.
 pub const OPENAI_BASE_URL: &str = "OPENAI_BASE_URL";
+/// Where a Messages client goes when no base URL names another service.
+pub const ANTHROPIC_API_URL: &str = "https://api.anthropic.com";
+/// Where an OpenAI client goes when no base URL names another service.
+pub const OPENAI_API_URL: &str = "https://api.openai.com/v1";
 /// The variable Codex reads a custom endpoint's key from (`env_key` in its provider config).
 pub const OPENAI_API_KEY_ENV: &str = "OPENAI_API_KEY";
 /// Codex's wire API for a custom OpenAI-speaking endpoint: `chat` or `responses`.

@@ -803,6 +803,7 @@ pub fn run(
                         agent_cmd,
                         env: crucible::host_env::HostEnv::inherited(),
                         buildit_socket: None,
+                        github: false,
                     }),
                     None,
                 )

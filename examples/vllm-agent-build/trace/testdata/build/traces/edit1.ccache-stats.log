@@ -1,0 +1,60 @@
+# /src/vllm/csrc/fs_io.cpp
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/cuda_utils_kernels.cu
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/spinloop.cpp
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/cumem_allocator.cpp
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/torch_bindings.cpp
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/custom_all_gather_reduce_scatter_ops.cpp
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/quantization/marlin/sm80_kernel_float16_fe2m1f_float16.cu
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/quantization/marlin/sm80_kernel_float16_u4_float16.cu
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/quantization/marlin/sm80_kernel_float16_u8b128_float16.cu
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/quantization/marlin/sm80_kernel_float16_fe4m3fn_float16.cu
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/quantization/marlin/sm80_kernel_float16_u4b8_float16.cu
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit
+# /src/vllm/csrc/quantization/marlin/sm80_kernel_s8_u4b8_float16.cu
+direct_cache_hit
+local_storage_hit
+local_storage_read_hit
+local_storage_read_hit

@@ -97,6 +97,16 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         .unwrap_or_else(|| manifest_dir.join("state"));
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
     let p = Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
+    // Before the workspace clone: crucible-git reads the draft-pr bound to authorize it.
+    let frozen = crate::cli::setup::frozen_projection(
+        &m,
+        m.publish
+            .as_ref()
+            .and_then(|p| p.pr_repo.as_deref())
+            .or(Some(args.pr_repo.as_str())),
+        &std::collections::BTreeMap::new(),
+        &p.session_log,
+    )?;
 
     if !workspace.exists() {
         crate::cli::workspace::manifest_setup(&m, &manifest_dir, &workspace)?;
@@ -120,15 +130,6 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     )?;
 
     // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
-    let frozen = crate::cli::setup::frozen_projection(
-        &m,
-        m.publish
-            .as_ref()
-            .and_then(|p| p.pr_repo.as_deref())
-            .or(Some(args.pr_repo.as_str())),
-        &std::collections::BTreeMap::new(),
-        &p.session_log,
-    )?;
     crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
     // Single-repo publish target: a `[publish] pr_repo` in the manifest wins over any `--pr-repo` the
     // caller passed (the controller passes its per-repo default via the flag; a pack that names its

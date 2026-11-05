@@ -1103,6 +1103,128 @@ mod tests {
         }
     }
 
+    /// Golden test against a real Claude Code 2.1.306 capture on the sandbox argv: two parallel
+    /// tool calls whose inputs stream as split `input_json_delta` chunks, their `user` result
+    /// echoes, and system subtypes the parser does not model.
+    #[test]
+    fn golden_real_tool_capture() {
+        let lines: Vec<&str> = include_str!("testdata/claude_stream_tools.jsonl")
+            .lines()
+            .collect();
+        let decode = |tool_io: bool| {
+            let mut p = StreamJsonParser::default().with_tool_io(tool_io);
+            let mut ev: Vec<AgentEvent> = lines.iter().flat_map(|l| p.push(l)).collect();
+            ev.extend(p.flush());
+            ev
+        };
+
+        match &decode(false)[..] {
+            [
+                AgentEvent::Init {
+                    model,
+                    tools,
+                    agents,
+                },
+                AgentEvent::Tool {
+                    name: bash,
+                    summary: bash_summary,
+                    input: None,
+                    result: None,
+                    failed: false,
+                    ..
+                },
+                AgentEvent::Tool {
+                    name: read,
+                    summary: read_summary,
+                    input: None,
+                    result: None,
+                    failed: false,
+                    ..
+                },
+                AgentEvent::Tokens(first),
+                AgentEvent::Text { delta: count },
+                AgentEvent::Text { delta: line },
+                AgentEvent::Tokens(turn),
+                AgentEvent::Result {
+                    subtype,
+                    is_error: false,
+                    turns: 3,
+                    cost_usd,
+                    error: None,
+                },
+            ] => {
+                assert_eq!(model, "claude-opus-5-5");
+                assert_eq!((*tools, *agents), (25, 6));
+                assert_eq!(bash, "Bash");
+                assert_eq!(bash_summary, "$ wc -l note.txt  # Count lines in note file");
+                assert_eq!(read, "Read");
+                assert_eq!(read_summary, "/sandbox/work/note.txt");
+                assert_eq!(
+                    (
+                        first.input,
+                        first.output,
+                        first.cache_read,
+                        first.cache_write
+                    ),
+                    (2, 214, 0, 27996)
+                );
+                assert_eq!(first.cost_usd, None);
+                assert_eq!((count.as_str(), line.as_str()), ("2", "alpha"));
+                assert_eq!(
+                    (turn.input, turn.output, turn.cache_read, turn.cache_write),
+                    (4, 221, 21039, 35242)
+                );
+                assert_eq!(turn.cost_usd, Some(0.1848538));
+                assert_eq!(subtype, "success");
+                assert!((cost_usd - 0.1848538).abs() < 1e-9);
+            }
+            other => panic!("unexpected event sequence from real capture: {other:?}"),
+        }
+
+        let verbose = decode(true);
+        let tool_io: Vec<(&str, &str, Option<&serde_json::Value>, Option<&str>)> = verbose
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Tool {
+                    name,
+                    summary,
+                    input,
+                    result,
+                    ..
+                } => Some((
+                    name.as_str(),
+                    summary.as_str(),
+                    input.as_ref(),
+                    result.as_deref(),
+                )),
+                _ => None,
+            })
+            .collect();
+        let bash_input = serde_json::json!({
+            "command": "wc -l note.txt",
+            "description": "Count lines in note file",
+        });
+        let read_input = serde_json::json!({ "file_path": "/sandbox/work/note.txt" });
+        assert_eq!(
+            tool_io,
+            [
+                (
+                    "Bash",
+                    "$ wc -l note.txt  # Count lines in note file",
+                    Some(&bash_input),
+                    None
+                ),
+                ("Read", "/sandbox/work/note.txt", Some(&read_input), None),
+                ("Read", "result", None, Some("1\talpha\n2\tbeta\n3\t")),
+                ("Bash", "result", None, Some("       2 note.txt")),
+            ]
+        );
+        assert!(
+            !verbose.iter().any(|e| matches!(e, AgentEvent::Raw { .. })),
+            "every line of the capture is modeled or deliberately dropped: {verbose:?}"
+        );
+    }
+
     #[test]
     fn a_result_without_model_usage_adds_no_turn_total() {
         let ev =

@@ -835,11 +835,23 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
                 }
                 _ => None,
             };
+            let github = match task.task {
+                TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
+                    match crate::openshell::agent_servers::run_git() {
+                        Ok(github) => github,
+                        Err(e) => {
+                            return Attempt::transport(TransportCause::Other, format!("{e:#}"));
+                        }
+                    }
+                }
+                _ => false,
+            };
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
                 env: args.workflow_env.clone(),
                 buildit_socket,
+                github,
             };
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs, deadline)

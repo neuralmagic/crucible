@@ -44,6 +44,7 @@ const DISPATCH = {
   dispatchable: true,
   refusal: null,
   local_mode: true,
+  pinned_target: null,
 };
 
 const GRAPH = {

@@ -1,0 +1,25 @@
+# ninja log v7
+6	10	1793822945868075128	/src/vllm/build/temp.linux-x86_64-cpython-312/CMakeFiles/cmake.verify_globs	92c38bf4f39a7995
+13	2056	1793822945875074573	CMakeFiles/cumem_allocator.dir/csrc/cumem_allocator.cpp.o	96352c7d9db90df1
+13	2313	1793822945875074573	CMakeFiles/spinloop.dir/csrc/spinloop.cpp.o	1a19494bc92a7e06
+13	2421	1793822945875074573	CMakeFiles/fs_io_C.dir/csrc/fs_io.cpp.o	a112c7a1a24e068e
+20	2852	1793822945882074019	CMakeFiles/_C_stable_libtorch.dir/csrc/custom_all_gather_reduce_scatter_ops.cpp.o	c52582cfaf759ac4
+14	8498	1793822945876074494	CMakeFiles/_C_stable_libtorch.dir/csrc/cuda_utils_kernels.cu.o	ef039d1e835a32ee
+14	10255	1793822945876074494	CMakeFiles/_C_stable_libtorch.dir/csrc/torch_bindings.cpp.o	60302f1a6ce04b7d
+2853	16686	1793822948714849608	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm75_kernel_float16_fe2m1f_float16.cu.o	fd71e0d6a842e58c
+15	24858	1793822945877074415	CMakeFiles/_C_stable_libtorch.dir/csrc/ngram_embedding_kernels.cu.o	bfd29aab9dee71f2
+22	24933	1793822945884073860	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/fp4/nvfp4_quant_entry.cu.o	48e04451ad90a1e4
+14	25155	1793822945876074494	CMakeFiles/_C_stable_libtorch.dir/csrc/cuda_view.cu.o	7519eab28ca54325
+22	25312	1793822945884073860	CMakeFiles/_C_stable_libtorch.dir/csrc/attention/dcp_utils/dcp_direct_q_gather.cu.o	fd2cb42b731bfd78
+22	25739	1793822945884073860	CMakeFiles/_C_stable_libtorch.dir/csrc/attention/dcp_utils/dcp_direct_kv_gather.cu.o	712822a0df8bd23c
+23	25885	1793822945885073781	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/fp4/nvfp4_scaled_mm_entry.cu.o	427a12213b93b6e8
+23	25930	1793822945885073781	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/awq/gemm_kernels.cu.o	d832496e7a4504c9
+22	26357	1793822945884073860	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/w8a8/cutlass/scaled_mm_entry.cu.o	51b6792e9401cad4
+26	26463	1793822945888073543	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm80_kernel_float16_fe2m1f_float16.cu.o	361ff55848304042
+16	27006	1793822945878074335	CMakeFiles/_C_stable_libtorch.dir/csrc/pos_encoding_kernels.cu.o	2f95a104f7028999
+15	27666	1793822945877074415	CMakeFiles/_C_stable_libtorch.dir/csrc/vocab_parallel_embedding_kernels.cu.o	8d659e270ad6197f
+21	28254	1793822945883073939	CMakeFiles/_C_stable_libtorch.dir/csrc/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu.o	41438c0b5de0a4b5
+18	28510	1793822945880074177	CMakeFiles/_C_stable_libtorch.dir/csrc/attention/merge_attn_states.cu.o	405fa8c100af1f92
+18	28582	1793822945880074177	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/fused_kernels/fused_silu_mul_block_quant.cu.o	80960741a0fe2587
+21	29276	1793822945883073939	CMakeFiles/_C_stable_libtorch.dir/csrc/hisparse_kernels.cu.o	5c0d84b198084cae
+8498	29607	1793822954360402370	CMakeFiles/_C_stable_libtorch.dir/csrc/quantization/marlin/sm75_kernel_float16_fe4m3fn_float16.cu.o	8050f241f8e3b067

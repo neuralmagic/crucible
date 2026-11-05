@@ -1,0 +1,34 @@
+[package]
+name = "crucible-git"
+description = "A run's git and GitHub calls, made with its minted GitHub App token: a smart-HTTP proxy and an MCP server for pull requests."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+apollo-parser = "0.8"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
+base64 = "0.22"
+clap.workspace = true
+crucible-contract = { path = "../crucible-contract" }
+crucible-mcp-auth = { path = "../crucible-mcp-auth" }
+futures-util = "0.3"
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+rmcp = { workspace = true, features = ["server", "macros", "transport-streamable-http-server"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal", "fs", "sync", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tower = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url.workspace = true

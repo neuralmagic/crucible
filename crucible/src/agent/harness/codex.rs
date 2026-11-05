@@ -4,11 +4,11 @@
 //! turn's result and token usage and `backfill_required` stays false; the rollout file under
 //! `$CODEX_HOME/sessions` is trace garnish, same posture as claude.
 //!
-//! Codex authenticates with either the loop process's `OPENAI_API_KEY` or a short-lived ChatGPT
-//! OAuth token minted host-side from `CODEX_CREDENTIALS`. Both are seeded into
-//! `$CODEX_HOME/auth.json`. A gateway provider cannot deliver either credential: the sandbox sees
-//! only an `openshell:resolve:env:` placeholder that the L7 egress proxy resolves, while Codex
-//! uses an L4 WebSocket tunnel. The real credential therefore has to be in the auth file.
+//! Codex authenticates with either an API key or a short-lived ChatGPT OAuth token minted
+//! host-side from `CODEX_CREDENTIALS`, seeded into `$CODEX_HOME/auth.json`. An API key is seeded
+//! only as the gateway's `openshell:resolve:env:` placeholder, which the egress proxy resolves on
+//! the inference endpoint. The ChatGPT token is seeded as itself: the ChatGPT backend is an L4
+//! tunnel the proxy does not inspect.
 
 use crate::agent::harness::{Backend, McpServer, SandboxAuth, SeedFile, TurnArtifacts, json_str};
 use crate::agent::inference::InferenceEnv;
@@ -96,8 +96,8 @@ fn auth_json(auth: &CodexAuth, last_refresh: &str) -> String {
 pub(crate) const WITHHELD_REFRESH_TOKEN: &str = "withheld-crucible-refreshes-host-side";
 
 /// The custom OpenAI-speaking endpoint a turn runs against, as codex's `model_providers` entry.
-/// Codex reads the key for a non-built-in provider from `env_key`, so the sandbox env carries
-/// `OPENAI_API_KEY` for this case where the built-in provider reads `auth.json`.
+/// Codex reads the key for a non-built-in provider from `env_key`, where the gateway issues its
+/// placeholder; the built-in provider reads `auth.json`.
 pub(crate) struct CustomEndpoint<'a> {
     pub base_url: &'a str,
     pub wire_api: crate::agent::inference::WireApi,
@@ -205,8 +205,7 @@ impl Backend for Codex {
         Some(config_toml(self.model(agent), servers, endpoint.as_ref()))
     }
 
-    /// `auth.json` whenever Codex auth was resolved; the credential reaches Codex only through it,
-    /// never the env script.
+    /// `auth.json` whenever Codex auth was resolved; the credential never rides the env script.
     fn credential(&self, _agent: &TurnAgent<'_>, auth: &SandboxAuth) -> Option<SeedFile> {
         auth.codex().map(|auth| SeedFile {
             content: auth_json(auth, &Timestamp::now().to_string()),

@@ -34,6 +34,8 @@ pub struct PackAgent {
     pub resources: crucible::manifest::SandboxResources,
     /// `[agent.sandbox.<name>].image`: the image each named sandbox starts from.
     pub sandboxes: BTreeMap<String, String>,
+    /// `[dispatch] target`: the one cluster every launch of this pack dispatches to.
+    pub pinned_target: Option<crucible::manifest::ClusterName>,
 }
 
 /// The `[agent]` fields beyond backend and image, as the `agent_requirements` column stores them.
@@ -54,6 +56,8 @@ pub struct AgentRequirements {
     pub resources: crucible::manifest::SandboxResources,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sandboxes: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_target: Option<crucible::manifest::ClusterName>,
 }
 
 impl PackAgent {
@@ -79,6 +83,7 @@ impl PackAgent {
             allow_unverified_image: r.allow_unverified_image,
             resources: r.resources,
             sandboxes: r.sandboxes,
+            pinned_target: r.pinned_target,
         }
     }
 
@@ -91,6 +96,7 @@ impl PackAgent {
             allow_unverified_image: self.allow_unverified_image,
             resources: self.resources.clone(),
             sandboxes: self.sandboxes.clone(),
+            pinned_target: self.pinned_target.clone(),
         }
     }
 
@@ -136,6 +142,8 @@ const SANDBOX_BACKEND: &str = "openshell";
 #[derive(Debug, Deserialize)]
 struct ManifestAgent {
     agent: Option<AgentTable>,
+    #[serde(default)]
+    dispatch: crucible::manifest::DispatchCfg,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -193,6 +201,7 @@ pub fn pack_agent(
             .into_iter()
             .map(|(name, table)| (name, table.image.trim().to_string()))
             .collect(),
+        pinned_target: parsed.dispatch.target,
     })
 }
 
@@ -276,6 +285,15 @@ impl DispatchCapability {
                  [cluster] sandbox_driver = \"kubernetes\" and pod dispatch)"
                     .to_string(),
             );
+        }
+        if let Some(pinned) = &agent.pinned_target
+            && self.executor == PlaybookExecutor::Local
+        {
+            return Some(format!(
+                "the pack pins [dispatch] target {:?}, and this deployment runs playbooks as a \
+                 local subprocess (CONTROLLER_PLAYBOOK_EXECUTOR=local), so no launch can land there",
+                pinned.as_str()
+            ));
         }
         match self.executor {
             PlaybookExecutor::Local => None,
