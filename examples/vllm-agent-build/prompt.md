@@ -1,5 +1,5 @@
-Build vLLM from source through the `buildit` MCP tools: once as checked out, then three times,
-each after a small edit to a different CUDA kernel, the way a kernel author iterates. Fetch each
+Build vLLM from source through the `buildit` MCP tools: once as checked out, then once after a
+small edit to one CUDA kernel. Your task inputs carry `item`: the kernel to edit. Fetch each
 build's ninja and ccache logs and report what each took.
 
 If the buildit tools are not available to you, write `report.json` with an `error` saying so and
@@ -22,12 +22,9 @@ and fetch_paths `["/trace"]`, then copy the three fetched files to `traces/<name
 1. Check out vLLM at `vllm_ref` (below) into `build/vllm/`:
    `git init -q build/vllm && git -C build/vllm fetch -q --depth 1 https://github.com/vllm-project/vllm.git <vllm_ref> && git -C build/vllm checkout -q --detach FETCH_HEAD`
    Build it as `checkout`.
-2. For N in 1, 2, 3, append this line to the file below, then build as `editN`:
-   `namespace crucible_smoke { [[maybe_unused]] __attribute__((used)) inline const char marker_N[] = "crucible-smoke-N"; }`
-   - N=1: `build/vllm/csrc/layernorm_kernels.cu`
-   - N=2: `build/vllm/csrc/activation_kernels.cu`
-   - N=3: `build/vllm/csrc/layernorm_kernels.cu` again
+2. Append this line to `build/vllm/csrc/<item>_kernels.cu`, then build as `edit`:
+   `namespace crucible_smoke { [[maybe_unused]] __attribute__((used)) inline const char marker[] = "crucible-smoke-<item>"; }`
 3. Write `report.json`:
-   `{"builds": [{"name": "checkout" | "edit1" | "edit2" | "edit3", "build_id": ..., "status": ..., "seconds": <from the build call to the last status>}]}`
+   `{"kernel": <item>, "builds": [{"name": "checkout" | "edit", "build_id": ..., "status": ..., "seconds": <from the build call to the last status>}]}`
 
 Do not change any other file and do not call `clean`.

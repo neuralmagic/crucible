@@ -1780,7 +1780,7 @@ starts its runs. The loop passes the site to buildit as `--cache-url` and `--cac
 before `bud`: `{"url": ...}`, with `"token"` when the build may write. The run's own builds, on its
 socket ([8.6](#86-the-runs-own-socket)), may; a sandbox's builds may only with `agent_writes`, and
 otherwise read only. A build with `ccache: true` gets the same choice in its `/etc/ccache.conf`,
-which is how `examples/vllm-agent-fanout` seeds the cache from a command task before its agents
+which is how `examples/vllm-agent-build` seeds the cache from a command task before its agents
 fan out. A build uses the cache only if its `RUN` steps read that file, as the vLLM bench's
 informer does for ccache and its build store.
 
