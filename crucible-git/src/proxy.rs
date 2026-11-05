@@ -1,6 +1,7 @@
 //! git's smart-HTTP protocol, passed through to GitHub with the run's token added. The three
 //! endpoints are plain HTTP, so bodies stream through unread.
 
+use crate::allow::Allow;
 use crate::github::GitHub;
 use crate::{SCOPE_READ, SCOPE_WRITE};
 use axum::Router;
@@ -28,10 +29,15 @@ const FORWARD_RESPONSE: [HeaderName; 3] = [
     header::CACHE_CONTROL,
 ];
 
-pub fn router(gh: Arc<GitHub>) -> Router {
+struct Upstream {
+    gh: Arc<GitHub>,
+    allow: Arc<Allow>,
+}
+
+pub fn router(gh: Arc<GitHub>, allow: Arc<Allow>) -> Router {
     Router::new()
         .route("/git/{owner}/{repo}/{*rest}", any(proxy))
-        .with_state(gh)
+        .with_state(Arc::new(Upstream { gh, allow }))
 }
 
 /// Which of the three endpoints, and whether it writes.
@@ -47,7 +53,7 @@ fn endpoint(rest: &str, query: Option<&str>) -> Option<&'static str> {
     }
 }
 
-fn is_name(s: &str) -> bool {
+pub fn is_name(s: &str) -> bool {
     !s.is_empty()
         && s != "."
         && s != ".."
@@ -60,7 +66,7 @@ fn refuse(status: StatusCode, why: impl Into<String>) -> Response {
 }
 
 async fn proxy(
-    State(gh): State<Arc<GitHub>>,
+    State(up): State<Arc<Upstream>>,
     Path((owner, repo, rest)): Path<(String, String, String)>,
     req: Request,
 ) -> Response {
@@ -81,6 +87,10 @@ async fn proxy(
     if !principal.missing_scopes(&[scope.to_string()]).is_empty() {
         return refuse(StatusCode::FORBIDDEN, format!("this call needs {scope}"));
     }
+    if let Err(e) = up.allow.repo(&format!("{owner}/{repo}")).await {
+        return refuse(e.status(), e.to_string());
+    }
+    let gh = &up.gh;
     let token = match gh.token().await {
         Ok(t) => t,
         Err(e) => return refuse(e.status(), e.to_string()),

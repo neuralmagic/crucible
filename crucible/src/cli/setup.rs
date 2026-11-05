@@ -30,6 +30,7 @@ pub(crate) fn frozen_projection(
     session_log: &Path,
 ) -> Result<FrozenProjection> {
     let bounds = run_bounds(&m.outputs, &m.build, pr_repo, params);
+    crate::openshell::git::write_bounds(&bounds)?;
     Ok(FrozenProjection {
         broker_env: broker_bounds_env(&bounds, session_log)?,
         disclosure: Some(crate::exposure::covered(m)),

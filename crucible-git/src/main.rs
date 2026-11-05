@@ -1,12 +1,14 @@
 //! `crucible-git serve`: one run's git and GitHub calls, made with the run's minted GitHub App
 //! token, which it reads from its file on every request so a token refreshed in place is used at
-//! once. Neither a sandbox nor a task ever holds the token.
+//! once. It runs in a container of its own, the only one the token is mounted into, and reaches
+//! only the repositories the run's `[outputs.draft-pr]` bound admits.
 //!
 //! ```text
 //!   sandbox ──run token──▶ --bind        ─┐  /git/<owner>/<repo>.git/…  ─▶ github.com
 //!   task    ──────────────▶ --local-bind ─┘  /mcp  open_pr              ─▶ api.github.com
 //! ```
 
+mod allow;
 mod github;
 mod mcp;
 mod proxy;
@@ -59,8 +61,11 @@ struct ServeArgs {
     #[arg(long)]
     run_id: String,
     /// The file holding the run's GitHub App token. Unset, every call is refused.
-    #[arg(long, env = "CRUCIBLE_GITHUB_TOKEN_FILE")]
+    #[arg(long)]
     token_file: Option<PathBuf>,
+    /// The run's output bounds, as the loop writes them at setup.
+    #[arg(long)]
+    bounds_file: PathBuf,
     #[arg(long, default_value = "https://github.com")]
     github_url: Url,
     #[arg(long, default_value = "https://api.github.com")]
@@ -155,10 +160,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
         run_id: args.run_id.clone(),
     });
     let sandbox_layer = axum::middleware::from_fn_with_state(sandbox, authenticate);
-    let sandbox_app = proxy::router(gh.clone())
+    let allow = Arc::new(allow::Allow::new(args.bounds_file));
+    let sandbox_app = proxy::router(gh.clone(), allow.clone())
         .layer(sandbox_layer.clone())
         .merge(mcp::router(
             gh.clone(),
+            allow.clone(),
             &args.allowed_hosts,
             sandbox_layer,
             Some(server),
@@ -166,9 +173,9 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let run = Arc::new(run_principal(&args.run_id)?);
     let run_layer = axum::middleware::from_fn_with_state(run, as_run);
-    let local_app = proxy::router(gh.clone())
+    let local_app = proxy::router(gh.clone(), allow.clone())
         .layer(run_layer.clone())
-        .merge(mcp::router(gh, &[], run_layer, None));
+        .merge(mcp::router(gh, allow, &[], run_layer, None));
 
     let sandbox_listener = tokio::net::TcpListener::bind(&args.bind)
         .await

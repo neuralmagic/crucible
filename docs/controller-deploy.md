@@ -375,13 +375,15 @@ openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt 
 oc create secret generic crucible-agent-signing-key --from-file=agent-signing.pem
 ```
 
-`[git]` starts `crucible-git` in the loop pod of each run on `clusters`. It proxies git's
-smart-HTTP protocol to GitHub and serves one MCP tool, `open_pr`, both with the run's minted
+`[git]` runs `crucible-git` as a sidecar of the loop pod of each run on `clusters`. It proxies
+git's smart-HTTP protocol to GitHub and serves one MCP tool, `open_pr`, both with the run's minted
 GitHub App token, which it reads from its file on every request. A run gets the token by binding a
-`mint://github-app/<owner>` secret as a file; the controller names that file to the loop pod in
-`CRUCIBLE_GITHUB_TOKEN_FILE`. Sandboxes reach `crucible-git` at `url` with run tokens, so git there
-needs no credential: clone `http://host.openshell.internal:8853/git/<owner>/<repo>.git`. The run's
-command and evaluate tasks reach it on loopback at `$CRUCIBLE_GIT_URL`, without a token.
+`mint://github-app/<owner>` secret as a file; the controller mounts it into the sidecar alone, by
+directory, so no task or sandbox can read it. `crucible-git` reaches only the repositories the
+run's `[outputs.draft-pr]` target admits, for fetches as well as pushes, and each pull request it
+opens spends that bound's count. Sandboxes reach it at `url` with run tokens, so git there needs no
+credential: clone `http://host.openshell.internal:8853/git/<owner>/<repo>.git`. The run's command
+and evaluate tasks reach it on loopback at `$CRUCIBLE_GIT_URL`, without a token.
 
 ```toml
 [git]

@@ -105,6 +105,7 @@ impl RunPodRender {
             stamp_git_identity(&mut pod, who);
         }
         crate::secrets::deliver::stamp(&mut pod, &self.secret_name, &self.delivery);
+        crate::runs::workpod::git_sidecar::add(&mut pod, &self.secret_name, &self.delivery)?;
         Ok(RunDocs {
             pod,
             pack,

@@ -103,13 +103,7 @@ impl Granted {
                 socket,
             }
             .ensure_running(),
-            Transport::Local(LocalServer::Git(site)) => git::Git {
-                site,
-                url: &self.server.url,
-                host: &self.host,
-                port: self.port,
-            }
-            .ensure_running(),
+            Transport::Local(LocalServer::Git(_)) => git::Git { port: self.port }.wait_ready(),
         }
     }
 }

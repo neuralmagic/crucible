@@ -65,6 +65,9 @@ pub struct Delivery {
     /// sandbox, so naming what may cross rather than what may not leaves a forgotten list
     /// withholding every secret instead of leaking each one.
     pub agent_visible: Vec<String>,
+    /// The Secret key of the run's minted GitHub App token bound as a file. It is mounted into the
+    /// `crucible-git` container alone, never the loop's, so no task can read it.
+    pub git_token: Option<String>,
 }
 
 impl Delivery {
@@ -113,6 +116,15 @@ impl Delivery {
                     path: path.clone(),
                 });
             }
+        }
+        if let (Some(first), Some(second)) = (&self.git_token, &other.git_token) {
+            return Err(DeliverError::TwoAppTokenFiles {
+                first: first.clone(),
+                second: second.clone(),
+            });
+        }
+        if other.git_token.is_some() {
+            self.git_token = other.git_token;
         }
         self.data.extend(other.data);
         self.env.extend(other.env);
@@ -167,25 +179,19 @@ pub fn assemble(
                     });
                 }
                 seen_paths.insert(projection.to_string(), name.clone());
-                delivery.files.push((projection.to_string(), name.clone()));
-                if matches!(
+                let app_token = matches!(
                     crate::secrets::minter::Minter::of(row.mode, &row.vault_path),
                     Ok(Some(crate::secrets::minter::Minter::GithubApp(_)))
-                ) {
-                    if let Some((_, first)) = delivery
-                        .plain_env
-                        .iter()
-                        .find(|(var, _)| var == crucible_contract::git::ENV_TOKEN_FILE)
-                    {
+                );
+                match (app_token, &delivery.git_token) {
+                    (false, _) => delivery.files.push((projection.to_string(), name.clone())),
+                    (true, None) => delivery.git_token = Some(name.clone()),
+                    (true, Some(first)) => {
                         return Err(DeliverError::TwoAppTokenFiles {
                             first: first.clone(),
-                            second: projection.to_string(),
+                            second: name,
                         });
                     }
-                    delivery.plain_env.push((
-                        crucible_contract::git::ENV_TOKEN_FILE.to_string(),
-                        projection.to_string(),
-                    ));
                 }
             }
         }

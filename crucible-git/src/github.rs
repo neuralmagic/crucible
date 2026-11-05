@@ -1,6 +1,7 @@
 //! GitHub as the run's App installation: the token, read fresh from its file, and the one REST
 //! call the server makes.
 
+use crate::allow::Allow;
 use anyhow::{Context, Result};
 use axum::http::StatusCode;
 use base64::Engine;
@@ -84,9 +85,10 @@ impl GitHub {
 
     /// The open pull request into `repo` from `head` (`owner:branch`), or a new one, carrying
     /// `pr.labels` and asking `pr.reviewers` either way.
-    pub async fn open_pr(&self, pr: &NewPr<'_>) -> Result<OpenedPr> {
+    /// A pull request created here spends one of `allow`'s count; one already open spends none.
+    pub async fn open_pr(&self, pr: &NewPr<'_>, allow: &Allow) -> Result<OpenedPr> {
         let token = self.token().await?;
-        let mut opened = self.find_or_create(pr, &token).await?;
+        let mut opened = self.find_or_create(pr, &token, allow).await?;
         if !pr.labels.is_empty() {
             let url = self
                 .api
@@ -138,7 +140,7 @@ impl GitHub {
         Ok(opened)
     }
 
-    async fn find_or_create(&self, pr: &NewPr<'_>, token: &str) -> Result<OpenedPr> {
+    async fn find_or_create(&self, pr: &NewPr<'_>, token: &str, allow: &Allow) -> Result<OpenedPr> {
         let pulls = self
             .api
             .join(&format!("repos/{}/pulls", pr.repo))
@@ -162,6 +164,7 @@ impl GitHub {
                 reviewers: Vec::new(),
             });
         }
+        allow.open(pr.repo).await?;
         let created: Pull = self
             .call(
                 self.http.post(pulls).json(&serde_json::json!({

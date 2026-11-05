@@ -11,6 +11,7 @@ anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "query"] }
 base64 = "0.22"
 clap.workspace = true
+crucible-contract = { path = "../crucible-contract" }
 crucible-mcp-auth = { path = "../crucible-mcp-auth" }
 futures-util = "0.3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
@@ -18,7 +19,7 @@ rmcp = { workspace = true, features = ["server", "macros", "transport-streamable
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["signal", "fs"] }
+tokio = { workspace = true, features = ["signal", "fs", "sync"] }
 tower = "0.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,6 +1,7 @@
 //! The MCP endpoint: one tool, `open_pr`.
 
 use crate::SCOPE_WRITE;
+use crate::allow::Allow;
 use crate::github::{GitHub, NewPr};
 use axum::Router;
 use crucible_mcp_auth::access::{AccessCheck, AccessRules, Call};
@@ -66,6 +67,7 @@ fn yes() -> bool {
 #[derive(Clone)]
 pub struct GitMcp {
     gh: Arc<GitHub>,
+    allow: Arc<Allow>,
 }
 
 #[tool_router]
@@ -78,26 +80,34 @@ impl GitMcp {
         Returns url, number, draft, existing, labels and reviewers."
     )]
     async fn open_pr(&self, Parameters(p): Parameters<OpenPrParams>) -> Result<String, String> {
-        let owner = p.repo.split_once('/').map(|(o, _)| o).unwrap_or_default();
-        if owner.is_empty() {
+        let Some((owner, name)) = p
+            .repo
+            .split_once('/')
+            .filter(|(o, n)| crate::proxy::is_name(o) && crate::proxy::is_name(n))
+        else {
             return Err(format!("repo {:?} is not owner/name", p.repo));
-        }
+        };
+        let repo = format!("{owner}/{name}");
+        self.allow.repo(&repo).await.map_err(|e| e.to_string())?;
         let head = match p.head.contains(':') {
             true => p.head.clone(),
             false => format!("{owner}:{}", p.head),
         };
         let opened = self
             .gh
-            .open_pr(&NewPr {
-                repo: &p.repo,
-                base: &p.base,
-                head: &head,
-                title: &p.title,
-                body: &p.body,
-                draft: p.draft,
-                labels: &p.labels,
-                reviewers: &p.reviewers,
-            })
+            .open_pr(
+                &NewPr {
+                    repo: &repo,
+                    base: &p.base,
+                    head: &head,
+                    title: &p.title,
+                    body: &p.body,
+                    draft: p.draft,
+                    labels: &p.labels,
+                    reviewers: &p.reviewers,
+                },
+                &self.allow,
+            )
             .await
             .map_err(|e| format!("{e:#}"))?;
         serde_json::to_string(&opened).map_err(|e| e.to_string())
@@ -117,6 +127,7 @@ impl ServerHandler for GitMcp {
 /// sandbox hostnames.
 pub fn router<L>(
     gh: Arc<GitHub>,
+    allow: Arc<Allow>,
     hosts: &[String],
     authenticate: L,
     server: Option<Arc<ResourceServer>>,
@@ -136,7 +147,12 @@ where
         .chain(hosts.iter().cloned())
         .collect();
     mcp_router(
-        move || Ok(GitMcp { gh: gh.clone() }),
+        move || {
+            Ok(GitMcp {
+                gh: gh.clone(),
+                allow: allow.clone(),
+            })
+        },
         authenticate,
         Mount {
             path: MCP_PATH,

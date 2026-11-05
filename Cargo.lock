@@ -2084,6 +2084,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "crucible-contract",
  "crucible-mcp-auth",
  "futures-util",
  "reqwest",
