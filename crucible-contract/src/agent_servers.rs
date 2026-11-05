@@ -92,7 +92,7 @@ pub enum Transport {
 pub enum LocalServer {
     /// `buildit mcp`.
     Buildit(Box<BuilditSite>),
-    /// `crucible-git serve`: the run's git and GitHub calls, made with the run's App token.
+    /// `crucible-git serve`: the run's git and GitHub calls, made with the run's GitHub credential.
     Git(Box<GitSite>),
 }
 

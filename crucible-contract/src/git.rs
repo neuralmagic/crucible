@@ -7,7 +7,7 @@ pub const URL: &str = "http://host.openshell.internal:8853/mcp";
 /// The port in [`URL`], which `crucible-git` listens on in the loop pod.
 pub const PORT: u16 = 8853;
 
-/// Where the controller mounts the run's minted GitHub App token in the `crucible-git` container,
+/// Where the controller mounts the run's GitHub credential in the `crucible-git` container,
 /// and nowhere else in the pod.
 pub const TOKEN_DIR: &str = "/var/run/crucible-git-token";
 
@@ -53,7 +53,7 @@ pub fn task_env() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The token tasks hold in `GH_TOKEN`: `crucible-git` replaces it with the run's App token, so it
+/// The token tasks hold in `GH_TOKEN`: `crucible-git` replaces it with the run's credential, so it
 /// is worthless outside the pod.
 pub const PLACEHOLDER_TOKEN: &str = "crucible-git";
 

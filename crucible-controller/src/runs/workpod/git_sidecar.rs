@@ -1,7 +1,7 @@
 //! The `crucible-git` container of a run pod granted the `git` agent server: a native sidecar (an
 //! init container that keeps running), so it is up before the loop starts and does not hold the
 //! pod open after the loop exits. It shares the pod's network, and is the only container the run's
-//! GitHub App token is mounted into: by directory, so a token rewritten in the Secret reaches it.
+//! GitHub credential is mounted into: by directory, so a token rewritten in the Secret reaches it.
 //! The loop writes the run's output bounds into a directory the two share, and `crucible-git`
 //! reads them from there.
 //!

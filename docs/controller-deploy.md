@@ -393,7 +393,7 @@ every binding exactly as bound.
 The run's command and evaluate tasks use stock `gh` and `git` against `github.com`. The pod maps
 GitHub's hostnames to loopback, where `crucible-git` serves them over TLS with a CA it mints for the
 run; tasks trust that CA (`SSL_CERT_FILE` and friends) and hold a placeholder `GH_TOKEN`, which
-`crucible-git` replaces with the App token. Sandboxes reach it at `url` with run tokens: git there
+`crucible-git` replaces with the run's credential. Sandboxes reach it at `url` with run tokens: git there
 needs no credential (`http://host.openshell.internal:8853/git/<owner>/<repo>.git`), and the
 `open_pr` tool opens pull requests.
 

@@ -1,6 +1,6 @@
 //! One request to GitHub, from either entry point: the `/git` routes sandboxes reach with run
-//! tokens, and the TLS listener the run's tasks reach as `github.com`. The run's App token is lent
-//! only to a request that carries none of its own or carries the placeholder, and only as far as
+//! tokens, and the TLS listener the run's tasks reach as `github.com`. The run's token is lent only
+//! to a request that carries none of its own or carries the placeholder, and only as far as
 //! [`crate::policy`] allows. A request with a credential of its own is relayed with it, untouched:
 //! `crucible-git` never widens what a caller could do anyway.
 //!
@@ -85,7 +85,7 @@ fn is_placeholder(value: &HeaderValue) -> bool {
 
 fn refuse(status: StatusCode, why: impl Into<String>) -> Response {
     let why = why.into();
-    tracing::info!(%status, %why, "refused");
+    tracing::info!(%status, %why, "refused a GitHub call");
     (status, why).into_response()
 }
 
@@ -177,7 +177,7 @@ impl Relay {
             path = %path.split('?').next().unwrap_or(""),
             status = %resp.status(),
             credential = if own { "caller" } else { "run" },
-            "relayed"
+            "relayed a GitHub call"
         );
         let mut out = Response::builder().status(resp.status());
         for (name, value) in resp.headers() {

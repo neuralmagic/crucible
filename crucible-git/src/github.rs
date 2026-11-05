@@ -1,5 +1,5 @@
-//! GitHub as the run's App installation: the token, read fresh from its file, and the one REST
-//! call the server makes.
+//! GitHub with the run's credential: the token, read fresh from its file, and the REST calls the
+//! policy and `open_pr` make with it.
 
 use crate::allow::Allow;
 use anyhow::{Context, Result};
@@ -11,14 +11,14 @@ use url::Url;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
-    #[error("this run binds no GitHub App token")]
+    #[error("this run binds no GitHub token")]
     Unbound,
-    #[error("reading the GitHub App token from {path}: {source}")]
+    #[error("reading the GitHub token from {path}: {source}")]
     Read {
         path: String,
         source: std::io::Error,
     },
-    #[error("the GitHub App token file {0} is empty")]
+    #[error("the GitHub token file {0} is empty")]
     Empty(String),
 }
 
@@ -75,7 +75,7 @@ impl GitHub {
         Ok(token.to_string())
     }
 
-    /// The `Authorization` value git over HTTPS takes an installation token as.
+    /// The `Authorization` value git over HTTPS takes a token as.
     pub fn basic(token: &str) -> String {
         let pair = format!("x-access-token:{token}");
         format!(
@@ -191,7 +191,7 @@ impl GitHub {
         })
     }
 
-    /// Whether `repo` is public, as the App installation sees it.
+    /// Whether `repo` is public, as the run's credential sees it.
     pub async fn is_public(&self, repo: &str) -> Result<bool> {
         Ok(!self.repo(repo).await?.private)
     }

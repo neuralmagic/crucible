@@ -1,7 +1,7 @@
 //! GitHub, as the run's tasks see it, so they use plain `gh` and `git`. The pod maps GitHub's
 //! hostnames to loopback, where this listener answers with a leaf certificate from a CA minted for
-//! this run; the decrypted request is decided by [`crate::policy`] and leaves with the run's App
-//! token in place of the placeholder the task holds. No other host reaches `crucible-git`.
+//! this run; the decrypted request is decided by [`crate::policy`] and leaves with the run's token
+//! in place of the placeholder the task holds. No other host reaches `crucible-git`.
 //!
 //! ```text
 //!   task ──https://api.github.com──▶ 127.0.0.1:443 (run CA) ─▶ policy ─▶ token swapped ─▶ GitHub

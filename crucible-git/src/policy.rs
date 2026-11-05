@@ -278,8 +278,8 @@ async fn writable(allow: &Allow, repo: &str) -> Verdict {
     }
 }
 
-/// A bound repository, or a public one. A repository the App cannot see and a private one are
-/// refused alike, so the answer tells a caller nothing about which.
+/// A bound repository, or a public one. A repository the run's credential cannot see and a
+/// private one are refused alike, so the answer tells a caller nothing about which.
 async fn readable(state: &State, gh: &GitHub, allow: &Allow, repo: &str) -> Verdict {
     if allow.repo(repo).await.is_ok() {
         return READ;

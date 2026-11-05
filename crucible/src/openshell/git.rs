@@ -1,5 +1,5 @@
 //! The run's `crucible-git`, which the controller runs as a sidecar of the loop pod when it granted
-//! the run the `git` server. The loop never holds the run's GitHub App token: it waits for the
+//! the run the `git` server. The loop never holds the run's GitHub credential: it waits for the
 //! sidecar to listen, and hands it the run's output bounds through the directory they share.
 //! Its grant, egress and `.mcp.json` entry are any agent server's
 //! ([`crate::openshell::agent_servers`]).

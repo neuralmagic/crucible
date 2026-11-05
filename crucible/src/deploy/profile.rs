@@ -321,8 +321,8 @@ pub fn jwks_uri(issuer: &str, over: Option<&url::Url>) -> Result<url::Url, url::
 }
 
 /// The `[git]` table. A run on one of `clusters` starts `crucible-git` in its loop pod, which
-/// proxies the run's git traffic to GitHub and opens its pull requests with the run's minted App
-/// token, accepting sandbox tokens from the controller's agent issuer.
+/// proxies the run's git traffic to GitHub and opens its pull requests with the run's GitHub
+/// credential, accepting sandbox tokens from the controller's agent issuer.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GitCfg {

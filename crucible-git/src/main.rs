@@ -1,7 +1,8 @@
-//! `crucible-git serve`: one run's git and GitHub calls, made with the run's minted GitHub App
-//! token, which it reads from its file on every request so a token refreshed in place is used at
-//! once. It runs in a container of its own, the only one the token is mounted into, and reaches
-//! only the repositories the run's `[outputs.draft-pr]` bound admits.
+//! `crucible-git serve`: one run's git and GitHub calls, made with the run's GitHub credential (a
+//! minted App token, or a token the run binds), which it reads from its file on every request so a
+//! token refreshed in place is used at once. It runs in a container of its own, the only one the
+//! credential is mounted into, and reaches only the repositories the run's `[outputs.draft-pr]`
+//! bound admits.
 //!
 //! ```text
 //!   sandbox ──run token──▶ --bind      ─┐  /git/<owner>/<repo>.git/…  ─▶ github.com
@@ -41,7 +42,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Serve one run: sandboxes on `--bind` with run tokens, the run's tasks on `--local-bind`.
+    /// Serve one run: sandboxes on `--bind` with run tokens, the run's tasks as GitHub on
+    /// `--tls-bind`.
     Serve(ServeArgs),
 }
 
@@ -62,7 +64,7 @@ struct ServeArgs {
     /// The run this server serves, compared with a run token's `run_id`.
     #[arg(long)]
     run_id: String,
-    /// The file holding the run's GitHub App token. Unset, every call is refused.
+    /// The file holding the run's GitHub credential. Unset, every call is refused.
     #[arg(long)]
     token_file: Option<PathBuf>,
     /// The run's output bounds, as the loop writes them at setup.
@@ -133,7 +135,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .context("building the resource server")?,
     );
     if args.token_file.is_none() {
-        tracing::warn!("no GitHub App token file; every call is refused");
+        tracing::warn!("no GitHub token file; every call is refused");
     }
     let gh = Arc::new(github::GitHub::new(args.token_file, args.api_url)?);
 
