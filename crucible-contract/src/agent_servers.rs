@@ -126,16 +126,26 @@ pub struct BuilditSite {
     pub cache: Option<SharedCache>,
 }
 
-/// A `buildit cache` every build of the run may read.
+/// A `buildit cache` that every build of the run reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SharedCache {
     /// Where builds reach it.
     pub url: String,
-    /// Whether builds get its write token, at [`crate::buildit::CACHE_TOKEN_FILE`]; otherwise
-    /// they only read.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub write: bool,
+    /// The builds that also write to it, with the token at [`crate::buildit::CACHE_TOKEN_FILE`].
+    pub writers: CacheWriters,
+}
+
+/// The builds that may write to the shared cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheWriters {
+    None,
+    /// The builds of the run's own command and evaluate tasks.
+    #[default]
+    Run,
+    /// The run's builds and its agents' builds.
+    All,
 }
 
 /// buildit's builder pods: the node architecture they run on, how many a sandbox may have live,
@@ -298,7 +308,7 @@ mod tests {
                     builders: BuilderPods::default(),
                     cache: Some(SharedCache {
                         url: "http://buildit-cache.loops.svc:8850".into(),
-                        write: true,
+                        writers: CacheWriters::Run,
                     }),
                 }))),
             },
@@ -356,37 +366,11 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_cache_rides_the_env_and_says_write_only_when_builds_write() {
-        let site = |write| BuilditSite {
-            run_issuer: "https://hub.example=https://hub.example/jwks".into(),
-            namespace: "builds".into(),
-            push_repo: None,
-            queue: None,
-            builders: BuilderPods::default(),
-            cache: Some(SharedCache {
-                url: "http://buildit-cache.loops.svc:8850".into(),
-                write,
-            }),
-        };
-        let raw = serde_json::to_value(site(false)).unwrap();
-        assert_eq!(
-            raw["cache"],
-            serde_json::json!({"url": "http://buildit-cache.loops.svc:8850"})
+    fn a_shared_cache_never_carries_its_token() {
+        assert!(
+            serde_json::from_str::<SharedCache>(r#"{"url": "u", "writers": "run", "token": "t"}"#)
+                .is_err()
         );
-        assert_eq!(
-            serde_json::from_value::<BuilditSite>(raw).unwrap(),
-            site(false)
-        );
-        let raw = serde_json::to_value(site(true)).unwrap();
-        assert_eq!(
-            raw["cache"],
-            serde_json::json!({"url": "http://buildit-cache.loops.svc:8850", "write": true})
-        );
-        assert_eq!(
-            serde_json::from_value::<BuilditSite>(raw).unwrap(),
-            site(true)
-        );
-        assert!(serde_json::from_str::<SharedCache>(r#"{"url": "u", "token": "t"}"#).is_err());
     }
 
     #[test]

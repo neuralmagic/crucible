@@ -352,7 +352,7 @@ node_arch = "amd64"
 clusters     = ["spoke-a"]                          # default the hub; deploy it on each
 token_secret = "buildit-cache-token"
 size_gib     = 500
-write        = true
+writers      = "run"                                # "none", "run" (default) or "all"
 ```
 
 `image` pins buildit apart from the loop image: loop pods copy its `/usr/local/bin/buildit` in
@@ -373,10 +373,13 @@ loop namespace, with a URL-safe value:
 oc create secret generic buildit-cache-token --from-literal=token="$(openssl rand -hex 32)"
 ```
 
-With `write` (the default) loop pods mount the token and builds on the cache's clusters may write
-to it. A build's `RUN` steps can read it, so one run's agent could store objects other runs' builds
-use: keep `write` for clusters whose runs trust each other, and set `write = false` otherwise so
-builds read only.
+Every build reads the cache. `writers` says which builds also write to it:
+
+- `"run"` (the default): the builds a run's own command and evaluate tasks start. A pack can seed
+  the cache from a known ref before its agents fan out, and agents' builds only read.
+- `"all"`: agents' builds too. A build's `RUN` steps can read the token, so one run's agent could
+  store objects other runs' builds use. Use it only on clusters whose runs trust each other.
+- `"none"`: no build writes, and loop pods do not mount the token.
 
 ```bash
 openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out agent-signing.pem

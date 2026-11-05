@@ -121,7 +121,7 @@ mod tests {
     use crate::runs::workpod::agent_servers::*;
     use crucible::deploy::profile::DeployProfile;
     use crucible_contract::agent_servers::{
-        BuilderPods, BuilditSite, LocalServer, NodeArch, SharedCache, Transport,
+        BuilderPods, BuilditSite, CacheWriters, LocalServer, NodeArch, SharedCache, Transport,
     };
 
     const SOCKET: &str = "/run/spire/agent.sock";
@@ -337,8 +337,8 @@ mod tests {
         );
     }
 
-    /// A run on a cluster with the shared cache is told its URL and whether its builds write; a
-    /// run on another buildit cluster is told nothing of it.
+    /// A run on a cluster with the shared cache is told its URL and which builds write; a run on
+    /// another buildit cluster is told nothing of it.
     #[test]
     fn only_runs_on_a_cache_cluster_are_told_of_the_shared_cache() {
         let site = |tables: &str, cluster: &str| {
@@ -351,24 +351,24 @@ mod tests {
             }
         };
         let url = "http://buildit-cache.crucible-system.svc:8850";
-        let writes = format!(
+        let cache = format!(
             "{BUILDIT}[buildit.cache]\ncluster = \"k8s\"\ntoken_secret = \"buildit-cache-token\"\n"
         );
-        assert_eq!(
-            site(&writes, "k8s"),
+        let told = |writers| {
             Some(SharedCache {
                 url: url.into(),
-                write: true,
+                writers,
             })
+        };
+        assert_eq!(site(&cache, "k8s"), told(CacheWriters::Run));
+        assert_eq!(site(&cache, "ocp"), None);
+        assert_eq!(
+            site(&format!("{cache}writers = \"all\"\n"), "k8s"),
+            told(CacheWriters::All)
         );
-        assert_eq!(site(&writes, "ocp"), None);
-        let reads = format!("{writes}write = false\n");
         assert_eq!(
-            site(&reads, "k8s"),
-            Some(SharedCache {
-                url: url.into(),
-                write: false,
-            })
+            site(&format!("{cache}writers = \"none\"\n"), "k8s"),
+            told(CacheWriters::None)
         );
         assert_eq!(site(BUILDIT, "k8s"), None);
     }

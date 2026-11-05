@@ -9,6 +9,7 @@ use crate::openshell::gateway::{
 };
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
+use crucible_contract::agent_servers::CacheWriters;
 use crucible_contract::driver_env::{BrokerEnv, SandboxDriverEnv};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
@@ -1126,7 +1127,9 @@ exit $rc
         if self.profile.secrets.push_authfile.is_some() {
             mounts.push(ro("quay-push", PUSH_AUTHFILE_DIR, None));
         }
-        if buildit_cache::configured(self.profile).is_some_and(|(_, c)| c.write) {
+        if buildit_cache::configured(self.profile)
+            .is_some_and(|(_, c)| c.writers != CacheWriters::None)
+        {
             mounts.push(ro("buildit-cache-token", buildit_cache::TOKEN_DIR, None));
         }
         if self.spoke.is_some() {
@@ -1246,7 +1249,7 @@ exit $rc
         }
 
         if let Some((_, cache)) = buildit_cache::configured(self.profile)
-            && cache.write
+            && cache.writers != CacheWriters::None
         {
             volumes.push(core::Volume {
                 name: "buildit-cache-token".to_string(),
@@ -5218,7 +5221,7 @@ mod tests {
         assert!(!netpol.contains("- Egress"), "no egress: {netpol}");
     }
 
-    /// With `[buildit.cache]` and `write`, the loop pod mounts the token Secret, optional since a
+    /// With `[buildit.cache]` and any writers, the loop pod mounts the token Secret, optional since a
     /// cluster without the cache has none; builder pods may reach the cache either way. A run
     /// learns the cache itself from its buildit site, not the pod.
     #[test]
@@ -5300,7 +5303,7 @@ mod tests {
         );
 
         let reads =
-            docs("[buildit.cache]\ntoken_secret = \"buildit-cache-token\"\nwrite = false\n");
+            docs("[buildit.cache]\ntoken_secret = \"buildit-cache-token\"\nwriters = \"none\"\n");
         assert!(!mounted(&reads), "a read-only cache mounts no token");
         assert_eq!(
             builder_egress(&reads),

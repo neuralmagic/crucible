@@ -1,8 +1,9 @@
-# vllm-agent-build: an agent edits a vLLM CUDA kernel and builds vLLM through the run's buildit
-# from a plain Dockerfile; a command task renders each build's ninja and ccache logs as an html
-# trace. See README.md.
+# vllm-agent-build: a command task seeds the shared build cache with one build of a vLLM ref, then
+# agents fan out over CUDA kernels, each building vLLM from the seeded cache and then with its own
+# edit. A last command task renders every build as an html trace. See README.md.
 [workspace]
 inject = [
+    "seed.py",
     "build/Dockerfile",
     "trace/buildtrace.py",
     "trace/trace.html",
@@ -15,7 +16,7 @@ backend       = "openshell"
 harness       = "claude"
 model         = "claude-opus-4-6"
 sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-cc@sha256:36a11bb264a7268962eaf982986a631e7a2673848b468f8c8fd636c559770333"
-goal          = "Edit a vLLM CUDA kernel and build vLLM through the run's buildit."
+goal          = "Edit one vLLM CUDA kernel and build vLLM through the run's buildit, reading the cache the seed filled."
 
 [agent.openshell]
 binaries = ["/usr/bin/git", "/usr/lib/git-core/git-remote-https"]

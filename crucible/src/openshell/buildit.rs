@@ -5,7 +5,7 @@
 //! ([`crate::openshell::agent_servers`]).
 
 use anyhow::{Context, Result};
-use crucible_contract::agent_servers::{BuilditSite, NodeArch};
+use crucible_contract::agent_servers::{BuilditSite, CacheWriters, NodeArch};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -113,11 +113,18 @@ impl Buildit<'_> {
         }
         if let Some(cache) = &self.site.cache {
             args.extend(["--cache-url", &cache.url].map(String::from));
-            if cache.write {
+            let writers = match cache.writers {
+                CacheWriters::None => None,
+                CacheWriters::Run => Some("run"),
+                CacheWriters::All => Some("all"),
+            };
+            if let Some(writers) = writers {
                 args.extend(
                     [
                         "--cache-token-file",
                         crucible_contract::buildit::CACHE_TOKEN_FILE,
+                        "--cache-writers",
+                        writers,
                     ]
                     .map(String::from),
                 );
@@ -262,29 +269,31 @@ mod tests {
             "no cache: {args:?}"
         );
         let url = "http://buildit-cache.crucible-system.svc:8850";
-        let reads = BuilditSite {
+        let cached = |writers| BuilditSite {
             cache: Some(SharedCache {
                 url: url.into(),
-                write: false,
+                writers,
             }),
             ..plain.clone()
         };
-        let args = buildit(&reads).args(&run, "/p").unwrap();
+        let args = buildit(&cached(CacheWriters::None))
+            .args(&run, "/p")
+            .unwrap();
         assert_eq!(flag(&args, "--cache-url").as_deref(), Some(url));
         assert!(!args.contains(&"--cache-token-file".to_string()));
-        let writes = BuilditSite {
-            cache: Some(SharedCache {
-                url: url.into(),
-                write: true,
-            }),
-            ..plain.clone()
-        };
-        let args = buildit(&writes).args(&run, "/p").unwrap();
-        assert_eq!(flag(&args, "--cache-url").as_deref(), Some(url));
+        assert!(!args.contains(&"--cache-writers".to_string()));
+        let args = buildit(&cached(CacheWriters::Run))
+            .args(&run, "/p")
+            .unwrap();
         assert_eq!(
             flag(&args, "--cache-token-file").as_deref(),
             Some("/etc/buildit-cache/token")
         );
+        assert_eq!(flag(&args, "--cache-writers").as_deref(), Some("run"));
+        let args = buildit(&cached(CacheWriters::All))
+            .args(&run, "/p")
+            .unwrap();
+        assert_eq!(flag(&args, "--cache-writers").as_deref(), Some("all"));
         let queued = BuilditSite {
             queue: Some("builders".into()),
             ..plain.clone()
