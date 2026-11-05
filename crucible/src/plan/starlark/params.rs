@@ -296,6 +296,8 @@ impl Params {
             "additionalProperties": false,
             "properties": properties,
             "required": required,
+            // Object keys do not survive a JSONB round trip in order; a launch form reads this.
+            "x-order": self.0.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
         })
     }
 }
