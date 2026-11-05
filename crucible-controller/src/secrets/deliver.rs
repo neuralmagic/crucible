@@ -54,6 +54,7 @@ pub enum DeliverError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitToken {
     pub key: String,
+    pub binding_id: String,
     pub secret_id: String,
     pub minted: bool,
 }
@@ -66,6 +67,7 @@ const GITHUB_ENV: [&str; 2] = ["GH_TOKEN", "GITHUB_TOKEN"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GithubBinding {
     pub key: String,
+    pub binding_id: String,
     pub secret_id: String,
     pub minted: bool,
     pub kind: ProjectionKind,
@@ -210,6 +212,7 @@ pub fn assemble(
         if minted || github_env {
             delivery.github.push(GithubBinding {
                 key: name,
+                binding_id: mint.item.binding_id.clone(),
                 secret_id: row.id.clone(),
                 minted,
                 kind: mint.item.projection_kind,
@@ -251,6 +254,7 @@ impl Delivery {
             }
             self.git_token = Some(GitToken {
                 key: binding.key,
+                binding_id: binding.binding_id,
                 secret_id: binding.secret_id,
                 minted: binding.minted,
             });
@@ -629,6 +633,7 @@ mod tests {
     fn mint(name: &str, kind: ProjectionKind, projection: &str) -> GrantMint {
         GrantMint {
             item: crate::secrets::grant::GrantItem {
+                binding_id: format!("binding-{name}"),
                 secret_id: format!("id-{name}"),
                 declared_name: SecretName::parse(name).unwrap(),
                 projection_kind: kind,
