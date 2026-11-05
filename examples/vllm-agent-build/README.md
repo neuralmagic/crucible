@@ -2,8 +2,8 @@
 
 A `seed` command builds vLLM at `vllm_ref` once through the run's own `buildit`. Agents then fan
 out over CUDA kernels, one per kernel in `kernels`, at most eight at a time. Each builds the same
-ref as checked out, edits its kernel, and builds again. The `trace` task renders every build into
-`traces/index.html`, which the run page shows under its captured files.
+ref as checked out, then edits its kernel and builds again, three times. The `trace` task renders
+every build into `traces/index.html`, which the run page shows under its captured files.
 
 ## The deployment
 
@@ -45,10 +45,12 @@ known ref and a known Dockerfile, every agent's `checkout` build is served from 
   copies the build's logs to `traces/seed.*`. Its last stdout line emits `kernels`, the list
   `edit` maps over.
 - Every build names the same buildit caches: ccache's directory and vLLM's FetchContent sources
-  (`.deps`). buildit keeps them in the caller's builder pod between builds. The CMake build dir is
-  not cached: configure writes generated kernels such as Marlin's `kernel_selector.h` into the
-  source tree, which every build replaces, and a cached build dir records them as already
-  generated.
+  (`.deps`). buildit keeps them in the caller's builder pod between builds. `.deps` is also a
+  cluster cache, keyed by `CMakeLists.txt` and `cmake/external_projects`, where vLLM pins every
+  dependency: the seed saves it, and each agent's new pod restores it instead of cloning about
+  4 GB from GitHub. The CMake build dir is not cached: configure writes generated kernels such as
+  Marlin's `kernel_selector.h` into the source tree, which every build replaces, and a cached
+  build dir records them as already generated.
 - Every build also sets `ccache: true`. buildit then mounts a generated `/etc/ccache.conf` into
   every `RUN` step, with the shared cache as ccache's remote storage, and logs each object to
   `/buildit/ccache-stats.log`.

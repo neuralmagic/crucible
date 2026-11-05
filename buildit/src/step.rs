@@ -15,8 +15,11 @@
 //! <log>.published  JSON `Published`, the broker-side outcome of the fetch
 //! ```
 //!
-//! A build also stamps each `STEP` and `COMMIT` line of its log, and its end, into a steps file:
-//! `<unix ns> <line>`, then `<unix ns> END <exit record>` once the runner has exited.
+//! A build also stamps each `STEP`, `COMMIT` and `CACHE` line of its log, and its end, into a
+//! steps file: `<unix ns> <line>`, then `<unix ns> END <exit record>` once the runner has exited.
+//!
+//! A build with cluster caches restores their snapshots before `bud` and, when `bud` succeeds and
+//! the build may write to the shared cache, saves them after it ([`RESTORE`], [`SAVE`]).
 //!
 //! A build also copies its exit record to the termination log and mirrors its log to the
 //! container's stdout, so both outlive the pod's deadline.
@@ -56,15 +59,25 @@ stage() {
 term=
 case $mode in
 build)
-  secs=$1; term=$2; steps=$3; shift 3
+  secs=$1; term=$2; steps=$3; plan=$4; url=$5; auth=$6; restore=$7; save=$8; shift 8
   sleep 2147483647 & hold=$!
   {
-    tail -n +1 -f -s 0.1 --pid=$hold "$log" 2> /dev/null | grep --line-buffered -E '^(STEP |COMMIT )' \
+    tail -n +1 -f -s 0.1 --pid=$hold "$log" 2> /dev/null \
+      | grep --line-buffered -E '^(STEP |COMMIT |CACHE )' \
       | while IFS= read -r l; do printf '%s %s\n' "$(date +%s%N)" "$l"; done
     n=50; while [ ! -s "$log.exit" ] && [ "$n" -gt 0 ]; do sleep 0.1; n=$((n - 1)); done
     printf '%s END %s\n' "$(date +%s%N)" "$(head -n 1 "$log.exit" 2> /dev/null)"
   } >> "$steps" &
-  stage "$secs" "$@"; c=$?
+  if [ -n "$plan" ]; then
+    printf '%s\n' "$restore" > "$log.restore"
+    stage 900 sh "$log.restore" "$plan" "$url"
+  fi
+  stage "$secs" "$@"; bc=$?; bt=$t
+  if [ "$bc" -eq 0 ] && [ -n "$plan" ] && [ -s "$auth" ]; then
+    printf '%s\n' "$save" > "$log.save"
+    stage 900 sh "$log.save" "$plan" "$url" "$auth"
+  fi
+  c=$bc; t=$bt
   kill "$hold" 2> /dev/null; wait "$hold" 2> /dev/null
   ;;
 run)
@@ -86,6 +99,61 @@ printf '%s%s\n' "$c" "$t" > "$log.exit.$$" && ln "$log.exit.$$" "$log.exit" 2>/d
 rm -f "$log.exit.$$"
 [ -n "$term" ] && { cat "$log.exit"; printf '%s\n' "$log"; } > "$term" 2>/dev/null
 exit 0"#;
+
+/// Restores each cluster cache in a build's snapshot plan, `<name> <key> <dir> <use>` per line,
+/// whose directory is empty: the snapshot under its key, else the newest one under its name.
+/// Arguments: the plan and the shared cache's URL.
+pub(crate) const RESTORE: &str = r#"plan=$1; url=$2
+while read -r name key dir use; do
+  echo "CACHE restore $name"
+  if [ -n "$(ls -A "$dir" 2> /dev/null)" ]; then
+    echo "cache $name: kept in this pod"
+    continue
+  fi
+  newest=$(curl -fsS --max-time 30 "$url/dirs/$name/newest" 2> /dev/null)
+  got=
+  for k in "$key" "$newest"; do
+    case $k in "" | *[!0-9a-f]*) continue ;; esac
+    rm -rf "$dir.part" "$dir.snap"
+    if curl -fsS -o "$dir.snap" "$url/dirs/$name/$k" 2> /dev/null && mkdir -p "$dir.part" \
+      && tar --zstd -xf "$dir.snap" -C "$dir.part"; then
+      rm -rf "$dir" && mv "$dir.part" "$dir" && got=$k
+    fi
+    rm -rf "$dir.part" "$dir.snap"
+    [ -n "$got" ] && break
+  done
+  case $got in
+    "") echo "cache $name: no snapshot" ;;
+    "$key") echo "cache $name: restored $key" ;;
+    *) echo "cache $name: restored the newest snapshot, $got" ;;
+  esac
+done < "$plan""#;
+
+/// Saves each cluster cache in a build's snapshot plan marked `save` under its key, unless the
+/// key has a snapshot already or the cache is empty, and points its name's newest at it.
+/// Arguments: the plan, the shared cache's URL, and a file holding the `Authorization` header.
+pub(crate) const SAVE: &str = r#"plan=$1; url=$2; auth=$3
+while read -r name key dir use; do
+  [ "$use" = save ] || continue
+  echo "CACHE save $name"
+  if curl -fsS -o /dev/null -I "$url/dirs/$name/$key" 2> /dev/null; then
+    echo "cache $name: $key is saved already"
+    continue
+  fi
+  if [ -z "$(ls -A "$dir" 2> /dev/null)" ]; then
+    echo "cache $name: empty, not saved"
+    continue
+  fi
+  rm -f "$dir.snap"
+  if tar --zstd -cf "$dir.snap" -C "$dir" . \
+    && curl -fsS -o /dev/null -H @"$auth" -T "$dir.snap" "$url/dirs/$name/$key" \
+    && printf '%s' "$key" | curl -fsS -o /dev/null -H @"$auth" -T - "$url/dirs/$name/newest"; then
+    echo "cache $name: saved $key, $(($(wc -c < "$dir.snap") / 1048576)) MiB"
+  else
+    echo "cache $name: not saved"
+  fi
+  rm -f "$dir.snap"
+done < "$plan""#;
 
 pub(crate) const LAUNCH: &str = r#"body=$1; log=$2; mirror=$3; shift 3
 mkdir -p "${log%/*}" && : >> "$log" && cat > "$log.paths" || exit 1
@@ -280,13 +348,36 @@ fn sh(script: &str, args: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// Where a build's cluster cache snapshots are handled: the plan [`RESTORE`] and [`SAVE`] read,
+/// the shared cache's URL, and the file holding the header a save sends, which exists only when
+/// the build may save.
+pub struct SnapshotFiles {
+    pub plan: String,
+    pub url: String,
+    pub auth: String,
+}
+
 /// `steps` is the file the build stamps its steps into.
-pub fn build_args(limit: Duration, steps: &str, cmd: &[String]) -> Vec<String> {
+pub fn build_args(
+    limit: Duration,
+    steps: &str,
+    snapshots: Option<&SnapshotFiles>,
+    cmd: &[String],
+) -> Vec<String> {
+    let (plan, url, auth) = match snapshots {
+        Some(s) => (s.plan.as_str(), s.url.as_str(), s.auth.as_str()),
+        None => ("", "", ""),
+    };
     let mut args = vec![
         "build".to_string(),
         limit.as_secs().to_string(),
         TERMINATION_LOG.to_string(),
         steps.to_string(),
+        plan.to_string(),
+        url.to_string(),
+        auth.to_string(),
+        RESTORE.to_string(),
+        SAVE.to_string(),
     ];
     args.extend_from_slice(cmd);
     args
@@ -797,5 +888,117 @@ mod tests {
             }
         );
         zombie.wait().unwrap();
+    }
+
+    /// The snapshot scripts against a real `buildit cache`: the run's build saves a cache once
+    /// per key, a new pod restores that key or else the newest snapshot, a pod keeps what its
+    /// cache already holds, and nothing empty or unauthorized is ever saved.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn snapshots_are_saved_once_per_key_and_restored_into_empty_caches() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path().to_path_buf();
+        let token = w.join("token");
+        std::fs::write(&token, "tok\n").unwrap();
+        let store = crate::cache::Store::open(&w.join("data"), token, 1 << 30, 1 << 30).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, crate::cache::router(std::sync::Arc::new(store))).await
+        });
+        let file = |name: &str, body: &str| {
+            let path = w.join(name);
+            std::fs::write(&path, body).unwrap();
+            path.display().to_string()
+        };
+        let restore = file("restore.sh", crate::step::RESTORE);
+        let save = file("save.sh", crate::step::SAVE);
+        let auth = file("auth", "Authorization: Bearer tok\n");
+        let wrong = file("wrong", "Authorization: Bearer nope\n");
+        let run = |script: &str, plan: &str, auth: &str| {
+            let plan = file("plan", plan);
+            let out = std::process::Command::new("sh")
+                .args([script, &plan, &url, auth])
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let k1 = "1".repeat(64);
+        let k2 = "2".repeat(64);
+        let filled = w.join("pod-1/deps");
+        std::fs::create_dir_all(filled.join("cutlass-src/include")).unwrap();
+        std::fs::write(filled.join("cutlass-src/include/gemm.h"), "// pinned\n").unwrap();
+        let dir = |p: &std::path::Path| p.display().to_string();
+
+        let out = run(&save, &format!("deps {k1} {} save\n", dir(&filled)), &auth);
+        assert!(
+            out.contains("CACHE save deps") && out.contains(&format!("saved {k1}")),
+            "{out}"
+        );
+        let out = run(&save, &format!("deps {k1} {} save\n", dir(&filled)), &auth);
+        assert!(out.contains(&format!("{k1} is saved already")), "{out}");
+
+        let fresh = w.join("pod-2/deps");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let plan = format!("deps {k1} {} restore\n", dir(&fresh));
+        let out = run(&restore, &plan, "");
+        assert!(
+            out.contains("CACHE restore deps") && out.contains(&format!("restored {k1}")),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fresh.join("cutlass-src/include/gemm.h")).unwrap(),
+            "// pinned\n"
+        );
+        let out = run(&restore, &plan, "");
+        assert!(out.contains("kept in this pod"), "{out}");
+
+        let moved = w.join("pod-3/deps");
+        std::fs::create_dir_all(&moved).unwrap();
+        let out = run(&restore, &format!("deps {k2} {} save\n", dir(&moved)), "");
+        assert!(
+            out.contains(&format!("restored the newest snapshot, {k1}")),
+            "{out}"
+        );
+        assert!(moved.join("cutlass-src/include/gemm.h").is_file());
+
+        let out = run(
+            &save,
+            &format!("deps {k2} {} restore\n", dir(&moved)),
+            &auth,
+        );
+        assert!(
+            !out.contains("CACHE save"),
+            "a restore-only cache is never saved: {out}"
+        );
+        let out = run(&save, &format!("deps {k2} {} save\n", dir(&moved)), &wrong);
+        assert!(out.contains("deps: not saved"), "{out}");
+        let empty = w.join("pod-4/deps");
+        std::fs::create_dir_all(&empty).unwrap();
+        let out = run(&save, &format!("deps {k2} {} save\n", dir(&empty)), &auth);
+        assert!(out.contains("empty, not saved"), "{out}");
+        let none = w.join("pod-5/other");
+        std::fs::create_dir_all(&none).unwrap();
+        let out = run(
+            &restore,
+            &format!("other {k2} {} restore\n", dir(&none)),
+            "",
+        );
+        assert!(out.contains("other: no snapshot"), "{out}");
+        assert!(std::fs::read_dir(&none).unwrap().next().is_none());
+
+        let out = run(&save, &format!("deps {k2} {} save\n", dir(&moved)), &auth);
+        assert!(out.contains(&format!("saved {k2}")), "{out}");
+        let latest = w.join("pod-6/deps");
+        std::fs::create_dir_all(&latest).unwrap();
+        let out = run(
+            &restore,
+            &format!("deps {} {} restore\n", "3".repeat(64), dir(&latest)),
+            "",
+        );
+        assert!(
+            out.contains(&format!("restored the newest snapshot, {k2}")),
+            "{out}"
+        );
     }
 }

@@ -11,6 +11,7 @@ params = {
 }
 
 LOGS = ["ninja_log", "ccache-stats.log", "steps.log"]
+BUILDS = ["checkout", "edit1", "edit2", "edit3"]
 
 seed = command(
     name = "seed",
@@ -32,7 +33,7 @@ edit = agent(
     max_fanout = 8,
     isolated = True,
     required = False,
-    emits_files = ["report.json"] + ["traces/%s.%s" % (b, log) for b in ["checkout", "edit"] for log in LOGS],
+    emits_files = ["report.json"] + ["traces/%s.%s" % (b, log) for b in BUILDS for log in LOGS],
     timeout = "120m",
 )
 

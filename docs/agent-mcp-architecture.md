@@ -1785,6 +1785,15 @@ when the build may write. With `writers = "run"` only the run's own builds, on i
 uses the cache only if its `RUN` steps read that file, as the vLLM bench's informer does for ccache
 and its build store.
 
+A cache a build declares with `scope: "cluster"` is kept in the shared cache too, as a snapshot
+under `dirs/<name>/<key>`. The key is a sha256 over the name and the contents of the context paths
+the cache names in `key`, such as the files that pin its sources. Before `bud` the builder pod
+restores the snapshot under that key into the cache, or the newest one under the name, when the
+cache is empty; after a successful `bud`, a build that may write saves the cache under its key
+unless the key has a snapshot already (`step::RESTORE`, `step::SAVE`). The same `writers` decide
+who saves, and the save reads its token from a file in the build's log dir, which `RUN` steps
+never see.
+
 Warning: with `writers = "all"`, `RUN` steps of agents' builds can read the token, so any run's
 agent on the cluster can store objects that other runs' builds then use. Set it only where runs
 trust each other.

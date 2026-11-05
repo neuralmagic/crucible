@@ -97,6 +97,11 @@ const CCACHE_STATS: &str = "ccache-stats.log";
 const STEPS_LOG: &str = "steps.log";
 const CCACHE_USER: &str = "buildit";
 const CACHES_FILE: &str = "caches";
+/// A build's cluster cache snapshot plan in its log dir, one `<name> <key> <dir> <use>` line each
+/// (`step::RESTORE`, `step::SAVE`).
+const SNAPSHOTS_FILE: &str = "snapshots";
+/// The `Authorization` header a build that saves snapshots sends, written only for such a build.
+const SNAPSHOT_AUTH_FILE: &str = "snapshots.auth";
 const MAX_FACTS: u64 = 64 * 1024;
 const CACHE_FILE: &str = "cache.json";
 const LIST_BACKOFF: Duration = Duration::from_secs(1);
@@ -590,6 +595,15 @@ fn cache_volumes(caches: &[CacheSpec]) -> Result<Vec<(String, String)>> {
             if !names.insert(c.name.as_str()) || !paths.insert(c.path.as_str()) {
                 bail!("cache {:?} at {:?} repeats a name or path", c.name, c.path);
             }
+            if !c.key.is_empty() && c.scope != CacheScope::Cluster {
+                bail!(
+                    "cache {:?} has a key, which only a cluster cache uses",
+                    c.name
+                );
+            }
+            for key in &c.key {
+                RelPath::parse(key).with_context(|| format!("cache {:?} key", c.name))?;
+            }
             let mode = if c.read_only { "ro" } else { "rw" };
             Ok((
                 format!("{CACHE_ROOT}/{}", c.name),
@@ -719,6 +733,32 @@ pub struct Broker {
     run_caller: Option<SandboxName>,
 }
 
+/// What a build does with a cluster cache's snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotUse {
+    /// Restore it into the cache when the cache is empty.
+    Restore,
+    /// Restore it, and once the build succeeds save the cache under its key if the key has no
+    /// snapshot yet.
+    Save,
+}
+
+impl SnapshotUse {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Restore => "restore",
+            Self::Save => "save",
+        }
+    }
+}
+
+/// A build's cluster caches: the snapshot plan, and the header its saves send.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Snapshots {
+    plan: String,
+    auth: Option<String>,
+}
+
 /// The builds that get the shared cache's write token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum CacheWriters {
@@ -752,6 +792,41 @@ impl SharedCache {
             doc["token"] = serde_json::Value::String(t);
         }
         doc.to_string().into_bytes()
+    }
+
+    /// The snapshots of the cluster caches among `caches`, each keyed from the context `tar`. A
+    /// build saves those it mounts read-write when `starter` may write to the shared cache.
+    fn snapshots(&self, caches: &[CacheSpec], tar: &[u8], starter: Starter) -> Result<Snapshots> {
+        let token = self.token_for(starter);
+        let mut snapshots = Snapshots::default();
+        for c in caches.iter().filter(|c| c.scope == CacheScope::Cluster) {
+            let paths = c
+                .key
+                .iter()
+                .map(|k| RelPath::parse(k))
+                .collect::<Result<Vec<_>>>()?;
+            let key = crate::context::cache_key(&c.name, tar, &paths)?;
+            let used = match (&token, c.read_only) {
+                (Some(_), false) => SnapshotUse::Save,
+                _ => SnapshotUse::Restore,
+            };
+            snapshots.plan.push_str(&format!(
+                "{name} {key} {CACHE_ROOT}/{name} {}\n",
+                used.as_str(),
+                name = c.name
+            ));
+            if used == SnapshotUse::Save {
+                snapshots.auth = token
+                    .as_ref()
+                    .map(|t| format!("Authorization: Bearer {t}\n"));
+            }
+        }
+        Ok(snapshots)
+    }
+
+    /// The cache's URL without a trailing `/`, for the snapshot scripts to append paths to.
+    fn base(&self) -> String {
+        self.url.as_str().trim_end_matches('/').to_string()
     }
 
     /// The write token for a build `starter` started, if it may write.
@@ -913,6 +988,27 @@ pub struct CacheSpec {
     /// Mount it read-only
     #[serde(default)]
     pub read_only: bool,
+    /// Where it lives between builds (default "pod")
+    #[serde(default)]
+    pub scope: CacheScope,
+    /// For a "cluster" cache: files or directories of the context whose contents decide what
+    /// the cache holds, such as the files that pin its sources. Their hash keys its snapshot
+    #[serde(default)]
+    pub key: Vec<String>,
+}
+
+/// Where a cache lives between builds.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheScope {
+    /// In the sandbox's builder pod, for its later builds there
+    #[default]
+    Pod,
+    /// Also in the shared cache. A new builder pod starts from the snapshot under its key, or
+    /// else the newest one, and a build that may write to the shared cache saves it under its key
+    Cluster,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1681,6 +1777,15 @@ impl Broker {
         let tar = crate::context::staged_tar_bytes(&ctx)?;
         let digest = crate::context::digest(&tar)?;
         let tarball = crate::context::gzip(&tar)?;
+        let starter = if self.run_caller.as_ref() == Some(&caller.sandbox) {
+            Starter::Run
+        } else {
+            Starter::Sandbox
+        };
+        let snapshots = match &self.shared_cache {
+            Some(cache) => cache.snapshots(&p.caches, &tar, starter)?,
+            None => Snapshots::default(),
+        };
         let (id, pod, warm_age) = match warm {
             Some((pod, age)) => (BuildId::warm(&pod.name), pod, Some(age)),
             None => {
@@ -1734,10 +1839,24 @@ impl Broker {
             let file = format!("{}/{CACHES_FILE}", StepLog::dir(&id.0));
             let write = argv(["sh", "-c", r#"cat > "$1""#, "sh", &file]);
             pod.exec_with_stdin(&write, specs.as_bytes()).await?;
-            let starter = if self.run_caller.as_ref() == Some(&caller.sandbox) {
-                Starter::Run
-            } else {
-                Starter::Sandbox
+            let snapshot_files = match &self.shared_cache {
+                Some(cache) if !snapshots.plan.is_empty() => {
+                    let dir = StepLog::dir(&id.0);
+                    let files = step::SnapshotFiles {
+                        plan: format!("{dir}/{SNAPSHOTS_FILE}"),
+                        url: cache.base(),
+                        auth: format!("{dir}/{SNAPSHOT_AUTH_FILE}"),
+                    };
+                    let write = argv(["sh", "-c", r#"cat > "$1""#, "sh", &files.plan]);
+                    pod.exec_with_stdin(&write, snapshots.plan.as_bytes()).await?;
+                    if let Some(auth) = &snapshots.auth {
+                        let write =
+                            argv(["sh", "-c", r#"umask 077 && cat > "$1""#, "sh", &files.auth]);
+                        pod.exec_with_stdin(&write, auth.as_bytes()).await?;
+                    }
+                    Some(files)
+                }
+                _ => None,
             };
             if let Some(cache) = &self.shared_cache {
                 let file = format!("{}/{CACHE_FILE}", id.facts_dir());
@@ -1752,7 +1871,7 @@ impl Broker {
             }
             let limit = build_limit(requested, self.deadline_secs, used)?;
             let steps = format!("{}/{STEPS_LOG}", id.facts_dir());
-            let args = step::build_args(limit, &steps, &bud);
+            let args = step::build_args(limit, &steps, snapshot_files.as_ref(), &bud);
             let log = id.log(LogName::Build);
             step::launch(&pod, &log, Some(step::CONTAINER_STDOUT), &[], args).await?;
             step::snapshot(&pod, &log)
@@ -2515,12 +2634,13 @@ mod tests {
 
     use crate::mcp::{
         ANNOTATION_LAYOUT, BUSY_SCRIPT, Broker, BuildId, BuildParams, BuilditMcp, BuilditRules,
-        CacheSpec, CacheWriters, Caller, KUEUE_GATE, LABEL_QUEUE, LAYOUT_SHARED, Launcher,
-        LogsParams, MCP_PATH, PodView, PushParams, PushTarget, REUSE_SLACK, ResourceServer,
-        ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, SharedCache, Starter, StatusCode,
-        TokenLine, ToolPolicy, TrustedIssuer, alive, annotated_digest, annotation, argv,
-        bind_socket, bud_argv, build_limit, cache_volumes, ccache_conf, held, hosts, parse_tokens,
-        push_argv, read_only_volumes, reusable, router, run_sandbox, socket_router, unpack,
+        CACHE_ROOT, CacheScope, CacheSpec, CacheWriters, Caller, KUEUE_GATE, LABEL_QUEUE,
+        LAYOUT_SHARED, Launcher, LogsParams, MCP_PATH, PodView, PushParams, PushTarget,
+        REUSE_SLACK, ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ,
+        SharedCache, Snapshots, Starter, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, alive,
+        annotated_digest, annotation, argv, bind_socket, bud_argv, build_limit, cache_volumes,
+        ccache_conf, held, hosts, parse_tokens, push_argv, read_only_volumes, reusable, router,
+        run_sandbox, socket_router, unpack,
     };
     use crate::pod::BuilderPod;
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
@@ -4185,6 +4305,8 @@ mod tests {
             name: "ccache".to_string(),
             path: "/root/.cache/ccache".to_string(),
             read_only: false,
+            scope: CacheScope::Pod,
+            key: Vec::new(),
         }])
         .unwrap();
         let layered = bud_argv(&id, &df, None, &args, true, &caches, false).unwrap();
@@ -4248,6 +4370,84 @@ mod tests {
         assert_eq!(
             doc(&cache(None, CacheWriters::All), Starter::Run),
             serde_json::json!({ "url": url })
+        );
+    }
+
+    /// A build's snapshot plan holds its cluster caches alone, each keyed from the context, and
+    /// saves only what the build mounts read-write and may write to the shared cache.
+    #[test]
+    fn a_build_saves_the_cluster_caches_it_may_write_and_restores_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "tok-1\n").unwrap();
+        let ctx = dir.path().join("ctx");
+        std::fs::create_dir_all(ctx.join("vllm/cmake")).unwrap();
+        std::fs::write(ctx.join("vllm/cmake/deps.cmake"), "GIT_TAG 9cd61de\n").unwrap();
+        let tar = crate::context::staged_tar_bytes(&ctx).unwrap();
+        let cache = |writers| SharedCache {
+            url: url::Url::parse("http://cache.example.svc:8850/").unwrap(),
+            token_file: Some(token.clone()),
+            writers,
+        };
+        let spec = |name: &str, read_only, scope, key: &[&str]| CacheSpec {
+            name: name.to_string(),
+            path: format!("/{name}"),
+            read_only,
+            scope,
+            key: key.iter().map(|k| k.to_string()).collect(),
+        };
+        let caches = [
+            spec("deps", false, CacheScope::Cluster, &["vllm/cmake"]),
+            spec("pinned", true, CacheScope::Cluster, &[]),
+            spec("ccache", false, CacheScope::Pod, &[]),
+        ];
+        let deps =
+            crate::context::cache_key("deps", &tar, &[RelPath::parse("vllm/cmake").unwrap()])
+                .unwrap();
+        let pinned = crate::context::cache_key("pinned", &tar, &[]).unwrap();
+        let plan = |uses: [&str; 2]| {
+            format!(
+                "deps {deps} {CACHE_ROOT}/deps {}\npinned {pinned} {CACHE_ROOT}/pinned {}\n",
+                uses[0], uses[1]
+            )
+        };
+        let header = Some("Authorization: Bearer tok-1\n".to_string());
+        assert_eq!(
+            cache(CacheWriters::Run)
+                .snapshots(&caches, &tar, Starter::Run)
+                .unwrap(),
+            Snapshots {
+                plan: plan(["save", "restore"]),
+                auth: header.clone(),
+            }
+        );
+        assert_eq!(
+            cache(CacheWriters::Run)
+                .snapshots(&caches, &tar, Starter::Sandbox)
+                .unwrap(),
+            Snapshots {
+                plan: plan(["restore", "restore"]),
+                auth: None,
+            }
+        );
+        assert_eq!(
+            cache(CacheWriters::All)
+                .snapshots(&caches, &tar, Starter::Sandbox)
+                .unwrap(),
+            Snapshots {
+                plan: plan(["save", "restore"]),
+                auth: header,
+            }
+        );
+        assert_eq!(
+            cache(CacheWriters::Run)
+                .snapshots(&caches[2..], &tar, Starter::Run)
+                .unwrap(),
+            Snapshots::default()
+        );
+        assert_eq!(
+            cache(CacheWriters::Run).base(),
+            "http://cache.example.svc:8850"
         );
     }
 
@@ -4326,6 +4526,8 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             read_only,
+            scope: CacheScope::Pod,
+            key: Vec::new(),
         };
         let ok = cache_volumes(&[
             spec("ccache", "/root/.cache/ccache", false),
@@ -4367,6 +4569,23 @@ mod tests {
                 .collect(),
         ] {
             assert!(cache_volumes(&bad).is_err(), "{bad:?}");
+        }
+        let keyed = |scope, key: &str| CacheSpec {
+            scope,
+            key: vec![key.to_string()],
+            ..spec("deps", "/src/vllm/.deps", false)
+        };
+        assert!(cache_volumes(&[keyed(CacheScope::Cluster, "vllm/cmake")]).is_ok());
+        for bad in [
+            keyed(CacheScope::Pod, "vllm/cmake"),
+            keyed(CacheScope::Cluster, "/vllm/cmake"),
+            keyed(CacheScope::Cluster, "vllm/../cmake"),
+            keyed(CacheScope::Cluster, "."),
+        ] {
+            assert!(
+                cache_volumes(std::slice::from_ref(&bad)).is_err(),
+                "{bad:?}"
+            );
         }
     }
 
@@ -4908,6 +5127,8 @@ mod tests {
                 name: "plain-objs".to_string(),
                 path: "/objs".to_string(),
                 read_only: false,
+                scope: CacheScope::Pod,
+                key: Vec::new(),
             }]
         };
         let build = |token: &'static str, nonce: String| {
@@ -5036,6 +5257,213 @@ mod tests {
         assert!(
             stamped("STEP 1/") && stamped("COMMIT ") && stamped("END 0"),
             "the build's steps are stamped under /buildit: {out}"
+        );
+
+        for token in ["tok-a", "tok-b"] {
+            call(&addr, token, "clean", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        on_socket(&socket, Call::Clean(CleanParams { build_id: None })).await;
+    }
+
+    /// A cluster cache through the run's socket and sandboxes' tokens: the run's build fills it and
+    /// saves it under its key, a sandbox's new pod restores that snapshot and saves nothing, and a
+    /// new key starts a new pod from the newest snapshot, which the run's next build saves under
+    /// the new key.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x and either \
+                BUILDIT_E2E_HOST_ADDR=<this host's address from a pod> for a cache on this host, or \
+                BUILDIT_E2E_CACHE_URL and BUILDIT_E2E_CACHE_TOKEN_FILE for a deployed one"]
+    async fn e2e_a_cluster_cache_the_run_saves_starts_a_sandbox_s_new_pod() {
+        use crate::client::{Call, run as on_socket};
+        use crate::mcp::{CleanParams, RunParams};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap();
+        let cache_token = work.join("cache-token");
+        let run = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (cache_url, _) = e2e_cache(&work, &cache_token).await;
+        std::fs::create_dir_all(work.join("svc")).unwrap();
+        let pins = |n: u32| {
+            std::fs::write(work.join("svc/pins.txt"), format!("cutlass {run}-{n}\n")).unwrap()
+        };
+        pins(1);
+        std::fs::write(
+            work.join("svc/Dockerfile"),
+            "FROM docker.io/library/alpine:3.20\n\
+             COPY pins.txt /pins.txt\n\
+             ARG NONCE\n\
+             RUN if [ -s /deps/pins.txt ]; then \\\n\
+               echo \"deps-from-cache $(cat /deps/nonce) $(cat /deps/pins.txt)\"; \\\n\
+             else cp /pins.txt /deps/pins.txt && echo \"$NONCE\" > /deps/nonce && echo \"deps-fetched $NONCE\"; fi\n",
+        )
+        .unwrap();
+        let file = tokens(&work, "tok-a sb-deps-a\ntok-b sb-deps-b\n");
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        let run_caller = run_sandbox(Some("buildit-deps-e2e")).unwrap();
+        let broker = Arc::new(Broker {
+            shared_cache: Some(SharedCache {
+                url: url::Url::parse(&cache_url).unwrap(),
+                token_file: Some(cache_token.clone()),
+                writers: CacheWriters::Run,
+            }),
+            run_caller: Some(run_caller.clone()),
+            ..Arc::into_inner(broker_with(client, &file, Some(&work), 900, true)).unwrap()
+        });
+        let (addr, _server) = serve(broker.clone()).await;
+        let socket = tmp.path().join("b.sock");
+        let listener = bind_socket(&socket).unwrap();
+        let ours = Caller {
+            sandbox: run_caller,
+            workspace: Workspace::Local { dir: work.clone() },
+            launched_by: None,
+        };
+        let app = socket_router(broker, ours, ToolPolicy::from_toml(POLICY).unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for token in ["tok-a", "tok-b"] {
+            call(&addr, token, "clean", serde_json::json!({}))
+                .await
+                .unwrap();
+        }
+        on_socket(&socket, Call::Clean(CleanParams { build_id: None })).await;
+        let grep = "^(deps-|cache deps|CACHE )";
+        let run_build = |nonce: String| {
+            let socket = socket.clone();
+            async move {
+                let built = on_socket(
+                    &socket,
+                    Call::Build {
+                        params: BuildParams {
+                            context: "svc".to_string(),
+                            dockerfile: None,
+                            target: None,
+                            build_args: BTreeMap::from([("NONCE".to_string(), nonce)]),
+                            timeout_s: Some(600),
+                            caches: vec![CacheSpec {
+                                name: "deps".to_string(),
+                                path: "/deps".to_string(),
+                                read_only: false,
+                                scope: CacheScope::Cluster,
+                                key: vec!["pins.txt".to_string()],
+                            }],
+                            ccache: false,
+                        },
+                        wait: true,
+                    },
+                )
+                .await;
+                assert_eq!(built.reply["status"], "succeeded", "{}", built.reply);
+                let id = built.reply["build_id"].as_str().unwrap().to_string();
+                let log = on_socket(
+                    &socket,
+                    Call::Logs(LogsParams {
+                        build_id: id.clone(),
+                        which: None,
+                        grep: Some(grep.to_string()),
+                        context: None,
+                        from_line: None,
+                        to_line: None,
+                        tail_lines: None,
+                        max_bytes: None,
+                    }),
+                )
+                .await;
+                (
+                    id,
+                    log.reply["lines"].as_str().unwrap_or_default().to_string(),
+                )
+            }
+        };
+        let sandbox_build = |token: &'static str, nonce: String| {
+            let addr = addr.clone();
+            async move {
+                let args = serde_json::json!({
+                    "context": "svc", "timeout_s": 600,
+                    "caches": [{ "name": "deps", "path": "/deps", "scope": "cluster", "key": ["pins.txt"] }],
+                    "build_args": { "NONCE": nonce },
+                });
+                let started = call(&addr, token, "build", args).await.unwrap();
+                let id = started["build_id"].as_str().unwrap().to_string();
+                let args = serde_json::json!({ "build_id": id });
+                for _ in 0..300 {
+                    let status = call(&addr, token, "status", args.clone()).await.unwrap();
+                    if status["status"] != "running" {
+                        assert_eq!(status["status"], "succeeded", "{status}");
+                        let logs = serde_json::json!({ "build_id": id, "grep": grep });
+                        let lines = call(&addr, token, "logs", logs).await.unwrap();
+                        return lines["lines"].as_str().unwrap_or_default().to_string();
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("build {id} still running after 600s");
+            }
+        };
+
+        let (first, log) = run_build(format!("{run}-seed")).await;
+        assert!(
+            log.contains("cache deps: no snapshot")
+                && log.contains(&format!("deps-fetched {run}-seed"))
+                && log.contains("cache deps: saved "),
+            "the run's own build fills the cache and saves it: {log}"
+        );
+        let log = sandbox_build("tok-b", format!("{run}-b")).await;
+        assert!(
+            log.contains("cache deps: restored ")
+                && !log.contains("restored the newest")
+                && log.contains(&format!("deps-from-cache {run}-seed cutlass {run}-1")),
+            "a sandbox's new pod starts from the snapshot under its key: {log}"
+        );
+        assert!(
+            !log.contains("CACHE save"),
+            "a sandbox's build saves nothing: {log}"
+        );
+
+        pins(2);
+        let log = sandbox_build("tok-a", format!("{run}-a")).await;
+        assert!(
+            log.contains("cache deps: restored the newest snapshot")
+                && log.contains(&format!("deps-from-cache {run}-seed cutlass {run}-1")),
+            "a new key starts from the newest snapshot: {log}"
+        );
+        let (_, log) = run_build(format!("{run}-seed-2")).await;
+        assert!(
+            log.contains("cache deps: kept in this pod") && log.contains("cache deps: saved "),
+            "the run's warm pod keeps its cache and saves it under the new key: {log}"
+        );
+        let (_, log) = run_build(format!("{run}-seed-3")).await;
+        assert!(
+            log.contains("is saved already"),
+            "a key is saved once: {log}"
+        );
+
+        let steps = on_socket(
+            &socket,
+            Call::Run(RunParams {
+                build_id: first,
+                cmd: vec!["cat".to_string(), "/buildit/steps.log".to_string()],
+                timeout_s: Some(60),
+                fetch_paths: Vec::new(),
+            }),
+        )
+        .await;
+        let stamped = steps.reply["log_tail"].as_str().unwrap_or_default();
+        assert!(
+            [
+                "CACHE restore deps",
+                "STEP 1/",
+                "COMMIT ",
+                "CACHE save deps",
+                "END 0"
+            ]
+            .iter()
+            .all(|line| stamped.contains(line)),
+            "the restore and the save are stamped as steps: {}",
+            steps.reply
         );
 
         for token in ["tok-a", "tok-b"] {
