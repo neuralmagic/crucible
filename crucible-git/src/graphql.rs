@@ -14,13 +14,13 @@ pub enum Kind {
     Subscription,
 }
 
-/// One top-level field: its name (never its alias), its arguments, and the name of every field
-/// selected beneath it, through fragments too.
+/// One top-level field: its name (never its alias), its arguments, and the path of field names to
+/// every field selected beneath it, through fragments too.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Field {
     pub name: String,
     pub args: Map<String, Value>,
-    pub nested: Vec<String>,
+    pub nested: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,7 +111,7 @@ pub fn operation(body: &[u8]) -> Result<Operation, Unreadable> {
         }
         let mut nested = Vec::new();
         if let Some(set) = field.selection_set() {
-            collect(&set, &fragments, &mut Vec::new(), &mut nested)?;
+            collect(&set, &fragments, &[], &mut Vec::new(), &mut nested)?;
         }
         fields.push(Field {
             name: name.text().to_string(),
@@ -122,27 +122,31 @@ pub fn operation(body: &[u8]) -> Result<Operation, Unreadable> {
     Ok(Operation { kind, fields })
 }
 
-/// Every field name selected in `set`, following inline fragments and named ones; `seen` guards
-/// against a fragment that spreads itself.
+/// The path to every field selected in `set` beneath `prefix`, following inline fragments and
+/// named ones; `seen` guards against a fragment that spreads itself.
 fn collect(
     set: &cst::SelectionSet,
     fragments: &std::collections::HashMap<String, cst::FragmentDefinition>,
+    prefix: &[String],
     seen: &mut Vec<String>,
-    out: &mut Vec<String>,
+    out: &mut Vec<Vec<String>>,
 ) -> Result<(), Unreadable> {
     for selection in set.selections() {
         match selection {
             cst::Selection::Field(f) => {
-                if let Some(name) = f.name() {
-                    out.push(name.text().to_string());
-                }
+                let Some(name) = f.name() else {
+                    continue;
+                };
+                let mut path = prefix.to_vec();
+                path.push(name.text().to_string());
                 if let Some(inner) = f.selection_set() {
-                    collect(&inner, fragments, seen, out)?;
+                    collect(&inner, fragments, &path, seen, out)?;
                 }
+                out.push(path);
             }
             cst::Selection::InlineFragment(frag) => {
                 if let Some(inner) = frag.selection_set() {
-                    collect(&inner, fragments, seen, out)?;
+                    collect(&inner, fragments, prefix, seen, out)?;
                 }
             }
             cst::Selection::FragmentSpread(spread) => {
@@ -157,7 +161,7 @@ fn collect(
                 let def = fragments.get(&name).ok_or(Unreadable::UnknownFragment)?;
                 seen.push(name);
                 if let Some(inner) = def.selection_set() {
-                    collect(&inner, fragments, seen, out)?;
+                    collect(&inner, fragments, prefix, seen, out)?;
                 }
                 seen.pop();
             }

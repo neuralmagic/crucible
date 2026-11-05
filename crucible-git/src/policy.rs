@@ -66,9 +66,9 @@ const PR_FOLLOW_UPS: [&str; 5] = [
 /// What a caller may select under `viewer`: who it is, and nothing it can reach.
 const VIEWER_FIELDS: [&str; 5] = ["login", "name", "id", "databaseId", "__typename"];
 
-/// Fields that lead from an allowed object to other owners, repositories or searches. Refused
-/// anywhere beneath an allowed field.
-const CROSSING: [&str; 19] = [
+/// Fields that open another owner's or repository's contents, or a search. Refused anywhere
+/// beneath an allowed field.
+const CROSSING: [&str; 18] = [
     "repository",
     "repositories",
     "repositoryOwner",
@@ -81,14 +81,55 @@ const CROSSING: [&str; 19] = [
     "node",
     "enterprise",
     "forks",
-    "parent",
-    "templateRepository",
     "starredRepositories",
     "watching",
     "pinnedItems",
     "topRepositories",
     "contributionsCollection",
+    "sponsoring",
 ];
+
+/// Fields that name another repository, which a caller may select for its identity alone (`gh`
+/// reads a repository's fork parent), from [`SHALLOW`] and nothing deeper.
+const IDENTITY_ONLY: [&str; 2] = ["parent", "templateRepository"];
+
+/// What may be selected beneath an [`IDENTITY_ONLY`] field.
+const SHALLOW: [&str; 18] = [
+    "description",
+    "hasIssuesEnabled",
+    "hasWikiEnabled",
+    "id",
+    "databaseId",
+    "name",
+    "nameWithOwner",
+    "owner",
+    "login",
+    "url",
+    "__typename",
+    "isPrivate",
+    "isFork",
+    "isArchived",
+    "visibility",
+    "viewerPermission",
+    "defaultBranchRef",
+    "isInOrganization",
+];
+
+/// Why a selection beneath an allowed field may not run, if it may not.
+fn crosses(path: &[String]) -> Option<String> {
+    for (i, seg) in path.iter().enumerate() {
+        if CROSSING.contains(&seg.as_str()) {
+            return Some(format!("{seg} reaches other repositories"));
+        }
+        if IDENTITY_ONLY.contains(&seg.as_str()) {
+            return path[i + 1..]
+                .iter()
+                .find(|s| !SHALLOW.contains(&s.as_str()))
+                .map(|s| format!("{seg} may only select another repository's identity, not {s}"));
+        }
+    }
+    None
+}
 
 /// Whether the decision reads the response: a GraphQL request, or a REST pull request create,
 /// whose result names the pull request the run now owns.
@@ -269,15 +310,10 @@ async fn graphql(state: &State, gh: &GitHub, allow: &Allow, body: &[u8]) -> Verd
         Ok(op) => op,
         Err(e) => return deny(e.to_string()),
     };
-    if let Some(field) = op
-        .fields
-        .iter()
-        .find(|f| f.nested.iter().any(|n| CROSSING.contains(&n.as_str())))
-    {
-        return deny(format!(
-            "{} selects a field that reaches other repositories",
-            field.name
-        ));
+    for field in &op.fields {
+        if let Some(why) = field.nested.iter().find_map(|p| crosses(p)) {
+            return deny(format!("{}: {why}", field.name));
+        }
     }
     match op.kind {
         Kind::Subscription => deny("crucible-git does not forward GraphQL subscriptions"),
@@ -308,6 +344,7 @@ async fn query_field(state: &State, gh: &GitHub, allow: &Allow, field: &Field) -
         "viewer" => match field
             .nested
             .iter()
+            .flatten()
             .all(|n| VIEWER_FIELDS.contains(&n.as_str()))
         {
             true => READ,

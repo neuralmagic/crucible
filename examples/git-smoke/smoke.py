@@ -18,7 +18,10 @@ def params() -> dict:
 
 
 def run(*args: str, cwd: str | None = None) -> str:
-    return subprocess.run(list(args), cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+    proc = subprocess.run(list(args), cwd=cwd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(f"{' '.join(args[:3])} failed ({proc.returncode}): {proc.stderr.strip()[-800:]}")
+    return proc.stdout.strip()
 
 
 def push(args: argparse.Namespace) -> None:
