@@ -44,18 +44,36 @@ pub enum RelayError {
     },
 }
 
+/// A rendered relay file and the values it was built from.
+pub struct Rendered {
+    pub content: String,
+    /// Each interpolated value of a template, or the whole content of a verbatim source: what the
+    /// turn redacts from its output.
+    pub values: Vec<String>,
+}
+
+impl Rendered {
+    fn verbatim(content: String) -> Rendered {
+        Rendered {
+            values: vec![content.clone()],
+            content,
+        }
+    }
+}
+
 /// Render a relay file's content from its single source: `template` (interpolated),
 /// `from_file` (verbatim), or `from_cmd` (a host command's stdout). The OpenShell backend
 /// targeted-uploads the rendered bytes to the sandbox path.
-pub fn render(ws: &Path, rf: &RelayFile) -> Result<String> {
+pub fn render(ws: &Path, rf: &RelayFile) -> Result<Rendered> {
     match (&rf.template, &rf.from_file, &rf.from_cmd) {
         (Some(tpl), None, None) => interpolate(ws, tpl)
             .with_context(|| format!("rendering relay template for {}", rf.dest)),
         (None, Some(src), None) => std::fs::read_to_string(src)
+            .map(Rendered::verbatim)
             .with_context(|| format!("reading relay source {src} for {}", rf.dest)),
-        (None, None, Some(cmd)) => {
-            run(ws, cmd).with_context(|| format!("running relay command for {}", rf.dest))
-        }
+        (None, None, Some(cmd)) => run(ws, cmd)
+            .map(Rendered::verbatim)
+            .with_context(|| format!("running relay command for {}", rf.dest)),
         _ => Err(RelayError::AmbiguousSource {
             dest: rf.dest.clone(),
         }
@@ -66,8 +84,9 @@ pub fn render(ws: &Path, rf: &RelayFile) -> Result<String> {
 /// Replace `${env:NAME}` / `${file:/p}` / `${file64:/p}` / `${cmd:...}` in a relay template.
 /// The closing `}` is matched with brace balancing, so a `${cmd:...}` whose command contains
 /// braces (e.g. kubectl `-o jsonpath={.x}`) is parsed whole.
-fn interpolate(ws: &Path, tpl: &str) -> Result<String> {
+fn interpolate(ws: &Path, tpl: &str) -> Result<Rendered> {
     let mut out = String::with_capacity(tpl.len());
+    let mut values = Vec::new();
     let mut rest = tpl;
     while let Some(at) = rest.find("${") {
         out.push_str(&rest[..at]);
@@ -94,10 +113,14 @@ fn interpolate(ws: &Path, tpl: &str) -> Result<String> {
             .into());
         };
         out.push_str(&val);
+        values.push(val);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
-    Ok(out)
+    Ok(Rendered {
+        content: out,
+        values,
+    })
 }
 
 /// Byte index of the `}` that closes the `${` we just consumed, balancing nested `{}` so a
@@ -141,7 +164,7 @@ fn run(ws: &Path, cmd: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::agent::relay::*;
 
     #[test]
     fn interpolates_env_file_and_file64() {
@@ -157,7 +180,8 @@ mod tests {
             "server: ${{env:RELAY_TEST_VAR}}\ntoken: ${{file:{p}}}\nca: ${{file64:{p}}}",
             p = tok.display()
         );
-        let out = interpolate(&tmp, &tpl).unwrap();
+        let rendered = interpolate(&tmp, &tpl).unwrap();
+        let out = &rendered.content;
         assert!(out.contains("server: the-server"));
         assert!(out.contains("token: abc123"), "file is trimmed: {out}");
         // base64 of the raw "  abc123\n" bytes (untrimmed).
@@ -166,6 +190,7 @@ mod tests {
             out.contains(&format!("ca: {want}")),
             "file64 untrimmed b64: {out}"
         );
+        assert_eq!(rendered.values, ["the-server", "abc123", want.as_str()]);
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -175,9 +200,30 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         // A command whose own braces must not terminate the directive early.
         let out = interpolate(&tmp, "tok: ${cmd:printf '%s' tok-{abc}-end}").unwrap();
-        assert_eq!(out, "tok: tok-{abc}-end");
+        assert_eq!(out.content, "tok: tok-{abc}-end");
+        assert_eq!(out.values, ["tok-{abc}-end"]);
         // A failing command surfaces as an error.
         assert!(interpolate(&tmp, "${cmd:exit 4}").is_err());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn a_verbatim_source_is_its_own_value() {
+        let tmp = std::env::temp_dir().join(format!("relay-verbatim-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let src = tmp.join("token");
+        std::fs::write(&src, "ghp_verbatim-token\n").unwrap();
+        let rf = |from_file: Option<String>, from_cmd: Option<String>| RelayFile {
+            dest: ".token".into(),
+            template: None,
+            from_file,
+            from_cmd,
+        };
+        let file = render(&tmp, &rf(Some(src.display().to_string()), None)).unwrap();
+        assert_eq!(file.content, "ghp_verbatim-token\n");
+        assert_eq!(file.values, std::slice::from_ref(&file.content));
+        let cmd = render(&tmp, &rf(None, Some("printf ghp_from-cmd".into()))).unwrap();
+        assert_eq!(cmd.values, ["ghp_from-cmd"]);
         std::fs::remove_dir_all(&tmp).ok();
     }
 

@@ -94,7 +94,10 @@ pub(crate) fn api_endpoint(
     if openai {
         let (base_url, default_wire) = match inference.openai_base_url.clone() {
             Some(url) => (url, WireApi::Chat),
-            None => ("https://api.openai.com/v1".to_string(), WireApi::Responses),
+            None => (
+                crate::agent::inference::OPENAI_API_URL.to_string(),
+                WireApi::Responses,
+            ),
         };
         ApiEndpoint::OpenAi {
             base_url,
@@ -105,7 +108,7 @@ pub(crate) fn api_endpoint(
             base_url: inference
                 .anthropic_base_url
                 .clone()
-                .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+                .unwrap_or_else(|| crate::agent::inference::ANTHROPIC_API_URL.to_string()),
         }
     }
 }
@@ -159,12 +162,14 @@ pub(crate) struct TurnArtifacts {
 
 /// The credential a sandbox turn resolved for its [`AuthProvider`], handed to the backend so it
 /// can seed whatever its CLI reads off disk.
+#[derive(Clone)]
 pub(crate) enum SandboxAuth {
     /// Served by the gateway's metadata emulator; nothing to seed.
     Gateway,
-    /// Relayed into the sandbox env; nothing to seed.
+    /// Injected by the egress proxy; the sandbox env holds the gateway's placeholder.
     AnthropicKey,
-    /// Relayed into the sandbox env under the endpoint's own variable; nothing to seed.
+    /// Injected by the egress proxy; the sandbox env holds the gateway's placeholder under the
+    /// endpoint's own variable.
     ApiKey,
     Codex(CodexAuth),
 }
@@ -174,6 +179,17 @@ impl SandboxAuth {
         match self {
             SandboxAuth::Codex(auth) => Some(auth),
             SandboxAuth::Gateway | SandboxAuth::AnthropicKey | SandboxAuth::ApiKey => None,
+        }
+    }
+
+    /// What a seeded file may carry of this auth: a Codex API key only as `issued`, the
+    /// placeholder the gateway gave the sandbox for it, never the key itself.
+    pub(crate) fn seeded(&self, issued: Option<String>) -> SandboxAuth {
+        match self {
+            SandboxAuth::Codex(CodexAuth::ApiKey(_)) => {
+                SandboxAuth::Codex(CodexAuth::ApiKey(issued.unwrap_or_default()))
+            }
+            other => other.clone(),
         }
     }
 }

@@ -2800,6 +2800,124 @@ mod tests {
         Ok(())
     }
 
+    /// A draft-head schedule follows the draft's head, so a save that adds a `[dispatch]` pin
+    /// after the schedule was authorized must not fire it onto the target it was saved with: the
+    /// firing is refused naming both, and a schedule saved onto the pin fires there.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_draft_head_firing_refuses_a_target_its_draft_now_pins_away_from(
+        pool: PgPool,
+    ) -> Result<()> {
+        let saved = crate::playbooks::drafts::create(
+            &pool,
+            "studio",
+            "iterative pack",
+            crate::playbooks::drafts::DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("draft");
+        let schema_digest = saved.schema_digest.clone().expect("the skeleton compiles");
+        let max_time = MaxTime::parse("30m").expect("duration");
+        let spec = CronSpec::parse("0 * * * *", "UTC").expect("expr");
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        let params = serde_json::json!({});
+        let saved_onto = |target: &'static str| NewSchedule {
+            standing: NewStanding {
+                playbook: "studio",
+                target: crate::launches::standing::StandingTarget::DraftHead,
+                eligible_draft_version: Some(saved.version),
+                params: &params,
+                schema_digest: &schema_digest,
+                max_cost: 1.0,
+                max_time: &max_time,
+                advance_dedupe: false,
+                enabled: true,
+                created_by: Some("wren"),
+                owner_principal: None,
+                owner_groups: None,
+                dispatch_target: Some(target),
+                agent_provider: None,
+                agent_model: None,
+            },
+            cursor: None,
+            spec: &spec,
+        };
+        let stale = store
+            .create(&saved_onto("hub"), ts("2026-08-23T11:00:00Z"))
+            .await?;
+
+        let files = std::collections::BTreeMap::from([
+            (
+                "crucible.toml".to_string(),
+                format!(
+                    "{}\n[dispatch]\ntarget = \"cluster-a\"\n",
+                    crate::playbooks::drafts::SKELETON_MANIFEST
+                ),
+            ),
+            (
+                "workflow.star".to_string(),
+                crate::playbooks::drafts::SKELETON_WORKFLOW.to_string(),
+            ),
+        ]);
+        let pinned = crate::playbooks::drafts::save_version(&pool, "studio", files, None, None)
+            .await
+            .expect("save");
+        assert!(pinned.schema_digest.is_some(), "{:?}", pinned.diagnostics);
+        set_due(&pool, &stale.id, Some("2026-08-23T12:00:00Z")).await;
+
+        let db = Db::new(pool.clone());
+        let fired = fire_due(
+            &db,
+            ts("2026-08-23T12:01:00Z"),
+            1,
+            1,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert!(fired.is_empty(), "{fired:?}");
+        let row = store.get(&stale.id).await?.expect("row");
+        assert_eq!(row.consecutive_failures, 1);
+        let events = events_for(&pool, &Trigger::Schedule.event_key(&stale.id)).await;
+        let reason = events
+            .last()
+            .and_then(|e| e.2.clone())
+            .expect("the disable names the failure");
+        assert!(reason.contains("saved to dispatch to hub"), "{reason}");
+        assert!(
+            reason.contains(&format!(
+                "draft studio version {} pins [dispatch] target \"cluster-a\"",
+                pinned.version
+            )),
+            "{reason}"
+        );
+        let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launched, 0, "the refused firing minted nothing");
+
+        let resaved = store
+            .create(&saved_onto("cluster-a"), ts("2026-08-23T12:02:00Z"))
+            .await?;
+        set_due(&pool, &resaved.id, Some("2026-08-23T13:00:00Z")).await;
+        let keys = fire_due(
+            &db,
+            ts("2026-08-23T13:01:00Z"),
+            1,
+            1,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        let [key] = keys.as_slice() else {
+            panic!("expected one firing, got {keys:?}");
+        };
+        let issue = crate::issues::store::get_issue(&pool, key)
+            .await?
+            .expect("the minted issue");
+        assert_eq!(issue.dispatch_target.as_deref(), Some("cluster-a"));
+        Ok(())
+    }
+
     /// A firing that cannot launch leaves no half-written launch, counts against the schedule, and
     /// at the threshold takes it out of the rotation with the transition on the event log.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

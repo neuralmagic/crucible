@@ -15,3 +15,5 @@ fi
 
 npm install -g "@anthropic-ai/claude-code@${PIN_CLAUDE_CODE}"
 claude --version
+help="$(claude --help)"
+grep -Fq -- '--effort' <<<"${help}"

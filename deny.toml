@@ -37,6 +37,7 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0441", reason = "pin-utils via postgresql_embedded -> reqwest-retry -> wasmtimer, a wasm32-only dependency never built for our targets; unmaintained, not vulnerable" },
 ]
 
 [licenses]

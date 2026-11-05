@@ -1293,6 +1293,11 @@ const PLAYBOOK_SESSION_LOG: &str = r#"{"v":1,"kind":"identity","identity":{"dige
 /// A playbook pack that registers and renders: a one-task graph with a required `topic` and an
 /// optional `depth`, committed to a local git repo the registry clones.
 fn write_playbook_repo(dir: &Path) -> String {
+    write_pack_repo(dir, "")
+}
+
+/// [`write_playbook_repo`] with `manifest_extra` appended to its `crucible.toml`.
+fn write_pack_repo(dir: &Path, manifest_extra: &str) -> String {
     const MANIFEST: &str = concat!(
         "[repo]\n",
         "path = \".\"\n",
@@ -1319,7 +1324,11 @@ fn write_playbook_repo(dir: &Path) -> String {
     let repo = dir.join("packrepo");
     std::fs::create_dir_all(&repo).expect("mkdir");
     let d = repo.to_string_lossy().to_string();
-    std::fs::write(repo.join("crucible.toml"), MANIFEST).expect("manifest");
+    std::fs::write(
+        repo.join("crucible.toml"),
+        format!("{MANIFEST}{manifest_extra}"),
+    )
+    .expect("manifest");
     std::fs::write(repo.join("workflow.star"), WORKFLOW).expect("source");
     for args in [
         vec!["init", "--quiet", "-b", "main", &d],
@@ -1381,6 +1390,356 @@ async fn api(
         .expect("body");
     let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
     (status, json)
+}
+
+/// A spoke kubeconfig the clusters directory registers. Nothing dials it: the fake dispatcher
+/// stands in for the cluster.
+const SPOKE_KUBECONFIG: &str = r#"apiVersion: v1
+kind: Config
+clusters:
+- name: cluster-a
+  cluster:
+    server: https://127.0.0.1:1
+contexts:
+- name: cluster-a
+  context:
+    cluster: cluster-a
+    user: loop
+    namespace: loops
+current-context: cluster-a
+users:
+- name: loop
+  user:
+    token: e2e
+"#;
+
+/// A pack that pins its cluster in `crucible.toml` lands every launch there without the caller
+/// naming it: a registered launch, a draft test-fire and a schedule firing all dispatch onto the
+/// pin through one running daemon. The registry and the launch form show the pin and offer
+/// nothing else, a launch, schedule or draft launch naming another cluster is refused before
+/// anything is written, and a draft pinned to a cluster nobody mounted says so at save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pinned_pack_dispatches_every_launch_to_its_cluster() -> Result<()> {
+    const PIN: &str = "\n[dispatch]\ntarget = \"cluster-a\"\n";
+    let _g = E2E_LOCK.lock().await;
+    let root = tempfile::tempdir()?;
+    let state_dir = root.path().join("state");
+    let clusters_dir = root.path().join("clusters");
+    std::fs::create_dir_all(clusters_dir.join("cluster-a"))?;
+    std::fs::write(
+        clusters_dir.join("cluster-a").join("kubeconfig"),
+        SPOKE_KUBECONFIG,
+    )?;
+
+    let mut cfg = test_cfg(&state_dir, Vec::new());
+    cfg.admins = vec!["wren".to_string()];
+    cfg.profile.max_concurrent_pods = 3;
+    cfg.clusters_dir = Some(clusters_dir.clone());
+    let db = Db::open(cfg.db_url()).await?;
+
+    let (tx, completions) = channel_completions();
+    let launcher = Arc::new(FakePodDispatcher {
+        pool: db.pool().clone(),
+        deliver: true,
+        held: false,
+        tx,
+        session: PLAYBOOK_SESSION_LOG,
+        launches: Mutex::new(Vec::new()),
+        keys: Mutex::new(Vec::new()),
+        deleted: Mutex::new(Vec::new()),
+    });
+    cfg.runtime.dispatcher = launcher.clone();
+
+    let queue = WorkQueue::new();
+    let overrides = Arc::new(OverrideStore::new());
+    let wiring = daemon::assemble(
+        &db,
+        &cfg,
+        queue.clone(),
+        overrides.clone(),
+        completions,
+        crucible_controller::authz::policy::ActivePolicy::default_set()
+            .expect("the shipped default policy set loads"),
+    )
+    .await;
+    let app = crucible_controller::api::router(crucible_controller::api::state::ApiState::new(
+        db.clone(),
+        crucible_controller::QueueOverrideSink::new(overrides, queue.clone()),
+        queue,
+        Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
+            Some(clusters_dir.clone()),
+        )),
+        None,
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(crucible_controller::runs::contract::ContractRegistry::new(
+            Arc::new(PermissiveContracts),
+        )),
+        crucible_controller::authz::policy::ActivePolicy::default_set()
+            .expect("the shipped default policy set loads"),
+        &cfg,
+    ));
+
+    let repo = write_pack_repo(root.path(), PIN);
+    let (status, registered) = api(
+        &app,
+        "POST",
+        "/api/playbooks",
+        Some(serde_json::json!({
+            "id": "survey",
+            "description": "reads a paper and files a spec",
+            "repo": repo,
+            "git_ref": "main",
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::CREATED, "{registered}");
+
+    let (status, registry) = api(&app, "GET", "/api/playbooks", None).await;
+    assert_eq!(status, http::StatusCode::OK, "{registry}");
+    let survey = registry
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|p| p["id"] == "survey")
+        .expect("listed");
+    assert_eq!(survey["dispatch"]["pinned_target"], "cluster-a", "{survey}");
+    let (status, form) = api(&app, "GET", "/api/dispatch-targets?playbook=survey", None).await;
+    assert_eq!(status, http::StatusCode::OK, "{form}");
+    let offered: Vec<(String, bool)> = form["targets"]
+        .as_array()
+        .expect("targets")
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().expect("name").to_string(),
+                t["default"].as_bool().expect("default"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        offered,
+        vec![("cluster-a".to_string(), true)],
+        "the hub default is not offered to a pinned pack: {form}"
+    );
+
+    // Naming another cluster is refused on every surface, and nothing is written.
+    let contradicting = [
+        (
+            "/api/playbooks/survey/launch",
+            serde_json::json!({
+                "params": {"topic": "elsewhere"},
+                "max_cost": 1.0,
+                "max_time": "30m",
+                "dispatch_target": "hub",
+            }),
+        ),
+        (
+            "/api/schedules",
+            serde_json::json!({
+                "playbook": "survey",
+                "params": {"topic": "elsewhere"},
+                "max_cost": 1.0,
+                "max_time": "30m",
+                "cron_expr": "0 * * * *",
+                "tz": "UTC",
+                "dispatch_target": "hub",
+            }),
+        ),
+    ];
+    for (uri, body) in contradicting {
+        let (status, refused) = api(&app, "POST", uri, Some(body)).await;
+        assert_eq!(
+            status,
+            http::StatusCode::UNPROCESSABLE_ENTITY,
+            "{uri}: {refused}"
+        );
+        let message = refused["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("\"hub\"") && message.contains("[dispatch] target \"cluster-a\""),
+            "{uri}: {refused}"
+        );
+    }
+    let written: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM playbook_launches), (SELECT count(*) FROM playbook_schedules)",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    assert_eq!(written, (0, 0), "a refused launch writes nothing");
+
+    // Omitting the target lands on the pin.
+    let (status, launched) = api(
+        &app,
+        "POST",
+        "/api/playbooks/survey/launch",
+        Some(serde_json::json!({
+            "params": {"topic": "pinned launch"},
+            "max_cost": 1.0,
+            "max_time": "30m",
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::CREATED, "{launched}");
+    assert_eq!(launched["dispatch_target"], "cluster-a", "{launched}");
+    let launch_key = launched["key"].as_str().expect("key").to_string();
+
+    let (status, schedule) = api(
+        &app,
+        "POST",
+        "/api/schedules",
+        Some(serde_json::json!({
+            "playbook": "survey",
+            "params": {"topic": "pinned schedule"},
+            "max_cost": 1.0,
+            "max_time": "30m",
+            "cron_expr": "0 * * * *",
+            "tz": "UTC",
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::CREATED, "{schedule}");
+    assert_eq!(schedule["dispatch_target"], "cluster-a", "{schedule}");
+    sqlx::query("UPDATE playbook_schedules SET next_due_at = $2 WHERE id = $1")
+        .bind(schedule["id"].as_str().expect("id"))
+        .bind("2020-01-01T00:00:00Z")
+        .execute(db.pool())
+        .await?;
+
+    // A draft test-fire of a pinned pack lands on its pin too.
+    let draft_files = |pin: &str| {
+        serde_json::json!({
+            "crucible.toml": format!(
+                "[agent]\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n{pin}"
+            ),
+            "workflow.star": "params = {}\nhello = command(name = \"hello\", run = \"echo hello\")\nworkflow(type = \"playbook\", tasks = [hello], result = hello)\n",
+        })
+    };
+    for id in ["pinned-draft", "stray-draft"] {
+        let (status, created) = api(
+            &app,
+            "POST",
+            "/api/playbook-drafts",
+            Some(serde_json::json!({"id": id, "description": "a drafted pack"})),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::CREATED, "{created}");
+    }
+    let (status, saved) = api(
+        &app,
+        "POST",
+        "/api/playbook-drafts/pinned-draft/versions",
+        Some(serde_json::json!({"files": draft_files(PIN)})),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK, "{saved}");
+    assert_eq!(saved["dispatch"]["pinned_target"], "cluster-a", "{saved}");
+    assert_eq!(saved["diagnostics"], serde_json::json!([]), "{saved}");
+    let (status, refused) = api(
+        &app,
+        "POST",
+        "/api/playbook-drafts/pinned-draft/launch",
+        Some(serde_json::json!({
+            "params": {},
+            "max_cost": 1.0,
+            "max_time": "30m",
+            "dispatch_target": "hub",
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+    let (status, fired) = api(
+        &app,
+        "POST",
+        "/api/playbook-drafts/pinned-draft/launch",
+        Some(serde_json::json!({"params": {}, "max_cost": 1.0, "max_time": "30m"})),
+    )
+    .await;
+    assert!(status.is_success(), "{status}: {fired}");
+    assert_eq!(fired["dispatch_target"], "cluster-a", "{fired}");
+    let draft_key = fired["key"].as_str().expect("key").to_string();
+
+    // A pin to a cluster nobody mounted compiles, and the save says every launch would fail.
+    let (status, stray) = api(
+        &app,
+        "POST",
+        "/api/playbook-drafts/stray-draft/versions",
+        Some(serde_json::json!({
+            "files": draft_files("\n[dispatch]\ntarget = \"cluster-z\"\n"),
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::OK, "{stray}");
+    assert!(stray["schema_digest"].is_string(), "it compiles: {stray}");
+    let diagnostics = stray["diagnostics"].as_array().expect("diagnostics");
+    assert_eq!(diagnostics.len(), 1, "{stray}");
+    assert_eq!(diagnostics[0]["kind"], "dispatch", "{stray}");
+    assert_eq!(diagnostics[0]["file"], "crucible.toml", "{stray}");
+    assert!(
+        diagnostics[0]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("\"cluster-z\"")
+                && m.contains("not a cluster this controller can reach")),
+        "{stray}"
+    );
+    let (status, refused) = api(
+        &app,
+        "POST",
+        "/api/playbook-drafts/stray-draft/launch",
+        Some(serde_json::json!({"params": {}, "max_cost": 1.0, "max_time": "30m"})),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let handle = {
+        let shutdown = shutdown.clone();
+        tokio::spawn(daemon::run(
+            Vec::new(),
+            daemon_cfg(),
+            wiring,
+            shutdown,
+            None,
+        ))
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let keys = loop {
+        let keys = launcher.keys.lock().expect("keys").clone();
+        if keys.len() >= 3 {
+            break keys;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {keys:?} dispatched in 60s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for key in &keys {
+        wait_for_status(&db, key, Status::Done).await;
+    }
+    shutdown.notify_waiters();
+    join_daemon(handle).await;
+
+    assert!(keys.contains(&launch_key), "{keys:?}");
+    assert!(keys.contains(&draft_key), "{keys:?}");
+    for key in &keys {
+        let clusters: Vec<String> =
+            sqlx::query_scalar("SELECT cluster FROM work_pods WHERE issue_key = $1")
+                .bind(key)
+                .fetch_all(db.pool())
+                .await?;
+        assert!(!clusters.is_empty(), "{key} dispatched a pod");
+        assert!(
+            clusters.iter().all(|c| c == "cluster-a"),
+            "{key} dispatched onto {clusters:?}"
+        );
+    }
+    let (_, schedules) = api(&app, "GET", "/api/schedules", None).await;
+    let row = &schedules.as_array().expect("array")[0];
+    assert_eq!(row["consecutive_failures"], 0, "{row}");
+    assert!(
+        row["last_fired_at"].is_string(),
+        "the schedule fired: {row}"
+    );
+    Ok(())
 }
 
 /// Every standing trigger through ONE running assembled daemon: a one-shot whose instant passes,
