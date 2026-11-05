@@ -1122,10 +1122,7 @@ mod tests {
                 .filter(|case| allowed(case))
                 .filter(|case| {
                     case.base.is_none_or(|base| {
-                        !cases
-                            .iter()
-                            .find(|c| c.name == base)
-                            .is_some_and(allowed)
+                        !cases.iter().find(|c| c.name == base).is_some_and(allowed)
                     })
                 })
                 .map(|case| case.name)
