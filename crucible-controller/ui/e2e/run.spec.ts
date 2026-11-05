@@ -216,7 +216,7 @@ test.describe('the run task graph', () => {
     const frame = page.locator('iframe[title="trace/build-trace.html"]');
     await expect(frame).toHaveAttribute('sandbox', 'allow-scripts');
     await expect(frame.contentFrame().locator('#t')).toHaveText('scripted trace');
-    await expect(frame.contentFrame().locator('#flow-theme-bridge')).toHaveCount(1);
+    await expect(frame.contentFrame().locator('meta[http-equiv="Content-Security-Policy"]')).toHaveCount(1);
   });
 
   test('reads a captured file out of a finished run', async ({ page }) => {

@@ -206,6 +206,34 @@ describe('selectRunFile', () => {
     expect(selectRunFile([stray, early], null, [])).toEqual({ state: 'found', file: stray });
   });
 
+  it('carries an HTML report inline, ahead of the markdown summary beside it', () => {
+    const submitted = file({
+      key: 'submit/campaign.submitted.json',
+      path: 'campaign.submitted.json',
+      task: 'submit',
+    });
+    const summary = file({ key: 'summary/CAMPAIGN.md', path: 'CAMPAIGN.md', task: 'summary' });
+    const report = file({ key: 'watch/CAMPAIGN.html', path: 'CAMPAIGN.html', task: 'watch' });
+    const order = ['submit', 'validate', 'summary', 'watch'];
+    expect(selectRunFile([submitted, summary, report], null, order)).toEqual({
+      state: 'found',
+      file: report,
+    });
+    expect(selectRunFile([submitted, summary, report], null)).toEqual({
+      state: 'found',
+      file: report,
+    });
+  });
+
+  it('lets the task order outrank the report format', () => {
+    const html = file({ key: 'render/REPORT.html', path: 'REPORT.html', task: 'render' });
+    const md = file({ key: 'report/REPORT.md', path: 'REPORT.md', task: 'report' });
+    expect(selectRunFile([html, md], null, ['render', 'report'])).toEqual({
+      state: 'found',
+      file: md,
+    });
+  });
+
   it('opens a captured file before an empty one, unless only empty ones exist', () => {
     const empty = file({ key: 'report/REPORT.md', path: 'REPORT.md', task: 'report', size_bytes: 0 });
     const log = file({ key: 'apply/apply.log', path: 'apply.log', task: 'apply', size_bytes: 0 });
