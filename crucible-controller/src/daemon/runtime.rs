@@ -2,6 +2,7 @@
 //! pods are created, what admits an engine, what runs a declared build, and the queue a freed
 //! slot re-drives.
 
+use crate::authz::policy::{ActivePolicy, DEFAULT_POLICY, Engine, PolicyError};
 use crate::daemon::queue::WorkQueue;
 use crate::runs::contract::{AdmitFailure, ContractRegistry, DispatchTarget, RequestKind};
 use crate::runs::workpod::dispatcher::PodDispatcher;
@@ -21,6 +22,10 @@ pub struct Runtime {
     /// The reconcile queue a collection re-drives a queued issue through once it frees a slot.
     /// `None` leaves the backlog to the timeout sweep and the next pass.
     pub queue: Option<WorkQueue>,
+    /// The policy set in force, shared with the API so an activation reaches dispatch-time
+    /// decisions. `None` decides with the shipped default: a test, or a command that never
+    /// dispatches.
+    pub policy: Option<ActivePolicy>,
 }
 
 impl Default for Runtime {
@@ -35,6 +40,7 @@ impl Default for Runtime {
             #[cfg(feature = "autoresearch")]
             builds: Arc::new(crate::builds::backend::StubBuildBackend),
             queue: None,
+            policy: None,
         }
     }
 }
@@ -44,6 +50,7 @@ impl std::fmt::Debug for Runtime {
         f.debug_struct("Runtime")
             .field("contracts", &self.contracts.is_some())
             .field("queue", &self.queue.is_some())
+            .field("policy", &self.policy)
             .finish_non_exhaustive()
     }
 }
@@ -59,6 +66,15 @@ impl Runtime {
         match &self.contracts {
             Some(registry) => registry.admit_all(request, targets).await,
             None => Ok(()),
+        }
+    }
+
+    /// The engine a decision made off a request is taken with, such as a dispatch resolving the
+    /// secrets its scope binds.
+    pub(crate) fn policy(&self) -> Result<Arc<Engine>, PolicyError> {
+        match &self.policy {
+            Some(active) => Ok(active.current()),
+            None => Engine::load(DEFAULT_POLICY).map(Arc::new),
         }
     }
 

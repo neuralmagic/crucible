@@ -8,7 +8,10 @@
 //! Nothing here reads a value. The output is the item list the dispatch reads Vault for and
 //! delivers as the run's Secret.
 
+use crate::authz::action::{Action, ResourceType, Verb};
+use crate::authz::decision::{Resource, Subject};
 use crate::authz::model::Principals;
+use crate::authz::policy::Engine;
 use crate::playbooks::providers::{KeyLookup, ModelProvider};
 use crate::secrets::grant::{self, GrantMint};
 use crate::secrets::manifest::DeclaredSecret;
@@ -16,6 +19,11 @@ use crate::secrets::store::{self, BindingRow, SecretRow};
 use crate::secrets::{ScopeKind, SecretName};
 use anyhow::Result;
 use std::fmt;
+
+const USE: Action = Action {
+    resource: ResourceType::Secret,
+    verb: Verb::Use,
+};
 
 /// What a launch resolves its bindings against.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,12 +66,13 @@ impl fmt::Display for Scope {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Refusal {
     #[error(
-        "secret {name} is bound to {scope} and owned by {owner}; the launcher is not {owner} \
-         and holds no group that is"
+        "secret {name} is bound to {scope} and owned by {owner}; the active policy does not let \
+         the launcher use it ({rule})"
     )]
-    NotOwned {
+    NotUsable {
         name: SecretName,
         owner: String,
+        rule: String,
         scope: Scope,
     },
     #[error("the pack declares secret {name}, and {scope} has no binding for it")]
@@ -221,9 +230,13 @@ impl OwnedRevision {
 /// `revision` is what this launch runs. A binding made against a different published revision is
 /// stale: the declared names, their kinds, and their projections all belong to the revision the
 /// binder reviewed. A draft carries that reasoning further — it has no reviewed revision at all, so
-/// only an unpinned binding follows it, and only ever to a launcher who already owns the secret.
+/// only an unpinned binding follows it, and only ever to a launcher the policy lets use the secret.
+///
+/// Each bound secret is decided as `secret:use` for the launcher under `engine`, with any share
+/// the launcher holds on it attached.
 pub async fn resolve(
     pool: &sqlx::PgPool,
+    engine: &Engine,
     scope: &Scope,
     declared: &[DeclaredSecret],
     launcher: &Principals,
@@ -243,14 +256,34 @@ pub async fn resolve(
     if bound.is_empty() {
         return Ok(Ok(Vec::new()));
     }
-    if launcher.all().is_empty() {
+    let Some(subject) = Subject::of(launcher, launcher.group_paths().next().is_some()) else {
         return Ok(Err(Refusal::Anonymous {
             scope: scope.clone(),
         }));
-    }
+    };
+    let now = jiff::Timestamp::now().as_second();
     let mut mints = Vec::with_capacity(bound.len());
     for (binding, secret) in &bound {
-        if let Some(refusal) = check_one(scope, binding, secret, launcher, revision) {
+        let resource = crate::authz::granted::attach(
+            pool,
+            launcher,
+            Resource::new(
+                ResourceType::Secret,
+                secret.id.clone(),
+                secret.owner.clone(),
+            ),
+        )
+        .await?;
+        let decision = engine.authorize(&subject, USE, &resource, now);
+        if !decision.allowed {
+            return Ok(Err(Refusal::NotUsable {
+                name: secret.name.clone(),
+                owner: secret.owner.to_string(),
+                rule: decision.reason(),
+                scope: scope.clone(),
+            }));
+        }
+        if let Some(refusal) = check_one(scope, binding, secret, revision) {
             return Ok(Err(refusal));
         }
         if let Some(refusal) = check_disclosed(scope, binding, secret, exposure) {
@@ -308,21 +341,13 @@ pub async fn resolve_provider_secret(
     )
 }
 
-/// The per-binding half: ownership first, then the revision the binding was reviewed against.
+/// The revision the binding was reviewed against, once the policy has let the launcher use it.
 fn check_one(
     scope: &Scope,
     binding: &BindingRow,
     secret: &SecretRow,
-    launcher: &Principals,
     revision: Revision<'_>,
 ) -> Option<Refusal> {
-    if !launcher.covers(&secret.owner) {
-        return Some(Refusal::NotOwned {
-            name: secret.name.clone(),
-            owner: secret.owner.to_string(),
-            scope: scope.clone(),
-        });
-    }
     match (binding.pack_rev.as_deref(), revision) {
         (Some(bound_rev), Revision::Published(Some(current))) => {
             let (bound, current) = match (binding.pack_digest.as_deref(), current) {
@@ -597,6 +622,7 @@ mod tests {
 
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &want,
             &launcher,
@@ -618,6 +644,7 @@ mod tests {
 
         resolve(
             &pool,
+            &engine(),
             &scope,
             &want,
             &launcher,
@@ -630,6 +657,7 @@ mod tests {
 
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &want,
             &launcher,
@@ -660,6 +688,7 @@ mod tests {
         for exposure in [Some(exposure_with(None)), None] {
             resolve(
                 &pool,
+                &engine(),
                 &scope,
                 &declared("pr_token"),
                 &launcher,
@@ -670,6 +699,21 @@ mod tests {
             .expect("resolve")
             .expect("a broker-only binding needs no agent disclosure");
         }
+    }
+
+    fn engine() -> Engine {
+        Engine::load(crate::authz::policy::DEFAULT_POLICY).expect("default policy")
+    }
+
+    fn member_of(login: &str, team: &str, role: crate::authz::model::TeamRole) -> Principals {
+        let slug = crate::authz::model::TeamSlug::parse(team).expect("slug");
+        Principals::new(Some(login), &[]).with_teams(std::collections::BTreeMap::from([(
+            slug,
+            crate::authz::model::Membership {
+                role,
+                via: std::collections::BTreeSet::from([crate::authz::model::Via::Direct { role }]),
+            },
+        )]))
     }
 
     fn declared(name: &str) -> Vec<DeclaredSecret> {
@@ -686,6 +730,7 @@ mod tests {
         let launcher = Principals::new(Some("alice"), &[]);
         let out = resolve(
             &pool,
+            &engine(),
             &scope,
             &[],
             &launcher,
@@ -713,6 +758,7 @@ mod tests {
         let launcher = Principals::new(Some("alice"), &["/groups/team-x".to_string()]);
         let out = resolve(
             &pool,
+            &engine(),
             &scope,
             &declared("pr_token"),
             &launcher,
@@ -745,6 +791,7 @@ mod tests {
         let launcher = Principals::new(Some("bob"), &["/groups/team-y".to_string()]);
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &declared("pr_token"),
             &launcher,
@@ -754,7 +801,7 @@ mod tests {
         .await
         .expect("resolve")
         .expect_err("refused");
-        let Refusal::NotOwned { name, owner, .. } = &refusal else {
+        let Refusal::NotUsable { name, owner, .. } = &refusal else {
             panic!("expected a not-owned refusal, got {refusal:?}");
         };
         assert_eq!(name.as_str(), "pr_token");
@@ -775,6 +822,7 @@ mod tests {
         });
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &want,
             &launcher,
@@ -797,6 +845,7 @@ mod tests {
         bind(&pool, "user:alice", "pr_token", &scope, "pr_token", None).await;
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &declared("pr_token"),
             &Principals::default(),
@@ -827,6 +876,7 @@ mod tests {
         let want = declared("pr_token");
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &want,
             &launcher,
@@ -846,6 +896,7 @@ mod tests {
         // Re-binding against the revision now pinned clears it.
         resolve(
             &pool,
+            &engine(),
             &scope,
             &want,
             &launcher,
@@ -912,9 +963,17 @@ mod tests {
             }
         );
         let check = || async {
-            resolve(&pool, &scope, &[], &launcher, revision.as_revision(), None)
-                .await
-                .expect("resolve")
+            resolve(
+                &pool,
+                &engine(),
+                &scope,
+                &[],
+                &launcher,
+                revision.as_revision(),
+                None,
+            )
+            .await
+            .expect("resolve")
         };
         assert_eq!(check().await.expect("released").len(), 1);
 
@@ -949,10 +1008,18 @@ mod tests {
                 pack: Some(repinned_tree),
             }
         );
-        resolve(&pool, &scope, &[], &launcher, current.as_revision(), None)
-            .await
-            .expect("resolve")
-            .expect("a launch of the reviewed tree releases");
+        resolve(
+            &pool,
+            &engine(),
+            &scope,
+            &[],
+            &launcher,
+            current.as_revision(),
+            None,
+        )
+        .await
+        .expect("resolve")
+        .expect("a launch of the reviewed tree releases");
     }
 
     /// A frozen pack with no tree is named by its gzip digest, which a binding at a pre-tree rev
@@ -989,17 +1056,10 @@ mod tests {
             created_at: "now".to_string(),
             updated_at: "now".to_string(),
         };
-        let launcher = Principals::new(Some("alice"), &[]);
         let scope = Scope::playbook("survey");
         let revision = Revision::Published(Some(PackPin::Unregistered("sha256:old")));
         assert_eq!(
-            check_one(
-                &scope,
-                &binding("sha256:old", None),
-                &secret,
-                &launcher,
-                revision
-            ),
+            check_one(&scope, &binding("sha256:old", None), &secret, revision),
             None
         );
         assert!(matches!(
@@ -1007,26 +1067,19 @@ mod tests {
                 &scope,
                 &binding("sha256:old", Some("tree1:t")),
                 &secret,
-                &launcher,
                 revision
             ),
             Some(Refusal::Stale { .. })
         ));
         assert!(matches!(
-            check_one(
-                &scope,
-                &binding("abc123", None),
-                &secret,
-                &launcher,
-                revision
-            ),
+            check_one(&scope, &binding("abc123", None), &secret, revision),
             Some(Refusal::Stale { .. })
         ));
     }
 
     /// A draft test-fire is how a pack that needs a credential gets iterated on at all, so an
-    /// unpinned binding follows it. The owner check is what keeps that safe: the launcher already
-    /// holds the secret, so the draft can reach nothing they could not read anyway.
+    /// unpinned binding follows it. The `secret:use` decision is what keeps that safe: the launcher
+    /// may already spend the secret, so the draft can reach nothing they could not spend anyway.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_draft_resolves_an_unpinned_binding(pool: sqlx::PgPool) {
         let scope = Scope::playbook("docs-drift");
@@ -1034,6 +1087,7 @@ mod tests {
         let launcher = Principals::new(Some("alice"), &[]);
         let mints = resolve(
             &pool,
+            &engine(),
             &scope,
             &declared("pr_token"),
             &launcher,
@@ -1064,6 +1118,7 @@ mod tests {
         let launcher = Principals::new(Some("alice"), &[]);
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &declared("pr_token"),
             &launcher,
@@ -1096,6 +1151,7 @@ mod tests {
         let launcher = Principals::new(Some("mallory"), &[]);
         let refusal = resolve(
             &pool,
+            &engine(),
             &scope,
             &declared("pr_token"),
             &launcher,
@@ -1105,7 +1161,7 @@ mod tests {
         .await
         .expect("resolve")
         .expect_err("refused");
-        assert!(matches!(refusal, Refusal::NotOwned { .. }), "{refusal:?}");
+        assert!(matches!(refusal, Refusal::NotUsable { .. }), "{refusal:?}");
     }
 
     /// The zero-config case, and the Vertex case: nothing to project, so a dispatch renders exactly
@@ -1383,5 +1439,112 @@ mod tests {
         )
         .expect_err("a map without the protocol's entry is refused");
         assert!(wrong.contains("OPENAI_API_KEY"), "{wrong}");
+    }
+
+    /// A team's secret is used by every member of the team, whatever their role, and the decision
+    /// is the policy's: a set without the member rule refuses the same launch and names no rule.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_team_secret_is_used_by_any_member_under_the_policy_in_force(pool: sqlx::PgPool) {
+        let scope = Scope::playbook("survey");
+        bind(&pool, "team:acme", "pr_token", &scope, "pr_token", None).await;
+        let member = member_of("kim", "acme", crate::authz::model::TeamRole::Member);
+        let mints = resolve(
+            &pool,
+            &engine(),
+            &scope,
+            &declared("pr_token"),
+            &member,
+            Revision::Published(None),
+            None,
+        )
+        .await
+        .expect("resolve")
+        .expect("a member uses the team's secret");
+        assert_eq!(mints.len(), 1);
+
+        let outsider = member_of("zed", "other", crate::authz::model::TeamRole::Owner);
+        let refusal = resolve(
+            &pool,
+            &engine(),
+            &scope,
+            &declared("pr_token"),
+            &outsider,
+            Revision::Published(None),
+            None,
+        )
+        .await
+        .expect("resolve")
+        .expect_err("another team's owner is refused");
+        assert!(
+            matches!(&refusal, Refusal::NotUsable { owner, rule, .. }
+                if owner == "team:acme" && rule == "no-rule"),
+            "{refusal:?}"
+        );
+
+        let narrowed = crate::authz::policy::DEFAULT_POLICY.replace(
+            "@id(\"team-member-use-secrets\")\npermit(principal, action == Action::\"secret:use\", resource)\nwhen { resource.owner_kind == \"team\" && resource has owner_role };\n",
+            "",
+        );
+        assert_ne!(narrowed, crate::authz::policy::DEFAULT_POLICY);
+        let refusal = resolve(
+            &pool,
+            &Engine::load(&narrowed).expect("narrowed set loads"),
+            &scope,
+            &declared("pr_token"),
+            &member,
+            Revision::Published(None),
+            None,
+        )
+        .await
+        .expect("resolve")
+        .expect_err("the narrowed set does not let a member use it");
+        assert!(
+            refusal
+                .to_string()
+                .contains("the active policy does not let"),
+            "{refusal}"
+        );
+    }
+
+    /// A launcher share on someone else's secret is what lets another user spend it; a viewer
+    /// share is not.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_launcher_share_on_a_secret_lets_another_user_use_it(pool: sqlx::PgPool) {
+        let scope = Scope::playbook("survey");
+        let id = bind(&pool, "user:alice", "pr_token", &scope, "pr_token", None).await;
+        let bob = Principals::new(Some("bob"), &[]);
+        let share = |role: &str| crate::authz::store::ShareRow {
+            resource_type: "secret".to_string(),
+            resource_id: id.clone(),
+            grantee: "user:bob".to_string(),
+            role: role.to_string(),
+            not_after: None,
+            created_by: Some("alice".to_string()),
+            created_at: "2026-11-04T00:00:00Z".to_string(),
+            updated_at: "2026-11-04T00:00:00Z".to_string(),
+        };
+        let launch = || async {
+            resolve(
+                &pool,
+                &engine(),
+                &scope,
+                &declared("pr_token"),
+                &bob,
+                Revision::Published(None),
+                None,
+            )
+            .await
+            .expect("resolve")
+        };
+        assert!(launch().await.is_err(), "no share, no use");
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::authz::store::upsert_share(&mut conn, &share("viewer"))
+            .await
+            .expect("share");
+        assert!(launch().await.is_err(), "a viewer does not spend it");
+        crate::authz::store::upsert_share(&mut conn, &share("launcher"))
+            .await
+            .expect("share");
+        assert_eq!(launch().await.expect("a launcher uses it").len(), 1);
     }
 }

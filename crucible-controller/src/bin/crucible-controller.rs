@@ -837,6 +837,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
             )
         }
     }
+    cfg.runtime.policy = Some(policy.clone());
     let daemon_policy = policy.clone();
     let agent_auth = crucible_controller::agent_auth::AgentAuth::from_env(
         db.pool().clone(),

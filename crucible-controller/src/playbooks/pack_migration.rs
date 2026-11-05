@@ -669,6 +669,8 @@ mod tests {
             let tree = row.tree_digest.as_ref().map(|t| t.to_string());
             crate::secrets::launch::resolve(
                 &pool,
+                &crate::authz::policy::Engine::load(crate::authz::policy::DEFAULT_POLICY)
+                    .expect("default policy"),
                 &Scope::playbook("survey"),
                 &[crate::secrets::manifest::DeclaredSecret {
                     name: name.clone(),

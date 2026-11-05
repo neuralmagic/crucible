@@ -123,7 +123,7 @@ impl ResourceType {
             ResourceType::Playbook | ResourceType::StandingLaunch => &[Verb::Launch],
             ResourceType::PlaybookDraft => &[Verb::Launch, Verb::Approve, Verb::Publish],
             ResourceType::PackImport | ResourceType::Scope => &[Verb::Approve],
-            ResourceType::Secret => &[Verb::Bind, Verb::Rotate],
+            ResourceType::Secret => &[Verb::Bind, Verb::Rotate, Verb::Use],
             ResourceType::DispatchTarget => &[Verb::Dispatch],
             ResourceType::Run => &[Verb::Publish, Verb::Approve],
             ResourceType::PolicySet => &[Verb::Activate],
@@ -161,6 +161,7 @@ pub enum Verb {
     ManageMembers,
     Impersonate,
     Access,
+    Use,
 }
 
 wire_enum!(Verb, "action verb", both, {
@@ -180,6 +181,7 @@ wire_enum!(Verb, "action verb", both, {
     Verb::ManageMembers => "manage-members",
     Verb::Impersonate => "impersonate",
     Verb::Access => "access",
+    Verb::Use => "use",
 });
 
 /// One entry of the vocabulary: a verb the resource type defines.
@@ -312,7 +314,7 @@ mod tests {
             Err(ActionError::Malformed { .. })
         ));
         let all = Action::all();
-        assert_eq!(all.len(), 18 * 6 + 17 + 1);
+        assert_eq!(all.len(), 18 * 6 + 18 + 1);
         let mut sorted = all.clone();
         sorted.dedup();
         assert_eq!(sorted.len(), all.len());

@@ -311,7 +311,7 @@ async fn start_local(
         crate::issues::transitions::refuse(db, &issue.key, &failure.into_rejection()?).await?;
         return Ok(Started::ContractRejected);
     }
-    if let Some(refusal) = resolve_local_secrets(db, issue, secrets).await? {
+    if let Some(refusal) = resolve_local_secrets(db, cfg, issue, secrets).await? {
         return Ok(Started::SecretsRefused(refusal));
     }
     if u32::try_from(crate::runs::store::count_running(db.pool()).await?).unwrap_or(u32::MAX)
@@ -346,6 +346,7 @@ async fn start_local(
 /// scope without the secrets it bound would be a silent downgrade rather than a refusal.
 async fn resolve_local_secrets(
     db: &Db,
+    cfg: &ControllerCfg,
     issue: &Issue,
     secrets: Option<&crate::runs::workpod::LaunchSecrets>,
 ) -> Result<Option<String>> {
@@ -357,6 +358,7 @@ async fn resolve_local_secrets(
     let declared = crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
     match crate::secrets::launch::resolve(
         db.pool(),
+        &*cfg.runtime.policy()?,
         &ls.scope,
         &declared,
         &ls.launcher,

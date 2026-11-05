@@ -3057,6 +3057,8 @@ mod tests {
         assert_eq!(scope_bindings(&pool, "other").await, vec!["pr_token"]);
         let resolved = crate::secrets::launch::resolve(
             &pool,
+            &crate::authz::policy::Engine::load(crate::authz::policy::DEFAULT_POLICY)
+                .expect("default policy"),
             &crate::secrets::launch::Scope::playbook("survey-v2"),
             &[crate::secrets::manifest::DeclaredSecret {
                 name: crate::secrets::SecretName::parse("pr_token").expect("name"),

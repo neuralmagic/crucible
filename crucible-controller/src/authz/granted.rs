@@ -11,8 +11,14 @@ use std::collections::BTreeMap;
 pub fn confers(role: ShareRole) -> &'static [Verb] {
     match role {
         ShareRole::Viewer => &[Verb::Read],
-        ShareRole::Launcher => &[Verb::Read, Verb::Launch],
-        ShareRole::Editor => &[Verb::Read, Verb::Update, Verb::Launch, Verb::Bind],
+        ShareRole::Launcher => &[Verb::Read, Verb::Launch, Verb::Use],
+        ShareRole::Editor => &[
+            Verb::Read,
+            Verb::Update,
+            Verb::Launch,
+            Verb::Use,
+            Verb::Bind,
+        ],
     }
 }
 
@@ -61,15 +67,24 @@ pub async fn attach(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::authz::granted::*;
 
     #[test]
     fn a_role_confers_its_actions_and_expiry_is_by_the_clock() {
         assert_eq!(confers(ShareRole::Viewer), &[Verb::Read]);
-        assert_eq!(confers(ShareRole::Launcher), &[Verb::Read, Verb::Launch]);
+        assert_eq!(
+            confers(ShareRole::Launcher),
+            &[Verb::Read, Verb::Launch, Verb::Use]
+        );
         assert_eq!(
             confers(ShareRole::Editor),
-            &[Verb::Read, Verb::Update, Verb::Launch, Verb::Bind]
+            &[
+                Verb::Read,
+                Verb::Update,
+                Verb::Launch,
+                Verb::Use,
+                Verb::Bind
+            ]
         );
         let now = "2026-09-14T00:00:00Z".parse().expect("now");
         assert!(!expired(None, now));

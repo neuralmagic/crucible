@@ -476,6 +476,8 @@ async fn a_teams_blueprint_carries_its_secrets_to_members_and_placeholders_to_ev
             .expect("principals");
         crate::secrets::launch::resolve(
             &pool,
+            &crate::authz::policy::Engine::load(crate::authz::policy::DEFAULT_POLICY)
+                .expect("default policy"),
             &crate::secrets::launch::Scope::playbook("kim-copy"),
             &declared,
             &kim,
