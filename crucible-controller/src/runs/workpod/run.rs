@@ -707,6 +707,7 @@ pub(crate) async fn dispatch_run(
                 crate::secrets::manifest::declared_secrets(pack.path(), variant.as_ref())?;
             match crate::secrets::launch::resolve(
                 db.pool(),
+                &*cfg.runtime.policy()?,
                 &ls.scope,
                 &declared,
                 &ls.launcher,

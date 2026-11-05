@@ -2205,6 +2205,8 @@ async fn an_outsiders_pre_tree_binding_pins_what_conversion_would(pool: PgPool) 
     let launch = || async {
         crate::secrets::launch::resolve(
             &pool,
+            &crate::authz::policy::Engine::load(crate::authz::policy::DEFAULT_POLICY)
+                .expect("default policy"),
             &crate::secrets::launch::Scope::playbook("survey"),
             &[],
             &crate::authz::model::Principals::new(Some("bob"), &[]),

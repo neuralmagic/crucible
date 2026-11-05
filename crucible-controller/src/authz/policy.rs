@@ -17,7 +17,7 @@ pub const DEFAULT_POLICY: &str = include_str!("default.cedar");
 
 /// The version of the rendered schema: bumped when the vocabulary or the entity shapes change so
 /// a stored set can be told apart from one written against an older schema.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// Why a policy set was refused (RFC-0003 C-POLICY: refused with the failing rule named).
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -409,7 +409,7 @@ mod tests {
         assert!(ids.contains(&"runs-never-approve".to_string()));
         assert!(ids.contains(&"everyone-read-public-blueprints".to_string()));
         assert!(ids.contains(&"team-member-bind-carried".to_string()));
-        assert_eq!(ids.len(), 28);
+        assert_eq!(ids.len(), 29);
     }
 
     #[test]
@@ -1163,22 +1163,53 @@ mod tests {
         );
     }
 
+    /// Administration reaches every action but spending someone else's secret: an administrator
+    /// uses a secret only as its owner, a member of its owning team, or a share grantee.
     #[test]
-    fn a_platform_admin_holds_every_action_on_every_owner() {
+    fn a_platform_admin_holds_every_action_but_using_others_secrets() {
         let engine = Engine::load(DEFAULT_POLICY).expect("default");
         let admin = Subject::probe_platform_admin();
-        for action in Action::all() {
+        let secret_use = act(ResourceType::Secret, Verb::Use);
+        for action in Action::all().into_iter().filter(|a| *a != secret_use) {
             for build in [acme, alices, platforms] {
                 let d = engine.authorize(&admin, action, &build(action.resource), 0);
                 assert!(d.allowed, "{action}: {}", d.reason());
             }
         }
+        for build in [acme, alices] {
+            let d = engine.authorize(&admin, secret_use, &build(ResourceType::Secret), 0);
+            assert!(!d.allowed, "{}", d.reason());
+        }
+        let d = engine.authorize(&admin, secret_use, &platforms(ResourceType::Secret), 0);
+        assert!(d.allowed, "the administrators team's own: {}", d.reason());
+        assert!(
+            !d.rules.contains(&"platform-admin-all".to_string()),
+            "{}",
+            d.reason()
+        );
+        let own = Resource::new(ResourceType::Secret, "s", Principal::User("probe".into()));
+        let d = engine.authorize(&admin, secret_use, &own, 0);
+        assert!(
+            d.allowed,
+            "an administrator spends their own: {}",
+            d.reason()
+        );
+        assert_eq!(d.rules, vec!["user-owner-all"]);
+        let member = Subject::user(
+            "root",
+            true,
+            true,
+            BTreeMap::from([("team:acme".to_string(), "member".to_string())]),
+        );
+        let d = engine.authorize(&member, secret_use, &acme(ResourceType::Secret), 0);
+        assert!(d.allowed, "and their team's: {}", d.reason());
+        assert_eq!(d.rules, vec!["team-member-use-secrets"]);
     }
 
     /// The collaboration a team needs from its members, named so the intent survives a
     /// regenerated matrix.
     #[test]
-    fn team_members_collaborate_on_drafts_and_one_shots_and_stop_at_ownership() {
+    fn team_members_collaborate_on_drafts_secrets_and_one_shots_and_stop_at_ownership() {
         let engine = Engine::load(DEFAULT_POLICY).expect("default");
         let at = |role: &str| tagged("kim", &[("team:acme", role)]);
         let may = |role: &str, resource: ResourceType, verb: Verb| {
@@ -1202,6 +1233,11 @@ mod tests {
         }
         assert!(!may("member", StandingLaunch, Verb::Create));
         assert!(!may("member", Secret, Verb::Update));
+        assert!(
+            may("member", Secret, Verb::Use),
+            "a member spends the team's secrets"
+        );
+        assert!(!may("member", Secret, Verb::Bind));
 
         for resource in [PlaybookDraft, StandingLaunch, OneShot, PackImport] {
             assert!(may("maintainer", resource, Verb::Delete), "{resource:?}");
@@ -1223,6 +1259,8 @@ mod tests {
             &acme(PlaybookDraft),
             0,
         );
+        assert!(!outsider.allowed, "{}", outsider.reason());
+        let outsider = engine.authorize(&user("zed"), act(Secret, Verb::Use), &acme(Secret), 0);
         assert!(!outsider.allowed, "{}", outsider.reason());
     }
 }

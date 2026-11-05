@@ -86,6 +86,7 @@ secret:transfer: team-owner group-member user-owner
 secret:share: team-owner group-member user-owner
 secret:bind: team-maintainer team-owner team-firing team-member-carried group-member user-owner share-editor
 secret:rotate: team-maintainer team-owner team-firing group-member user-owner
+secret:use: team-member team-maintainer team-owner team-firing group-member user-owner share-launcher
 model_provider:read: team-member team-maintainer team-owner team-firing group-member user-owner share-viewer platform-user run-own-tree
 model_provider:create: team-maintainer team-owner team-firing group-member user-owner
 model_provider:update: team-maintainer team-owner team-firing group-member user-owner share-editor

@@ -4,7 +4,8 @@
 
 @id("platform-admin-all")
 permit(principal, action, resource)
-when { principal.platform_admin };
+when { principal.platform_admin }
+unless { action == Action::"secret:use" };
 
 @id("user-owner-all")
 permit(principal, action, resource)
@@ -38,6 +39,10 @@ when { resource.owner_kind == "team" && resource has owner_role };
 
 @id("team-member-create-drafts")
 permit(principal, action == Action::"playbook_draft:create", resource)
+when { resource.owner_kind == "team" && resource has owner_role };
+
+@id("team-member-use-secrets")
+permit(principal, action == Action::"secret:use", resource)
 when { resource.owner_kind == "team" && resource has owner_role };
 
 @id("team-member-one-shot")
@@ -108,7 +113,7 @@ permit(principal, action in [Action::"read"], resource)
 when { resource has share && ["viewer", "launcher", "editor"].contains(resource.share) };
 
 @id("share-launcher")
-permit(principal, action in [Action::"launch"], resource)
+permit(principal, action in [Action::"launch", Action::"use"], resource)
 when { resource has share && ["launcher", "editor"].contains(resource.share) };
 
 @id("share-editor")

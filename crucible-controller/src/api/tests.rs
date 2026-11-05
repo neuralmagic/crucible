@@ -14826,6 +14826,8 @@ async fn launch_draft_with_key(
     .await??;
     let resolved = crate::secrets::launch::resolve(
         pool,
+        &crate::authz::policy::Engine::load(crate::authz::policy::DEFAULT_POLICY)
+            .expect("default policy"),
         &crate::secrets::launch::Scope::playbook("cve-triage"),
         &[],
         &launcher,
@@ -14851,7 +14853,7 @@ fn team_not_owned(
 ) -> bool {
     matches!(
         resolved,
-        Err(crate::secrets::launch::Refusal::NotOwned { owner, .. }) if owner == "team:tibrahim-all"
+        Err(crate::secrets::launch::Refusal::NotUsable { owner, .. }) if owner == "team:tibrahim-all"
     )
 }
 

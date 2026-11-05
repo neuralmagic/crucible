@@ -55,4 +55,6 @@ changed = [
     "C-OWNERSHIP, C-HIERARCHY, C-DECISION, and C-ENFORCEMENT name webhooks and their deliveries",
     "C-APPROVALS: a draft graduation binds the pack's digest, which for a pack saved on a base covers the flattened tree",
     "C-POLICY default grants members create and update on playbook drafts and create on one-shots, and maintainers delete on drafts, standing launches, one-shots, and imports and approve on drafts and imports",
+    "Add secret:use, decided for the launcher at dispatch in place of the owner-coverage check; members of an owning team and launcher shares hold it",
+    "The default policy withholds secret:use from platform administrators on secrets they neither own, share a team with, nor hold a share on",
 ]
