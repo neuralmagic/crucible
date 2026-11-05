@@ -55,7 +55,7 @@ RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-
 WORKDIR /src
 COPY . .
 # The same bins, flags and staging docker.yml uses, so the packaged output matches CI's.
-RUN cargo build --release --locked -p crucible -p crucible-broker -p forge -p buildit --bins \
+RUN cargo build --release --locked -p crucible -p crucible-broker -p forge -p buildit -p crucible-git --bins \
     --features crucible/autoresearch \
     && mkdir -p /prebuilt/bin \
     && find target/release -maxdepth 1 -type f -executable -exec cp {} /prebuilt/bin/ \; \

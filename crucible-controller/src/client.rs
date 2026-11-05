@@ -524,6 +524,14 @@ mod tests {
                 "0078_refuse_hermes_harness.sql",
                 "85922563a7efb6175c11d71a04ccb99119382931d79204e58b49d1d1b02766c6",
             ),
+            (
+                "0079_run_git_tokens.sql",
+                "ef77801a99c6c4f13c8a244cbbc28a3ab7481bcf5f1b33c6ecfc95976b27f908",
+            ),
+            (
+                "0080_run_git_token_binding.sql",
+                "2e532fda4c9b1b68bc93d305d00ed31865931eaca09610ba1712e0692b4b1f0c",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

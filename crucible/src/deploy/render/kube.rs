@@ -1400,7 +1400,7 @@ exit $rc
     /// reaches the broker over the pod-internal bridge (traffic a NetworkPolicy never sees), so this
     /// is a pure deny-all-ingress lockdown. Under `kubernetes` the sandbox is a sibling pod, so
     /// gateway (:17670), broker (:8849), OTLP collector (:17671), buildit (:8848, with `[buildit]`),
-    /// and `[mcp]` server traffic becomes
+    /// crucible-git (:8853, with `[git]`), and `[mcp]` server traffic becomes
     /// real cluster networking. The policy then allows ingress **only** from sandbox pods (in
     /// `cluster.sandbox_namespace` when it is set), **only** on those ports. Sandbox pods are
     /// matched by either identity they may carry: the OpenShell managed-by label (the driver only
@@ -1427,73 +1427,81 @@ exit $rc
                 )])),
                 ..Default::default()
             });
-        let ingress = match self.driver {
-            ComputeDriver::Podman => None,
-            ComputeDriver::Kubernetes => Some(vec![networking::NetworkPolicyIngressRule {
-                from: Some(vec![
-                    networking::NetworkPolicyPeer {
-                        pod_selector: Some(LabelSelector {
-                            match_labels: Some(BTreeMap::from([(
-                                OPENSHELL_MANAGED_BY_LABEL.to_string(),
-                                OPENSHELL_MANAGED_BY_VALUE.to_string(),
-                            )])),
+        let ingress =
+            match self.driver {
+                ComputeDriver::Podman => None,
+                ComputeDriver::Kubernetes => Some(vec![networking::NetworkPolicyIngressRule {
+                    from: Some(vec![
+                        networking::NetworkPolicyPeer {
+                            pod_selector: Some(LabelSelector {
+                                match_labels: Some(BTreeMap::from([(
+                                    OPENSHELL_MANAGED_BY_LABEL.to_string(),
+                                    OPENSHELL_MANAGED_BY_VALUE.to_string(),
+                                )])),
+                                ..Default::default()
+                            }),
+                            namespace_selector: sandbox_ns.clone(),
                             ..Default::default()
-                        }),
-                        namespace_selector: sandbox_ns.clone(),
-                        ..Default::default()
-                    },
-                    networking::NetworkPolicyPeer {
-                        pod_selector: Some(LabelSelector {
-                            match_expressions: Some(vec![LabelSelectorRequirement {
-                                key: SANDBOX_NAME_HASH_LABEL.to_string(),
-                                operator: "Exists".to_string(),
-                                values: None,
-                            }]),
+                        },
+                        networking::NetworkPolicyPeer {
+                            pod_selector: Some(LabelSelector {
+                                match_expressions: Some(vec![LabelSelectorRequirement {
+                                    key: SANDBOX_NAME_HASH_LABEL.to_string(),
+                                    operator: "Exists".to_string(),
+                                    values: None,
+                                }]),
+                                ..Default::default()
+                            }),
+                            namespace_selector: sandbox_ns,
                             ..Default::default()
-                        }),
-                        namespace_selector: sandbox_ns,
-                        ..Default::default()
-                    },
-                ]),
-                ports: Some(
-                    (!crate::deploy::render::gateway::isolated(self.profile))
-                        .then_some(networking::NetworkPolicyPort {
-                            port: Some(IntOrString::Int(GATEWAY_PORT.into())),
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        })
-                        .into_iter()
-                        .chain([
-                            networking::NetworkPolicyPort {
-                                // The manifest's `[agent.broker].bind` port, never a second constant: a
-                                // domain that moves the broker must not silently lose its ingress rule.
-                                port: Some(IntOrString::Int(broker_ingress_port(
-                                    &self.input.agent.broker.bind,
-                                ))),
+                        },
+                    ]),
+                    ports: Some(
+                        (!crate::deploy::render::gateway::isolated(self.profile))
+                            .then_some(networking::NetworkPolicyPort {
+                                port: Some(IntOrString::Int(GATEWAY_PORT.into())),
                                 protocol: Some("TCP".to_string()),
                                 ..Default::default()
-                            },
-                            networking::NetworkPolicyPort {
-                                // The turn's in-process OTLP collector; the agent's exporter posts here
-                                // from the sandbox. Rendered unconditionally: with telemetry off nothing
-                                // listens and the rule is inert.
-                                port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
-                                protocol: Some("TCP".to_string()),
-                                ..Default::default()
-                            },
-                        ])
-                        .chain(self.profile.buildit.as_ref().map(|b| {
-                            networking::NetworkPolicyPort {
-                                port: Some(IntOrString::Int(b.port().into())),
-                                protocol: Some("TCP".to_string()),
-                                ..Default::default()
-                            }
-                        }))
-                        .chain(mcp_ports)
-                        .collect(),
-                ),
-            }]),
-        };
+                            })
+                            .into_iter()
+                            .chain([
+                                networking::NetworkPolicyPort {
+                                    // The manifest's `[agent.broker].bind` port, never a second constant: a
+                                    // domain that moves the broker must not silently lose its ingress rule.
+                                    port: Some(IntOrString::Int(broker_ingress_port(
+                                        &self.input.agent.broker.bind,
+                                    ))),
+                                    protocol: Some("TCP".to_string()),
+                                    ..Default::default()
+                                },
+                                networking::NetworkPolicyPort {
+                                    // The turn's in-process OTLP collector; the agent's exporter posts here
+                                    // from the sandbox. Rendered unconditionally: with telemetry off nothing
+                                    // listens and the rule is inert.
+                                    port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
+                                    protocol: Some("TCP".to_string()),
+                                    ..Default::default()
+                                },
+                            ])
+                            .chain(self.profile.buildit.as_ref().map(|b| {
+                                networking::NetworkPolicyPort {
+                                    port: Some(IntOrString::Int(b.port().into())),
+                                    protocol: Some("TCP".to_string()),
+                                    ..Default::default()
+                                }
+                            }))
+                            .chain(self.profile.git.as_ref().map(|g| {
+                                networking::NetworkPolicyPort {
+                                    port: Some(IntOrString::Int(g.port().into())),
+                                    protocol: Some("TCP".to_string()),
+                                    ..Default::default()
+                                }
+                            }))
+                            .chain(mcp_ports)
+                            .collect(),
+                    ),
+                }]),
+            };
         networking::NetworkPolicy {
             metadata: ObjectMeta {
                 name: Some(format!("{}-loop-deny-ingress", self.input.name)),
