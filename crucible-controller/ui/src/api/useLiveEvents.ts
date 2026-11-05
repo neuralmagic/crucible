@@ -27,17 +27,21 @@ export function useLiveEvents() {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    const eventSource = openEventSource('/api/events/stream');
+    let eventSource: EventSource | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    // The stream survives restarts and tab switches, so "not the first open" is what tells an
+    // invalidation that the page may have missed events while it was disconnected.
+    let connected = false;
 
     const invalidate = () => {
       timer = null;
       for (const path of LIVE_PATHS) {
         void queryClient.invalidateQueries({ queryKey: ['get', path] });
       }
-      // Individual issue detail pages (/api/issues/{key}) use a different query key; prefix-match
-      // invalidates them all so the detail + progress views stay live. Only *mounted* queries
-      // refetch, which is why an expandable row must not mount its detail until it opens.
+      // Individual issue detail pages (/api/issues/{key}) and run-scoped queries
+      // (/api/runs/{run_id}/files and friends) use different query keys; prefix-match invalidates
+      // them so the detail and run views stay live. Only *mounted* queries refetch, which is why an
+      // expandable row must not mount its detail until it opens.
       void queryClient.invalidateQueries({
         predicate: (query) => {
           const key = query.queryKey;
@@ -45,22 +49,53 @@ export function useLiveEvents() {
             Array.isArray(key) &&
             key[0] === 'get' &&
             typeof key[1] === 'string' &&
-            key[1].startsWith('/api/issues/')
+            (key[1].startsWith('/api/issues/') || key[1].startsWith('/api/runs/'))
           );
         },
       });
     };
 
-    // Leading-edge timer: the first event of a quiet period arms it and everything inside the
-    // window rides along, so a burst costs exactly one pass. Transient stream errors are left to
-    // EventSource's native reconnect.
-    eventSource.onmessage = () => {
-      if (timer === null) timer = setTimeout(invalidate, COALESCE_MS);
+    // A browser gives one origin six connections and an open stream holds one of them for as long
+    // as it is open, so a handful of background tabs starve every new request on that origin.
+    // Hidden tabs therefore give their connection back; becoming visible reopens the stream and
+    // invalidates, which covers whatever they missed while closed.
+    const connect = () => {
+      if (eventSource !== null) return;
+      const source = openEventSource('/api/events/stream');
+      // Leading-edge timer: the first event of a quiet period arms it and everything inside the
+      // window rides along, so a burst costs exactly one pass. Transient stream errors are left to
+      // EventSource's native reconnect.
+      source.onmessage = () => {
+        if (timer === null) timer = setTimeout(invalidate, COALESCE_MS);
+      };
+      // A controller restart drops every in-flight query on an open page; EventSource reconnects on
+      // its own but no event need follow, so the page would sit on its loading state until a
+      // reload. The first open is the page's own initial fetch and has nothing stale to replace.
+      source.onopen = () => {
+        if (connected) invalidate();
+        connected = true;
+      };
+      eventSource = source;
     };
 
-    return () => {
-      if (timer !== null) clearTimeout(timer);
+    const disconnect = () => {
+      if (eventSource === null) return;
       eventSource.close();
+      eventSource = null;
+    };
+
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') connect();
+      else disconnect();
+    };
+
+    onVisibility();
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      if (timer !== null) clearTimeout(timer);
+      disconnect();
     };
   }, [queryClient]);
 }
