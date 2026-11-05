@@ -19,6 +19,6 @@ RUN grep -v '^torch' /tmp/requirements/build/cuda.txt > /tmp/build-reqs.txt && \
 COPY vllm /src/vllm
 WORKDIR /src/vllm
 ENV CCACHE_DIR=/root/.cache/ccache
-ARG TORCH_CUDA_ARCH_LIST=10.0
+ARG CUDA_ARCH_LIST=10.0
 ARG MAX_JOBS=64
-RUN TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" MAX_JOBS="$MAX_JOBS" python3 setup.py build_ext --inplace
+RUN TORCH_CUDA_ARCH_LIST="$CUDA_ARCH_LIST" MAX_JOBS="$MAX_JOBS" python3 setup.py build_ext --inplace

@@ -25,7 +25,7 @@ edit = agent(
     prompt = prompt_file("prompt.md") +
              "\n\nvllm_ref: " + param("vllm_ref") +
              "\nBASE: " + param("base_image") +
-             "\nTORCH_CUDA_ARCH_LIST: " + param("arch_list") +
+             "\nCUDA_ARCH_LIST: " + param("arch_list") +
              "\nMAX_JOBS: " + str(param("max_jobs")) + "\n",
     depends_on = [seed],
     over = seed.kernels,

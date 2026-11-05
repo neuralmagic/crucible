@@ -45,7 +45,7 @@ def main() -> None:
         "--cache", "vllm-ccache=/root/.cache/ccache",
         "--cache", "vllm-deps=/src/vllm/.deps",
         "--build-arg", f"BASE={params['base_image']}",
-        "--build-arg", f"TORCH_CUDA_ARCH_LIST={params['arch_list']}",
+        "--build-arg", f"CUDA_ARCH_LIST={params['arch_list']}",
         "--build-arg", f"MAX_JOBS={params['max_jobs']}",
         "--timeout", "3600",
     )

@@ -6,7 +6,7 @@ If the buildit tools are not available to you, write `report.json` with an `erro
 stop. Do not look for credentials, tokens or other ways in.
 
 Every build uses the same arguments: context `build`, dockerfile `Dockerfile`, `ccache` true,
-`timeout_s` 3600, build_args `BASE`, `TORCH_CUDA_ARCH_LIST` and `MAX_JOBS` from below, and these
+`timeout_s` 3600, build_args `BASE`, `CUDA_ARCH_LIST` and `MAX_JOBS` from below, and these
 caches, unchanged:
 
     [{"name": "vllm-ccache", "path": "/root/.cache/ccache"},
