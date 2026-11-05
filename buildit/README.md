@@ -170,6 +170,15 @@ and the build's caches read-only. A `facts.json` object a build leaves there com
 the run's own builds on its socket, or `all`, sandboxes' builds too. A build without the token
 reads only.
 
+A cache with `scope: "cluster"` (`NAME=PATH:cluster`) also lives in the shared cache, as a zstd
+tarball under `dirs/<name>/<key>`. Its `key` lists context files and directories
+(`--cache-key NAME=PATH`), and the snapshot's key is a hash of the name and their contents, so the
+files that pin a cache's sources make a key that changes exactly when the sources do. Before
+`bud`, a build whose pod has the cache empty restores the snapshot under its key, else the newest
+one under the name. After a successful `bud`, a build that may write saves the cache under its key
+unless that key has a snapshot already. Both steps run in the builder pod, appear in the build log,
+and are stamped in `steps.log` as `CACHE restore <name>` and `CACHE save <name>`.
+
 A build with `ccache: true` (`--ccache` on the CLI) gets a generated `/etc/ccache.conf` in every
 `RUN` step, so a Dockerfile that already compiles through ccache needs no change: ccache uses the
 shared cache as remote storage (writing to it when the server holds the token) and logs each

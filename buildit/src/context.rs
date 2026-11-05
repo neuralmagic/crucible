@@ -11,6 +11,8 @@ use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::sandbox::RelPath;
+
 // gzipped for streaming over exec stdin (the interactive path)
 pub fn tarball(ctx: &Path) -> Result<Vec<u8>> {
     gzip(&tar_bytes(ctx)?)
@@ -95,6 +97,45 @@ fn content_sha256(content: &mut impl Read) -> Result<Vec<u8>> {
 
 /// The [`ContextDigest`] of an uncompressed context tar.
 pub fn digest(tar: &[u8]) -> Result<ContextDigest> {
+    let mut hasher = Sha256::new();
+    for (_, record) in records(tar)? {
+        hasher.update(record);
+    }
+    Ok(ContextDigest(format!("sha256:{}", hex(&hasher.finalize()))))
+}
+
+/// The key of cache `name`'s snapshot: a sha256 over the name and the records of the context
+/// entries at or under each of `paths`. Each path must name at least one entry.
+pub fn cache_key(name: &str, tar: &[u8], paths: &[RelPath]) -> Result<String> {
+    let records = records(tar)?;
+    let covers = |key: &RelPath, path: &[u8]| {
+        let key = key.as_str().as_bytes();
+        path.strip_prefix(key)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with(b"/"))
+    };
+    if let Some(missing) = paths
+        .iter()
+        .find(|key| !records.iter().any(|(path, _)| covers(key, path)))
+    {
+        bail!(
+            "cache {name} is keyed by {}, which is not in the context",
+            missing.as_str()
+        );
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    hasher.update([0]);
+    for (_, record) in records
+        .iter()
+        .filter(|(path, _)| paths.iter().any(|key| covers(key, path)))
+    {
+        hasher.update(record);
+    }
+    Ok(hex(&hasher.finalize()))
+}
+
+/// One record per entry of an uncompressed context tar, sorted by path.
+fn records(tar: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     use tar::EntryType;
     let mut records: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for entry in tar::Archive::new(tar)
@@ -135,11 +176,7 @@ pub fn digest(tar: &[u8]) -> Result<ContextDigest> {
         records.push((path, record));
     }
     records.sort();
-    let mut hasher = Sha256::new();
-    for (_, record) in &records {
-        hasher.update(record);
-    }
-    Ok(ContextDigest(format!("sha256:{}", hex(&hasher.finalize()))))
+    Ok(records)
 }
 
 /// The digest `dir` gets as a build context from a local workspace: staged, sanitized and
@@ -211,7 +248,7 @@ mod tests {
 
     use flate2::read::GzDecoder;
 
-    use crate::context::{ContextDigest, digest, digest_dir, staged_tar_bytes, tarball};
+    use crate::context::{ContextDigest, cache_key, digest, digest_dir, staged_tar_bytes, tarball};
     use crate::sandbox::{RelPath, SandboxName, Workspace};
 
     #[derive(Clone, Copy)]
@@ -518,5 +555,52 @@ mod tests {
         let file = dir.path().join("f");
         touch(&file);
         assert!(tarball(&file).is_err());
+    }
+
+    /// A cache key covers the named files and directories of the context and nothing else, and
+    /// a name that matches no entry is refused.
+    #[test]
+    fn a_cache_key_changes_with_its_files_and_only_with_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("vllm/cmake/external_projects")).unwrap();
+        std::fs::create_dir_all(root.join("vllm/csrc")).unwrap();
+        let write = |path: &str, body: &str| std::fs::write(root.join(path), body).unwrap();
+        write("vllm/CMakeLists.txt", "set(CUTLASS_REVISION \"v4.7.1\")\n");
+        write(
+            "vllm/cmake/external_projects/flashmla.cmake",
+            "GIT_TAG 0eee43b\n",
+        );
+        write("vllm/csrc/layernorm_kernels.cu", "// kernel\n");
+        let paths = [
+            RelPath::parse("vllm/CMakeLists.txt").unwrap(),
+            RelPath::parse("vllm/cmake/external_projects").unwrap(),
+        ];
+        let key = |name: &str| cache_key(name, &staged_tar_bytes(root).unwrap(), &paths).unwrap();
+        let first = key("vllm-deps");
+        assert_eq!(first.len(), 64);
+        assert_ne!(key("other"), first, "the name is part of the key");
+
+        write("vllm/csrc/layernorm_kernels.cu", "// edited kernel\n");
+        assert_eq!(key("vllm-deps"), first, "an edit outside the key keeps it");
+        write(
+            "vllm/cmake/external_projects/flashmla.cmake",
+            "GIT_TAG 1fff54c\n",
+        );
+        let bumped = key("vllm-deps");
+        assert_ne!(bumped, first, "a pin in a keyed directory moves it");
+        write("vllm/CMakeLists.txt", "set(CUTLASS_REVISION \"v4.8.0\")\n");
+        assert_ne!(key("vllm-deps"), bumped, "a pin in a keyed file moves it");
+
+        let missing = cache_key(
+            "vllm-deps",
+            &staged_tar_bytes(root).unwrap(),
+            &[RelPath::parse("vllm/cmake/external").unwrap()],
+        )
+        .unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("vllm/cmake/external, which is not in the context"),
+            "{missing:#}"
+        );
     }
 }
