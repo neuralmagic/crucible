@@ -1629,7 +1629,9 @@ writes requested output paths back to `<workdir>/.buildit/<build id>/` in the sa
 Each build gets one builder pod in the buildit namespace (`buildit/src/mcp.rs:971`). The pod has
 the labels `buildit.dev/managed-by=mcp`, `buildit.dev/sandbox`, `buildit.dev/build-id` and
 `crucible.dev/launched-by`. It runs `buildah` with `automountServiceAccountToken: false`,
-`enableServiceLinks: false` and an `activeDeadlineSeconds` of `--pod-deadline` (default 7200).
+`enableServiceLinks: false` and an `activeDeadlineSeconds` of `--pod-deadline` (default 14400).
+Its main process ends the pod after `--pod-idle` seconds (default 1800) with no build or run in it,
+so an idle pod stops counting against the builder namespace's quota.
 `--max-builds` (default 4) limits live builder pods per sandbox. The shipped policy caps a build at
 3600 seconds and a run at 1800 seconds; without a value they are 1800 and 600.
 
@@ -2010,7 +2012,8 @@ kinds treats a token with `act` as a run and a token without `act` as a person.
 | `--namespace` | the client namespace | Where builder pods go. |
 | `--push-repo` (`MCP_PUSH_REPO`) | unset | Needs `--push-authfile`. |
 | `--push-authfile` (`MCP_PUSH_AUTHFILE`) | unset | Needs `--push-repo`. |
-| `--pod-deadline` | `7200` | Builder pod `activeDeadlineSeconds`. |
+| `--pod-deadline` | `14400` | Builder pod `activeDeadlineSeconds`. |
+| `--pod-idle` (`MCP_POD_IDLE`) | `1800` | Seconds without a build or run before a builder pod ends; `0` keeps it to its deadline. |
 | `--max-builds` | `4` | Live builder pods per sandbox. |
 
 `buildit` also accepts an older tokens file. `buildit` never reads a compact JWT as a tokens-file

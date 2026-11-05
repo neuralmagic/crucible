@@ -157,7 +157,10 @@ whose deadline leaves room for the build's timeout, as `<pod>-<suffix>`, with
 `buildah bud --layers`, so it reuses the pod's pulled images, layer cache and
 `RUN --mount=type=cache` contents. `clean` of one build drops its image name, context and logs
 and leaves the pod for the next build; `clean` with no build_id deletes the sandbox's pods.
-`--reuse-builders false` gives every build a pod of its own. `--pod-deadline` defaults to 4h.
+`--reuse-builders false` gives every build a pod of its own. `--pod-deadline` defaults to 4h,
+and a pod with no build or run for `--pod-idle` seconds (default 1800, 0 for never) ends on its
+own, so an idle pod stops holding the namespace's quota. A busy check that picks a warm pod stamps
+it used, and the pod takes a lock before it ends, so it never ends under a build it was picked for.
 `--storage-driver overlay` stores layers with kernel overlayfs instead of vfs, on nodes that
 allow it in a user namespace.
 
@@ -216,7 +219,8 @@ Callers are identified by the bearer token alone: `MCP_TOKENS_FILE` holds
 `BROKER_SANDBOX_WORKDIR`) and is re-read on every request. Builds are found by
 pod labels, so a restarted server keeps serving them, and a sandbox only sees
 its own. Builder pods mount no service account token and end at
-`--pod-deadline`; a sandbox may hold `--max-builds` live ones.
+`--pod-deadline`, or after `--pod-idle` seconds unused; a sandbox may hold `--max-builds` live
+ones.
 
 `--queue` submits builder pods to a Kueue LocalQueue (the
 `kueue.x-k8s.io/queue-name` label), for namespaces Kueue manages; where it

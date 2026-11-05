@@ -109,7 +109,8 @@ const DEADLINE_EXCEEDED: &str = "DeadlineExceeded";
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
-/// Prints `busy` when a build step in the pod is still running, else `idle`.
+/// Prints `busy` when a build step in the pod is still running or the pod is leaving, else
+/// stamps the pod used and prints `idle`.
 const BUSY_SCRIPT: &str = r#"for log in "$1"/*/build.log; do
   [ -e "$log" ] && [ ! -s "$log.exit" ] || continue
   pid=$(cat "$log.pid" 2>/dev/null)
@@ -117,7 +118,37 @@ const BUSY_SCRIPT: &str = r#"for log in "$1"/*/build.log; do
   stat=$(cat "/proc/$pid/stat" 2>/dev/null); stat=${stat##*) }
   case "${stat%% *}" in ""|Z|X) ;; *) echo busy; exit 0 ;; esac
 done
+touch "$1/.used" 2>/dev/null
+[ -d "$1/.leaving" ] && { echo busy; exit 0; }
 echo idle"#;
+
+/// A builder pod's main process: it holds the pod until its deadline, and exits once nothing
+/// under the logs dir has changed for `idle` seconds and no step runs, which ends the pod.
+/// Arguments: deadline, idle (0 holds to the deadline), logs dir, and seconds between checks.
+const HOLD_SCRIPT: &str = r#"deadline=$1; idle=$2; logs=$3; poll=$4
+trap 'exit 0' TERM INT
+recent() { find "$logs" -mindepth 1 ! -name .leaving -newermt "@$((now - idle))" -print -quit 2> /dev/null; }
+start=$(date +%s)
+while [ $(($(date +%s) - start)) -lt "$deadline" ]; do
+  sleep "$poll" & wait $!
+  now=$(date +%s)
+  [ "$idle" -gt 0 ] && [ $((now - start)) -ge "$idle" ] || continue
+  [ -z "$(recent)" ] || continue
+  running=
+  for log in "$logs"/*/*.log; do
+    [ -e "$log" ] && [ ! -s "$log.exit" ] || continue
+    pid=$(cat "$log.pid" 2> /dev/null)
+    case "$pid" in "" | *[!0-9]*) continue ;; esac
+    stat=$(cat "/proc/$pid/stat" 2> /dev/null); stat=${stat##*) }
+    case "${stat%% *}" in "" | Z | X) ;; *) running=1; break ;; esac
+  done
+  [ -z "$running" ] || continue
+  mkdir -p "$logs" && mkdir "$logs/.leaving" 2> /dev/null || continue
+  [ -z "$(recent)" ] && exit 0
+  rmdir "$logs/.leaving"
+done"#;
+/// The longest a builder pod waits between idle checks.
+const HOLD_POLL_SECS: u64 = 30;
 
 /// Drops a build from a pod that stays warm: its image takes the pod's one anchor tag, and the
 /// previous anchor's image goes, with the parents no later build shares.
@@ -187,6 +218,10 @@ pub struct McpArgs {
     /// Builder pod lifetime in seconds (activeDeadlineSeconds)
     #[arg(long, env = "MCP_POD_DEADLINE", default_value_t = 14400)]
     pub pod_deadline: i64,
+    /// A builder pod ends after this many seconds with no build or run in it; 0 keeps it to its
+    /// deadline
+    #[arg(long, env = "MCP_POD_IDLE", default_value_t = 1800)]
+    pub pod_idle: u64,
     /// A build reuses an idle builder pod of its sandbox that has time left, keeping the pulled
     /// images, buildah's layer cache (`--layers`) and `RUN --mount=type=cache` contents of the
     /// builds before it; `clean` of one build leaves the pod for the next
@@ -345,6 +380,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
             limits: args.limits,
         },
         deadline_secs: args.pod_deadline,
+        idle_secs: args.pod_idle,
         max_builds: args.max_builds,
         reuse: args.reuse_builders,
         storage: args.storage_driver,
@@ -721,6 +757,7 @@ pub struct Broker {
     local_workdir: Option<PathBuf>,
     resources: Resources,
     deadline_secs: i64,
+    idle_secs: u64,
     max_builds: usize,
     reuse: bool,
     storage: StorageDriver,
@@ -1724,8 +1761,18 @@ impl Broker {
                 .get_or_insert_default()
                 .insert("kubernetes.io/arch".to_string(), arch.clone());
         }
+        let poll = (self.idle_secs / 4).clamp(1, HOLD_POLL_SECS);
         for c in &mut spec.containers {
-            c.command = Some(argv(["sleep", &self.deadline_secs.to_string()]));
+            c.command = Some(argv([
+                "sh",
+                "-c",
+                HOLD_SCRIPT,
+                "sh",
+                &self.deadline_secs.to_string(),
+                &self.idle_secs.to_string(),
+                crate::logs::LOG_DIR,
+                &poll.to_string(),
+            ]));
             for e in c.env.iter_mut().flatten() {
                 if e.name == "STORAGE_DRIVER" {
                     e.value = Some(self.storage.as_str().to_string());
@@ -2634,13 +2681,13 @@ mod tests {
 
     use crate::mcp::{
         ANNOTATION_LAYOUT, BUSY_SCRIPT, Broker, BuildId, BuildParams, BuilditMcp, BuilditRules,
-        CACHE_ROOT, CacheScope, CacheSpec, CacheWriters, Caller, KUEUE_GATE, LABEL_QUEUE,
-        LAYOUT_SHARED, Launcher, LogsParams, MCP_PATH, PodView, PushParams, PushTarget,
-        REUSE_SLACK, ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ,
-        SharedCache, Snapshots, Starter, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, alive,
-        annotated_digest, annotation, argv, bind_socket, bud_argv, build_limit, cache_volumes,
-        ccache_conf, held, hosts, parse_tokens, push_argv, read_only_volumes, reusable, router,
-        run_sandbox, socket_router, unpack,
+        CACHE_ROOT, CacheScope, CacheSpec, CacheWriters, Caller, HOLD_SCRIPT, KUEUE_GATE,
+        LABEL_QUEUE, LAYOUT_SHARED, Launcher, LogsParams, MCP_PATH, PodView, PushParams,
+        PushTarget, REUSE_SLACK, ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD,
+        SCOPE_READ, SharedCache, Snapshots, Starter, StatusCode, TokenLine, ToolPolicy,
+        TrustedIssuer, alive, annotated_digest, annotation, argv, bind_socket, bud_argv,
+        build_limit, cache_volumes, ccache_conf, held, hosts, parse_tokens, push_argv,
+        read_only_volumes, reusable, router, run_sandbox, socket_router, unpack,
     };
     use crate::pod::BuilderPod;
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
@@ -2678,6 +2725,9 @@ mod tests {
             local_workdir: local.map(Path::to_path_buf),
             resources: Resources::default(),
             deadline_secs,
+            idle_secs: std::env::var("BUILDIT_E2E_POD_IDLE")
+                .map(|s| s.parse().unwrap())
+                .unwrap_or(1800),
             max_builds: 4,
             reuse,
             storage: std::env::var("BUILDIT_E2E_STORAGE_DRIVER")
@@ -3646,6 +3696,92 @@ mod tests {
             .unwrap();
             assert_eq!(busy(), "busy", "a live runner without an exit record");
         }
+        let used = dir.path().join(".used");
+        assert!(used.is_file(), "an idle answer stamps the pod used");
+        std::fs::create_dir(dir.path().join(".leaving")).unwrap();
+        assert_eq!(busy(), "busy", "a leaving pod takes no build");
+    }
+
+    /// The hold loop as a builder pod runs it: it ends the pod once nothing under the logs dir
+    /// has changed for `idle` seconds and no step runs, keeps it while either holds, never ends
+    /// it with idle 0, and leaves at once on TERM.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_builder_pod_ends_once_idle_and_never_while_used() {
+        use std::process::{Child, Command};
+        use std::time::{Duration, Instant};
+        let hold = |logs: &std::path::Path, idle: &str| -> Child {
+            Command::new("sh")
+                .args(["-c", HOLD_SCRIPT, "sh", "120", idle])
+                .arg(logs)
+                .arg("1")
+                .spawn()
+                .unwrap()
+        };
+        let exits_within = |child: &mut Child, secs: u64| {
+            let until = Instant::now() + Duration::from_secs(secs);
+            while Instant::now() < until {
+                if let Some(status) = child.try_wait().unwrap() {
+                    return Some(status);
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            None
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let idle = dir.path().join("idle");
+        std::fs::create_dir_all(idle.join("buildit-1")).unwrap();
+        let mut child = hold(&idle, "2");
+        let status = exits_within(&mut child, 8).expect("an idle pod ends");
+        assert!(status.success());
+        assert!(idle.join(".leaving").is_dir(), "it claims its exit first");
+
+        let used = dir.path().join("used");
+        std::fs::create_dir_all(&used).unwrap();
+        let mut child = hold(&used, "2");
+        for _ in 0..6 {
+            std::fs::write(used.join(".used"), "").unwrap();
+            std::thread::sleep(Duration::from_secs(1));
+            assert!(child.try_wait().unwrap().is_none(), "a pod in use stays");
+        }
+        assert!(
+            exits_within(&mut child, 8).is_some(),
+            "and ends once unused"
+        );
+
+        let running = dir.path().join("running");
+        let step = running.join("buildit-2");
+        std::fs::create_dir_all(&step).unwrap();
+        std::fs::write(step.join("build.log"), "").unwrap();
+        let mut sleeper = Command::new("sleep").arg("30").spawn().unwrap();
+        std::fs::write(step.join("build.log.pid"), sleeper.id().to_string()).unwrap();
+        let mut child = hold(&running, "1");
+        assert!(
+            exits_within(&mut child, 5).is_none(),
+            "a running step keeps the pod"
+        );
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        assert!(
+            exits_within(&mut child, 8).is_some(),
+            "and its end lets it go"
+        );
+
+        let kept = dir.path().join("kept");
+        std::fs::create_dir_all(&kept).unwrap();
+        let mut child = hold(&kept, "0");
+        assert!(
+            exits_within(&mut child, 4).is_none(),
+            "idle 0 holds to the deadline"
+        );
+        nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap()),
+            nix::sys::signal::Signal::SIGTERM,
+        )
+        .unwrap();
+        let status = exits_within(&mut child, 3).expect("TERM ends it at once");
+        assert!(status.success());
     }
 
     #[test]
@@ -4232,7 +4368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_pods_carry_no_credentials_and_end_at_the_deadline() {
+    async fn builder_pods_carry_no_credentials_and_end_at_the_deadline_or_when_idle() {
         let dir = tempfile::tempdir().unwrap();
         let broker = broker(offline_client(), &tokens(dir.path(), ""), None);
         let id = BuildId::parse("buildit-1").unwrap();
@@ -4283,7 +4419,19 @@ mod tests {
             "builds prefer nodes off the control plane"
         );
         let c = &spec.containers[0];
-        assert_eq!(c.command.as_deref().unwrap(), ["sleep", "900"]);
+        assert_eq!(
+            c.command.as_deref().unwrap(),
+            [
+                "sh",
+                "-c",
+                HOLD_SCRIPT,
+                "sh",
+                "900",
+                "1800",
+                "/tmp/buildit-logs",
+                "30"
+            ]
+        );
         assert!(c.env_from.is_none());
         assert!(c.env.iter().flatten().all(|e| e.value_from.is_none()));
         let driver = c.env.iter().flatten().find(|e| e.name == "STORAGE_DRIVER");
@@ -4825,6 +4973,81 @@ mod tests {
             let e = a(tool, only_id.clone()).await.unwrap_err();
             assert!(e.contains("no live build"), "{tool}: {e}");
         }
+    }
+
+    /// A builder pod with nothing to do ends on its own: the pod finishes once idle, and the
+    /// sandbox's next build gets a new pod instead of the ended one.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_an_idle_builder_pod_ends_and_the_next_build_gets_a_new_one() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(work.join("svc")).unwrap();
+        std::fs::write(
+            work.join("svc/Dockerfile"),
+            "FROM docker.io/library/busybox:latest\nRUN echo idle-e2e\n",
+        )
+        .unwrap();
+        let file = tokens(&work, "tok-a sb-idle\n");
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        let namespace = client.default_namespace().to_string();
+        let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+        let broker = Broker {
+            idle_secs: 12,
+            ..Arc::into_inner(broker_with(client, &file, Some(&work), 900, true)).unwrap()
+        };
+        let (addr, _server) = serve(Arc::new(broker)).await;
+        call(&addr, "tok-a", "clean", serde_json::json!({}))
+            .await
+            .unwrap();
+        let built = || {
+            let addr = addr.clone();
+            async move {
+                let args = serde_json::json!({ "context": "svc", "timeout_s": 300 });
+                let started = call(&addr, "tok-a", "build", args).await.unwrap();
+                let id = started["build_id"].as_str().unwrap().to_string();
+                let args = serde_json::json!({ "build_id": id });
+                for _ in 0..150 {
+                    let status = call(&addr, "tok-a", "status", args.clone()).await.unwrap();
+                    if status["status"] != "running" {
+                        assert_eq!(status["status"], "succeeded", "{status}");
+                        return id;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("build {id} still running after 300s");
+            }
+        };
+        let phase = |name: String| {
+            let pods = pods.clone();
+            async move {
+                let pod = pods.get(&name).await.unwrap();
+                pod.status.and_then(|s| s.phase).unwrap_or_default()
+            }
+        };
+
+        let first = built().await;
+        assert_eq!(phase(first.clone()).await, "Running");
+        let mut ended = String::new();
+        for _ in 0..60 {
+            ended = phase(first.clone()).await;
+            if ended == "Succeeded" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        assert_eq!(ended, "Succeeded", "an idle pod ends on its own");
+
+        let second = built().await;
+        assert!(
+            !second.starts_with(&first),
+            "the next build runs in a new pod, not the ended one: {first} then {second}"
+        );
+        call(&addr, "tok-a", "clean", serde_json::json!({}))
+            .await
+            .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
