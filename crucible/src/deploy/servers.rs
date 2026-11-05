@@ -5,7 +5,8 @@
 
 use crate::deploy::profile::{BuilditCacheCfg, DeployProfile};
 use crucible_contract::agent_servers::{
-    BuilderPods, BuilditSite, LocalServer, NotServerName, ServerName, SharedCache, Transport,
+    BuilderPods, BuilditSite, GitSite, LocalServer, NotServerName, ServerName, SharedCache,
+    Transport,
 };
 use crucible_contract::oauth::Scope;
 use std::collections::BTreeMap;
@@ -46,6 +47,11 @@ pub enum Hosting {
         /// What it runs with on each of the server's clusters.
         sites: BTreeMap<String, ClusterSite>,
     },
+    /// `crucible-git serve` in the loop pod.
+    Git {
+        /// Where it fetches the agent issuer's keys, when not from the issuer itself.
+        run_jwks_uri: Option<url::Url>,
+    },
 }
 
 /// buildit on one cluster: its builder pods, and the shared cache there if there is one.
@@ -82,6 +88,12 @@ impl ServerSpec {
                     queue: queue.clone(),
                     builders: site.builders,
                     cache: site.cache,
+                })))
+            }
+            Hosting::Git { run_jwks_uri } => {
+                let jwks = crate::deploy::profile::jwks_uri(issuer, run_jwks_uri.as_ref())?;
+                Transport::Local(LocalServer::Git(Box::new(GitSite {
+                    run_issuer: format!("{issuer}={jwks}"),
                 })))
             }
         })
@@ -215,6 +227,20 @@ impl DeployProfile {
                 .into_iter()
                 .filter_map(|(k, v)| Some((k.to_string(), v?)))
                 .collect(),
+            });
+        }
+        if let Some(g) = &self.git {
+            servers.push(ServerSpec {
+                name: ServerName::parse("git")?,
+                url: g.url(),
+                scopes: Scope::GIT.map(|s| s.as_str().to_string()).to_vec(),
+                clusters: g.clusters.clone(),
+                requires_kube_user: false,
+                namespaces: Vec::new(),
+                hosting: Hosting::Git {
+                    run_jwks_uri: g.run_jwks_uri.clone(),
+                },
+                limits: BTreeMap::new(),
             });
         }
         for s in &self.agent_servers {
@@ -439,7 +465,7 @@ mod tests {
             .unwrap()
         {
             Transport::Local(LocalServer::Buildit(site)) => site.builders,
-            Transport::Remote => panic!("buildit runs in the loop pod"),
+            other => panic!("buildit runs in the loop pod, not {other:?}"),
         }
     }
 
