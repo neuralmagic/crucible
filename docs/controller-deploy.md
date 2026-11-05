@@ -353,6 +353,7 @@ clusters     = ["spoke-a"]                          # default the hub; deploy it
 token_secret = "buildit-cache-token"
 size_gib     = 500
 write        = true
+agent_writes = false                                # optional; true lets agents' builds write
 ```
 
 `image` pins buildit apart from the loop image: loop pods copy its `/usr/local/bin/buildit` in
@@ -373,10 +374,11 @@ loop namespace, with a URL-safe value:
 oc create secret generic buildit-cache-token --from-literal=token="$(openssl rand -hex 32)"
 ```
 
-With `write` (the default) loop pods mount the token and builds on the cache's clusters may write
-to it. A build's `RUN` steps can read it, so one run's agent could store objects other runs' builds
-use: keep `write` for clusters whose runs trust each other, and set `write = false` otherwise so
-builds read only.
+With `write` (the default) loop pods mount the token, and the builds a run's own command and
+evaluate tasks start may write to the cache, so a pack can seed it once for a vLLM ref before its
+agents fan out. Agents' builds read only. `agent_writes = true` gives them the token too: a build's
+`RUN` steps can read it, so one run's agent could then store objects other runs' builds use, and it
+belongs only on clusters whose runs trust each other. `write = false` makes every build read only.
 
 ```bash
 openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out agent-signing.pem

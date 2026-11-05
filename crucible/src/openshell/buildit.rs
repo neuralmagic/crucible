@@ -121,6 +121,9 @@ impl Buildit<'_> {
                     ]
                     .map(String::from),
                 );
+                if cache.agent_writes {
+                    args.push("--cache-agent-writes".to_string());
+                }
             }
         }
         if let Some(socket) = self.socket {
@@ -266,24 +269,35 @@ mod tests {
             cache: Some(SharedCache {
                 url: url.into(),
                 write: false,
+                agent_writes: false,
             }),
             ..plain.clone()
         };
         let args = buildit(&reads).args(&run, "/p").unwrap();
         assert_eq!(flag(&args, "--cache-url").as_deref(), Some(url));
         assert!(!args.contains(&"--cache-token-file".to_string()));
-        let writes = BuilditSite {
+        let writes = |agent_writes| BuilditSite {
             cache: Some(SharedCache {
                 url: url.into(),
                 write: true,
+                agent_writes,
             }),
             ..plain.clone()
         };
-        let args = buildit(&writes).args(&run, "/p").unwrap();
+        let args = buildit(&writes(false)).args(&run, "/p").unwrap();
         assert_eq!(flag(&args, "--cache-url").as_deref(), Some(url));
         assert_eq!(
             flag(&args, "--cache-token-file").as_deref(),
             Some("/etc/buildit-cache/token")
+        );
+        assert!(
+            !args.contains(&"--cache-agent-writes".to_string()),
+            "only the run's own builds write: {args:?}"
+        );
+        let args = buildit(&writes(true)).args(&run, "/p").unwrap();
+        assert!(
+            args.contains(&"--cache-agent-writes".to_string()),
+            "{args:?}"
         );
         let queued = BuilditSite {
             queue: Some("builders".into()),

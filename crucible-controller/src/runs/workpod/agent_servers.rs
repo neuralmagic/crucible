@@ -359,16 +359,28 @@ mod tests {
             Some(SharedCache {
                 url: url.into(),
                 write: true,
-            })
+                agent_writes: false,
+            }),
+            "by default only a run's own builds write"
         );
         assert_eq!(site(&writes, "ocp"), None);
-        let reads = format!("{writes}write = false\n");
+        assert_eq!(
+            site(&format!("{writes}agent_writes = true\n"), "k8s"),
+            Some(SharedCache {
+                url: url.into(),
+                write: true,
+                agent_writes: true,
+            })
+        );
+        let reads = format!("{writes}write = false\nagent_writes = true\n");
         assert_eq!(
             site(&reads, "k8s"),
             Some(SharedCache {
                 url: url.into(),
                 write: false,
-            })
+                agent_writes: false,
+            }),
+            "agents write only where the run's own builds do"
         );
         assert_eq!(site(BUILDIT, "k8s"), None);
     }

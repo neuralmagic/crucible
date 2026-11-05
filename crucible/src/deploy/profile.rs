@@ -439,11 +439,15 @@ pub struct BuilditCacheCfg {
     /// The Secret in the loop namespace whose `token` key is the cache's write token, a URL-safe
     /// string. The cache and, with `write`, every loop pod mount it.
     pub token_secret: KubeName,
-    /// Whether builds get the write token. A build's `RUN` steps can read it, so a run's agent
-    /// could store objects other runs' builds then use: set it only on a cluster whose runs trust
-    /// each other. Without it builds read only. Default true.
+    /// Whether the builds a run's own tasks start get the write token, so a pack can seed the
+    /// cache. Without it every build reads only. Default true.
     #[serde(default = "yes")]
     pub write: bool,
+    /// Whether agents' builds get the write token too. A build's `RUN` steps can read it, so an
+    /// agent could store objects other runs' builds then use: set it only on a cluster whose runs
+    /// trust each other. Default false: agents' builds read only.
+    #[serde(default)]
+    pub agent_writes: bool,
     /// The cache's PersistentVolumeClaim size in GiB; it keeps 90% of it before it drops the
     /// least recently used blobs. Default 200.
     #[serde(default = "default_cache_gib")]

@@ -166,7 +166,8 @@ CLI): directories of its builder pod mounted at `path` in every `RUN` step and k
 sandbox's later builds there. Every `RUN` step also sees `/buildit`; a `run` of the build sees it
 and the build's caches read-only. A `facts.json` object a build leaves there comes back as `status.facts`. With
 `--cache-url`, buildit first writes `cache.json` there, naming the shared cache and, with
-`--cache-token-file`, its write token.
+`--cache-token-file`, its write token: for the run's own builds on its socket, and for sandboxes'
+builds only with `--cache-agent-writes`. Without the token a build reads only.
 
 A build with `ccache: true` (`--ccache` on the CLI) gets a generated `/etc/ccache.conf` in every
 `RUN` step, so a Dockerfile that already compiles through ccache needs no change: ccache uses the

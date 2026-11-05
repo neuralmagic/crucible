@@ -192,6 +192,7 @@ impl DeployProfile {
                 Some(SharedCache {
                     url: BuilditCacheCfg::url(&self.cluster.loop_namespace),
                     write: cache.write,
+                    agent_writes: cache.write && cache.agent_writes,
                 })
             };
             servers.push(ServerSpec {
