@@ -18,8 +18,9 @@ crux run-file <run_id> report/index.html --out index.html
 returns the bytes as `application/octet-stream`.
 
 A link to `/runs/<run_id>/files/<key>` opens that file, and **copy link** copies it. A page
-opened on such a link scrolls the panel into view. Without a key, the view opens `REPORT.md`
-from the task latest in plan order that wrote one, then the first Markdown file, then the first
+opened on such a link scrolls the panel into view. Without a key, the view opens the report from
+the task latest in plan order that wrote one, where a report is `REPORT.md`, `REPORT.html`, or any
+HTML file, and HTML wins within a task. Then it opens the first Markdown file, then the first
 file. A file from a task whose latest attempt failed is marked **failure evidence**. Empty files
 are left out of the list, and the panel counts them.
 
