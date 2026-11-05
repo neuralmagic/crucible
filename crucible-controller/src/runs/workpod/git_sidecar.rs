@@ -72,7 +72,7 @@ fn mount(volume: &str, path: &str, read_only: bool) -> core::VolumeMount {
 }
 
 /// Add the `crucible-git` container when the run is granted the `git` server. The token is mounted
-/// only when the run binds one; without it every call is refused.
+/// only when the run binds one; without it no call gets a token.
 pub fn add(
     pod: &mut core::Pod,
     secret: &str,

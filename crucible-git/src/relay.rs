@@ -1,14 +1,16 @@
 //! One request to GitHub, from either entry point: the `/git` routes sandboxes reach with run
 //! tokens, and the TLS listener the run's tasks reach as `github.com`. The run's token is lent only
 //! to a request that carries none of its own or carries the placeholder, and only as far as
-//! [`crate::policy`] allows. A request with a credential of its own is relayed with it, untouched:
-//! `crucible-git` never widens what a caller could do anyway.
+//! [`crate::policy`] allows. A task's request with a credential of its own is relayed with it,
+//! untouched, and one with none that the policy does not lend the token to goes out anonymously:
+//! `crucible-git` never narrows or widens what a task could do without it.
 //!
 //! ```text
 //!   Authorization          policy   on refusal
 //!   own credential         skipped  -
 //!   placeholder            applied  403
-//!   none                   applied  401 challenge, so git retries with the caller's credentials
+//!   none, from a task      applied  relayed anonymously
+//!   none, from a sandbox   applied  403
 //! ```
 
 use crate::allow::Allow;
@@ -89,16 +91,6 @@ fn refuse(status: StatusCode, why: impl Into<String>) -> Response {
     (status, why).into_response()
 }
 
-fn challenge(why: String) -> Response {
-    tracing::info!(%why, "challenged for the caller's own credential");
-    (
-        StatusCode::UNAUTHORIZED,
-        [(header::WWW_AUTHENTICATE, "Basic realm=\"GitHub\"")],
-        why,
-    )
-        .into_response()
-}
-
 impl Relay {
     pub async fn relay(&self, host: &str, req: Request, caller: Caller<'_>) -> Response {
         let (parts, body) = req.into_parts();
@@ -126,6 +118,8 @@ impl Relay {
             .http
             .request(parts.method.clone(), format!("https://{host}{path}"))
             .headers(forwarded(&parts.headers, own));
+        let anonymous = matches!(caller, Caller::Task) && presented.is_none();
+        let mut lent = false;
         if !own {
             let verdict = policy::decide(
                 &self.policy,
@@ -137,27 +131,30 @@ impl Relay {
                 decided_body.as_deref(),
             )
             .await;
-            let scope = match verdict {
-                Verdict::Allow { scope } => scope,
-                Verdict::Deny(_, why) if presented.is_none() && matches!(caller, Caller::Task) => {
-                    return challenge(why);
+            let token = match verdict {
+                Verdict::Allow { scope } => {
+                    if let Caller::Run(principal) = caller
+                        && !principal.missing_scopes(&[scope.to_string()]).is_empty()
+                    {
+                        return refuse(StatusCode::FORBIDDEN, format!("this call needs {scope}"));
+                    }
+                    match self.gh.token().await {
+                        Ok(t) => Some(t),
+                        Err(_) if anonymous => None,
+                        Err(e) => return refuse(e.status(), e.to_string()),
+                    }
                 }
+                Verdict::Deny(..) if anonymous => None,
                 Verdict::Deny(status, why) => return refuse(status, why),
             };
-            if let Caller::Run(principal) = caller
-                && !principal.missing_scopes(&[scope.to_string()]).is_empty()
-            {
-                return refuse(StatusCode::FORBIDDEN, format!("this call needs {scope}"));
+            if let Some(token) = token {
+                let auth = match host {
+                    "github.com" => GitHub::basic(&token),
+                    _ => format!("token {token}"),
+                };
+                upstream = upstream.header(header::AUTHORIZATION, auth);
+                lent = true;
             }
-            let token = match self.gh.token().await {
-                Ok(t) => t,
-                Err(e) => return refuse(e.status(), e.to_string()),
-            };
-            let auth = match host {
-                "github.com" => GitHub::basic(&token),
-                _ => format!("token {token}"),
-            };
-            upstream = upstream.header(header::AUTHORIZATION, auth);
         }
         upstream = match (decided_body, body) {
             (Some(bytes), _) => upstream.body(bytes),
@@ -176,7 +173,11 @@ impl Relay {
             method = %parts.method,
             path = %path.split('?').next().unwrap_or(""),
             status = %resp.status(),
-            credential = if own { "caller" } else { "run" },
+            credential = match (own, lent) {
+                (true, _) => "caller",
+                (false, true) => "run",
+                (false, false) => "none",
+            },
             "relayed a GitHub call"
         );
         let mut out = Response::builder().status(resp.status());
@@ -185,7 +186,7 @@ impl Relay {
                 out = out.header(name, value);
             }
         }
-        if !own && policy::reads_response(host, &parts.method, &path) {
+        if lent && policy::reads_response(host, &parts.method, &path) {
             let mut bytes = Vec::new();
             let mut stream = resp.bytes_stream();
             while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {

@@ -110,6 +110,26 @@ def deny(args: argparse.Namespace) -> None:
     print(json.dumps({"pass": not failures, "score": 1.0 if not failures else 0.0, "failures": failures}))
 
 
+def passthrough(args: argparse.Namespace) -> None:
+    """GitHub traffic crucible-git does not lend the token to reaches GitHub as it would anywhere:
+    anonymous downloads stay anonymous, and a caller's own credential is GitHub's to judge."""
+    failures = []
+    asset = "https://github.com/anchore/syft/releases/download/v1.33.0/syft_1.33.0_checksums.txt"
+    proc = attempt("curl", "-fsSL", asset)
+    if proc.returncode != 0 or "syft_1.33.0_linux_amd64.tar.gz" not in proc.stdout:
+        failures.append(f"a tokenless public release download failed: {proc.stderr.strip()[:200]}")
+    proc = attempt("curl", "-sS", "-w", "\n%{http_code}", "-H", "Authorization: Bearer not-a-token",
+                   "https://api.github.com/repos/anchore/syft")
+    body, _, code = proc.stdout.rpartition("\n")
+    try:
+        message = json.loads(body).get("message")
+    except ValueError:
+        message = None
+    if code != "401" or message != "Bad credentials":
+        failures.append(f"a caller's own token was not GitHub's to judge: {code} {body[:200]}")
+    print(json.dumps({"pass": not failures, "score": 1.0 if not failures else 0.0, "failures": failures}))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(required=True)
@@ -119,6 +139,8 @@ def main() -> None:
     p.set_defaults(func=push)
     d = sub.add_parser("deny")
     d.set_defaults(func=deny)
+    t = sub.add_parser("passthrough")
+    t.set_defaults(func=passthrough)
     c = sub.add_parser("check")
     c.add_argument("evidence", nargs="+")
     c.set_defaults(func=check)

@@ -64,7 +64,7 @@ struct ServeArgs {
     /// The run this server serves, compared with a run token's `run_id`.
     #[arg(long)]
     run_id: String,
-    /// The file holding the run's GitHub credential. Unset, every call is refused.
+    /// The file holding the run's GitHub credential. Unset, no call gets a token.
     #[arg(long)]
     token_file: Option<PathBuf>,
     /// The run's output bounds, as the loop writes them at setup.
@@ -135,7 +135,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
         .context("building the resource server")?,
     );
     if args.token_file.is_none() {
-        tracing::warn!("no GitHub token file; every call is refused");
+        tracing::warn!("no GitHub token file; no call gets a token");
     }
     let gh = Arc::new(github::GitHub::new(args.token_file, args.api_url)?);
 

@@ -25,11 +25,16 @@ deny = evaluate(
     depends_on = [task_push, agent_push],
 )
 
+passthrough = evaluate(
+    name = "passthrough",
+    run = "python3 smoke.py passthrough",
+)
+
 check = evaluate(
     name = "check",
     run = "python3 smoke.py check evidence/task.json evidence/agent.json",
-    depends_on = [task_push, agent_push, deny],
+    depends_on = [task_push, agent_push, deny, passthrough],
     emits = {"prs": "list"},
 )
 
-workflow(type = "playbook", tasks = [task_push, agent_push, deny, check], result = check)
+workflow(type = "playbook", tasks = [task_push, agent_push, deny, passthrough, check], result = check)
