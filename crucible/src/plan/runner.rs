@@ -43,9 +43,9 @@ pub struct ShellRunner {
     /// The run's buildit socket, exported to command and evaluate tasks as
     /// [`BUILDIT_SOCKET_ENV`].
     pub buildit_socket: Option<PathBuf>,
-    /// The run's `crucible-git` base URL, exported to command and evaluate tasks as
-    /// [`crucible_contract::git::ENV_URL`].
-    pub git_url: Option<String>,
+    /// Whether the run's `crucible-git` serves GitHub to command and evaluate tasks, which then
+    /// get [`crucible_contract::git::task_env`].
+    pub github: bool,
 }
 
 impl TaskRunner for ShellRunner {
@@ -105,7 +105,6 @@ impl ShellRunner {
         }
         crate::inference::withhold_from_task(&mut cmd);
         cmd.env_remove(BUILDIT_SOCKET_ENV);
-        cmd.env_remove(crucible_contract::git::ENV_URL);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -139,8 +138,7 @@ impl ShellRunner {
                 if let Some(socket) = &self.buildit_socket {
                     cmd.env(BUILDIT_SOCKET_ENV, socket);
                 }
-                if let Some(url) = &self.git_url {
-                    cmd.env(crucible_contract::git::ENV_URL, url);
+                if self.github {
                     for (name, value) in crucible_contract::git::task_env() {
                         cmd.env(name, value);
                     }
@@ -529,7 +527,7 @@ mod tests {
             agent_cmd: None,
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
-            git_url: None,
+            github: false,
         }
     }
 
@@ -1415,7 +1413,7 @@ mod tests {
             agent_cmd: Some("true".into()),
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
-            git_url: None,
+            github: false,
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
@@ -1475,7 +1473,7 @@ mod tests {
         let mut r = ShellRunner {
             agent_cmd: Some(show.into()),
             buildit_socket: Some("/runs/r1/pack/state/buildit.sock".into()),
-            git_url: None,
+            github: false,
             ..runner()
         };
         let seen =

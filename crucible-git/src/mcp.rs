@@ -75,9 +75,9 @@ impl GitMcp {
     #[tool(
         description = "Open a pull request (params: repo, base, head, title, body, draft, labels, \
         reviewers) as the run's GitHub App, a draft unless draft is false, or return the one \
-        already open from head into base; either way add labels and ask reviewers (users, or \
-        teams as org/team). Push head first through this server's /git/<owner>/<repo>.git. \
-        Returns url, number, draft, existing, labels and reviewers."
+        already open from head into base. Labels and reviewers (users, or teams as org/team) \
+        are applied to a pull request this run opened. Push head first through this server's \
+        /git/<owner>/<repo>.git. Returns url, number, draft, existing, labels and reviewers."
     )]
     async fn open_pr(&self, Parameters(p): Parameters<OpenPrParams>) -> Result<String, String> {
         let Some((owner, name)) = p

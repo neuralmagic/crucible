@@ -124,8 +124,6 @@ pub fn add(
         "serve",
         "--bind",
         &format!("0.0.0.0:{port}"),
-        "--local-bind",
-        git::LOCAL_BIND,
         "--tls-bind",
         git::TLS_BIND,
         "--ca-dir",

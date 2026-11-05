@@ -4,9 +4,9 @@
 //! only the repositories the run's `[outputs.draft-pr]` bound admits.
 //!
 //! ```text
-//!   sandbox ──run token──▶ --bind        ─┐  /git/<owner>/<repo>.git/…  ─▶ github.com
-//!   task    ──────────────▶ --local-bind ─┤  /mcp  open_pr              ─▶ api.github.com
-//!   task    ──TLS (SNI)───▶ --tls-bind   ─┘  plain gh and git (HTTPS)   ─▶ GitHub
+//!   sandbox ──run token──▶ --bind      ─┐  /git/<owner>/<repo>.git/…  ─▶ github.com
+//!           ──run token──▶ --bind      ─┤  /mcp  open_pr              ─▶ api.github.com
+//!   task    ──TLS (SNI)───▶ --tls-bind ─┘  plain gh and git (HTTPS)   ─▶ GitHub
 //! ```
 
 mod allow;
@@ -23,7 +23,7 @@ use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use clap::{Args, Parser, Subcommand};
-use crucible_mcp_auth::principal::{Callers, Principal};
+use crucible_mcp_auth::principal::Callers;
 use crucible_mcp_auth::server::{JwksTls, ResourceServer, ResourceServerConfig, TrustedIssuer};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,9 +50,6 @@ struct ServeArgs {
     /// Where sandboxes reach the server.
     #[arg(long)]
     bind: String,
-    /// Where the run's own tasks reach the server, without a token: a loopback address.
-    #[arg(long)]
-    local_bind: String,
     /// An issuer of run tokens, `<issuer>=<jwks uri>`.
     #[arg(long = "run-issuer", value_parser = run_issuer, required = true)]
     run_issuers: Vec<TrustedIssuer>,
@@ -72,12 +69,12 @@ struct ServeArgs {
     #[arg(long)]
     bounds_file: PathBuf,
     /// Where GitHub's hostnames are served over TLS to the run's tasks: the loopback address the
-    /// pod maps them to. Needs `--ca-dir`.
-    #[arg(long, requires = "ca_dir")]
-    tls_bind: Option<String>,
+    /// pod maps them to.
+    #[arg(long)]
+    tls_bind: String,
     /// Where to write the run CA and the bundle tasks trust.
     #[arg(long)]
-    ca_dir: Option<PathBuf>,
+    ca_dir: PathBuf,
     #[arg(long, default_value = "https://api.github.com")]
     api_url: Url,
     /// PEM bundle of CAs trusted for the issuer's JWKS host.
@@ -115,24 +112,6 @@ async fn authenticate(
     }
     req.extensions_mut().insert(principal);
     next.run(req).await
-}
-
-/// The run's own tasks: every request is the run, with every scope.
-async fn as_run(State(run): State<Arc<Principal>>, mut req: Request, next: Next) -> Response {
-    req.extensions_mut().insert(Principal::clone(&run));
-    next.run(req).await
-}
-
-fn run_principal(run_id: &str) -> Result<Principal> {
-    let claims = serde_json::Map::from_iter([
-        ("sub".to_string(), format!("run:{run_id}").into()),
-        ("run_id".to_string(), run_id.into()),
-        (
-            "scope".to_string(),
-            format!("{SCOPE_READ} {SCOPE_WRITE}").into(),
-        ),
-    ]);
-    Principal::from_claims(claims, Callers::Runs).context("building the run's own principal")
 }
 
 async fn serve(args: ServeArgs) -> Result<()> {
@@ -179,53 +158,27 @@ async fn serve(args: ServeArgs) -> Result<()> {
             Some(server),
         ));
 
-    let run = Arc::new(run_principal(&args.run_id)?);
-    let run_layer = axum::middleware::from_fn_with_state(run, as_run);
-    let local_app = proxy::router(relay.clone())
-        .layer(run_layer.clone())
-        .merge(mcp::router(gh.clone(), allow.clone(), &[], run_layer, None));
-    let tls = match (&args.tls_bind, &args.ca_dir) {
-        (Some(bind), Some(dir)) => {
-            let mitm = mitm::Mitm::new(relay).context("starting the GitHub TLS listener")?;
-            mitm.write(dir)?;
-            let listener = tokio::net::TcpListener::bind(bind)
-                .await
-                .with_context(|| format!("binding {bind}"))?;
-            Some(mitm::serve(Arc::new(mitm), listener))
-        }
-        _ => None,
-    };
-
+    let mitm = mitm::Mitm::new(relay).context("starting the GitHub TLS listener")?;
+    mitm.write(&args.ca_dir)?;
+    let tls_listener = tokio::net::TcpListener::bind(&args.tls_bind)
+        .await
+        .with_context(|| format!("binding {}", args.tls_bind))?;
     let sandbox_listener = tokio::net::TcpListener::bind(&args.bind)
         .await
         .with_context(|| format!("binding {}", args.bind))?;
-    let local_listener = tokio::net::TcpListener::bind(&args.local_bind)
-        .await
-        .with_context(|| format!("binding {}", args.local_bind))?;
     tracing::info!(
-        "crucible-git serving run {} on http://{} (sandboxes) and http://{} (tasks)",
+        "crucible-git serving run {} to sandboxes on http://{} and to tasks as GitHub on {}",
         args.run_id,
         args.bind,
-        args.local_bind
+        args.tls_bind
     );
-    let tls = async {
-        match tls {
-            Some(tls) => tls.await,
-            None => std::future::pending().await,
-        }
-    };
     tokio::try_join!(
         async {
             axum::serve(sandbox_listener, sandbox_app)
                 .await
                 .context("serving sandboxes")
         },
-        async {
-            axum::serve(local_listener, local_app)
-                .await
-                .context("serving tasks")
-        },
-        tls,
+        mitm::serve(Arc::new(mitm), tls_listener),
     )
     .map(|_| ())
     .context("serving crucible-git")

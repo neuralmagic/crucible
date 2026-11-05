@@ -108,23 +108,20 @@ impl Granted {
     }
 }
 
-/// The base URL a command or evaluate task reaches the run's `crucible-git` at, once it is
-/// running: none when the controller granted no `crucible-git` in this pod.
-pub fn run_git() -> Result<Option<String>> {
+/// Whether the run's `crucible-git` serves this pod's command and evaluate tasks as GitHub, once
+/// it is ready: false when the controller granted none.
+pub fn run_git() -> Result<bool> {
     let servers = AgentServers::from_env().context("reading the run's agent servers")?;
     let Some(granted) = servers
         .iter()
         .find(|g| matches!(g.server.transport, Transport::Local(LocalServer::Git(_))))
     else {
-        return Ok(None);
+        return Ok(false);
     };
     granted
         .start_local(None)
-        .with_context(|| format!("starting the run's {}", granted.server.name))?;
-    Ok(Some(format!(
-        "http://{}",
-        crucible_contract::git::LOCAL_BIND
-    )))
+        .with_context(|| format!("waiting for the run's {}", granted.server.name))?;
+    Ok(true)
 }
 
 /// The socket a command or evaluate task reaches the run's buildit on, once it is running: none

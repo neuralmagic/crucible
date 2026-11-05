@@ -84,13 +84,14 @@ impl GitHub {
         )
     }
 
-    /// The open pull request into `repo` from `head` (`owner:branch`), or a new one, carrying
-    /// `pr.labels` and asking `pr.reviewers` either way.
-    /// A pull request created here spends one of `allow`'s count; one already open spends none.
+    /// The open pull request into `repo` from `head` (`owner:branch`), or a new one. A pull
+    /// request created here spends one of `allow`'s count, one already open spends none, and
+    /// `pr.labels` and `pr.reviewers` are applied only to one this run opened.
     pub async fn open_pr(&self, pr: &NewPr<'_>, allow: &Allow) -> Result<OpenedPr> {
         let token = self.token().await?;
         let mut opened = self.find_or_create(pr, &token, allow).await?;
-        if !pr.labels.is_empty() {
+        let ours = allow.opened_number(pr.repo, opened.number);
+        if ours && !pr.labels.is_empty() {
             let url = self
                 .api
                 .join(&format!(
@@ -109,7 +110,7 @@ impl GitHub {
                 .context("labelling the pull request")?;
             opened.labels = pr.labels.to_vec();
         }
-        if !pr.reviewers.is_empty() {
+        if ours && !pr.reviewers.is_empty() {
             let (teams, users): (Vec<&str>, Vec<&str>) = pr
                 .reviewers
                 .iter()

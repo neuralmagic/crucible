@@ -377,21 +377,26 @@ openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt 
 oc create secret generic crucible-agent-signing-key --from-file=agent-signing.pem
 ```
 
-`[git]` runs `crucible-git` as a sidecar of the loop pod of each run on `clusters`. It proxies
-git's smart-HTTP protocol to GitHub and serves one MCP tool, `open_pr`, both with the run's minted
-GitHub App token, which it reads from its file on every request. A run gets the token by binding a
-`mint://github-app/<owner>` secret as a file; the controller mounts it into the sidecar alone, by
-directory, so no task or sandbox can read it. `crucible-git` reaches only the repositories the
-run's `[outputs.draft-pr]` target admits, for fetches as well as pushes, and each pull request it
-opens spends that bound's count. Sandboxes reach it at `url` with run tokens, so git there needs no
-credential: clone `http://host.openshell.internal:8853/git/<owner>/<repo>.git`. The run's command
-and evaluate tasks use stock `gh` and `git` against `github.com`: the pod maps GitHub's hostnames
-to loopback, where `crucible-git` serves them over TLS with a CA it mints for the run, tasks trust
-that CA (`SSL_CERT_FILE` and friends) and hold a placeholder `GH_TOKEN`, and each request leaves
-with the run's App token. REST writes are limited to opening, labelling and requesting review on
-pull requests in the bound repository; GraphQL mutations to creating one there and following up on
-the ones the run created. GraphQL queries are not repository-scoped. The pod needs the safe sysctl
-`net.ipv4.ip_unprivileged_port_start` for `crucible-git` to bind 443.
+`[git]` runs `crucible-git` as a sidecar of the loop pod of each run on `clusters`. It holds the
+run's minted GitHub App token, which a run gets by binding a `mint://github-app/<owner>` secret as a
+file: the controller mounts it into the sidecar alone, by directory, and the leader re-mints it
+into the run's Secret every 25 minutes, so no task or sandbox ever reads it and a long run never
+pushes with a lapsed one.
+
+The run's command and evaluate tasks use stock `gh` and `git` against `github.com`. The pod maps
+GitHub's hostnames to loopback, where `crucible-git` serves them over TLS with a CA it mints for the
+run; tasks trust that CA (`SSL_CERT_FILE` and friends) and hold a placeholder `GH_TOKEN`, which
+`crucible-git` replaces with the App token. Sandboxes reach it at `url` with run tokens: git there
+needs no credential (`http://host.openshell.internal:8853/git/<owner>/<repo>.git`), and the
+`open_pr` tool opens pull requests.
+
+The token goes only as far as the run's `[outputs.draft-pr]` bound allows: reads of a bound or
+public repository; pushes, and opening a pull request (spending the bound's count), on a bound one;
+labels, reviewers and edits on pull requests the run opened. GraphQL is parsed and scoped field by
+field the same way. A request carrying a credential of its own, such as the engine's own clone or
+publish push, is relayed with it untouched. The pod needs the safe sysctl
+`net.ipv4.ip_unprivileged_port_start` for `crucible-git` to bind 443, and `run_jwks_uri` must be
+https.
 
 ```toml
 [git]

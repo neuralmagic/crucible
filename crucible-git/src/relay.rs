@@ -51,8 +51,8 @@ const DROPPED_RESPONSE: [HeaderName; 3] = [
 pub enum Caller<'a> {
     /// A task in the loop container, through the TLS listener.
     Task,
-    /// A sandbox or task authenticated as the run, through the `/git` routes; its scopes bound
-    /// what it may borrow the token for.
+    /// A sandbox, authenticated as the run through the `/git` routes; its token's scopes bound
+    /// what it may borrow the run's token for.
     Run(&'a Principal),
 }
 

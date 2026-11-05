@@ -5,7 +5,7 @@
 //! ([`crate::openshell::agent_servers`]).
 
 use anyhow::{Context, Result};
-use crucible_contract::git::{BOUNDS_FILE, Bounds, LOCAL_BIND, SHARED_DIR};
+use crucible_contract::git::{BOUNDS_FILE, Bounds, SHARED_DIR, TLS_BIND};
 use std::time::{Duration, Instant};
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -17,7 +17,7 @@ struct BootTimeout {
     seconds: u64,
 }
 
-/// The sidecar on `port` for sandboxes and on loopback for tasks.
+/// The sidecar on `port` for sandboxes and at [`TLS_BIND`] as GitHub for tasks.
 pub struct Git {
     pub port: u16,
 }
@@ -25,7 +25,7 @@ pub struct Git {
 impl Git {
     fn listening(&self) -> bool {
         crate::control::broker::port_open(&format!("127.0.0.1:{}", self.port))
-            && crate::control::broker::port_open(LOCAL_BIND)
+            && crate::control::broker::port_open(TLS_BIND)
     }
 
     /// Wait until both of the sidecar's listeners accept connections.
@@ -38,7 +38,7 @@ impl Git {
             std::thread::sleep(Duration::from_millis(200));
         }
         Err(BootTimeout {
-            probe: format!("127.0.0.1:{} and {LOCAL_BIND}", self.port),
+            probe: format!("127.0.0.1:{} and {TLS_BIND}", self.port),
             seconds: BOOT_TIMEOUT.as_secs(),
         }
         .into())
