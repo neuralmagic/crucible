@@ -4,6 +4,7 @@
 //! Degradation matches telemetry-off: the collector enriches evidence and is never a run
 //! dependency.
 
+use crate::redact::Redactor;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -182,6 +183,7 @@ struct CollectorState {
     /// Never `Client::default()` as a fallback — that is `Client::new()`, which panics on the
     /// same failure, and telemetry is documented as never being a run dependency.
     client: Option<reqwest::Client>,
+    redactor: Redactor,
 }
 
 /// A running in-process OTLP collector. Owns a background thread with a current-thread tokio
@@ -201,12 +203,14 @@ impl OtelCollector {
     /// is `127.0.0.1` for a local agent, or `0.0.0.0` for a sandboxed one. `port` 0 takes an
     /// OS-assigned port; a sandboxed turn under a NetworkPolicy needs a fixed one the policy can
     /// name. `forward` mirrors every export on to an upstream OTLP/HTTP receiver, re-parented
-    /// onto the turn span; `None` keeps the collector a terminal sink.
+    /// onto the turn span; `None` keeps the collector a terminal sink. `redactor` masks every
+    /// export before it is logged or forwarded.
     pub fn start(
         log_path: PathBuf,
         bind_addr: &str,
         port: u16,
         forward: Option<OtelForward>,
+        redactor: Redactor,
     ) -> std::io::Result<OtelCollector> {
         // Fresh log per run.
         let _ = std::fs::remove_file(&log_path);
@@ -227,6 +231,7 @@ impl OtelCollector {
                 .build()
                 .inspect_err(|e| eprintln!("otel: forwarding disabled, no http client: {e}"))
                 .ok(),
+            redactor,
         });
 
         let (port_tx, port_rx) = std::sync::mpsc::channel::<std::io::Result<u16>>();
@@ -373,6 +378,7 @@ async fn ingest(State(state): State<Arc<CollectorState>>, req: Request) -> Respo
 
     let mut payload: Value = serde_json::from_slice(&bytes)
         .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) }));
+    state.redactor.json(&mut payload);
 
     // Traces only. Metrics and logs stay local: the token/cost rollup is already derived here into
     // `otel_summary`, and the log stream carries user prompts and tool content (`OTEL_LOG_*` in
@@ -798,7 +804,7 @@ fn round_u64(v: f64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::otel::*;
 
     const TID: &str = "0af7651916cd43dd8448eb211c80319c";
     const SID: &str = "b7ad6b7169203331";
@@ -918,6 +924,7 @@ mod tests {
             "127.0.0.1",
             0,
             None,
+            Redactor::default(),
         )
         .expect("collector binds loopback");
         let port = c.local_endpoint().rsplit(':').next().unwrap().to_string();
@@ -1121,7 +1128,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("otel.jsonl");
         let collector =
-            OtelCollector::start(log.clone(), "127.0.0.1", 0, None).expect("collector binds");
+            OtelCollector::start(log.clone(), "127.0.0.1", 0, None, Redactor::default())
+                .expect("collector binds");
         let port = collector.port();
         assert_ne!(port, 0);
 
@@ -1162,14 +1170,26 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let upstream_log = dir.join("upstream.jsonl");
-        let upstream = OtelCollector::start(upstream_log.clone(), "127.0.0.1", 0, None)
-            .expect("upstream binds");
+        let upstream = OtelCollector::start(
+            upstream_log.clone(),
+            "127.0.0.1",
+            0,
+            None,
+            Redactor::default(),
+        )
+        .expect("upstream binds");
         let fwd = OtelForward::new(
             format!("http://127.0.0.1:{}", upstream.port()),
             Some(&format!("00-{TID}-{SID}-01")),
         );
-        let collector = OtelCollector::start(dir.join("otel.jsonl"), "127.0.0.1", 0, Some(fwd))
-            .expect("collector binds");
+        let collector = OtelCollector::start(
+            dir.join("otel.jsonl"),
+            "127.0.0.1",
+            0,
+            Some(fwd),
+            Redactor::default(),
+        )
+        .expect("collector binds");
 
         let traces = serde_json::to_vec(&trace_payload(&[Value::Null])).unwrap();
         assert!(post_bytes(collector.port(), "/v1/traces", &traces).contains("partialSuccess"));
@@ -1209,12 +1229,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A registered secret in an export (a tool command the agent ran, say) reaches neither the
+    /// local capture nor the upstream receiver, including one registered after the collector
+    /// started.
+    #[test]
+    fn a_registered_secret_never_reaches_the_capture_or_the_upstream() {
+        const KEY: &str = "sk-oai-0123456789abcdef";
+        let dir = std::env::temp_dir().join(format!("otel-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let upstream_log = dir.join("upstream.jsonl");
+        let upstream = OtelCollector::start(
+            upstream_log.clone(),
+            "127.0.0.1",
+            0,
+            None,
+            Redactor::default(),
+        )
+        .expect("upstream binds");
+        let redactor = Redactor::default();
+        let local_log = dir.join("otel.jsonl");
+        let collector = OtelCollector::start(
+            local_log.clone(),
+            "127.0.0.1",
+            0,
+            Some(OtelForward::new(
+                format!("http://127.0.0.1:{}", upstream.port()),
+                None,
+            )),
+            redactor.clone(),
+        )
+        .expect("collector binds");
+        redactor.add(KEY);
+
+        let mut traces = trace_payload(&[Value::Null]);
+        traces["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"] = json!([
+            {"key": "tool.command", "value": {"stringValue": format!("curl -H 'x-api-key: {KEY}'")}},
+        ]);
+        let logs = json!({"resourceLogs": [{"scopeLogs": [{"logRecords": [
+            {"body": {"stringValue": format!("echo {KEY}")}},
+        ]}]}]});
+        for (path, body) in [("/v1/traces", traces), ("/v1/logs", logs)] {
+            let body = serde_json::to_vec(&body).unwrap();
+            assert!(post_bytes(collector.port(), path, &body).contains("partialSuccess"));
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let received = loop {
+            let got = std::fs::read_to_string(&upstream_log).unwrap_or_default();
+            if got
+                .lines()
+                .any(|l| serde_json::from_str::<Value>(l).is_ok())
+                || Instant::now() >= deadline
+            {
+                break got;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        let captured = std::fs::read_to_string(&local_log).unwrap();
+        assert_eq!(captured.lines().count(), 2, "{captured}");
+        assert!(received.contains(crate::redact::MASK), "{received}");
+        for text in [&captured, &received] {
+            assert!(!text.contains(KEY), "{text}");
+        }
+
+        collector.stop();
+        upstream.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn collector_rejects_oversize_body() {
         let dir = std::env::temp_dir().join(format!("otel-big-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("otel.jsonl");
-        let collector = OtelCollector::start(log, "127.0.0.1", 0, None).expect("binds");
+        let collector =
+            OtelCollector::start(log, "127.0.0.1", 0, None, Redactor::default()).expect("binds");
         let port = collector.port();
         let big = vec![b'x'; MAX_EXPORT_BYTES + 1];
         let resp = post_bytes(port, "/v1/metrics", &big);
@@ -1251,7 +1340,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let log = dir.join("otel.jsonl");
             let collector =
-                OtelCollector::start(log.clone(), "127.0.0.1", 0, None).expect("collector binds");
+                OtelCollector::start(log.clone(), "127.0.0.1", 0, None, Redactor::default())
+                    .expect("collector binds");
             let port = collector.port();
 
             for (i, cost) in exports.iter().enumerate() {
@@ -1299,8 +1389,14 @@ mod tests {
     fn a_costless_export_does_not_disturb_the_live_total() {
         let dir = std::env::temp_dir().join(format!("otel-nocost-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let collector = OtelCollector::start(dir.join("otel.jsonl"), "127.0.0.1", 0, None)
-            .expect("collector binds");
+        let collector = OtelCollector::start(
+            dir.join("otel.jsonl"),
+            "127.0.0.1",
+            0,
+            None,
+            Redactor::default(),
+        )
+        .expect("collector binds");
         let port = collector.port();
         let body = serde_json::to_vec(&json!({
             "resourceMetrics": [{"scopeMetrics": [{"metrics": [

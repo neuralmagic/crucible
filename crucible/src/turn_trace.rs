@@ -107,6 +107,58 @@ pub enum GenAiRecord {
     },
 }
 
+impl ToolInvocation {
+    /// The invocation with `mask` applied to its hint.
+    pub fn masked(self, mask: impl Fn(&str) -> String) -> ToolInvocation {
+        ToolInvocation {
+            summary: mask(&self.summary),
+            ..self
+        }
+    }
+}
+
+impl GenAiRecord {
+    /// The record with `mask` applied to each message body, tool name, and tool argument.
+    pub fn masked(self, mask: impl Fn(&str) -> String) -> GenAiRecord {
+        let mask = |s: String| mask(&s);
+        match self {
+            GenAiRecord::System { content } => GenAiRecord::System {
+                content: mask(content),
+            },
+            GenAiRecord::User { content } => GenAiRecord::User {
+                content: mask(content),
+            },
+            GenAiRecord::Assistant {
+                text,
+                reasoning,
+                tool_calls,
+                model,
+            } => GenAiRecord::Assistant {
+                text: text.map(mask),
+                reasoning: reasoning.map(mask),
+                tool_calls: tool_calls
+                    .into_iter()
+                    .map(|call| ToolCall {
+                        id: call.id,
+                        name: mask(call.name),
+                        arguments: mask(call.arguments),
+                    })
+                    .collect(),
+                model,
+            },
+            GenAiRecord::Tool {
+                id,
+                content,
+                is_error,
+            } => GenAiRecord::Tool {
+                id,
+                content: mask(content),
+                is_error,
+            },
+        }
+    }
+}
+
 /// Parse a native session transcript into its full conversation records, in transcript order,
 /// with message bodies redacted per [`redact_enabled`]. Robust to a torn tail and interleaved
 /// noise exactly like [`parse_transcript`]: a non-JSON line, or one with no usable message, is
@@ -552,7 +604,52 @@ pub fn parse_ts(s: &str) -> Option<SystemTime> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::turn_trace::*;
+
+    #[test]
+    fn masking_reaches_every_string_a_record_or_span_hint_carries() {
+        const KEY: &str = "sk-oai-0123456789abcdef";
+        let mask = |s: &str| s.replace(KEY, "***");
+        let records = [
+            GenAiRecord::System {
+                content: KEY.into(),
+            },
+            GenAiRecord::User {
+                content: format!("use {KEY}"),
+            },
+            GenAiRecord::Assistant {
+                text: Some(KEY.into()),
+                reasoning: Some(KEY.into()),
+                tool_calls: vec![ToolCall {
+                    id: "t1".into(),
+                    name: KEY.into(),
+                    arguments: format!(r#"{{"command":"echo {KEY}"}}"#),
+                }],
+                model: Some("m".into()),
+            },
+            GenAiRecord::Tool {
+                id: "t1".into(),
+                content: KEY.into(),
+                is_error: false,
+            },
+        ];
+        for record in records {
+            let masked = record.masked(mask);
+            let shown = format!("{masked:?}");
+            assert!(!shown.contains(KEY), "{shown}");
+            assert!(shown.contains("***"), "{shown}");
+        }
+        let call = ToolInvocation {
+            name: "Bash".into(),
+            start: SystemTime::UNIX_EPOCH,
+            end: None,
+            summary: format!("curl -H 'x-api-key: {KEY}'"),
+            error: false,
+        }
+        .masked(mask);
+        assert_eq!(call.summary, "curl -H 'x-api-key: ***'");
+        assert_eq!(call.name, "Bash");
+    }
 
     fn at(ts: &str) -> SystemTime {
         parse_ts(ts).expect("test timestamp parses")

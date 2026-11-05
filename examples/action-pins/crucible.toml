@@ -21,7 +21,7 @@ frozen = true
 backend = "openshell"
 harness = "claude"
 model = "claude-opus-4-6"
-sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-cc@sha256:36a11bb264a7268962eaf982986a631e7a2673848b468f8c8fd636c559770333"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-cc@sha256:19e069b7f8724f0a2195e7caa4579416af0da9b7e52bcc932449eac4d8919fa9"
 goal = "Find GitHub Actions workflow uses references that are not pinned to full commit SHAs, then propose grounded pinning changes."
 
 [agent.openshell]
