@@ -57,12 +57,15 @@ term=
 case $mode in
 build)
   secs=$1; term=$2; steps=$3; shift 3
+  sleep 2147483647 & hold=$!
   {
-    tail -n +1 -f -s 0.1 --pid=$$ "$log" 2> /dev/null | grep --line-buffered -E '^(STEP |COMMIT )' \
+    tail -n +1 -f -s 0.1 --pid=$hold "$log" 2> /dev/null | grep --line-buffered -E '^(STEP |COMMIT )' \
       | while IFS= read -r l; do printf '%s %s\n' "$(date +%s%N)" "$l"; done
+    n=50; while [ ! -s "$log.exit" ] && [ "$n" -gt 0 ]; do sleep 0.1; n=$((n - 1)); done
     printf '%s END %s\n' "$(date +%s%N)" "$(head -n 1 "$log.exit" 2> /dev/null)"
   } >> "$steps" &
   stage "$secs" "$@"; c=$?
+  kill "$hold" 2> /dev/null; wait "$hold" 2> /dev/null
   ;;
 run)
   fs=$1; rs=$2; ctr=$3; img=$4; fetch=$5; shift 5
@@ -685,7 +688,8 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_build_stamps_its_steps_and_its_end() {
+    fn a_build_stamps_its_steps_and_its_end_when_nothing_reaps_its_runner() {
+        nix::sys::prctl::set_child_subreaper(true).unwrap();
         let dir = tempfile::tempdir().unwrap();
         let log = dir.path().join("logs/build.log");
         let script = "echo 'STEP 1/2: FROM base'; echo noise; sleep 1; \
@@ -710,7 +714,12 @@ mod tests {
             at("STEP 2/2: RUN make") - at("STEP 1/2: FROM base") >= 900_000_000,
             "{stamped:?}"
         );
-        assert!(at("END 4") >= at("STEP 2/2: RUN make"), "{stamped:?}");
+        assert!(at("END 4") >= at("COMMIT img"), "{stamped:?}");
+        let runner = read(&ext(&log, "pid"));
+        assert!(
+            zombie_or_gone(&runner),
+            "the runner exited and this process, its reaper, never waited for it"
+        );
     }
 
     #[cfg(target_os = "linux")]
