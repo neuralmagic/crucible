@@ -90,7 +90,9 @@ A minimal set of objects:
   relay); `pods/finalizers` update (the pod's ConfigMap and Secret block its deletion, which
   OpenShift's owner-reference admission checks); `configmaps` and `secrets` create/delete (the
   pack ConfigMap and the run Secret, which holds the pod token and the delivered secrets, both
-  owner-referenced to the pod); and `leases` get/create/update/patch for leader election;
+  owner-referenced to the pod); `secrets` list/patch, with which the leader re-mints a running
+  run's GitHub App token into its Secret every 25 minutes; and `leases` get/create/update/patch
+  for leader election;
 - a **Secret** for `CONTROLLER_API_TOKEN` and one for `GITHUB_TOKEN`, referenced by env;
 - a **Service** on the API port;
 - the **Deployment**, env from the table above, `emptyDir` at `CONTROLLER_SCRATCH_DIR`.

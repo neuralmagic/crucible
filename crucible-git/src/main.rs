@@ -11,10 +11,12 @@
 
 mod allow;
 mod github;
+mod graphql;
 mod mcp;
 mod mitm;
 mod policy;
 mod proxy;
+mod relay;
 
 use anyhow::{Context, Result};
 use axum::extract::{Request, State};
@@ -76,16 +78,11 @@ struct ServeArgs {
     /// Where to write the run CA and the bundle tasks trust.
     #[arg(long)]
     ca_dir: Option<PathBuf>,
-    #[arg(long, default_value = "https://github.com")]
-    github_url: Url,
     #[arg(long, default_value = "https://api.github.com")]
     api_url: Url,
     /// PEM bundle of CAs trusted for the issuer's JWKS host.
     #[arg(long)]
     jwks_ca: Option<PathBuf>,
-    /// Fetch the issuer's keys over plain http from a non-loopback host.
-    #[arg(long)]
-    insecure_jwks_http: bool,
 }
 
 fn run_issuer(arg: &str) -> Result<TrustedIssuer, String> {
@@ -151,7 +148,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
             },
             &JwksTls {
                 ca_bundle: args.jwks_ca,
-                insecure_http: args.insecure_jwks_http,
+                insecure_http: false,
             },
         )
         .context("building the resource server")?,
@@ -159,11 +156,7 @@ async fn serve(args: ServeArgs) -> Result<()> {
     if args.token_file.is_none() {
         tracing::warn!("no GitHub App token file; every call is refused");
     }
-    let gh = Arc::new(github::GitHub::new(
-        args.token_file,
-        args.github_url,
-        args.api_url,
-    )?);
+    let gh = Arc::new(github::GitHub::new(args.token_file, args.api_url)?);
 
     let sandbox = Arc::new(Sandbox {
         server: server.clone(),
@@ -171,7 +164,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
     });
     let sandbox_layer = axum::middleware::from_fn_with_state(sandbox, authenticate);
     let allow = Arc::new(allow::Allow::new(args.bounds_file));
-    let sandbox_app = proxy::router(gh.clone(), allow.clone())
+    let relay = Arc::new(relay::Relay {
+        gh: gh.clone(),
+        allow: allow.clone(),
+        policy: policy::State::default(),
+    });
+    let sandbox_app = proxy::router(relay.clone())
         .layer(sandbox_layer.clone())
         .merge(mcp::router(
             gh.clone(),
@@ -183,12 +181,12 @@ async fn serve(args: ServeArgs) -> Result<()> {
 
     let run = Arc::new(run_principal(&args.run_id)?);
     let run_layer = axum::middleware::from_fn_with_state(run, as_run);
-    let local_app = proxy::router(gh.clone(), allow.clone())
+    let local_app = proxy::router(relay.clone())
         .layer(run_layer.clone())
         .merge(mcp::router(gh.clone(), allow.clone(), &[], run_layer, None));
     let tls = match (&args.tls_bind, &args.ca_dir) {
         (Some(bind), Some(dir)) => {
-            let mitm = mitm::Mitm::new(gh, allow).context("starting the GitHub TLS listener")?;
+            let mitm = mitm::Mitm::new(relay).context("starting the GitHub TLS listener")?;
             mitm.write(dir)?;
             let listener = tokio::net::TcpListener::bind(bind)
                 .await

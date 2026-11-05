@@ -38,23 +38,23 @@ impl TokenError {
 pub struct GitHub {
     token_file: Option<PathBuf>,
     pub http: reqwest::Client,
-    /// Where repositories are served, `https://github.com`.
-    pub web: Url,
     /// The REST API, `https://api.github.com`.
     pub api: Url,
 }
 
 impl GitHub {
-    pub fn new(token_file: Option<PathBuf>, web: Url, api: Url) -> Result<Self> {
+    pub fn new(token_file: Option<PathBuf>, api: Url) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(concat!("crucible-git/", env!("CARGO_PKG_VERSION")))
             .dns_resolver(std::sync::Arc::new(PastHostsFile::new()?))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .read_timeout(std::time::Duration::from_secs(300))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building the GitHub client")?;
         Ok(Self {
             token_file,
             http,
-            web,
             api,
         })
     }

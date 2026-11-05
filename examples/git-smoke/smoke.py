@@ -65,6 +65,48 @@ def check(args: argparse.Namespace) -> None:
     print(json.dumps({"pass": not failures, "score": 1.0 if not failures else 0.0, "prs": prs, "failures": failures}))
 
 
+def attempt(*args: str, cwd: str | None = None) -> subprocess.CompletedProcess:
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    return subprocess.run(list(args), cwd=cwd, capture_output=True, text=True, env=env, timeout=120)
+
+
+def deny(args: argparse.Namespace) -> None:
+    """Everything crucible-git must refuse, and the token nowhere a task can read it."""
+    p = params()
+    repo, base = p["repo"], p["base"]
+    failures = []
+
+    def expect_refused(what: str, proc: subprocess.CompletedProcess) -> None:
+        if proc.returncode == 0:
+            failures.append(f"{what} succeeded: {proc.stdout.strip()[:200]}")
+
+    if Path("/var/run/crucible-git-token").exists():
+        failures.append("the token directory is mounted in the loop container")
+    if os.environ.get("GH_TOKEN") != "crucible-git":
+        failures.append("GH_TOKEN is not the placeholder")
+    with tempfile.TemporaryDirectory() as tmp:
+        run("git", "clone", "-q", "--depth", "1", "--branch", base, f"https://github.com/{repo}.git", tmp)
+        run("git", "-c", "user.name=crucible-git smoke", "-c", "user.email=smoke@crucible.invalid",
+            "commit", "-q", "--allow-empty", "-m", "crucible-git smoke: must not land", cwd=tmp)
+        expect_refused("a push outside the bound", attempt(
+            "git", "push", f"https://github.com/{p['outside_public']}.git",
+            "HEAD:refs/heads/crucible-git-smoke-denied", cwd=tmp))
+        branch = f"crucible-git-smoke/deny-{time.strftime('%Y%m%d%H%M%S', time.gmtime())}"
+        run("git", "push", "-q", "origin", f"HEAD:refs/heads/{branch}", cwd=tmp)
+    expect_refused("a pull request past the bound's count", attempt(
+        "gh", "pr", "create", "--repo", repo, "--draft", "--base", base, "--head", branch,
+        "--title", "crucible-git smoke: must be refused", "--body", "count exhausted"))
+    if p.get("outside_private"):
+        expect_refused("a read of a private repository outside the bound",
+                       attempt("gh", "api", f"repos/{p['outside_private']}"))
+    expect_refused("a REST issue comment", attempt(
+        "gh", "api", "-X", "POST", f"repos/{repo}/issues/1/comments", "-f", "body=must be refused"))
+    expect_refused("a GraphQL mutation outside the allowed set", attempt(
+        "gh", "api", "graphql", "-f",
+        'query=mutation { addStar(input: {starrableId: "x"}) { clientMutationId } }'))
+    print(json.dumps({"pass": not failures, "score": 1.0 if not failures else 0.0, "failures": failures}))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(required=True)
@@ -72,6 +114,8 @@ def main() -> None:
     p.add_argument("--who", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(func=push)
+    d = sub.add_parser("deny")
+    d.set_defaults(func=deny)
     c = sub.add_parser("check")
     c.add_argument("evidence", nargs="+")
     c.set_defaults(func=check)

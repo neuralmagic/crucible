@@ -8,16 +8,9 @@
 //!   task ──https://pypi.org────────▶ pypi.org
 //! ```
 
-use crate::allow::Allow;
-use crate::github::GitHub;
-use crate::policy::{self, Verdict};
+use crate::relay::{Caller, Relay};
 use anyhow::{Context, Result};
 use axum::body::Body;
-use axum::extract::Request;
-use axum::http::{HeaderMap, HeaderName, Method, StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use futures_util::TryStreamExt;
-use http_body_util::BodyExt;
 use hyper_util::rt::TokioIo;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DistinguishedName, DnType,
@@ -29,32 +22,11 @@ use std::sync::{Arc, Mutex};
 
 use crucible_contract::git::GITHUB_HOSTS as INTERCEPTED;
 
-/// The largest request body buffered for a decision (a GraphQL document).
-const DECIDED_BODY_LIMIT: usize = 1024 * 1024;
-
 /// Where an image keeps the system's trusted roots, first match wins.
 const SYSTEM_ROOTS: [&str; 3] = [
     "/etc/pki/tls/certs/ca-bundle.crt",
     "/etc/ssl/certs/ca-certificates.crt",
     "/etc/ssl/cert.pem",
-];
-
-/// Request headers never forwarded: hop-by-hop, the proxy's own, and the caller's credentials.
-const DROPPED_REQUEST: [HeaderName; 8] = [
-    header::HOST,
-    header::CONTENT_LENGTH,
-    header::AUTHORIZATION,
-    header::CONNECTION,
-    header::PROXY_AUTHORIZATION,
-    header::TRANSFER_ENCODING,
-    header::TE,
-    header::UPGRADE,
-];
-
-const DROPPED_RESPONSE: [HeaderName; 3] = [
-    header::CONNECTION,
-    header::TRANSFER_ENCODING,
-    header::UPGRADE,
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -66,13 +38,11 @@ pub struct Mitm {
     ca: CertifiedIssuer<'static, KeyPair>,
     provider: Arc<rustls::crypto::CryptoProvider>,
     configs: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
-    gh: Arc<GitHub>,
-    allow: Arc<Allow>,
-    policy: policy::State,
+    relay: Arc<Relay>,
 }
 
 impl Mitm {
-    pub fn new(gh: Arc<GitHub>, allow: Arc<Allow>) -> Result<Self> {
+    pub fn new(relay: Arc<Relay>) -> Result<Self> {
         let mut params = CertificateParams::default();
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, "crucible-git run CA");
@@ -85,9 +55,7 @@ impl Mitm {
             ca,
             provider: Arc::new(rustls::crypto::ring::default_provider()),
             configs: Mutex::new(HashMap::new()),
-            gh,
-            allow,
-            policy: policy::State::default(),
+            relay,
         })
     }
 
@@ -168,103 +136,16 @@ async fn accept(mitm: Arc<Mitm>, stream: tokio::net::TcpStream) -> Result<()> {
     let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
         let mitm = mitm.clone();
         let host = host.clone();
-        async move { Ok::<_, std::convert::Infallible>(forward(&mitm, &host, req.map(Body::new)).await) }
+        async move {
+            Ok::<_, std::convert::Infallible>(
+                mitm.relay
+                    .relay(&host, req.map(Body::new), Caller::Task)
+                    .await,
+            )
+        }
     });
     hyper::server::conn::http1::Builder::new()
         .serve_connection(TokioIo::new(tls), service)
         .await?;
     Ok(())
-}
-
-fn refuse(status: StatusCode, why: impl Into<String>) -> Response {
-    let why = why.into();
-    tracing::info!(%status, %why, "refused");
-    (status, why).into_response()
-}
-
-async fn forward(mitm: &Mitm, host: &str, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-    let path = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| "/".to_string());
-    let graphql = policy::needs_body(host, &parts.method, &path);
-    let (decided_body, body) = match graphql {
-        false => (None, Some(body)),
-        true => match http_body_util::Limited::new(body, DECIDED_BODY_LIMIT)
-            .collect()
-            .await
-        {
-            Ok(collected) => (Some(collected.to_bytes()), None),
-            Err(_) => return refuse(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
-        },
-    };
-    let verdict = policy::decide(
-        &mitm.policy,
-        &mitm.gh,
-        &mitm.allow,
-        host,
-        &parts.method,
-        &path,
-        decided_body.as_deref(),
-    )
-    .await;
-    if let Verdict::Deny(status, why) = verdict {
-        return refuse(status, why);
-    }
-    let token = match mitm.gh.token().await {
-        Ok(t) => t,
-        Err(e) => return refuse(e.status(), e.to_string()),
-    };
-    let auth = match host {
-        "github.com" => GitHub::basic(&token),
-        _ => format!("token {token}"),
-    };
-    let mut upstream = mitm
-        .gh
-        .http
-        .request(parts.method.clone(), format!("https://{host}{path}"))
-        .headers(forwarded(&parts.headers))
-        .header(header::AUTHORIZATION, auth);
-    upstream = match (decided_body, body) {
-        (Some(bytes), _) => upstream.body(bytes),
-        (None, _) if parts.method == Method::GET || parts.method == Method::HEAD => upstream,
-        (None, Some(body)) => upstream.body(reqwest::Body::wrap_stream(body.into_data_stream())),
-        (None, None) => upstream,
-    };
-    let resp = match upstream.send().await {
-        Ok(r) => r,
-        Err(e) => return refuse(StatusCode::BAD_GATEWAY, format!("reaching {host}: {e}")),
-    };
-    tracing::info!(%host, method = %parts.method, path = %path.split('?').next().unwrap_or(""), status = %resp.status(), "forwarded");
-    let mut out = Response::builder().status(resp.status());
-    for (name, value) in resp.headers() {
-        if !DROPPED_RESPONSE.contains(name) {
-            out = out.header(name, value);
-        }
-    }
-    if graphql {
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => return refuse(StatusCode::BAD_GATEWAY, format!("reading {host}: {e}")),
-        };
-        policy::record_created(&mitm.policy, &bytes);
-        return out
-            .body(Body::from(bytes))
-            .unwrap_or_else(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-    }
-    let stream = resp.bytes_stream().map_err(std::io::Error::other);
-    out.body(Body::from_stream(stream))
-        .unwrap_or_else(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
-}
-
-fn forwarded(headers: &HeaderMap) -> HeaderMap {
-    let mut out = HeaderMap::new();
-    for (name, value) in headers {
-        if !DROPPED_REQUEST.contains(name) && !name.as_str().starts_with("proxy-") {
-            out.append(name.clone(), value.clone());
-        }
-    }
-    out
 }

@@ -39,6 +39,11 @@ pub enum SidecarError {
     Issuer(String),
     #[error("the run pod has no loop container to run crucible-git beside")]
     NoLoop,
+    #[error(
+        "the git server's JWKS URI {0} is plain http; whoever answers it could mint run tokens \
+         crucible-git accepts, so it must be https"
+    )]
+    InsecureJwks(String),
 }
 
 /// The granted `git` server in the delivery's plain env, if any.
@@ -88,6 +93,9 @@ pub fn add(
         .split_once('=')
         .and_then(|(_, jwks)| url::Url::parse(jwks).ok())
         .ok_or_else(|| SidecarError::Issuer(site.run_issuer.clone()))?;
+    if jwks.scheme() != "https" {
+        return Err(SidecarError::InsecureJwks(jwks.to_string()));
+    }
     let local_port = git::LOCAL_BIND
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse().ok())
@@ -139,9 +147,6 @@ pub fn add(
     ]
     .map(String::from)
     .to_vec();
-    if jwks.scheme() == "http" {
-        args.push("--insecure-jwks-http".to_string());
-    }
     let mut mounts = vec![
         mount(SHARED_VOLUME, git::SHARED_DIR, true),
         mount(CA_VOLUME, git::CA_DIR, false),

@@ -1,6 +1,8 @@
 params = {
     "repo": {"type": "string", "required": True, "doc": "owner/name the run's GitHub App is installed on"},
     "base": {"type": "string", "default": "main", "doc": "the branch smoke branches start from"},
+    "outside_public": {"type": "string", "default": "neuralmagic/crucible", "doc": "a public repository outside the bound, which the run must not push to"},
+    "outside_private": {"type": "string", "default": "", "doc": "a private repository the App reaches outside the bound, which the run must not read; empty skips the check"},
 }
 
 task_push = command(
@@ -17,11 +19,17 @@ agent_push = agent(
     timeout = "20m",
 )
 
+deny = evaluate(
+    name = "deny",
+    run = "python3 smoke.py deny",
+    depends_on = [task_push, agent_push],
+)
+
 check = evaluate(
     name = "check",
     run = "python3 smoke.py check evidence/task.json evidence/agent.json",
-    depends_on = [task_push, agent_push],
+    depends_on = [task_push, agent_push, deny],
     emits = {"prs": "list"},
 )
 
-workflow(type = "playbook", tasks = [task_push, agent_push, check], result = check)
+workflow(type = "playbook", tasks = [task_push, agent_push, deny, check], result = check)

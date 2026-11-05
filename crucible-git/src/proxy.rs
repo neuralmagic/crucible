@@ -1,43 +1,20 @@
-//! git's smart-HTTP protocol, passed through to GitHub with the run's token added. The three
-//! endpoints are plain HTTP, so bodies stream through unread.
+//! git's smart-HTTP protocol at `/git/<owner>/<repo>.git/...`, for callers that authenticate as
+//! the run (sandboxes): rewritten to the github.com path and handed to the [`Relay`].
 
-use crate::allow::Allow;
-use crate::github::GitHub;
+use crate::relay::{Caller, Relay};
 use crate::{SCOPE_READ, SCOPE_WRITE};
 use axum::Router;
-use axum::body::Body;
 use axum::extract::{Path, Request, State};
-use axum::http::{HeaderName, StatusCode, header};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use crucible_mcp_auth::principal::Principal;
-use futures_util::TryStreamExt;
 use std::sync::Arc;
 
-/// Request headers git sends that GitHub needs to see.
-const FORWARD_REQUEST: [HeaderName; 4] = [
-    header::CONTENT_TYPE,
-    header::CONTENT_ENCODING,
-    header::ACCEPT,
-    HeaderName::from_static("git-protocol"),
-];
-
-/// Response headers git reads.
-const FORWARD_RESPONSE: [HeaderName; 3] = [
-    header::CONTENT_TYPE,
-    header::CONTENT_ENCODING,
-    header::CACHE_CONTROL,
-];
-
-struct Upstream {
-    gh: Arc<GitHub>,
-    allow: Arc<Allow>,
-}
-
-pub fn router(gh: Arc<GitHub>, allow: Arc<Allow>) -> Router {
+pub fn router(relay: Arc<Relay>) -> Router {
     Router::new()
         .route("/git/{owner}/{repo}/{*rest}", any(proxy))
-        .with_state(Arc::new(Upstream { gh, allow }))
+        .with_state(relay)
 }
 
 /// Which of the three endpoints, and whether it writes.
@@ -66,67 +43,26 @@ fn refuse(status: StatusCode, why: impl Into<String>) -> Response {
 }
 
 async fn proxy(
-    State(up): State<Arc<Upstream>>,
+    State(relay): State<Arc<Relay>>,
     Path((owner, repo, rest)): Path<(String, String, String)>,
-    req: Request,
+    mut req: Request,
 ) -> Response {
     let repo = repo.strip_suffix(".git").unwrap_or(&repo).to_string();
     if !is_name(&owner) || !is_name(&repo) {
         return refuse(StatusCode::BAD_REQUEST, "not a repository path");
     }
-    let query = req.uri().query().map(str::to_string);
-    let Some(scope) = endpoint(&rest, query.as_deref()) else {
-        return refuse(
-            StatusCode::NOT_FOUND,
-            "only git's smart-HTTP endpoints are served",
-        );
-    };
-    let Some(principal) = req.extensions().get::<Principal>() else {
+    let Some(principal) = req.extensions().get::<Principal>().cloned() else {
         return refuse(StatusCode::UNAUTHORIZED, "no authenticated caller");
     };
-    if !principal.missing_scopes(&[scope.to_string()]).is_empty() {
-        return refuse(StatusCode::FORBIDDEN, format!("this call needs {scope}"));
-    }
-    if let Err(e) = up.allow.repo(&format!("{owner}/{repo}")).await {
-        return refuse(e.status(), e.to_string());
-    }
-    let gh = &up.gh;
-    let token = match gh.token().await {
-        Ok(t) => t,
-        Err(e) => return refuse(e.status(), e.to_string()),
+    let path = match req.uri().query() {
+        Some(q) => format!("/{owner}/{repo}.git/{rest}?{q}"),
+        None => format!("/{owner}/{repo}.git/{rest}"),
     };
-    let mut url = match gh.web.join(&format!("{owner}/{repo}.git/{rest}")) {
-        Ok(u) => u,
-        Err(e) => return refuse(StatusCode::BAD_REQUEST, e.to_string()),
-    };
-    url.set_query(query.as_deref());
-
-    let (parts, body) = req.into_parts();
-    let mut upstream = gh
-        .http
-        .request(parts.method, url)
-        .header(header::AUTHORIZATION, GitHub::basic(&token));
-    for name in FORWARD_REQUEST {
-        if let Some(v) = parts.headers.get(&name) {
-            upstream = upstream.header(name, v);
-        }
+    match path.parse() {
+        Ok(uri) => *req.uri_mut() = uri,
+        Err(_) => return refuse(StatusCode::BAD_REQUEST, "not a repository path"),
     }
-    let upstream = upstream.body(reqwest::Body::wrap_stream(body.into_data_stream()));
-    let resp = match upstream.send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(%owner, %repo, %rest, error = %e, "GitHub unreachable");
-            return refuse(StatusCode::BAD_GATEWAY, format!("reaching GitHub: {e}"));
-        }
-    };
-    tracing::info!(%owner, %repo, %rest, status = %resp.status(), "proxied");
-    let mut out = Response::builder().status(resp.status());
-    for name in FORWARD_RESPONSE {
-        if let Some(v) = resp.headers().get(&name) {
-            out = out.header(name, v);
-        }
-    }
-    let stream = resp.bytes_stream().map_err(std::io::Error::other);
-    out.body(Body::from_stream(stream))
-        .unwrap_or_else(|e| refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+    relay
+        .relay("github.com", req, Caller::Run(&principal))
+        .await
 }

@@ -7,20 +7,25 @@
 //! | api.github.com            | GET a bound or public repo; a few account-free GETs             |
 //! |                           | POST pulls (spends the draft-pr count), labels, reviewers,       |
 //! |                           | PATCH pulls, on a bound repo                                     |
-//! | api.github.com /graphql   | queries; `createPullRequest` on a bound repo (spends the count); |
-//! |                           | label, reviewer and update mutations on pull requests it created |
+//! | api.github.com /graphql   | queries of a bound or public `repository`, `viewer`, `rateLimit`, |
+//! |                           | and `node(s)` it created; `createPullRequest` on a bound repo     |
+//! |                           | (spends the count); label, reviewer and update mutations on pull  |
+//! |                           | requests it created                                              |
 //!
-//! Anything else is refused. GraphQL queries are not scoped to a repository: a query can read any
-//! repository the App installation reaches.
+//! Anything else is refused, including any GraphQL top-level field not listed.
 
 use crate::allow::Allow;
 use crate::github::GitHub;
+use crate::graphql::{Field, Kind};
 use axum::http::{Method, StatusCode};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 pub enum Verdict {
-    Allow,
+    /// Lend the run's token, to a caller holding `scope`.
+    Allow {
+        scope: &'static str,
+    },
     Deny(StatusCode, String),
 }
 
@@ -113,7 +118,9 @@ async fn api(
     }
     let read = matches!(*method, Method::GET | Method::HEAD);
     if read && ACCOUNT_FREE.contains(&bare) {
-        return Verdict::Allow;
+        return Verdict::Allow {
+            scope: crate::SCOPE_READ,
+        };
     }
     let Some(rest) = bare.strip_prefix("/repos/") else {
         return deny(format!("crucible-git does not forward {method} {bare}"));
@@ -127,7 +134,9 @@ async fn api(
     let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
     match (method.clone(), tail.as_slice()) {
         (Method::POST, ["pulls"]) => match allow.open(&repo).await {
-            Ok(()) => Verdict::Allow,
+            Ok(()) => Verdict::Allow {
+                scope: crate::SCOPE_WRITE,
+            },
             Err(e) => Verdict::Deny(e.status(), e.to_string()),
         },
         (Method::POST | Method::DELETE, ["issues", _, "labels", ..])
@@ -139,7 +148,9 @@ async fn api(
 
 async fn writable(allow: &Allow, repo: &str) -> Verdict {
     match allow.repo(repo).await {
-        Ok(()) => Verdict::Allow,
+        Ok(()) => Verdict::Allow {
+            scope: crate::SCOPE_WRITE,
+        },
         Err(e) => Verdict::Deny(e.status(), e.to_string()),
     }
 }
@@ -147,7 +158,9 @@ async fn writable(allow: &Allow, repo: &str) -> Verdict {
 /// A bound repository, or a public one.
 async fn readable(state: &State, gh: &GitHub, allow: &Allow, repo: &str) -> Verdict {
     if allow.repo(repo).await.is_ok() {
-        return Verdict::Allow;
+        return Verdict::Allow {
+            scope: crate::SCOPE_READ,
+        };
     }
     let cached = state.public.lock().ok().and_then(|m| m.get(repo).copied());
     let public = match cached {
@@ -168,7 +181,9 @@ async fn readable(state: &State, gh: &GitHub, allow: &Allow, repo: &str) -> Verd
         },
     };
     match public {
-        true => Verdict::Allow,
+        true => Verdict::Allow {
+            scope: crate::SCOPE_READ,
+        },
         false => deny(format!(
             "{repo} is private and outside this run's [outputs.draft-pr] target"
         )),
@@ -176,21 +191,85 @@ async fn readable(state: &State, gh: &GitHub, allow: &Allow, repo: &str) -> Verd
 }
 
 async fn graphql(state: &State, gh: &GitHub, allow: &Allow, body: &[u8]) -> Verdict {
-    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return deny("the GraphQL request is not JSON");
+    let op = match crate::graphql::operation(body) {
+        Ok(op) => op,
+        Err(e) => return deny(e.to_string()),
     };
-    let query = doc
-        .get("query")
-        .and_then(|q| q.as_str())
-        .unwrap_or_default();
-    let fields = match mutation_fields(query) {
-        None => return Verdict::Allow,
-        Some(f) => f,
+    match op.kind {
+        Kind::Subscription => deny("crucible-git does not forward GraphQL subscriptions"),
+        Kind::Query => {
+            for field in &op.fields {
+                if let Verdict::Deny(status, why) = query_field(state, gh, allow, field).await {
+                    return Verdict::Deny(status, why);
+                }
+            }
+            Verdict::Allow {
+                scope: crate::SCOPE_READ,
+            }
+        }
+        Kind::Mutation => mutation(state, gh, allow, &op.fields).await,
+    }
+}
+
+/// A top-level query field: a bound or public repository, the caller itself, the rate limit, or
+/// a pull request this run created.
+async fn query_field(state: &State, gh: &GitHub, allow: &Allow, field: &Field) -> Verdict {
+    let created = || state.created.lock().map(|c| c.clone()).unwrap_or_default();
+    let arg = |k: &str| {
+        field
+            .args
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
     };
-    let vars = doc.get("variables").cloned().unwrap_or_default();
-    let input = vars.get("input").cloned().unwrap_or_default();
-    match fields.as_slice() {
-        [one] if one == "createPullRequest" => {
+    match field.name.as_str() {
+        "viewer" | "rateLimit" | "__typename" => Verdict::Allow {
+            scope: crate::SCOPE_READ,
+        },
+        "repository" => match (arg("owner"), arg("name")) {
+            (Some(owner), Some(name))
+                if crate::proxy::is_name(&owner) && crate::proxy::is_name(&name) =>
+            {
+                readable(state, gh, allow, &format!("{owner}/{name}")).await
+            }
+            _ => deny("a repository query needs a literal or variable owner and name"),
+        },
+        "node" => match arg("id") {
+            Some(id) if created().contains(&id) => Verdict::Allow {
+                scope: crate::SCOPE_READ,
+            },
+            _ => deny("a node query may only read pull requests this run created"),
+        },
+        "nodes" => {
+            let ids: Vec<String> = field
+                .args
+                .get("ids")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let created = created();
+            match !ids.is_empty() && ids.iter().all(|id| created.contains(id)) {
+                true => Verdict::Allow {
+                    scope: crate::SCOPE_READ,
+                },
+                false => deny("a nodes query may only read pull requests this run created"),
+            }
+        }
+        other => deny(format!(
+            "crucible-git does not forward the GraphQL query field {other}"
+        )),
+    }
+}
+
+async fn mutation(state: &State, gh: &GitHub, allow: &Allow, fields: &[Field]) -> Verdict {
+    let input = |f: &Field| f.args.get("input").cloned().unwrap_or_default();
+    match fields {
+        [one] if one.name == "createPullRequest" => {
+            let input = input(one);
             let Some(repo_id) = input.get("repositoryId").and_then(|v| v.as_str()) else {
                 return deny("createPullRequest needs input.repositoryId");
             };
@@ -208,30 +287,50 @@ async fn graphql(state: &State, gh: &GitHub, allow: &Allow, body: &[u8]) -> Verd
                     );
                 }
             };
-            if repo_id != node {
+            let head_repo = input.get("headRepositoryId").and_then(|v| v.as_str());
+            if repo_id != node || head_repo.is_some_and(|h| h != node) {
                 return deny(format!(
                     "createPullRequest targets a repository other than {target}"
                 ));
             }
             match allow.open(&target).await {
-                Ok(()) => Verdict::Allow,
+                Ok(()) => Verdict::Allow {
+                    scope: crate::SCOPE_WRITE,
+                },
                 Err(e) => Verdict::Deny(e.status(), e.to_string()),
             }
         }
-        fields if fields.iter().all(|f| PR_FOLLOW_UPS.contains(&f.as_str())) => {
-            let ids = ["pullRequestId", "labelableId", "assignableId"]
-                .iter()
-                .filter_map(|k| input.get(*k).and_then(|v| v.as_str()))
-                .collect::<Vec<_>>();
+        fields
+            if !fields.is_empty()
+                && fields
+                    .iter()
+                    .all(|f| PR_FOLLOW_UPS.contains(&f.name.as_str())) =>
+        {
             let created = state.created.lock().map(|c| c.clone()).unwrap_or_default();
-            match !ids.is_empty() && ids.iter().all(|id| created.contains(*id)) {
-                true => Verdict::Allow,
-                false => deny("this mutation may only touch pull requests this run created"),
+            for field in fields {
+                let input = input(field);
+                let ids: Vec<&str> = ["pullRequestId", "labelableId", "assignableId"]
+                    .iter()
+                    .filter_map(|k| input.get(*k).and_then(|v| v.as_str()))
+                    .collect();
+                if ids.is_empty() || !ids.iter().all(|id| created.contains(*id)) {
+                    return deny(format!(
+                        "{} may only touch pull requests this run created",
+                        field.name
+                    ));
+                }
+            }
+            Verdict::Allow {
+                scope: crate::SCOPE_WRITE,
             }
         }
         fields => deny(format!(
             "crucible-git does not forward the mutation {}",
-            fields.join(", ")
+            fields
+                .iter()
+                .map(|f| f.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }
@@ -263,74 +362,4 @@ async fn node_id(state: &State, gh: &GitHub, repo: &str) -> anyhow::Result<Strin
         m.insert(repo.to_string(), id.clone());
     }
     Ok(id)
-}
-
-/// The top-level field names of the document's mutation, or `None` when it is not one.
-fn mutation_fields(query: &str) -> Option<Vec<String>> {
-    let src = strip(query);
-    let doc = src.trim_start();
-    let rest = doc.strip_prefix("mutation")?;
-    if rest.starts_with(|c: char| c.is_alphanumeric() || c == '_') {
-        return None;
-    }
-    let mut depth = 0usize;
-    let mut paren = 0usize;
-    let mut fields = Vec::new();
-    let mut token = String::new();
-    for c in rest.chars() {
-        let ident = c.is_alphanumeric() || c == '_';
-        let top = depth == 1 && paren == 0;
-        if top && !ident && !token.is_empty() {
-            if c == ':' {
-                token.clear();
-                continue;
-            }
-            fields.push(std::mem::take(&mut token));
-        }
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.saturating_sub(1);
-                if depth == 0 {
-                    break;
-                }
-            }
-            '(' => paren += 1,
-            ')' => paren = paren.saturating_sub(1),
-            c if ident && top => token.push(c),
-            _ => {}
-        }
-    }
-    Some(fields)
-}
-
-/// The document without comments and string literals.
-fn strip(query: &str) -> String {
-    let mut out = String::with_capacity(query.len());
-    let mut chars = query.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '#' => {
-                for c in chars.by_ref() {
-                    if c == '\n' {
-                        break;
-                    }
-                }
-                out.push(' ');
-            }
-            '"' => {
-                let mut escaped = false;
-                for c in chars.by_ref() {
-                    match (escaped, c) {
-                        (false, '\\') => escaped = true,
-                        (false, '"') => break,
-                        _ => escaped = false,
-                    }
-                }
-                out.push_str("\"\"");
-            }
-            c => out.push(c),
-        }
-    }
-    out
 }
