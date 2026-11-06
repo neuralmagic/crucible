@@ -7,6 +7,7 @@ mod cache;
 mod client;
 mod context;
 mod job;
+mod jobs;
 mod logs;
 mod mcp;
 mod oci;

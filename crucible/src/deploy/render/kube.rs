@@ -9,7 +9,6 @@ use crate::openshell::gateway::{
 };
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
-use crucible_contract::agent_servers::CacheWriters;
 use crucible_contract::driver_env::{BrokerEnv, SandboxDriverEnv};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
@@ -1127,9 +1126,7 @@ exit $rc
         if self.profile.secrets.push_authfile.is_some() {
             mounts.push(ro("quay-push", PUSH_AUTHFILE_DIR, None));
         }
-        if buildit_cache::configured(self.profile)
-            .is_some_and(|(_, c)| c.writers != CacheWriters::None)
-        {
+        if buildit_cache::configured(self.profile).is_some() {
             mounts.push(ro("buildit-cache-token", buildit_cache::TOKEN_DIR, None));
         }
         if self.spoke.is_some() {
@@ -1248,9 +1245,7 @@ exit $rc
             });
         }
 
-        if let Some((_, cache)) = buildit_cache::configured(self.profile)
-            && cache.writers != CacheWriters::None
-        {
+        if let Some((_, cache)) = buildit_cache::configured(self.profile) {
             volumes.push(core::Volume {
                 name: "buildit-cache-token".to_string(),
                 secret: Some(core::SecretVolumeSource {
@@ -1863,17 +1858,20 @@ exit $rc
         objects
     }
 
-    /// With `[buildit]`, the loop account's rights over buildit's builder pods in buildit's own
-    /// namespace: create, watch and delete them, exec into them, and read their logs. None in the
-    /// loop namespace, where they would reach every run's loop pod and Secret.
+    /// With `[buildit]`, the loop account's rights over buildit's builds in buildit's own
+    /// namespace: create, watch, cancel and delete their Jobs, create each Job's inputs Secret,
+    /// and watch and read the logs of their pods. None in the loop namespace, where they would
+    /// reach every run's loop pod and Secret. Beside them, the namespace's default account, which
+    /// build pods run as, pushes to the cluster's registry, and every service account pulls the
+    /// builds, so workloads anywhere run them.
     fn buildit_rbac(&self) -> Vec<SandboxRbacObject> {
         let Some(buildit) = &self.profile.buildit else {
             return Vec::new();
         };
         let cluster = &self.profile.cluster;
         let name = format!("{}-buildit", cluster.service_account);
-        let rule = |resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
-            api_groups: Some(vec![String::new()]),
+        let rule = |group: &str, resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
+            api_groups: Some(vec![group.to_string()]),
             resources: Some(resources.iter().map(|r| r.to_string()).collect()),
             verbs: verbs.iter().map(|v| v.to_string()).collect(),
             ..Default::default()
@@ -1885,9 +1883,14 @@ exit $rc
                 ..Default::default()
             },
             rules: Some(vec![
-                rule(&["pods"], &["create", "delete", "get", "list", "watch"]),
-                rule(&["pods/exec"], &["create", "get"]),
-                rule(&["pods/log"], &["get"]),
+                rule(
+                    "batch",
+                    &["jobs"],
+                    &["create", "delete", "get", "list", "patch", "watch"],
+                ),
+                rule("", &["secrets"], &["create"]),
+                rule("", &["pods"], &["get", "list", "watch"]),
+                rule("", &["pods/log"], &["get"]),
             ]),
         };
         let binding = role_binding(
@@ -1898,14 +1901,42 @@ exit $rc
             cluster.service_account.clone(),
             cluster.loop_namespace.clone(),
         );
+        let pushers = role_binding(
+            format!("{name}-image-builders"),
+            buildit.namespace.to_string(),
+            "ClusterRole",
+            "system:image-builder",
+            "default".to_string(),
+            buildit.namespace.to_string(),
+        );
+        let pullers = rbac::RoleBinding {
+            metadata: ObjectMeta {
+                name: Some(format!("{name}-image-pullers")),
+                namespace: Some(buildit.namespace.to_string()),
+                ..Default::default()
+            },
+            role_ref: rbac::RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "ClusterRole".to_string(),
+                name: "system:image-puller".to_string(),
+            },
+            subjects: Some(vec![rbac::Subject {
+                api_group: Some("rbac.authorization.k8s.io".to_string()),
+                kind: "Group".to_string(),
+                name: "system:serviceaccounts".to_string(),
+                ..Default::default()
+            }]),
+        };
         vec![
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(binding),
+            SandboxRbacObject::RoleBinding(pushers),
+            SandboxRbacObject::RoleBinding(pullers),
         ]
     }
 
     /// With `[buildit]`, the builder pods' NetworkPolicy in buildit's namespace: no ingress, and
-    /// egress only to DNS and `[buildit] egress`.
+    /// egress only to DNS, the cluster's image registry, and `[buildit] egress`.
     fn builder_netpol(&self) -> Option<networking::NetworkPolicy> {
         let buildit = self.profile.buildit.as_ref()?;
         let unfenced = buildit.unfenced_egress();
@@ -1929,6 +1960,19 @@ exit $rc
                     .collect(),
             ),
             to: None,
+        };
+        let registry = networking::NetworkPolicyEgressRule {
+            ports: Some(vec![port(REGISTRY_PORT, "TCP")]),
+            to: Some(vec![networking::NetworkPolicyPeer {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".to_string(),
+                        REGISTRY_NAMESPACE.to_string(),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
         };
         let allowed = buildit
             .egress
@@ -1960,7 +2004,8 @@ exit $rc
                 policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
                 ingress: None,
                 egress: Some(
-                    std::iter::once(dns)
+                    [dns, registry]
+                        .into_iter()
                         .chain(allowed)
                         .chain(buildit_cache::configured(self.profile).map(|_| {
                             buildit_cache::builder_egress(&self.profile.cluster.loop_namespace)
@@ -2089,6 +2134,9 @@ pub const SPIRE_READER: &str = "crucible-spire-reader";
 
 /// The builder pods' NetworkPolicy in `[buildit] namespace`.
 pub const BUILDER_NETPOL: &str = "buildit-builders";
+/// OpenShift's internal registry, which build pods push to and the kubelet pulls run images from.
+const REGISTRY_NAMESPACE: &str = "openshift-image-registry";
+const REGISTRY_PORT: u16 = 5000;
 
 /// The suffix of the builder pods' admission policy and binding, after `[buildit] namespace`.
 pub const BUILDER_ADMISSION: &str = "buildit-builders";
@@ -5153,10 +5201,34 @@ mod tests {
         assert_eq!(
             role["rules"],
             serde_json::json!([
-                {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]},
-                {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create", "get"]},
+                {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create", "delete", "get", "list", "patch", "watch"]},
+                {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]},
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch"]},
                 {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
             ])
+        );
+        let images = |suffix: &str| {
+            docs.iter()
+                .find(|d| {
+                    d["kind"] == "RoleBinding"
+                        && d["metadata"]["name"]
+                            == format!("autoresearch-publisher-buildit-image-{suffix}").as_str()
+                })
+                .unwrap_or_else(|| panic!("the image {suffix} binding: {yaml}"))
+        };
+        assert_eq!(
+            images("builders")["roleRef"]["name"],
+            "system:image-builder"
+        );
+        assert_eq!(images("builders")["subjects"][0]["name"], "default");
+        assert_eq!(
+            images("builders")["subjects"][0]["namespace"],
+            "crucible-builds"
+        );
+        assert_eq!(images("pullers")["roleRef"]["name"], "system:image-puller");
+        assert_eq!(
+            images("pullers")["subjects"][0]["name"],
+            "system:serviceaccounts"
         );
         let binding = named("RoleBinding");
         assert_eq!(binding["metadata"]["namespace"], "crucible-builds");
@@ -5187,11 +5259,21 @@ mod tests {
         let egress = builders["spec"]["egress"].as_array().unwrap();
         assert_eq!(egress[0].get("to"), None, "DNS anywhere");
         assert_eq!(
-            egress[1]["to"][0]["ipBlock"]["cidr"], "0.0.0.0/0",
+            egress[1],
+            serde_json::json!({
+                "ports": [{"port": 5000, "protocol": "TCP"}],
+                "to": [{"namespaceSelector": {"matchLabels": {
+                    "kubernetes.io/metadata.name": "openshift-image-registry"
+                }}}]
+            }),
+            "the cluster's image registry, which builds push to"
+        );
+        assert_eq!(
+            egress[2]["to"][0]["ipBlock"]["cidr"], "0.0.0.0/0",
             "by default, TCP 443 anywhere"
         );
         assert_eq!(
-            egress[1]["ports"],
+            egress[2]["ports"],
             serde_json::json!([{"port": 443, "protocol": "TCP"}])
         );
         let narrowed = render_k8s_manifest(
@@ -5206,10 +5288,10 @@ mod tests {
             .find(|d| d["metadata"]["name"] == BUILDER_NETPOL)
             .unwrap();
         assert_eq!(
-            narrowed["spec"]["egress"][1]["to"][0]["ipBlock"],
+            narrowed["spec"]["egress"][2]["to"][0]["ipBlock"],
             serde_json::json!({"cidr": "203.0.113.0/24", "except": ["203.0.113.8/29"]})
         );
-        assert_eq!(narrowed["spec"]["egress"].as_array().unwrap().len(), 2);
+        assert_eq!(narrowed["spec"]["egress"].as_array().unwrap().len(), 3);
         let netpol = yaml
             .split("\n---\n")
             .find(|d| d.contains("kind: NetworkPolicy"))
@@ -5304,7 +5386,10 @@ mod tests {
 
         let reads =
             docs("[buildit.cache]\ntoken_secret = \"buildit-cache-token\"\nwriters = \"none\"\n");
-        assert!(!mounted(&reads), "a read-only cache mounts no token");
+        assert!(
+            mounted(&reads),
+            "buildit uploads contexts and archives results even when builds only read"
+        );
         assert_eq!(
             builder_egress(&reads),
             egress,

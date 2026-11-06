@@ -12,7 +12,6 @@ members = [
     "crucible-kueue",
     "crucible-mcp-auth",
     "buildit",
-    "buildq",
     "crucible-git",
     "capability",
     "xtask",

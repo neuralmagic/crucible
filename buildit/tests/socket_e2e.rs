@@ -35,6 +35,7 @@ impl Run {
         std::fs::create_dir_all(root.join("ws/svc")).unwrap();
         std::fs::create_dir_all(root.join("elsewhere")).unwrap();
         std::fs::write(root.join("ws/svc/Dockerfile"), "FROM scratch\n").unwrap();
+        std::fs::write(root.join("cache-token"), "socket-e2e\n").unwrap();
         std::fs::write(
             root.join("kubeconfig"),
             "apiVersion: v1\nkind: Config\ncurrent-context: none\n\
@@ -86,6 +87,12 @@ impl Run {
                 socket.to_str().unwrap(),
                 "--socket-workdir",
                 workdir.to_str().unwrap(),
+                "--cache-url",
+                "http://127.0.0.1:9",
+                "--cache-token-file",
+                self.path("cache-token").to_str().unwrap(),
+                "--cache-writers",
+                "run",
             ])
             .env("KUBECONFIG", self.path("kubeconfig"))
             .env_remove(ENV_SERVER)
@@ -170,10 +177,7 @@ fn the_cli_drives_the_runs_socket_under_the_runs_own_name_and_the_shipped_policy
     let (reply, code) = run.buildit(&["build", "-c", svc]);
     assert_eq!(code, 1, "{reply}");
     let e = error(&reply);
-    assert!(
-        e.contains("listing builder pods") && e.contains(&label),
-        "{e}"
-    );
+    assert!(e.contains("listing builds") && e.contains(&label), "{e}");
     for args in [
         &["status", "buildit-0123"][..],
         &["clean", "buildit-0123"],

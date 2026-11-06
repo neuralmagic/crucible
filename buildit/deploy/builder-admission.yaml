@@ -1,15 +1,17 @@
-# The pods `buildit mcp` may create in its builder namespace, as a ValidatingAdmissionPolicy
-# (admissionregistration.k8s.io/v1, Kubernetes 1.30+). Whoever may create pods there (a run's loop
-# account) can create only a builder pod shaped like the one buildit/src/mcp.rs `builder_pod`
-# makes: the buildah image, one unprivileged non-root container that does not ask for seccomp
-# Unconfined, emptyDir volumes, no host namespaces, no service account token or other Secret, no
-# node, runtime, toleration, sysctl or SELinux overrides, and AppArmor unconfined for that container
-# alone. Admission defaults are admitted: the not-ready and unreachable tolerations every pod gets,
-# a global default PriorityClass, and an SELinux level an OpenShift SCC assigns. So is Kueue
-# admitting the pod: the update that lifts its kueue.x-k8s.io/admission gate may add the
-# ResourceFlavor's tolerations.
+# The pods `buildit mcp`'s Jobs may run in its builder namespace, as a ValidatingAdmissionPolicy
+# (admissionregistration.k8s.io/v1, Kubernetes 1.30+). Whoever may create Jobs there (a run's loop
+# account) gets only pods shaped like buildit/src/jobs.rs makes: a build (buildah), a run (a
+# built image by digest) or a push (crane), with the fetch init container and the archive sidecar
+# beside them; every pod in a user namespace, so root in a container is no one on the node; no
+# privilege, added capability or seccomp Unconfined; emptyDir volumes, the build's own inputs
+# Secret, and a projection of the default account's token and the cluster's service CA; no host
+# namespaces, no service account token mount or other Secret (an OpenShift internal registry's
+# pull Secret, which the account admission plugin adds, aside), no node, runtime, toleration,
+# sysctl or SELinux overrides. Admission defaults are admitted: the not-ready and unreachable
+# tolerations every pod gets, a global default PriorityClass, and an SELinux level an OpenShift SCC
+# assigns.
 # `crucible deploy` renders it with a binding to the builder namespace; buildit's tests check its
-# own builder pod passes and the escapes do not.
+# own pods pass and the escapes do not.
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicy
 metadata:
@@ -26,44 +28,68 @@ spec:
         apiVersions: ["v1"]
         operations: ["UPDATE"]
         resources: ["pods/ephemeralcontainers"]
+  variables:
+    - name: inits
+      expression: >-
+        has(object.spec.initContainers) ? object.spec.initContainers : []
+    - name: all
+      expression: variables.inits + object.spec.containers
+    - name: build
+      expression: >-
+        has(object.metadata.labels) && 'buildit.dev/build-id' in object.metadata.labels &&
+        object.metadata.labels['buildit.dev/build-id'].matches('^buildit-[0-9a-f]{16}$') ?
+        object.metadata.labels['buildit.dev/build-id'] : ''
   validations:
     - expression: >-
         has(object.metadata.labels) && 'buildit.dev/managed-by' in object.metadata.labels &&
         object.metadata.labels['buildit.dev/managed-by'] == 'mcp'
       message: a pod here must carry buildit.dev/managed-by=mcp
+    - expression: variables.build != ''
+      message: a pod here must name its build in buildit.dev/build-id
+    - expression: has(object.spec.hostUsers) && object.spec.hostUsers == false
+      message: a pod here runs in a user namespace (hostUsers false)
     - expression: >-
         size(object.spec.containers) == 1 &&
-        object.spec.containers.all(c, c.name == 'builder' && c.image == 'quay.io/buildah/stable:latest')
-      message: a pod here runs one container, builder, from quay.io/buildah/stable:latest
+        object.spec.containers.all(c,
+        (c.name == 'builder' && c.image in
+        ['quay.io/buildah/stable:latest', 'gcr.io/go-containerregistry/crane:debug']) ||
+        (c.name == 'run' && c.image.contains('@sha256:')))
+      message: >-
+        a pod here runs one container: builder from buildah or crane, or run from an image by
+        digest
     - expression: >-
-        (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) &&
-        (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)
-      message: a pod here has no init or ephemeral containers
+        variables.inits.all(c,
+        (c.name == 'fetch' && c.image == 'gcr.io/go-containerregistry/crane:debug' &&
+        !has(c.restartPolicy)) ||
+        (c.name == 'archive' && c.image == 'quay.io/buildah/stable:latest' &&
+        has(c.restartPolicy) && c.restartPolicy == 'Always'))
+      message: >-
+        a pod here has init containers fetch (crane) and the archive sidecar (buildah) alone
     - expression: >-
-        object.spec.containers.all(c, (!has(c.envFrom) || size(c.envFrom) == 0) &&
+        !has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0
+      message: a pod here has no ephemeral containers
+    - expression: >-
+        variables.all.all(c, (!has(c.envFrom) || size(c.envFrom) == 0) &&
         (!has(c.env) || c.env.all(e, !has(e.valueFrom))))
       message: a pod here reads no Secret or ConfigMap into its environment
     - expression: >-
-        !has(object.spec.imagePullSecrets) || size(object.spec.imagePullSecrets) == 0
-      message: a pod here names no image pull Secret
+        !has(object.spec.imagePullSecrets) ||
+        object.spec.imagePullSecrets.all(s, s.name.startsWith('default-dockercfg-'))
+      message: a pod here names no image pull Secret but the default account's registry one
     - expression: >-
-        object.spec.containers.all(c, !has(c.securityContext) ||
+        variables.all.all(c, !has(c.securityContext) ||
         ((!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
         (!has(c.securityContext.capabilities) || !has(c.securityContext.capabilities.add) ||
         size(c.securityContext.capabilities.add) == 0)))
       message: a pod here is not privileged and adds no capabilities
     - expression: >-
-        object.spec.containers.all(c, has(c.securityContext) && has(c.securityContext.runAsUser) &&
-        c.securityContext.runAsUser > 0)
-      message: a pod here runs as a non-root user
-    - expression: >-
-        object.spec.containers.all(c, !has(c.securityContext) ||
+        variables.all.all(c, !has(c.securityContext) ||
         !has(c.securityContext.seccompProfile) || c.securityContext.seccompProfile.type != 'Unconfined') &&
         (!has(object.spec.securityContext) || !has(object.spec.securityContext.seccompProfile) ||
         object.spec.securityContext.seccompProfile.type != 'Unconfined')
       message: a pod here does not ask for seccomp Unconfined
     - expression: >-
-        object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.procMount) ||
+        variables.all.all(c, !has(c.securityContext) || !has(c.securityContext.procMount) ||
         c.securityContext.procMount == 'Default')
       message: a pod here keeps the default /proc mount
     - expression: >-
@@ -71,7 +97,7 @@ spec:
         (!has(object.spec.securityContext.seLinuxOptions.type) &&
         !has(object.spec.securityContext.seLinuxOptions.user) &&
         !has(object.spec.securityContext.seLinuxOptions.role))) &&
-        object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.seLinuxOptions) ||
+        variables.all.all(c, !has(c.securityContext) || !has(c.securityContext.seLinuxOptions) ||
         (!has(c.securityContext.seLinuxOptions.type) && !has(c.securityContext.seLinuxOptions.user) &&
         !has(c.securityContext.seLinuxOptions.role)))
       message: a pod here sets no SELinux user, role or type
@@ -89,34 +115,32 @@ spec:
     - expression: >-
         !has(object.spec.tolerations) || object.spec.tolerations.all(t, has(t.key) &&
         t.key in ['node.kubernetes.io/not-ready', 'node.kubernetes.io/unreachable'] &&
-        has(t.effect) && t.effect == 'NoExecute') ||
-        (request.operation == 'UPDATE' && has(oldObject.spec.schedulingGates) &&
-        oldObject.spec.schedulingGates.exists(g, g.name == 'kueue.x-k8s.io/admission') &&
-        (!has(object.spec.schedulingGates) ||
-        !object.spec.schedulingGates.exists(g, g.name == 'kueue.x-k8s.io/admission')))
-      message: >-
-        a pod here tolerates only the not-ready and unreachable taints every pod gets, and its
-        Kueue flavor's on admission
+        has(t.effect) && t.effect == 'NoExecute')
+      message: a pod here tolerates only the not-ready and unreachable taints every pod gets
     - expression: >-
         (!has(object.spec.hostNetwork) || object.spec.hostNetwork == false) &&
         (!has(object.spec.hostPID) || object.spec.hostPID == false) &&
         (!has(object.spec.hostIPC) || object.spec.hostIPC == false)
       message: a pod here shares no host namespace
     - expression: >-
-        !has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir))
-      message: a pod here mounts only emptyDir volumes
+        !has(object.spec.volumes) || object.spec.volumes.all(v, has(v.emptyDir) ||
+        (has(v.secret) && has(v.secret.secretName) &&
+        v.secret.secretName.startsWith(variables.build) && v.secret.secretName.endsWith('-inputs')) ||
+        (has(v.projected) && has(v.projected.sources) && v.projected.sources.all(s,
+        (has(s.serviceAccountToken) && !has(s.serviceAccountToken.audience)) ||
+        (has(s.configMap) && s.configMap.name == 'openshift-service-ca.crt'))))
+      message: >-
+        a pod here mounts emptyDir volumes, its build's inputs Secret, and the account's token
+        and the service CA alone
     - expression: >-
         has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false &&
         (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default')
-      message: a pod here runs as the default account without its token
+      message: a pod here runs as the default account without its token mounted
     - expression: >-
         !has(object.metadata.annotations) || object.metadata.annotations.all(k,
-        !k.startsWith('container.apparmor.security.beta.kubernetes.io/') ||
-        (k == 'container.apparmor.security.beta.kubernetes.io/builder' &&
-        object.metadata.annotations[k] == 'unconfined'))
-      message: a pod here sets AppArmor only as buildit does, unconfined for builder
+        !k.startsWith('container.apparmor.security.beta.kubernetes.io/'))
+      message: a pod here sets no AppArmor annotation
     - expression: >-
         (!has(object.spec.securityContext) || !has(object.spec.securityContext.appArmorProfile)) &&
-        object.spec.containers.all(c, !has(c.securityContext) || !has(c.securityContext.appArmorProfile) ||
-        c.securityContext.appArmorProfile.type == 'Unconfined')
-      message: a pod here sets AppArmor only as buildit does, unconfined for builder
+        variables.all.all(c, !has(c.securityContext) || !has(c.securityContext.appArmorProfile))
+      message: a pod here sets no AppArmor profile

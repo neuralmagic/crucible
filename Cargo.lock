@@ -1286,7 +1286,6 @@ dependencies = [
  "ignore",
  "k8s-openapi 0.28.0",
  "kube 4.2.0",
- "nix 0.31.3",
  "oci-client 0.17.0",
  "regex",
  "reqwest",
@@ -1303,30 +1302,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
-]
-
-[[package]]
-name = "buildq"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "clap",
- "futures-util",
- "ignore",
- "k8s-openapi 0.28.0",
- "kube 4.2.0",
- "oci-client 0.17.0",
- "rmcp",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.11.1",
- "tar",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
