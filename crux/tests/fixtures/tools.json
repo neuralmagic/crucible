@@ -393,6 +393,61 @@
     "name": "crucible_draft_launch"
   },
   {
+    "description": "Move a draft to a newer pack edition with the controller's engine: set the manifest's edition and declare, as optional, each variable its host commands read. A dry run unless apply is set: returns each diff, the changes, and what needs review, and saves nothing. With apply, each migration is saved as the draft's next version. all sweeps every draft you may read, owner narrows that sweep, and drafts already at the edition are skipped.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "all": {
+          "default": false,
+          "description": "Every draft you may read that is below the target edition, retired ones aside.",
+          "type": "boolean"
+        },
+        "apply": {
+          "default": false,
+          "description": "Save each migration as its draft's next version. Without it nothing is saved.",
+          "type": "boolean"
+        },
+        "draft_id": {
+          "default": null,
+          "description": "The draft to migrate. Omit when `all` is set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dry_run": {
+          "default": false,
+          "description": "Print each diff and its findings and save nothing. The default.",
+          "type": "boolean"
+        },
+        "json": {
+          "default": false,
+          "type": "boolean"
+        },
+        "owner": {
+          "default": null,
+          "description": "With `all`, only drafts this principal owns: `user:<login>` or `team:<slug>`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "default": null,
+          "description": "The edition to move to. Omit for the newest the controller's engine runs.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "name": "crucible_draft_migrate"
+  },
+  {
     "description": "What a draft version compiled to, without launching it: the schema digest its params are validated against and the engine's diagnostics. Read this before crucible_draft_launch — a version with no schema digest never compiled and cannot be launched.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

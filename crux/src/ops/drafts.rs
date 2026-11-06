@@ -1,6 +1,6 @@
 //! Draft packs in the authoring studio: the surface an agent shares with a human.
 
-use crate::client::{Client, DraftSave, encode};
+use crate::client::{Client, DraftSave, MigrateReply, encode};
 use crate::dto;
 use crate::ops::playbooks::put_rerun;
 use crate::ops::{Operation, put_trimmed};
@@ -691,6 +691,141 @@ impl Operation for DraftGraduate {
     }
 }
 
+/// Move drafts to a newer pack edition with the controller's engine. A dry run unless `--apply`:
+/// each draft's diff, the changes, and what needs review, with nothing saved.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
+pub struct DraftMigrate {
+    /// The draft to migrate. Omit with --all.
+    #[arg(required_unless_present = "all", conflicts_with = "all")]
+    #[serde(default)]
+    #[schemars(description = "The draft to migrate. Omit when `all` is set.")]
+    pub draft_id: Option<String>,
+    /// Every draft you may read that is below the target edition, retired ones aside.
+    #[arg(long)]
+    #[serde(default)]
+    #[schemars(
+        description = "Every draft you may read that is below the target edition, retired ones aside."
+    )]
+    pub all: bool,
+    /// With --all, only drafts this principal owns: `user:<login>` or `team:<slug>`.
+    #[arg(long, requires = "all")]
+    #[serde(default)]
+    #[schemars(
+        description = "With `all`, only drafts this principal owns: `user:<login>` or `team:<slug>`."
+    )]
+    pub owner: Option<String>,
+    /// The edition to move to. Omit for the newest the controller's engine runs.
+    #[arg(long)]
+    #[serde(default)]
+    pub to: Option<u32>,
+    /// Print each diff and its findings and save nothing. The default.
+    #[arg(long, conflicts_with = "apply")]
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Save each migration as its draft's next version.
+    #[arg(long)]
+    #[serde(default)]
+    #[schemars(
+        description = "Save each migration as its draft's next version. Without it nothing is saved."
+    )]
+    pub apply: bool,
+    #[arg(long)]
+    #[serde(default)]
+    pub json: bool,
+}
+
+impl DraftMigrate {
+    /// The drafts to migrate, each with the version its migration is based on, and the ones a
+    /// sweep passes over.
+    async fn targets(&self, c: &Client) -> Result<(Vec<(String, i64)>, Vec<Value>)> {
+        if let Some(id) = &self.draft_id {
+            let detail: dto::DraftDetail = c
+                .get(&format!("/api/playbook-drafts/{}", encode(id)))
+                .await?;
+            return Ok((vec![(id.clone(), detail.draft.latest_version)], Vec::new()));
+        }
+        if !self.all {
+            bail!("name a draft, or pass --all");
+        }
+        let mut listed: Vec<dto::DraftListEntry> = c.get("/api/playbook-drafts").await?;
+        listed.retain(|d| self.owner.as_deref().is_none_or(|o| d.owner == o));
+        listed.sort_by(|a, b| a.id.cmp(&b.id));
+        let mut targets = Vec::new();
+        let mut skipped = Vec::new();
+        for draft in listed {
+            if draft.retired_at.is_some() {
+                skipped.push(passed(&draft.id, "retired"));
+            } else {
+                targets.push((draft.id, draft.latest_version));
+            }
+        }
+        Ok((targets, skipped))
+    }
+}
+
+fn passed(draft_id: &str, reason: &str) -> Value {
+    serde_json::json!({ "draft_id": draft_id, "reason": reason })
+}
+
+impl Operation for DraftMigrate {
+    type Output = dto::DraftMigrations;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        if self.draft_id.is_some() && self.all {
+            bail!("name a draft or pass --all, not both");
+        }
+        if self.owner.is_some() && !self.all {
+            bail!("--owner picks drafts for --all");
+        }
+        if self.dry_run && self.apply {
+            bail!("--dry-run and --apply are opposites; pass one");
+        }
+        let dry_run = !self.apply;
+        let (targets, mut skipped) = self.targets(c).await?;
+        let mut migrated = Vec::new();
+        let mut refused = Vec::new();
+        for (id, base_version) in targets {
+            match c.migrate_draft(&id, self.to, base_version, dry_run).await? {
+                MigrateReply::Migrated(mut raw) => {
+                    let unchanged = raw["changes"].as_array().is_none_or(Vec::is_empty);
+                    if unchanged {
+                        let edition = raw["from"].as_i64().unwrap_or_default();
+                        skipped.push(passed(&id, &format!("already at edition {edition}")));
+                        continue;
+                    }
+                    if let Some(obj) = raw.as_object_mut() {
+                        obj.insert("draft_id".to_string(), Value::String(id.clone()));
+                        obj.insert("studio_url".to_string(), Value::String(studio_url(c, &id)));
+                    }
+                    migrated.push(raw);
+                }
+                MigrateReply::Stale(stale) => refused.push(passed(&id, &stale.error)),
+                MigrateReply::Refused(error) => refused.push(passed(&id, &error)),
+            }
+        }
+        if let (Some(id), Some(refusal)) = (&self.draft_id, refused.first()) {
+            bail!(
+                "draft {id}: {}",
+                refusal["reason"].as_str().unwrap_or_default()
+            );
+        }
+        Ok(serde_json::json!({
+            "dry_run": dry_run,
+            "migrated": migrated,
+            "skipped": skipped,
+            "refused": refused,
+        }))
+    }
+
+    fn render(&self, _c: &Client, out: Self::Output) -> Result<String> {
+        Ok(render::draft_migrations(&out))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
 /// [`DraftCreate`] as a call, for callers outside this crate.
 pub async fn draft_create(
     c: &Client,
@@ -1273,5 +1408,210 @@ mod tests {
             .await
             .expect_err("404");
         assert!(missing.to_string().contains("404"), "{missing}");
+    }
+
+    /// A stand-in controller holding four drafts: two of alice's at edition 1, one of hers already
+    /// at edition 2, and a retired one of bob's. It records each migrate request it is sent.
+    async fn migrate_controller() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use axum::extract::{Path as AxumPath, State};
+        use axum::http::StatusCode;
+        use axum::routing::{get, post};
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<Value>>>;
+
+        async fn list() -> axum::Json<Value> {
+            axum::Json(serde_json::json!([
+                {"id": "notify", "owner": "user:alice", "latest_version": 4, "retired_at": null},
+                {"id": "done", "owner": "user:alice", "latest_version": 9, "retired_at": null},
+                {"id": "broken", "owner": "user:alice", "latest_version": 2, "retired_at": null},
+                {"id": "old", "owner": "user:bob", "latest_version": 1,
+                 "retired_at": "2026-10-01T00:00:00Z"},
+            ]))
+        }
+
+        async fn migrate(
+            State(seen): State<Seen>,
+            AxumPath(id): AxumPath<String>,
+            axum::Json(body): axum::Json<Value>,
+        ) -> (StatusCode, axum::Json<Value>) {
+            let mut request = body.clone();
+            request["draft_id"] = Value::String(id.clone());
+            seen.lock().expect("seen").push(request);
+            let dry_run = body["dry_run"].as_bool().unwrap_or(true);
+            match id.as_str() {
+                "done" => (
+                    StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "from": 2, "to": 2, "base_version": 9, "dry_run": dry_run,
+                        "diffs": [], "changes": [], "findings": [], "saved": null,
+                    })),
+                ),
+                "broken" => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    axum::Json(serde_json::json!({
+                        "error": "crucible.toml does not parse, so it cannot be migrated: missing field `agent`",
+                    })),
+                ),
+                _ => {
+                    let saved = (!dry_run).then(|| {
+                        serde_json::json!({
+                            "version": 5, "saved_by": "alice", "saved_at": "t",
+                            "schema_digest": "sha256:aa", "diagnostics": [],
+                        })
+                    });
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "from": 1, "to": 2, "base_version": 4, "dry_run": dry_run,
+                            "diffs": [{"path": "crucible.toml", "unified": "--- a/crucible.toml\n+++ b/crucible.toml\n@@ -1 +1,3 @@\n+edition = 2\n+\n [agent]\n"}],
+                            "changes": [
+                                {"kind": "edition", "table": null, "entry": null, "read_at": [],
+                                 "message": "edition = 2 (was 1)"},
+                                {"kind": "declared", "table": "[workflow]", "entry": "SLACK_WEBHOOK_URL?",
+                                 "read_at": ["scripts/notify.py:3"],
+                                 "message": "[workflow].env declares \"SLACK_WEBHOOK_URL?\", read at scripts/notify.py:3"},
+                            ],
+                            "findings": [
+                                {"kind": "unattributed_reads", "path": "tools/backfill.py",
+                                 "message": "tools/backfill.py reads BACKFILL_SINCE, and no host command was found to run it; if one does, declare them in that command's table"},
+                            ],
+                            "saved": saved,
+                        })),
+                    )
+                }
+            }
+        }
+
+        async fn detail(AxumPath(id): AxumPath<String>) -> axum::Json<Value> {
+            axum::Json(serde_json::json!({
+                "draft": {"id": id, "owner": "user:alice", "latest_version": 2, "retired_at": null},
+                "versions": [],
+            }))
+        }
+
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .route("/api/playbook-drafts", get(list))
+            .route("/api/playbook-drafts/{id}", get(detail))
+            .route("/api/playbook-drafts/{id}/migrate", post(migrate))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        (url, seen)
+    }
+
+    fn sweep(owner: Option<&str>, apply: bool) -> DraftMigrate {
+        DraftMigrate {
+            draft_id: None,
+            all: true,
+            owner: owner.map(str::to_string),
+            to: None,
+            dry_run: false,
+            apply,
+            json: false,
+        }
+    }
+
+    /// A sweep is a dry run unless asked: every unretired draft of the owner is migrated against
+    /// its newest version, one already at the edition is skipped, and a refusal is reported
+    /// without stopping the rest.
+    #[tokio::test]
+    async fn a_sweep_previews_each_draft_and_skips_the_ones_already_migrated() {
+        let (url, seen) = migrate_controller().await;
+        let client = test_client(&url);
+
+        let printed = sweep(Some("user:alice"), false)
+            .run(&client)
+            .await
+            .expect("sweep");
+        let notify_url = studio_url(&client, "notify");
+        assert_eq!(
+            printed,
+            format!(
+                "dry run: nothing saved; --apply saves each migration as its draft's next version\n\
+                 == draft notify (version 4): edition 1 -> 2\n\
+                 --- a/crucible.toml\n+++ b/crucible.toml\n@@ -1 +1,3 @@\n+edition = 2\n+\n [agent]\n\
+                 change: edition = 2 (was 1)\n\
+                 change: [workflow].env declares \"SLACK_WEBHOOK_URL?\", read at scripts/notify.py:3\n\
+                 review: tools/backfill.py reads BACKFILL_SINCE, and no host command was found to \
+                 run it; if one does, declare them in that command's table\n\
+                 studio: {notify_url}\n\
+                 skipped: done (already at edition 2)\n\
+                 refused: broken (HTTP 422 Unprocessable Entity: crucible.toml does not parse, so it \
+                 cannot be migrated: missing field `agent`)\n\
+                 1 migrated, 1 skipped, 1 refused\n"
+            )
+        );
+        let requests = seen.lock().expect("seen").clone();
+        assert_eq!(
+            requests,
+            [
+                serde_json::json!({"draft_id": "broken", "base_version": 2, "dry_run": true}),
+                serde_json::json!({"draft_id": "done", "base_version": 9, "dry_run": true}),
+                serde_json::json!({"draft_id": "notify", "base_version": 4, "dry_run": true}),
+            ]
+        );
+    }
+
+    /// `--apply` saves, and without `--owner` a sweep covers every draft listed, retired ones
+    /// reported as passed over rather than sent.
+    #[tokio::test]
+    async fn applying_a_sweep_saves_and_reports_retired_drafts_as_skipped() {
+        let (url, seen) = migrate_controller().await;
+        let client = test_client(&url);
+
+        let op = DraftMigrate {
+            json: true,
+            ..sweep(None, true)
+        };
+        let raw: Value =
+            serde_json::from_str(&op.run(&client).await.expect("sweep")).expect("json");
+        assert_eq!(raw["dry_run"], false);
+        assert_eq!(raw["migrated"][0]["draft_id"], "notify");
+        assert_eq!(raw["migrated"][0]["saved"]["version"], 5);
+        assert_eq!(
+            raw["skipped"],
+            serde_json::json!([
+                {"draft_id": "old", "reason": "retired"},
+                {"draft_id": "done", "reason": "already at edition 2"},
+            ])
+        );
+        assert!(
+            seen.lock()
+                .expect("seen")
+                .iter()
+                .all(|r| r["dry_run"] == false && r["draft_id"] != "old"),
+            "{seen:?}"
+        );
+    }
+
+    /// One named draft's refusal is the command's error, not a line in a report.
+    #[tokio::test]
+    async fn one_named_draft_that_is_refused_fails_the_command() {
+        let (url, _seen) = migrate_controller().await;
+        let client = test_client(&url);
+        let op = DraftMigrate {
+            draft_id: Some("broken".to_string()),
+            all: false,
+            owner: None,
+            to: Some(2),
+            dry_run: true,
+            apply: false,
+            json: false,
+        };
+        let error = op.call(&client).await.expect_err("refused");
+        assert!(
+            error.to_string().starts_with(
+                "draft broken: HTTP 422 Unprocessable Entity: crucible.toml does not parse"
+            ),
+            "{error}"
+        );
     }
 }

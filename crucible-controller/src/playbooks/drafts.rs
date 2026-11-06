@@ -950,6 +950,71 @@ pub async fn save_version(
     })
 }
 
+/// One draft version moved to a newer edition: the files it read, what the linked engine made of
+/// them, and the version it stored.
+#[derive(Debug, Clone)]
+pub struct MigratedDraft {
+    pub base: crucible::manifest::migrate::PackFiles,
+    pub migration: crucible::manifest::migrate::Migration,
+    /// `None` on a dry run, and when the draft was already at the target edition.
+    pub saved: Option<SavedVersion>,
+}
+
+/// Migrate draft `id`'s newest save to edition `to` with the linked engine. `base_version` must be
+/// that save: a newer one is refused as [`DraftError::StaleBase`], here and again inside the save
+/// if one lands meanwhile. The result is stored through [`save_version`] unless `dry_run` is set
+/// or nothing changed.
+pub async fn migrate(
+    pool: &PgPool,
+    id: &str,
+    to: crucible::manifest::edition::Edition,
+    base_version: i64,
+    dry_run: bool,
+    actor: Option<&str>,
+) -> Result<MigratedDraft, DraftError> {
+    let head = files(pool, id, None)
+        .await?
+        .ok_or_else(|| DraftError::NotFound(format!("no draft {id:?}")))?;
+    if head.version != base_version {
+        return Err(DraftError::StaleBase(StaleBase {
+            base_version,
+            current_version: head.version,
+            saved_by: head.saved_by,
+            saved_at: head.saved_at,
+        }));
+    }
+    let base =
+        crucible::manifest::migrate::PackFiles::new(crate::playbooks::packs::MANIFEST, head.files)
+            .map_err(|e| DraftError::Invalid(e.to_string()))?;
+    let migration = tokio::task::spawn_blocking({
+        let base = base.clone();
+        move || crucible::manifest::migrate::migrate(&base, to)
+    })
+    .await
+    .context("joining the draft migration worker")
+    .map_err(DraftError::Internal)?
+    .map_err(|e| DraftError::Invalid(e.to_string()))?;
+    let saved = if dry_run || migration.is_noop() {
+        None
+    } else {
+        Some(
+            save_version(
+                pool,
+                id,
+                migration.files.files().clone(),
+                actor,
+                Some(base_version),
+            )
+            .await?,
+        )
+    };
+    Ok(MigratedDraft {
+        base,
+        migration,
+        saved,
+    })
+}
+
 /// Every draft, newest first, each with the state of its newest save.
 pub async fn list(pool: &PgPool) -> Result<Vec<DraftSummary>> {
     let rows = sqlx::query(const_format::formatcp!(

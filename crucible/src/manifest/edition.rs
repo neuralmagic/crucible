@@ -20,6 +20,9 @@ impl Edition {
     /// Every edition this engine runs, oldest first.
     pub const SUPPORTED: [Edition; 2] = [Edition::One, Edition::Two];
 
+    /// The newest edition this engine runs.
+    pub const LATEST: Edition = Edition::SUPPORTED[Edition::SUPPORTED.len() - 1];
+
     pub fn number(self) -> i64 {
         match self {
             Edition::One => 1,
@@ -60,6 +63,16 @@ impl TryFrom<i64> for Edition {
             .find(|known| known.number() == edition)
             .ok_or(UnknownEdition { edition })
     }
+}
+
+/// The edition manifest `text` declares, read without parsing or validating the rest of it.
+pub fn declared(text: &str) -> Result<Edition, toml::de::Error> {
+    #[derive(serde::Deserialize)]
+    struct Declared {
+        #[serde(default)]
+        edition: Edition,
+    }
+    toml::from_str::<Declared>(text).map(|d| d.edition)
 }
 
 /// What `crucible check` and run start say about an edition-1 pack whose host commands inherit
@@ -111,5 +124,20 @@ mod tests {
     fn an_edition_that_is_not_an_integer_is_refused() {
         assert!(parse("edition = \"2\"").is_err());
         assert!(parse("edition = 2.0").is_err());
+    }
+
+    #[test]
+    fn the_declared_edition_reads_past_tables_it_does_not_know() {
+        let text = "edition = 2\n[agent]\ngoal = \"g\"\n[workflow]\nunknown = 1\n";
+        assert_eq!(crate::manifest::edition::declared(text), Ok(Edition::Two));
+        assert_eq!(
+            crate::manifest::edition::declared("[agent]\n"),
+            Ok(Edition::One)
+        );
+        let error = crate::manifest::edition::declared("edition = 9\n").unwrap_err();
+        assert!(
+            error.to_string().contains("edition = 9 is not an edition"),
+            "{error}"
+        );
     }
 }

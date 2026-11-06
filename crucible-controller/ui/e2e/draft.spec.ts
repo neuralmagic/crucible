@@ -497,6 +497,84 @@ test.describe('draft authoring studio', () => {
     await expect(await editor(page)).toContainText("# the agent's edit");
   });
 
+  /// An edition-1 draft says its commands inherit the engine's environment and offers the move:
+  /// the dry run shows the diff and what needs review, and saving it reloads onto the new version,
+  /// where the banner is gone.
+  test('an edition-1 draft previews its migration, then saves it as the next version', async ({
+    page,
+  }) => {
+    await stubApi(page);
+    const stored = ROUTES['/api/playbook-drafts/studio/files'];
+    if (typeof stored !== 'object' || stored === null || Array.isArray(stored)) {
+      throw new Error('the files fixture is an object');
+    }
+    let head = { ...stored, edition: 1 };
+    const sent: unknown[] = [];
+    await page.route('**/api/playbook-drafts/studio/files*', (route: Route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(head) }),
+    );
+    await page.route('**/api/playbook-drafts/studio/migrate', (route: Route) => {
+      const body: unknown = route.request().postDataJSON();
+      sent.push(body);
+      const dryRun = typeof body === 'object' && body !== null && 'dry_run' in body && body.dry_run === true;
+      if (!dryRun) head = { ...stored, version: 2, edition: 2 };
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          from: 1,
+          to: 2,
+          base_version: 1,
+          dry_run: dryRun,
+          diffs: [
+            {
+              path: 'crucible.toml',
+              unified:
+                '--- a/crucible.toml\n+++ b/crucible.toml\n@@ -1,2 +1,4 @@\n+edition = 2\n+\n [workflow]\n type = "playbook"\n+env = ["SLACK_WEBHOOK_URL?"]\n',
+            },
+          ],
+          changes: [
+            { kind: 'edition', table: null, entry: null, read_at: [], message: 'edition = 2 (was 1)' },
+            {
+              kind: 'declared',
+              table: '[workflow]',
+              entry: 'SLACK_WEBHOOK_URL?',
+              read_at: ['scripts/notify.py:3'],
+              message: '[workflow].env declares "SLACK_WEBHOOK_URL?", read at scripts/notify.py:3',
+            },
+          ],
+          findings: [
+            {
+              kind: 'unattributed_reads',
+              path: 'tools/backfill.py',
+              message:
+                "tools/backfill.py reads BACKFILL_SINCE, and no host command was found to run it; if one does, declare them in that command's table",
+            },
+          ],
+          saved: dryRun ? null : { ...REFUSED, diagnostics: [], dispatch: null },
+        }),
+      });
+    });
+    await ready(page, STUDIO);
+
+    const section = page.getByTestId('draft-migrate');
+    await expect(page.getByText("inherit the engine's whole environment")).toBeVisible();
+    await section.getByRole('button', { name: 'Migrate to edition 2' }).click();
+
+    const preview = page.getByTestId('draft-migrate-preview');
+    await expect(preview).toContainText('edition 1 → 2, 1 variable declared, 1 finding to review');
+    await expect(page.getByTestId('draft-migrate-diff')).toContainText('+env = ["SLACK_WEBHOOK_URL?"]');
+    await expect(page.getByTestId('draft-migrate-changes')).toContainText('read at scripts/notify.py:3');
+    await expect(page.getByTestId('draft-migrate-findings')).toContainText('unattributed');
+
+    await preview.getByRole('button', { name: 'Save as v2' }).click();
+    await expect(section).toHaveCount(0);
+    expect(sent).toEqual([
+      { base_version: 1, dry_run: true },
+      { base_version: 1, dry_run: false },
+    ]);
+  });
+
   /// A launch is refused until what is on screen is what was compiled.
   test('an unsaved buffer cannot be test-fired', async ({ page }) => {
     await stubApi(page);

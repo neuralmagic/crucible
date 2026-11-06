@@ -32,6 +32,14 @@ pub const INVALID_VERDICT_EXIT: u8 = 3;
 /// reach.
 pub const TASK_NAME_ENV: &str = "CRUCIBLE_TASK";
 
+/// Upstream results as JSON, set by the command runner only while they fit its bound.
+pub const INPUTS_ENV: &str = "CRUCIBLE_INPUTS";
+/// Path to a file holding the same JSON, always set by the command runner.
+pub const INPUTS_FILE_ENV: &str = "CRUCIBLE_INPUTS_FILE";
+/// The run's buildit socket, set for command and evaluate tasks alone; `buildit` calls the server
+/// there.
+pub const BUILDIT_SOCKET_ENV: &str = "CRUCIBLE_BUILDIT_SOCKET";
+
 /// Where a consumer finds what its ancestors declared. Under the workspace so a task reaches it
 /// with a relative path, and named so it is obviously not the task's own work.
 pub const STAGED_INPUTS: &str = "inputs";

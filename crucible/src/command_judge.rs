@@ -63,13 +63,13 @@ impl CommandJudge {
             .current_dir(&self.workspace);
         self.env.apply(&mut c);
         if let Some(s) = ctx.baseline_score {
-            c.env("CRUCIBLE_BASELINE_SCORE", s.to_string());
+            c.env(crate::host_env::BASELINE_SCORE, s.to_string());
         }
         if let Some(t) = ctx.baseline_total {
-            c.env("CRUCIBLE_BASELINE_TOTAL", t.to_string());
+            c.env(crate::host_env::BASELINE_TOTAL, t.to_string());
         }
         if let Some(b) = ctx.best_score {
-            c.env("CRUCIBLE_BEST_SCORE", b.to_string());
+            c.env(crate::host_env::BEST_SCORE, b.to_string());
         }
         let out = c
             .output()
@@ -214,7 +214,7 @@ mod tests {
         let judge = CommandJudge {
             workspace: std::env::temp_dir(),
             measure_cmd: r#"test -z "$CRUCIBLE_TEST_UNDECLARED" && test "$CRUCIBLE_TEST_DECLARED" = passed && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
-            env: crate::host_env::HostEnv::resolve(crate::manifest::edition::Edition::Two, "[judge]", &declared).unwrap(),
+            env: crate::host_env::HostEnv::resolve(crate::manifest::edition::Edition::Two, crate::host_env::HostTable::Judge, &declared).unwrap(),
             ..judge(Direction::Higher)
         };
         let reading = judge.measure(&MeasureCtx {
@@ -242,7 +242,7 @@ mod tests {
             measure_cmd: r#"test "$CRUCIBLE_TEST_INHERITED" = kept && echo "{\"valid\": true, \"score\": $CRUCIBLE_BEST_SCORE}""#.into(),
             env: crate::host_env::HostEnv::resolve(
                 crate::manifest::edition::Edition::One,
-                "[judge]",
+                crate::host_env::HostTable::Judge,
                 &crate::host_env::DeclaredEnv::default(),
             )
             .unwrap(),
@@ -275,7 +275,7 @@ mod tests {
         .unwrap();
         let env = crate::host_env::HostEnv::resolve(
             crate::manifest::edition::Edition::Two,
-            "[judge]",
+            crate::host_env::HostTable::Judge,
             &declared,
         );
         unsafe {

@@ -1937,6 +1937,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "similar",
  "starlark",
  "starlark_syntax",
  "tar",

@@ -162,7 +162,7 @@ times would otherwise print twelve copies of the same verdict. `(any)` means the
 *one* dependency passes, so a red dependency above it is not necessarily what is blocking it.
 `--mermaid` emits a flowchart.
 
-### Drafts: `draft-create` / `draft-pull` / `draft-push` / `draft-preview` / `draft-launch` / `draft-graduate` / `draft-rename` / `draft-clone` / `draft-delete`
+### Drafts: `draft-create` / `draft-pull` / `draft-push` / `draft-preview` / `draft-launch` / `draft-graduate` / `draft-rename` / `draft-clone` / `draft-migrate` / `draft-delete`
 
 ```
 $ crux draft-create calibrate --description "EPP calibration sweep"   # version 1, a skeleton
@@ -173,6 +173,8 @@ $ crux draft-launch calibrate --params '{"repo":"o/n"}' --max-cost 4 --max-time 
 $ crux draft-graduate calibrate --repo wren/packs --path packs/calibrate
 $ crux draft-rename calibrate epp-sweep                                # bindings and runs follow
 $ crux draft-clone epp-sweep epp-sweep-gpu                            # newest save, same origin
+$ crux draft-migrate epp-sweep                                        # dry run: diff + findings
+$ crux draft-migrate --all --owner user:wren --apply                  # save each as a new version
 ```
 
 A push carries the version it edited from, and a save that another editor overtook comes back as
@@ -183,6 +185,12 @@ directory's `tree1:` digest.
 A rename moves the draft's saves, secret bindings, shares, schedules and launches to the new id. A
 clone copies only the bindings you could make yourself and lists the rest; a reference-mode secret
 needs your Vault token, which `crux` never sends, so bind those from the UI.
+`draft-migrate` moves a draft to a newer pack edition with the controller's engine
+([ADR-0072](../docs/adr/ADR-0072.md)). It is a dry run unless `--apply` is given: each draft's
+diff, the variables it declares (optional, with where each is read), and what needs review. With
+`--apply` each migration is saved as the draft's next version, against the version just read.
+`--all` covers every draft you may read, passes over retired ones and ones already at the
+edition, and reports a refusal without stopping; `--owner` narrows it to one owner's drafts.
 `skills/draft-a-playbook/SKILL.md` is the full authoring workflow.
 
 ### Blueprints: `blueprints` / `blueprint-use` / `blueprint-mark` / `blueprint-unmark` / `blueprint-public` / `blueprint-private`

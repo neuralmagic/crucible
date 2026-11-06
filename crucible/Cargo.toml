@@ -45,6 +45,8 @@ regex-syntax = "0.8"
 # sandboxed [agent] backend); the deserialize-only `Manifest` can't round-trip, so a targeted edit
 # keeps the agent's authored comments. Already in the tree as `toml`'s own backing crate.
 toml_edit = "0.25"
+# Unified diffs of what `crucible migrate` rewrites. Already in the tree through insta.
+similar = "2.7"
 # The workflow DSL frontend: the starlark evaluator runs `workflow.star` against a
 # constructor-only global surface, and starlark_syntax supplies the AST pre-pass and
 # the FileSpan the compile errors carry.

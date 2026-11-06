@@ -3423,6 +3423,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/origin/files",
         "/api/playbook-drafts/{id}/tarball",
         "/api/playbook-drafts/{id}/versions",
+        "/api/playbook-drafts/{id}/migrate",
         "/api/playbook-drafts/{id}/rename",
         "/api/playbook-drafts/{id}/clone",
         "/api/playbook-drafts/{id}/launch",
@@ -8914,6 +8915,218 @@ async fn a_stale_base_is_refused_with_the_version_that_overtook_it(pool: PgPool)
         ],
         "the history interleaves the human's saves with the agent's"
     );
+    Ok(())
+}
+
+/// An edition-1 draft whose one command runs a script that reads a variable the run's declared
+/// secret delivers.
+fn edition_one_files() -> serde_json::Value {
+    serde_json::json!({
+        "crucible.toml": "# Post the verdict to Slack.\n[workspace]\ninject = [\"scripts\"]\n\n[agent]\n\n[[secret]]\nname = \"slack\"\nkind = \"opaque\"\nenv = \"SLACK_WEBHOOK_URL\"\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n",
+        "workflow.star": "params = {}\nnotify = command(name = \"notify\", run = \"python3 scripts/notify.py\")\nworkflow(type = \"playbook\", tasks = [notify], result = notify)\n",
+        "scripts/notify.py": "import os\n\nhook = os.environ[\"SLACK_WEBHOOK_URL\"]\nprint(hook)\n",
+    })
+}
+
+/// A draft `studio` whose newest save, version 2, is [`edition_one_files`].
+async fn edition_one_draft(app: &Router) {
+    let (status, body) = post_admin(
+        app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "posts the verdict"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = post_admin(
+        app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": edition_one_files(), "base_version": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["version"], 2);
+}
+
+async fn migrated_events(pool: &PgPool) -> Vec<(String, Option<String>, Option<String>)> {
+    sqlx::query_as(
+        "SELECT to_status, reason, actor FROM events WHERE key = 'draft:studio' AND to_status = \
+         'migrated' ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("events")
+}
+
+/// The studio's preview: the diff, each declaration with where it is read, and nothing stored.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_dry_run_migration_answers_the_diff_and_stores_nothing(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    edition_one_draft(&app).await;
+
+    let (status, files) = get_json_object(&app, "/api/playbook-drafts/studio/files").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(files["edition"], 1);
+
+    let (status, dry) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/migrate",
+        serde_json::json!({"base_version": 2, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{dry}");
+    assert_eq!(dry["from"], 1);
+    assert_eq!(dry["to"], 2);
+    assert_eq!(dry["base_version"], 2);
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["saved"], serde_json::Value::Null);
+    assert_eq!(dry["diffs"].as_array().map(Vec::len), Some(1), "{dry}");
+    assert_eq!(dry["diffs"][0]["path"], "crucible.toml");
+    let unified = dry["diffs"][0]["unified"].as_str().expect("unified");
+    assert!(
+        unified.starts_with("--- a/crucible.toml\n+++ b/crucible.toml\n"),
+        "{unified}"
+    );
+    assert!(unified.contains("\n+edition = 2\n"), "{unified}");
+    assert!(
+        unified.contains("\n+env = [\"SLACK_WEBHOOK_URL?\"]\n"),
+        "{unified}"
+    );
+    assert_eq!(
+        dry["changes"],
+        serde_json::json!([
+            {
+                "kind": "edition",
+                "table": null,
+                "entry": null,
+                "read_at": [],
+                "message": "edition = 2 (was 1)",
+            },
+            {
+                "kind": "declared",
+                "table": "[workflow]",
+                "entry": "SLACK_WEBHOOK_URL?",
+                "read_at": ["scripts/notify.py:3"],
+                "message": "[workflow].env declares \"SLACK_WEBHOOK_URL?\", read at scripts/notify.py:3",
+            },
+        ])
+    );
+    assert_eq!(dry["findings"], serde_json::json!([]));
+
+    let (_, detail) = get_json_object(&app, "/api/playbook-drafts/studio").await;
+    assert_eq!(detail["versions"].as_array().map(Vec::len), Some(2));
+    let (_, head) = get_json_object(&app, "/api/playbook-drafts/studio/files").await;
+    assert_eq!(head["version"], 2);
+    assert_eq!(head["files"], edition_one_files());
+    assert!(migrated_events(&pool).await.is_empty());
+    Ok(())
+}
+
+/// Applying saves the migrated files as the next version, through the same save the editor uses,
+/// attributed to the caller and audited; migrating the result again stores nothing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn applying_a_migration_saves_the_next_version_as_the_caller(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string(), "author".to_string()]);
+    edition_one_draft(&app).await;
+
+    let (status, applied) = post_json_as(
+        &app,
+        "/api/playbook-drafts/studio/migrate",
+        "author",
+        serde_json::json!({"to": 2, "base_version": 2, "dry_run": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{applied}");
+    assert_eq!(applied["dry_run"], false);
+    assert_eq!(applied["saved"]["version"], 3);
+    assert_eq!(applied["saved"]["saved_by"], "author");
+    assert_eq!(
+        applied["saved"]["diagnostics"],
+        serde_json::json!([]),
+        "{applied}"
+    );
+
+    let (_, head) = get_json_object(&app, "/api/playbook-drafts/studio/files").await;
+    assert_eq!(head["version"], 3);
+    assert_eq!(head["edition"], 2);
+    assert_eq!(head["saved_by"], "author");
+    let manifest = head["files"]["crucible.toml"].as_str().expect("manifest");
+    assert!(
+        manifest.starts_with("edition = 2\n\n# Post the verdict to Slack.\n[workspace]\n"),
+        "{manifest}"
+    );
+    assert!(
+        manifest.ends_with("file = \"workflow.star\"\nenv = [\"SLACK_WEBHOOK_URL?\"]\n"),
+        "{manifest}"
+    );
+    assert_eq!(
+        head["files"]["scripts/notify.py"],
+        edition_one_files()["scripts/notify.py"]
+    );
+    assert_eq!(
+        migrated_events(&pool).await,
+        vec![(
+            "migrated".to_string(),
+            Some("migrated to edition 2 as version 3".to_string()),
+            Some("author".to_string()),
+        )]
+    );
+
+    let (status, again) = post_json_as(
+        &app,
+        "/api/playbook-drafts/studio/migrate",
+        "author",
+        serde_json::json!({"base_version": 3, "dry_run": false}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["from"], 2);
+    assert_eq!(again["changes"], serde_json::json!([]));
+    assert_eq!(again["diffs"], serde_json::json!([]));
+    assert_eq!(again["saved"], serde_json::Value::Null);
+    let (_, detail) = get_json_object(&app, "/api/playbook-drafts/studio").await;
+    assert_eq!(detail["versions"].as_array().map(Vec::len), Some(3));
+    assert_eq!(migrated_events(&pool).await.len(), 1);
+    Ok(())
+}
+
+/// A migration against a version another save overtook is the save's own conflict, carrying who
+/// overtook it, and stores nothing; an edition the engine does not run is refused before any read.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_stale_base_or_an_unknown_edition_refuses_the_migration(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    edition_one_draft(&app).await;
+
+    for dry_run in [true, false] {
+        let (status, stale) = post_admin(
+            &app,
+            "/api/playbook-drafts/studio/migrate",
+            serde_json::json!({"base_version": 1, "dry_run": dry_run}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+        assert_eq!(stale["base_version"], 1);
+        assert_eq!(stale["current_version"], 2);
+        assert_eq!(stale["saved_by"], "wren");
+    }
+
+    let (status, unknown) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/migrate",
+        serde_json::json!({"to": 3, "base_version": 2, "dry_run": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{unknown}");
+    assert_eq!(
+        unknown["error"],
+        "edition = 3 is not an edition this engine supports; it supports 1 and 2"
+    );
+
+    let (_, detail) = get_json_object(&app, "/api/playbook-drafts/studio").await;
+    assert_eq!(detail["versions"].as_array().map(Vec::len), Some(2));
+    assert!(migrated_events(&pool).await.is_empty());
     Ok(())
 }
 

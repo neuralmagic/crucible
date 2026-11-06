@@ -5,7 +5,7 @@
 //! content executes, so `crucible check` and `crucible plan exposure` can print a pack's reach
 //! before anything of the pack has run.
 
-use crate::host_env::DeclaredEnv;
+use crate::host_env::{DeclaredEnv, HostTable};
 use crate::manifest::edition::Edition;
 use crate::manifest::{CapabilitiesCfg, CredentialContext, Manifest};
 use crate::openshell::gateway::ComputeDriver;
@@ -332,7 +332,7 @@ pub fn inherits_engine_env(m: &Manifest) -> bool {
 
 /// Each manifest table that can run commands outside the sandbox, with what it declares for
 /// them and whether it runs any.
-fn host_tables(m: &Manifest) -> impl Iterator<Item = (&'static str, Option<&DeclaredEnv>, bool)> {
+fn host_tables(m: &Manifest) -> impl Iterator<Item = (HostTable, Option<&DeclaredEnv>, bool)> {
     let world = [
         m.world.apply_cmd.as_ref(),
         m.world.snapshot_cmd.as_ref(),
@@ -340,19 +340,19 @@ fn host_tables(m: &Manifest) -> impl Iterator<Item = (&'static str, Option<&Decl
     ];
     [
         (
-            "[judge]",
+            HostTable::Judge,
             m.judge.as_ref().map(|j| &j.env),
             m.judge
                 .as_ref()
                 .is_some_and(|j| !j.measure_cmd.trim().is_empty()),
         ),
         (
-            "[world]",
+            HostTable::World,
             Some(&m.world.env),
             world.into_iter().flatten().any(|c| !c.trim().is_empty()),
         ),
         (
-            "[workflow]",
+            HostTable::Workflow,
             m.workflow.as_ref().map(|w| &w.env),
             m.workflow
                 .as_ref()
@@ -384,7 +384,7 @@ fn host_env(m: &Manifest) -> impl Iterator<Item = Capability> + '_ {
             }
         };
         Some(Capability::HostEnv {
-            table: table.to_owned(),
+            table: table.to_string(),
             reach,
         })
     })
