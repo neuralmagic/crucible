@@ -1436,12 +1436,46 @@ impl Broker {
             _ => return Ok(()),
         };
         let name = meta.name.clone().unwrap_or_default();
-        let Some(pod) = self.pod_of(&name).await? else {
+        let pod = self.pod_of(&name).await?;
+        self.record_end(&sandbox, &build, log, job, pod.as_ref())
+            .await?;
+        let Some(pod) = pod else {
             return Ok(());
         };
         let text = self.pod_log(&pod, log).await?;
         self.keep(&self.log_file(&sandbox, &build, log), &text)
             .await
+    }
+
+    /// Archives an ended step's exit record when its pod left none, as one killed before it
+    /// wrote it does, so the step's end outlives its Job.
+    async fn record_end(
+        &self,
+        sandbox: &SandboxName,
+        id: &BuildId,
+        log: LogName,
+        job: &Job,
+        pod: Option<&Pod>,
+    ) -> Result<()> {
+        let key = format!(
+            "{}/{}",
+            jobs::archive_prefix(sandbox.as_str(), id.as_str()),
+            exit_file(log)
+        );
+        if self.has_blob(&key).await? {
+            return Ok(());
+        }
+        let jobs::Observed::Ended { state, .. } = jobs::observe(job, pod, main_container(log))
+        else {
+            return Ok(());
+        };
+        match state.to_record() {
+            Some(record) => {
+                self.put_blob(&key, format!("{record}\n").into_bytes())
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     /// Writes `text` to the log `file` when it holds more than the file does.
@@ -1538,10 +1572,6 @@ impl Broker {
     ) -> Result<Option<Seen>> {
         let prefix = jobs::archive_prefix(sandbox.as_str(), id.as_str());
         let Some(job) = self.step_job(sandbox, id, log).await? else {
-            let cancelled = self.log_file(sandbox, id, log).with_extension("cancelled");
-            if cancelled.exists() {
-                return Ok(Some(Seen::ended(step::State::Cancelled, None, None)));
-            }
             let Some(raw) = self.blob(&format!("{prefix}/{}", exit_file(log))).await? else {
                 return Ok(None);
             };
@@ -1849,11 +1879,18 @@ impl Broker {
         .await?;
         let ended = self.wait_ended(&name, PUSH_TIMEOUT).await;
         let pod = self.pod_of(&name).await.ok().flatten();
+        let tail = match &pod {
+            Some(pod) => match self.pod_log(pod, LogName::Build).await {
+                Ok(text) => summary(&Log::last(text.into_bytes(), SUMMARY_WINDOW)),
+                Err(e) => format!("{e:#}"),
+            },
+            None => String::new(),
+        };
         let _ = self
             .jobs_api()
             .delete(&name, &DeleteParams::background())
             .await;
-        let job = ended?;
+        let job = ended.with_context(|| format!("pushing build {} to {tag}: {tail}", id.0))?;
         let digest = match jobs::observe(&job, pod.as_ref(), jobs::BUILDER) {
             jobs::Observed::Ended {
                 state: step::State::Exited { code: 0, .. },
@@ -1864,13 +1901,7 @@ impl Broker {
         let digest = digest
             .map(|d| d.trim().to_string())
             .filter(|d| d.starts_with("sha256:"))
-            .ok_or_else(|| {
-                anyhow!(
-                    "pushing build {} to {tag} failed: {}",
-                    id.0,
-                    terminated_message(pod.as_ref(), jobs::BUILDER).unwrap_or_default()
-                )
-            })?;
+            .ok_or_else(|| anyhow!("pushing build {} to {tag} failed:\n{tail}", id.0))?;
         tracing::info!(sandbox = caller.sandbox.as_str(), build = id.0, %tag, digest, "pushed");
         Ok(PushReply {
             build_id: id.0,
@@ -2032,7 +2063,10 @@ impl Broker {
             .max()
             .unwrap_or(0)
             + 1;
-        while self.log_file(sandbox, id, LogName::Run(n)).exists() {
+        let prefix = jobs::archive_prefix(sandbox.as_str(), id.as_str());
+        while self.log_file(sandbox, id, LogName::Run(n)).exists()
+            || self.has_blob(&format!("{prefix}/run-{n}.exit")).await?
+        {
             n += 1;
         }
         Ok(n)
@@ -2209,13 +2243,12 @@ impl Broker {
         };
         let name = job.metadata.name.clone().unwrap_or_default();
         if job.spec.as_ref().and_then(|s| s.suspend) == Some(true) {
-            let marker = self
-                .log_file(&caller.sandbox, &t.build, t.log)
-                .with_extension("cancelled");
-            if let Some(dir) = marker.parent() {
-                tokio::fs::create_dir_all(dir).await?;
-            }
-            tokio::fs::write(&marker, b"").await?;
+            let key = format!(
+                "{}/{}",
+                jobs::archive_prefix(caller.sandbox.as_str(), t.build.as_str()),
+                exit_file(t.log)
+            );
+            self.put_blob(&key, b"cancelled\n".to_vec()).await?;
             self.jobs_api()
                 .delete(&name, &DeleteParams::background())
                 .await
@@ -3802,6 +3835,30 @@ mod tests {
         assert!(
             !refused_by_admission(&by_tag).is_empty(),
             "a run's image goes by digest"
+        );
+        let run_reads_the_token = {
+            let mut p = run.clone();
+            p["spec"]["containers"][0]["volumeMounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name": "archive-auth", "mountPath": "/t"}));
+            p
+        };
+        assert!(
+            !refused_by_admission(&run_reads_the_token).is_empty(),
+            "a run never mounts the write token"
+        );
+        let fetch_reads_the_account = {
+            let mut p = pod.clone();
+            p["spec"]["initContainers"][0]["volumeMounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name": "cluster", "mountPath": "/t"}));
+            p
+        };
+        assert!(
+            !refused_by_admission(&fetch_reads_the_account).is_empty(),
+            "nor does the fetch mount the account's token"
         );
         let mut injected = pod.clone();
         injected["spec"]["imagePullSecrets"] =

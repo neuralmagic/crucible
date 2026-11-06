@@ -24,6 +24,7 @@ use std::collections::BTreeMap;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1 as core;
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 
 use crate::backend::{Resources, StorageDriver};
@@ -46,7 +47,14 @@ const INPUTS: &str = "/buildit-inputs";
 const ARCHIVE_AUTH: &str = "/buildit-archive";
 const CLUSTER: &str = "/buildit-cluster";
 const STORAGE: &str = "/home/build/.local/share/containers";
-const GRACE_SECS: i64 = 300;
+/// What a pod may leave for the archive: facts, a run's log and the fetched paths `buildit mcp`
+/// takes up to `step::FETCH_LIMIT` of.
+const OUT_LIMIT: &str = "2Gi";
+const FACTS_LIMIT: &str = "256Mi";
+const TOOLS_LIMIT: &str = "64Mi";
+/// Time the archive sidecar has to upload once the main container exits; each upload takes at
+/// most 120s.
+const GRACE_SECS: i64 = 600;
 
 /// What a Job does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,17 +173,21 @@ cp /busybox/busybox /buildit-tools/
 mkdir -p /buildit-out/facts
 if wget -qO /tmp/facts.tar "$CACHE/$PREFIX/facts.tar"; then tar -xf /tmp/facts.tar -C /buildit-out/facts; fi"#;
 
-/// The archive sidecar: waits for SIGTERM, then uploads what the pod left in /buildit-out, the exit
-/// record last. Arguments: the exit record's file, then the other files.
-const ARCHIVE: &str = r#"exitf=$1; shift
+/// The archive sidecar: waits for SIGTERM, then uploads what the pod left in /buildit-out, each
+/// upload bounded so all of them fit the grace period. An upload that fails is noted in the
+/// error file, which goes up after the others; the exit record goes up last. Arguments: the exit
+/// record's file, the error file, then the other files.
+const ARCHIVE: &str = r#"exitf=$1; errf=$2; shift 2
 up() {
   [ -e "/buildit-out/$1" ] || return 0
-  curl -fsS --retry 3 -o /dev/null -H @/buildit-archive/archive.auth -T "/buildit-out/$1" "$CACHE/$PREFIX/$1" \
-    || echo "archive: uploading $1 failed" >&2
+  curl -fsS --retry 2 --max-time 120 -o /dev/null -H @/buildit-archive/archive.auth \
+    -T "/buildit-out/$1" "$CACHE/$PREFIX/$1" \
+    || { echo "uploading $1 to the shared cache failed" | tee -a "/buildit-out/$errf" >&2; return 1; }
 }
 finish() {
   if [ -d /buildit-out/facts ] && [ -n "$(ls -A /buildit-out/facts)" ]; then tar -cf /buildit-out/facts.tar -C /buildit-out/facts .; fi
   for f in "$@"; do up "$f"; done
+  up "$errf"
   up "$exitf"
   exit 0
 }
@@ -220,13 +232,15 @@ printf '%s\n' "$rec" > /buildit-out/build.exit
 { printf '%s\n' "$rec"; cat /buildit-out/image 2> /dev/null; } > /dev/termination-log"#;
 
 /// A run: the command under a timeout with its output mirrored to the log, then the fetch_paths
-/// as a tar, and the exit record as the termination message. Arguments: the timeout, the run
-/// number, the paths, `--`, then the command.
-const RUN: &str = r#"B=/buildit-tools/busybox; secs=$1; n=$2; shift 2
+/// that exist as a tar, and the exit record as the termination message. Arguments: the timeout,
+/// the run number, the number of paths, the paths, then the command.
+const RUN: &str = r#"B=/buildit-tools/busybox; secs=$1; n=$2; np=$3; shift 3
 trap '$B kill -TERM -1 2> /dev/null; exit 143' TERM
-paths=
-while [ "$#" -gt 0 ] && [ "$1" != -- ]; do paths="$paths $1"; shift; done
-shift
+: > /tmp/buildit-paths
+while [ "$np" -gt 0 ]; do
+  if [ -e "/$1" ]; then printf '%s\n' "$1" >> /tmp/buildit-paths; fi
+  shift; np=$((np - 1))
+done
 log=/buildit-out/run-$n.log
 s=$($B date +%s)
 (set -o pipefail; $B timeout -s KILL "$secs" "$@" 2>&1 | $B tee "$log") &
@@ -234,10 +248,9 @@ wait $!
 c=$?
 t=
 if [ "$c" -ne 0 ] && [ $(($($B date +%s) - s)) -ge "$secs" ]; then c=124; t=" timeout"; fi
-kept=
-for p in $paths; do if [ -e "/$p" ]; then kept="$kept $p"; fi; done
-if [ -n "$kept" ]; then
-  (cd / && $B tar -cf "/buildit-out/run-$n.tar" $kept) 2> "/buildit-out/run-$n.fetch-err" || $B rm -f "/buildit-out/run-$n.tar"
+if [ -s /tmp/buildit-paths ]; then
+  (cd / && $B tar -cf "/buildit-out/run-$n.tar" -T /tmp/buildit-paths) 2> "/buildit-out/run-$n.fetch-err" \
+    || $B rm -f "/buildit-out/run-$n.tar"
 fi
 printf '%s%s\n' "$c" "$t" > "/buildit-out/run-$n.exit"
 $B cat "/buildit-out/run-$n.exit" > /dev/termination-log"#;
@@ -305,10 +318,16 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
         volume_mounts: Some(vec![mount("workspace", WORKSPACE, false)]),
         ..Default::default()
     };
-    let archive = archive(site, id, "build.exit", &["facts.tar", "image"]);
+    let archive = archive(
+        site,
+        id,
+        "build.exit",
+        "build.archive-err",
+        &["facts.tar", "image"],
+    );
     let mut volumes = vec![
         empty_dir("workspace"),
-        empty_dir("out"),
+        limited_dir("out", OUT_LIMIT),
         empty_dir("storage"),
         inputs_volume(
             id.name,
@@ -339,9 +358,9 @@ pub fn run_job(site: &Site, id: &Ident<'_>, r: &RunJob<'_>) -> Job {
         "sh".to_string(),
         r.limit_secs.to_string(),
         r.n.to_string(),
+        r.fetch_paths.len().to_string(),
     ]);
     command.extend(r.fetch_paths.iter().cloned());
-    command.push("--".to_string());
     command.extend(r.cmd.iter().cloned());
     let main = core::Container {
         name: RUN_CONTAINER.to_string(),
@@ -374,12 +393,13 @@ pub fn run_job(site: &Site, id: &Ident<'_>, r: &RunJob<'_>) -> Job {
         site,
         id,
         &format!("run-{n}.exit"),
-        &[&format!("run-{n}.tar"), &format!("run-{n}.fetch-err")],
+        &format!("run-{n}.fetch-err"),
+        &[&format!("run-{n}.tar")],
     );
     let volumes = vec![
-        empty_dir("out"),
-        empty_dir("facts"),
-        empty_dir("tools"),
+        limited_dir("out", OUT_LIMIT),
+        limited_dir("facts", FACTS_LIMIT),
+        limited_dir("tools", TOOLS_LIMIT),
         archive_volume(id.name),
     ];
     let mut job = job(
@@ -593,10 +613,17 @@ fn job(
     }
 }
 
-fn archive(site: &Site, id: &Ident<'_>, exit: &str, files: &[&str]) -> core::Container {
+fn archive(
+    site: &Site,
+    id: &Ident<'_>,
+    exit: &str,
+    errors: &str,
+    files: &[&str],
+) -> core::Container {
     let mut command = vec!["sh".to_string(), "-c".to_string(), ARCHIVE.to_string()];
     command.push("sh".to_string());
     command.push(exit.to_string());
+    command.push(errors.to_string());
     command.extend(files.iter().map(|f| f.to_string()));
     core::Container {
         name: "archive".to_string(),
@@ -718,6 +745,17 @@ fn mount(name: &str, path: &str, read_only: bool) -> core::VolumeMount {
     }
 }
 
+fn limited_dir(name: &str, limit: &str) -> core::Volume {
+    core::Volume {
+        name: name.to_string(),
+        empty_dir: Some(core::EmptyDirVolumeSource {
+            size_limit: Some(Quantity(limit.to_string())),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 fn empty_dir(name: &str) -> core::Volume {
     core::Volume {
         name: name.to_string(),
@@ -813,7 +851,7 @@ mod tests {
         let pod = &spec["template"]["spec"];
         assert_eq!(pod["hostUsers"], false);
         assert_eq!(pod["automountServiceAccountToken"], false);
-        assert_eq!(pod["terminationGracePeriodSeconds"], 300);
+        assert_eq!(pod["terminationGracePeriodSeconds"], 600);
         assert_eq!(pod["nodeSelector"]["kubernetes.io/arch"], "amd64");
         assert_eq!(
             spec["template"]["metadata"]["labels"]["buildit.dev/kind"], "build",
@@ -839,7 +877,10 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(tail, ["build.exit", "facts.tar", "image"]);
+        assert_eq!(
+            tail,
+            ["build.exit", "build.archive-err", "facts.tar", "image"]
+        );
         assert_eq!(
             archive["volumeMounts"][1]["mountPath"], "/buildit-archive",
             "the write token is the archive's alone"
@@ -914,7 +955,7 @@ mod tests {
         ))
         .unwrap();
         assert!(plain["spec"].get("suspend").is_none());
-        assert_eq!(plain["spec"]["activeDeadlineSeconds"], 660);
+        assert_eq!(plain["spec"]["activeDeadlineSeconds"], 1260);
         assert!(
             !plain["spec"]["template"]["spec"]["volumes"]
                 .as_array()
@@ -959,7 +1000,7 @@ mod tests {
         assert_eq!(&command[..3], ["/buildit-tools/busybox", "sh", "-c"]);
         assert_eq!(
             &command[4..],
-            ["sh", "600", "3", "out/a.txt", "--", "sh", "-c", "make test"]
+            ["sh", "600", "3", "1", "out/a.txt", "sh", "-c", "make test"]
         );
         assert_eq!(run["volumeMounts"][1]["mountPath"], "/buildit");
         assert_eq!(run["volumeMounts"][1]["readOnly"], true);
@@ -968,7 +1009,8 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(tail, ["run-3.exit", "run-3.tar", "run-3.fetch-err"]);
+        assert_eq!(tail, ["run-3.exit", "run-3.fetch-err", "run-3.tar"]);
+        assert_eq!(pod["volumes"][0]["emptyDir"]["sizeLimit"], "2Gi");
         assert!(
             !pod["volumes"]
                 .as_array()

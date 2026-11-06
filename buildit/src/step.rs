@@ -134,10 +134,13 @@ pub enum State {
 }
 
 impl State {
-    // `<exit code>[ timeout]` or `cancelled`, as the runner and CANCEL write it
+    /// `<exit code>[ timeout]`, as the runner and a run write it, or `cancelled`, `expired` or
+    /// `lost`, as `buildit mcp` records a step that ended without writing one.
     pub fn record(raw: &str) -> Option<Self> {
         let (code, timed_out) = match raw.split_whitespace().collect::<Vec<_>>()[..] {
             ["cancelled"] => return Some(Self::Cancelled),
+            ["expired"] => return Some(Self::Expired),
+            ["lost"] => return Some(Self::Lost),
             [code] => (code, false),
             [code, "timeout"] => (code, true),
             _ => return None,
@@ -145,6 +148,19 @@ impl State {
         Some(Self::Exited {
             code: code.parse().ok()?,
             timed_out,
+        })
+    }
+
+    /// The exit record [`State::record`] reads back; None while the step runs.
+    pub fn to_record(self) -> Option<String> {
+        Some(match self {
+            Self::Running => return None,
+            Self::Exited { code, timed_out } => {
+                format!("{code}{}", if timed_out { " timeout" } else { "" })
+            }
+            Self::Cancelled => "cancelled".to_string(),
+            Self::Expired => "expired".to_string(),
+            Self::Lost => "lost".to_string(),
         })
     }
 
@@ -293,6 +309,20 @@ mod tests {
         ] {
             assert_eq!(State::record(bad), None, "{bad:?}");
         }
+        for state in [
+            exited(0, false),
+            exited(124, true),
+            State::Cancelled,
+            State::Expired,
+            State::Lost,
+        ] {
+            assert_eq!(
+                State::record(&state.to_record().unwrap()),
+                Some(state),
+                "{state:?}"
+            );
+        }
+        assert_eq!(State::Running.to_record(), None);
         assert_eq!(State::Running.status(), Status::Running);
         assert_eq!(State::Lost.status(), Status::Failed);
         assert_eq!(State::Expired.status(), Status::Failed);

@@ -133,6 +133,13 @@ spec:
         a pod here mounts emptyDir volumes, its build's inputs Secret, and the account's token
         and the service CA alone
     - expression: >-
+        variables.all.filter(c, c.name in ['run', 'fetch']).all(c, !has(c.volumeMounts) ||
+        c.volumeMounts.all(m, has(object.spec.volumes) &&
+        object.spec.volumes.exists(v, v.name == m.name && has(v.emptyDir))))
+      message: >-
+        a pod here mounts its inputs Secret and the account's token only in the builder and the
+        archive, never in a run or the fetch
+    - expression: >-
         has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false &&
         (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default')
       message: a pod here runs as the default account without its token mounted
