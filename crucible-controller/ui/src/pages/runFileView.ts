@@ -1,6 +1,13 @@
 import type { components } from '../api/schema';
+import { evidencePolicy } from './decisions';
 
 type RunFile = components['schemas']['RunFile'];
+
+/** Scripts a captured HTML file may load from the network, each pinned to one exact build. */
+export const RUN_FILE_SCRIPTS: readonly string[] = ['https://cdn.plot.ly/plotly-2.35.2.min.js'];
+
+/** The policy a captured HTML file runs under: the evidence policy plus `RUN_FILE_SCRIPTS`. */
+export const RUN_FILE_CSP = evidencePolicy(RUN_FILE_SCRIPTS);
 
 /** How a captured file is rendered inline; null means download only. */
 export type InlineKind = 'markdown' | 'json' | 'text' | 'log' | 'image' | 'html';
@@ -130,9 +137,19 @@ export type FileSelection =
   | { state: 'found'; file: RunFile };
 
 /**
+ * A file a reader opened the run for: a report by name, or an HTML document, which is a report
+ * rather than a source file. A campaign captures its report as `watch/CAMPAIGN.html`.
+ */
+function isReport(file: RunFile): boolean {
+  const name = file.path.toLowerCase();
+  return name === 'report.md' || name === 'report.html' || inlineKind(file.path) === 'html';
+}
+
+/**
  * A requested key must resolve to that file or to nothing: silently showing a different file would
  * make a shared link lie. With no key requested the report is what a reader came for, and of
  * several, the one from the task latest in `order` (plan order), which reports on the run whole.
+ * Within one task the HTML report wins, since that is the one meant to be read rather than mined.
  */
 export function selectRunFile(
   entries: readonly RunFile[],
@@ -145,9 +162,11 @@ export function selectRunFile(
   }
   const rank = (e: RunFile) => order.indexOf(e.task);
   const captured = entries.filter((e) => e.size_bytes !== 0);
-  const report = captured
-    .filter((e) => e.path.toLowerCase() === 'report.md')
-    .reduce<RunFile | undefined>((best, e) => (best === undefined || rank(e) > rank(best) ? e : best), undefined);
+  const report = captured.filter(isReport).reduce<RunFile | undefined>((best, e) => {
+    if (best === undefined) return e;
+    if (rank(e) !== rank(best)) return rank(e) > rank(best) ? e : best;
+    return inlineKind(e.path) === 'html' ? e : best;
+  }, undefined);
   const fallback =
     report ?? captured.find((e) => inlineKind(e.path) === 'markdown') ?? captured[0] ?? entries[0];
   return fallback === undefined ? { state: 'empty' } : { state: 'found', file: fallback };

@@ -75,6 +75,7 @@ import { RunTaskGrid } from './RunTaskGrid';
 import { planOrder } from './runGrid';
 import { absoluteTime, relativeTime } from './journeyView';
 import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView';
+import { sandboxedDocument } from './decisions';
 import {
   downloadName,
   imageMimeType,
@@ -83,6 +84,7 @@ import {
   parseRunFilePath,
   prettyJson,
   producerOf,
+  RUN_FILE_CSP,
   runFileApiPath,
   runFilePath,
   runFileUrl,
@@ -99,6 +101,9 @@ const DECISION_TONE: Record<DecisionTone, StatusTone> = {
   baseline: 'grey',
   neutral: 'blue',
 };
+
+/** How often a running playbook run's page refetches while it has no event stream of its own. */
+const POLL_RUNNING = 5000;
 
 /// A personal target's name is an opaque secret id, so it is shown as what it is rather than as a
 /// cluster name a reader could go look up.
@@ -120,9 +125,17 @@ export function RunDetailPage() {
   const isPlaybook = runId.startsWith('playbook_');
 
   const agentTools = useAgentTools() === true;
-  const runDetail = $api.useQuery('get', '/api/runs/{run_id}', {
-    params: { path: { run_id: runId } },
-  });
+  const runDetail = $api.useQuery(
+    'get',
+    '/api/runs/{run_id}',
+    { params: { path: { run_id: runId } } },
+    {
+      // A playbook run drives local processes, so nothing streams its status or its captured
+      // files; without polling the page stays on whatever it was opened with until a reload.
+      refetchInterval: (query) =>
+        isPlaybook && query.state.data?.run.status === 'running' ? POLL_RUNNING : false,
+    },
+  );
   const iterations = $api.useQuery(
     'get',
     '/api/runs/{run_id}/iterations',
@@ -164,6 +177,15 @@ export function RunDetailPage() {
     },
     [queryClient],
   );
+
+  const wasLive = useRef(isLiveRun);
+  useEffect(() => {
+    if (wasLive.current && !isLiveRun) {
+      void queryClient.invalidateQueries({ queryKey: ['get', '/api/runs/{run_id}/files'] });
+      void queryClient.invalidateQueries({ queryKey: ['get', '/api/runs/{run_id}/graph'] });
+    }
+    wasLive.current = isLiveRun;
+  }, [isLiveRun, queryClient]);
 
   if (!runId) {
     return <Empty title="No run ID" />;
@@ -318,7 +340,12 @@ export function RunDetailPage() {
         </Section>
       )}
 
-      <FilesPanel runId={runId} launchKey={launchKey} fileKey={deepLinkedFile} />
+      <FilesPanel
+        runId={runId}
+        launchKey={launchKey}
+        fileKey={deepLinkedFile}
+        live={isPlaybook && isLiveRun}
+      />
 
       <div className="grid grid-cols-2 max-wide:grid-cols-1">
         <CostSection runId={runId} runCost={run.cost_usd} />
@@ -1244,27 +1271,67 @@ function CopyLinkButton({ route, className }: { route: RunFileRoute; className?:
   );
 }
 
+const USER_SCROLL = ['wheel', 'touchstart', 'pointerdown', 'keydown'] as const;
+
+/**
+ * The file listing can arrive before the task graph renders, so a single scroll happens while the
+ * page is still shorter than the viewport, does nothing, and the graph then pushes the panel below
+ * the fold. Re-anchor over the next frames until the panel holds at the top of the scroller, the
+ * reader scrolls, or three seconds pass. Returns a function that stops it.
+ */
+function anchorFilesPanel(el: HTMLElement): () => void {
+  const deadline = performance.now() + 3000;
+  let held = 0;
+  let frame = 0;
+  const stop = () => {
+    cancelAnimationFrame(frame);
+    for (const type of USER_SCROLL) window.removeEventListener(type, stop, true);
+  };
+  const step = () => {
+    el.scrollIntoView({ block: 'start' });
+    const main = el.closest('main');
+    if (main !== null) {
+      const top = el.getBoundingClientRect().top - main.getBoundingClientRect().top;
+      const scrollable = main.scrollHeight > main.clientHeight + 1;
+      held = scrollable && Math.abs(top) < 8 ? held + 1 : 0;
+    }
+    if (held >= 2 || performance.now() > deadline) {
+      stop();
+      return;
+    }
+    frame = requestAnimationFrame(step);
+  };
+  for (const type of USER_SCROLL) {
+    window.addEventListener(type, stop, { capture: true, passive: true });
+  }
+  frame = requestAnimationFrame(step);
+  return stop;
+}
+
 function FilesPanel({
   runId,
   launchKey,
   fileKey,
+  live,
 }: {
   runId: string;
   launchKey: string | null;
   fileKey: string | null;
+  live: boolean;
 }) {
   const navigate = useNavigate();
+  const poll = live ? POLL_RUNNING : false;
   const listing = $api.useQuery(
     'get',
     '/api/runs/{run_id}/files',
     { params: { path: { run_id: runId } } },
-    { retry: 2 },
+    { retry: 2, refetchInterval: poll },
   );
   const graph = $api.useQuery(
     'get',
     '/api/runs/{run_id}/graph',
     { params: { path: { run_id: runId } } },
-    { retry: 2 },
+    { retry: 2, refetchInterval: poll },
   );
   // A file captured from a task that did not pass is evidence of the failure, and must not read
   // as the output of a task that succeeded.
@@ -1280,8 +1347,11 @@ function FilesPanel({
   const selection = selectRunFile(entries, fileKey, order);
   const anchor = useRef<HTMLDivElement>(null);
   const anchored = useRef(false);
+  const stopAnchor = useRef<(() => void) | null>(null);
   const openedOnDeepLink = useRef(fileKey !== null);
   const loaded = entries.length;
+
+  useEffect(() => () => stopAnchor.current?.(), []);
 
   useEffect(() => {
     if (
@@ -1295,7 +1365,7 @@ function FilesPanel({
     const el = anchor.current;
     if (el === null) return;
     anchored.current = true;
-    el.scrollIntoView({ block: 'start' });
+    stopAnchor.current = anchorFilesPanel(el);
   }, [loaded]);
 
   if (listing.isPending) {
@@ -1504,9 +1574,10 @@ function RunFileContent({
   return <RunFileText runId={runId} fileKey={fileKey} kind={textKind(path)} />;
 }
 
-/// A captured html page, rendered like flow.html: srcDoc in a sandboxed iframe, so its scripts
-/// run at an opaque origin with no reach into the controller's cookies or API, and with the same
-/// theme bridge, so a page that styles itself with the --flow-* tokens follows the app's theme.
+/// A captured html page, rendered like flow.html: srcDoc in a sandboxed iframe under
+/// `RUN_FILE_CSP`, so its scripts run at an opaque origin with no reach into the controller's
+/// cookies or API and no network beyond the pinned scripts, and with the same theme bridge, so a
+/// page that styles itself with the --flow-* tokens follows the app's theme.
 function RunFileHtml({ runId, fileKey }: { runId: string; fileKey: string }) {
   const theme = useAppTheme();
   const brand = useAppBrand();
@@ -1535,9 +1606,14 @@ function RunFileHtml({ runId, fileKey }: { runId: string; fileKey: string }) {
       className="min-h-0 w-full flex-1 border-0 bg-surface"
       title={fileKey}
       sandbox="allow-scripts"
-      srcDoc={injectFlowTheme(
-        query.data ?? '',
-        flowThemeStyle(theme, (token) => tokens.getPropertyValue(token)),
+      referrerPolicy="no-referrer"
+      srcDoc={sandboxedDocument(
+        injectFlowTheme(
+          query.data ?? '',
+          flowThemeStyle(theme, (token) => tokens.getPropertyValue(token)),
+        ),
+        'text/html',
+        RUN_FILE_CSP,
       )}
     />
   );
