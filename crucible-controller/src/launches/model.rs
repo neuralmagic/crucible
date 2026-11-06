@@ -30,7 +30,11 @@ pub(crate) struct NewPlaybookLaunch<'a> {
     pub origin: LaunchOrigin,
     /// The draft version this run froze. `None` = `playbook` names a registered pack.
     pub draft_version: Option<i64>,
+    /// The login that created this launch.
     pub created_by: Option<&'a str>,
+    /// The principal this launch's runs belong to: `team:<slug>` or `user:<login>`. `None` on
+    /// paths that predate the column, resolved at attribution time from `created_by`.
+    pub owner: Option<&'a str>,
     /// The groups the launcher's claims carried, as a JSON array. `created_by` is only half an
     /// identity: a group-owned secret needs the memberships too.
     pub launcher_groups: Option<&'a serde_json::Value>,

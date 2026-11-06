@@ -2091,6 +2091,7 @@ pub(crate) mod tests {
             origin: crate::model::LaunchOrigin::Manual,
             draft_version: None,
             created_by: Some("wren"),
+            owner: None,
             launcher_groups: None,
             rerun: None,
             dispatch: Default::default(),
@@ -2160,6 +2161,7 @@ pub(crate) mod tests {
                     origin: crate::model::LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
+                    owner: None,
                     launcher_groups: None,
                     rerun: None,
                     dispatch: crate::launches::model::DispatchPin {
@@ -2279,6 +2281,7 @@ pub(crate) mod tests {
                     origin: crate::model::LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
+                    owner: None,
                     launcher_groups: None,
                     rerun: None,
                     dispatch: Default::default(),

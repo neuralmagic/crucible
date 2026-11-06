@@ -161,9 +161,6 @@ pub struct Audience {
     /// audience.
     pub cluster: String,
     pub scopes: Vec<String>,
-    /// Whether the server authorizes as the token's `kube_user`, so no token is minted without
-    /// one.
-    pub requires_kube_user: bool,
     /// The namespaces a token names, the first as the default.
     pub namespaces: Vec<String>,
 }
@@ -176,7 +173,6 @@ impl Audience {
             resource: server.url.clone(),
             cluster: cluster.clone(),
             scopes: server.scopes.clone(),
-            requires_kube_user: server.requires_kube_user,
             namespaces: server.namespaces.clone(),
         })
     }
@@ -434,16 +430,6 @@ pub enum GrantError {
         grantable: Vec<String>,
     },
     #[error(
-        "launcher {launcher} has no known kubernetes username on cluster {cluster}, which {audience} \
-         requires ({why}); link it under Settings > Cluster identities"
-    )]
-    NoKubeUser {
-        launcher: String,
-        cluster: String,
-        audience: String,
-        why: String,
-    },
-    #[error(
         "the SVID comes from cluster {spire}'s SPIRE, but sandbox {sandbox} is bound to a run on \
          {run}"
     )]
@@ -452,27 +438,21 @@ pub enum GrantError {
         spire: String,
         run: String,
     },
-    #[error(
-        "run {run_id} was dispatched for {dispatched_by:?}, not a person, so it has no launcher"
-    )]
-    NoLauncher {
-        run_id: String,
-        dispatched_by: Option<String>,
-    },
-    #[error("{0}")]
-    NoUsername(String),
+    #[error("run {run_id} records nobody it was dispatched for")]
+    NoLauncher { run_id: String },
 }
 
-/// The launcher a run's token acts for: the login of the person the run was dispatched for.
+/// The subject a run's token acts for: whoever asked for the dispatch, else the launch's owner,
+/// with a `user:` prefix stripped so the login-shaped subject keeps its value. A team stays
+/// `team:<slug>`.
 pub fn launcher(run: &BoundRun) -> Result<String, GrantError> {
     run.dispatched_by
         .as_deref()
-        .and_then(|p| p.strip_prefix("user:"))
-        .filter(|login| !login.is_empty())
+        .or(run.owner.as_deref())
+        .map(|principal| principal.strip_prefix("user:").unwrap_or(principal))
         .map(str::to_string)
         .ok_or_else(|| GrantError::NoLauncher {
             run_id: run.run_id.clone(),
-            dispatched_by: run.dispatched_by.clone(),
         })
 }
 
@@ -502,13 +482,50 @@ pub fn granted_scopes(
     Ok(granted)
 }
 
+/// Who a run's token is to Kubernetes RBAC: its own user, `crucible:run:<pod>`, and the groups
+/// that scope it — every run plus its owner's team or user group, so a RoleBinding can grant a
+/// team's runs what the team's own calls already have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIdentity {
+    pub user: String,
+    pub groups: Vec<String>,
+}
+
+impl RunIdentity {
+    /// The identity of the run whose pod is `pod_name`, owned by `owner` (a principal string, or
+    /// `None` on rows attributed before owners were recorded: such a run carries only the group
+    /// every run shares).
+    pub fn of(pod_name: &str, owner: Option<&str>) -> Self {
+        let scope = owner
+            .and_then(|owner| crate::authz::model::Principal::parse(owner).ok())
+            .map(|owner| match owner {
+                crate::authz::model::Principal::Team(team) => {
+                    format!("crucible:team:{team}")
+                }
+                crate::authz::model::Principal::User(login) => format!("crucible:user:{login}"),
+                _ => String::new(),
+            })
+            .filter(|group| !group.is_empty());
+        let mut groups = vec!["crucible:runs".to_string()];
+        if let Some(scope) = scope
+            && !groups.contains(&scope)
+        {
+            groups.push(scope);
+        }
+        Self {
+            user: format!("crucible:run:{pod_name}"),
+            groups,
+        }
+    }
+}
+
 /// Everything a minted token says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentGrant {
     pub sandbox: Sandbox,
     pub launcher: String,
-    /// The launcher's Kubernetes username, for the `kube_user` claim.
-    pub kube_user: Option<String>,
+    /// The run's Kubernetes identity, for the `kube_user` and `kube_groups` claims.
+    pub kube: RunIdentity,
     pub run: BoundRun,
     pub audience: String,
     pub scopes: Vec<String>,
@@ -790,9 +807,8 @@ impl AgentIssuer {
             if let Some(name) = &grant.run.sandbox_name {
                 map.insert("sandbox".into(), json!(name));
             }
-            if let Some(kube_user) = &grant.kube_user {
-                map.insert("kube_user".into(), json!(kube_user));
-            }
+            map.insert("kube_user".into(), json!(grant.kube.user));
+            map.insert("kube_groups".into(), json!(grant.kube.groups));
             if let Some(workdir) = &grant.run.workdir {
                 map.insert("workdir".into(), json!(workdir));
             }
@@ -1257,7 +1273,6 @@ mod tests {
         for cluster in ["spoke-a", "spoke-b"] {
             let kueue = on(cluster).unwrap_or_else(|| panic!("no kueue audience on {cluster}"));
             assert_eq!(kueue.scopes, [SCOPE_READ, SCOPE_SUBMIT]);
-            assert!(kueue.requires_kube_user);
             assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);
         }
         assert!(on("spoke-c").is_none());
@@ -1267,7 +1282,7 @@ mod tests {
             .find(|a| a.resource == BUILDIT)
             .unwrap();
         assert_eq!(buildit.scopes, ["buildit.read", "buildit.build"]);
-        assert!(!buildit.requires_kube_user && buildit.namespaces.is_empty());
+        assert!(buildit.namespaces.is_empty());
     }
 
     /// SPIRE entries and the deploy profile accept the same cluster names.
@@ -1327,34 +1342,66 @@ mod tests {
         assert!(granted_scopes(None, &bare).unwrap().is_empty());
     }
 
-    fn run(dispatched_by: Option<&str>) -> BoundRun {
+    fn run(dispatched_by: Option<&str>, owner: Option<&str>) -> BoundRun {
         BoundRun {
             run_id: "playbook_kueue-e2e_01a1-1791474738".into(),
             pod_name: "crucible-run-brave-otter".into(),
             cluster: CLUSTER.into(),
             dispatched_by: dispatched_by.map(str::to_string),
+            owner: owner.map(str::to_string),
             sandbox_name: Some("ci-0123abcd".into()),
             workdir: Some("/sandbox/repo".into()),
         }
     }
 
     #[test]
-    fn the_launcher_is_the_person_the_run_was_dispatched_for() {
-        assert_eq!(launcher(&run(Some("user:alice"))).unwrap(), "alice");
-        for unattributed in [
-            None,
-            Some("team:platform-administrators"),
-            Some("user:"),
-            Some("alice"),
-        ] {
-            assert!(
-                matches!(
-                    launcher(&run(unattributed)),
-                    Err(GrantError::NoLauncher { .. })
-                ),
-                "{unattributed:?}"
-            );
-        }
+    fn the_subject_is_whoever_asked_for_the_dispatch_else_the_owner() {
+        assert_eq!(
+            launcher(&run(Some("user:alice"), None)).unwrap(),
+            "alice",
+            "a user: prefix comes off so the login-shaped subject keeps its value"
+        );
+        assert_eq!(
+            launcher(&run(Some("team:ml"), None)).unwrap(),
+            "team:ml",
+            "a team stays spelled as one"
+        );
+        assert_eq!(
+            launcher(&run(None, Some("team:ml"))).unwrap(),
+            "team:ml",
+            "no dispatcher: the launch's owner"
+        );
+        assert_eq!(launcher(&run(None, Some("user:bob"))).unwrap(), "bob");
+        assert!(matches!(
+            launcher(&run(None, None)),
+            Err(GrantError::NoLauncher { .. })
+        ));
+    }
+
+    #[test]
+    fn a_runs_kubernetes_identity_is_its_pod_and_its_owners_scope() {
+        assert_eq!(
+            RunIdentity::of("crucible-run-brave-otter", Some("team:ml")),
+            RunIdentity {
+                user: "crucible:run:crucible-run-brave-otter".into(),
+                groups: vec!["crucible:runs".into(), "crucible:team:ml".into()],
+            }
+        );
+        assert_eq!(
+            RunIdentity::of("crucible-run-brave-otter", Some("user:alice")),
+            RunIdentity {
+                user: "crucible:run:crucible-run-brave-otter".into(),
+                groups: vec!["crucible:runs".into(), "crucible:user:alice".into()],
+            }
+        );
+        assert_eq!(
+            RunIdentity::of("crucible-run-brave-otter", None),
+            RunIdentity {
+                user: "crucible:run:crucible-run-brave-otter".into(),
+                groups: vec!["crucible:runs".into()],
+            },
+            "an owner recorded before owners existed leaves the run's own group alone"
+        );
     }
 
     fn grant(namespaces: &[&str]) -> AgentGrant {
@@ -1367,8 +1414,8 @@ mod tests {
                 id: crate::agent_auth::sandbox::SandboxId::parse("sbx-1").unwrap(),
             },
             launcher: "alice".into(),
-            kube_user: Some("alice-k8s".into()),
-            run: run(Some("user:alice")),
+            kube: RunIdentity::of(POD, Some("team:ml")),
+            run: run(Some("user:alice"), Some("team:ml")),
             audience: KUEUE.into(),
             scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
             namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
@@ -1410,7 +1457,8 @@ mod tests {
             json!({
                 "iss": ISSUER,
                 "sub": "alice",
-                "kube_user": "alice-k8s",
+                "kube_user": format!("crucible:run:{POD}"),
+                "kube_groups": ["crucible:runs", "crucible:team:ml"],
                 "aud": KUEUE,
                 "iat": at,
                 "nbf": at,
@@ -1437,16 +1485,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_token_gets_its_own_id_and_omits_the_namespace_and_kube_user_it_lacks() {
+    async fn every_token_gets_its_own_id_and_omits_the_namespace_it_lacks() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
-        let unlinked = AgentGrant {
-            kube_user: None,
-            ..grant(&[])
-        };
         let a = verified(
             &issuer,
-            &issuer.mint(&unlinked, now()).unwrap().access_token,
+            &issuer.mint(&grant(&[]), now()).unwrap().access_token,
         )
         .await;
         let b = verified(
@@ -1455,7 +1499,7 @@ mod tests {
         )
         .await;
         assert_ne!(a["jti"], b["jti"]);
-        for key in ["namespace", "namespaces", "queues", "role", "kube_user"] {
+        for key in ["namespace", "namespaces", "queues", "role"] {
             assert!(!a.contains_key(key), "{key}");
         }
     }

@@ -12,7 +12,7 @@
 //! `groups.user.openshift.io`.
 
 use crate::access::{AccessCheck, AccessReview, ReviewError, ReviewFuture};
-use crate::principal::Principal;
+use crate::principal::{Callers, Principal};
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
 };
@@ -25,6 +25,9 @@ use tokio::sync::Mutex;
 
 /// Claim naming the caller's Kubernetes user.
 pub const USER_CLAIM: &str = "kube_user";
+/// The prefix of every identity the crucible issuer mints for runs: a person's token can never
+/// stand in for one, and a run's user can never stand in for a person.
+pub const CRUCIBLE_PREFIX: &str = "crucible:";
 /// Claim listing the caller's Kubernetes groups, when groups come from the token.
 pub const GROUPS_CLAIM: &str = "kube_groups";
 
@@ -55,6 +58,10 @@ pub enum KubeIdentityError {
     NoUser,
     #[error("{USER_CLAIM} {0:?} is a system identity")]
     SystemUser(String),
+    #[error("{USER_CLAIM} {user:?} carries the reserved {prefix} prefix")]
+    ReservedUser { user: String, prefix: &'static str },
+    #[error("a run's {USER_CLAIM} must carry the {prefix} prefix")]
+    NotARun { user: String, prefix: &'static str },
     #[error("{GROUPS_CLAIM} must be a list of strings")]
     Groups,
     #[error("listing OpenShift groups: {0}")]
@@ -71,7 +78,8 @@ pub struct KubeIdentity {
 }
 
 /// The caller's user, from `kube_user`. A `system:` user is refused so no token can stand in for
-/// a node, a service account or the cluster itself.
+/// a node, a service account or the cluster itself; a person's user may not carry the `crucible:`
+/// prefix and a run's must, so neither kind of token can act as the other.
 pub fn kube_user(principal: &Principal) -> Result<String, KubeIdentityError> {
     let user = principal
         .claims
@@ -82,11 +90,27 @@ pub fn kube_user(principal: &Principal) -> Result<String, KubeIdentityError> {
     if user.starts_with("system:") {
         return Err(KubeIdentityError::SystemUser(user.to_string()));
     }
+    match principal.callers {
+        Callers::People if user.starts_with(CRUCIBLE_PREFIX) => {
+            return Err(KubeIdentityError::ReservedUser {
+                user: user.to_string(),
+                prefix: CRUCIBLE_PREFIX,
+            });
+        }
+        Callers::Runs if !user.starts_with(CRUCIBLE_PREFIX) => {
+            return Err(KubeIdentityError::NotARun {
+                user: user.to_string(),
+                prefix: CRUCIBLE_PREFIX,
+            });
+        }
+        _ => {}
+    }
     Ok(user.to_string())
 }
 
-/// Groups from the token's `kube_groups`, without any `system:` group a token could use to claim
-/// cluster powers (`system:masters`), plus `system:authenticated`.
+/// Groups from the token's `kube_groups`, plus `system:authenticated`. A `system:` group is
+/// always dropped, so no token can claim cluster powers (`system:masters`); a `crucible:` group
+/// is dropped for people, so a person's issuer cannot smuggle a run's scope in.
 pub fn token_groups(principal: &Principal) -> Result<Vec<String>, KubeIdentityError> {
     let listed = match principal.claims.get(GROUPS_CLAIM) {
         None | Some(Value::Null) => Vec::new(),
@@ -100,8 +124,12 @@ pub fn token_groups(principal: &Principal) -> Result<Vec<String>, KubeIdentityEr
             .collect::<Result<Vec<_>, _>>()?,
         Some(_) => return Err(KubeIdentityError::Groups),
     };
+    let reserved = |g: &str| {
+        g.starts_with("system:")
+            || (principal.callers == Callers::People && g.starts_with(CRUCIBLE_PREFIX))
+    };
     Ok(with_authenticated(
-        listed.into_iter().filter(|g| !g.starts_with("system:")),
+        listed.into_iter().filter(|g| !reserved(g)),
         &[AUTHENTICATED],
     ))
 }
@@ -196,11 +224,14 @@ impl SubjectAccessReviewer {
         }
     }
 
+    /// The caller's Kubernetes identity. A run's groups always come from its token, which the
+    /// issuer mints with its scope; a person's come from the configured source.
     pub async fn identity(&self, principal: &Principal) -> Result<KubeIdentity, KubeIdentityError> {
         let user = kube_user(principal)?;
-        let groups = match self.groups {
-            GroupSource::Token => token_groups(principal)?,
-            GroupSource::OpenShift => {
+        let groups = match (principal.callers, self.groups) {
+            (Callers::Runs, _) => token_groups(principal)?,
+            (Callers::People, GroupSource::Token) => token_groups(principal)?,
+            (Callers::People, GroupSource::OpenShift) => {
                 let all = self.all_openshift_groups().await?;
                 openshift_groups(&all, &user)
             }
@@ -309,6 +340,8 @@ impl From<KubeIdentityError> for ReviewError {
         match error {
             KubeIdentityError::NoUser
             | KubeIdentityError::SystemUser(_)
+            | KubeIdentityError::ReservedUser { .. }
+            | KubeIdentityError::NotARun { .. }
             | KubeIdentityError::Groups => Self::Identity(Box::new(error)),
             KubeIdentityError::GroupLookup(_) | KubeIdentityError::Review(_) => {
                 Self::Unavailable(Box::new(error))
@@ -346,8 +379,8 @@ mod tests {
 
     #[test]
     fn the_user_comes_from_kube_user_and_never_names_a_system_identity() {
-        let p = principal(json!({"sub": "s", "kube_user": "alice"}));
-        assert_eq!(kube_user(&p).unwrap(), "alice");
+        let p = principal(json!({"sub": "s", "kube_user": "crucible:run:x"}));
+        assert_eq!(kube_user(&p).unwrap(), "crucible:run:x");
         for bad in [
             json!({"sub": "s"}),
             json!({"sub": "s", "kube_user": ""}),
@@ -378,6 +411,79 @@ mod tests {
         assert_eq!(token_groups(&none).unwrap(), [AUTHENTICATED]);
         let bad = principal(json!({"sub": "s", "kube_groups": "ml-team"}));
         assert!(matches!(token_groups(&bad), Err(KubeIdentityError::Groups)));
+    }
+
+    fn person(claims: Value) -> Principal {
+        match claims {
+            Value::Object(m) => {
+                Principal::from_claims(m, crate::principal::Callers::People).unwrap()
+            }
+            other => panic!("{other}"),
+        }
+    }
+
+    /// A person's user may not carry the crucible: prefix and a run's must, so neither kind of
+    /// token can stand in for the other.
+    #[test]
+    fn the_user_prefix_is_refused_both_ways() {
+        let run = principal(json!({"sub": "s", "kube_user": "crucible:run:crucible-run-x"}));
+        assert_eq!(kube_user(&run).unwrap(), "crucible:run:crucible-run-x");
+        let bare = principal(json!({"sub": "s", "kube_user": "alice"}));
+        assert!(matches!(
+            kube_user(&bare),
+            Err(KubeIdentityError::NotARun { .. })
+        ));
+        let someone = person(json!({"sub": "s", "kube_user": "alice"}));
+        assert_eq!(kube_user(&someone).unwrap(), "alice");
+        let smuggler = person(json!({"sub": "s", "kube_user": "crucible:run:crucible-run-x"}));
+        assert!(matches!(
+            kube_user(&smuggler),
+            Err(KubeIdentityError::ReservedUser { .. })
+        ));
+    }
+
+    /// A person's token drops crucible: groups; a run's keeps them, since they are its scope.
+    #[test]
+    fn crucible_groups_are_a_runs_scope_and_never_a_persons() {
+        let run = principal(json!({
+            "sub": "s", "kube_user": "crucible:run:crucible-run-x",
+            "kube_groups": ["crucible:runs", "crucible:team:ml", "system:masters"],
+        }));
+        assert_eq!(
+            token_groups(&run).unwrap(),
+            ["crucible:runs", "crucible:team:ml", "system:authenticated"]
+        );
+        let person = person(json!({
+            "sub": "s", "kube_user": "alice",
+            "kube_groups": ["crucible:runs", "crucible:team:ml"],
+        }));
+        assert_eq!(
+            token_groups(&person).unwrap(),
+            ["system:authenticated"],
+            "a person's issuer cannot hand out a run's scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runs_groups_come_from_its_token_even_on_an_openshift_group_source() {
+        let (client, _) = scripted(vec![]);
+        let reviewer = SubjectAccessReviewer::new(client, GroupSource::OpenShift);
+        let run = principal(json!({
+            "sub": "s", "kube_user": "crucible:run:crucible-run-x",
+            "kube_groups": ["crucible:runs", "crucible:team:ml"],
+        }));
+        assert_eq!(
+            reviewer.identity(&run).await.unwrap(),
+            KubeIdentity {
+                user: "crucible:run:crucible-run-x".into(),
+                groups: vec![
+                    "crucible:runs".into(),
+                    "crucible:team:ml".into(),
+                    "system:authenticated".into()
+                ],
+            },
+            "the Group objects are never listed for a run"
+        );
     }
 
     #[test]
@@ -487,7 +593,7 @@ mod tests {
     }
 
     fn alice() -> Principal {
-        principal(json!({"sub": "s", "kube_user": "alice"}))
+        person(json!({"sub": "s", "kube_user": "alice"}))
     }
 
     #[tokio::test]

@@ -46,8 +46,8 @@ Each term has one sense in this document.
 | issuer | The OAuth authorization server inside the controller. `CONTROLLER_AGENT_ISSUER` is its identifier. |
 | issuer key | The ES256 private key that signs every token. |
 | JWKS | A JSON Web Key Set: the public keys that verify signatures. |
-| `kube_user` | The Kubernetes username that a token acts as. Every resource server that does access checks reviews this user. |
-| launcher | The person that a run acts for. The login comes from `runs.dispatched_by`. |
+| `kube_user` | The Kubernetes username that a token acts as. A run's is its own pod user (`crucible:run:<pod>`); a person's is themselves. Every resource server that does access checks reviews this user. |
+| launcher | The subject a run acts for: whoever asked for the dispatch (`runs.dispatched_by`), else the run's owner. A login or `team:<slug>`. |
 | link | A record in `kube_identity_links` that a cluster's TokenReview proved: this person is this username on this cluster. |
 | loop namespace | The namespace of loop pods (`[cluster] loop_namespace`). |
 | loop pod | The pod that runs the engine for one run. The controller calls it the run pod. Pack code runs here. |
@@ -90,12 +90,12 @@ on their laptops need the same tools, with their own Kubernetes permissions.
 The controller is the one OAuth issuer for agents and for people. A sandbox supervisor proves its
 identity with a JWT-SVID from the SPIRE of its cluster. The controller finds the run that the
 sandbox belongs to and signs a short token. The token names the launcher (`sub`), the sandbox
-(`act.sub`), the run and the launcher's Kubernetes username (`kube_user`). A person gets a token
+(`act.sub`), the run and the run's own Kubernetes identity (`kube_user`, `kube_groups`). A person gets a token
 through the authorization code flow with PKCE, after upstream SSO and consent. The MCP client is
 a public client: a registered client, a metadata document client, or a self-registered client.
 
 The MCP servers verify each token against the issuer JWKS. Before each action, they ask the API
-server a SubjectAccessReview as `kube_user`. So the person's own RBAC is the ceiling. Each run's
+server a SubjectAccessReview as `kube_user`. So the caller's own RBAC is the ceiling. Each run's
 gateway runs in a pod of its own in the sandbox namespace. So pack code cannot create a
 supervisor with the SPIFFE ID of another run.
 
@@ -192,11 +192,12 @@ trust boundaries are the namespaces:
 | Run | The pod token of its loop pod, at the bind endpoint only | `run_id` (the loop pod name) |
 | Sandbox supervisor | A JWT-SVID from the SPIRE of its cluster | `act.sub` (the SPIFFE ID), `sandbox`, `workdir` |
 
-A run acts for its launcher. The launcher is `runs.dispatched_by`, which must be `user:<login>`.
-The controller stamps it when it creates the run row (`crucible-controller/src/runs/store.rs:334`).
-The value is the person who last asked for this dispatch: an unpark, a redispatch, a scope, or a
-paired GitHub approval. Without such a request, the value is the owner of the run. A run that
-has no person behind it gets no token (`GrantError::NoLauncher`).
+A run acts as its scope. The subject is `runs.dispatched_by` with `user:` stripped — the person
+who last asked for this dispatch, or `team:<slug>` when a team did — else the run's owner. A run
+whose row records neither gets no token (`GrantError::NoLauncher`). To Kubernetes RBAC the run is
+its own user, `crucible:run:<pod>`, carrying the groups `crucible:runs` and
+`crucible:team:<slug>` or `crucible:user:<login>` of its owner; the deploy binds the caller role
+to Group `crucible:runs` in the `[kueue] shared_namespaces`.
 
 ### 2.2 Token types and claims
 
@@ -216,7 +217,8 @@ with the same key and the same `iss`.
 | `run_id` | loop pod name | absent | The run. It is the pod name because a run id can be longer than a label value |
 | `sandbox` | when known | absent | The sandbox name from its `Sandbox` resource |
 | `workdir` | when bound | absent | The workspace path inside the sandbox |
-| `kube_user` | when known | always | The Kubernetes username on the cluster of the audience |
+| `kube_user` | always | always | The Kubernetes identity on the cluster of the audience: `crucible:run:<pod>` for a run, the person's username otherwise |
+| `kube_groups` | always | absent | The run's groups: `crucible:runs` plus its owner's `crucible:team:<slug>` or `crucible:user:<login>` |
 | `kube_cluster` | the run's cluster | yes | The cluster the token acts on. A server started with `--cluster` refuses a token naming another, so a token for one cluster's URL does not work at the same URL on another |
 | `namespace` | when the audience names namespaces | absent | The audience's first namespace, the default for its server |
 | `namespaces` | when the audience names namespaces | absent | Every namespace of the audience. A server that reads it confines the caller to these namespaces, within those it serves |
@@ -304,8 +306,8 @@ Then each server applies its own rules:
 
 | Check | crucible-kueue | buildit |
 | --- | --- | --- |
-| Caller kind | Runs and people. People only with an access reviewer (`--kube-authz`) | Runs only |
-| `kube_user` | Required for both kinds | Not read |
+| Caller kind | Runs and people. People only with an access reviewer (`--kube-authz`, which describes people's group source; a run's groups always come from its token) | Runs only |
+| `kube_user` | Required for both kinds. A run's must start with `crucible:`, a person's must not | Not read |
 | `run_id` | Required for runs. A people token with `run_id` is refused | Must equal `--run-id` |
 | `sandbox` | Not read | Required, a label value |
 | `workdir` | Not read | Optional absolute normal path |
@@ -323,11 +325,14 @@ it. So:
 
 - A token can do at most what its `kube_user` can do with `kubectl`. The token scopes, the tool
   policy, the allowlist profile and the server account reach can only reduce that.
-- An agent token acts as its launcher. A run cannot do more than the person who launched it.
-- The issuer and the reviewer both refuse a `system:` username
-  (`crucible-controller/src/identity/kube_identity.rs:27`, `crucible-mcp-auth/src/kube.rs:67`).
-  So no token can act as a node, a service account or the cluster. Groups from a token claim
-  also lose every `system:` entry.
+- An agent token acts as the run itself, `crucible:run:<pod>`, with the groups of the run's
+  scope. A run can do what its owner's RoleBindings for `crucible:runs` (and the team or user
+  group) allow, and no more.
+- The reviewer refuses a `system:` username, a person's username or group carrying the
+  `crucible:` prefix, and a run's username without it
+  (`crucible-mcp-auth/src/kube.rs`). So no token can act as a node, a service
+  account, the cluster, or as a caller of the other kind. Groups from a person's token claim
+  also lose every `system:` and `crucible:` entry.
 - The server creates pods with its own identity. So the caller must be able to `get` each
   Secret and PersistentVolumeClaim that a manifest names (`crucible-kueue/src/access.rs:149`).
 - A new RoleBinding applies on the next call, because denials are not cached. A removed
@@ -448,15 +453,13 @@ The steps are these:
 12. The requested `audience` is the URL of a server the deploy profile describes on the run's
     cluster (`Audience::of`).
 13. The gateway id in the SPIFFE ID is the gateway id of the bound loop pod.
-14. The run has a launcher (`dispatched_by` is `user:<login>`).
+14. The run records who it was dispatched for, or its owner (`dispatched_by`, `attributed_to`).
 15. Each requested scope is in the audience entry. A request with no scope gets all the scopes
     of the entry.
-16. When the audience requires a `kube_user` (the profile describes its server as one that
-    authorizes as `kube_user`, as `[kueue]` does), it is known for the launcher on the run's
-    cluster. For other audiences, the token omits an unknown `kube_user`, and the controller logs
-    a warning. Every audience is described: at startup the controller refuses one for which the
+16. Every audience is described: at startup the controller refuses one for which the
     profile describes no server at that URL on that cluster, comparing URLs once parsed
-    (`Audience::described_by`, `crucible-controller/src/agent_auth/issuer.rs`).
+    (`Audience::described_by`, `crucible-controller/src/agent_auth/issuer.rs`). The token always
+    carries the run's Kubernetes identity, derived from its pod name and its owner.
 
 Note: Pack code holds the run CA's client certificate, so it can make its gateway create
 sandboxes and request a token for any audience on its run's cluster, with that audience's
@@ -487,9 +490,8 @@ controller log as `agent token refused` with `reason` and the `user_agent`.
 | Bound loop pod not in `running` | `invalid_grant` | 400 |
 | SVID from the SPIRE of another cluster than the run (wrong cluster) | `invalid_grant` | 400 |
 | SVID gateway id is not the gateway of the bound run (the bind record of another run) | `invalid_grant` | 400 |
-| Run dispatched for no person | `invalid_grant` | 400 |
+| Run records nobody it was dispatched for and no owner | `invalid_grant` | 400 |
 | Scope not listed for the audience | `invalid_scope` | 400 |
-| `kueue.*` scope and no `kube_user` for the launcher | `invalid_grant` | 400 |
 
 The bind route has its own refusals (`bindings.rs:320`):
 
@@ -1937,7 +1939,7 @@ tokens, the controller does not read them.
 | `[buildit.cache] storage_class`, `image` | the cluster's, `[buildit] image` or else the loop image | The claim's StorageClass and the image `buildit cache` runs from. |
 | `[buildit] image` | the loop image's `buildit` | An image holding `/usr/local/bin/buildit` that loop pods run instead ([8.1](#81-where-it-runs)). |
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
-| `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `scopes` (default none), `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
+| `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `scopes` (default none), `clusters` (default `["hub"]`) and `namespaces` (default none). It needs only this entry. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |
 | `[cluster_link] external_url` | `CONTROLLER_AGENT_ISSUER` | The controller URL as browsers reach it. https, or http to loopback. Without either, cluster links refuse to start. |
 | `[cluster_link] client_id` | `crucible-controller` | The `OAuthClient` name. |
@@ -2492,7 +2494,7 @@ and every one of these defaults to the single-tenant behaviour.
 
 | Shape | Today's value | Where |
 | --- | --- | --- |
-| Token needs per audience | Each audience carries `requires_kube_user` and `namespaces`, filled from the profile's server descriptions; the issuer names no server | `Audience::described_by`, `DeployProfile::agent_servers` |
+| Namespaces per audience | Each audience carries `namespaces`, filled from the profile's server descriptions; the issuer names no server | `Audience::described_by`, `DeployProfile::agent_servers` |
 | Namespaces as a set | Tokens carry `namespaces` (the first is also `namespace`); crucible-kueue confines a caller to the claim within the namespaces it serves; `[kueue] workload_namespaces` is a list | `Identity::act_in`, `crucible-kueue/src/caller.rs` |
 | Open server list | `[kueue]`, `[buildit]` and any `[[agent_servers]]` reach the loop pod as one `CRUCIBLE_AGENT_SERVERS` list keyed by `ServerName`; buildit's URL is configuration | `crucible-contract/src/agent_servers.rs` |
 | Principal-shaped identity | Issuance and grant records resolve an `authz::model::Principal`; a person through their sign-in, a run through its dispatcher; groups and teams are refused with a typed error | `cluster_identity::for_principal` |

@@ -8206,6 +8206,165 @@ async fn a_fired_one_shot_becomes_a_deferred_run_with_the_frozen_snapshot(
 
 // --- schedules ----------------------------------------------------------------
 
+/// Activate the default policy set plus one rule letting a team dispatch onto the platform's
+/// targets, which the shipped set reserves for users: the launch surfaces under test here are
+/// about ownership, not about who may pick a cluster.
+async fn activate_team_dispatch(app: &Router) {
+    let text = format!(
+        "{}\n@id(\"team-dispatch-platform-targets\")\npermit(principal, action == \
+         Action::\"dispatch_target:dispatch\", resource)\nwhen {{ resource.owner == \
+         \"team:platform-administrators\" }};\n",
+        crate::authz::policy::DEFAULT_POLICY
+    );
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/authz/policy-sets",
+        "wren",
+        serde_json::json!({"text": text}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let digest = body["digest"].as_str().expect("digest").to_string();
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        &format!("/api/authz/policy-sets/{digest}/activate"),
+        "wren",
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A one-shot created while acting as a team fires a launch the team owns: the launch row records
+/// the team as owner and the person as creator, so the run's spend attributes to the team and its
+/// dispatch is stamped for the team, not for platform-administrators (RFC-0003 C-HIERARCHY).
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_team_owned_one_shot_fire_attributes_its_run_to_the_team(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/teams",
+        "wren",
+        serde_json::json!({"slug": "ml", "display_name": "ML"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send_as(
+        &app,
+        "PUT",
+        "/api/playbooks/survey/owner",
+        "wren",
+        serde_json::json!({"owner": "team:ml"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    activate_team_dispatch(&app).await;
+
+    let req = HttpRequest::post("/api/one-shots")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-auth-request-user", "wren")
+        .header(crate::authz::ACT_AS_HEADER, "team:ml")
+        .body(Body::from(
+            one_shot_body("2099-01-01T00:00:00Z").to_string(),
+        ))
+        .expect("req");
+    let (status, created) = crate::testing::call(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+
+    let fired = crate::launches::one_shots::fire_due(&db, "2099-01-01T00:00:00Z", 8).await?;
+    assert_eq!(fired.len(), 1, "{fired:?}");
+    let key = fired[0].as_str();
+    let launch: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT owner, created_by FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(launch, (Some("team:ml".into()), Some("wren".into())));
+
+    sqlx::query("INSERT INTO runs (run_id, issue, status) VALUES ('r-ml', $1, 'new')")
+        .bind(key)
+        .execute(db.pool())
+        .await?;
+    crate::runs::store::attribute_run(db.pool(), "r-ml").await?;
+    crate::runs::store::stamp_dispatcher(db.pool(), "r-ml").await?;
+    let stamped: Option<String> = sqlx::query_scalar(
+        "SELECT attributed_to || ' / ' || dispatched_by FROM runs \
+                            WHERE run_id = 'r-ml'",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    assert_eq!(stamped.as_deref(), Some("team:ml / team:ml"));
+    Ok(())
+}
+
+/// A manual launch made while acting as a team is owned by the team: the row records the team as
+/// owner and the person as creator.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_manual_launch_made_acting_as_a_team_is_owned_by_the_team(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, body) = send_as(
+        &app,
+        "POST",
+        "/api/teams",
+        "wren",
+        serde_json::json!({"slug": "ml", "display_name": "ML"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send_as(
+        &app,
+        "PUT",
+        "/api/playbooks/survey/owner",
+        "wren",
+        serde_json::json!({"owner": "team:ml"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    activate_team_dispatch(&app).await;
+
+    let req = HttpRequest::post("/api/playbooks/survey/launch")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-auth-request-user", "wren")
+        .header(crate::authz::ACT_AS_HEADER, "team:ml")
+        .body(Body::from(
+            serde_json::json!({
+                "params": {"topic": "attention", "depth": "deep"},
+                "max_cost": 1.0,
+                "max_time": "5m",
+            })
+            .to_string(),
+        ))
+        .expect("req");
+    let (status, ack) = crate::testing::call(&app, req).await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let key = ack["key"].as_str().expect("key");
+    let launch: (Option<String>, Option<String>) =
+        sqlx::query_as("SELECT owner, created_by FROM playbook_launches WHERE key = $1")
+            .bind(key)
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(launch, (Some("team:ml".into()), Some("wren".into())));
+
+    sqlx::query("INSERT INTO runs (run_id, issue, status) VALUES ('r-manual', $1, 'new')")
+        .bind(key)
+        .execute(db.pool())
+        .await?;
+    crate::runs::store::attribute_run(db.pool(), "r-manual").await?;
+    let attributed: Option<String> =
+        sqlx::query_scalar("SELECT attributed_to FROM runs WHERE run_id = 'r-manual'")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(attributed.as_deref(), Some("team:ml"));
+    Ok(())
+}
+
 async fn send_json(
     app: &Router,
     req: axum::http::request::Builder,

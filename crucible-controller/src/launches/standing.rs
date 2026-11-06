@@ -481,11 +481,8 @@ pub(crate) async fn fire(
         dedupe_schedule: firing.dedupe_schedule,
         origin: firing.origin,
         draft_version: row.draft_version,
-        created_by: core
-            .owner_principal
-            .as_deref()
-            .map(strip_user_prefix)
-            .or(core.created_by.as_deref()),
+        created_by: core.created_by.as_deref(),
+        owner: core.owner_principal.as_deref(),
         launcher_groups: core.owner_groups.as_ref(),
         rerun: None,
         dispatch: crate::launches::model::DispatchPin {

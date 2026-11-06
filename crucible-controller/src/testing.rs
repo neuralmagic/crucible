@@ -233,6 +233,7 @@ pub(crate) async fn launch_playbook(
             origin: crate::model::LaunchOrigin::Manual,
             draft_version: None,
             created_by: Some("wren"),
+            owner: None,
             launcher_groups: None,
             rerun: None,
             dispatch: Default::default(),

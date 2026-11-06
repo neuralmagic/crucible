@@ -306,10 +306,12 @@ pub(crate) async fn run_issue_repo(
 }
 
 /// Stamp the owner principal of the launch a run was made from (RFC-0003 C-HIERARCHY): the
-/// playbook launch's creator as a user principal, else the platform.
+/// launch's recorded owner, else a legacy login-shaped `created_by`, else the platform.
 pub async fn attribute_run(ex: impl PgExecutor<'_>, run_id: &str) -> Result<()> {
     sqlx::query(
         "UPDATE runs SET attributed_to = COALESCE(
+            (SELECT l.owner FROM playbook_launches l
+              WHERE l.key = runs.issue AND l.owner IS NOT NULL),
             (SELECT 'user:' || lower(trim(l.created_by)) FROM playbook_launches l
               WHERE l.key = runs.issue AND l.created_by IS NOT NULL
                 AND trim(l.created_by) ~ '^[A-Za-z0-9._@-]+$'),
@@ -450,6 +452,11 @@ pub(crate) async fn delete_unstarted_run(tx: &mut sqlx::PgConnection, run_id: &s
     .execute(&mut *tx)
     .await
     .context("restoring a released run's dispatch request")?;
+    sqlx::query("DELETE FROM run_agent_tools WHERE run_id = $1")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .context("deleting a released run's agent tools")?;
     sqlx::query("DELETE FROM runs WHERE run_id = $1")
         .bind(run_id)
         .execute(&mut *tx)
@@ -775,6 +782,7 @@ mod tests {
                     origin: crate::model::LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
+                    owner: None,
                     launcher_groups: None,
                     rerun: None,
                     dispatch: Default::default(),
@@ -913,6 +921,7 @@ mod tests {
                 max_time: &max_time,
                 advance_dedupe: false,
                 dedupe_schedule: None,
+                owner: None,
                 launcher_groups: None,
                 rerun: None,
                 dispatch: Default::default(),

@@ -1911,6 +1911,8 @@ dependencies = [
  "crucible-broker",
  "crucible-contract",
  "crucible-harness",
+ "crucible-kueue",
+ "crucible-mcp-auth",
  "crucible-vcs",
  "ctrlc",
  "flate2",
