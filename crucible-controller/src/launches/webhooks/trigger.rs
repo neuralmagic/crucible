@@ -526,7 +526,6 @@ mod tests {
     fn cfg() -> SweepCfg {
         SweepCfg {
             auto_disable_after: 2,
-            owner_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -544,7 +543,6 @@ mod tests {
             &WebhookTrigger,
             cfg(),
             Timestamp::now(),
-            None,
             None,
             &[],
         )
@@ -649,19 +647,11 @@ mod tests {
             "a held webhook's deliveries are left out"
         );
         assert!(
-            standing::sweep(
-                &db,
-                &WebhookTrigger,
-                cfg(),
-                Timestamp::now(),
-                None,
-                None,
-                &[id]
-            )
-            .await
-            .unwrap()
-            .fired
-            .is_empty(),
+            standing::sweep(&db, &WebhookTrigger, cfg(), Timestamp::now(), None, &[id],)
+                .await
+                .unwrap()
+                .fired
+                .is_empty(),
             "a held webhook does not fire"
         );
 

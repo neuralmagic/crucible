@@ -54,10 +54,10 @@ enum Command {
     /// One run with its candidates, as JSON.
     Run(ops::runs::Run),
 
-    /// Recurrences: what fires when, and what is blocked on an owner signing in.
+    /// Recurrences: what fires when, and whether each is enabled.
     Schedules(ops::launches::Schedules),
 
-    /// Tracker watches: what each sweeps, and what is blocked on an owner signing in.
+    /// Tracker watches: what each sweeps, and whether each is enabled.
     Watches(ops::launches::Watches),
 
     /// One tracker watch, as JSON.

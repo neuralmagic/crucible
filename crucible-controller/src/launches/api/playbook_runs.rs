@@ -351,9 +351,8 @@ dto! {
         pub fired_key: Option<String>,
         pub fired_at: Option<String>,
         pub created_by: Option<String>,
-        /// The principal the firing launches under, and whether they must sign in again first.
+        /// The principal the firing launches under.
         pub owner_principal: Option<String>,
-        pub owner_signin_required: bool,
         pub dispatch_target: Option<String>,
         pub agent_provider: Option<String>,
         pub agent_model: Option<String>,

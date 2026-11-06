@@ -522,7 +522,7 @@ impl std::fmt::Display for ControllerAuthMode {
 
 /// `GET /api/whoami`: what the controller thinks of the caller after all the headers landed.
 ///
-/// `mode`, `groups` and `downgraded` are what the controller says about its own side of the
+/// `mode` and `groups` are what the controller says about its own side of the
 /// exchange, and are read beside the client's view of the credential so the two can be compared.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Whoami {
@@ -536,8 +536,6 @@ pub struct Whoami {
     pub groups: Vec<String>,
     #[serde(default)]
     pub mode: Option<ControllerAuthMode>,
-    #[serde(default)]
-    pub downgraded: bool,
 }
 
 /// `POST /api/playbooks/imports`: a proposal frozen at the commit the fetch resolved to.
@@ -948,9 +946,6 @@ pub struct Schedule {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
-    /// The owner has to sign in again before this can fire.
-    #[serde(default)]
-    pub owner_signin_required: bool,
 }
 
 /// The provider a scope's unpinned dispatches of one workload class take.
@@ -996,9 +991,6 @@ pub struct Watch {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
-    /// The owner has to sign in again before this can launch.
-    #[serde(default)]
-    pub owner_signin_required: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1018,9 +1010,6 @@ pub struct Webhook {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
-    /// The owner has to sign in again before this can launch.
-    #[serde(default)]
-    pub owner_signin_required: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

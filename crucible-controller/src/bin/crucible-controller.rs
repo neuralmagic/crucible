@@ -491,7 +491,6 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
                     "the maintenance advisory lock is held by another session (a running daemon \
                      or a maintenance command); stop it and retry",
                 )?;
-            cfg.owner_refresh = owner_refresh(&pool);
             let result = crucible_controller::daemon::autopilot::run_once(&cfg).await;
             let _ = lock.release().await;
             pool.close().await;
@@ -509,20 +508,6 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
 
 /// How long a stopping autopilot waits on blocking work after its tasks are dropped.
 const AUTOPILOT_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// The offline credential a launcher's stale groups are re-read through. A broken issuer or key
-/// config is logged and leaves none.
-fn owner_refresh(
-    pool: &sqlx::PgPool,
-) -> Option<std::sync::Arc<crucible_controller::identity::oidc::credentials::OwnerRefresh>> {
-    match crucible_controller::identity::oidc::credentials::OwnerRefresh::from_env(pool.clone()) {
-        Ok(refresh) => refresh,
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "no owner group refresh");
-            None
-        }
-    }
-}
 
 /// Start the embedded Postgres when `DATABASE_URL=embedded` and point `cfg` at it. The returned
 /// guard stops the server when the daemon lets go of it.
@@ -636,7 +621,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         serve_vault.clone(),
         cfg.github_app.clone(),
     );
-    cfg.owner_refresh = owner_refresh(db.pool());
     let clusters =
         crucible_controller::runs::clusters::ClusterClients::new(cfg.clusters_dir.clone());
     // Personal dispatch targets are kubeconfig secrets, so they resolve only where the registry

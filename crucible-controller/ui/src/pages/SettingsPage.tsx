@@ -16,87 +16,17 @@ import {
   Status,
 } from '../ui';
 import type { StatusTone } from '../ui';
-import {
-  credentialView,
-  keyView,
-  mcpInstall,
-  revokedMessage,
-  type ApiKeyDto,
-  type CredentialState,
-  type KeyState,
-} from './settingsView';
+import { keyView, mcpInstall, type ApiKeyDto, type KeyState } from './settingsView';
 import { TextField, NumberInputField, CheckField, FormActions } from './formControls';
 import { clusterIdentitiesShown, linkOutcome, sortIdentities } from './clusterIdentitiesView';
 import { ClusterIdentityRow } from './ClusterIdentityRow';
 import { byClient, mcpSignInsShown, signedOutMessage, type ClientSignIns } from './mcpSignInsView';
-
-const TONE: Record<CredentialState, StatusTone> = {
-  absent: 'grey',
-  failing: 'amber',
-  live: 'green',
-};
 
 const KEY_TONE: Record<KeyState, StatusTone> = {
   live: 'green',
   expired: 'amber',
   revoked: 'grey',
 };
-
-function OfflineCredential() {
-  const qc = useQueryClient();
-  const credential = $api.useQuery('get', '/api/credentials/me');
-  const revoke = $api.useMutation('delete', '/api/credentials/me');
-  const [outcome, setOutcome] = useState<string | null>(null);
-
-  if (credential.isError) {
-    return <Empty title="Credential unavailable" description={formatError(credential.error)} />;
-  }
-  if (credential.isPending) {
-    return <LoadingBlock label="Loading credential" />;
-  }
-  const view = credentialView(credential.data);
-
-  return (
-    <Section>
-      <SectionHeader
-        title="Offline credential"
-        note="what your scheduled launches re-check team membership with"
-        actions={<Status status={view.headline} tone={TONE[view.state]} pulse={false} />}
-      />
-      <SectionBody>
-        <p className="text-body text-ink-2">{view.detail}</p>
-        <p className="mt-2 text-body text-ink-3">
-          Revoking stops every schedule of yours whose playbook binds a secret. They start again
-          when you sign in.
-        </p>
-        {outcome !== null && <p className="mt-2 text-body text-ink-2">{outcome}</p>}
-        {revoke.isError && (
-          <p className="mt-2 text-body text-red">{formatError(revoke.error)}</p>
-        )}
-        <div className="mt-3">
-          <Button
-            className="uppercase"
-            variant="filled"
-            disabled={!view.revocable || revoke.isPending}
-            onClick={() => {
-              revoke.mutate(
-                {},
-                {
-                  onSuccess: (result) => {
-                    setOutcome(revokedMessage(result.revoked, result.schedules_parked));
-                    void qc.invalidateQueries();
-                  },
-                },
-              );
-            }}
-          >
-            {revoke.isPending ? 'Revoking…' : 'Revoke'}
-          </Button>
-        </div>
-      </SectionBody>
-    </Section>
-  );
-}
 
 /// One key's row: what it is doing, and the control that stops it.
 function KeyRow({ apiKey }: { apiKey: ApiKeyDto }) {
@@ -411,7 +341,6 @@ export function SettingsPage() {
       <Memberships />
       {identities ? <ClusterIdentities /> : null}
       {identities ? <McpSignIns /> : null}
-      <OfflineCredential />
       <ApiKeys />
     </>
   );

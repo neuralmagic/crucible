@@ -1,54 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import {
-  credentialView,
-  keyView,
-  mcpInstall,
-  revokedMessage,
-  type ApiKeyDto,
-  type CredentialDto,
-} from './settingsView';
-
-function credential(over: Partial<CredentialDto> = {}): CredentialDto {
-  return { present: true, refreshed_at: null, last_error: null, failures: 0, ...over };
-}
-
-describe('credentialView', () => {
-  it('says nothing is stored, and offers nothing to revoke', () => {
-    const view = credentialView(credential({ present: false }));
-    expect(view.state).toBe('absent');
-    expect(view.revocable).toBe(false);
-    expect(view.detail).toMatch(/snapshot/);
-  });
-
-  it('surfaces the refusal verbatim once a refresh has failed', () => {
-    const view = credentialView(
-      credential({ last_error: 'the refresh was refused: invalid_grant', failures: 2 }),
-    );
-    expect(view.state).toBe('failing');
-    expect(view.headline).toBe('NEEDS SIGN-IN');
-    expect(view.detail).toBe('the refresh was refused: invalid_grant');
-    expect(view.revocable).toBe(true);
-  });
-
-  it('distinguishes a credential that has been spent from one that has not', () => {
-    expect(credentialView(credential()).detail).toMatch(/not used yet/);
-    expect(credentialView(credential({ refreshed_at: '2026-08-24T10:00:00Z' })).detail).toContain(
-      '2026-08-24T10:00:00Z',
-    );
-  });
-});
-
-describe('revokedMessage', () => {
-  it('counts the schedules that stopped, and pluralizes them', () => {
-    expect(revokedMessage(true, 0)).toBe('Offline credential revoked. No schedules needed it.');
-    expect(revokedMessage(true, 1)).toContain('1 schedule will not fire');
-    expect(revokedMessage(true, 3)).toContain('3 schedules will not fire');
-  });
-
-  it('says so when there was nothing to revoke', () => {
-    expect(revokedMessage(false, 0)).toMatch(/nothing stored to revoke/);
-  });
-});
+import { keyView, mcpInstall, type ApiKeyDto } from './settingsView';
 
 function apiKey(over: Partial<ApiKeyDto> = {}): ApiKeyDto {
   return {

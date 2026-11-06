@@ -380,10 +380,7 @@ impl CrucibleMcp {
         self.run(&a).await
     }
 
-    #[tool(
-        description = "Recurrences: ID PLAYBOOK CRON STATE NEXT LAST FAILS OWNER. STATE is \
-        `blocked` when the owner must sign in again — enabled, and still will not fire."
-    )]
+    #[tool(description = "Recurrences: ID PLAYBOOK CRON STATE NEXT LAST FAILS OWNER.")]
     async fn crucible_schedules(&self, Parameters(a): Parameters<Schedules>) -> String {
         self.run(&a).await
     }
@@ -391,7 +388,7 @@ impl CrucibleMcp {
     #[tool(
         description = "Tracker watches: ID PLAYBOOK TRACKER QUERY STATE SWEPT LAUNCHED FAILS OWNER. \
         A watch launches its playbook once per item its query matches, never again for the same \
-        item. STATE is `blocked` when the owner must sign in again."
+        item."
     )]
     async fn crucible_watches(&self, Parameters(a): Parameters<Watches>) -> String {
         self.run(&a).await
@@ -404,8 +401,7 @@ impl CrucibleMcp {
 
     #[tool(
         description = "Webhooks: ID PLAYBOOK VERIFIER STATE RATE DELIVERED FAILS OWNER. A webhook \
-        launches its playbook from deliveries a sender outside the controller posts. STATE is \
-        `blocked` when the owner must sign in again."
+        launches its playbook from deliveries a sender outside the controller posts."
     )]
     async fn crucible_webhooks(&self, Parameters(a): Parameters<Webhooks>) -> String {
         self.run(&a).await

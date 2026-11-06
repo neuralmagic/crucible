@@ -1,8 +1,8 @@
 //! The public delivery surface (RFC-0003:C-WEBHOOK-DELIVERY): `POST /hooks/{id}` and
 //! `POST /hooks/{id}/{token}`, served on their own listener.
 
-use crate::identity::oidc::credentials::CredentialKeys;
 use crate::launches::webhooks as store;
+use crate::launches::webhooks::keys::WebhookKeys;
 use crate::launches::webhooks::verify::{self, Presented};
 use axum::Router;
 use axum::body::Body;
@@ -24,12 +24,12 @@ const CONCURRENCY: usize = 64;
 #[derive(Clone)]
 pub struct HooksState {
     pool: PgPool,
-    keys: Option<Arc<CredentialKeys>>,
+    keys: Option<Arc<WebhookKeys>>,
     permits: Arc<Semaphore>,
 }
 
 impl HooksState {
-    pub fn new(pool: PgPool, keys: Option<Arc<CredentialKeys>>) -> Self {
+    pub fn new(pool: PgPool, keys: Option<Arc<WebhookKeys>>) -> Self {
         HooksState {
             pool,
             keys,
@@ -147,8 +147,8 @@ async fn deliver(
 
 #[cfg(test)]
 mod tests {
-    use crate::identity::oidc::credentials::CredentialKeys;
     use crate::launches::standing::NewStanding;
+    use crate::launches::webhooks::keys::WebhookKeys;
     use crate::launches::webhooks::receive::{HooksState, MAX_BODY, router};
     use crate::launches::webhooks::verify::{Verifier, VerifierKind};
     use crate::launches::webhooks::{self as store, NewWebhook};
@@ -162,8 +162,8 @@ mod tests {
 
     const BODY: &str = r#"{"repository":"org/img","updated_tags":["latest"]}"#;
 
-    fn keys() -> Arc<CredentialKeys> {
-        Arc::new(CredentialKeys::new(vec![vec![7u8; 32]]).expect("keys"))
+    fn keys() -> Arc<WebhookKeys> {
+        Arc::new(WebhookKeys::new(vec![vec![7u8; 32]]).expect("keys"))
     }
 
     async fn register(pool: &PgPool) {
@@ -191,7 +191,7 @@ mod tests {
 
     async fn webhook(
         pool: &PgPool,
-        keys: &CredentialKeys,
+        keys: &WebhookKeys,
         kind: VerifierKind,
         header: Option<&str>,
     ) -> store::Created {

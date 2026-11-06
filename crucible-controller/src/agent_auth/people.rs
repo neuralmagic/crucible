@@ -503,13 +503,11 @@ fn session_failure(e: impl std::fmt::Display) -> Response {
     )
 }
 
-/// The signed-in person, `None` without a native session or with one whose groups refresh failed.
+/// The signed-in person, `None` without a native session.
 async fn signed_in(
     session: &Session,
 ) -> Result<Option<crate::identity::session::NativeClaims>, tower_sessions::session::Error> {
-    crate::identity::session::native_claims(session)
-        .await
-        .map(|c| c.filter(|c| !c.downgraded))
+    crate::identity::session::native_claims(session).await
 }
 
 pub fn router(state: Arc<AgentAuth>) -> axum::Router {
@@ -1271,8 +1269,6 @@ mod tests {
             login: "jordan".into(),
             email: Some("casey@example.com".into()),
             groups: Vec::new(),
-            groups_at: String::new(),
-            downgraded: false,
         };
         crate::identity::session::establish_native(&session, &claims, None)
             .await
@@ -2076,23 +2072,10 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         assert_eq!(live, 0, "the approval is revoked");
     }
 
-    /// A person the identity provider has refused, or one who is gone, refreshes nothing.
+    /// A person who is gone refreshes nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_refused_or_deleted_person_refreshes_nothing(pool: PgPool) {
+    async fn a_deleted_person_refreshes_nothing(pool: PgPool) {
         let h = harness(&pool).await;
-        let code = issued_code(&h, &pool).await;
-        let (_, first) = code_exchange(&h.app, &code).await;
-        sqlx::query(
-            "INSERT INTO user_credentials (sub, token_cipher, key_id, last_error, failures,
-                                           created_at, updated_at)
-             VALUES ($1, 'sealed', 'k1', 'invalid_grant: account disabled', 1, '', '')",
-        )
-        .bind(SUB)
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert!(refused(&refreshed(&h.app, &first["refresh_token"]).await));
-
         let code = issued_code(&h, &pool).await;
         let (_, other) = code_exchange(&h.app, &code).await;
         sqlx::query("DELETE FROM users WHERE sub = $1")

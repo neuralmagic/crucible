@@ -28,9 +28,6 @@ function schedule(over: Partial<ScheduleRow> = {}): ScheduleRow {
     enabled: true,
     next_due_at: '2026-09-02T06:00:00Z',
     consecutive_failures: 0,
-    owner_signin_required: false,
-    owner_refresh_error: null,
-    owner_refresh_at: null,
     ...over,
   };
 }
@@ -77,21 +74,6 @@ describe('attentionItems', () => {
     expect(attentionItems(parked, [], 0).at(-1)?.text).toBe('1 more parked run');
   });
 
-  it('puts schedules waiting on sign-in first, in red', () => {
-    const items = attentionItems(
-      [run({ status: 'parked' })],
-      [schedule({ owner_signin_required: true }), schedule({ id: 'sch-2', owner_signin_required: true })],
-      0,
-    );
-    expect(items[0]).toEqual({
-      key: 'schedules:signin',
-      tone: 'red',
-      text: '2 schedules stop firing until their owners sign in again',
-      to: '/schedules',
-    });
-    expect(items[1]?.key).toBe('parked:playbook:survey:0001');
-  });
-
   it('flags a schedule disabled by failures but not one disabled by hand', () => {
     const items = attentionItems(
       [],
@@ -106,15 +88,6 @@ describe('attentionItems', () => {
         to: '/schedules',
       },
     ]);
-  });
-
-  it('does not double count a schedule that needs sign-in and is disabled', () => {
-    const items = attentionItems(
-      [],
-      [schedule({ enabled: false, consecutive_failures: 2, owner_signin_required: true })],
-      0,
-    );
-    expect(items.map((i) => i.text)).toEqual(['1 schedule stops firing until its owner signs in again']);
   });
 
   it('counts the approvals queue', () => {
@@ -177,7 +150,6 @@ describe('upcoming', () => {
   it('skips schedules that will not fire', () => {
     const rows = [
       schedule({ id: 'off', enabled: false }),
-      schedule({ id: 'signin', owner_signin_required: true }),
       schedule({ id: 'done', next_due_at: null }),
       schedule({ id: 'live' }),
     ];

@@ -101,9 +101,3 @@ SQLX_OFFLINE=true cargo test -p crucible-controller --lib -- oidc::keycloak_e2e
 
 With no issuer and no docker the tests print why they are skipping and pass. Set
 `CRUCIBLE_REQUIRE_KEYCLOAK_TESTS=1` to make that skip a failure instead; CI sets it.
-
-The suite also covers the offline credential (`src/identity/oidc/credentials.rs`): the callback storing an
-encrypted refresh token, two concurrent refreshes of one owner serializing under the per-subject
-advisory lock, the schedule sweep re-reading live groups before it claims a due row, and a refused
-refresh downgrading a live session. The realm grants `offline_access` and permits refresh-token
-reuse for exactly that reason, so editing those settings out will fail those tests, not skip them.

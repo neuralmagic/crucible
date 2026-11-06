@@ -74,17 +74,9 @@ dto! {
         /// Firings that did not launch since the last one that did.
         pub consecutive_failures: i64,
         pub created_by: Option<String>,
-        /// The principal this schedule's firings launch under, and when its group snapshot was last
-        /// taken. Null on a schedule saved before ownership was recorded, which parks any firing whose
-        /// scope binds secrets.
+        /// The principal this schedule's firings launch under. Null on a schedule saved before
+        /// ownership was recorded.
         pub owner_principal: Option<String>,
-        pub owner_groups_at: Option<String>,
-        /// The fire-time group refresh, for the schedules view: whether the owner has to sign in again
-        /// before this schedule can fire, why the last refresh did not land (transient failures
-        /// included), and when it was tried.
-        pub owner_signin_required: bool,
-        pub owner_refresh_error: Option<String>,
-        pub owner_refresh_at: Option<String>,
         /// The cluster every firing dispatches to; null takes the controller default.
         pub dispatch_target: Option<String>,
         /// The inference provider every firing pins on its issue; null resolves through the configured
@@ -633,16 +625,6 @@ pub(crate) async fn update_schedule(
         Ok(None) => return not_found(format!("no schedule {id:?}")),
         Err(e) => return crate::launches::api::save_failed(e),
     };
-    // The re-save re-owned the row, so the firings that parked under the old snapshot will never
-    // launch.
-    let expired = match state.schedules.expire_stale_owner_parks(&id).await {
-        Ok(keys) => keys,
-        Err(e) => return ApiError::from(e).into_response(),
-    };
-    if !expired.is_empty() {
-        tracing::info!(schedule = %id, expired = expired.len(), "schedules: re-save expired stale-owner parks");
-    }
-
     let audit_key = format!("schedule:{id}");
     let audit_reason = format!(
         "playbook {} rescheduled on {:?} ({}) from {} to {}",

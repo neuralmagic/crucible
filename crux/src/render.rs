@@ -1091,12 +1091,8 @@ fn line(out: &mut String, key: &str, value: Option<&str>) {
     }
 }
 
-fn owner_state(enabled: bool, signin_required: bool) -> &'static str {
-    match (enabled, signin_required) {
-        (_, true) => "blocked",
-        (true, false) => "enabled",
-        (false, false) => "disabled",
-    }
+fn enabled_state(enabled: bool) -> &'static str {
+    if enabled { "enabled" } else { "disabled" }
 }
 
 fn blank_as_dash(s: &str) -> &str {
@@ -1375,8 +1371,7 @@ pub fn dispatch_defaults(list: &[dto::DispatchDefault]) -> String {
     )
 }
 
-/// The recurrences. A schedule whose owner has to sign in again is listed as blocked rather than
-/// enabled: it is enabled and still will not fire, which is the confusing case worth naming.
+/// The recurrences.
 pub fn schedules(list: &[dto::Schedule]) -> String {
     if list.is_empty() {
         return "no schedules\n".to_string();
@@ -1384,7 +1379,7 @@ pub fn schedules(list: &[dto::Schedule]) -> String {
     let rows: Vec<Vec<String>> = list
         .iter()
         .map(|s| {
-            let state = owner_state(s.enabled, s.owner_signin_required).to_string();
+            let state = enabled_state(s.enabled).to_string();
             vec![
                 s.id.clone(),
                 s.playbook.clone(),
@@ -1409,8 +1404,7 @@ pub fn schedules(list: &[dto::Schedule]) -> String {
     )
 }
 
-/// The tracker watches. Same state vocabulary as schedules: `blocked` is enabled and still will
-/// not launch, because the owner has to sign in again.
+/// The tracker watches. Same state vocabulary as schedules.
 pub fn watches(list: &[dto::Watch]) -> String {
     if list.is_empty() {
         return "no watches\n".to_string();
@@ -1418,7 +1412,7 @@ pub fn watches(list: &[dto::Watch]) -> String {
     let rows: Vec<Vec<String>> = list
         .iter()
         .map(|w| {
-            let state = owner_state(w.enabled, w.owner_signin_required).to_string();
+            let state = enabled_state(w.enabled).to_string();
             vec![
                 w.id.clone(),
                 w.playbook.clone(),
@@ -1457,7 +1451,7 @@ pub fn webhooks(list: &[dto::Webhook]) -> String {
                 w.id.clone(),
                 w.playbook.clone(),
                 w.verifier.clone(),
-                owner_state(w.enabled, w.owner_signin_required).to_string(),
+                enabled_state(w.enabled).to_string(),
                 format!("{}/h", w.max_launches_per_hour),
                 or_dash(w.last_delivery_at.as_deref()),
                 w.consecutive_failures.to_string(),
@@ -1584,12 +1578,6 @@ pub fn whoami(endpoint: &Endpoint, credential: &Credential, w: &dto::Whoami) -> 
                 .as_deref()
         )
     ));
-    if w.downgraded {
-        out.push_str(
-            "\nNOTE: the controller could not refresh this session's groups, so the role above \
-             may be lower than the one the issuer would grant.\n",
-        );
-    }
     out
 }
 
@@ -1732,7 +1720,7 @@ mod tests {
     fn wynn() -> dto::Whoami {
         controller_says(
             r#"{"user":"wynn","admin":true,"role":"admin","groups":["/groups/crucible"],
-                "mode":"proxy","downgraded":false}"#,
+                "mode":"proxy"}"#,
         )
     }
 
@@ -1836,36 +1824,11 @@ mod tests {
         assert!(!text.contains("NOTE:"), "{text}");
     }
 
-    /// A refused group refresh is why a role can read lower than the one the issuer would grant,
-    /// which is the same 403 this command gets run about.
-    #[test]
-    fn whoami_says_when_the_controller_downgraded_the_session() {
-        let text = whoami(
-            &Endpoint::Configured {
-                url: "https://crucible.example.com".into(),
-            },
-            &Credential::Wire(Auth::ApiKey {
-                token: "crk_a_b".into(),
-            }),
-            &controller_says(
-                r#"{"user":"wynn","admin":false,"role":"viewer","groups":[],
-                    "mode":"native","downgraded":true}"#,
-            ),
-        );
-        assert!(text.contains("controller auth mode: native\n"), "{text}");
-        assert!(
-            text.contains("could not refresh this session's groups"),
-            "{text}"
-        );
-    }
-
     /// A mode this build has never heard of is carried through verbatim instead of failing the
     /// one request an operator makes when nothing else works.
     #[test]
     fn an_unknown_controller_mode_survives_deserialization() {
-        let w = controller_says(
-            r#"{"user":"wynn","admin":false,"role":"viewer","mode":"mesh","downgraded":false}"#,
-        );
+        let w = controller_says(r#"{"user":"wynn","admin":false,"role":"viewer","mode":"mesh"}"#);
         assert_eq!(w.mode, Some(dto::ControllerAuthMode::Other("mesh".into())));
     }
 
@@ -1950,31 +1913,27 @@ mod tests {
         );
     }
 
-    /// An enabled schedule whose owner must sign in again still will not fire. Reporting it as
-    /// `enabled` is the confusing answer; `blocked` is the useful one.
     #[test]
-    fn a_schedule_blocked_on_its_owner_does_not_read_as_enabled() {
+    fn schedules_read_as_enabled_or_disabled() {
         let list: Vec<dto::Schedule> = serde_json::from_str(
             r#"[
               {"id":"s1","playbook":"report","cron_expr":"0 9 * * *","enabled":true,
                "next_due_at":"2026-08-29T09:00:00Z","last_fired_at":null,
                "consecutive_failures":0,"owner_principal":"user:alice",
-               "owner_signin_required":true,"advance_dedupe":false,"max_cost":1.0,
+               "advance_dedupe":false,"max_cost":1.0,
                "max_time":"30m","params":{},"created_at":"2026-08-01T00:00:00Z"},
               {"id":"s2","playbook":"report","cron_expr":"0 9 * * *","enabled":false,
                "next_due_at":null,"last_fired_at":null,"consecutive_failures":3,
-               "owner_principal":null,"owner_signin_required":false,"advance_dedupe":false,
+               "owner_principal":null,"advance_dedupe":false,
                "max_cost":1.0,"max_time":"30m","params":{},"created_at":"2026-08-01T00:00:00Z"}
             ]"#,
         )
         .expect("wire shape");
         let out = schedules(&list);
-        assert!(out.contains("blocked"), "{out}");
-        assert!(out.contains("disabled"), "{out}");
-        assert!(
-            !out.contains("enabled"),
-            "an owner-blocked schedule must not read as enabled: {out}"
-        );
+        let s1 = out.lines().find(|l| l.starts_with("s1")).expect("s1");
+        assert!(s1.contains(" enabled "), "{s1}");
+        let s2 = out.lines().find(|l| l.starts_with("s2")).expect("s2");
+        assert!(s2.contains(" disabled "), "{s2}");
     }
 
     #[test]
@@ -3009,26 +2968,25 @@ mod tests {
                 last_delivery_at: Some("2026-09-29T12:00:00Z".to_string()),
                 consecutive_failures: 0,
                 owner_principal: Some("user:wren".to_string()),
-                owner_signin_required: false,
             },
             dto::Webhook {
                 id: "w2".to_string(),
                 playbook: "release".to_string(),
                 verifier: "hmac_sha256".to_string(),
-                enabled: true,
+                enabled: false,
                 max_launches_per_hour: 1,
                 last_delivery_at: None,
                 consecutive_failures: 2,
                 owner_principal: None,
-                owner_signin_required: true,
             },
         ];
         let out = webhooks(&list);
         assert!(out.starts_with("2 webhooks\n"), "{out}");
         let w1 = out.lines().find(|l| l.starts_with("w1")).expect("w1");
         assert!(w1.contains("path_token") && w1.contains("5/h") && w1.contains("2026-09-29"));
+        assert!(w1.contains(" enabled "), "{w1}");
         let w2 = out.lines().find(|l| l.starts_with("w2")).expect("w2");
-        assert!(w2.contains("blocked"), "{w2}");
+        assert!(w2.contains(" disabled "), "{w2}");
         assert_eq!(webhooks(&[]), "no webhooks\n");
     }
 
