@@ -2883,7 +2883,7 @@ mod tests {
             site: jobs::Site {
                 namespace,
                 queue: std::env::var("BUILDIT_E2E_QUEUE").ok(),
-                node_arch: None,
+                node_arch: std::env::var("BUILDIT_E2E_NODE_ARCH").ok(),
                 resources: Resources::default(),
                 storage: std::env::var("BUILDIT_E2E_STORAGE_DRIVER")
                     .map(|d| <StorageDriver as clap::ValueEnum>::from_str(&d, false).unwrap())
@@ -2899,7 +2899,10 @@ mod tests {
                     .map(SharedCache::base)
                     .unwrap_or_default(),
                 image_repo,
-                registry: jobs::Registry::Insecure { host },
+                registry: match std::env::var("BUILDIT_E2E_REGISTRY_AUTH").as_deref() {
+                    Ok("cluster") => jobs::Registry::Cluster { host },
+                    _ => jobs::Registry::Insecure { host },
+                },
             },
             max_builds: 4,
             log_dir,
@@ -2909,6 +2912,15 @@ mod tests {
             push: None,
             shared_cache,
             run_caller: None,
+        }
+    }
+
+    /// A Dockerfile with Docker Hub's library images pulled through BUILDIT_E2E_LIBRARY, such as
+    /// mirror.gcr.io/library, for a cluster that Docker Hub's anonymous rate limit reaches.
+    fn library(dockerfile: &str) -> String {
+        match std::env::var("BUILDIT_E2E_LIBRARY") {
+            Ok(mirror) => dockerfile.replace("docker.io/library", &mirror),
+            Err(_) => dockerfile.to_string(),
         }
     }
 
@@ -4512,10 +4524,12 @@ mod tests {
         std::fs::create_dir_all(work.join("svc")).unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            "FROM docker.io/library/busybox:latest AS base\n\
+            &library(
+                "FROM docker.io/library/busybox:latest AS base\n\
              RUN echo hello-from-build && sleep 20 && mkdir -p /out && echo artifact > /out/a.txt\n\
              FROM base AS broken\n\
              RUN exit 1\n",
+            ),
         )
         .unwrap();
         let file = tokens(&work, "tok-a sb-a\ntok-b sb-b\n");
@@ -4710,7 +4724,7 @@ mod tests {
         source(7);
         std::fs::write(
             work.join("svc/Dockerfile"),
-            "FROM docker.io/library/alpine:3.20\n\
+            &library("FROM docker.io/library/alpine:3.20\n\
              RUN apk add --no-cache ccache gcc musl-dev\n\
              COPY a.c /src/\n\
              ARG NONCE\n\
@@ -4719,7 +4733,7 @@ mod tests {
                stats=$(ccache --print-stats); \\\n\
                hits=$(echo \"$stats\" | awk '$1 == \"remote_storage_hit\" || $1 == \"secondary_storage_hit\" { n += $2 } END { print n + 0 }'); \\\n\
                misses=$(echo \"$stats\" | awk '$1 == \"cache_miss\" { n += $2 } END { print n + 0 }'); \\\n\
-               echo \"plain-ccache nonce=$NONCE remote_hits=$hits misses=$misses\"\n",
+               echo \"plain-ccache nonce=$NONCE remote_hits=$hits misses=$misses\"\n"),
         )
         .unwrap();
         let file = tokens(&work, "tok-a sb-plain-a\ntok-b sb-plain-b\n");
@@ -4923,12 +4937,12 @@ mod tests {
         pins(1);
         std::fs::write(
             work.join("svc/Dockerfile"),
-            "FROM docker.io/library/alpine:3.20\n\
+            &library("FROM docker.io/library/alpine:3.20\n\
              COPY pins.txt /pins.txt\n\
              ARG NONCE\n\
              RUN if [ -s /deps/pins.txt ]; then \\\n\
                echo \"deps-from-cache $(cat /deps/nonce) $(cat /deps/pins.txt)\"; \\\n\
-             else cp /pins.txt /deps/pins.txt && echo \"$NONCE\" > /deps/nonce && echo \"deps-fetched $NONCE\"; fi\n",
+             else cp /pins.txt /deps/pins.txt && echo \"$NONCE\" > /deps/nonce && echo \"deps-fetched $NONCE\"; fi\n"),
         )
         .unwrap();
         let file = tokens(&work, "tok-a sb-deps-a\ntok-b sb-deps-b\n");
@@ -5161,7 +5175,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            "FROM docker.io/library/alpine:3.20\n\
+            &library("FROM docker.io/library/alpine:3.20\n\
              RUN apk add --no-cache ccache gcc musl-dev python3\n\
              COPY informer.py buildtrace.py a.c /src/\n\
              ARG NONCE\n\
@@ -5173,7 +5187,7 @@ mod tests {
                stats=$(ccache --print-stats); \\\n\
                hits=$(echo \"$stats\" | awk '$1 == \"remote_storage_hit\" || $1 == \"secondary_storage_hit\" { n += $2 } END { print n + 0 }'); \\\n\
                misses=$(echo \"$stats\" | awk '$1 == \"cache_miss\" { n += $2 } END { print n + 0 }'); \\\n\
-               echo \"shared-ccache nonce=$NONCE remote_hits=$hits misses=$misses\"\n",
+               echo \"shared-ccache nonce=$NONCE remote_hits=$hits misses=$misses\"\n"),
         )
         .unwrap();
         let file = tokens(&work, "tok-a sb-cache-a\ntok-b sb-cache-b\n");
@@ -5266,7 +5280,9 @@ mod tests {
         std::fs::create_dir_all(work.join("svc")).unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            "FROM docker.io/library/busybox:latest\nRUN echo deadline-build && sleep 600\n",
+            &library(
+                "FROM docker.io/library/busybox:latest\nRUN echo deadline-build && sleep 600\n",
+            ),
         )
         .unwrap();
         let file = tokens(&work, "tok-a sb-a\n");
@@ -5424,10 +5440,12 @@ mod tests {
         std::fs::create_dir_all(work.join("svc")).unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            "FROM docker.io/library/busybox:latest AS base\n\
+            &library(
+                "FROM docker.io/library/busybox:latest AS base\n\
              RUN echo hello-from-task && mkdir -p /out && echo artifact > /out/a.txt\n\
              FROM base AS slow\n\
              RUN echo slow-build && sleep 600\n",
+            ),
         )
         .unwrap();
         let file = tokens(&work, "tok-a sb-a\ntok-b sb-b\n");
@@ -5631,7 +5649,7 @@ mod tests {
         std::fs::create_dir_all(&svc).unwrap();
         std::fs::write(
             svc.join("Dockerfile"),
-            "FROM docker.io/library/busybox:latest\nCOPY run.sh /run.sh\nRUN echo socket-build\n",
+            &library("FROM docker.io/library/busybox:latest\nCOPY run.sh /run.sh\nRUN echo socket-build\n"),
         )
         .unwrap();
         std::fs::write(svc.join("run.sh"), "#!/bin/sh\necho ran-from-context\n").unwrap();
