@@ -266,6 +266,16 @@ pub struct BuildArgs {
     /// Point ccache in every RUN step at the server's shared cache; needs ccache 4.4 or later
     #[arg(long, requires = "server", conflicts_with = "image")]
     pub ccache: bool,
+    /// Run --script in this image instead of building the Dockerfile; the build is the image plus
+    /// --path as one new layer
+    #[arg(long, requires_all = ["server", "script", "path"], conflicts_with = "image")]
+    pub base: Option<String>,
+    /// With --base: the shell script, run with `sh -e` in --path
+    #[arg(long, requires = "base")]
+    pub script: Option<String>,
+    /// With --base: the absolute directory the context is placed at and the layer holds
+    #[arg(long, requires = "base")]
+    pub path: Option<String>,
     #[command(flatten)]
     pub server: ServerOpt,
 }
@@ -362,12 +372,15 @@ impl BuildArgs {
         }
         Ok(BuildParams {
             context,
-            dockerfile: Some(self.dockerfile.clone()),
+            dockerfile: self.base.is_none().then(|| self.dockerfile.clone()),
             target: self.target.clone(),
             build_args,
             timeout_s: self.timeout,
             caches,
             ccache: self.ccache,
+            base: self.base.clone(),
+            script: self.script.clone(),
+            path: self.path.clone(),
         })
     }
 

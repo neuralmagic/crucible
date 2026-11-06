@@ -161,6 +161,13 @@ last `tail_lines` (default 100). Output is numbered lines capped at `max_bytes` 
 max 64 KiB); on overflow, grep and tail keep the end of the log and range keeps its start.
 `clean` deletes a build's Jobs, or all of a sandbox's.
 
+A build with `base` (`--base` on the CLI) builds no Dockerfile: it runs `script` with `sh -e` in
+that image, as the image's root in the pod's user namespace, with the context placed at `path` and
+the build's args as environment. The build is `base` (by digest; buildit resolves a tag) plus
+`path` as one new layer, which the pod's archive sidecar appends with `crane append`, so a large
+base is neither unpacked nor pushed again. Caches mounted under `path` stay out of the layer;
+`ccache: true` points the script's ccache at the shared cache through `CCACHE_CONFIGPATH`.
+
 Logs come from the pod while it lives. When a Job ends, the server keeps its log in `--log-dir`,
 so `logs` and `status` outlive the Job and `clean`. A native sidecar in every build and run pod
 uploads what the pod leaves (the build's facts and image digest, a run's fetched paths, each

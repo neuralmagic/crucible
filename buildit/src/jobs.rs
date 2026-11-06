@@ -32,6 +32,9 @@ use crate::step::State;
 
 pub const BUILDER: &str = "builder";
 pub const RUN_CONTAINER: &str = "run";
+pub const LAYER_CONTAINER: &str = "layer";
+/// `dockerfile` or `layer` on a build's Job: how it builds.
+pub const LABEL_RECIPE: &str = "buildit.dev/recipe";
 pub const LABEL_KIND: &str = "buildit.dev/kind";
 pub const LABEL_RUN: &str = "buildit.dev/run";
 pub const ANNOTATION_CANCELLED: &str = "buildit.dev/cancelled";
@@ -44,6 +47,8 @@ pub const OUT: &str = "/buildit-out";
 pub const FACTS: &str = "/buildit-out/facts";
 const TOOLS: &str = "/buildit-tools";
 const INPUTS: &str = "/buildit-inputs";
+const LAYER_DIR: &str = "/buildit-layer";
+pub const CACHES: &str = "/buildit-caches";
 const ARCHIVE_AUTH: &str = "/buildit-archive";
 const CLUSTER: &str = "/buildit-cluster";
 const STORAGE: &str = "/home/build/.local/share/containers";
@@ -151,6 +156,22 @@ pub struct BuildJob<'a> {
     pub limit_secs: i64,
 }
 
+/// A build that runs a script in an existing image and appends one directory to it as a layer.
+pub struct LayerJob<'a> {
+    pub context_digest: &'a str,
+    /// The image, by digest, the script runs in and the result is built on.
+    pub base: &'a str,
+    pub script: &'a str,
+    /// The absolute directory the context is placed at and the layer holds.
+    pub path: &'a str,
+    /// Environment for the script: the build's args.
+    pub env: &'a BTreeMap<String, String>,
+    /// Declared caches, by name and the path the script sees them at.
+    pub caches: &'a [(String, String)],
+    pub ccache: bool,
+    pub limit_secs: i64,
+}
+
 /// A run of a succeeded build's image.
 pub struct RunJob<'a> {
     pub n: u32,
@@ -168,10 +189,64 @@ pub struct PushJob<'a> {
 const FETCH_BUILD: &str = r#"set -o pipefail
 wget -qO- "$CACHE/$CTX" | tar -xzf - -C /workspace"#;
 
+const FETCH_LAYER: &str = r#"set -o pipefail
+cp /busybox/busybox /ko-app/crane /buildit-tools/
+wget -qO- "$CACHE/$CTX" | tar -xzf - -C /workspace"#;
+
 const FETCH_RUN: &str = r#"set -o pipefail
 cp /busybox/busybox /buildit-tools/
 mkdir -p /buildit-out/facts
 if wget -qO /tmp/facts.tar "$CACHE/$PREFIX/facts.tar"; then tar -xf /tmp/facts.tar -C /buildit-out/facts; fi"#;
+
+/// A layer build's trusted init: the build's facts inputs into its facts, and its cluster caches
+/// restored from the shared cache.
+const PREPARE: &str = r#"for f in ccache.conf cache.json; do
+  if [ -e "/buildit-inputs/$f" ]; then cp "/buildit-inputs/$f" /buildit-out/facts/; fi
+done
+if [ -s /buildit-inputs/snapshots ]; then sh -c "$RESTORE" sh /buildit-inputs/snapshots "$CACHE"; fi"#;
+
+/// A layer build: the script in the base image, from `path`, then `path` as a tar without the
+/// caches mounted under it, and the exit record as the termination message. Arguments: the
+/// timeout, then `path`.
+const LAYER: &str = r#"B=/buildit-tools/busybox; secs=$1; dir=$2
+trap '$B kill -TERM -1 2> /dev/null; exit 143' TERM
+s=$($B date +%s)
+(cd "$dir" && $B timeout -s KILL "$secs" sh -ec "$BUILDIT_SCRIPT") &
+wait $!
+c=$?
+t=
+if [ "$c" -ne 0 ] && [ $(($($B date +%s) - s)) -ge "$secs" ]; then c=124; t=" timeout"; fi
+if [ "$c" -eq 0 ]; then
+  printf '%s\n' "$BUILDIT_EXCLUDE" | $B sed '/^$/d' > /tmp/buildit-exclude
+  printf '$ tar %s\n' "$dir"
+  $B tar -cf /buildit-layer/layer.tar -X /tmp/buildit-exclude -C / "${dir#/}" || c=1
+fi
+printf '%s%s\n' "$c" "$t" > /buildit-out/build.exit
+$B cat /buildit-out/build.exit > /dev/termination-log"#;
+
+/// What the archive sidecar does first for a layer build that succeeded: `crane append` of its
+/// layer onto the base, which pushes no base layer the registry has, then the build's cluster
+/// caches saved. A failed push turns the build's exit record into a failure.
+const LAYER_PUSH: &str = r#"[ "$(head -n 1 /buildit-out/build.exit 2> /dev/null)" = 0 ] || exit 0
+export DOCKER_CONFIG=/tmp/buildit-docker
+mkdir -p "$DOCKER_CONFIG" && echo '{}' > "$DOCKER_CONFIG/config.json"
+insecure=
+if [ -e /buildit-cluster/token ]; then
+  /buildit-tools/crane auth login -u buildit --password-stdin "$REGISTRY" < /buildit-cluster/token
+  export SSL_CERT_DIR=/buildit-cluster
+else
+  insecure=--insecure
+fi
+if ref=$(/buildit-tools/crane append $insecure $PLATFORM -b "$BASE" -f /buildit-layer/layer.tar -t "$DEST"); then
+  printf '%s\n' "${ref#*@}" > /buildit-out/image
+else
+  echo "pushing the layer to $DEST failed"
+  echo 1 > /buildit-out/build.exit
+  exit 0
+fi
+if [ -s /buildit-inputs/snapshots ] && [ -s /buildit-inputs/snapshots.auth ]; then
+  sh -c "$SAVE" sh /buildit-inputs/snapshots "$CACHE" /buildit-inputs/snapshots.auth
+fi"#;
 
 /// The archive sidecar: waits for SIGTERM, then uploads what the pod left in /buildit-out, each
 /// upload bounded so all of them fit the grace period. An upload that fails is noted in the
@@ -185,6 +260,7 @@ up() {
     || { echo "uploading $1 to the shared cache failed" | tee -a "/buildit-out/$errf" >&2; return 1; }
 }
 finish() {
+  if [ -n "$BEFORE" ]; then sh -c "$BEFORE" >> "/buildit-out/$errf" 2>&1; fi
   if [ -d /buildit-out/facts ] && [ -n "$(ls -A /buildit-out/facts)" ]; then tar -cf /buildit-out/facts.tar -C /buildit-out/facts .; fi
   for f in "$@"; do up "$f"; done
   up "$errf"
@@ -345,6 +421,152 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
         builder,
         volumes,
     )
+}
+
+pub fn layer_job(site: &Site, id: &Ident<'_>, l: &LayerJob<'_>) -> Job {
+    let dest = format!("{}:{}-{}", site.image_repo, id.sandbox, id.build);
+    let mut vars: Vec<core::EnvVar> = l.env.iter().map(|(k, v)| env(k, v)).collect();
+    vars.push(env("BUILDIT_SCRIPT", l.script));
+    let exclude: Vec<String> = l
+        .caches
+        .iter()
+        .filter_map(|(_, p)| p.strip_prefix(l.path.trim_end_matches('/')))
+        .filter(|rest| rest.starts_with('/'))
+        .map(|rest| {
+            format!(
+                "{}{rest}",
+                l.path.trim_start_matches('/').trim_end_matches('/')
+            )
+        })
+        .collect();
+    vars.push(env("BUILDIT_EXCLUDE", &exclude.join("\n")));
+    if l.ccache {
+        vars.push(env(
+            "CCACHE_CONFIGPATH",
+            &format!("{}/ccache.conf", crate::mcp::FACTS_MOUNT),
+        ));
+    }
+    let mut command = vec![
+        format!("{TOOLS}/busybox"),
+        "sh".to_string(),
+        "-c".to_string(),
+    ];
+    command.extend([
+        LAYER.to_string(),
+        "sh".to_string(),
+        l.limit_secs.to_string(),
+        l.path.to_string(),
+    ]);
+    let mut mounts = vec![
+        mount("workspace", l.path, false),
+        mount("out", OUT, false),
+        mount("facts", crate::mcp::FACTS_MOUNT, false),
+        mount("layer", LAYER_DIR, false),
+        mount("tools", TOOLS, true),
+    ];
+    for (name, path) in l.caches {
+        mounts.push(core::VolumeMount {
+            sub_path: Some(name.clone()),
+            ..mount("caches", path, false)
+        });
+    }
+    let main = core::Container {
+        name: LAYER_CONTAINER.to_string(),
+        image: Some(l.base.to_string()),
+        command: Some(command),
+        env: Some(vars),
+        security_context: Some(as_user(0)),
+        resources: site.resources.requirements(),
+        termination_message_policy: Some("FallbackToLogsOnError".to_string()),
+        volume_mounts: Some(mounts),
+        ..Default::default()
+    };
+    let fetch = core::Container {
+        name: "fetch".to_string(),
+        image: Some(TOOLS_IMAGE.to_string()),
+        command: Some(busybox_sh(FETCH_LAYER)),
+        env: Some(vec![
+            env("CACHE", &site.cache),
+            env("CTX", &context_key(l.context_digest)),
+        ]),
+        volume_mounts: Some(vec![
+            mount("workspace", WORKSPACE, false),
+            mount("tools", TOOLS, false),
+        ]),
+        ..Default::default()
+    };
+    let prepare = core::Container {
+        name: "prepare".to_string(),
+        image: Some(BUILDAH_IMAGE.to_string()),
+        command: Some(sh(PREPARE)),
+        env: Some(vec![
+            env("CACHE", &site.cache),
+            env("RESTORE", crate::step::RESTORE),
+        ]),
+        security_context: Some(as_user(1000)),
+        volume_mounts: Some(vec![
+            mount("facts", FACTS, false),
+            mount("caches", CACHES, false),
+            mount("inputs", INPUTS, true),
+        ]),
+        ..Default::default()
+    };
+    let mut archive = archive(
+        site,
+        id,
+        "build.exit",
+        "build.archive-err",
+        &["facts.tar", "image"],
+    );
+    let platform = site
+        .node_arch
+        .as_ref()
+        .map(|arch| format!("--platform=linux/{arch}"))
+        .unwrap_or_default();
+    archive.env.get_or_insert_default().extend([
+        env("BEFORE", LAYER_PUSH),
+        env("BASE", l.base),
+        env("DEST", &dest),
+        env("PLATFORM", &platform),
+        env("REGISTRY", site.registry.host()),
+        env("SAVE", crate::step::SAVE),
+    ]);
+    let archive_mounts = archive.volume_mounts.get_or_insert_default();
+    archive_mounts.extend([
+        mount("facts", FACTS, false),
+        mount("layer", LAYER_DIR, true),
+        mount("tools", TOOLS, true),
+        mount("caches", CACHES, false),
+        mount("inputs", INPUTS, true),
+    ]);
+    archive_mounts.extend(cluster_mount(site));
+    let mut volumes = vec![
+        empty_dir("workspace"),
+        limited_dir("out", OUT_LIMIT),
+        limited_dir("facts", FACTS_LIMIT),
+        empty_dir("layer"),
+        limited_dir("tools", TOOLS_LIMIT),
+        empty_dir("caches"),
+        inputs_volume(
+            id.name,
+            &["snapshots", "snapshots.auth", "ccache.conf", "cache.json"],
+        ),
+        archive_volume(id.name),
+    ];
+    volumes.extend(cluster_volume(site));
+    let mut job = job(
+        site,
+        id,
+        Kind::Build,
+        l.limit_secs,
+        vec![fetch, prepare, archive],
+        main,
+        volumes,
+    );
+    if let Some(labels) = job.metadata.labels.as_mut() {
+        labels.insert(LABEL_RECIPE.to_string(), "layer".to_string());
+    }
+    job
 }
 
 pub fn run_job(site: &Site, id: &Ident<'_>, r: &RunJob<'_>) -> Job {
@@ -773,8 +995,8 @@ mod tests {
 
     use crate::backend::{Resources, StorageDriver};
     use crate::jobs::{
-        BuildJob, Ident, Observed, PodUsers, PushJob, Registry, RunJob, Site, build_job, observe,
-        push_job, run_job,
+        BuildJob, Ident, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob, Site, build_job,
+        layer_job, observe, push_job, run_job,
     };
     use crate::step::State;
 
@@ -962,6 +1184,96 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|v| v["name"] == "cluster")
+        );
+    }
+
+    #[test]
+    fn a_layer_build_runs_its_script_in_the_base_and_pushes_from_the_archive() {
+        let labels = labels();
+        let env = BTreeMap::from([("MAX_JOBS".to_string(), "64".to_string())]);
+        let caches = [
+            ("deps".to_string(), "/src/app/.deps".to_string()),
+            ("ccache".to_string(), "/root/.cache/ccache".to_string()),
+        ];
+        let job = serde_json::to_value(layer_job(
+            &site(Some("builds"), cluster()),
+            &ident("buildit-00000000000000a1", &labels),
+            &LayerJob {
+                context_digest: "sha256:ab",
+                base: "docker.io/acme/base@sha256:cd",
+                script: "make",
+                path: "/src/app",
+                env: &env,
+                caches: &caches,
+                ccache: true,
+                limit_secs: 600,
+            },
+        ))
+        .unwrap();
+        assert_eq!(job["metadata"]["labels"]["buildit.dev/recipe"], "layer");
+        assert_eq!(job["metadata"]["labels"]["buildit.dev/kind"], "build");
+        let pod = &job["spec"]["template"]["spec"];
+        let names: Vec<&str> = pod["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["fetch", "prepare", "archive"]);
+        let main = &pod["containers"][0];
+        assert_eq!(main["name"], "layer");
+        assert_eq!(main["image"], "docker.io/acme/base@sha256:cd");
+        let var = |c: &serde_json::Value, name: &str| {
+            c["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .map(|e| e["value"].as_str().unwrap().to_string())
+        };
+        assert_eq!(var(main, "BUILDIT_SCRIPT").as_deref(), Some("make"));
+        assert_eq!(var(main, "MAX_JOBS").as_deref(), Some("64"));
+        assert_eq!(
+            var(main, "BUILDIT_EXCLUDE").as_deref(),
+            Some("src/app/.deps"),
+            "a cache under path stays out of the layer"
+        );
+        assert_eq!(
+            var(main, "CCACHE_CONFIGPATH").as_deref(),
+            Some("/buildit/ccache.conf")
+        );
+        let mounts = main["volumeMounts"].as_array().unwrap();
+        assert!(mounts.iter().all(|m| {
+            !["inputs", "archive-auth", "cluster"].contains(&m["name"].as_str().unwrap())
+        }));
+        let deps = mounts
+            .iter()
+            .find(|m| m["mountPath"] == "/src/app/.deps")
+            .unwrap();
+        assert_eq!(deps["name"], "caches");
+        assert_eq!(deps["subPath"], "deps");
+        assert_eq!(main["command"].as_array().unwrap().len(), 7);
+        assert_eq!(main["command"][6], "/src/app");
+        let archive = &pod["initContainers"][2];
+        assert_eq!(
+            var(archive, "BASE").as_deref(),
+            Some("docker.io/acme/base@sha256:cd")
+        );
+        assert_eq!(
+            var(archive, "DEST").as_deref(),
+            Some("registry.builds.svc:5000/builds/buildit:sb-a-buildit-00000000000000a1")
+        );
+        assert_eq!(
+            var(archive, "PLATFORM").as_deref(),
+            Some("--platform=linux/amd64")
+        );
+        assert!(
+            archive["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"] == "cluster"),
+            "the archive alone pushes"
         );
     }
 

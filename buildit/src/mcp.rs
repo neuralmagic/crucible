@@ -778,7 +778,13 @@ impl SharedCache {
 
     /// The snapshots of the cluster caches among `caches`, each keyed from the context `tar`. A
     /// build saves those it mounts read-write when `starter` may write to the shared cache.
-    fn snapshots(&self, caches: &[CacheSpec], tar: &[u8], starter: Starter) -> Result<Snapshots> {
+    fn snapshots(
+        &self,
+        caches: &[CacheSpec],
+        tar: &[u8],
+        starter: Starter,
+        root: &str,
+    ) -> Result<Snapshots> {
         let token = self.token_for(starter);
         let mut snapshots = Snapshots::default();
         for c in caches.iter().filter(|c| c.scope == CacheScope::Cluster) {
@@ -793,7 +799,7 @@ impl SharedCache {
                 _ => SnapshotUse::Restore,
             };
             snapshots.plan.push_str(&format!(
-                "{name} {key} {CACHE_ROOT}/{name} {}\n",
+                "{name} {key} {root}/{name} {}\n",
                 used.as_str(),
                 name = c.name
             ));
@@ -927,6 +933,14 @@ pub struct BuildParams {
     /// builds in the same builder pod see what this one left
     #[serde(default)]
     pub caches: Vec<CacheSpec>,
+    /// Instead of a Dockerfile, an image to run `script` in; the build is that image plus `path`
+    /// as one new layer, so the image is neither unpacked nor pushed again. Its build_args reach
+    /// the script as environment
+    pub base: Option<String>,
+    /// With `base`: a shell script, run with `sh -e` in `path` as the image's root
+    pub script: Option<String>,
+    /// With `base`: the absolute directory the context is placed at and the new layer holds
+    pub path: Option<String>,
     /// Configure ccache in every RUN step through a generated /etc/ccache.conf: the shared cache
     /// as remote storage when the server has one, and a per-object log at
     /// /buildit/ccache-stats.log. Needs ccache 4.4 or later in the image
@@ -1442,7 +1456,7 @@ impl Broker {
         let Some(pod) = pod else {
             return Ok(());
         };
-        let text = self.pod_log(&pod, log).await?;
+        let text = self.pod_log(&pod, main_container(job, log)).await?;
         self.keep(&self.log_file(&sandbox, &build, log), &text)
             .await
     }
@@ -1465,7 +1479,7 @@ impl Broker {
         if self.has_blob(&key).await? {
             return Ok(());
         }
-        let jobs::Observed::Ended { state, .. } = jobs::observe(job, pod, main_container(log))
+        let jobs::Observed::Ended { state, .. } = jobs::observe(job, pod, main_container(job, log))
         else {
             return Ok(());
         };
@@ -1487,11 +1501,7 @@ impl Broker {
         save(file, text.as_bytes()).await
     }
 
-    async fn pod_log(&self, pod: &Pod, log: LogName) -> Result<String> {
-        let container = match log {
-            LogName::Build => jobs::BUILDER,
-            LogName::Run(_) => jobs::RUN_CONTAINER,
-        };
+    async fn pod_log(&self, pod: &Pod, container: &str) -> Result<String> {
         let name = pod.metadata.name.as_deref().unwrap_or_default();
         self.pods_api()
             .logs(
@@ -1529,7 +1539,7 @@ impl Broker {
         {
             tracing::warn!("keeping {name}'s log: {e:#}");
         }
-        match self.pod_log(&pod, log).await {
+        match self.pod_log(&pod, main_container(&job, log)).await {
             Ok(text) => Ok(Log::last(text.into_bytes(), window)),
             Err(e) => {
                 tracing::debug!("{e:#}");
@@ -1596,23 +1606,40 @@ impl Broker {
             .unwrap_or_default();
         let context_digest = annotation(&job.metadata, ANNOTATION_CONTEXT_DIGEST)
             .and_then(|d| ContextDigest::parse(d).ok());
-        let mut seen = match jobs::observe(&job, pod.as_ref(), main_container(log)) {
+        let mut seen = match jobs::observe(&job, pod.as_ref(), main_container(&job, log)) {
             jobs::Observed::Queued => Seen::working(&created, Working::Queued),
             jobs::Observed::Running => Seen::working(&created, Working::Running),
             jobs::Observed::Ended { state, digest } => {
-                let ended = finished_at(pod.as_ref(), main_container(log))
+                let ended = finished_at(pod.as_ref(), main_container(&job, log))
                     .or_else(|| job_end(&job))
                     .unwrap_or_else(|| created.clone());
                 Seen::ended(state, digest, Some((created.clone(), ended)))
             }
         };
         seen.context_digest = context_digest;
-        if let (LogName::Run(n), step::State::Exited { .. } | step::State::Expired) =
-            (log, seen.snap.state)
-            && !self.has_blob(&format!("{prefix}/run-{n}.exit")).await?
+        let archived = matches!(log, LogName::Run(_)) || is_layer(&job);
+        if archived
+            && matches!(
+                seen.snap.state,
+                step::State::Exited { .. } | step::State::Expired
+            )
         {
-            seen.snap.state = step::State::Running;
-            seen.working = Some(Working::Archiving);
+            match self.blob(&format!("{prefix}/{}", exit_file(log))).await? {
+                None => {
+                    seen.snap.state = step::State::Running;
+                    seen.working = Some(Working::Archiving);
+                }
+                Some(raw) if is_layer(&job) => {
+                    if let Some(state) = step::State::record(String::from_utf8_lossy(&raw).trim()) {
+                        seen.snap.state = state;
+                    }
+                    seen.digest = self
+                        .blob(&format!("{prefix}/image"))
+                        .await?
+                        .map(|d| String::from_utf8_lossy(&d).trim().to_string());
+                }
+                Some(_) => {}
+            }
         }
         Ok(Some(seen))
     }
@@ -1657,6 +1684,7 @@ impl Broker {
     ) -> Result<(BuildId, Snapshot, ContextDigest)> {
         let cache = self.cache()?;
         let context = caller.workspace.context(&p.context)?;
+        let recipe = Recipe::of(&p)?;
         let dockerfile = RelPath::parse(p.dockerfile.as_deref().unwrap_or("Dockerfile"))?;
         let limit = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
         let volumes = cache_volumes(&p.caches)?;
@@ -1687,7 +1715,11 @@ impl Broker {
         } else {
             Starter::Sandbox
         };
-        let snapshots = cache.snapshots(&p.caches, &tar, starter)?;
+        let root = match recipe {
+            Recipe::Dockerfile => CACHE_ROOT,
+            Recipe::Layer { .. } => jobs::CACHES,
+        };
+        let snapshots = cache.snapshots(&p.caches, &tar, starter, root)?;
         let id = BuildId::fresh();
         let bud = bud_argv(
             &id,
@@ -1731,18 +1763,44 @@ impl Broker {
                 digest.as_str().to_string(),
             )]),
         };
-        let cache_dirs: Vec<String> = volumes.iter().map(|(dir, _)| dir.clone()).collect();
-        let spec = jobs::build_job(
-            &self.site,
-            &ident,
-            &jobs::BuildJob {
-                context_digest: digest.as_str(),
-                cache_dirs: &cache_dirs,
-                runner_args: &runner_args,
-                local_tag: &id.tag(),
-                limit_secs: limit_secs(limit) + RESTORE_SAVE_SECS,
-            },
-        );
+        let spec = match recipe {
+            Recipe::Dockerfile => {
+                let cache_dirs: Vec<String> = volumes.iter().map(|(dir, _)| dir.clone()).collect();
+                jobs::build_job(
+                    &self.site,
+                    &ident,
+                    &jobs::BuildJob {
+                        context_digest: digest.as_str(),
+                        cache_dirs: &cache_dirs,
+                        runner_args: &runner_args,
+                        local_tag: &id.tag(),
+                        limit_secs: limit_secs(limit) + RESTORE_SAVE_SECS,
+                    },
+                )
+            }
+            Recipe::Layer { base, script, path } => {
+                let base = pinned(base).await?;
+                let caches: Vec<(String, String)> = p
+                    .caches
+                    .iter()
+                    .map(|c| (c.name.clone(), c.path.clone()))
+                    .collect();
+                jobs::layer_job(
+                    &self.site,
+                    &ident,
+                    &jobs::LayerJob {
+                        context_digest: digest.as_str(),
+                        base: &base,
+                        script,
+                        path,
+                        env: &p.build_args,
+                        caches: &caches,
+                        ccache: p.ccache,
+                        limit_secs: limit_secs(limit),
+                    },
+                )
+            }
+        };
         self.create(&spec, &labels, inputs).await?;
         tracing::info!(
             "build {}: sandbox {} context {} {digest} ({} KiB)",
@@ -1880,7 +1938,7 @@ impl Broker {
         let ended = self.wait_ended(&name, PUSH_TIMEOUT).await;
         let pod = self.pod_of(&name).await.ok().flatten();
         let tail = match &pod {
-            Some(pod) => match self.pod_log(pod, LogName::Build).await {
+            Some(pod) => match self.pod_log(pod, jobs::BUILDER).await {
                 Ok(text) => summary(&Log::last(text.into_bytes(), SUMMARY_WINDOW)),
                 Err(e) => format!("{e:#}"),
             },
@@ -2255,7 +2313,7 @@ impl Broker {
                 .with_context(|| format!("cancelling queued job {name}"))?;
         } else {
             if let Some(pod) = self.pod_of(&name).await? {
-                match self.pod_log(&pod, t.log).await {
+                match self.pod_log(&pod, main_container(&job, t.log)).await {
                     Ok(text) => {
                         let file = self.log_file(&caller.sandbox, &t.build, t.log);
                         self.keep(&file, &text).await?;
@@ -2407,11 +2465,77 @@ fn exit_file(log: LogName) -> String {
     }
 }
 
-fn main_container(log: LogName) -> &'static str {
+/// The container of `job` that runs the step: the builder, a layer build's script, or a run.
+fn main_container(job: &Job, log: LogName) -> &'static str {
     match log {
+        LogName::Build if is_layer(job) => jobs::LAYER_CONTAINER,
         LogName::Build => jobs::BUILDER,
         LogName::Run(_) => jobs::RUN_CONTAINER,
     }
+}
+
+fn is_layer(job: &Job) -> bool {
+    label(&job.metadata, jobs::LABEL_RECIPE) == Some("layer")
+}
+
+/// How a build makes its image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recipe<'a> {
+    Dockerfile,
+    /// `script` in `base`, then `path` appended as a layer.
+    Layer {
+        base: &'a str,
+        script: &'a str,
+        path: &'a str,
+    },
+}
+
+impl<'a> Recipe<'a> {
+    fn of(p: &'a BuildParams) -> Result<Self> {
+        let Some(base) = p.base.as_deref() else {
+            if p.script.is_some() || p.path.is_some() {
+                bail!("script and path go with base");
+            }
+            return Ok(Self::Dockerfile);
+        };
+        if p.dockerfile.is_some() || p.target.is_some() {
+            bail!("a build with base runs a script; it takes no dockerfile or target");
+        }
+        let script = p
+            .script
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| anyhow!("a build with base needs a script"))?;
+        let path = p
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow!("a build with base needs a path"))?;
+        let plain = path.len() <= 255
+            && !path.contains(['\n', '\0'])
+            && path.strip_prefix('/').is_some_and(|rest| {
+                !rest.is_empty()
+                    && rest
+                        .trim_end_matches('/')
+                        .split('/')
+                        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+            });
+        if !plain || path.starts_with(FACTS_MOUNT) || path.starts_with("/buildit-") {
+            bail!(
+                "path {path:?} must be a plain absolute directory below / that buildit does not use"
+            );
+        }
+        Ok(Self::Layer { base, script, path })
+    }
+}
+
+/// `image` by digest, resolving a tag in its registry.
+async fn pinned(image: &str) -> Result<String> {
+    if image.contains("@sha256:") {
+        return Ok(image.to_string());
+    }
+    let digest =
+        crate::oci::resolve_digest(image, &oci_client::secrets::RegistryAuth::Anonymous).await?;
+    Ok(format!("{}@{digest}", crate::oci::repo_of(image)))
 }
 
 fn label<'a>(meta: &'a ObjectMeta, key: &str) -> Option<&'a str> {
@@ -3839,6 +3963,34 @@ mod tests {
             },
         ));
         assert_eq!(refused_by_admission(&push), Vec::<String>::new());
+        let layer_caches = [("deps".to_string(), "/src/app/.deps".to_string())];
+        let layer = pod_of(&jobs::layer_job(
+            &broker.site,
+            &ident(id.as_str()),
+            &jobs::LayerJob {
+                context_digest: "sha256:00",
+                base: "docker.io/acme/base@sha256:00",
+                script: "make",
+                path: "/src/app",
+                env: &BTreeMap::new(),
+                caches: &layer_caches,
+                ccache: true,
+                limit_secs: 60,
+            },
+        ));
+        assert_eq!(refused_by_admission(&layer), Vec::<String>::new());
+        let script_reads_the_token = {
+            let mut p = layer.clone();
+            p["spec"]["containers"][0]["volumeMounts"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"name": "cluster", "mountPath": "/t"}));
+            p
+        };
+        assert!(
+            !refused_by_admission(&script_reads_the_token).is_empty(),
+            "a layer build's script never mounts the account's token"
+        );
         let by_tag = {
             let mut p = run.clone();
             p["spec"]["containers"][0]["image"] = serde_json::json!("docker.io/library/alpine");
@@ -4292,7 +4444,7 @@ mod tests {
         let header = Some("Authorization: Bearer tok-1\n".to_string());
         assert_eq!(
             cache(CacheWriters::Run)
-                .snapshots(&caches, &tar, Starter::Run)
+                .snapshots(&caches, &tar, Starter::Run, CACHE_ROOT)
                 .unwrap(),
             Snapshots {
                 plan: plan(["save", "restore"]),
@@ -4301,7 +4453,7 @@ mod tests {
         );
         assert_eq!(
             cache(CacheWriters::Run)
-                .snapshots(&caches, &tar, Starter::Sandbox)
+                .snapshots(&caches, &tar, Starter::Sandbox, CACHE_ROOT)
                 .unwrap(),
             Snapshots {
                 plan: plan(["restore", "restore"]),
@@ -4310,7 +4462,7 @@ mod tests {
         );
         assert_eq!(
             cache(CacheWriters::All)
-                .snapshots(&caches, &tar, Starter::Sandbox)
+                .snapshots(&caches, &tar, Starter::Sandbox, CACHE_ROOT)
                 .unwrap(),
             Snapshots {
                 plan: plan(["save", "restore"]),
@@ -4319,7 +4471,7 @@ mod tests {
         );
         assert_eq!(
             cache(CacheWriters::Run)
-                .snapshots(&caches[2..], &tar, Starter::Run)
+                .snapshots(&caches[2..], &tar, Starter::Run, CACHE_ROOT)
                 .unwrap(),
             Snapshots::default()
         );
@@ -4524,7 +4676,7 @@ mod tests {
         std::fs::create_dir_all(work.join("svc")).unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            &library(
+            library(
                 "FROM docker.io/library/busybox:latest AS base\n\
              RUN echo hello-from-build && sleep 20 && mkdir -p /out && echo artifact > /out/a.txt\n\
              FROM base AS broken\n\
@@ -4663,6 +4815,87 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_a_layer_build_runs_its_script_in_the_base_and_appends_its_path() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(work.join("svc")).unwrap();
+        std::fs::write(work.join("svc/hello.txt"), "from the context\n").unwrap();
+        let file = tokens(&work, "tok-a sb-layer\n");
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        let (addr, _server) = serve(broker(client, &file, Some(&work))).await;
+        let a = |tool, args| call(&addr, "tok-a", tool, args);
+        a("clean", serde_json::json!({})).await.unwrap();
+
+        let base = library("docker.io/library/busybox:latest");
+        let refused = a(
+            "build",
+            serde_json::json!({ "context": "svc", "base": base, "script": "true", "path": "/" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.contains("plain absolute directory"), "{refused}");
+        let built = a(
+            "build",
+            serde_json::json!({
+                "context": "svc",
+                "base": base,
+                "path": "/app",
+                "script": "cat hello.txt > built.txt\necho \"$GREETING\" >> built.txt\n\
+                           echo cached > deps/x\necho layer-script-ran",
+                "build_args": { "GREETING": "hi from a build arg" },
+                "caches": [{ "name": "layer-deps", "path": "/app/deps", "scope": "cluster", "key": ["hello.txt"] }],
+            }),
+        )
+        .await
+        .unwrap();
+        let id = built["build_id"].as_str().unwrap().to_string();
+        let only_id = serde_json::json!({ "build_id": id });
+        let mut status = serde_json::Value::Null;
+        for _ in 0..150 {
+            status = a("status", only_id.clone()).await.unwrap();
+            if status["status"] != "running" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        assert_eq!(status["status"], "succeeded", "{status}");
+        assert!(
+            status["log_tail"]
+                .as_str()
+                .unwrap()
+                .contains("layer-script-ran"),
+            "{status}"
+        );
+
+        let ran = a(
+            "run",
+            serde_json::json!({
+                "build_id": id,
+                "cmd": ["sh", "-c", "cat /app/built.txt; ls -a /app"],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ran["exit"], 0, "{ran}");
+        let log = serde_json::json!({ "build_id": id, "which": "run:1" });
+        let lines = a("logs", log).await.unwrap()["lines"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(lines.contains(":from the context\n"), "{lines}");
+        assert!(lines.contains(":hi from a build arg\n"), "{lines}");
+        assert!(lines.contains(":built.txt\n"), "{lines}");
+        assert!(
+            !lines.contains(":deps\n"),
+            "a cache under path stays out of the layer: {lines}"
+        );
+        a("clean", serde_json::json!({})).await.unwrap();
+    }
+
     /// The shared cache an e2e build uses: a deployed one (BUILDIT_E2E_CACHE_URL and
     /// BUILDIT_E2E_CACHE_TOKEN_FILE), or one served from this host, which pods reach at
     /// BUILDIT_E2E_HOST_ADDR. True when it is local, so its blobs are on disk under `work`.
@@ -4724,7 +4957,7 @@ mod tests {
         source(7);
         std::fs::write(
             work.join("svc/Dockerfile"),
-            &library("FROM docker.io/library/alpine:3.20\n\
+            library("FROM docker.io/library/alpine:3.20\n\
              RUN apk add --no-cache ccache gcc musl-dev\n\
              COPY a.c /src/\n\
              ARG NONCE\n\
@@ -4810,6 +5043,9 @@ mod tests {
                     timeout_s: Some(600),
                     caches: caches(),
                     ccache: true,
+                    base: None,
+                    script: None,
+                    path: None,
                 },
                 wait: true,
             },
@@ -4937,7 +5173,7 @@ mod tests {
         pins(1);
         std::fs::write(
             work.join("svc/Dockerfile"),
-            &library("FROM docker.io/library/alpine:3.20\n\
+            library("FROM docker.io/library/alpine:3.20\n\
              COPY pins.txt /pins.txt\n\
              ARG NONCE\n\
              RUN if [ -s /deps/pins.txt ]; then \\\n\
@@ -4994,6 +5230,9 @@ mod tests {
                                 key: vec!["pins.txt".to_string()],
                             }],
                             ccache: false,
+                            base: None,
+                            script: None,
+                            path: None,
                         },
                         wait: true,
                     },
@@ -5175,7 +5414,7 @@ mod tests {
         .unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            &library("FROM docker.io/library/alpine:3.20\n\
+            library("FROM docker.io/library/alpine:3.20\n\
              RUN apk add --no-cache ccache gcc musl-dev python3\n\
              COPY informer.py buildtrace.py a.c /src/\n\
              ARG NONCE\n\
@@ -5280,7 +5519,7 @@ mod tests {
         std::fs::create_dir_all(work.join("svc")).unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            &library(
+            library(
                 "FROM docker.io/library/busybox:latest\nRUN echo deadline-build && sleep 600\n",
             ),
         )
@@ -5440,7 +5679,7 @@ mod tests {
         std::fs::create_dir_all(work.join("svc")).unwrap();
         std::fs::write(
             work.join("svc/Dockerfile"),
-            &library(
+            library(
                 "FROM docker.io/library/busybox:latest AS base\n\
              RUN echo hello-from-task && mkdir -p /out && echo artifact > /out/a.txt\n\
              FROM base AS slow\n\
@@ -5649,7 +5888,7 @@ mod tests {
         std::fs::create_dir_all(&svc).unwrap();
         std::fs::write(
             svc.join("Dockerfile"),
-            &library("FROM docker.io/library/busybox:latest\nCOPY run.sh /run.sh\nRUN echo socket-build\n"),
+            library("FROM docker.io/library/busybox:latest\nCOPY run.sh /run.sh\nRUN echo socket-build\n"),
         )
         .unwrap();
         std::fs::write(svc.join("run.sh"), "#!/bin/sh\necho ran-from-context\n").unwrap();
@@ -5678,6 +5917,9 @@ mod tests {
                 timeout_s: None,
                 caches: Vec::new(),
                 ccache: false,
+                base: None,
+                script: None,
+                path: None,
             },
             wait,
         };
