@@ -325,7 +325,7 @@ async fn locate_session(db: &Db, run: &crate::runs::model::RunningRun) -> Result
             }
         }
     }
-    crate::runs::blob_store::get_run_session(db.pool(), &run.run_id).await
+    crate::runs::blob_store::get_run_session(db.blobs(), &run.run_id).await
 }
 
 /// The pod leg of the completion edge: peek the pod's phase and, once terminal, keep its log and
@@ -457,7 +457,7 @@ async fn pod_session(
         let engine = crate::runs::workpod::engine_log_of(logs);
         if !engine.trim().is_empty()
             && let Err(e) =
-                crate::runs::blob_store::put_run_engine_log(db.pool(), &run.run_id, engine).await
+                crate::runs::blob_store::put_run_engine_log(db.blobs(), &run.run_id, engine).await
         {
             tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: keeping the pod's engine log failed");
         }
@@ -476,7 +476,7 @@ async fn pod_session(
     use crate::runs::workpod::RunSessionScrape;
     let reason = match crate::runs::workpod::extract_run_session_logs(&logs) {
         RunSessionScrape::Found(payload) => {
-            crate::runs::blob_store::put_run_session(db.pool(), &run.run_id, payload.as_bytes())
+            crate::runs::blob_store::put_run_session(db.blobs(), &run.run_id, payload.as_bytes())
                 .await?;
             tracing::info!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, "run completion: session log scraped from the finished pod's logs");
             return Ok(Some(payload));

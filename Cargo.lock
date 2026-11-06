@@ -2018,7 +2018,9 @@ version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-config",
  "aws-lc-rs",
+ "aws-sdk-s3",
  "axum",
  "base64 0.23.1",
  "cedar-policy",

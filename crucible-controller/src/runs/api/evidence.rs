@@ -91,13 +91,13 @@ pub(crate) async fn get_task_evidence(
     }
     let latest = mine.iter().max_by_key(|r| r.iter);
 
-    let session = task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id).await?;
+    let session = task_evidence::run_session(state.db.blobs(), &state.scratch_dir, &run_id).await?;
     let from_session = session
         .as_deref()
         .and_then(|s| task_evidence::session_result(s, &task));
 
     let bundle = crate::runs::blob_store::get_run_bundle(
-        state.db.pool(),
+        state.db.blobs(),
         &run_id,
         crucible_contract::ArtifactKind::RunFiles,
     )
@@ -235,7 +235,7 @@ async fn pod_run_log(
         let (tail, truncated) = task_evidence::tail_within_cap(text.as_bytes());
         return (Some(tail), truncated, None);
     }
-    match crate::runs::blob_store::get_run_engine_log(state.db.pool(), run_id).await {
+    match crate::runs::blob_store::get_run_engine_log(state.db.blobs(), run_id).await {
         Ok(Some(log)) => {
             let (tail, truncated) = task_evidence::tail_within_cap(log.as_bytes());
             return (Some(tail), truncated, None);
@@ -245,7 +245,7 @@ async fn pod_run_log(
             tracing::warn!(run_id, error = %e, "reading the stored engine log failed");
         }
     }
-    match crate::runs::blob_store::get_run_session(state.db.pool(), run_id).await {
+    match crate::runs::blob_store::get_run_session(state.db.blobs(), run_id).await {
         Ok(Some(session)) => {
             let (tail, truncated) = task_evidence::tail_within_cap(session.as_bytes());
             (Some(tail), truncated, None)
@@ -331,7 +331,7 @@ pub(crate) async fn get_run_files(
         return Ok(not_found(format!("run not found: {run_id}")));
     }
     let files = match crate::runs::blob_store::get_run_bundle(
-        state.db.pool(),
+        state.db.blobs(),
         &run_id,
         crucible_contract::ArtifactKind::RunFiles,
     )
@@ -374,7 +374,7 @@ pub(crate) async fn get_run_file(
         return Ok(not_found(format!("run not found: {run_id}")));
     }
     let body = match crate::runs::blob_store::get_run_bundle(
-        state.db.pool(),
+        state.db.blobs(),
         &run_id,
         crucible_contract::ArtifactKind::RunFiles,
     )

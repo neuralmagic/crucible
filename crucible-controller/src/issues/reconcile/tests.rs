@@ -2629,7 +2629,7 @@ async fn ingest_completion_scrapes_the_session_from_the_finished_pods_logs(
 
     assert!(outcome?, "the completion edge ingested");
     assert_eq!(
-        crate::runs::blob_store::get_run_engine_log(db.pool(), "run-40")
+        crate::runs::blob_store::get_run_engine_log(db.blobs(), "run-40")
             .await?
             .as_deref(),
         Some(
@@ -2638,7 +2638,7 @@ async fn ingest_completion_scrapes_the_session_from_the_finished_pods_logs(
         ),
         "the pod's own output before the delimiter outlives the pod"
     );
-    let written = crate::runs::blob_store::get_run_session(db.pool(), "run-40")
+    let written = crate::runs::blob_store::get_run_session(db.blobs(), "run-40")
         .await?
         .expect("the scraped session log was stored");
     assert!(
@@ -2663,7 +2663,7 @@ async fn ingest_completion_scrapes_the_session_from_the_finished_pods_logs(
 /// Store a gzipped run-session exactly where a pod's upload lands it: the run's own artifact.
 async fn seed_uploaded_run_session(pool: &sqlx::PgPool, run_id: &str, ndjson: &str) {
     crate::runs::blob_store::put_artifact_bytes(
-        pool,
+        &crate::runs::blob_store::BlobStore::new(pool.clone()),
         &crate::runs::blob_store::ArtifactOwner::Run {
             run_id: run_id.to_string(),
         },
@@ -2718,7 +2718,7 @@ async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Resul
         "the completion edge ingested the uploaded session"
     );
     assert_eq!(
-        crate::runs::blob_store::get_run_engine_log(db.pool(), "run-43")
+        crate::runs::blob_store::get_run_engine_log(db.blobs(), "run-43")
             .await?
             .as_deref(),
         Some("podman login noise\n"),
@@ -2989,7 +2989,7 @@ async fn ingest_completion_parks_loud_when_a_terminal_pod_has_no_session(
 
     assert!(!outcome?, "nothing ingested");
     assert!(
-        crate::runs::blob_store::get_run_session(db.pool(), "run-41")
+        crate::runs::blob_store::get_run_session(db.blobs(), "run-41")
             .await?
             .is_none()
     );
@@ -3160,7 +3160,7 @@ async fn ingest_completion_waits_quietly_while_the_pod_still_runs(pool: PgPool) 
         Status::Running
     );
     assert!(
-        crate::runs::blob_store::get_run_session(db.pool(), "run-42")
+        crate::runs::blob_store::get_run_session(db.blobs(), "run-42")
             .await?
             .is_none()
     );
@@ -7988,7 +7988,7 @@ async fn a_restart_adopts_the_local_runs_it_orphaned(pool: PgPool) -> Result<()>
         .fetch_one(db.pool())
         .await?;
     assert_eq!(
-        crate::runs::blob_store::get_run_session(db.pool(), &run_id).await?,
+        crate::runs::blob_store::get_run_session(db.blobs(), &run_id).await?,
         Some(playbook_log("finished")),
         "a folded local session is stored like a pod's, so a rerun can read it"
     );

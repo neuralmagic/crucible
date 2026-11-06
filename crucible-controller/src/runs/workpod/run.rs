@@ -1690,13 +1690,13 @@ pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
 pub(crate) async fn apply_turn_artifacts(
     report: &mut engine::Scraped,
     manifest: &[ArtifactRef],
-    pool: &sqlx::PgPool,
+    blobs: &crate::runs::blob_store::BlobStore,
     pod: &str,
 ) -> Result<(), String> {
     let survived = report.survived();
     for art in manifest {
         match art.kind {
-            ArtifactKind::ScopePack => match resolve_turn_artifact(pool, pod, art).await {
+            ArtifactKind::ScopePack => match resolve_turn_artifact(blobs, pod, art).await {
                 Ok(bytes) => {
                     report.pack_tgz = Some(bytes);
                     report.pack_error = None;
@@ -1710,7 +1710,7 @@ pub(crate) async fn apply_turn_artifacts(
                     }
                 }
             },
-            ArtifactKind::ScopeTranscript => match resolve_turn_artifact(pool, pod, art).await {
+            ArtifactKind::ScopeTranscript => match resolve_turn_artifact(blobs, pod, art).await {
                 Ok(bytes) => report.transcript_gz = Some(bytes),
                 Err(problem) => {
                     tracing::warn!(
@@ -1736,7 +1736,7 @@ pub(crate) async fn apply_turn_artifacts(
 /// manifest.
 #[cfg(feature = "autoresearch")]
 async fn resolve_turn_artifact(
-    pool: &sqlx::PgPool,
+    blobs: &crate::runs::blob_store::BlobStore,
     pod: &str,
     art: &ArtifactRef,
 ) -> Result<Vec<u8>, String> {
@@ -1749,7 +1749,7 @@ async fn resolve_turn_artifact(
     let owner = crate::runs::blob_store::ArtifactOwner::PodEvidence {
         pod: pod.to_string(),
     };
-    let payload = crate::runs::blob_store::get_artifact(pool, &owner, art.kind.as_str())
+    let payload = crate::runs::blob_store::get_artifact(blobs, &owner, art.kind.as_str())
         .await
         .map_err(|e| format!("reading the uploaded {}: {e:#}", art.kind))?
         .ok_or_else(|| format!("the turn uploaded no {}", art.kind))?;

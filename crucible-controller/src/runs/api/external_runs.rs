@@ -93,7 +93,7 @@ pub(crate) async fn put_external_run_session(
 
     // Evidence first, fold second: the session lands in the store before any row points at it.
     if let Err(e) =
-        crate::runs::blob_store::put_run_session(state.db.pool(), &run_id, body.as_bytes()).await
+        crate::runs::blob_store::put_run_session(state.db.blobs(), &run_id, body.as_bytes()).await
     {
         return bad_gateway(format!("storing the session: {e:#}"));
     }

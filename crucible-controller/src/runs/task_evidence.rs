@@ -153,11 +153,11 @@ pub fn session_result(session: &str, task: &str) -> Option<SessionTaskResult> {
 /// directory, because a run whose session never reached the store still has its evidence on this
 /// disk.
 pub async fn run_session(
-    pool: &sqlx::PgPool,
+    blobs: &crate::runs::blob_store::BlobStore,
     scratch_root: &Path,
     run_id: &str,
 ) -> anyhow::Result<Option<String>> {
-    match crate::runs::blob_store::get_run_session(pool, run_id).await? {
+    match crate::runs::blob_store::get_run_session(blobs, run_id).await? {
         Some(stored) => Ok(Some(stored)),
         None => Ok(local_session(scratch_root, run_id).await),
     }

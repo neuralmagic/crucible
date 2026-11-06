@@ -5,6 +5,8 @@ use crate::config::ControllerCfg;
 #[cfg(feature = "autoresearch")]
 use crate::issues::engine;
 use crate::playbooks::providers::{AgentSelection, ModelRole, ResolvedModel};
+#[cfg(feature = "autoresearch")]
+use crate::runs::blob_store::BlobStore;
 use anyhow::Result;
 use crucible_contract::inference::{
     EnvName, InferenceBinding, InferenceProtocol as WireProtocol, InferenceRole, ResolvedInference,
@@ -655,7 +657,7 @@ fn survived_report() -> engine::Scraped {
 #[cfg(feature = "autoresearch")]
 async fn drop_artifact(pool: &sqlx::PgPool, pod: &str, kind: ArtifactKind, bytes: &[u8]) {
     crate::runs::blob_store::put_artifact_bytes(
-        pool,
+        &BlobStore::new(pool.clone()),
         &crate::runs::blob_store::ArtifactOwner::PodEvidence {
             pod: pod.to_string(),
         },
@@ -679,9 +681,14 @@ async fn an_uploaded_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) 
         delivered: true,
     }];
     let mut report = survived_report();
-    apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
-        .await
-        .expect("a valid uploaded pack is accepted");
+    apply_turn_artifacts(
+        &mut report,
+        &manifest,
+        &BlobStore::new(pool.clone()),
+        "pod-x",
+    )
+    .await
+    .expect("a valid uploaded pack is accepted");
     assert_eq!(report.pack_tgz.as_deref(), Some(&pack[..]));
     assert!(report.pack_error.is_none());
 }
@@ -697,9 +704,14 @@ async fn survived_scope_with_a_missing_delivered_pack_fails_loudly(pool: sqlx::P
         delivered: true,
     }];
     let mut report = survived_report();
-    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
-        .await
-        .expect_err("a survival's missing pack is fatal");
+    let err = apply_turn_artifacts(
+        &mut report,
+        &manifest,
+        &BlobStore::new(pool.clone()),
+        "pod-x",
+    )
+    .await
+    .expect_err("a survival's missing pack is fatal");
     assert!(err.contains("scope pack not recovered"), "{err}");
 }
 
@@ -714,9 +726,14 @@ async fn a_digest_mismatch_fails_loudly(pool: sqlx::PgPool) {
         delivered: true,
     }];
     let mut report = survived_report();
-    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
-        .await
-        .expect_err("digest mismatch is fatal for a survival");
+    let err = apply_turn_artifacts(
+        &mut report,
+        &manifest,
+        &BlobStore::new(pool.clone()),
+        "pod-x",
+    )
+    .await
+    .expect_err("digest mismatch is fatal for a survival");
     assert!(err.contains("integrity mismatch"), "{err}");
 }
 
@@ -730,9 +747,14 @@ async fn an_undelivered_pack_on_a_survival_fails_loudly(pool: sqlx::PgPool) {
         delivered: false,
     }];
     let mut report = survived_report();
-    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
-        .await
-        .expect_err("delivered:false pack on a survival is fatal");
+    let err = apply_turn_artifacts(
+        &mut report,
+        &manifest,
+        &BlobStore::new(pool.clone()),
+        "pod-x",
+    )
+    .await
+    .expect_err("delivered:false pack on a survival is fatal");
     assert!(err.contains("delivered:false"), "{err}");
 }
 
@@ -758,9 +780,14 @@ async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
     ];
     let mut report = survived_report();
     // No error: the missing transcript is logged, not fatal.
-    apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
-        .await
-        .expect("transcript problem is best-effort");
+    apply_turn_artifacts(
+        &mut report,
+        &manifest,
+        &BlobStore::new(pool.clone()),
+        "pod-x",
+    )
+    .await
+    .expect("transcript problem is best-effort");
     assert_eq!(report.pack_tgz.as_deref(), Some(&pack[..]));
     assert!(
         report.transcript_gz.is_none(),
@@ -772,7 +799,7 @@ async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn an_empty_manifest_leaves_the_report_untouched(pool: sqlx::PgPool) {
     let mut report = survived_report();
-    apply_turn_artifacts(&mut report, &[], &pool, "pod-x")
+    apply_turn_artifacts(&mut report, &[], &BlobStore::new(pool.clone()), "pod-x")
         .await
         .expect("no-op");
     assert!(report.pack_tgz.is_none());
@@ -809,7 +836,14 @@ async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
     let cfg = pod_cfg(&profile, "img");
     match crate::runs::workpod::spec::ScopeSpec
-        .watch(&scope_dispatcher, &cfg, &pool, "hub", "ns", "pod")
+        .watch(
+            &scope_dispatcher,
+            &cfg,
+            &BlobStore::new(pool.clone()),
+            "hub",
+            "ns",
+            "pod",
+        )
         .await?
     {
         crate::runs::workpod::spec::TurnRunOutcome::Result(r) => {
@@ -835,7 +869,14 @@ async fn adoption_reads_the_result_from_pod_status(pool: sqlx::PgPool) -> Result
         deleted,
     };
     match crate::runs::workpod::spec::GroundedRankSpec
-        .watch(&verdict_dispatcher, &cfg, &pool, "hub", "ns", "pod")
+        .watch(
+            &verdict_dispatcher,
+            &cfg,
+            &BlobStore::new(pool.clone()),
+            "hub",
+            "ns",
+            "pod",
+        )
         .await?
     {
         crate::runs::workpod::spec::TurnRunOutcome::Result(v) => {

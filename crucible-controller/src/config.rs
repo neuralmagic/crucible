@@ -269,6 +269,11 @@ pub struct ControllerCfg {
         default_value = "postgres://localhost:5432/crucible"
     )]
     pub db: String,
+    /// `s3://bucket[/prefix]` for run evidence payloads (session logs, captured files, git
+    /// memory, engine logs, scope packs). Unset keeps them in Postgres. Credentials, region and
+    /// `AWS_ENDPOINT_URL` come from the standard AWS environment.
+    #[arg(long = "evidence-bucket", env = "CONTROLLER_EVIDENCE_BUCKET")]
+    pub evidence_bucket: Option<crate::runs::blob_store::objects::BucketUri>,
     /// A repo (`owner/repo`) to watch at boot; repeatable, or comma-separated via the env var.
     /// **Seed-only** (Lane O3): consulted exactly once, at startup, to idempotently seed a
     /// watched row in the `repos` table (`crate::issues::repo_watch::seed_watched_repos`) — never overwriting a row an
@@ -947,6 +952,18 @@ impl ControllerCfg {
     /// The Postgres ledger URL (`--db` / `DATABASE_URL`).
     pub fn db_url(&self) -> &str {
         &self.db
+    }
+
+    /// Open the ledger at [`Self::db_url`], with the evidence bucket attached when one is set.
+    pub async fn open_db(&self) -> Result<crate::Db> {
+        let db = crate::Db::open(self.db_url()).await?;
+        let Some(location) = &self.evidence_bucket else {
+            return Ok(db);
+        };
+        let objects =
+            crate::runs::blob_store::objects::ObjectStore::from_env(location.clone()).await;
+        objects.check().await?;
+        Ok(db.with_object_store(objects))
     }
 
     /// The scratch root: `--scratch-dir` when set, else `state_dir`.

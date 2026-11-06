@@ -243,8 +243,12 @@ async fn seed_task_graph(db: &Db) -> anyhow::Result<()> {
         r#"{"v":1,"kind":"task_result","task":"decide","status":"skipped","plan_version":1,"task_kind":"engine_decide","iter":2,"attempts":0,"cost_usd":0.0,"note":"measurement failed","secs":0.0}"#,
     ]
     .join("\n");
-    crucible_controller::runs::blob_store::put_run_session(db.pool(), "run-demo-1", log.as_bytes())
-        .await?;
+    crucible_controller::runs::blob_store::put_run_session(
+        db.blobs(),
+        "run-demo-1",
+        log.as_bytes(),
+    )
+    .await?;
     crucible_controller::runs::ingest::ingest_session(
         db,
         &crucible_controller::runs::ingest::IngestTarget {

@@ -98,7 +98,7 @@ pub(crate) trait TurnSpec: Send + Sync {
         &self,
         terminal: &TerminalState,
         logs: &str,
-        pool: &sqlx::PgPool,
+        blobs: &crate::runs::blob_store::BlobStore,
         pod: &str,
     ) -> Result<TurnRunOutcome<Self::Result>>;
 
@@ -107,7 +107,7 @@ pub(crate) trait TurnSpec: Send + Sync {
         &self,
         d: &dyn PodDispatcher,
         cfg: &ControllerCfg,
-        pool: &sqlx::PgPool,
+        blobs: &crate::runs::blob_store::BlobStore,
         cluster: &str,
         ns: &str,
         name: &str,
@@ -129,7 +129,7 @@ pub(crate) trait TurnSpec: Send + Sync {
             .logs(cluster, ns, name)
             .await
             .with_context(|| format!("reading the {}'s logs", self.pod_noun()))?;
-        self.parse(&terminal, &logs, pool, name).await
+        self.parse(&terminal, &logs, blobs, name).await
     }
 
     /// Adopt an orphaned running pod for this issue → fold through the one collect tail.
@@ -157,7 +157,14 @@ pub(crate) trait TurnSpec: Send + Sync {
         let cluster = running.cluster.clone();
         let ns = d.pod_namespace(&cluster, &cfg.pod_namespace).await?;
         let outcome = self
-            .watch(d.as_ref(), cfg, db.pool(), &cluster, &ns, &running.pod_name)
+            .watch(
+                d.as_ref(),
+                cfg,
+                db.blobs(),
+                &cluster,
+                &ns,
+                &running.pod_name,
+            )
             .await;
         collect(
             self,
@@ -825,7 +832,7 @@ impl TurnSpec for GroundedRankSpec {
         &self,
         terminal: &TerminalState,
         logs: &str,
-        _pool: &sqlx::PgPool,
+        _blobs: &crate::runs::blob_store::BlobStore,
         pod: &str,
     ) -> Result<TurnRunOutcome<Self::Result>> {
         match collect_verdict(terminal.termination_message(), logs) {
@@ -901,13 +908,14 @@ impl TurnSpec for ScopeSpec {
         &self,
         terminal: &TerminalState,
         logs: &str,
-        pool: &sqlx::PgPool,
+        blobs: &crate::runs::blob_store::BlobStore,
         pod: &str,
     ) -> Result<TurnRunOutcome<Self::Result>> {
         match collect_scope_report(terminal.termination_message(), logs) {
             Ok(mut report) => {
                 let manifest = manifest_from_message(terminal.termination_message());
-                if let Err(reason) = apply_turn_artifacts(&mut report, &manifest, pool, pod).await {
+                if let Err(reason) = apply_turn_artifacts(&mut report, &manifest, blobs, pod).await
+                {
                     return Ok(TurnRunOutcome::NoResult {
                         reason: format!("scope turn pod {pod}: {reason}"),
                     });
