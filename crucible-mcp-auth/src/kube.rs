@@ -19,7 +19,9 @@ use k8s_openapi::api::authorization::v1::{
 use kube::api::{Api, ApiResource, DynamicObject, ListParams, PostParams};
 use kube::core::GroupVersionKind;
 use serde_json::Value;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// Claim naming the caller's Kubernetes user.
 pub const USER_CLAIM: &str = "kube_user";
@@ -33,6 +35,10 @@ const OPENSHIFT_OAUTH: &str = "system:authenticated:oauth";
 
 const ALLOW_TTL: Duration = Duration::from_secs(30);
 const GROUPS_TTL: Duration = Duration::from_secs(15);
+/// Attempts at one review. The second rides out an API server that dropped the request or
+/// answered 5xx; it is never taken against a server that answered.
+const REVIEW_ATTEMPTS: u32 = 2;
+const REVIEW_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 /// Where a caller's groups come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,7 +174,13 @@ pub struct SubjectAccessReviewer {
     client: kube::Client,
     groups: GroupSource,
     allowed: moka::future::Cache<DecisionKey, ()>,
-    openshift_groups: moka::future::Cache<(), std::sync::Arc<Vec<DynamicObject>>>,
+    openshift_groups: Mutex<Option<GroupCache>>,
+}
+
+/// The Group objects last listed, and when.
+struct GroupCache {
+    at: Instant,
+    items: Arc<Vec<DynamicObject>>,
 }
 
 impl SubjectAccessReviewer {
@@ -180,9 +192,7 @@ impl SubjectAccessReviewer {
                 .time_to_live(ALLOW_TTL)
                 .max_capacity(10_000)
                 .build(),
-            openshift_groups: moka::future::Cache::builder()
-                .time_to_live(GROUPS_TTL)
-                .build(),
+            openshift_groups: Mutex::new(None),
         }
     }
 
@@ -198,11 +208,12 @@ impl SubjectAccessReviewer {
         Ok(KubeIdentity { user, groups })
     }
 
-    async fn all_openshift_groups(
-        &self,
-    ) -> Result<std::sync::Arc<Vec<DynamicObject>>, KubeIdentityError> {
-        if let Some(cached) = self.openshift_groups.get(&()).await {
-            return Ok(cached);
+    async fn all_openshift_groups(&self) -> Result<Arc<Vec<DynamicObject>>, KubeIdentityError> {
+        let mut cached = self.openshift_groups.lock().await;
+        if let Some(groups) = cached.as_ref()
+            && groups.at.elapsed() < GROUPS_TTL
+        {
+            return Ok(Arc::clone(&groups.items));
         }
         let gvk = GroupVersionKind::gvk("user.openshift.io", "v1", "Group");
         let api: Api<DynamicObject> =
@@ -211,9 +222,12 @@ impl SubjectAccessReviewer {
             .list(&ListParams::default())
             .await
             .map_err(KubeIdentityError::GroupLookup)?;
-        let groups = std::sync::Arc::new(listed.items);
-        self.openshift_groups.insert((), groups.clone()).await;
-        Ok(groups)
+        let items = Arc::new(listed.items);
+        *cached = Some(GroupCache {
+            at: Instant::now(),
+            items: Arc::clone(&items),
+        });
+        Ok(items)
     }
 
     /// Allowed decisions are cached for 30 seconds; denials never are, so a new RoleBinding takes
@@ -236,12 +250,7 @@ impl SubjectAccessReviewer {
         if self.allowed.contains_key(&key) {
             return Ok(true);
         }
-        let api: Api<SubjectAccessReview> = Api::all(self.client.clone());
-        let reviewed = api
-            .create(&PostParams::default(), &review_request(&identity, check))
-            .await
-            .map_err(KubeIdentityError::Review)?;
-        let allowed = reviewed.status.is_some_and(|s| s.allowed);
+        let allowed = self.create_review(&identity, check).await?;
         tracing::debug!(user = %identity.user, rule = %check.rule, verb = %check.verb,
             resource = %check.resource, namespace = %check.namespace, name = %check.name, allowed,
             "subject access review");
@@ -249,6 +258,43 @@ impl SubjectAccessReviewer {
             self.allowed.insert(key, ()).await;
         }
         Ok(allowed)
+    }
+
+    /// Ask the API server, once more when it failed to answer at all.
+    async fn create_review(
+        &self,
+        identity: &KubeIdentity,
+        check: &AccessCheck,
+    ) -> Result<bool, KubeIdentityError> {
+        let api: Api<SubjectAccessReview> = Api::all(self.client.clone());
+        let request = review_request(identity, check);
+        let mut attempt = 1;
+        loop {
+            match api.create(&PostParams::default(), &request).await {
+                Ok(reviewed) => return Ok(reviewed.status.is_some_and(|s| s.allowed)),
+                Err(error) if attempt < REVIEW_ATTEMPTS && unanswered(&error) => {
+                    tracing::warn!(error = %error, attempt, user = %identity.user,
+                        rule = %check.rule, namespace = %check.namespace,
+                        "subject access review unanswered; retrying");
+                    attempt += 1;
+                    tokio::time::sleep(REVIEW_RETRY_DELAY).await;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, user = %identity.user, rule = %check.rule,
+                        namespace = %check.namespace, "subject access review failed; refusing");
+                    return Err(KubeIdentityError::Review(error));
+                }
+            }
+        }
+    }
+}
+
+/// Whether the API server failed to answer the review: unreachable, overloaded, or erroring.
+fn unanswered(error: &kube::Error) -> bool {
+    match error {
+        kube::Error::Service(_) | kube::Error::HyperError(_) => true,
+        kube::Error::Api(status) => status.code >= 500 || status.code == 429,
+        _ => false,
     }
 }
 
@@ -393,5 +439,85 @@ mod tests {
             attrs,
             json!({"group": "", "resource": "localqueues", "verb": "use"})
         );
+    }
+
+    /// A kube client answering each request with the next scripted `(status, body)`, counting how
+    /// many it served.
+    fn scripted(answers: Vec<(u16, Value)>) -> (kube::Client, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        let service = tower::service_fn(move |_request: http::Request<kube::client::Body>| {
+            let counter = Arc::clone(&counter);
+            let answers = answers.clone();
+            async move {
+                let index = counter.fetch_add(1, Ordering::SeqCst);
+                let (code, body) = answers[index.min(answers.len() - 1)].clone();
+                let response = http::Response::builder()
+                    .status(code)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(http_body_util::Full::new(bytes::Bytes::from(
+                        body.to_string(),
+                    )))
+                    .expect("a response");
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+        (kube::Client::new(service, "default"), seen)
+    }
+
+    fn answer(allowed: bool) -> Value {
+        json!({
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SubjectAccessReview",
+            "metadata": {},
+            "spec": {},
+            "status": {"allowed": allowed},
+        })
+    }
+
+    fn failure() -> Value {
+        json!({
+            "apiVersion": "v1",
+            "kind": "Status",
+            "status": "Failure",
+            "message": "etcdserver: request timed out",
+            "code": 500,
+        })
+    }
+
+    fn alice() -> Principal {
+        principal(json!({"sub": "s", "kube_user": "alice"}))
+    }
+
+    #[tokio::test]
+    async fn a_review_the_api_server_could_not_answer_is_asked_again() {
+        let (client, seen) = scripted(vec![(500, failure()), (200, answer(true))]);
+        let reviewer = SubjectAccessReviewer::new(client, GroupSource::Token);
+        assert!(reviewer.allowed(&alice(), &check()).await.unwrap());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_denial_is_an_answer_and_is_not_asked_again() {
+        let (client, seen) = scripted(vec![(200, answer(false))]);
+        let reviewer = SubjectAccessReviewer::new(client, GroupSource::Token);
+        assert!(!reviewer.allowed(&alice(), &check()).await.unwrap());
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_review_the_api_server_forbids_asking_is_not_asked_again() {
+        let (client, seen) = scripted(vec![(
+            403,
+            json!({"apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "message": "cannot create subjectaccessreviews", "code": 403}),
+        )]);
+        let reviewer = SubjectAccessReviewer::new(client, GroupSource::Token);
+        assert!(matches!(
+            reviewer.allowed(&alice(), &check()).await,
+            Err(KubeIdentityError::Review(_))
+        ));
+        assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

@@ -77,7 +77,13 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
         Some(method) => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             if let Err(refusal) = decide(&guard, &mut message, &principal, method).await {
-                tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "request refused");
+                tracing::info!(
+                    sub = %principal.subject,
+                    presenter = principal.presenter(),
+                    run = principal.claims.get("run_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                    %refusal,
+                    "request refused"
+                );
                 return refuse(&guard, &parts.headers, id, method, refusal);
             }
             false
