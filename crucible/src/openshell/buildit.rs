@@ -114,21 +114,19 @@ impl Buildit<'_> {
         if let Some(cache) = &self.site.cache {
             args.extend(["--cache-url", &cache.url].map(String::from));
             let writers = match cache.writers {
-                CacheWriters::None => None,
-                CacheWriters::Run => Some("run"),
-                CacheWriters::All => Some("all"),
+                CacheWriters::None => "none",
+                CacheWriters::Run => "run",
+                CacheWriters::All => "all",
             };
-            if let Some(writers) = writers {
-                args.extend(
-                    [
-                        "--cache-token-file",
-                        crucible_contract::buildit::CACHE_TOKEN_FILE,
-                        "--cache-writers",
-                        writers,
-                    ]
-                    .map(String::from),
-                );
-            }
+            args.extend(
+                [
+                    "--cache-token-file",
+                    crucible_contract::buildit::CACHE_TOKEN_FILE,
+                    "--cache-writers",
+                    writers,
+                ]
+                .map(String::from),
+            );
         }
         if let Some(socket) = self.socket {
             for (flag, path) in [
@@ -280,8 +278,12 @@ mod tests {
             .args(&run, "/p")
             .unwrap();
         assert_eq!(flag(&args, "--cache-url").as_deref(), Some(url));
-        assert!(!args.contains(&"--cache-token-file".to_string()));
-        assert!(!args.contains(&"--cache-writers".to_string()));
+        assert_eq!(
+            flag(&args, "--cache-token-file").as_deref(),
+            Some("/etc/buildit-cache/token"),
+            "buildit uploads contexts and its pods archive results with the token"
+        );
+        assert_eq!(flag(&args, "--cache-writers").as_deref(), Some("none"));
         let args = buildit(&cached(CacheWriters::Run))
             .args(&run, "/p")
             .unwrap();

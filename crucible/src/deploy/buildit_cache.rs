@@ -10,7 +10,9 @@ use k8s_openapi::api::apps::v1 as apps;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::networking::v1 as networking;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+    LabelSelector, LabelSelectorRequirement, ObjectMeta,
+};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -254,7 +256,8 @@ fn service(namespace: &str) -> core::Service {
     }
 }
 
-/// Ingress to the cache from builder pods in `builder_namespace` only.
+/// Ingress to the cache from builder pods in `builder_namespace` and from the runs' loop pods
+/// beside it, whose `buildit mcp` uploads build contexts and reads what builds archived.
 fn netpol(namespace: &str, builder_namespace: &str) -> networking::NetworkPolicy {
     networking::NetworkPolicy {
         metadata: meta(namespace),
@@ -265,7 +268,7 @@ fn netpol(namespace: &str, builder_namespace: &str) -> networking::NetworkPolicy
             }),
             policy_types: Some(vec!["Ingress".to_string()]),
             ingress: Some(vec![networking::NetworkPolicyIngressRule {
-                from: Some(vec![builder_peer(builder_namespace)]),
+                from: Some(vec![builder_peer(builder_namespace), loop_peer()]),
                 ports: Some(vec![networking::NetworkPolicyPort {
                     port: Some(IntOrString::Int(BuilditCacheCfg::PORT.into())),
                     protocol: Some("TCP".to_string()),
@@ -291,6 +294,21 @@ fn builder_peer(builder_namespace: &str) -> networking::NetworkPolicyPeer {
                 "buildit.dev/managed-by".to_string(),
                 "mcp".to_string(),
             )])),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// A run's loop pod, in the cache's own namespace.
+fn loop_peer() -> networking::NetworkPolicyPeer {
+    networking::NetworkPolicyPeer {
+        pod_selector: Some(LabelSelector {
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: crate::deploy::render::gateway::RUN_LABEL.to_string(),
+                operator: "Exists".to_string(),
+                values: None,
+            }]),
             ..Default::default()
         }),
         ..Default::default()
@@ -433,6 +451,10 @@ mod tests {
                         "kubernetes.io/metadata.name": "crucible-builds"
                     } },
                     "podSelector": { "matchLabels": { "buildit.dev/managed-by": "mcp" } }
+                }, {
+                    "podSelector": { "matchExpressions": [
+                        { "key": "crucible/run", "operator": "Exists" }
+                    ] }
                 }],
                 "ports": [{ "port": 8850, "protocol": "TCP" }]
             }])

@@ -5,20 +5,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{
-    Api, AttachParams, AttachedProcess, DeleteParams, ListParams, LogParams, PostParams,
-};
+use kube::api::{Api, AttachParams, AttachedProcess, DeleteParams, ListParams, PostParams};
 use kube::runtime::wait::{await_condition, conditions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::backend::Backend;
-
-pub struct ExecOutput {
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    // None when stdout went past the limit and the process was cut off
-    pub code: Option<i32>,
-}
 
 pub struct BuilderPod {
     pods: Api<Pod>,
@@ -58,9 +49,6 @@ impl Stderr {
     }
 }
 
-/// The scheduling gate Kueue holds a pod behind until it admits the pod's workload.
-pub const KUEUE_GATE: &str = "kueue.x-k8s.io/admission";
-
 const CREATE_TRIES: u32 = 4;
 const CREATE_BACKOFF: Duration = Duration::from_secs(2);
 
@@ -72,23 +60,6 @@ pub(crate) fn transient(e: &kube::Error) -> bool {
         kube::Error::HyperError(_) | kube::Error::Service(_) => true,
         _ => false,
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum Release {
-    Released,
-    /// Still gated when the wait ended, by these gates.
-    Held(Vec<String>),
-}
-
-fn scheduling_gates(pod: &Pod) -> Vec<&str> {
-    pod.spec
-        .as_ref()
-        .and_then(|s| s.scheduling_gates.as_deref())
-        .unwrap_or_default()
-        .iter()
-        .map(|g| g.name.as_str())
-        .collect()
 }
 
 pub(crate) fn unique_name() -> String {
@@ -131,41 +102,6 @@ impl BuilderPod {
             }
         }
         Ok(Self { pods, name })
-    }
-
-    pub fn existing(client: kube::Client, namespace: &str, name: &str) -> Self {
-        Self {
-            pods: Api::namespaced(client, namespace),
-            name: name.to_string(),
-        }
-    }
-
-    /// Wait until no scheduling gate holds the pod, as Kueue holds one it has not admitted.
-    pub async fn wait_ungated(&self, timeout: Duration) -> Result<Release> {
-        let ungated = |p: Option<&Pod>| p.is_none_or(|p| scheduling_gates(p).is_empty());
-        let watched = tokio::time::timeout(
-            timeout,
-            await_condition(self.pods.clone(), &self.name, ungated),
-        )
-        .await;
-        match watched {
-            Ok(Ok(Some(_))) => Ok(Release::Released),
-            Ok(Ok(None)) => bail!("pod {} was deleted before it was scheduled", self.name),
-            Ok(Err(e)) => Err(e).with_context(|| format!("waiting for pod {}", self.name)),
-            Err(_) => {
-                let pod = self
-                    .pods
-                    .get(&self.name)
-                    .await
-                    .with_context(|| format!("reading pod {}", self.name))?;
-                Ok(Release::Held(
-                    scheduling_gates(&pod)
-                        .into_iter()
-                        .map(String::from)
-                        .collect(),
-                ))
-            }
-        }
     }
 
     pub async fn wait_ready(&self, timeout: Duration) -> Result<()> {
@@ -275,38 +211,6 @@ impl BuilderPod {
         self.finish(attached, stderr, argv).await
     }
 
-    pub async fn exec_with_stdin_capture(&self, argv: &[String], data: &[u8]) -> Result<String> {
-        let params = AttachParams::default()
-            .stdin(true)
-            .stdout(true)
-            .stderr(true);
-        let mut attached = self
-            .pods
-            .exec(&self.name, argv.iter().map(String::as_str), &params)
-            .await
-            .with_context(|| format!("exec `{}` in pod {}", argv.join(" "), self.name))?;
-        let stderr = Stderr::drain(&mut attached);
-        let mut stdout = attached
-            .stdout()
-            .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
-        let captured = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            tokio::io::copy(&mut stdout, &mut buf).await.map(|_| buf)
-        });
-        let mut stdin = attached
-            .stdin()
-            .ok_or_else(|| anyhow!("exec stdin stream missing"))?;
-        stdin.write_all(data).await.context("writing exec stdin")?;
-        stdin.shutdown().await.context("closing exec stdin")?;
-        drop(stdin);
-        let buf = captured
-            .await
-            .context("joining exec stdout")?
-            .context("capturing exec stdout")?;
-        self.finish(attached, stderr, argv).await?;
-        String::from_utf8(buf).context("exec output was not utf-8")
-    }
-
     pub async fn exec_capture(&self, argv: &[String]) -> Result<String> {
         let params = AttachParams::default().stdout(true).stderr(true);
         let mut attached = self
@@ -324,57 +228,6 @@ impl BuilderPod {
             .context("capturing exec stdout")?;
         self.finish(attached, stderr, argv).await?;
         String::from_utf8(buf).context("exec output was not utf-8")
-    }
-
-    // stdout up to `limit` bytes, stderr, and the exit status
-    pub async fn exec_output(&self, argv: &[String], limit: u64) -> Result<ExecOutput> {
-        let params = AttachParams::default().stdout(true).stderr(true);
-        let mut attached = self
-            .pods
-            .exec(&self.name, argv.iter().map(String::as_str), &params)
-            .await
-            .with_context(|| format!("exec `{}` in pod {}", argv.join(" "), self.name))?;
-        let stdout = attached
-            .stdout()
-            .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
-        let mut stderr = attached
-            .stderr()
-            .ok_or_else(|| anyhow!("exec stderr stream missing"))?;
-        let err = tokio::spawn(async move {
-            let mut buf = Vec::new();
-            stderr.read_to_end(&mut buf).await.map(|_| buf)
-        });
-        let mut out = Vec::new();
-        stdout
-            .take(limit.saturating_add(1))
-            .read_to_end(&mut out)
-            .await
-            .context("reading exec stdout")?;
-        if out.len() as u64 > limit {
-            err.abort();
-            out.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
-            return Ok(ExecOutput {
-                stdout: out,
-                stderr: Vec::new(),
-                code: None,
-            });
-        }
-        let stderr = err
-            .await
-            .context("joining exec stderr")?
-            .context("reading exec stderr")?;
-        Ok(ExecOutput {
-            stdout: out,
-            stderr,
-            code: Some(self.exit_code(attached).await?),
-        })
-    }
-
-    pub async fn container_log(&self) -> Result<String> {
-        self.pods
-            .logs(&self.name, &LogParams::default())
-            .await
-            .with_context(|| format!("reading the logs of pod {}", self.name))
     }
 
     pub async fn delete(&self) -> Result<()> {

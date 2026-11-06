@@ -1286,7 +1286,6 @@ dependencies = [
  "ignore",
  "k8s-openapi 0.28.0",
  "kube 4.2.0",
- "nix 0.31.3",
  "oci-client 0.17.0",
  "regex",
  "reqwest",

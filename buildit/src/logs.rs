@@ -6,9 +6,6 @@ use anyhow::{Context, Result, bail};
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 
-use crate::pod::BuilderPod;
-
-pub const LOG_DIR: &str = "/tmp/buildit-logs";
 pub const MAX_READ: u64 = 4 * 1024 * 1024;
 const LINE_CAP: usize = 1024;
 const REGEX_SIZE: usize = 1024 * 1024;
@@ -31,7 +28,7 @@ impl LogName {
         }
     }
 
-    fn file(self) -> String {
+    pub(crate) fn file(self) -> String {
         match self {
             Self::Build => "build.log".to_string(),
             Self::Run(n) => format!("run-{n}.log"),
@@ -45,42 +42,6 @@ impl fmt::Display for LogName {
             Self::Build => f.write_str("build"),
             Self::Run(n) => write!(f, "run:{n}"),
         }
-    }
-}
-
-/// A step's log in its builder pod. One pod can host several builds, so each build keeps its
-/// steps under `<LOG_DIR>/<build>/`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StepLog {
-    build: String,
-    name: LogName,
-}
-
-impl StepLog {
-    pub fn new(build: &str, name: LogName) -> Self {
-        Self {
-            build: build.to_string(),
-            name,
-        }
-    }
-
-    /// The directory a build's step logs live in.
-    pub fn dir(build: &str) -> String {
-        format!("{LOG_DIR}/{build}")
-    }
-
-    pub fn name(&self) -> LogName {
-        self.name
-    }
-
-    pub fn path(&self) -> String {
-        format!("{}/{}", Self::dir(&self.build), self.name.file())
-    }
-}
-
-impl fmt::Display for StepLog {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.name.fmt(f)
     }
 }
 
@@ -119,24 +80,7 @@ pub struct Log {
 }
 
 impl Log {
-    pub async fn fetch(pod: &BuilderPod, name: &StepLog, window: u64) -> Result<Self> {
-        let read = (window + 1).to_string();
-        let argv = ["tail", "-c", &read, "--", &name.path()].map(String::from);
-        let out = pod.exec_output(&argv, window + 1).await?;
-        if out.code != Some(0) {
-            bail!(
-                "reading the {name} log: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(Self::from_bytes(out.stdout, window))
-    }
-
-    pub async fn from_container(pod: &BuilderPod, window: u64) -> Result<Self> {
-        Ok(Self::last(pod.container_log().await?.into_bytes(), window))
-    }
-
-    fn last(mut bytes: Vec<u8>, window: u64) -> Self {
+    pub(crate) fn last(mut bytes: Vec<u8>, window: u64) -> Self {
         let keep = usize::try_from(window.saturating_add(1)).unwrap_or(usize::MAX);
         bytes.drain(..bytes.len().saturating_sub(keep));
         Self::from_bytes(bytes, window)
@@ -275,7 +219,7 @@ impl Budget {
 
 #[cfg(test)]
 mod tests {
-    use crate::logs::{Log, LogName, MAX_READ, Query, StepLog};
+    use crate::logs::{Log, LogName, MAX_READ, Query};
 
     fn log(text: &str) -> Log {
         Log::from_bytes(text.as_bytes().to_vec(), MAX_READ)
@@ -286,14 +230,13 @@ mod tests {
     }
 
     #[test]
-    fn log_names_are_build_or_numbered_runs_under_their_build() {
-        let build = StepLog::new("buildit-0a", LogName::parse("build").unwrap());
-        assert_eq!(build.path(), "/tmp/buildit-logs/buildit-0a/build.log");
-        let run = StepLog::new("buildit-0a", LogName::parse("run:7").unwrap());
-        assert_eq!(run.path(), "/tmp/buildit-logs/buildit-0a/run-7.log");
-        assert_eq!(StepLog::dir("buildit-0a"), "/tmp/buildit-logs/buildit-0a");
+    fn log_names_are_build_or_numbered_runs() {
+        let build = LogName::parse("build").unwrap();
+        assert_eq!(build.file(), "build.log");
+        let run = LogName::parse("run:7").unwrap();
+        assert_eq!(run.file(), "run-7.log");
         assert_eq!(run.to_string(), "run:7");
-        assert_eq!(run.name(), LogName::Run(7));
+        assert_eq!(run, LogName::Run(7));
         for bad in [
             "",
             "Build",
