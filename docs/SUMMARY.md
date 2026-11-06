@@ -121,3 +121,4 @@
   - [ADR-0069: A launch sets agent settings per task and the checkout ref, within bounds the manifest declares](./adr/ADR-0069.md)
   - [ADR-0070: A dynamic choice reads its options from a dependency field, bounded and recorded](./adr/ADR-0070.md)
   - [ADR-0071: A pack edition gates contract changes, and edition 2 gives host commands only declared env](./adr/ADR-0071.md)
+  - [ADR-0072: Standing launches fire on their save snapshot, with no offline credential](./adr/ADR-0072.md)

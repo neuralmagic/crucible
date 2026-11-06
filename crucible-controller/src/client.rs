@@ -532,6 +532,10 @@ mod tests {
                 "0080_run_git_token_binding.sql",
                 "2e532fda4c9b1b68bc93d305d00ed31865931eaca09610ba1712e0692b4b1f0c",
             ),
+            (
+                "0081_drop_offline_credential.sql",
+                "d89538dcc83635668a87b392bf048d770dc8baafba0ef3beb0707a4b4e1613c7",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

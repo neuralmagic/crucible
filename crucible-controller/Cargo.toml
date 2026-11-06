@@ -125,9 +125,9 @@ sha2 = "0.10"
 rand = "0.10"
 # A run's display name (`benevolent-monkey`), from the crate's built-in English word lists.
 petname = { version = "3", default-features = false, features = ["default-rng", "default-words"] }
-# Percent-encodes the form bodies the OIDC logout and revoke requests carry, and URL path segments.
+# Percent-encodes OIDC logout query strings and URL path segments.
 percent-encoding = "2"
-# AES-256-GCM for the offline credential at rest, under the chart-mounted key. Already the crypto
+# AES-256-GCM for webhook secrets at rest, under the chart-mounted key. Already the crypto
 # provider under rustls and jsonwebtoken in this tree, so it adds no new build.
 aws-lc-rs = "1.18"
 # Evaluates webhook transforms (ADR-0055). Pinned to master by rev until a release carries

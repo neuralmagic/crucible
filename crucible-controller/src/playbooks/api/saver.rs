@@ -41,7 +41,7 @@ pub(crate) struct SaverRequest<'a> {
 
 fn cannot_own() -> ApiError {
     ApiError::Forbidden(
-        "this credential stands for no confirmed sign-in (a downgraded or viewed-as session), \
+        "this credential stands for no confirmed sign-in (a viewed-as session), \
          so it can own nothing that fires without a session"
             .to_string(),
     )
@@ -205,18 +205,20 @@ mod tests {
     /// cannot own it, and the refusal is the same on every such surface.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_snapshot_surface_refuses_a_credential_that_may_not_own(pool: PgPool) {
-        for path in [AuthPath::DowngradedSession, AuthPath::Impersonated] {
-            let refused = resolve(pool.clone(), path, Ownership::Snapshot { asked: None })
-                .await
-                .expect_err("cannot own");
-            assert_eq!(refused, StatusCode::FORBIDDEN, "{path:?}");
-        }
+        let refused = resolve(
+            pool,
+            AuthPath::Impersonated,
+            Ownership::Snapshot { asked: None },
+        )
+        .await
+        .expect_err("cannot own");
+        assert_eq!(refused, StatusCode::FORBIDDEN);
     }
 
     /// The same credential launches fine under its session: an immediate launch owns nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_session_surface_takes_any_credential_and_snapshots_no_owner(pool: PgPool) {
-        let saver = resolve(pool, AuthPath::DowngradedSession, Ownership::Session)
+        let saver = resolve(pool, AuthPath::Impersonated, Ownership::Session)
             .await
             .expect("resolved");
         assert_eq!(saver.actor.as_deref(), Some("alice"));

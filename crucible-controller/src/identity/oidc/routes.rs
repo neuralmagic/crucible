@@ -23,9 +23,6 @@ use crate::identity::oidc::{OidcError, OidcProvider};
 pub struct AuthState {
     pub oidc: Option<Arc<OidcProvider>>,
     pub pool: sqlx::PgPool,
-    /// The chart-mounted key the offline credential is sealed under. `None` — no key mounted —
-    /// stores no credential, and scheduled launches stay on the schedule-row snapshot.
-    pub credential_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
 }
 
 pub fn router(state: AuthState) -> Router {
@@ -176,32 +173,20 @@ async fn callback(
         Ok(ok) => ok,
         Err(e) => return from_oidc(e),
     };
-    let crate::identity::oidc::Exchanged {
-        claims,
-        refresh_token,
-        id_token,
-    } = exchanged;
+    let crate::identity::oidc::Exchanged { claims, id_token } = exchanged;
     let now = jiff::Timestamp::now();
-    if let Err(e) = record_login(&state, &claims, refresh_token.as_deref(), now).await {
+    if let Err(e) = record_login(&state, &claims, now).await {
         tracing::error!(error = %format!("{e:#}"), "recording the login");
         return refused(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the login could not be recorded",
         );
     }
-    // A fresh login clears whatever a failed refresh left on this owner's schedules: the whole
-    // point of signing in again is that the credential works.
-    if let Err(e) = crate::launches::standing::clear_owner_signin(&state.pool, &claims.login).await
-    {
-        tracing::warn!(error = %format!("{e:#}"), "clearing the owner's sign-in flags");
-    }
     let native = crate::identity::session::NativeClaims {
         sub: claims.sub,
         login: claims.login,
         email: claims.email,
         groups: claims.groups,
-        groups_at: now.to_string(),
-        downgraded: false,
     };
     if let Err(e) =
         crate::identity::session::establish_native(&session, &native, Some(&id_token)).await
@@ -211,15 +196,11 @@ async fn callback(
     Redirect::to(&flow.redirect_to).into_response()
 }
 
-/// The user row, the groups its claim carried, and the offline credential, in one transaction under
-/// the subject's credential lock.
-/// Either all of it lands or none does: a `users` row with no credential is a user whose schedules
-/// silently stop following live groups, and one with stale groups is an API key answering for a
-/// membership its owner no longer holds.
+/// The user row and the groups its claim carried, in one transaction: a `users` row with stale
+/// groups is an API key answering for a membership its owner no longer holds.
 async fn record_login(
     state: &AuthState,
     claims: &crate::identity::oidc::VerifiedClaims,
-    refresh_token: Option<&str>,
     now: jiff::Timestamp,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
@@ -228,9 +209,6 @@ async fn record_login(
         .begin()
         .await
         .context("opening the login write")?;
-    crate::identity::oidc::credentials::lock(&mut tx, &claims.sub)
-        .await
-        .context("taking the credential lock")?;
     crate::identity::oidc::users::record_login_on(
         &mut tx,
         &claims.sub,
@@ -241,9 +219,6 @@ async fn record_login(
     .await?;
     crate::identity::oidc::users::record_groups_on(&mut tx, &claims.sub, &claims.groups, now)
         .await?;
-    if let (Some(keys), Some(token)) = (state.credential_keys.as_deref(), refresh_token) {
-        crate::identity::oidc::credentials::upsert(&mut tx, keys, &claims.sub, token, now).await?;
-    }
     tx.commit().await.context("committing the login write")
 }
 
@@ -319,46 +294,5 @@ mod tests {
             );
         }
         assert_eq!(safe_redirect(None), "/");
-    }
-
-    /// The callback's write waits on a held credential lock, and lands once it is released.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_login_write_waits_on_the_credential_lock(pool: sqlx::PgPool) {
-        let state = AuthState {
-            oidc: None,
-            pool: pool.clone(),
-            credential_keys: None,
-        };
-        let claims = crate::identity::oidc::VerifiedClaims {
-            sub: "sub-alice".to_string(),
-            login: "alice".to_string(),
-            email: None,
-            groups: vec!["/groups/team-x".to_string()],
-        };
-        let mut held = pool.begin().await.expect("tx");
-        crate::identity::oidc::credentials::lock(&mut held, "sub-alice")
-            .await
-            .expect("lock");
-
-        let write = tokio::spawn(async move {
-            record_login(&state, &claims, None, jiff::Timestamp::now()).await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert!(!write.is_finished(), "the write ran under a held lock");
-        assert_eq!(
-            crate::identity::oidc::users::stamped(&pool, "alice")
-                .await
-                .expect("read"),
-            None
-        );
-
-        held.commit().await.expect("release");
-        write.await.expect("join").expect("record login");
-        let (_, groups, at) = crate::identity::oidc::users::stamped(&pool, "alice")
-            .await
-            .expect("read")
-            .expect("users row");
-        assert_eq!(groups, vec!["/groups/team-x".to_string()]);
-        assert!(at.is_some());
     }
 }

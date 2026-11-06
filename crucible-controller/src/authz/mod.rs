@@ -154,12 +154,9 @@ impl Caller {
 
     /// The coarse role the admin- and operator-gated routes and `whoami` read: an owner of the
     /// platform administrators team is an admin, any other member of it or of the platform
-    /// operators team an operator. A downgraded session holds no role.
+    /// operators team an operator.
     pub fn role(&self) -> crate::identity::auth::Role {
         use crate::identity::auth::Role;
-        if !self.path.holds_roles() {
-            return Role::Viewer;
-        }
         if self.principals.is_platform_admin() {
             Role::Admin
         } else if self
@@ -276,34 +273,32 @@ pub async fn resolve_caller(
     let login = identity.map(str::trim).map(str::to_lowercase);
     let groups: &[String] = if proves_groups { groups } else { &[] };
     let mut teams = resolve::teams_for(pool, login.as_deref(), groups, proves_groups).await?;
-    if path.holds_roles() {
-        let identity = crate::identity::session::Identity(login.clone());
-        let groups = crate::identity::auth::Groups(groups.to_vec());
-        let configured = match roles.role(&identity, &groups) {
-            crate::identity::auth::Role::Admin => Some((
-                model::TeamSlug::platform_administrators(),
-                model::TeamRole::Owner,
-                "configured-admins",
-            )),
-            crate::identity::auth::Role::Operator => Some((
-                model::TeamSlug::platform_operators(),
-                model::TeamRole::Member,
-                "configured-operators",
-            )),
-            crate::identity::auth::Role::Viewer => None,
+    let identity = crate::identity::session::Identity(login.clone());
+    let asserted = crate::identity::auth::Groups(groups.to_vec());
+    let configured = match roles.role(&identity, &asserted) {
+        crate::identity::auth::Role::Admin => Some((
+            model::TeamSlug::platform_administrators(),
+            model::TeamRole::Owner,
+            "configured-admins",
+        )),
+        crate::identity::auth::Role::Operator => Some((
+            model::TeamSlug::platform_operators(),
+            model::TeamRole::Member,
+            "configured-operators",
+        )),
+        crate::identity::auth::Role::Viewer => None,
+    };
+    if let Some((slug, role, rule)) = configured {
+        let via = model::Via::Rule {
+            rule: rule.to_string(),
+            role,
         };
-        if let Some((slug, role, rule)) = configured {
-            let via = model::Via::Rule {
-                rule: rule.to_string(),
-                role,
-            };
-            let entry = teams.entry(slug).or_insert_with(|| model::Membership {
-                role,
-                via: Default::default(),
-            });
-            entry.role = entry.role.max(role);
-            entry.via.insert(via);
-        }
+        let entry = teams.entry(slug).or_insert_with(|| model::Membership {
+            role,
+            via: Default::default(),
+        });
+        entry.role = entry.role.max(role);
+        entry.via.insert(via);
     }
     let principals = Principals::new(login.as_deref(), groups).with_teams(teams);
     Ok(Caller {
@@ -372,15 +367,6 @@ mod tests {
             Role::Viewer
         );
         assert_eq!(caller(&[], AuthPath::Session).role(), Role::Viewer);
-    }
-
-    #[test]
-    fn a_downgraded_session_holds_no_role_even_as_a_platform_owner() {
-        let admins = [(TeamSlug::platform_administrators(), TeamRole::Owner)];
-        assert_eq!(
-            caller(&admins, AuthPath::DowngradedSession).role(),
-            Role::Viewer
-        );
     }
 
     fn slug(s: &str) -> TeamSlug {

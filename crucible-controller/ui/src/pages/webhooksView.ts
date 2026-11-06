@@ -1,12 +1,11 @@
 import type { components } from '../api/schema.d';
 import type { StatusTone } from '../ui';
 import { relativeTime } from './journeyView';
-import { refreshFailure } from './schedulesView';
 
 export type WebhookDto = components['schemas']['WebhookDto'];
 export type WebhookDeliveryDto = components['schemas']['WebhookDeliveryDto'];
 
-export type WebhookState = 'signin' | 'paused' | 'failing' | 'live';
+export type WebhookState = 'paused' | 'live';
 
 export interface WebhookView {
   state: WebhookState;
@@ -15,28 +14,10 @@ export interface WebhookView {
 }
 
 /// The fields the webhook view reads, so a test row does not spell out the whole DTO.
-export type WebhookRow = Pick<
-  WebhookDto,
-  | 'enabled'
-  | 'consecutive_failures'
-  | 'owner_signin_required'
-  | 'owner_refresh_error'
-  | 'owner_refresh_at'
-  | 'last_delivery_at'
->;
+export type WebhookRow = Pick<WebhookDto, 'enabled' | 'consecutive_failures' | 'last_delivery_at'>;
 
-/// What a row says about itself. `signin` outranks the rest: a webhook whose owner has to sign in
-/// again launches nothing until they do.
+/// What a row says about itself.
 export function webhookView(row: WebhookRow): WebhookView {
-  const failure = refreshFailure(row);
-  if (row.owner_signin_required) {
-    return {
-      state: 'signin',
-      headline: 'SIGN-IN NEEDED',
-      detail:
-        failure ?? 'The owner has to sign in again.',
-    };
-  }
   if (!row.enabled) {
     const failures = row.consecutive_failures;
     return {
@@ -45,9 +26,6 @@ export function webhookView(row: WebhookRow): WebhookView {
       detail:
         failures > 0 ? `Paused after ${failures} failed launch${failures === 1 ? '' : 'es'}.` : 'Paused.',
     };
-  }
-  if (failure !== null) {
-    return { state: 'failing', headline: 'REFRESH FAILING', detail: failure };
   }
   const last = relativeTime(row.last_delivery_at);
   return {
@@ -58,9 +36,7 @@ export function webhookView(row: WebhookRow): WebhookView {
 }
 
 export const STATE_TONE: Record<WebhookState, StatusTone> = {
-  signin: 'red',
   paused: 'grey',
-  failing: 'amber',
   live: 'green',
 };
 

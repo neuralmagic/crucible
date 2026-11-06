@@ -111,14 +111,6 @@ pub struct NativeClaims {
     pub login: String,
     pub email: Option<String>,
     pub groups: Vec<String>,
-    /// When `groups` was last the issuer's word, RFC3339. Login stamps it; the on-use refresh
-    /// restamps it, and its age is what decides whether the next request refreshes at all.
-    #[serde(default)]
-    pub groups_at: String,
-    /// Set when a group refresh was definitively refused. The login stands and every role it
-    /// carried is gone until the user signs in again.
-    #[serde(default)]
-    pub downgraded: bool,
 }
 
 /// An authorization-code request in flight: what `/auth/callback` needs to finish the exchange and
@@ -243,15 +235,6 @@ pub async fn native_claims(
         return Ok(None);
     }
     read_slot(session, CLAIMS_KEY).await
-}
-
-/// Restamp a live native session's claims after an on-use group refresh. The identity slot is
-/// untouched: a refresh changes what a caller may do, never who they are.
-pub async fn restamp_native(
-    session: &Session,
-    claims: &NativeClaims,
-) -> Result<(), tower_sessions::session::Error> {
-    write_slot(session, CLAIMS_KEY, claims).await
 }
 
 /// The user an administrator is viewing as, snapshotted when the view started: their login,

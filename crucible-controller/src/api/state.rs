@@ -126,13 +126,8 @@ pub struct ApiState {
     /// The environment variable names the deploy profile already fills from pre-created cluster
     /// Secrets. The preview gate warns when a pack declares a secret one of these also supplies.
     pub(crate) profile_secret_env: Arc<Vec<String>>,
-    /// The chart-mounted key the offline credential is sealed under. `None` — no key mounted —
-    /// answers the revoke route 503, because nothing was ever stored.
-    pub(crate) credential_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
-    /// The key `hmac_sha256` webhook secrets are sealed under; independent of `credential_keys`.
-    pub(crate) webhook_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
-    /// The issuer, so a revoke can tell it the token is dead too. `None` leaves a revoke local.
-    pub(crate) oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
+    /// The key `hmac_sha256` webhook secrets are sealed under.
+    pub(crate) webhook_keys: Option<Arc<crate::launches::webhooks::keys::WebhookKeys>>,
     /// The dispatch-target contract records `GET /api/config` reports; the same registry the
     /// launch gate reads.
     pub(crate) contracts: Arc<crate::runs::contract::ContractRegistry>,
@@ -259,32 +254,17 @@ impl ApiState {
                     .map(crate::secrets::manifest::profile_secret_env)
                     .unwrap_or_default(),
             ),
-            credential_keys: None,
             webhook_keys: None,
-            oidc: None,
             contracts,
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
         }
     }
 
-    /// Attach the issuer and the mounted credential key the offline-credential routes need. Both
-    /// are built by the binary (either can fail to read its environment), so assembling the state
-    /// itself stays infallible.
-    pub fn with_oidc(
-        mut self,
-        oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
-        credential_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
-    ) -> Self {
-        self.oidc = oidc;
-        self.credential_keys = credential_keys;
-        self
-    }
-
     /// Attach the key webhook secrets are sealed under.
     pub fn with_webhook_keys(
         mut self,
-        webhook_keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
+        webhook_keys: Option<Arc<crate::launches::webhooks::keys::WebhookKeys>>,
     ) -> Self {
         self.webhook_keys = webhook_keys;
         self
@@ -403,9 +383,7 @@ impl ApiState {
             vault: None,
             secret_provider: None,
             profile_secret_env: Arc::new(Vec::new()),
-            credential_keys: None,
             webhook_keys: None,
-            oidc: None,
             contracts: crate::runs::contract::permissive(),
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             default_cluster: crate::runs::clusters::HUB_CLUSTER.to_string(),

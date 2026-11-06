@@ -65,18 +65,14 @@ pub(crate) async fn version(
 /// `groups` is what the issuer asserted for this caller, normalized. It is empty on the machine paths, and empty on a human path when the IdP emits no
 /// `groups` claim — which is the difference between `auth.operatorGroups` granting write access and
 /// granting nothing, so it is reported rather than left to be inferred from a role.
-///
-/// `downgraded` says a live session's group refresh was refused, so the SPA can tell a viewer who
-/// lost their role from one who never had it.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct Whoami {
     user: Option<String>,
     admin: bool,
     role: crate::identity::auth::Role,
     groups: Vec<String>,
-    downgraded: bool,
     /// Whether the presenting credential proves groups (RFC-0003 C-CREDENTIAL-PARITY). False on
-    /// a static token or a downgraded session, whatever `groups` holds.
+    /// a static token, whatever `groups` holds.
     proves_groups: bool,
     /// The teams the caller reaches in their own right, with the role held and how: every team
     /// they may act as, whichever one this request acts as.
@@ -129,7 +125,6 @@ pub(crate) async fn whoami(
         admin: role == crate::identity::auth::Role::Admin,
         role,
         groups: actor.group_paths().map(str::to_string).collect(),
-        downgraded: !caller.path.holds_roles(),
         proves_groups: caller.path.carries_groups(),
         teams,
         acting_as: caller.acting_as.as_ref().map(|acting| acting.team.clone()),

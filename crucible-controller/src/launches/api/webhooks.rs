@@ -79,10 +79,6 @@ pub struct WebhookDto {
     pub consecutive_failures: i64,
     pub created_by: Option<String>,
     pub owner_principal: Option<String>,
-    pub owner_groups_at: Option<String>,
-    pub owner_signin_required: bool,
-    pub owner_refresh_error: Option<String>,
-    pub owner_refresh_at: Option<String>,
     pub dispatch_target: Option<String>,
     pub agent_provider: Option<String>,
     pub agent_model: Option<String>,
@@ -118,10 +114,6 @@ impl From<Webhook> for WebhookDto {
             consecutive_failures: c.consecutive_failures,
             created_by: c.created_by,
             owner_principal: c.owner_principal,
-            owner_groups_at: c.owner_groups_at,
-            owner_signin_required: c.owner_signin_required,
-            owner_refresh_error: c.owner_refresh_error,
-            owner_refresh_at: c.owner_refresh_at,
             dispatch_target: c.dispatch_target,
             agent_provider: c.agent_provider,
             agent_model: c.agent_model,
@@ -837,13 +829,6 @@ pub(crate) async fn update_webhook(
         Ok(None) => return not_found(format!("no webhook {id:?}")),
         Err(e) => return save_refusal(e),
     };
-    match crate::launches::webhooks::expire_stale_owner_parks(state.db.pool(), &id).await {
-        Ok(expired) if !expired.is_empty() => {
-            tracing::info!(webhook = %id, expired = expired.len(), "webhooks: re-save expired stale-owner parks");
-        }
-        Ok(_) => {}
-        Err(e) => return ApiError::from(e).into_response(),
-    }
     if !webhook.core.enabled
         && let Err(e) = crate::launches::webhooks::settle_pending(
             state.db.pool(),
