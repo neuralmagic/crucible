@@ -249,7 +249,13 @@ fn refused_tool_result(refusal: &Refusal) -> Value {
         "error": refusal.to_string(),
         "retryable": refusal.retryable(),
     });
-    json!({"content": [{"type": "text", "text": text.to_string()}], "isError": true})
+    // Protocol 2026-07-28 requires the discriminator; a client that enforces it discards the
+    // refusal, and the caller reads a schema error instead of the reason.
+    json!({
+        "resultType": "complete",
+        "content": [{"type": "text", "text": text.to_string()}],
+        "isError": true,
+    })
 }
 
 fn plain(status: StatusCode, message: &'static str) -> Response {
@@ -595,6 +601,14 @@ mod tests {
         assert_eq!(body["result"]["isError"], true, "{body}");
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_a_complete_result_the_client_can_parse() {
+        let app = app(guard(None), Some(principal("kueue.submit")), false);
+        let (_, _, body, _) = post(app, call("workload_plan", json!({"queue": "other"}))).await;
+        assert_eq!(body["result"]["resultType"], "complete", "{body}");
+        assert_eq!(body["result"]["isError"], true, "{body}");
     }
 
     #[tokio::test]
