@@ -21,7 +21,6 @@ import {
   statusTone,
 } from '../ui';
 import type { SpecItem } from '../ui';
-import { issueStatusColor } from './issueStatus';
 import { absoluteTime, relativeTime } from './journeyView';
 import {
   dispatchFailure,
@@ -29,6 +28,8 @@ import {
   graphRunId,
   launchLabel,
   launchRunPath,
+  launchStatusColor,
+  launchStatusLabel,
   launchVersion,
   originLabel,
   originLinks,
@@ -91,7 +92,7 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
       <DetailHeader
         title={launch.playbook}
         badge={
-          <Status status={launch.status} tone={statusTone(issueStatusColor(launch.status))} />
+          <Status status={launchStatusLabel(launch.status)} tone={statusTone(launchStatusColor(launch.status))} />
         }
         description={launch.description ?? undefined}
         meta={
@@ -176,7 +177,7 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
 
       {launch.parked_reason && !launch.secrets_refusal && dispatch.state !== 'failed' && (
         <Section>
-          <SectionHeader title="Parked" />
+          <SectionHeader title="Error" />
           <SectionBody className="whitespace-pre-wrap font-mono text-data text-ink-2">
             {launch.parked_reason}
           </SectionBody>

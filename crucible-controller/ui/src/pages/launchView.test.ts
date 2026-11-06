@@ -6,6 +6,8 @@ import {
   dispatchTone,
   graphRunId,
   launchLabel,
+  launchStatusColor,
+  launchStatusLabel,
   launchWallSecs,
   launchRunPath,
   launchVersion,
@@ -138,6 +140,17 @@ describe('launchVersion', () => {
     expect(launchVersion({ draft_version: 126, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('draft v126');
     expect(launchVersion({ draft_version: null, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('8484c6b8284c');
     expect(launchVersion({ schema_digest: 'deadbeef' })).toBe('deadbeef');
+  });
+});
+
+describe('launchStatusLabel', () => {
+  it('reads a parked launch as the error it is and passes every other status through', () => {
+    expect(launchStatusLabel('parked')).toBe('error');
+    expect(launchStatusColor('parked')).toBe('red');
+    expect(launchStatusLabel('running')).toBe('running');
+    expect(launchStatusColor('running')).toBe('blue');
+    expect(launchStatusLabel('done')).toBe('done');
+    expect(launchStatusColor('done')).toBe('green');
   });
 });
 

@@ -25,9 +25,8 @@ import {
   useDataTable,
 } from '../ui';
 import type { AppliedFilter, FacetRow } from '../ui';
-import { issueStatusColor } from './issueStatus';
 import { relativeTime } from './journeyView';
-import { launchPath, originLabel, relaunchPath } from './launchView';
+import { launchPath, launchStatusColor, launchStatusLabel, originLabel, relaunchPath } from './launchView';
 import { formatCost, transportLossLabel } from './runReport';
 import {
   DEFAULT_FILTERS,
@@ -64,8 +63,8 @@ const runColumns = runHelper.columns([
       return (
         <span className="flex flex-wrap items-center gap-2">
           <Status
-            status={row.original.status}
-            tone={statusTone(issueStatusColor(row.original.status))}
+            status={launchStatusLabel(row.original.status)}
+            tone={statusTone(launchStatusColor(row.original.status))}
             pulse={row.original.status === 'running'}
           />
           {lost && <Status status={lost} tone="red" pulse={false} />}
@@ -191,8 +190,9 @@ export function PlaybookRunsPage() {
   const applied: AppliedFilter[] = [];
   for (const axis of ['status', 'playbook', 'origin', 'schedule'] as const) {
     if (filters[axis]) {
+      const value = axis === 'status' ? launchStatusLabel(filters.status) : filters[axis];
       applied.push({
-        label: `${axis}: ${filters[axis]}`,
+        label: `${axis}: ${value}`,
         onClear: () => {
           patch({ [axis]: '' });
         },
