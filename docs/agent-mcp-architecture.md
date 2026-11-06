@@ -2012,6 +2012,7 @@ kinds treats a token with `act` as a run and a token without `act` as a person.
 | `--push-authfile` (`MCP_PUSH_AUTHFILE`) | unset | Needs `--push-repo`. |
 | `--pod-deadline` | `7200` | Builder pod `activeDeadlineSeconds`. |
 | `--max-builds` | `4` | Live builder pods per sandbox. |
+| `--adopt-idle` (`MCP_ADOPT_IDLE`) | `600` | Seconds without a build before another sandbox of the same launcher and base image may adopt an idle builder pod. |
 
 `buildit` also accepts an older tokens file. `buildit` never reads a compact JWT as a tokens-file
 token.

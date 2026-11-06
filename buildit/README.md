@@ -157,7 +157,13 @@ whose deadline leaves room for the build's timeout, as `<pod>-<suffix>`, with
 `buildah bud --layers`, so it reuses the pod's pulled images, layer cache and
 `RUN --mount=type=cache` contents. `clean` of one build drops its image name, context and logs
 and leaves the pod for the next build; `clean` with no build_id deletes the sandbox's pods.
-`--reuse-builders false` gives every build a pod of its own. `--pod-deadline` defaults to 4h.
+A sandbox with no idle pod of its own adopts an idle pod of another sandbox started by the same
+person, whose first build began `FROM` the same image (the pod's `buildit.dev/base` label), once
+that pod has gone `--adopt-idle` seconds (default 600) without a build. The pod keeps its pulled
+images, layers and caches; its previous sandbox's builds and logs are dropped, and that sandbox's
+next build gets a new pod. Each pod records its owner under a lock, so two sandboxes never take
+the same pod. `--reuse-builders false` gives every build a pod of its own. `--pod-deadline`
+defaults to 4h.
 `--storage-driver overlay` stores layers with kernel overlayfs instead of vfs, on nodes that
 allow it in a user namespace.
 

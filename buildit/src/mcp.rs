@@ -17,7 +17,7 @@ use k8s_openapi::api::core::v1::{
     Affinity, NodeAffinity, NodeSelectorRequirement, NodeSelectorTerm, Pod, PreferredSchedulingTerm,
 };
 use kube::Api;
-use kube::api::{DeleteParams, ListParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResponse, CallToolResult, CancelTaskParams, ContentBlock, CreateTaskResult,
@@ -58,6 +58,9 @@ const LABEL_BUILD_ID: &str = "buildit.dev/build-id";
 const LABEL_LAUNCHED_BY: &str = "crucible.dev/launched-by";
 /// The Kueue LocalQueue a builder pod is submitted to.
 const LABEL_QUEUE: &str = "kueue.x-k8s.io/queue-name";
+/// A hash of the image a builder pod's first build starts `FROM`; another sandbox of the same
+/// launcher may adopt the pod only for a build from the same image.
+const LABEL_BASE: &str = "buildit.dev/base";
 /// The [`ContextDigest`] of what buildit uploaded for a builder pod's first build.
 const ANNOTATION_CONTEXT_DIGEST: &str = "buildit.dev/context-digest";
 /// `shared` on a pod that keeps each build's context and logs apart, so later builds of its
@@ -109,15 +112,36 @@ const DEADLINE_EXCEEDED: &str = "DeadlineExceeded";
 const DEFAULT_LOG_BYTES: u64 = 16 * 1024;
 const MAX_LOG_BYTES: u64 = 64 * 1024;
 
-/// Prints `busy` when a build step in the pod is still running, else `idle`.
-const BUSY_SCRIPT: &str = r#"for log in "$1"/*/build.log; do
-  [ -e "$log" ] && [ ! -s "$log.exit" ] || continue
-  pid=$(cat "$log.pid" 2>/dev/null)
-  case "$pid" in ""|*[!0-9]*) continue ;; esac
-  stat=$(cat "/proc/$pid/stat" 2>/dev/null); stat=${stat##*) }
-  case "${stat%% *}" in ""|Z|X) ;; *) echo busy; exit 0 ;; esac
+/// Claims a builder pod for sandbox `$2` under a lock in the logs dir `$1`. Prints `busy` while a
+/// build step runs, else, with `$3` `own`, `taken` when another sandbox owns the pod and, with
+/// `adopt`, `recent` when the pod was claimed within `$4` seconds. Otherwise it records `$2` as
+/// the owner and prints `claimed`.
+const CLAIM_SCRIPT: &str = r#"logs=$1; me=$2; mode=$3; idle=$4
+mkdir -p "$logs" || exit 1
+find "$logs/.lock" -maxdepth 0 -mmin +1 -exec rmdir {} \; 2> /dev/null
+n=0
+until mkdir "$logs/.lock" 2> /dev/null; do
+  n=$((n + 1)); [ "$n" -lt 50 ] || { echo busy; exit 0; }; sleep 0.1
 done
-echo idle"#;
+trap 'rmdir "$logs/.lock"' EXIT
+for log in "$logs"/*/build.log; do
+  [ -e "$log" ] && [ ! -s "$log.exit" ] || continue
+  pid=$(cat "$log.pid" 2> /dev/null)
+  case "$pid" in "" | *[!0-9]*) continue ;; esac
+  stat=$(cat "/proc/$pid/stat" 2> /dev/null); stat=${stat##*) }
+  case "${stat%% *}" in "" | Z | X) ;; *) echo busy; exit 0 ;; esac
+done
+owner=$(cat "$logs/.owner" 2> /dev/null)
+case $mode in
+  own) [ -z "$owner" ] || [ "$owner" = "$me" ] || { echo taken; exit 0; } ;;
+  adopt) [ -z "$(find "$logs/.used" -newermt "@$(($(date +%s) - idle))" 2> /dev/null)" ] || { echo recent; exit 0; } ;;
+esac
+printf '%s\n' "$me" > "$logs/.owner" && touch "$logs/.used" && echo claimed"#;
+
+/// Drops every build of a pod's previous owner, its logs and its workspace, and keeps the pod's
+/// images, layers and caches for the adopting sandbox. Arguments: the logs dir and the workspace
+/// root.
+const SCRUB_SCRIPT: &str = r#"for d in "$1"/*/ "$2"/*/; do rm -rf "$d"; done"#;
 
 /// Drops a build from a pod that stays warm: its image takes the pod's one anchor tag, and the
 /// previous anchor's image goes, with the parents no later build shares.
@@ -187,6 +211,10 @@ pub struct McpArgs {
     /// Builder pod lifetime in seconds (activeDeadlineSeconds)
     #[arg(long, env = "MCP_POD_DEADLINE", default_value_t = 14400)]
     pub pod_deadline: i64,
+    /// A sandbox with no idle pod of its own adopts an idle pod of another sandbox with the same
+    /// launcher and base image, once that pod has gone this many seconds without a build
+    #[arg(long, env = "MCP_ADOPT_IDLE", default_value_t = 600)]
+    pub adopt_idle: u64,
     /// A build reuses an idle builder pod of its sandbox that has time left, keeping the pulled
     /// images, buildah's layer cache (`--layers`) and `RUN --mount=type=cache` contents of the
     /// builds before it; `clean` of one build leaves the pod for the next
@@ -345,6 +373,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
             limits: args.limits,
         },
         deadline_secs: args.pod_deadline,
+        adopt_idle_secs: args.adopt_idle,
         max_builds: args.max_builds,
         reuse: args.reuse_builders,
         storage: args.storage_driver,
@@ -721,6 +750,7 @@ pub struct Broker {
     local_workdir: Option<PathBuf>,
     resources: Resources,
     deadline_secs: i64,
+    adopt_idle_secs: u64,
     max_builds: usize,
     reuse: bool,
     storage: StorageDriver,
@@ -766,6 +796,13 @@ pub enum CacheWriters {
     Run,
     /// The run's builds and every sandbox's.
     All,
+}
+
+/// How a build takes a live pod: one of its sandbox's own, or another sandbox's to adopt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Claim {
+    Own,
+    Adopt,
 }
 
 /// Who started a build.
@@ -1295,6 +1332,50 @@ fn alive(pod: &Pod) -> bool {
         )
 }
 
+/// The image a Dockerfile's first stage starts `FROM`, with `${NAME}` and `$NAME` taken from
+/// `build_args` or the `ARG` defaults before it; none without a `FROM`.
+fn base_image(dockerfile: &str, build_args: &BTreeMap<String, String>) -> Option<String> {
+    let mut args: BTreeMap<String, String> = BTreeMap::new();
+    let joined = dockerfile.replace("\\\n", " ");
+    for line in joined.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (word, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        match word.to_ascii_uppercase().as_str() {
+            "ARG" => {
+                let (name, default) = rest.trim().split_once('=').unwrap_or((rest.trim(), ""));
+                let value = build_args
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| default.trim_matches(|c| c == '"' || c == '\'').to_string());
+                args.insert(name.to_string(), value);
+            }
+            "FROM" => {
+                let image = rest.split_whitespace().find(|w| !w.starts_with("--"))?;
+                let mut out = image.to_string();
+                for (name, value) in &args {
+                    out = out
+                        .replace(&format!("${{{name}}}"), value)
+                        .replace(&format!("${name}"), value);
+                }
+                return Some(out);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// [`LABEL_BASE`]'s value for a base image.
+fn base_label(image: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(image.as_bytes())[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn bud_argv(
     id: &BuildId,
     dockerfile: &RelPath,
@@ -1684,7 +1765,13 @@ impl Broker {
         }
     }
 
-    fn builder_pod(&self, caller: &Caller, id: &BuildId, digest: &ContextDigest) -> Result<Pod> {
+    fn builder_pod(
+        &self,
+        caller: &Caller,
+        id: &BuildId,
+        digest: &ContextDigest,
+        base: Option<&str>,
+    ) -> Result<Pod> {
         let opts = PodOpts {
             idle_nodes: &[],
             resources: &self.resources,
@@ -1706,6 +1793,9 @@ impl Broker {
         }
         if let Some(queue) = &self.queue {
             labels.insert(LABEL_QUEUE.to_string(), queue.clone());
+        }
+        if let Some(base) = base {
+            labels.insert(LABEL_BASE.to_string(), base.to_string());
         }
         pod.metadata.annotations.get_or_insert_default().extend([
             (
@@ -1744,16 +1834,34 @@ impl Broker {
         let dockerfile = RelPath::parse(p.dockerfile.as_deref().unwrap_or("Dockerfile"))?;
         let requested = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
         let volumes = cache_volumes(&p.caches)?;
+        let stage = tempfile::tempdir().context("creating staging dir")?;
+        let ctx = stage.path().join("ctx");
+        tokio::task::block_in_place(|| {
+            caller
+                .workspace
+                .fetch_context(&caller.sandbox, &context, &ctx)
+        })?;
+        let base = std::fs::read_to_string(ctx.join(dockerfile.as_str()))
+            .ok()
+            .and_then(|d| base_image(&d, &p.build_args))
+            .map(|image| base_label(&image));
         let live: Vec<Pod> = self
             .list(&caller.sandbox, None)
             .await?
             .into_iter()
             .filter(alive)
             .collect();
-        let warm = match self.reuse {
-            true => self.warm_pod(&live, requested).await,
+        let mut warm = match self.reuse {
+            true => self.warm_pod(caller, &live, requested).await,
             false => None,
         };
+        if warm.is_none()
+            && self.reuse
+            && live.len() < self.max_builds
+            && let Some(base) = &base
+        {
+            warm = self.adopt_pod(caller, base, requested).await;
+        }
         if warm.is_none() && live.len() >= self.max_builds {
             let ids: Vec<&str> = live
                 .iter()
@@ -1767,13 +1875,6 @@ impl Broker {
                 ids.join(", ")
             );
         }
-        let stage = tempfile::tempdir().context("creating staging dir")?;
-        let ctx = stage.path().join("ctx");
-        tokio::task::block_in_place(|| {
-            caller
-                .workspace
-                .fetch_context(&caller.sandbox, &context, &ctx)
-        })?;
         let tar = crate::context::staged_tar_bytes(&ctx)?;
         let digest = crate::context::digest(&tar)?;
         let tarball = crate::context::gzip(&tar)?;
@@ -1790,7 +1891,7 @@ impl Broker {
             Some((pod, age)) => (BuildId::warm(&pod.name), pod, Some(age)),
             None => {
                 let id = BuildId::fresh();
-                let spec = self.builder_pod(caller, &id, &digest)?;
+                let spec = self.builder_pod(caller, &id, &digest, base.as_deref())?;
                 let pod =
                     BuilderPod::create_from(self.client.clone(), &self.namespace, &spec).await?;
                 (id, pod, None)
@@ -1823,19 +1924,27 @@ impl Broker {
                     }
                     let admitted = Instant::now();
                     pod.wait_ready(POD_READY).await?;
-                    pod.exec_capture(&sh_c(&self.storage.setup_script())).await?;
+                    pod.exec_capture(&sh_c(&self.storage.setup_script()))
+                        .await?;
                     admitted.elapsed()
                 }
             };
             let dirs: String = volumes.iter().map(|(dir, _)| format!(" '{dir}'")).collect();
             let untar = format!(
-                "mkdir -p '{ws}' '{facts}'{dirs} && printf %s '{digest}' > '{file}' && tar xzf - -C '{ws}'",
+                "mkdir -p '{ws}' '{facts}'{dirs} && printf %s '{digest}' > '{file}' \
+                 && printf '%s\\n' '{owner}' > '{logs}/.owner' && touch '{logs}/.used' \
+                 && tar xzf - -C '{ws}'",
                 ws = id.workspace(),
                 facts = id.facts_dir(),
                 file = id.digest_file(),
+                owner = caller.sandbox.as_str(),
+                logs = crate::logs::LOG_DIR,
             );
             pod.exec_with_stdin(&sh_c(&untar), &tarball).await?;
-            let specs: String = volumes.iter().map(|(_, spec)| format!("{spec}\n")).collect();
+            let specs: String = volumes
+                .iter()
+                .map(|(_, spec)| format!("{spec}\n"))
+                .collect();
             let file = format!("{}/{CACHES_FILE}", StepLog::dir(&id.0));
             let write = argv(["sh", "-c", r#"cat > "$1""#, "sh", &file]);
             pod.exec_with_stdin(&write, specs.as_bytes()).await?;
@@ -1848,7 +1957,8 @@ impl Broker {
                         auth: format!("{dir}/{SNAPSHOT_AUTH_FILE}"),
                     };
                     let write = argv(["sh", "-c", r#"cat > "$1""#, "sh", &files.plan]);
-                    pod.exec_with_stdin(&write, snapshots.plan.as_bytes()).await?;
+                    pod.exec_with_stdin(&write, snapshots.plan.as_bytes())
+                        .await?;
                     if let Some(auth) = &snapshots.auth {
                         let write =
                             argv(["sh", "-c", r#"umask 077 && cat > "$1""#, "sh", &files.auth]);
@@ -1861,7 +1971,8 @@ impl Broker {
             if let Some(cache) = &self.shared_cache {
                 let file = format!("{}/{CACHE_FILE}", id.facts_dir());
                 let write = argv(["sh", "-c", r#"umask 077 && cat > "$1""#, "sh", &file]);
-                pod.exec_with_stdin(&write, &cache.document(starter)).await?;
+                pod.exec_with_stdin(&write, &cache.document(starter))
+                    .await?;
             }
             if p.ccache {
                 let file = format!("{}/{CCACHE_CONF}", id.facts_dir());
@@ -1894,9 +2005,14 @@ impl Broker {
         }
     }
 
-    // an idle live pod of the sandbox with time for a build of `limit`, and its age; the
-    // youngest such pod, since it has the most time left
-    async fn warm_pod(&self, live: &[Pod], limit: Duration) -> Option<(BuilderPod, Duration)> {
+    // an idle live pod of the sandbox with time for a build of `limit`, claimed for it, and its
+    // age; the youngest such pod, since it has the most time left
+    async fn warm_pod(
+        &self,
+        caller: &Caller,
+        live: &[Pod],
+        limit: Duration,
+    ) -> Option<(BuilderPod, Duration)> {
         let now = unix_now();
         let mut candidates: Vec<&Pod> = live
             .iter()
@@ -1906,15 +2022,108 @@ impl Broker {
         for pod in candidates {
             let name = pod.metadata.name.as_deref().unwrap_or_default();
             let handle = BuilderPod::existing(self.client.clone(), &self.namespace, name);
-            let busy = argv(["sh", "-c", BUSY_SCRIPT, "sh", crate::logs::LOG_DIR]);
-            match handle.exec_capture(&busy).await {
-                Ok(out) if out.trim() == "idle" => {}
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!("reading builds in pod {name}: {e:#}");
-                    continue;
-                }
+            if !self.claim(&handle, caller, Claim::Own).await {
+                continue;
             }
+            let age = age(pod, now)
+                .and_then(|a| u64::try_from(a).ok())
+                .unwrap_or(0);
+            return Some((handle, Duration::from_secs(age)));
+        }
+        None
+    }
+
+    // whether the caller now holds the pod: see CLAIM_SCRIPT
+    async fn claim(&self, pod: &BuilderPod, caller: &Caller, claim: Claim) -> bool {
+        let mode = match claim {
+            Claim::Own => "own",
+            Claim::Adopt => "adopt",
+        };
+        let script = argv([
+            "sh",
+            "-c",
+            CLAIM_SCRIPT,
+            "sh",
+            crate::logs::LOG_DIR,
+            caller.sandbox.as_str(),
+            mode,
+            &self.adopt_idle_secs.to_string(),
+        ]);
+        match pod.exec_capture(&script).await {
+            Ok(out) => out.trim() == "claimed",
+            Err(e) => {
+                tracing::warn!("claiming pod {}: {e:#}", pod.name);
+                false
+            }
+        }
+    }
+
+    // an idle pod of another sandbox of the caller's launcher whose first build started from
+    // `base`, taken over for the caller: claimed in the pod, relabeled, and cleared of the
+    // previous sandbox's builds
+    async fn adopt_pod(
+        &self,
+        caller: &Caller,
+        base: &str,
+        limit: Duration,
+    ) -> Option<(BuilderPod, Duration)> {
+        let launcher = caller.launched_by.as_ref()?;
+        let sel = format!(
+            "{LABEL_MANAGED_BY}={MANAGED_BY},{LABEL_LAUNCHED_BY}={},{LABEL_BASE}={base}",
+            launcher.as_str()
+        );
+        let pods = match self.pods().list(&ListParams::default().labels(&sel)).await {
+            Ok(list) => list.items,
+            Err(e) => {
+                tracing::warn!("listing pods to adopt ({sel}): {e}");
+                return None;
+            }
+        };
+        let now = unix_now();
+        let mut candidates: Vec<&Pod> = pods
+            .iter()
+            .filter(|p| {
+                p.metadata
+                    .labels
+                    .as_ref()
+                    .and_then(|l| l.get(LABEL_SANDBOX))
+                    .is_some_and(|s| s != caller.sandbox.as_str())
+                    && reusable(p, self.deadline_secs, limit, now)
+            })
+            .collect();
+        candidates.sort_by_key(|p| age(p, now));
+        for pod in candidates {
+            let name = pod.metadata.name.as_deref().unwrap_or_default();
+            let handle = BuilderPod::existing(self.client.clone(), &self.namespace, name);
+            if !self.claim(&handle, caller, Claim::Adopt).await {
+                continue;
+            }
+            let relabel = serde_json::json!({
+                "metadata": { "labels": { LABEL_SANDBOX: caller.sandbox.as_str() } }
+            });
+            if let Err(e) = self
+                .pods()
+                .patch(name, &PatchParams::default(), &Patch::Merge(&relabel))
+                .await
+            {
+                tracing::warn!("relabeling adopted pod {name}: {e}");
+                continue;
+            }
+            let scrub = argv([
+                "sh",
+                "-c",
+                SCRUB_SCRIPT,
+                "sh",
+                crate::logs::LOG_DIR,
+                Backend::Buildah.workspace(),
+            ]);
+            if let Err(e) = handle.exec_capture(&scrub).await {
+                tracing::warn!("clearing adopted pod {name}: {e:#}");
+            }
+            tracing::info!(
+                "sandbox {} adopted idle pod {name}",
+                caller.sandbox.as_str()
+            );
             let age = age(pod, now)
                 .and_then(|a| u64::try_from(a).ok())
                 .unwrap_or(0);
@@ -2633,14 +2842,14 @@ mod tests {
     use kube::Api;
 
     use crate::mcp::{
-        ANNOTATION_LAYOUT, BUSY_SCRIPT, Broker, BuildId, BuildParams, BuilditMcp, BuilditRules,
-        CACHE_ROOT, CacheScope, CacheSpec, CacheWriters, Caller, KUEUE_GATE, LABEL_QUEUE,
+        ANNOTATION_LAYOUT, Broker, BuildId, BuildParams, BuilditMcp, BuilditRules, CACHE_ROOT,
+        CLAIM_SCRIPT, CacheScope, CacheSpec, CacheWriters, Caller, KUEUE_GATE, LABEL_QUEUE,
         LAYOUT_SHARED, Launcher, LogsParams, MCP_PATH, PodView, PushParams, PushTarget,
         REUSE_SLACK, ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ,
-        SharedCache, Snapshots, Starter, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, alive,
-        annotated_digest, annotation, argv, bind_socket, bud_argv, build_limit, cache_volumes,
-        ccache_conf, held, hosts, parse_tokens, push_argv, read_only_volumes, reusable, router,
-        run_sandbox, socket_router, unpack,
+        SCRUB_SCRIPT, SharedCache, Snapshots, Starter, StatusCode, TokenLine, ToolPolicy,
+        TrustedIssuer, alive, annotated_digest, annotation, argv, base_image, base_label,
+        bind_socket, bud_argv, build_limit, cache_volumes, ccache_conf, held, hosts, parse_tokens,
+        push_argv, read_only_volumes, reusable, router, run_sandbox, socket_router, unpack,
     };
     use crate::pod::BuilderPod;
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
@@ -2678,6 +2887,7 @@ mod tests {
             local_workdir: local.map(Path::to_path_buf),
             resources: Resources::default(),
             deadline_secs,
+            adopt_idle_secs: 600,
             max_builds: 4,
             reuse,
             storage: std::env::var("BUILDIT_E2E_STORAGE_DRIVER")
@@ -2908,7 +3118,12 @@ mod tests {
             "spiffe://example.crucible/openshell/sandbox/auth-spike"
         );
         let pod = broker
-            .builder_pod(&caller, &BuildId::parse("buildit-1").unwrap(), &digest())
+            .builder_pod(
+                &caller,
+                &BuildId::parse("buildit-1").unwrap(),
+                &digest(),
+                None,
+            )
             .unwrap();
         assert_eq!(
             pod.metadata.labels.unwrap()["crucible.dev/launched-by"],
@@ -3616,36 +3831,132 @@ mod tests {
     }
 
     #[test]
-    fn the_busy_check_sees_only_running_build_steps() {
+    fn a_pod_is_claimed_by_its_owner_and_adopted_only_once_idle() {
         let dir = tempfile::tempdir().unwrap();
-        let busy = || {
+        let logs = dir.path().join("logs");
+        let claim = |me: &str, mode: &str, idle: &str| {
             let out = std::process::Command::new("sh")
-                .args(["-c", BUSY_SCRIPT, "sh"])
-                .arg(dir.path())
+                .args(["-c", CLAIM_SCRIPT, "sh"])
+                .arg(&logs)
+                .args([me, mode, idle])
                 .output()
                 .unwrap();
+            assert!(out.status.success(), "{out:?}");
             String::from_utf8(out.stdout).unwrap().trim().to_string()
         };
-        assert_eq!(busy(), "idle", "no builds yet");
-        let done = dir.path().join("buildit-1");
+        let owner = || std::fs::read_to_string(logs.join(".owner")).unwrap();
+        assert_eq!(
+            claim("sb-a", "own", "600"),
+            "claimed",
+            "a pod nobody owns yet"
+        );
+        assert_eq!(owner(), "sb-a\n");
+        assert!(logs.join(".used").is_file());
+        assert!(!logs.join(".lock").exists(), "the lock is released");
+        assert_eq!(claim("sb-a", "own", "600"), "claimed");
+        assert_eq!(
+            claim("sb-b", "own", "600"),
+            "taken",
+            "another sandbox's pod"
+        );
+
+        let done = logs.join("buildit-1");
         std::fs::create_dir(&done).unwrap();
         std::fs::write(done.join("build.log"), "").unwrap();
         std::fs::write(done.join("build.log.exit"), "0\n").unwrap();
         std::fs::write(done.join("build.log.pid"), std::process::id().to_string()).unwrap();
-        assert_eq!(busy(), "idle", "an exited build");
-        let running = dir.path().join("buildit-1-0000beef");
+        assert_eq!(claim("sb-a", "own", "600"), "claimed", "an exited build");
+        let running = logs.join("buildit-1-0000beef");
         std::fs::create_dir(&running).unwrap();
         std::fs::write(running.join("build.log"), "").unwrap();
         std::fs::write(running.join("build.log.pid"), "999999999").unwrap();
-        assert_eq!(busy(), "idle", "a dead runner without an exit record");
+        assert_eq!(claim("sb-a", "own", "600"), "claimed", "a dead runner");
         if std::path::Path::new("/proc/self/stat").exists() {
             std::fs::write(
                 running.join("build.log.pid"),
                 std::process::id().to_string(),
             )
             .unwrap();
-            assert_eq!(busy(), "busy", "a live runner without an exit record");
+            assert_eq!(claim("sb-a", "own", "600"), "busy", "a live runner");
+            assert_eq!(
+                claim("sb-b", "adopt", "0"),
+                "busy",
+                "never adopted mid-build"
+            );
+            std::fs::write(running.join("build.log.exit"), "0\n").unwrap();
+
+            assert_eq!(
+                claim("sb-b", "adopt", "600"),
+                "recent",
+                "claimed moments ago"
+            );
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            assert_eq!(
+                claim("sb-b", "adopt", "1"),
+                "claimed",
+                "idle past the limit"
+            );
+            assert_eq!(owner(), "sb-b\n");
+            assert_eq!(
+                claim("sb-a", "own", "600"),
+                "taken",
+                "its old owner lost it"
+            );
         }
+
+        std::fs::create_dir(logs.join(".lock")).unwrap();
+        assert_eq!(
+            claim("sb-a", "own", "600"),
+            "busy",
+            "another claim holds the lock"
+        );
+    }
+
+    #[test]
+    fn scrubbing_an_adopted_pod_drops_its_old_builds_and_keeps_its_marks() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join("logs");
+        let ws = dir.path().join("workspace");
+        for d in [logs.join("buildit-1/facts"), ws.join("buildit-1/svc")] {
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("f"), "x").unwrap();
+        }
+        std::fs::write(logs.join(".owner"), "sb-b\n").unwrap();
+        std::fs::write(logs.join(".used"), "").unwrap();
+        let out = std::process::Command::new("sh")
+            .args(["-c", SCRUB_SCRIPT, "sh"])
+            .arg(&logs)
+            .arg(&ws)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(!logs.join("buildit-1").exists() && !ws.join("buildit-1").exists());
+        assert!(logs.join(".owner").is_file() && logs.join(".used").is_file());
+    }
+
+    #[test]
+    fn a_dockerfiles_base_is_its_first_from_with_args_filled_in() {
+        let args = BTreeMap::from([(
+            "BASE".to_string(),
+            "docker.io/vllm/vllm-openai:v1".to_string(),
+        )]);
+        assert_eq!(
+            base_image("ARG BASE\nFROM ${BASE}\nRUN true\n", &args).as_deref(),
+            Some("docker.io/vllm/vllm-openai:v1")
+        );
+        assert_eq!(
+            base_image("# syntax\nARG TAG=3.20\nFROM --platform=linux/amd64 alpine:$TAG AS build\nFROM scratch\n", &BTreeMap::new()).as_deref(),
+            Some("alpine:3.20")
+        );
+        assert_eq!(
+            base_image("ARG TAG=\"3.19\"\nfrom alpine:${TAG}\n", &BTreeMap::new()).as_deref(),
+            Some("alpine:3.19")
+        );
+        assert_eq!(base_image("RUN true\n", &BTreeMap::new()), None);
+        let label = base_label("docker.io/vllm/vllm-openai:v1");
+        assert_eq!(label.len(), 32);
+        assert!(crate::sandbox::is_label_value(&label));
+        assert_ne!(label, base_label("docker.io/vllm/vllm-openai:v2"));
     }
 
     #[test]
@@ -3870,7 +4181,7 @@ mod tests {
         let id = BuildId::parse("buildit-1").unwrap();
         let pod = serde_json::to_value(
             broker
-                .builder_pod(&sandbox_caller("sb-a"), &id, &digest())
+                .builder_pod(&sandbox_caller("sb-a"), &id, &digest(), None)
                 .unwrap(),
         )
         .unwrap();
@@ -4143,7 +4454,7 @@ mod tests {
         let caller = sandbox_caller("sb-a");
         let id = BuildId::parse("buildit-1").unwrap();
         let plain = broker(offline_client(), &tokens(dir.path(), ""), None)
-            .builder_pod(&caller, &id, &digest())
+            .builder_pod(&caller, &id, &digest(), None)
             .unwrap();
         assert!(!plain.metadata.labels.unwrap().contains_key(LABEL_QUEUE));
         let queued = Broker {
@@ -4151,7 +4462,8 @@ mod tests {
             ..Arc::into_inner(broker(offline_client(), &tokens(dir.path(), ""), None)).unwrap()
         };
         let mut gated =
-            serde_json::to_value(queued.builder_pod(&caller, &id, &digest()).unwrap()).unwrap();
+            serde_json::to_value(queued.builder_pod(&caller, &id, &digest(), None).unwrap())
+                .unwrap();
         assert_eq!(gated["metadata"]["labels"][LABEL_QUEUE], "builds");
 
         gated["metadata"]["labels"]["kueue.x-k8s.io/managed"] = serde_json::json!("true");
@@ -4237,7 +4549,7 @@ mod tests {
         let broker = broker(offline_client(), &tokens(dir.path(), ""), None);
         let id = BuildId::parse("buildit-1").unwrap();
         let pod = broker
-            .builder_pod(&sandbox_caller("sb-a"), &id, &digest())
+            .builder_pod(&sandbox_caller("sb-a"), &id, &digest(), None)
             .unwrap();
         assert_eq!(
             annotated_digest(&pod, &id),
@@ -4595,7 +4907,7 @@ mod tests {
         let sandbox = sandbox_caller("sb-a");
         let id = BuildId::parse("buildit-1").unwrap();
         let unpinned = broker(offline_client(), &tokens(dir.path(), ""), None)
-            .builder_pod(&sandbox, &id, &digest())
+            .builder_pod(&sandbox, &id, &digest(), None)
             .unwrap();
         let arch = |pod: Pod| {
             pod.spec
@@ -4610,7 +4922,7 @@ mod tests {
             ..Arc::into_inner(broker(offline_client(), &tokens(dir.path(), ""), None)).unwrap()
         };
         assert_eq!(
-            arch(pinned.builder_pod(&sandbox, &id, &digest()).unwrap()).as_deref(),
+            arch(pinned.builder_pod(&sandbox, &id, &digest(), None).unwrap()).as_deref(),
             Some("amd64")
         );
     }
@@ -4824,6 +5136,122 @@ mod tests {
         for tool in ["logs", "status"] {
             let e = a(tool, only_id.clone()).await.unwrap_err();
             assert!(e.contains("no live build"), "{tool}: {e}");
+        }
+    }
+
+    /// Pod sharing on a cluster: a sandbox with no pod of its own adopts an idle pod of another
+    /// sandbox of the same launcher built from the same base, the old owner's next build gets a
+    /// new pod, and neither another launcher nor another base adopts it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a cluster: BUILDIT_E2E_KUBECONTEXT=kind-x cargo test -- --ignored"]
+    async fn e2e_an_idle_pod_is_adopted_by_its_launchers_next_sandbox_with_the_same_base() {
+        use crate::mcp::StatusParams;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let context = std::env::var("BUILDIT_E2E_KUBECONTEXT").unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().canonicalize().unwrap();
+        for (dir, base) in [("svc", "busybox:1.36"), ("other", "busybox:1.37")] {
+            std::fs::create_dir_all(work.join(dir)).unwrap();
+            std::fs::write(
+                work.join(dir).join("Dockerfile"),
+                format!("ARG BASE=docker.io/library/{base}\nFROM $BASE\nRUN echo adopt-e2e\n"),
+            )
+            .unwrap();
+        }
+        let file = tokens(&work, "");
+        let client = crate::client_for(Some(&context)).await.unwrap();
+        let broker = Broker {
+            adopt_idle_secs: 2,
+            ..Arc::into_inner(broker_with(client, &file, Some(&work), 900, true)).unwrap()
+        };
+        let caller = |sandbox: &str, launcher: &str| Caller {
+            sandbox: SandboxName::parse(sandbox).unwrap(),
+            workspace: Workspace::Local { dir: work.clone() },
+            launched_by: Some(Launcher::of(launcher)),
+        };
+        let a = caller("sb-adopt-a", "e2e-alice");
+        let b = caller("sb-adopt-b", "e2e-alice");
+        let c = caller("sb-adopt-c", "e2e-bob");
+        let d = caller("sb-adopt-d", "e2e-alice");
+        for who in [&a, &b, &c, &d] {
+            broker.clean(&who.sandbox, None).await.unwrap();
+        }
+        let built = |who: &Caller, dir: &str| {
+            let params = BuildParams {
+                context: dir.to_string(),
+                dockerfile: None,
+                target: None,
+                build_args: BTreeMap::new(),
+                timeout_s: Some(300),
+                caches: Vec::new(),
+                ccache: false,
+            };
+            let (broker, who) = (&broker, who.clone());
+            async move {
+                let id = broker.build(&who, params).await.unwrap().build_id;
+                for _ in 0..150 {
+                    let st = broker
+                        .status(
+                            &who.sandbox,
+                            StatusParams {
+                                build_id: id.clone(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                    if st.status != Status::Running {
+                        assert_eq!(st.status, Status::Succeeded, "{}", st.log_tail);
+                        return id;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                panic!("build {id} still running after 300s");
+            }
+        };
+        let pod_of = |id: &str| id.split('-').take(2).collect::<Vec<_>>().join("-");
+
+        let first = built(&a, "svc").await;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let other_launcher = built(&c, "svc").await;
+        assert_ne!(
+            pod_of(&other_launcher),
+            pod_of(&first),
+            "another launcher never adopts"
+        );
+        let other_base = built(&d, "other").await;
+        assert_ne!(
+            pod_of(&other_base),
+            pod_of(&first),
+            "another base never adopts"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let adopted = built(&b, "svc").await;
+        assert_eq!(
+            pod_of(&adopted),
+            pod_of(&first),
+            "the same launcher and base adopt the idle pod: {first} then {adopted}"
+        );
+        let gone = broker
+            .status(
+                &a.sandbox,
+                StatusParams {
+                    build_id: first.clone(),
+                },
+            )
+            .await;
+        assert!(
+            gone.is_err(),
+            "the old owner no longer sees its build: {gone:?}"
+        );
+        let again = built(&a, "svc").await;
+        assert_ne!(
+            pod_of(&again),
+            pod_of(&first),
+            "the old owner gets a new pod"
+        );
+
+        for who in [&a, &b, &c, &d] {
+            broker.clean(&who.sandbox, None).await.unwrap();
         }
     }
 
