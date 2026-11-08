@@ -337,6 +337,14 @@
         "draft_id": {
           "type": "string"
         },
+        "from": {
+          "default": [],
+          "description": "Tasks the rerun dispatches again, with everything downstream of them. Needs `rerun_of`;\nempty reruns only what did not pass.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "json": {
           "default": false,
           "type": "boolean"
@@ -369,6 +377,14 @@
         "provider": {
           "default": null,
           "description": "Registered inference provider id the run's agent talks to (see GET /api/config/providers),\nreplacing the pack manifest's `[agent]` harness. Omit to resolve through the configured\ndefaults.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rerun_of": {
+          "default": null,
+          "description": "A finished run of the same pack to rerun instead of starting afresh: every task it passed\nis reused, and the tasks `from` names run again with everything after them.",
           "type": [
             "string",
             "null"
@@ -654,6 +670,14 @@
             "null"
           ]
         },
+        "from": {
+          "default": [],
+          "description": "Tasks the rerun dispatches again, with everything downstream of them. Needs `rerun_of`;\nempty reruns only what did not pass.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "id": {
           "description": "Playbook id, as `crucible_playbooks` lists it.",
           "type": "string"
@@ -686,6 +710,14 @@
         "provider": {
           "default": null,
           "description": "Registered inference provider id the run's agent talks to (see GET /api/config/providers),\nreplacing the pack manifest's `[agent]` harness. Omit to resolve through the configured\ndefaults.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "rerun_of": {
+          "default": null,
+          "description": "A finished run of the same pack to rerun instead of starting afresh: every task it passed\nis reused, and the tasks `from` names run again with everything after them.",
           "type": [
             "string",
             "null"
