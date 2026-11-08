@@ -6,6 +6,8 @@
 
 use std::collections::HashMap;
 
+use jiff::Timestamp;
+
 use crate::session::{TaskState, TaskView};
 
 /// One bar: `start` and `end` in seconds from the run's start. A running task has no end yet.
@@ -28,23 +30,24 @@ pub struct Schedule {
     pub span: f64,
 }
 
-/// When a task, or the earliest of its instances, first started, in Unix seconds.
-fn first_start(task: &TaskView) -> Option<f64> {
-    task.started_at.or_else(|| {
-        task.instances
-            .iter()
-            .filter_map(|instance| instance.started_at)
-            .reduce(f64::min)
-    })
+/// When a task, or the earliest of its instances, first started.
+fn first_start(task: &TaskView) -> Option<Timestamp> {
+    task.started_at
+        .or_else(|| task.instances.iter().filter_map(|i| i.started_at).min())
+}
+
+/// Seconds from `origin` to `at`.
+fn since(origin: Timestamp, at: Timestamp) -> f64 {
+    at.duration_since(origin).as_secs_f64()
 }
 
 /// Where each task sits, by index into the run's tasks: its start, and `Some(end)` once placed,
-/// where `end` is `None` while it runs. `origin` is the run's first start in Unix seconds when the
-/// placement came from stamps.
+/// where `end` is `None` while it runs. `origin` is the run's first start when the placement
+/// came from stamps.
 struct Placement {
     starts: Vec<f64>,
     ends: Vec<Option<Option<f64>>>,
-    origin: Option<f64>,
+    origin: Option<Timestamp>,
 }
 
 /// Each task's start and end from the stamps in the log, against the run's first start; `None`
@@ -57,14 +60,11 @@ fn clocked(tasks: &[TaskView]) -> Option<Placement> {
     if placed.is_empty() || placed.iter().any(|task| first_start(task).is_none()) {
         return None;
     }
-    let origin = placed
-        .iter()
-        .filter_map(|task| first_start(task))
-        .reduce(f64::min)?;
+    let origin = placed.iter().filter_map(|task| first_start(task)).min()?;
     let mut starts = vec![0.0; tasks.len()];
     let mut ends = vec![None; tasks.len()];
     for (i, task) in tasks.iter().enumerate() {
-        let Some(start) = first_start(task).map(|at| at - origin) else {
+        let Some(start) = first_start(task).map(|at| since(origin, at)) else {
             continue;
         };
         starts[i] = start;
@@ -72,7 +72,7 @@ fn clocked(tasks: &[TaskView]) -> Option<Placement> {
             TaskState::Settled(_) => task
                 .result
                 .as_ref()
-                .map(|r| r.at.map_or(start + r.secs.max(0.0), |at| at - origin)),
+                .map(|r| r.at.map_or(start + r.secs.max(0.0), |at| since(origin, at))),
             _ => None,
         });
     }
@@ -123,11 +123,11 @@ pub fn schedule(tasks: &[TaskView]) -> Schedule {
                 .filter(|instance| instance.state() != TaskState::Pending)
                 .map(|instance| {
                     let from = match (origin, instance.started_at) {
-                        (Some(origin), Some(at)) => at - origin,
+                        (Some(origin), Some(at)) => since(origin, at),
                         _ => start,
                     };
                     let end = instance.result.as_ref().map(|r| match (origin, r.at) {
-                        (Some(origin), Some(at)) => at - origin,
+                        (Some(origin), Some(at)) => since(origin, at),
                         _ => from + r.secs.max(0.0),
                     });
                     (from, end, instance.state())

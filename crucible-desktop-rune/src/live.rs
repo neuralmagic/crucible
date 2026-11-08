@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crucible_contract::session::SessionEvent;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde_json::Value;
 use tokio::sync::oneshot;
 
@@ -1196,52 +1198,33 @@ fn build_detail(launch: &LivePlaybook, fold: RunFold, log: Vec<LogLine>) -> Live
     }
 }
 
+/// `18:00`, the UTC time of day of an RFC 3339 stamp; empty when it does not parse.
 fn clock(stamp: &str) -> String {
     stamp
-        .split_once('T')
-        .map(|(_, rest)| rest.chars().take(5).collect())
+        .parse::<Timestamp>()
+        .map(|at| at.to_zoned(TimeZone::UTC).strftime("%H:%M").to_string())
         .unwrap_or_default()
 }
 
 fn unix_now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or_default()
+    Timestamp::now().as_second()
 }
 
 /// Whole Unix seconds from an RFC 3339 stamp.
 fn epoch(stamp: &str) -> Option<i64> {
-    crate::clock::secs(stamp).map(|secs| secs.floor() as i64)
+    stamp.parse::<Timestamp>().ok().map(|at| at.as_second())
 }
 
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// `Nov 6 18:00`, from a `YYYY-MM-DDTHH:MM:SSZ` stamp; the raw stamp when it does not parse.
+/// `Nov 6 18:00` in UTC; the raw stamp when it does not parse.
 fn landed_label(stamp: &str) -> String {
-    let Some((date, rest)) = stamp.split_once('T') else {
-        return stamp.to_string();
-    };
-    let mut date = date.split('-');
-    let (Some(_), Some(month), Some(day)) = (date.next(), date.next(), date.next()) else {
-        return stamp.to_string();
-    };
-    let Ok(month) = month.parse::<usize>() else {
-        return stamp.to_string();
-    };
-    let Some(name) = MONTHS.get(month.saturating_sub(1)) else {
-        return stamp.to_string();
-    };
-    let Ok(day) = day.parse::<u32>() else {
-        return stamp.to_string();
-    };
-    let clock = clock(stamp);
-    if clock.is_empty() || rest.is_empty() {
-        return stamp.to_string();
-    }
-    format!("{name} {day} {clock}")
+    stamp
+        .parse::<Timestamp>()
+        .map(|at| {
+            at.to_zoned(TimeZone::UTC)
+                .strftime("%b %-d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|_| stamp.to_string())
 }
 
 /// What the live worker last read, for the window.

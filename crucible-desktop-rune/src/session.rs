@@ -43,8 +43,8 @@ pub struct TaskView {
     pub attempt: Option<Attempt>,
     pub result: Option<Outcome>,
     pub instances: Vec<Instance>,
-    /// When its first attempt started, in Unix seconds, from logs that record it.
-    pub started_at: Option<f64>,
+    /// When its first attempt started, from logs that record it.
+    pub started_at: Option<jiff::Timestamp>,
 }
 
 /// The newest attempt the engine started.
@@ -60,8 +60,8 @@ pub struct Instance {
     pub key: String,
     pub attempt: Option<Attempt>,
     pub result: Option<Outcome>,
-    /// When its first attempt started, in Unix seconds, from logs that record it.
-    pub started_at: Option<f64>,
+    /// When its first attempt started, from logs that record it.
+    pub started_at: Option<jiff::Timestamp>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -70,8 +70,8 @@ pub struct Outcome {
     pub attempts: u32,
     pub cost_usd: f64,
     pub secs: f64,
-    /// When it settled, in Unix seconds, from logs that record it.
-    pub at: Option<f64>,
+    /// When it settled, from logs that record it.
+    pub at: Option<jiff::Timestamp>,
     pub output: Option<Value>,
     pub note: String,
     pub links: Vec<LinkView>,
@@ -290,7 +290,7 @@ impl RunFold {
                     number: attempt,
                     estimate_usd,
                 };
-                let at = at.as_deref().and_then(crate::clock::secs);
+                let at = at.and_then(|at| at.parse().ok());
                 let (newest, first) = match self.slot(&task) {
                     Some(Slot::Task(task)) => (&mut task.attempt, &mut task.started_at),
                     Some(Slot::Instance(instance)) => {
@@ -326,7 +326,7 @@ impl RunFold {
                     attempts,
                     cost_usd: cost_usd.max(0.0),
                     secs,
-                    at: at.as_deref().and_then(crate::clock::secs),
+                    at: at.and_then(|at| at.parse().ok()),
                     output,
                     note,
                     links: links

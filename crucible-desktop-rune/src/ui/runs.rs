@@ -5,7 +5,7 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 
 use crate::live::LivePlaybook;
 use crate::model::Verdict;
-use crate::runs::{DAY, Day, MONTHS, Summary, calendar, date, day_label, lanes};
+use crate::runs::{DAY, Day, Summary, calendar, date, day_label, lanes};
 use crate::ui::{
     Paint, SECTION, TITLE, age, meter, mono, pulsing, runs_note, stat, verdict_color, verdict_tone,
 };
@@ -291,13 +291,11 @@ fn heatmap(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
     );
     grid = grid.child(labels);
     for week in days.chunks(7) {
-        let starts_month = week.iter().any(|d| date(d.day).2 == 1) || week[0].day == days[0].day;
-        let month = starts_month.then(|| {
-            let (_, m, _) = date(week[6].day);
-            MONTHS[(m as usize).saturating_sub(1).min(11)]
-        });
+        let starts_month =
+            week.iter().any(|d| date(d.day).day() == 1) || week[0].day == days[0].day;
+        let month = starts_month.then(|| date(week[6].day).strftime("%b").to_string());
         let mut column = col().gap(CELL_GAP).child(
-            text(month.unwrap_or(""))
+            text(month.unwrap_or_default())
                 .font(p.k.ty.small)
                 .color(p.c.text_faint)
                 .h(16.0)
