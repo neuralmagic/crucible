@@ -632,3 +632,207 @@ async fn groups_come_from_the_access_token_when_the_id_token_has_none(pool: PgPo
         "the group came off the access token: {who}"
     );
 }
+
+// --- signing a desktop app in through the browser ------------------------------------------------
+
+fn post(path: &str, cookie: Option<&str>, content_type: &str, body: String) -> Request<Body> {
+    let mut b = Request::post(path).header(header::CONTENT_TYPE, content_type);
+    if let Some(cookie) = cookie {
+        b = b.header(header::COOKIE, cookie);
+    }
+    b.body(Body::from(body)).expect("request")
+}
+
+/// A signed-in session cookie for alice, through Keycloak's real login form.
+async fn signed_in(app: &axum::Router) -> String {
+    let start = call(app, get("/auth/login?rd=/", None)).await;
+    let authorize_url = start.location.expect("login redirects to the issuer");
+    let flow_cookie = start.cookie.expect("flow cookie");
+    let (code, state) = authenticate(&authorize_url).await;
+    let done = call(
+        app,
+        get(
+            &format!("/auth/callback?code={code}&state={state}"),
+            Some(&flow_cookie),
+        ),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
+    done.cookie.expect("session cookie")
+}
+
+/// The approval page's pending id.
+fn pending_id(html: &str) -> String {
+    let at = html
+        .find("name=\"id\" value=\"")
+        .expect("the page carries a pending id")
+        + 17;
+    html[at..].split('"').next().expect("id").to_string()
+}
+
+fn query_of(location: &str) -> std::collections::HashMap<String, String> {
+    url::Url::parse(location)
+        .expect("a url")
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_desktop_app_signs_in_through_the_browser_and_gets_a_working_key(pool: PgPool) {
+    use base64::Engine;
+    use sha2::Digest;
+
+    let Some(base) = keycloak().await else { return };
+    let provider = Arc::new(OidcProvider::new(cfg(&base)).expect("provider"));
+    let app = native_router(&pool, provider).await;
+    let verifier = "a".repeat(20) + "-verifier-that-only-the-app-holds-0123";
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    let redirect = "http://127.0.0.1:53111/callback";
+    let ask = format!(
+        "/auth/native?redirect_uri={}&state=s1&code_challenge={challenge}&code_challenge_method=S256&name=Test%20app",
+        url::form_urlencoded::byte_serialize(redirect.as_bytes()).collect::<String>()
+    );
+
+    let anonymous = call(&app, get(&ask, None)).await;
+    assert_eq!(anonymous.status, StatusCode::SEE_OTHER);
+    assert!(
+        anonymous
+            .location
+            .as_deref()
+            .is_some_and(|l| l.starts_with("/auth/login?rd=%2Fauth%2Fnative%3F")),
+        "a visitor signs in first and comes back: {:?}",
+        anonymous.location
+    );
+
+    let session = signed_in(&app).await;
+    let page = call(&app, get(&ask, Some(&session))).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page.body.contains("Test app"), "{}", page.body);
+    assert!(page.body.contains(USER), "{}", page.body);
+    let session = page.cookie.unwrap_or(session);
+
+    let forged = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            "id=guessed&decision=approve".into(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        forged.status,
+        StatusCode::BAD_REQUEST,
+        "a guessed id approves nothing"
+    );
+
+    let page = call(&app, get(&ask, Some(&session))).await;
+    let approved = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            format!("id={}&decision=approve", pending_id(&page.body)),
+        ),
+    )
+    .await;
+    assert_eq!(approved.status, StatusCode::SEE_OTHER, "{}", approved.body);
+    let back = approved.location.expect("back to the app");
+    assert!(
+        back.starts_with("http://127.0.0.1:53111/callback?"),
+        "{back}"
+    );
+    let params = query_of(&back);
+    assert_eq!(params["state"], "s1");
+    let code = params["code"].clone();
+    assert!(
+        !back.contains("crk_"),
+        "the key never travels through the browser"
+    );
+
+    let redeem = |code: &str, verifier: &str| {
+        post(
+            "/auth/native/token",
+            None,
+            "application/json",
+            serde_json::json!({"code": code, "code_verifier": verifier, "redirect_uri": redirect})
+                .to_string(),
+        )
+    };
+    let issued = call(&app, redeem(&code, &verifier)).await;
+    assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
+    let issued: serde_json::Value = serde_json::from_str(&issued.body).expect("json");
+    let key = issued["key"].as_str().expect("a key").to_string();
+    assert!(key.starts_with("crk_"), "{issued}");
+    assert_eq!(issued["name"], "Test app");
+    assert!(
+        issued["expires_at"].is_string(),
+        "the key expires: {issued}"
+    );
+
+    let who = call(
+        &app,
+        Request::get("/api/whoami")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(who.status, StatusCode::OK, "{}", who.body);
+    let who: serde_json::Value = serde_json::from_str(&who.body).expect("whoami");
+    assert_eq!(
+        who["user"], USER,
+        "the key acts as the person who approved: {who}"
+    );
+
+    let replay = call(&app, redeem(&code, &verifier)).await;
+    assert_eq!(
+        replay.status,
+        StatusCode::BAD_REQUEST,
+        "a code buys one key"
+    );
+
+    let page = call(&app, get(&ask, Some(&session))).await;
+    let second = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            format!("id={}&decision=approve", pending_id(&page.body)),
+        ),
+    )
+    .await;
+    let stolen = query_of(&second.location.expect("back"))["code"].clone();
+    let wrong = call(&app, redeem(&stolen, &format!("{verifier}x"))).await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{}", wrong.body);
+    assert!(wrong.body.contains("does not match"), "{}", wrong.body);
+    let after = call(&app, redeem(&stolen, &verifier)).await;
+    assert_eq!(
+        after.status,
+        StatusCode::BAD_REQUEST,
+        "a wrong verifier burns the code"
+    );
+
+    let page = call(&app, get(&ask, Some(&session))).await;
+    let denied = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            format!("id={}&decision=deny", pending_id(&page.body)),
+        ),
+    )
+    .await;
+    let params = query_of(&denied.location.expect("back"));
+    assert_eq!(
+        params.get("error").map(String::as_str),
+        Some("access_denied")
+    );
+    assert!(!params.contains_key("code"));
+}

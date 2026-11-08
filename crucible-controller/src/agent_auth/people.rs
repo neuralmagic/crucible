@@ -429,7 +429,7 @@ pub(crate) struct Pending {
     pub(crate) request: AuthorizeRequest,
 }
 
-fn escape(raw: &str) -> String {
+pub(crate) fn escape(raw: &str) -> String {
     raw.chars()
         .fold(String::with_capacity(raw.len()), |mut s, c| {
             match c {
@@ -445,6 +445,15 @@ fn escape(raw: &str) -> String {
 }
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    styled_page(status, title, body, "'none'")
+}
+
+/// A page whose forms post back to this origin.
+pub(crate) fn form_page(status: StatusCode, title: &str, body: &str) -> Response {
+    styled_page(status, title, body, "'self'")
+}
+
+fn styled_page(status: StatusCode, title: &str, body: &str, form_action: &'static str) -> Response {
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{t}</title>\
@@ -461,12 +470,12 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let mut response = (status, Html(html)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'",
-        ),
+    let csp = format!(
+        "default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}; frame-ancestors 'none'"
     );
+    if let Ok(csp) = HeaderValue::from_str(&csp) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
+    }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }

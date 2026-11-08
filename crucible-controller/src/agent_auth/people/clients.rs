@@ -280,7 +280,7 @@ impl RedirectRule {
         }
     }
 
-    fn admits(&self, url: &Url, raw: &str) -> bool {
+    pub(crate) fn admits(&self, url: &Url, raw: &str) -> bool {
         match self {
             Self::Loopback { host, path } => {
                 url.scheme() == "http"
