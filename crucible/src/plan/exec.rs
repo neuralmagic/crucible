@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
-use crate::plan::admission::{Admission, Refusal};
+use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure};
 use crate::plan::files::CapturedFiles;
 use crate::plan::history::SeriesHistory;
@@ -68,12 +68,14 @@ impl Substrate {
 /// [`Deadline::note`], never a transport failure: rerunning an attempt that exceeded its limit
 /// would repeat the cost.
 pub trait TaskRunner {
+    /// Run one attempt of `task` in `lane`, which carries its deadline and takes its spend and
+    /// transcript; `None` runs it outside any admission.
     fn run(
         &mut self,
         task: &Task,
         attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt;
 
     /// Stage every declared file produced by the tasks named, into the workspace this task is
@@ -104,11 +106,7 @@ pub trait TaskRunner {
     ) -> Vec<Result<Attempt, Refusal>> {
         batch
             .iter()
-            .map(|b| {
-                admission.run(b, |lane| {
-                    self.run(b.task, b.attempt, &b.inputs, lane.deadline())
-                })
-            })
+            .map(|b| admission.run(b, |lane| self.run(b.task, b.attempt, &b.inputs, Some(lane))))
             .collect()
     }
 }
@@ -2354,7 +2352,7 @@ fn run_batch_with_retries<'a>(
             .journaled(cfg.journal);
         let attempts = match items.as_slice() {
             [only] if single => vec![admission.run(only, |lane| {
-                runner.run(only.task, only.attempt, &only.inputs, lane.deadline())
+                runner.run(only.task, only.attempt, &only.inputs, Some(lane))
             })],
             _ => runner.run_many(&items, &admission),
         };
@@ -3269,8 +3267,9 @@ mod tests {
             task: &Task,
             attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
-            deadline: Option<Deadline>,
+            lane: Option<&Lane<'_>>,
         ) -> Attempt {
+            let deadline = lane.and_then(Lane::deadline);
             self.dispatched.push((task.name.0.clone(), attempt));
             self.deadlines.push((task.name.0.clone(), deadline));
             self.seen_inputs.insert(
@@ -3469,8 +3468,9 @@ mod tests {
             task: &Task,
             _: u32,
             _: &BTreeMap<TaskName, Value>,
-            deadline: Option<Deadline>,
+            lane: Option<&Lane<'_>>,
         ) -> Attempt {
+            let deadline = lane.and_then(Lane::deadline);
             self.dispatched.push(task.name.0.clone());
             let takes = self.takes.get(&task.name.0).copied().unwrap_or_default();
             let done = Instant::now() + takes;
@@ -4276,7 +4276,7 @@ mod tests {
                 task: &Task,
                 _: u32,
                 _: &BTreeMap<TaskName, Value>,
-                _: Option<Deadline>,
+                _: Option<&Lane<'_>>,
             ) -> Attempt {
                 self.batches.push(vec![task.name.0.clone()]);
                 Attempt {
@@ -4559,7 +4559,7 @@ mod tests {
                 _: &Task,
                 _: u32,
                 _: &BTreeMap<TaskName, Value>,
-                _: Option<Deadline>,
+                _: Option<&Lane<'_>>,
             ) -> Attempt {
                 unreachable!("batchable plan must go through run_many");
             }
@@ -6243,7 +6243,7 @@ mod tests {
             task: &Task,
             _attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
-            _deadline: Option<Deadline>,
+            _lane: Option<&Lane<'_>>,
         ) -> Attempt {
             self.log.push(format!("run {}", task.name));
             self.seen_inputs.insert(task.name.0.clone(), inputs.clone());
@@ -6282,9 +6282,7 @@ mod tests {
             batch
                 .iter()
                 .map(|b| {
-                    admission.run(b, |lane| {
-                        self.run(b.task, b.attempt, &b.inputs, lane.deadline())
-                    })
+                    admission.run(b, |lane| self.run(b.task, b.attempt, &b.inputs, Some(lane)))
                 })
                 .collect()
         }
@@ -6501,7 +6499,7 @@ mod tests {
             task: &Task,
             _attempt: u32,
             _inputs: &BTreeMap<TaskName, Value>,
-            _deadline: Option<Deadline>,
+            _lane: Option<&Lane<'_>>,
         ) -> Attempt {
             self.ran.push(task.name.0.clone());
             let output = match task.name.0.as_str() {
@@ -9354,8 +9352,9 @@ mod tests {
             task: &Task,
             _attempt: u32,
             _inputs: &BTreeMap<TaskName, Value>,
-            deadline: Option<Deadline>,
+            lane: Option<&Lane<'_>>,
         ) -> Attempt {
+            let deadline = lane.and_then(Lane::deadline);
             assert_eq!(
                 deadline.map(|d| d.bound),
                 task.timeout.map(Bound::Task),

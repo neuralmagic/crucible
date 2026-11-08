@@ -30,6 +30,8 @@ Directives, all optional:
   stderr        text to emit on stderr
   exit          exit code (default 0); a nonzero code skips the result file
   result        object written to PLAN_TASK_RESULT.json and echoed to stdout
+  events        native agent events (`{"kind": "text", "delta": ...}`, tool calls, thinking)
+                printed on stdout in order, before anything else the turn reports
   cost_usd      what the turn reports it cost, as a native result event on stdout
   turns         per-invocation overrides: the Nth turn of the task applies the Nth entry over
                 the rest of its spec, and turns past the end apply the last
@@ -139,6 +141,9 @@ def main() -> int:
     sleep_ms = int(spec.get("sleep_ms", 0))
     if sleep_ms:
         time.sleep(sleep_ms / 1000.0)
+
+    for event in expand(spec.get("events", [])):
+        print(json.dumps({"v": 1, **event}), flush=True)
 
     loop_tool = spec.get("loop_tool")
     if loop_tool is not None:

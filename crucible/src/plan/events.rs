@@ -466,7 +466,7 @@ mod tests {
                 task: &Task,
                 attempt: u32,
                 _inputs: &BTreeMap<TaskName, serde_json::Value>,
-                _deadline: Option<crucible::deadline::Deadline>,
+                _lane: Option<&crucible::plan::admission::Lane<'_>>,
             ) -> Attempt {
                 let outcome = match (task.name.0.as_str(), attempt) {
                     ("discover", _) => {
