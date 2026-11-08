@@ -1,27 +1,36 @@
 //! The Graph pane: the run's tasks as a mermaid flowchart, shaped and labelled like the web
 //! graph, where a node opens its task and an edge opens what flows along it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crucible_contract::session::TaskStatus;
-use rune::{Color, El, col, text};
+use rune::{Color, El, Tx, col, row, text};
+use rune_kit::{Button, ButtonVariant, ControlSize, SegmentedControl};
 
-use crate::App;
 use crate::session::{TaskState, TaskView};
 use crate::ui::{Paint, Pane, empty_run, mono};
+use crate::{App, GraphSource};
 
 pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
+    let head = preview_head(pane, p);
     if pane.tasks.is_empty() {
         return col()
             .key("graph-empty")
             .w_full()
             .grow(1.0)
             .min_h(0.0)
+            .children(head)
             .child(empty_run(pane, p));
     }
+    let marks = if pane.previewing && !pane.run_tasks.is_empty() {
+        edits(&pane.run_tasks, &pane.tasks)
+    } else {
+        HashMap::new()
+    };
     let shown = Shown {
         open: app.expanded.as_deref(),
         unfolded: &app.unfolded,
+        marks: &marks,
     };
     let source = mermaid_source(&pane.tasks, &shown, &Ink::of(p));
     let mut style = rune_mermaid::DiagramStyle::neutral(p.dark);
@@ -94,17 +103,143 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
         )
     });
     col()
-        .key("graph-scroll")
+        .key("graph-pane")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .items_center()
-        .scroll(rune::ScrollSpec {
-            stick_bottom: false,
+        .gap(8.0)
+        .children(head)
+        .child(
+            col()
+                .key("graph-scroll")
+                .w_full()
+                .grow(1.0)
+                .min_h(0.0)
+                .items_center()
+                .scroll(rune::ScrollSpec {
+                    stick_bottom: false,
+                })
+                .scroll_xy()
+                .scroll_edge_fade(8.0)
+                .child(card),
+        )
+}
+
+/// How a task in the compiled pack differs from the run's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edit {
+    Added,
+    Changed,
+}
+
+/// What a task is, apart from how it ran.
+fn definition(task: &TaskView) -> impl PartialEq + '_ {
+    (
+        (
+            &task.kind,
+            &task.depends_on,
+            &task.over,
+            &task.when,
+            &task.keyed,
+        ),
+        (
+            &task.emits,
+            &task.files,
+            &task.session,
+            &task.timeout,
+            task.required,
+        ),
+    )
+}
+
+/// The compiled pack's tasks that are new or defined differently from the run's.
+fn edits(run: &[TaskView], compiled: &[TaskView]) -> HashMap<String, Edit> {
+    compiled
+        .iter()
+        .filter_map(|task| match run.iter().find(|r| r.name == task.name) {
+            None => Some((task.name.clone(), Edit::Added)),
+            Some(was) if definition(was) != definition(task) => {
+                Some((task.name.clone(), Edit::Changed))
+            }
+            Some(_) => None,
         })
-        .scroll_xy()
-        .scroll_edge_fade(8.0)
-        .child(card)
+        .collect()
+}
+
+/// Above the graph while there is a compiled pack: which to show, what the edit changed, and
+/// why it does not compile.
+fn preview_head(pane: &Pane, p: &Paint) -> Option<El> {
+    let preview = pane.preview.as_ref()?;
+    let has_run =
+        pane.previewing && !pane.run_tasks.is_empty() || !pane.previewing && !pane.tasks.is_empty();
+    let mut head = col().key("preview-head").w_full().gap(6.0);
+    let mut bar = row().w_full().gap(10.0).center_y();
+    if has_run {
+        const SOURCES: [GraphSource; 2] = [GraphSource::Run, GraphSource::Preview];
+        bar = bar.child(
+            SegmentedControl::new(&["Run", "Working copy"], Some(usize::from(pane.previewing)))
+                .label("Graph source")
+                .width(Some(250.0))
+                .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.graph_source = Some(SOURCES[i]))
+                .build(p.k)
+                .key("graph-source"),
+        );
+    }
+    if pane.previewing && !pane.run_tasks.is_empty() {
+        let marks = edits(&pane.run_tasks, &pane.tasks);
+        let added = marks.values().filter(|e| **e == Edit::Added).count();
+        let changed = marks.len() - added;
+        let removed: Vec<&str> = pane
+            .run_tasks
+            .iter()
+            .filter(|r| !pane.tasks.iter().any(|t| t.name == r.name))
+            .map(|r| r.name.as_str())
+            .collect();
+        let mut said = vec![format!("+{added} new"), format!("~{changed} changed")];
+        if !removed.is_empty() {
+            said.push(format!(
+                "\u{2212}{} removed: {}",
+                removed.len(),
+                removed.join(", ")
+            ));
+        }
+        bar = bar.child(
+            text(said.join(" \u{b7} "))
+                .font(mono(10.5, 400.0))
+                .color(p.c.text_muted)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    }
+    head = head.child(bar);
+    for (i, problem) in preview.problems.iter().enumerate() {
+        let mut line = row()
+            .key(format!("preview-problem-{i}"))
+            .w_full()
+            .gap(8.0)
+            .child(
+                text(problem.message.clone())
+                    .font(mono(10.5, 400.0))
+                    .color(p.fail)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .max_lines(3)
+                    .wrap()
+                    .selectable(true),
+            );
+        if let Some((path, at)) = problem.at.clone() {
+            line = line.child(
+                Button::new("Open")
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Small)
+                    .on_press(move |app: &mut App| app.open_path_in_editor(&path, at as usize))
+                    .build(p.k),
+            );
+        }
+        head = head.child(line);
+    }
+    Some(head)
 }
 
 /// What a [`mermaid_source`] node id names: task `t<i>`, or instance `t<i>i<k>` of it.
@@ -141,6 +276,9 @@ struct Ink {
     faded: Color,
     /// Edges on the critical path.
     critical: Color,
+    /// Outlines of tasks a preview adds and redefines.
+    added: Color,
+    changed: Color,
 }
 
 impl Ink {
@@ -162,6 +300,8 @@ impl Ink {
             accent: p.c.text_accent,
             faded: p.c.border_muted,
             critical: p.c.text_muted,
+            added: p.pass,
+            changed: p.c.warning.icon,
         }
     }
 }
@@ -236,6 +376,8 @@ struct Shown<'a> {
     open: Option<&'a str>,
     /// Fan-outs drawn with their instances.
     unfolded: &'a HashSet<String>,
+    /// Tasks the compiled pack adds or redefines, outlined.
+    marks: &'a HashMap<String, Edit>,
 }
 
 /// The run's tasks as a mermaid flowchart, task `i` as node `t<i>`; an unfolded fan-out is
@@ -401,6 +543,14 @@ fn mermaid_source(tasks: &[TaskView], shown: &Shown, ink: &Ink) -> String {
     for (node, class) in classes {
         source.push_str(&format!("  class {node} {class}\n"));
     }
+    for (i, task) in tasks.iter().enumerate() {
+        let ink = match shown.marks.get(&task.name) {
+            Some(Edit::Added) => ink.added,
+            Some(Edit::Changed) => ink.changed,
+            None => continue,
+        };
+        source.push_str(&format!("  style t{i} stroke:{}\n", ink.hex()));
+    }
     if let Some(open) = shown
         .open
         .filter(|open| tasks.iter().any(|task| task.name == *open))
@@ -431,7 +581,9 @@ mod tests {
     use rune::Color;
 
     use crate::session::{RunFold, TaskView};
-    use crate::ui::graph::{Ink, Shown, Swatch, critical_path, graph_node, mermaid_source};
+    use crate::ui::graph::{
+        Edit, Ink, Shown, Swatch, critical_path, edits, graph_node, mermaid_source,
+    };
 
     const RUN: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
@@ -481,6 +633,8 @@ mod tests {
             accent: Color::WHITE,
             faded: Color::BLACK,
             critical: Color::WHITE,
+            added: Color::WHITE,
+            changed: Color::BLACK,
         }
     }
 
@@ -499,6 +653,7 @@ mod tests {
             &Shown {
                 open,
                 unfolded: &unfolded,
+                marks: &std::collections::HashMap::new(),
             },
             &ink(),
         );
@@ -577,6 +732,42 @@ mod tests {
             ],
         );
         assert!(!source(&tasks, None, &["a"]).contains("subgraph"));
+    }
+
+    #[test]
+    fn an_edit_marks_the_tasks_it_adds_or_redefines_but_not_how_they_ran() {
+        let run = fold(TIMED);
+        let mut compiled = fold(RUN);
+        compiled.extend(fold(TIMED).into_iter().map(|mut task| {
+            task.result = None;
+            if task.name == "b" {
+                task.depends_on = vec!["c".into()];
+            }
+            task
+        }));
+        let marks = edits(&run, &compiled);
+        assert_eq!(marks.get("b"), Some(&Edit::Changed));
+        assert_eq!(marks.get("scan"), Some(&Edit::Added));
+        assert_eq!(
+            marks.get("a"),
+            None,
+            "a settled run is not a different definition"
+        );
+        let unfolded = HashSet::new();
+        let source = mermaid_source(
+            &compiled,
+            &Shown {
+                open: None,
+                unfolded: &unfolded,
+                marks: &marks,
+            },
+            &ink(),
+        );
+        let b = compiled.iter().position(|t| t.name == "b").unwrap();
+        assert!(
+            source.contains(&format!("style t{b} stroke:#000000ff")),
+            "{source}"
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ use rune::Waker;
 
 use crate::logline::LogLine;
 use crate::pack::PackFiles;
+use crate::preview::Preview;
 use crate::session::{RunFold, TaskView};
 
 const LOG: &str = "state/session.jsonl";
@@ -92,6 +93,7 @@ pub struct PackView {
     pub transcript: Vec<LogLine>,
     pub agent_events: Vec<crate::session::AgentStep>,
     pub pack: PackFiles,
+    pub preview: Preview,
 }
 
 impl PackView {
@@ -259,6 +261,8 @@ struct Pack {
     budget_usd: f64,
     run: Run,
     files: PackFiles,
+    /// The pack as it compiles now, redone whenever its files change.
+    preview: Preview,
     started: bool,
     since: Option<Instant>,
     stderr: PathBuf,
@@ -323,11 +327,12 @@ impl Pack {
                 .to_string(),
             stderr: dir.join(STDERR),
             name,
-            dir,
+            dir: dir.clone(),
             plan,
             goal,
             budget_usd,
             run,
+            preview: crate::preview::compile(&dir),
             files,
             started,
             since: None,
@@ -354,6 +359,7 @@ impl Pack {
         let files = PackFiles::read_dir(&self.dir);
         if files != self.files {
             self.files = files;
+            self.preview = crate::preview::compile(&self.dir);
             changed = true;
         }
         if let Some(mut child) = self.run.child.take() {
@@ -434,6 +440,7 @@ impl Pack {
             transcript: self.run.fold.transcript.clone(),
             agent_events: self.run.fold.agent_events.clone(),
             pack: self.files.clone(),
+            preview: self.preview.clone(),
         }
     }
 }

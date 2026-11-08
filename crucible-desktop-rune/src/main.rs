@@ -56,6 +56,13 @@ const MAX_TIME: &str = "10m";
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
+/// What the run views draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GraphSource {
+    Run,
+    Preview,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Controller,
@@ -223,6 +230,11 @@ pub struct App {
     /// The working copy of the draft the shown pack edits, and its files as last read.
     pub working: Option<Working>,
     pub working_pack: Option<PackFiles>,
+    /// The working copy as it compiles now.
+    pub working_preview: Option<preview::Preview>,
+    /// Whether the run views show the run or the pack as it compiles now; `None` shows the run
+    /// when there is one.
+    pub graph_source: Option<GraphSource>,
     pub working_edited: bool,
     working_read: Option<std::time::Instant>,
     /// The pack the user picked to show; `None` shows a draft run's working copy.
@@ -426,6 +438,15 @@ impl App {
             self.lsp.show(&sent.0, text);
             self.lsp_sent = Some(sent);
         }
+    }
+
+    /// Open line `line` (1-based) of the file at `path` in the user's editor.
+    pub fn open_path_in_editor(&mut self, path: &std::path::Path, line: usize) {
+        let Some(editor) = self.settings.editor.or_else(Editor::detect) else {
+            self.editor_error = Some("No editor found. Pick one in Settings.".to_string());
+            return;
+        };
+        self.editor_error = editor::open_file(editor, path, line).err();
     }
 
     /// Open line `line` (1-based) of pack file `file` in the user's editor: the file itself from
@@ -991,6 +1012,8 @@ fn init() -> App {
         waker: None,
         working: None,
         working_pack: None,
+        working_preview: None,
+        graph_source: None,
         working_edited: false,
         working_read: None,
         pack_source: None,

@@ -59,14 +59,20 @@ pub fn compile(pack: &Path) -> Preview {
         }
     };
     let file = match toml::from_str::<Manifest>(&manifest) {
-        Ok(parsed) => parsed.workflow.and_then(|w| w.file).filter(|f| !f.is_empty()),
+        Ok(parsed) => parsed
+            .workflow
+            .and_then(|w| w.file)
+            .filter(|f| !f.is_empty()),
         Err(e) => {
             refuse(&mut preview, format!("crucible.toml: {e}"));
             return preview;
         }
     };
     let Some(file) = file else {
-        refuse(&mut preview, "crucible.toml names no [workflow] file".into());
+        refuse(
+            &mut preview,
+            "crucible.toml names no [workflow] file".into(),
+        );
         return preview;
     };
     let source = pack.join(file);
@@ -207,13 +213,19 @@ mod tests {
     #[test]
     fn a_pack_that_does_not_compile_says_where() {
         let dir = tempfile::tempdir().unwrap();
-        pack(dir.path(), "workflow(type = \"playbook\", tasks = [missing])\n");
+        pack(
+            dir.path(),
+            "workflow(type = \"playbook\", tasks = [missing])\n",
+        );
         let preview = compile(dir.path());
         assert!(preview.fold.tasks.is_empty());
         let problem = preview.problems.first().expect("a refusal");
         assert!(problem.message.contains("missing"), "{problem:?}");
         assert_eq!(
-            problem.at.as_ref().map(|(file, line)| (file.ends_with("workflow.star"), *line)),
+            problem
+                .at
+                .as_ref()
+                .map(|(file, line)| (file.ends_with("workflow.star"), *line)),
             Some((true, 1)),
             "{problem:?}"
         );

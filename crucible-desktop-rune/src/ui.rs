@@ -278,9 +278,32 @@ struct Pane {
     launch: Option<crux::dto::PlaybookLaunch>,
     log_font: LogFont,
     launchable: bool,
+    /// The pack as it compiles now: a local pack's, or the run's draft working copy's.
+    preview: Option<crate::preview::Preview>,
+    /// `tasks` are the preview's, not the run's.
+    previewing: bool,
+    /// The run's tasks while the preview's are shown, for marking what the edit changed.
+    run_tasks: Vec<TaskView>,
 }
 
 impl Pane {
+    /// Show the compiled pack's tasks when they are picked, or when there is no run to show.
+    fn previewed(mut self, source: Option<crate::GraphSource>) -> Pane {
+        let Some(compiled) = self.preview.as_ref().map(|p| p.fold.tasks.clone()) else {
+            return self;
+        };
+        let show = match source {
+            Some(crate::GraphSource::Preview) => true,
+            Some(crate::GraphSource::Run) => false,
+            None => self.tasks.is_empty() && !compiled.is_empty(),
+        };
+        if show {
+            self.run_tasks = std::mem::replace(&mut self.tasks, compiled);
+            self.previewing = true;
+        }
+        self
+    }
+
     /// What the agents did: the session transcript when the engine recorded one, otherwise the
     /// console's sampled progress lines.
     fn agent_lines(&self) -> &[LogLine] {
@@ -323,6 +346,9 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
         agent_events: pack.agent_events.clone(),
         log_font,
         launchable: true,
+        preview: Some(pack.preview.clone()),
+        previewing: false,
+        run_tasks: Vec::new(),
         pack: Ok(pack.pack.clone()),
         launch: None,
         empty: (
@@ -387,6 +413,9 @@ fn live_pane(
             .unwrap_or_default(),
         log_font,
         launchable: false,
+        preview: None,
+        previewing: false,
+        run_tasks: Vec::new(),
         empty: live_empty(launch, detail),
         pack: detail.map_or_else(
             || Err("Reading the pack\u{2026}".to_string()),
@@ -934,11 +963,14 @@ fn detail(app: &App, p: &Paint) -> El {
         Some(Selection::Local(_)) => app.selected_pack().map(|pack| local_pane(pack, font)),
         Some(Selection::Live { launch, .. }) => {
             let pinned = launch.is_some() && playbook_launches(app).is_some();
-            app.selected_live()
-                .map(|live| live_pane(live, app.selected_detail(), font, pinned))
+            app.selected_live().map(|live| Pane {
+                preview: app.working_preview.clone(),
+                ..live_pane(live, app.selected_detail(), font, pinned)
+            })
         }
         None => None,
-    };
+    }
+    .map(|pane| pane.previewed(app.graph_source));
 
     let Some(pane) = pane else {
         return col()

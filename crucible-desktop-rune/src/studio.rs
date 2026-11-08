@@ -142,6 +142,7 @@ impl App {
                 .as_deref()
                 .and_then(|draft| Working::open(&crate::draft::root()?, draft));
             self.working_pack = None;
+            self.working_preview = None;
             self.working_read = None;
             if self.working.is_none() {
                 return true;
@@ -164,6 +165,10 @@ impl App {
             ),
             ..PackFiles::read_dir(&working.dir)
         };
+        let files_moved = self.working_pack.as_ref().map(|p| &p.files) != Some(&pack.files);
+        if files_moved {
+            self.working_preview = Some(crate::preview::compile(&working.dir));
+        }
         let changed = self.working_pack.as_ref() != Some(&pack) || self.working_edited != edited;
         self.working_pack = Some(pack);
         self.working_edited = edited;

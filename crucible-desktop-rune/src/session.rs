@@ -262,13 +262,9 @@ impl RunFold {
     /// Fold one NDJSON line. A line this build cannot decode is skipped, so a newer engine's events
     /// never stop the rest of the log from reading.
     pub fn apply_line(&mut self, line: &str) -> bool {
-        let line = line.trim();
-        if line.is_empty() {
-            return false;
-        }
-        match serde_json::from_str::<SessionEvent>(line) {
-            Ok(event) => self.apply(event),
-            Err(_) => false,
+        match crucible_contract::session::decode(line) {
+            Some(event) => self.apply(event),
+            None => false,
         }
     }
 
