@@ -38,7 +38,10 @@ pub fn router(state: AuthState) -> Router {
     {
         router = router.route(&path, get(callback));
     }
-    router.with_state(state)
+    let pool = state.pool.clone();
+    router
+        .with_state(state)
+        .merge(crate::identity::native_sign_in::router(pool))
 }
 
 #[derive(Debug, Deserialize)]
