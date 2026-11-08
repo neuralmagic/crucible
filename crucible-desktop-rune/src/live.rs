@@ -322,10 +322,13 @@ pub struct Synced {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Finished {
     pub seq: u64,
+    /// The launch's key.
+    pub key: String,
     pub playbook: String,
     pub status: String,
     pub by: String,
     pub why: Option<String>,
+    pub cost: Option<f64>,
 }
 
 /// The controller fetcher. One instance lives on its own worker thread, so a slow controller
@@ -763,10 +766,12 @@ impl Fetcher {
                 self.finished_seq += 1;
                 self.finished.push(Finished {
                     seq: self.finished_seq,
+                    key: launch.key.clone(),
                     playbook: launch.id.clone(),
                     status: launch.status.clone(),
                     by: launch.by.clone(),
                     why: launch.why.clone(),
+                    cost: launch.cost,
                 });
             }
         }

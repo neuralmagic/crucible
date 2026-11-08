@@ -209,6 +209,10 @@ pub struct App {
     pub palette: Option<palette::Palette>,
     /// The pane keyboard navigation starts from.
     pub pane_focus: Option<PaneKind>,
+    /// Posts notifications once the app's loop is up.
+    notifier: Option<notify::Notifier>,
+    /// Links of clicked notifications, to open.
+    clicks: Option<std::sync::mpsc::Receiver<String>>,
     /// Each command's key recorder in Settings, once touched.
     pub recorders: HashMap<keymap::Command, rune_kit::ShortcutRecorderState>,
     /// The pack file the Pack tab shows; the manifest when none is picked.
@@ -487,9 +491,17 @@ impl App {
         let seen = self.notified;
         for done in finished.iter().filter(|done| done.seq > seen) {
             self.notified = done.seq;
-            if self.settings.notify && !me.is_empty() && done.by == me {
-                let (title, body) = notify::message(done);
-                notify::post(&title, &body);
+            let looking = notify::app_focused()
+                && self
+                    .selected_live()
+                    .is_some_and(|live| live.key == done.key);
+            if self.settings.notify
+                && !me.is_empty()
+                && done.by == me
+                && !looking
+                && let Some(notifier) = &self.notifier
+            {
+                notifier.post(&notify::note(done));
             }
         }
     }
@@ -989,6 +1001,8 @@ fn init() -> App {
         keys_refused,
         palette: None,
         pane_focus: None,
+        notifier: None,
+        clicks: None,
         recorders: HashMap::new(),
         pack_file: None,
         layout: settings.layout.clone(),
@@ -1032,6 +1046,9 @@ fn init() -> App {
 
 fn setup(app: &mut App, waker: Waker) {
     app.waker = Some(waker.clone());
+    let (clicked, clicks) = std::sync::mpsc::channel();
+    app.notifier = Some(notify::Notifier::start(clicked, waker.clone()));
+    app.clicks = Some(clicks);
     app.local.set_waker(waker.clone());
     app.live_client.set_waker(waker.clone());
     app.lsp.set_waker(waker);
@@ -1049,6 +1066,16 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
     if let Some((version, snapshot)) = app.live_client.take(app.live_seen) {
         app.live_seen = version;
         app.apply_live(snapshot);
+        changed = true;
+    }
+    while let Some(link) = app
+        .clicks
+        .as_ref()
+        .and_then(|clicks| clicks.try_recv().ok())
+        .and_then(|url| Link::parse(&url))
+    {
+        app.follow(&link);
+        notify::bring_to_front();
         changed = true;
     }
     app.sync_live();

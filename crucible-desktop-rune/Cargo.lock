@@ -1469,12 +1469,14 @@ dependencies = [
  "crucible",
  "crucible-contract",
  "crux",
+ "futures-util",
  "jiff",
  "rand 0.10.3",
  "reqwest",
  "rune",
  "rune-fx",
  "rune-kit",
+ "rune-mac",
  "rune-mermaid",
  "rune-theme-opencode",
  "rusqlite",
@@ -1486,6 +1488,7 @@ dependencies = [
  "toml 0.8.23",
  "url",
  "wgpu",
+ "zbus 6.2.1",
 ]
 
 [[package]]
@@ -6590,6 +6593,14 @@ dependencies = [
  "rune",
  "rune-motion",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "rune-mac"
+version = "0.0.1"
+dependencies = [
+ "block2 0.5.1",
+ "objc2 0.5.3",
 ]
 
 [[package]]

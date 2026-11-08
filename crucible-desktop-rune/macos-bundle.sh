@@ -51,4 +51,5 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
 </dict>
 </plist>
 EOF
+codesign --force --deep --sign - "$APP"
 echo "$APP"
