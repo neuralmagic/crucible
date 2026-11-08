@@ -63,26 +63,30 @@ pub struct Config {
 }
 
 /// The flags every subcommand shares. Each mirrors an env var and a config-file key.
-#[derive(Debug, clap::Args, Default)]
+#[derive(Debug, Default)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct ConnectArgs {
     /// Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
     /// `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
     /// wins over the file.
-    #[arg(long, env = "CONTROLLER_CONFIG", global = true)]
+    #[cfg_attr(feature = "cli", arg(long, env = "CONTROLLER_CONFIG", global = true))]
     pub config: Option<PathBuf>,
 
     /// Controller base URL: the API route. Defaults to a controller on this machine,
     /// `http://127.0.0.1:8870`.
-    #[arg(long, env = "CONTROLLER_URL", global = true)]
+    #[cfg_attr(feature = "cli", arg(long, env = "CONTROLLER_URL", global = true))]
     pub url: Option<String>,
 
     /// The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
     /// controller's static token, which authenticates as nobody.
-    #[arg(
-        long,
-        env = "CONTROLLER_API_TOKEN",
-        global = true,
-        hide_env_values = true
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long,
+            env = "CONTROLLER_API_TOKEN",
+            global = true,
+            hide_env_values = true
+        )
     )]
     pub api_token: Option<String>,
 }
@@ -121,6 +125,20 @@ impl FileConfig {
 }
 
 impl ConnectArgs {
+    /// What a program with no flags of its own resolves: the env vars the flags mirror.
+    pub fn from_env() -> Self {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |name| var(name).filter(|value: &String| !value.trim().is_empty());
+        ConnectArgs {
+            config: var("CONTROLLER_CONFIG").map(PathBuf::from),
+            url: var("CONTROLLER_URL"),
+            api_token: var("CONTROLLER_API_TOKEN"),
+        }
+    }
+
     /// Flags and env vars over the file.
     pub fn resolve(&self) -> Result<Config> {
         let file = FileConfig::load(self.config.as_deref())?;
@@ -171,8 +189,9 @@ fn config_dir_from(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::config::*;
 
+    #[cfg(feature = "cli")]
     fn args(argv: &[&str]) -> ConnectArgs {
         #[derive(clap::Parser)]
         struct Only {
@@ -281,7 +300,7 @@ mod tests {
             "#,
         )
         .expect("parses");
-        let cfg = args(&[]).resolve_over(file);
+        let cfg = ConnectArgs::default().resolve_over(file);
         assert_eq!(cfg.url, "https://file.example.com");
         assert_eq!(
             cfg.auth,
@@ -293,6 +312,7 @@ mod tests {
 
     /// A shell that exports a token is authenticated as that token and nothing else, whatever the
     /// file says.
+    #[cfg(feature = "cli")]
     #[test]
     fn the_command_line_wins_over_the_file() {
         let file: FileConfig = toml::from_str(
@@ -320,9 +340,46 @@ mod tests {
 
     #[test]
     fn with_nothing_at_all_the_url_is_the_local_controller_and_the_auth_is_none() {
-        let cfg = args(&[]).resolve_over(FileConfig::default());
+        let cfg = ConnectArgs::default().resolve_over(FileConfig::default());
         assert_eq!(cfg.url, "http://127.0.0.1:8870");
         assert_eq!(cfg.auth, Auth::None);
+    }
+
+    #[test]
+    fn the_env_vars_resolve_like_the_flags_they_mirror_and_blank_ones_are_unset() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let args = ConnectArgs::from_vars(env(&[
+            ("CONTROLLER_URL", "https://env.example.com/"),
+            ("CONTROLLER_API_TOKEN", "crk_env"),
+            ("CONTROLLER_CONFIG", "/etc/crux.toml"),
+        ]));
+        assert_eq!(args.config, Some(PathBuf::from("/etc/crux.toml")));
+        let file: FileConfig =
+            toml::from_str("url = \"https://file.example.com\"\n").expect("parses");
+        let cfg = args.resolve_over(file);
+        assert_eq!(cfg.url, "https://env.example.com");
+        assert_eq!(
+            cfg.auth,
+            Auth::ApiKey {
+                token: "crk_env".into()
+            }
+        );
+
+        let blank = ConnectArgs::from_vars(env(&[
+            ("CONTROLLER_URL", "  "),
+            ("CONTROLLER_API_TOKEN", ""),
+        ]));
+        assert_eq!(
+            (blank.url, blank.api_token, blank.config),
+            (None, None, None)
+        );
     }
 
     #[test]

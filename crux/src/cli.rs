@@ -158,6 +158,9 @@ enum Command {
     /// One window of a run's engine output, resumable by cursor.
     RunLog(ops::runs::RunLog),
 
+    /// A run's engine session as NDJSON, one event per line; -f streams a running one.
+    RunSession(ops::runs::RunSession),
+
     /// The files a run's tasks captured: what the run produced, as opposed to what it narrated.
     RunFiles(ops::runs::RunFiles),
 
@@ -466,6 +469,11 @@ pub async fn run() -> Result<()> {
                 .await?
         }
         Command::RunLog(op) => op.run(&c).await?,
+        Command::RunSession(op) if op.follow => {
+            op.follow(&c, &mut std::io::stdout()).await?;
+            String::new()
+        }
+        Command::RunSession(op) => op.run(&c).await?,
         Command::RunFiles(op) => op.run(&c).await?,
         Command::RunFile(op) => op.run(&c).await?,
         Command::Contracts(op) => op.run(&c).await?,
