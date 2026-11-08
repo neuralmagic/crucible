@@ -818,9 +818,11 @@ dependencies = [
 name = "crucible-playbooks"
 version = "0.0.0"
 dependencies = [
+ "base64 0.23.1",
  "crucible-contract",
  "crux",
  "jiff",
+ "rand 0.10.3",
  "rune",
  "rune-fx",
  "rune-kit",
@@ -828,9 +830,11 @@ dependencies = [
  "rune-theme-opencode",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "toml 0.8.23",
+ "url",
  "wgpu",
 ]
 

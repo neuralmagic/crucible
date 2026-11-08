@@ -677,7 +677,7 @@ fn pack_list(app: &App, p: &Paint) -> El {
                         ),
                 )
             }
-            LiveView::Unavailable(error) => list = list.child(unavailable(error, p)),
+            LiveView::Unavailable(error) => list = list.child(unavailable(error, app, p)),
         },
         Backend::Local => {
             let packs: Vec<&PackView> = app.visible_packs().collect();
@@ -711,12 +711,31 @@ fn note(label: &str, p: &Paint) -> El {
         .py(8.0)
 }
 
-fn unavailable(error: &str, p: &Paint) -> El {
+fn unavailable(error: &str, app: &App, p: &Paint) -> El {
     let s = p.tone(Tone::Danger);
+    let action = if app.signing_in {
+        row()
+            .gap(8.0)
+            .center_y()
+            .child(Spinner::new().size(14.0).build(p.k))
+            .child(
+                text("Waiting for the browser\u{2026}")
+                    .font(p.k.ty.ui)
+                    .color(p.c.text_muted),
+            )
+    } else {
+        row().child(
+            Button::new("Sign in with browser")
+                .variant(ButtonVariant::Submit)
+                .on_press(|app: &mut App| app.sign_in())
+                .build(p.k)
+                .key("sign-in"),
+        )
+    };
     col()
         .key("live-error")
         .w_full()
-        .gap(6.0)
+        .gap(8.0)
         .padding(10.0)
         .radius(p.k.radius.lg)
         .fill(s.bg)
@@ -726,11 +745,7 @@ fn unavailable(error: &str, p: &Paint) -> El {
                 .gap(6.0)
                 .center_y()
                 .child(icon(&oc::WARNING, 14.0).color(s.icon))
-                .child(
-                    text("Not connected")
-                        .font(p.k.ty.ui_medium)
-                        .color(s.fg),
-                ),
+                .child(text("Not connected").font(p.k.ty.ui_medium).color(s.fg)),
         )
         .child(
             text(error.to_string())
@@ -740,11 +755,19 @@ fn unavailable(error: &str, p: &Paint) -> El {
                 .wrap(),
         )
         .child(
-            text("Live tracking reads crux's config: CONTROLLER_URL, CONTROLLER_API_TOKEN, ~/.config/crux/config.toml.")
-                .font(p.k.ty.caption())
-                .color(p.c.text_muted)
-                .max_lines(3)
-                .wrap(),
+            TextInput::new(&app.sign_in_url)
+                .placeholder("https://crucible.example.com")
+                .width(Some(SIDEBAR - 2.0 * SIDEBAR_PAD - 20.0))
+                .disabled(app.signing_in)
+                .on_edit(|app: &mut App| &mut app.sign_in_url)
+                .build(p.k)
+                .key("sign-in-url"),
+        )
+        .child(action)
+        .children(
+            app.sign_in_error
+                .as_ref()
+                .map(|why| text(why.clone()).font(p.k.ty.small).color(s.fg).wrap()),
         )
 }
 

@@ -242,6 +242,8 @@ enum Msg {
     },
     /// Save a working copy as its draft's next version.
     Save(Working),
+    /// Drop the connection and who it named, and read crux's config afresh.
+    Reconnect,
 }
 
 /// What a launch form starts: a registered playbook, or a draft's newest save.
@@ -1322,6 +1324,11 @@ impl Client {
         let _ = self.tx.send(Msg::Save(working));
     }
 
+    /// Connect again with whatever crux's config now holds.
+    pub fn reconnect(&self) {
+        let _ = self.tx.send(Msg::Reconnect);
+    }
+
     /// Which live playbook's graph to keep current; `None` stops fetching graphs.
     pub fn select(&self, playbook: Option<&str>) {
         let _ = self.tx.send(Msg::Select(playbook.map(ToString::to_string)));
@@ -1388,6 +1395,14 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
             }
             Ok(Msg::Save(working)) => {
                 fetcher.save(working);
+                force = true;
+            }
+            Ok(Msg::Reconnect) => {
+                fetcher.connection = None;
+                fetcher.identity = None;
+                fetcher.registered_at = None;
+                fetcher.view = LiveView::Loading;
+                next_list = Instant::now();
                 force = true;
             }
             Err(RecvTimeoutError::Disconnected) => return,

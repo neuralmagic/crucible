@@ -19,6 +19,12 @@ reads exactly the config a terminal does: `CONTROLLER_URL`, `CONTROLLER_API_TOKE
 `~/.config/crux/config.toml` (or `$XDG_CONFIG_HOME/crux`). No credential is copied, stored or
 logged by the app; `crux` resolves it per call. `CRUX_BIN` points the app at another `crux`.
 
+With no working credential, the sidebar offers `Sign in with browser`: the app opens the
+controller's `/auth/native` page, you sign in and approve, and the controller hands the app a
+90-day api key over a loopback redirect with PKCE. The key is saved to crux's `config.toml`
+(owner-readable only), so the `crux` CLI is signed in too, and it can be revoked in the
+controller's Settings like any other key.
+
 The account row at the bottom of the sidebar names the user `crux whoami` reports for that
 credential (its tooltip adds the role and endpoint), so the list can be read against the principal
 it came from.

@@ -17,6 +17,7 @@ mod pack;
 mod runs;
 mod session;
 mod settings;
+mod signin;
 mod studio;
 mod syntax;
 mod timeline;
@@ -197,6 +198,12 @@ pub struct App {
     pub draft_note: Option<Result<String, String>>,
     pub draft_busy: bool,
     draft_after: u64,
+    /// The controller a browser sign-in goes to, and how the last one went.
+    pub sign_in_url: TextEdit,
+    pub signing_in: bool,
+    pub sign_in_error: Option<String>,
+    sign_in_done: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    waker: Option<Waker>,
     /// Playbooks the controller has registered: the ones a launch form can start.
     pub registered: Vec<String>,
     /// The open launch form, when there is one.
@@ -644,6 +651,47 @@ impl App {
         }
     }
 
+    /// Sign in to the controller at the sign-in field's URL through the browser, on a thread of
+    /// its own since it waits for the person.
+    pub fn sign_in(&mut self) {
+        if self.signing_in {
+            return;
+        }
+        let url = self.sign_in_url.text.trim().to_string();
+        let waker = self.waker.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.signing_in = true;
+        self.sign_in_error = None;
+        self.sign_in_done = Some(rx);
+        let spawned = std::thread::Builder::new()
+            .name("crucible-playbooks-sign-in".into())
+            .spawn(move || {
+                let _ = tx.send(signin::sign_in(&url));
+                if let Some(waker) = waker {
+                    waker();
+                }
+            });
+        if let Err(e) = spawned {
+            self.signing_in = false;
+            self.sign_in_done = None;
+            self.sign_in_error = Some(format!("starting the sign-in: {e}"));
+        }
+    }
+
+    /// Take a finished sign-in's answer; a key now in crux's config means connecting again.
+    fn finish_sign_in(&mut self) -> bool {
+        let Some(answer) = self.sign_in_done.as_ref().and_then(|rx| rx.try_recv().ok()) else {
+            return false;
+        };
+        self.sign_in_done = None;
+        self.signing_in = false;
+        match answer {
+            Ok(()) => self.live_client.reconnect(),
+            Err(why) => self.sign_in_error = Some(why),
+        }
+        true
+    }
+
     /// Open what `link` names: a playbook, one of its launches with a task open, or a local pack.
     pub fn follow(&mut self, link: &Link) {
         self.settings_open = false;
@@ -800,6 +848,16 @@ fn init() -> App {
         logo_clicks: 0,
         logo_screen: [0.0; 2],
         notified: 0,
+        sign_in_url: TextEdit::new(
+            crux::config::ConnectArgs::from_env()
+                .resolve()
+                .map(|config| config.url)
+                .unwrap_or_default(),
+        ),
+        signing_in: false,
+        sign_in_error: None,
+        sign_in_done: None,
+        waker: None,
         working: None,
         working_pack: None,
         working_edited: false,
@@ -819,6 +877,7 @@ fn init() -> App {
 }
 
 fn setup(app: &mut App, waker: Waker) {
+    app.waker = Some(waker.clone());
     app.local.set_waker(waker.clone());
     app.live_client.set_waker(waker.clone());
     app.lsp.set_waker(waker);
@@ -840,6 +899,7 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
     }
     app.sync_live();
     changed |= app.refresh_working();
+    changed |= app.finish_sign_in();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
         app.lsp_seen = version;
         app.checks = view;
