@@ -74,9 +74,9 @@ struct Cli {
     /// and Kubernetes access each call needs are the server's own.
     #[arg(long, env = "CRUCIBLE_KUEUE_TOOL_POLICY")]
     tool_policy: Option<PathBuf>,
-    /// Decide access checks for callers carrying kube_user with Kubernetes RBAC
-    /// (SubjectAccessReview), taking the caller's groups from OpenShift Group objects or the
-    /// token's kube_groups claim. Turns on people's tokens.
+    /// Decide access checks for people's tokens with Kubernetes RBAC (SubjectAccessReview),
+    /// taking the person's groups from OpenShift Group objects or the token's kube_groups claim.
+    /// A run's groups always come from its own token. Turns on people's tokens.
     #[arg(long, env = "CRUCIBLE_KUEUE_KUBE_AUTHZ", value_enum)]
     kube_authz: Option<KubeAuthz>,
     /// Domain of the labels and annotations the server stamps (`<domain>/run-id`, ...).

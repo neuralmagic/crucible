@@ -11,7 +11,7 @@
 # PUSH_REPO, and runs it as a Job. The script then checks the cluster and the controller, not the
 # agent's word alone:
 #   - the controller issued buildit and crucible-kueue tokens to a supervisor SPIFFE ID under this
-#     cluster's gateway prefix, for the launcher's kube_user and the run;
+#     cluster's gateway prefix, for the run's own kube_user and the run;
 #   - the Job exists in the workload namespace, carries that run, launcher and queue, runs an
 #     image pushed to PUSH_REPO by digest, succeeded, and its log carries the nonce;
 #   - the agent's whoami reported the same run and kube_user;
@@ -346,7 +346,7 @@ for _ in $(seq 30); do
 done
 [ -n "$PORT" ] || fail "the port-forward to the controller never listened: $(cat "$WORK/forward.log")"
 printf 'url = "http://127.0.0.1:%s"\n' "$PORT" > "$WORK/crux.toml"
-# The launcher as a person the controller knows, linked to their username on the hub, with an api
+# The launcher as a person the controller knows, with no linked Kubernetes username, and an api
 # key of their own for crux.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 KEY_ID=$(openssl rand -hex 16)
@@ -356,9 +356,6 @@ KEY="crk_${KEY_ID}_${KEY_SECRET}"
 kc -n "$CTL_NS" exec deploy/postgres -- psql -q -U crucible -d crucible -v ON_ERROR_STOP=1 -c \
     "INSERT INTO users (sub, login, last_login, created_at, updated_at)
      VALUES ('e2e:$LAUNCHER', '$LAUNCHER', '$NOW', '$NOW', '$NOW') ON CONFLICT (login) DO NOTHING;
-     INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
-     SELECT sub, 'hub', '$LAUNCHER', 'token-review', '$NOW' FROM users WHERE login = '$LAUNCHER'
-     ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user;
      INSERT INTO api_keys (id, sub, name, secret_hash, created_at)
      SELECT '$KEY_ID', sub, 'kueue-e2e', '$KEY_HASH', '$NOW' FROM users WHERE login = '$LAUNCHER'" >/dev/null
 crux() { env -u CONTROLLER_URL CONTROLLER_API_TOKEN="$KEY" "$BIN/crux" "$@" --config "$WORK/crux.toml"; }
@@ -461,7 +458,7 @@ for aud in "$KUEUE_URL" "http://host.openshell.internal:8848/mcp"; do
     issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" \
         | grep -F "aud=\"$aud\"" | head -1)
     [ -n "$issued" ] || fail "the controller issued no token for $aud to run $RUN"
-    grep -qE "kube_user=\"?$LAUNCHER\"?( |$)" <<<"$issued" || fail "the token was not for kube_user $LAUNCHER: $issued"
+    grep -qF "kube_user=crucible:run:$RUN" <<<"$issued" || fail "the token was not for the run's own kube_user: $issued"
     grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}$RUN/sandbox/" <<<"$issued" \
         || fail "the token went to no supervisor under $GATEWAY_PREFIX: $issued"
     log "issued: $issued"
@@ -489,7 +486,7 @@ EOF
 )
 [ -n "$whoami" ] || fail "the agent printed no WHOAMI line; see $WORK/run-log.json"
 [ "$(jq -r .run_id <<<"$whoami")" = "$RUN" ] || fail "whoami names another run: $whoami"
-[ "$(jq -r .kube_user <<<"$whoami")" = "$LAUNCHER" ] || fail "whoami names another kube_user: $whoami"
+[ "$(jq -r .kube_user <<<"$whoami")" = "crucible:run:$RUN" ] || fail "whoami names another kube_user: $whoami"
 log "whoami: $whoami"
 else
     crux graph "$CRUN" --json > "$WORK/graph.json"

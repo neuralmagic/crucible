@@ -389,7 +389,6 @@ async fn serve_controller(
             resource: RESOURCE.to_string(),
             cluster: env.cluster.clone(),
             scopes: vec!["kueue.read".into(), "kueue.submit".into()],
-            requires_kube_user: false,
             namespaces: Vec::new(),
         }],
     };

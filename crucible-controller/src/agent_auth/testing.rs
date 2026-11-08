@@ -166,7 +166,6 @@ pub fn audience(cluster: &str, resource: &str, scopes: &str) -> Audience {
         resource: resource.to_string(),
         cluster: cluster.to_string(),
         scopes: scopes.split_whitespace().map(str::to_string).collect(),
-        requires_kube_user: false,
         namespaces: Vec::new(),
     }
 }

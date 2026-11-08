@@ -68,8 +68,8 @@ pub(crate) async fn insert_playbook_launch_with(
     sqlx::query!(
         "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, \
          advance_dedupe, dedupe_schedule, origin, draft_version, created_by, launcher_groups, \
-         created_at, exposure, exposure_digest, rerun_of, rerun_from) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+         owner, created_at, exposure, exposure_digest, rerun_of, rerun_from) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         key,
         launch.playbook,
         launch.params,
@@ -82,6 +82,7 @@ pub(crate) async fn insert_playbook_launch_with(
         launch.draft_version,
         launch.created_by,
         launch.launcher_groups,
+        launch.owner,
         now,
         exposure_json,
         exposure_digest,

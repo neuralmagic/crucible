@@ -162,6 +162,9 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
 ] }
 
 [dev-dependencies]
+crucible-kueue = { path = "../crucible-kueue" }
+crucible-mcp-auth = { path = "../crucible-mcp-auth" }
+
 # The in-memory log exporter (behind `testing`) drives the gen_ai log mapping through the real SDK
 # export path in unit tests, no mock logger.
 opentelemetry_sdk = { version = "0.33", default-features = false, features = [

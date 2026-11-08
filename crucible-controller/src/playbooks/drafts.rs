@@ -3025,6 +3025,7 @@ mod tests {
                 origin: crate::model::LaunchOrigin::Draft,
                 draft_version,
                 created_by: Some("alice"),
+                owner: None,
                 launcher_groups: None,
                 rerun: None,
                 dispatch: Default::default(),

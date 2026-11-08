@@ -10,7 +10,7 @@ export interface AgentToolRow {
   key: string;
   /** `kueue on ocp` */
   title: string;
-  /** `as casey`, or empty when the server acts as no Kubernetes user. */
+  /** `acts as crucible:run:...`, or empty when no identity is recorded. */
   identity: string;
   scopes: string;
   /** `namespace crucible-kueue-e2e · push_repo quay.io/...`, sorted by name. */
@@ -23,7 +23,7 @@ export function agentToolRows(tools: readonly AgentTool[]): AgentToolRow[] {
   return tools.map((t) => ({
     key: `${t.server}/${t.cluster}`,
     title: `${t.server} on ${t.cluster}`,
-    identity: t.kube_user ? `as ${t.kube_user}` : '',
+    identity: t.kube_user ? `acts as ${t.kube_user}` : '',
     scopes: t.scopes.join(' '),
     limits: Object.entries(t.limits)
       .sort(([a], [b]) => a.localeCompare(b))

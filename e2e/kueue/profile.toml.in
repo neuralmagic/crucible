@@ -37,6 +37,7 @@ image              = "@KUEUE_IMAGE@"
 cluster            = "hub"
 namespace          = "@KUEUE_NS@"
 workload_namespace = "@WORKLOAD_NS@"
+shared_namespaces  = ["@WORKLOAD_NS@"]
 pull_secrets       = ["@PULL_SECRET@=@PUSH_REPO@"]
 
 [buildit]
