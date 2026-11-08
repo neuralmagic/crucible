@@ -934,6 +934,17 @@ impl Client {
         run_id: &str,
         on_line: &mut (dyn FnMut(&str) -> Result<()> + Send),
     ) -> Result<()> {
+        self.follow_run(run_id, on_line, &mut |_| Ok(())).await
+    }
+
+    /// [`Self::follow_session`], also handing each pod log line to `on_log` as it lands. A run on
+    /// a spoke cluster streams only its pod's log until it ends, and its session lines after.
+    pub async fn follow_run(
+        &self,
+        run_id: &str,
+        on_line: &mut (dyn FnMut(&str) -> Result<()> + Send),
+        on_log: &mut (dyn FnMut(&str) -> Result<()> + Send),
+    ) -> Result<()> {
         let mut last_id: Option<String> = None;
         let mut streamed = 0usize;
         let mut pod_waits = 0u32;
@@ -950,6 +961,7 @@ impl Client {
                             on_line(&event.data)?;
                             streamed += 1;
                         }
+                        "log" => on_log(&event.data)?,
                         "end" => reason = Some(event.data),
                         _ => {}
                     }
@@ -1080,6 +1092,80 @@ mod tests {
         let text = format!("{e:#}");
         assert!(text.contains("502 Bad Gateway"), "{text}");
         assert!(text.contains("GET /api/whoami"), "{text}");
+    }
+
+    /// A relay that serves one scripted event stream: what a spoke run's `/live` looks like.
+    struct Scripted(Vec<SseEvent>);
+
+    #[async_trait::async_trait]
+    impl Transport for Scripted {
+        async fn send(
+            &self,
+            _method: reqwest::Method,
+            path: &str,
+            _body: Option<&serde_json::Value>,
+        ) -> Result<(reqwest::StatusCode, String)> {
+            bail!("{path}: the scripted relay only streams")
+        }
+        async fn events(
+            &self,
+            _path: &str,
+            _last_event_id: Option<&str>,
+            on_event: &mut (dyn FnMut(SseEvent) -> Result<()> + Send),
+        ) -> Result<(reqwest::StatusCode, String)> {
+            for event in &self.0 {
+                on_event(event.clone())?;
+            }
+            Ok((reqwest::StatusCode::OK, String::new()))
+        }
+        fn base(&self) -> &str {
+            "http://relay.test"
+        }
+    }
+
+    fn event(kind: &str, data: &str, id: &str) -> SseEvent {
+        SseEvent {
+            event: kind.into(),
+            data: data.into(),
+            id: Some(id.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn following_a_run_hands_over_log_and_session_lines_in_order() {
+        let client = Client::new(std::sync::Arc::new(Scripted(vec![
+            event("log", "pulling sandbox image", "0.1"),
+            event("log", "scan: 2 issues", "0.2"),
+            event("session", r#"{"v":1,"kind":"note","msg":"hi"}"#, "1.2"),
+            event("end", "completed: Succeeded", "1.2"),
+        ])));
+        let (mut sessions, mut logs) = (Vec::new(), Vec::new());
+        client
+            .follow_run(
+                "r1",
+                &mut |line| {
+                    sessions.push(line.to_string());
+                    Ok(())
+                },
+                &mut |line| {
+                    logs.push(line.to_string());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs, ["pulling sandbox image", "scan: 2 issues"]);
+        assert_eq!(sessions, [r#"{"v":1,"kind":"note","msg":"hi"}"#]);
+
+        let mut only = Vec::new();
+        client
+            .follow_session("r1", &mut |line| {
+                only.push(line.to_string());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(only, sessions, "following the session alone skips the log");
     }
 
     /// The link a human is handed hangs off the base this client dialled.
