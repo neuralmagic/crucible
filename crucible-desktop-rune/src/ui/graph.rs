@@ -1,6 +1,8 @@
 //! The Graph pane: the run's tasks as a mermaid flowchart, shaped and labelled like the web
 //! graph, where a node opens its task and an edge opens what flows along it.
 
+use std::collections::HashSet;
+
 use crucible_contract::session::TaskStatus;
 use rune::{Color, El, col, text};
 
@@ -17,7 +19,11 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
             .min_h(0.0)
             .child(empty_run(pane, p));
     }
-    let source = mermaid_source(&pane.tasks, app.expanded.as_deref(), &Ink::of(p));
+    let shown = Shown {
+        open: app.expanded.as_deref(),
+        unfolded: &app.unfolded,
+    };
+    let source = mermaid_source(&pane.tasks, &shown, &Ink::of(p));
     let mut style = rune_mermaid::DiagramStyle::neutral(p.dark);
     style.font = mono(11.5, 400.0);
     style.max_width = 1160.0;
@@ -29,27 +35,49 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
     style.text = p.c.text_base;
     style.muted = p.c.text_muted;
     let decorate = |target: &rune_mermaid::Target, spot: El| {
-        let (task, from, help) = match target {
-            rune_mermaid::Target::Node(id) => {
-                let Some(task) = graph_task(&pane.tasks, id) else {
-                    return spot;
-                };
-                (task, None, task.name.clone())
-            }
+        let pointer = |spot: El, help: String| spot.cursor(rune::Cursor::Pointer).help(help);
+        match target {
+            rune_mermaid::Target::Node(id) => match graph_node(&pane.tasks, id) {
+                Some((task, Some(key))) => {
+                    let (name, key) = (task.name.clone(), key.to_string());
+                    pointer(spot, format!("{name}[{key}]"))
+                        .on_press(move |app: &mut App| app.pick_instance(&name, &key))
+                }
+                Some((task, None)) => {
+                    let name = task.name.clone();
+                    let open = app.expanded.as_deref() == Some(task.name.as_str());
+                    let help = match (task.instances.is_empty(), open) {
+                        (false, true) if app.unfolded.contains(&name) => {
+                            format!("Fold {name}'s instances")
+                        }
+                        (false, true) => format!("Show {name}'s instances"),
+                        _ => name.clone(),
+                    };
+                    let unfolds = open && !task.instances.is_empty();
+                    pointer(spot, help).on_press(move |app: &mut App| {
+                        if unfolds {
+                            app.toggle_unfolded(&name);
+                        } else {
+                            app.pick_task(&name, None);
+                        }
+                    })
+                }
+                None => spot,
+            },
             rune_mermaid::Target::Edge { from, to } => {
-                let (Some(from), Some(task)) =
-                    (graph_task(&pane.tasks, from), graph_task(&pane.tasks, to))
+                let (Some((from, _)), Some((task, _))) =
+                    (graph_node(&pane.tasks, from), graph_node(&pane.tasks, to))
                 else {
                     return spot;
                 };
-                let help = format!("What {} hands {}", from.name, task.name);
-                (task, Some(from.name.clone()), help)
+                if from.name == task.name {
+                    return spot;
+                }
+                let (name, from) = (task.name.clone(), from.name.clone());
+                pointer(spot, format!("What {from} hands {name}"))
+                    .on_press(move |app: &mut App| app.pick_task(&name, Some(&from)))
             }
-        };
-        let name = task.name.clone();
-        spot.cursor(rune::Cursor::Pointer)
-            .help(help)
-            .on_press(move |app: &mut App| app.pick_task(&name, from.as_deref()))
+        }
     };
     let card = rune_mermaid::render_with(
         &source,
@@ -79,9 +107,18 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
         .child(card)
 }
 
-/// The task a [`mermaid_source`] node id names.
-fn graph_task<'a>(tasks: &'a [TaskView], id: &str) -> Option<&'a TaskView> {
-    tasks.get(id.strip_prefix('t')?.parse::<usize>().ok()?)
+/// What a [`mermaid_source`] node id names: task `t<i>`, or instance `t<i>i<k>` of it.
+fn graph_node<'a>(tasks: &'a [TaskView], id: &str) -> Option<(&'a TaskView, Option<&'a str>)> {
+    let rest = id.strip_prefix('t')?;
+    let (task, instance) = match rest.split_once('i') {
+        Some((task, instance)) => (task, Some(instance.parse::<usize>().ok()?)),
+        None => (rest, None),
+    };
+    let task = tasks.get(task.parse::<usize>().ok()?)?;
+    match instance {
+        None => Some((task, None)),
+        Some(k) => Some((task, Some(task.instances.get(k)?.key.as_str()))),
+    }
 }
 
 /// A node's fill, outline and text.
@@ -102,6 +139,8 @@ struct Ink {
     accent: Color,
     /// Edges into a task the run passed over.
     faded: Color,
+    /// Edges on the critical path.
+    critical: Color,
 }
 
 impl Ink {
@@ -122,6 +161,7 @@ impl Ink {
             },
             accent: p.c.text_accent,
             faded: p.c.border_muted,
+            critical: p.c.text_muted,
         }
     }
 }
@@ -148,7 +188,58 @@ fn clean(text: &str) -> String {
     text.replace(['"', '|'], "'")
 }
 
-/// The run's tasks as a mermaid flowchart, task `i` as node `t<i>`.
+/// When a task settled: its own time, else its last instance's.
+fn finished(task: &TaskView) -> Option<jiff::Timestamp> {
+    task.result.as_ref().and_then(|r| r.at).or_else(|| {
+        task.instances
+            .iter()
+            .filter_map(|i| i.result.as_ref().and_then(|r| r.at))
+            .max()
+    })
+}
+
+/// The chain of dependency edges, as `(from, to)` task indexes, that held the run up: back from
+/// the task that settled last, each step to the dependency that settled last. Empty when the
+/// run recorded no settle times.
+fn critical_path(tasks: &[TaskView]) -> HashSet<(usize, usize)> {
+    let index = |name: &str| tasks.iter().position(|task| task.name == name);
+    let mut path = HashSet::new();
+    let Some(mut at) = (0..tasks.len())
+        .filter_map(|i| finished(&tasks[i]).map(|t| (t, i)))
+        .max()
+        .map(|(_, i)| i)
+    else {
+        return path;
+    };
+    while let Some(from) = tasks[at]
+        .depends_on
+        .iter()
+        .filter_map(|dep| index(dep))
+        .filter_map(|i| finished(&tasks[i]).map(|t| (t, i)))
+        .max()
+        .map(|(_, i)| i)
+    {
+        if !path.insert((from, at)) {
+            break;
+        }
+        at = from;
+    }
+    path
+}
+
+/// The most instances an unfolded fan-out draws.
+const UNFOLDED: usize = 24;
+
+/// What the graph shows beyond the tasks themselves.
+struct Shown<'a> {
+    /// The open task, outlined.
+    open: Option<&'a str>,
+    /// Fan-outs drawn with their instances.
+    unfolded: &'a HashSet<String>,
+}
+
+/// The run's tasks as a mermaid flowchart, task `i` as node `t<i>`; an unfolded fan-out is
+/// subgraph `g<i>` holding its node and its instances, `t<i>i<k>`.
 ///
 /// ```text
 ///   route  {{◇ name}}   fan-out  [[≡ name ×n]]   agent  (✦ name)   command  [› name]
@@ -156,11 +247,12 @@ fn clean(text: &str) -> String {
 ///   a ==>|each .f| b    b runs once per element of a.f
 ///   a -->|.k| b         b gets its own entry of a.k
 ///   a -->|yes / no| b   b runs on those answers of route a
-///   a -.-> b            b is advisory or was not taken (faded when not taken)
+///   a -.-> b            b was not taken, faded
 /// ```
 ///
-/// Node colour carries each task's state and the open task has an accent outline.
-fn mermaid_source(tasks: &[TaskView], open: Option<&str>, ink: &Ink) -> String {
+/// Node colour carries each task's state, the open task has an accent outline, and the edges
+/// that held the run up are drawn heavier.
+fn mermaid_source(tasks: &[TaskView], shown: &Shown, ink: &Ink) -> String {
     let mut source = String::from("flowchart TD\n");
     for (class, s) in [
         ("pass", ink.pass),
@@ -185,7 +277,11 @@ fn mermaid_source(tasks: &[TaskView], open: Option<&str>, ink: &Ink) -> String {
             format!("x{cleaned}")
         }
     };
-    for task in tasks {
+    let unfolded =
+        |task: &TaskView| !task.instances.is_empty() && shown.unfolded.contains(&task.name);
+    let mut classes: Vec<(String, &'static str)> = Vec::new();
+    let mut edge = 0;
+    for (i, task) in tasks.iter().enumerate() {
         let mut label = format!("{} {}", glyph(task), clean(&task.name));
         if !task.instances.is_empty() {
             label.push_str(&format!(
@@ -203,11 +299,34 @@ fn mermaid_source(tasks: &[TaskView], open: Option<&str>, ink: &Ink) -> String {
         } else {
             ("[", "]")
         };
-        source.push_str(&format!("  {}{open}\"{label}\"{close}\n", id(&task.name)));
+        let node = format!("t{i}{open}\"{label}\"{close}");
+        if !unfolded(task) {
+            source.push_str(&format!("  {node}\n"));
+            continue;
+        }
+        source.push_str(&format!("  subgraph g{i} [\" \"]\n    {node}\n"));
+        for (k, instance) in task.instances.iter().take(UNFOLDED).enumerate() {
+            source.push_str(&format!(
+                "    t{i}i{k}[\"{}\"]\n    t{i} --- t{i}i{k}\n",
+                clean(&instance.key)
+            ));
+            edge += 1;
+            if let Some(class) = state_class(instance.state()) {
+                classes.push((format!("t{i}i{k}"), class));
+            }
+        }
+        if task.instances.len() > UNFOLDED {
+            source.push_str(&format!(
+                "    t{i}more[\"+{} more\"]\n    t{i} --- t{i}more\n",
+                task.instances.len() - UNFOLDED
+            ));
+            edge += 1;
+        }
+        source.push_str("  end\n");
     }
-    let mut faded = Vec::new();
-    let mut edge = 0;
-    for task in tasks {
+    let critical = critical_path(tasks);
+    let (mut faded, mut heavy) = (Vec::new(), Vec::new());
+    for (to, task) in tasks.iter().enumerate() {
         let passed_over = matches!(
             task.state(),
             TaskState::Settled(TaskStatus::NotTaken | TaskStatus::Skipped)
@@ -234,7 +353,7 @@ fn mermaid_source(tasks: &[TaskView], open: Option<&str>, ink: &Ink) -> String {
             {
                 labels.push(clean(&answers.replace('|', " / ")));
             }
-            let arrow = if passed_over || !task.required {
+            let arrow = if passed_over {
                 "-.->"
             } else if over.is_some() {
                 "==>"
@@ -246,36 +365,46 @@ fn mermaid_source(tasks: &[TaskView], open: Option<&str>, ink: &Ink) -> String {
             } else {
                 format!("|{}|", labels.join(", "))
             };
-            source.push_str(&format!(
-                "  {} {arrow}{label} {}\n",
-                id(dependency),
-                id(&task.name)
-            ));
+            let from = tasks.iter().position(|t| t.name == *dependency);
+            let source_id = match from {
+                Some(f) if unfolded(&tasks[f]) => format!("g{f}"),
+                _ => id(dependency),
+            };
+            source.push_str(&format!("  {source_id} {arrow}{label} t{to}\n"));
             if passed_over {
-                faded.push(edge);
+                faded.push(edge.to_string());
+            } else if from.is_some_and(|f| critical.contains(&(f, to))) {
+                heavy.push(edge.to_string());
             }
             edge += 1;
         }
     }
     if !faded.is_empty() {
-        let list: Vec<String> = faded.iter().map(ToString::to_string).collect();
         source.push_str(&format!(
             "  linkStyle {} stroke:{}\n",
-            list.join(","),
+            faded.join(","),
             ink.faded.hex()
         ));
     }
-    for task in tasks {
-        let class = match task.state() {
-            TaskState::Pending => continue,
-            TaskState::Running(_) => "running",
-            TaskState::Settled(status) if status.passed() => "pass",
-            TaskState::Settled(TaskStatus::Skipped | TaskStatus::NotTaken) => "skipped",
-            TaskState::Settled(_) => "fail",
-        };
-        source.push_str(&format!("  class {} {class}\n", id(&task.name)));
+    if !heavy.is_empty() {
+        source.push_str(&format!(
+            "  linkStyle {} stroke:{},stroke-width:2.25\n",
+            heavy.join(","),
+            ink.critical.hex()
+        ));
     }
-    if let Some(open) = open.filter(|open| tasks.iter().any(|task| task.name == *open)) {
+    for (i, task) in tasks.iter().enumerate() {
+        if let Some(class) = state_class(task.state()) {
+            classes.push((format!("t{i}"), class));
+        }
+    }
+    for (node, class) in classes {
+        source.push_str(&format!("  class {node} {class}\n"));
+    }
+    if let Some(open) = shown
+        .open
+        .filter(|open| tasks.iter().any(|task| task.name == *open))
+    {
         source.push_str(&format!(
             "  style {} stroke:{}\n",
             id(open),
@@ -285,12 +414,24 @@ fn mermaid_source(tasks: &[TaskView], open: Option<&str>, ink: &Ink) -> String {
     source
 }
 
+fn state_class(state: TaskState) -> Option<&'static str> {
+    Some(match state {
+        TaskState::Pending => return None,
+        TaskState::Running(_) => "running",
+        TaskState::Settled(status) if status.passed() => "pass",
+        TaskState::Settled(TaskStatus::Skipped | TaskStatus::NotTaken) => "skipped",
+        TaskState::Settled(_) => "fail",
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use rune::Color;
 
-    use crate::session::RunFold;
-    use crate::ui::graph::{Ink, Swatch, graph_task, mermaid_source};
+    use crate::session::{RunFold, TaskView};
+    use crate::ui::graph::{Ink, Shown, Swatch, critical_path, graph_node, mermaid_source};
 
     const RUN: &str = concat!(
         r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
@@ -302,6 +443,27 @@ mod tests {
         r#"]}"#,
         "\n",
         r#"{"v":1,"kind":"task_result","task":"skip \"me\"","status":"not_taken","attempts":0,"cost_usd":0.0,"secs":0.0,"note":""}"#,
+        "\n",
+    );
+
+    /// `a` feeds `b` and the fan-out `c`, both feed `d`; `c` settles after `b`.
+    const TIMED: &str = concat!(
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
+        r#"{"name":"a","kind":"command","required":true},"#,
+        r#"{"name":"b","kind":"command","depends_on":["a"],"required":true},"#,
+        r#"{"name":"c","kind":"agent","depends_on":["a"],"required":true,"over":"a.items"},"#,
+        r#"{"name":"d","kind":"command","depends_on":["b","c"],"required":true}"#,
+        r#"]}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"a","status":"pass","attempts":1,"cost_usd":0.0,"secs":1.0,"note":"","at":"2026-11-06T10:00:00Z"}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"b","status":"pass","attempts":1,"cost_usd":0.0,"secs":1.0,"note":"","at":"2026-11-06T10:05:00Z"}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"c[x]","status":"pass","attempts":1,"cost_usd":0.0,"secs":1.0,"note":"","at":"2026-11-06T10:12:00Z"}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"c[y \"q\"]","status":"fail","attempts":1,"cost_usd":0.0,"secs":1.0,"note":"","at":"2026-11-06T10:20:00Z"}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"d","status":"pass","attempts":1,"cost_usd":0.0,"secs":1.0,"note":"","at":"2026-11-06T10:30:00Z"}"#,
         "\n",
     );
 
@@ -318,56 +480,113 @@ mod tests {
             skipped: s,
             accent: Color::WHITE,
             faded: Color::BLACK,
+            critical: Color::WHITE,
         }
     }
 
-    fn tasks() -> Vec<crate::session::TaskView> {
+    fn fold(text: &str) -> Vec<TaskView> {
         let mut fold = RunFold::default();
-        for line in RUN.lines() {
+        for line in text.lines() {
             fold.apply_line(line);
         }
         fold.tasks
     }
 
+    fn source(tasks: &[TaskView], open: Option<&str>, unfolded: &[&str]) -> String {
+        let unfolded: HashSet<String> = unfolded.iter().map(ToString::to_string).collect();
+        let source = mermaid_source(
+            tasks,
+            &Shown {
+                open,
+                unfolded: &unfolded,
+            },
+            &ink(),
+        );
+        assert!(rune_mermaid::supported(&source), "{source}");
+        source
+    }
+
+    fn contains_all(source: &str, parts: &[&str]) {
+        for part in parts {
+            assert!(source.contains(part), "{part} in\n{source}");
+        }
+    }
+
     #[test]
     fn nodes_take_the_shape_and_glyph_of_what_runs_them() {
-        let source = mermaid_source(&tasks(), None, &ink());
-        for node in [
-            "t0[\"\u{203a} scan\"]",
-            "t1{{\"\u{25c7} pick\"}}",
-            "t2[[\"\u{2261} fix\"]]",
-            "t3(\"\u{2726} note\")",
-            "t4[\"\u{203a} skip 'me'\"]",
-        ] {
-            assert!(source.contains(node), "{node} in\n{source}");
-        }
-    }
-
-    #[test]
-    fn edges_say_how_data_reaches_each_task() {
-        let source = mermaid_source(&tasks(), None, &ink());
-        for edge in [
-            "t0 ==>|each .cves, .repo| t2",
-            "t1 -->|yes / maybe| t2",
-            "t2 -.-> t3",
-            "t1 -.-> t4",
-            "t0 --> t1",
-            "linkStyle 4 stroke:",
-        ] {
-            assert!(source.contains(edge), "{edge} in\n{source}");
-        }
-    }
-
-    #[test]
-    fn the_source_draws_and_its_ids_lead_back_to_tasks() {
-        let tasks = tasks();
-        let source = mermaid_source(&tasks, Some("fix"), &ink());
-        assert!(source.contains("style t2 stroke:"), "{source}");
-        assert!(rune_mermaid::supported(&source), "{source}");
-        assert_eq!(
-            graph_task(&tasks, "t2").map(|t| t.name.as_str()),
-            Some("fix")
+        contains_all(
+            &source(&fold(RUN), None, &[]),
+            &[
+                "t0[\"\u{203a} scan\"]",
+                "t1{{\"\u{25c7} pick\"}}",
+                "t2[[\"\u{2261} fix\"]]",
+                "t3(\"\u{2726} note\")",
+                "t4[\"\u{203a} skip 'me'\"]",
+            ],
         );
-        assert!(graph_task(&tasks, "t9").is_none() && graph_task(&tasks, "xscan").is_none());
+    }
+
+    #[test]
+    fn edges_say_how_data_reaches_each_task_and_only_untaken_ones_are_dotted() {
+        let source = source(&fold(RUN), Some("fix"), &[]);
+        contains_all(
+            &source,
+            &[
+                "t0 ==>|each .cves, .repo| t2",
+                "t1 -->|yes / maybe| t2",
+                "t2 --> t3",
+                "t1 -.-> t4",
+                "t0 --> t1",
+                "linkStyle 4 stroke:",
+                "style t2 stroke:",
+            ],
+        );
+        assert!(
+            !source.contains("stroke-width"),
+            "no times, no critical path"
+        );
+    }
+
+    #[test]
+    fn the_critical_path_runs_back_through_whatever_settled_last() {
+        let tasks = fold(TIMED);
+        assert_eq!(critical_path(&tasks), HashSet::from([(0, 2), (2, 3)]));
+        assert!(critical_path(&fold(RUN)).is_empty());
+        contains_all(
+            &source(&tasks, None, &[]),
+            &["linkStyle 1,3 stroke:#ffffffff,stroke-width:2.25"],
+        );
+    }
+
+    #[test]
+    fn an_unfolded_fanout_draws_its_instances_and_keeps_its_edges() {
+        let tasks = fold(TIMED);
+        contains_all(
+            &source(&tasks, None, &["c"]),
+            &[
+                "subgraph g2 [\" \"]",
+                "t2[[\"\u{2261} c \u{d7}2 (1 ok)\"]]",
+                "t2i0[\"x\"]",
+                "t2i1[\"y 'q'\"]",
+                "t2 --- t2i1",
+                "t0 ==>|each .items| t2",
+                "g2 --> t3",
+                "class t2i0 pass",
+                "class t2i1 fail",
+                "linkStyle 3,5 stroke:",
+            ],
+        );
+        assert!(!source(&tasks, None, &["a"]).contains("subgraph"));
+    }
+
+    #[test]
+    fn ids_lead_back_to_tasks_and_instances() {
+        let tasks = fold(TIMED);
+        let named = |id: &str| graph_node(&tasks, id).map(|(t, k)| (t.name.as_str(), k));
+        assert_eq!(named("t2"), Some(("c", None)));
+        assert_eq!(named("t2i1"), Some(("c", Some("y \"q\""))));
+        for nothing in ["t9", "t2i7", "t2more", "g2", "xscan", "t"] {
+            assert_eq!(named(nothing), None, "{nothing}");
+        }
     }
 }

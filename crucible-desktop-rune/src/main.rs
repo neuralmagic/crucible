@@ -26,6 +26,7 @@ mod timeline;
 mod ui;
 mod workspace;
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -174,6 +175,8 @@ pub struct App {
     /// The task card shown open, and the task the Data pane shows.
     pub expanded: Option<String>,
     pub inspect: inspect::Inspect,
+    /// Fan-outs the graph draws with their instances.
+    pub unfolded: HashSet<String>,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
@@ -754,11 +757,26 @@ impl App {
     fn forget_run_view(&mut self) {
         self.expanded = None;
         self.inspect = inspect::Inspect::default();
+        self.unfolded.clear();
         self.log_task = None;
         self.pack_file = None;
         self.pack_source = None;
         self.draft_note = None;
         self.handoff_note = None;
+    }
+
+    /// Selects instance `key` of fan-out `task` from the graph and shows its output in Data.
+    pub fn pick_instance(&mut self, task: &str, key: &str) {
+        self.expanded = Some(task.to_string());
+        self.inspect.from = None;
+        self.inspect.pick = Some(inspect::Pick::Instance(key.to_string()));
+        self.show_pane(PaneKind::Data);
+    }
+
+    pub fn toggle_unfolded(&mut self, task: &str) {
+        if !self.unfolded.remove(task) {
+            self.unfolded.insert(task.to_string());
+        }
     }
 
     /// Selects `task` from the graph, with `from` when its edge from that dependency was picked:
@@ -862,6 +880,7 @@ fn init() -> App {
         log_task: None,
         expanded: None,
         inspect: inspect::Inspect::default(),
+        unfolded: HashSet::new(),
         pack_file: None,
         layout: settings.layout.clone(),
         shown: Vec::new(),
