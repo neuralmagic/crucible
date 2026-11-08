@@ -494,11 +494,17 @@ pub struct DraftLaunch {
     /// Rerun this finished run of the same pack instead of starting afresh: every task it
     /// passed is reused, and the tasks --from names run again with everything after them.
     #[arg(long, value_name = "RUN")]
-    #[serde(skip)]
+    #[serde(default)]
+    #[schemars(
+        description = "A finished run of the same pack to rerun instead of starting afresh: every task it passed\nis reused, and the tasks `from` names run again with everything after them."
+    )]
     pub rerun_of: Option<String>,
     /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
     #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
-    #[serde(skip)]
+    #[serde(default)]
+    #[schemars(
+        description = "Tasks the rerun dispatches again, with everything downstream of them. Needs `rerun_of`;\nempty reruns only what did not pass."
+    )]
     pub from: Vec<String>,
     #[arg(long)]
     #[serde(default)]
@@ -522,7 +528,7 @@ impl Operation for DraftLaunch {
         );
         put_trimmed(&mut body, "provider", self.provider.as_deref());
         put_trimmed(&mut body, "model", self.model.as_deref());
-        put_rerun(&mut body, self.rerun_of.as_deref(), &self.from);
+        put_rerun(&mut body, self.rerun_of.as_deref(), &self.from)?;
         c.launch_draft(&self.draft_id, &body).await
     }
 

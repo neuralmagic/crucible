@@ -84,11 +84,17 @@ pub(crate) fn parse_json(s: &str) -> Result<Value, String> {
     serde_json::from_str(s).map_err(|e| format!("not valid JSON: {e}"))
 }
 
-/// A launch that reruns a finished run of the same pack from some of its tasks.
-pub(crate) fn put_rerun(body: &mut Value, rerun_of: Option<&str>, from: &[String]) {
-    if let Some(of) = rerun_of {
-        body["rerun"] = serde_json::json!({ "of": of, "from": from });
+/// A launch that reruns a finished run of the same pack from some of its tasks. Tasks to rerun
+/// with no run to rerun are refused, as the CLI refuses `--from` without `--rerun-of`.
+pub(crate) fn put_rerun(body: &mut Value, rerun_of: Option<&str>, from: &[String]) -> Result<()> {
+    match rerun_of.map(str::trim).filter(|of| !of.is_empty()) {
+        Some(of) => body["rerun"] = serde_json::json!({ "of": of, "from": from }),
+        None if !from.is_empty() => {
+            anyhow::bail!("`from` names tasks to rerun, which needs `rerun_of`")
+        }
+        None => {}
     }
+    Ok(())
 }
 
 /// Launch a playbook. The caps are the ceilings the launch is authorized against, and the
@@ -138,11 +144,17 @@ pub struct Launch {
     /// Rerun this finished run of the same pack instead of starting afresh: every task it
     /// passed is reused, and the tasks --from names run again with everything after them.
     #[arg(long, value_name = "RUN")]
-    #[serde(skip)]
+    #[serde(default)]
+    #[schemars(
+        description = "A finished run of the same pack to rerun instead of starting afresh: every task it passed\nis reused, and the tasks `from` names run again with everything after them."
+    )]
     pub rerun_of: Option<String>,
     /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
     #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
-    #[serde(skip)]
+    #[serde(default)]
+    #[schemars(
+        description = "Tasks the rerun dispatches again, with everything downstream of them. Needs `rerun_of`;\nempty reruns only what did not pass."
+    )]
     pub from: Vec<String>,
     #[arg(long)]
     #[serde(default)]
@@ -165,7 +177,7 @@ impl Operation for Launch {
         );
         put_trimmed(&mut body, "provider", self.provider.as_deref());
         put_trimmed(&mut body, "model", self.model.as_deref());
-        put_rerun(&mut body, self.rerun_of.as_deref(), &self.from);
+        put_rerun(&mut body, self.rerun_of.as_deref(), &self.from)?;
         c.launch(&self.id, &body).await
     }
 
@@ -495,6 +507,31 @@ mod tests {
         assert!(
             sent.get("provider").is_none() && sent.get("model").is_none(),
             "{sent}"
+        );
+
+        let via_mcp: Launch = serde_json::from_value(serde_json::json!({
+            "id": "survey", "max_cost": 1.0, "max_time": "5m",
+            "rerun_of": "run-9", "from": ["check", "report"]
+        }))
+        .expect("an MCP call's arguments");
+        via_mcp.run(&client).await.expect("an MCP rerun launches");
+        let sent = seen.lock().expect("lock").last().cloned().expect("sent");
+        assert_eq!(
+            sent["rerun"],
+            serde_json::json!({"of": "run-9", "from": ["check", "report"]}),
+            "an MCP caller reruns as the CLI does"
+        );
+        let launches = seen.lock().expect("lock").len();
+        let stray: Launch = serde_json::from_value(serde_json::json!({
+            "id": "survey", "max_cost": 1.0, "max_time": "5m", "from": ["check"]
+        }))
+        .expect("arguments");
+        let refused = stray.run(&client).await.expect_err("from without rerun_of");
+        assert!(refused.to_string().contains("rerun_of"), "{refused:#}");
+        assert_eq!(
+            seen.lock().expect("lock").len(),
+            launches,
+            "a refused rerun sends nothing"
         );
     }
 }
