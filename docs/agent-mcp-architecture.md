@@ -141,6 +141,7 @@ flowchart LR
             KQ["crucible-kueue :8850"]
         end
         subgraph WNS["workload namespace"]
+            RB["RoleBinding crucible-kueue-runs<br/>Group crucible:runs"]
             WL["Jobs, RayJobs,<br/>Deployments, ..."]
         end
     end
@@ -161,7 +162,8 @@ flowchart LR
     SUP -- "agent token" --> LOOP
     LOOP -- "bind sandbox,<br/>pod token" --> CTL
     LOOP --> BUILDER
-    KQ -- "SAR as kube_user,<br/>then acts as own SA" --> API
+    KQ -- "SAR as crucible:run:&lt;pod&gt;<br/>with the token's groups,<br/>then acts as own SA" --> API
+    API -. "decided by" .-> RB
     KQ --> WL
 ```
 
@@ -388,11 +390,11 @@ sequenceDiagram
     S->>C: POST /oauth/token client_credentials,<br/>client_assertion = JWT-SVID, audience = kueue URL, scope
     C->>A: GET SPIRE /keys through the Service proxy (cached)
     A-->>C: SPIRE JWKS
-    Note over C: verify the assertion, read gateway id and sandbox id,<br/>find the bind record, check cluster and gateway,<br/>resolve the launcher and kube_user
+    Note over C: verify the assertion, read gateway id and sandbox id,<br/>find the bind record, check cluster and gateway,<br/>sub = dispatcher else owner,<br/>kube_user = crucible:run:&lt;pod&gt;,<br/>kube_groups = crucible:runs + owner's team or user group
     C-->>S: access_token, expires_in, scope
     Note over S: inject Authorization on egress<br/>to the kueue host and port only
     S->>K: MCP request with Bearer token
-    K->>A: SubjectAccessReview as kube_user
+    K->>A: SubjectAccessReview as kube_user with kube_groups
     K->>A: act with the server service account
 ```
 
@@ -1280,9 +1282,9 @@ named `cluster` on OpenShift.
 ```mermaid
 flowchart LR
     REQ["POST /mcp"] --> AUTH["auth::authenticate<br/>verify token, required scope kueue.read"]
-    AUTH --> CAN["ClaimMap::canonicalize<br/>map configured claims to kube_user,<br/>kube_groups, run_id, namespace"]
+    AUTH --> CAN["ClaimMap::canonicalize<br/>people only: map configured claims to<br/>kube_user, kube_groups, run_id, namespace"]
     CAN --> DNS["default_namespace<br/>the only usable namespace, if one"]
-    DNS --> ID["Identity::from_principal<br/>run or person, kube_user required"]
+    DNS --> ID["Identity::from_principal<br/>run or person, kube_user required:<br/>crucible: prefix for runs, never for people"]
     ID --> GUARD["guard::enforce<br/>method allowlist, per-tool scope,<br/>tool policy, access checks"]
     GUARD --> RMCP["rmcp Streamable HTTP<br/>stateless, JSON responses"]
     RMCP --> TOOL["KueueMcp tool<br/>acts as the server service account"]

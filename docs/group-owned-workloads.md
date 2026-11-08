@@ -20,6 +20,17 @@ The controller mints a run's identity from the run's owner:
 | `kube_groups` | `crucible:runs`, `crucible:team:<slug>` (or `crucible:user:<login>`) | what the run may do |
 | `sub` | whoever asked for the dispatch, else the owner | attribution, stamped as `<domain>/launched-by` |
 
+```mermaid
+flowchart LR
+    L["playbook_launches.owner<br/>team:ml or user:alice"] --> R["runs.attributed_to"]
+    P["run pod<br/>crucible-run-brave-otter"] --> T
+    R --> T["run token<br/>kube_user crucible:run:crucible-run-brave-otter<br/>kube_groups crucible:runs, crucible:team:ml"]
+    T --> K["crucible-kueue<br/>SubjectAccessReview as that user and groups"]
+    K --> S["shared namespace<br/>RoleBinding to Group crucible:runs"]
+    K --> N["team namespace<br/>RoleBinding to Group crucible:team:ml"]
+    PT["person token<br/>kube_user alice"] --> K
+```
+
 An owner recorded before launch owners existed leaves the run its own group alone. A
 team-dispatched run's `sub` is `team:<slug>`, so its `launched-by` label is the hashed,
 label-safe form.
