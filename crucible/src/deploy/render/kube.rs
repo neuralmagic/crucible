@@ -619,8 +619,9 @@ impl Renderer<'_> {
     /// lines that start the echo and the lines that stop it once the engine has exited.
     ///
     /// ```text
-    /// tail -F session.jsonl ──> fifo ──> numbering loop ──> stdout
-    ///   killed after the engine exits; the loop ends on the fifo's EOF
+    /// read fd 3 ──> line? ──yes──> number it, print it
+    ///                 └──no (EOF)──> engine exited? ──yes──> done
+    ///                                     └──no──> sleep 0.2s, read again
     /// ```
     fn session_echo(&self) -> (String, String) {
         let clear = if self.resumable() {
@@ -632,15 +633,19 @@ impl Renderer<'_> {
         let max = crucible_contract::RUN_SESSION_ECHO_MAX;
         let start = format!(
             r#"{clear}
-  echo_fifo="${{TMPDIR:-/tmp}}/crucible-session-echo.$$"
-  rm -f "$echo_fifo"; mkfifo "$echo_fifo"
-  {{ i=0; while IFS= read -r l; do i=$((i+1)); [ ${{#l}} -le {max} ] && printf '%s%s %s\n' '{marker}' "$i" "$l"; done; }} < "$echo_fifo" &
-  echo_loop=$!
-  tail -n +1 -F "$D/state/session.jsonl" > "$echo_fifo" 2>/dev/null &
-  echo_tail=$!"#
+  touch "$D/state/session.jsonl"
+  echo_done="${{TMPDIR:-/tmp}}/crucible-session-echo.$$"; rm -f "$echo_done"
+  {{ exec 3< "$D/state/session.jsonl"; i=0; part=
+    echo_line() {{ i=$((i+1)); [ ${{#1}} -le {max} ] && printf '%s%s %s\n' '{marker}' "$i" "$1"; }}
+    while :; do
+      if IFS= read -r l <&3; then echo_line "$part$l"; part=
+      else part="$part$l"; [ -e "$echo_done" ] && break; sleep 0.2; fi
+    done
+    [ -n "$part" ] && echo_line "$part"; }} &
+  echo_loop=$!"#
         );
         let stop = r#"
-  sleep 1; kill "$echo_tail" 2>/dev/null; wait "$echo_loop"; rm -f "$echo_fifo""#
+  touch "$echo_done"; wait "$echo_loop"; rm -f "$echo_done""#
             .to_string();
         (start, stop)
     }
@@ -6402,7 +6407,7 @@ mod tests {
             &format!(
                 "#!/bin/sh\ns=\"$FAKE_DIR/state/session.jsonl\"\n\
                  echo '{{\"n\":1}}' >> \"$s\"\nsleep 1\n\
-                 echo '{{\"n\":2}}' >> \"$s\"\necho '{long}' >> \"$s\"\necho 'a b  c' >> \"$s\"\n\
+                 printf '{{\"n\":' >> \"$s\"\nsleep 1\necho '2}}' >> \"$s\"\necho '{long}' >> \"$s\"\necho 'a b  c' >> \"$s\"\n\
                  sleep 1\nexit \"$FAKE_RC\"\n"
             ),
         );
@@ -6418,8 +6423,8 @@ mod tests {
                 (2, r#"{"n":2}"#.to_string()),
                 (4, "a b  c".to_string()),
             ],
-            "a start that cannot resume drops the old log, and an over-long line keeps its \
-             index without being echoed: {stdout}"
+            "a start that cannot resume drops the old log, a line written in two pieces is echoed \
+             whole, and an over-long line keeps its index without being echoed: {stdout}"
         );
     }
 
