@@ -5,18 +5,26 @@ use rune_kit::{SegmentedControl, TextInput};
 use rune_theme_opencode::icons as oc;
 
 use crate::logline::{Body, Level, LogLine, LogView};
+use crate::session::{TaskState, TaskView};
 use crate::settings::LogFont;
-use crate::ui::tasks::{count, status_color};
+use crate::ui::tasks::{count, state_mark, status_color};
 use crate::ui::{Paint, mono};
+use crate::unfurl::{self, Block, LogMode};
 use crate::{App, LogSource};
 use crucible_contract::session::TaskStatus;
 
 /// Rows drawn at once; the newest are kept.
 const SHOWN: usize = 500;
+/// Lines an open block draws; its newest are kept.
+const BLOCK_SHOWN: usize = 300;
+/// Lines a running task's folded block shows.
+const TAIL: usize = 3;
+const INDENT: f32 = 16.0;
 
 pub(crate) fn log_pane(
     transcript: &[LogLine],
     console: &[LogLine],
+    tasks: &[TaskView],
     font: LogFont,
     app: &App,
     p: &Paint,
@@ -43,6 +51,9 @@ pub(crate) fn log_pane(
         .collect();
 
     let style = TextStyle::new(11.5, 400.0).lh(17.0).family(font.family());
+    let mode = app
+        .log_mode
+        .unwrap_or_else(|| unfurl::default_mode(&matched));
     let mut lines = col()
         .key("log-lines")
         .w_full()
@@ -52,7 +63,7 @@ pub(crate) fn log_pane(
         .px(10.0)
         .py(8.0)
         .scroll(ScrollSpec {
-            stick_bottom: app.log_task.is_none() && query.is_empty(),
+            stick_bottom: app.log_task.is_none() && query.is_empty() && mode == LogMode::Stream,
         })
         .scroll_edge_fade(8.0);
     if matched.is_empty() {
@@ -67,8 +78,24 @@ pub(crate) fn log_pane(
             .py(4.0),
         );
     }
-    for line in matched.iter().skip(matched.len().saturating_sub(SHOWN)) {
-        lines = lines.child(line_row(line, style, app.log_task.is_some(), p));
+    match mode {
+        LogMode::Stream => {
+            for line in matched.iter().skip(matched.len().saturating_sub(SHOWN)) {
+                lines = lines.child(line_row(line, style, app.log_task.is_some(), p));
+            }
+        }
+        LogMode::ByTask => {
+            let blocks = Blocks {
+                tasks,
+                app,
+                style,
+                p,
+            };
+            let plan: Vec<&str> = tasks.iter().map(|task| task.name.as_str()).collect();
+            for block in unfurl::blocks(&matched, &plan) {
+                lines = lines.children(blocks.rows(&block, 0));
+            }
+        }
     }
 
     col()
@@ -84,6 +111,7 @@ pub(crate) fn log_pane(
                 .gap(8.0)
                 .center_y()
                 .child(scope_row(app, p).grow(1.0).min_w(0.0))
+                .child(modes(mode, p))
                 .children((!transcript.is_empty()).then(|| sources(reading, p))),
         )
         .children((!log.is_empty()).then(|| views(&scoped, app, p)))
@@ -97,6 +125,177 @@ pub(crate) fn log_pane(
                 .border(p.hair, p.c.border_muted)
                 .clip_rounded(p.k.radius.md),
         )
+}
+
+/// One stream, or a block per task.
+fn modes(mode: LogMode, p: &Paint) -> El {
+    const MODES: [LogMode; 2] = [LogMode::Stream, LogMode::ByTask];
+    SegmentedControl::new(
+        &["Stream", "By task"],
+        MODES.iter().position(|m| *m == mode),
+    )
+    .label("Log layout")
+    .width(Some(150.0))
+    .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.log_mode = Some(MODES[i]))
+    .build(p.k)
+    .key("log-modes")
+}
+
+/// How a block shows unless opened or folded by hand.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fold {
+    Folded,
+    /// Folded, with its newest lines under the header.
+    Tail,
+    Open,
+}
+
+/// The pieces every block draws with.
+struct Blocks<'a> {
+    tasks: &'a [TaskView],
+    app: &'a App,
+    style: TextStyle,
+    p: &'a Paint,
+}
+
+impl Blocks<'_> {
+    /// Where the task or instance `name` stands; `None` for the lines no task owns.
+    fn state(&self, name: &str) -> Option<TaskState> {
+        let (task, key) = match name.split_once('[') {
+            Some((task, rest)) => (task, rest.strip_suffix(']')),
+            None => (name, None),
+        };
+        let task = self.tasks.iter().find(|t| t.name == task)?;
+        match key {
+            None => Some(task.state()),
+            Some(key) => task
+                .instances
+                .iter()
+                .find(|i| i.key == key)
+                .map(|i| i.state()),
+        }
+    }
+
+    /// A running task shows its tail, a failed one opens, the rest fold.
+    fn fold(&self, block: &Block) -> Fold {
+        if let Some(open) = self.app.log_folds.get(&block.name) {
+            return if *open { Fold::Open } else { Fold::Folded };
+        }
+        match self.state(&block.name) {
+            Some(TaskState::Running(_)) => Fold::Tail,
+            Some(TaskState::Settled(status))
+                if !status.passed()
+                    && !matches!(status, TaskStatus::Skipped | TaskStatus::NotTaken) =>
+            {
+                Fold::Open
+            }
+            _ => Fold::Folded,
+        }
+    }
+
+    fn rows(&self, block: &Block, depth: usize) -> Vec<El> {
+        let fold = self.fold(block);
+        let indent = INDENT * depth as f32;
+        let mut rows = vec![self.header(block, fold, indent)];
+        let line = |line: &LogLine, scoped: bool| {
+            line_row(line, self.style, scoped, self.p).pl(indent + INDENT)
+        };
+        match fold {
+            Fold::Folded => {}
+            Fold::Tail => rows.extend(block.tail(TAIL).iter().map(|l| line(l, false))),
+            Fold::Open => {
+                let own = &block.lines;
+                rows.extend(
+                    own.iter()
+                        .skip(own.len().saturating_sub(BLOCK_SHOWN))
+                        .map(|l| line(l, true)),
+                );
+                for instance in &block.instances {
+                    rows.extend(self.rows(instance, depth + 1));
+                }
+            }
+        }
+        rows
+    }
+
+    fn header(&self, block: &Block, fold: Fold, indent: f32) -> El {
+        let p = self.p;
+        let open = fold == Fold::Open;
+        let name = block.name.clone();
+        let label = if block.name.is_empty() {
+            "engine".to_string()
+        } else {
+            block.name.clone()
+        };
+        let problems = block.problems();
+        let preview = block
+            .all
+            .last()
+            .map(|line| parts(line, p).2)
+            .unwrap_or_default();
+        let mut head = row()
+            .key(format!("log-block-{}", block.name))
+            .role("button")
+            .label(format!("{} {label}", if open { "Fold" } else { "Open" }))
+            .w_full()
+            .h(24.0)
+            .pl(indent + 2.0)
+            .pr(4.0)
+            .gap(7.0)
+            .center_y()
+            .radius(p.k.radius.sm)
+            .hover(p.c.hover)
+            .focusable(true)
+            .on_press(move |app: &mut App| {
+                app.log_folds.insert(name.clone(), !open);
+            })
+            .child(
+                icon(
+                    if open {
+                        &oc::CHEVRON_DOWN
+                    } else {
+                        &oc::CHEVRON_RIGHT
+                    },
+                    12.0,
+                )
+                .color(p.c.icon_faint),
+            );
+        if let Some(state) = self.state(&block.name) {
+            head = head.child(state_mark(state, p).scale(0.8));
+        }
+        head = head
+            .child(
+                text(label)
+                    .font(mono(11.0, 600.0))
+                    .color(p.c.text_base)
+                    .max_w(260.0)
+                    .truncate(),
+            )
+            .child(
+                text(count(block.all.len() as u64))
+                    .font(mono(10.5, 400.0))
+                    .color(p.c.text_faint),
+            );
+        if problems > 0 {
+            head = head.child(
+                text(format!("{problems} problems"))
+                    .font(mono(10.5, 500.0))
+                    .color(p.c.danger.fg),
+            );
+        }
+        head.child(
+            text(if fold == Fold::Folded {
+                preview
+            } else {
+                String::new()
+            })
+            .font(mono(10.5, 400.0))
+            .color(p.c.text_faint)
+            .grow(1.0)
+            .min_w(0.0)
+            .truncate(),
+        )
+    }
 }
 
 /// Transcript or console, offered only when the run recorded a transcript.

@@ -25,9 +25,10 @@ mod studio;
 mod syntax;
 mod timeline;
 mod ui;
+mod unfurl;
 mod workspace;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -179,6 +180,10 @@ pub struct App {
     pub log_chatter: bool,
     /// Only lines from this task or fan-out instance.
     pub log_task: Option<String>,
+    /// The log's layout when picked; `None` takes the one the log suits.
+    pub log_mode: Option<unfurl::LogMode>,
+    /// Log blocks opened or folded by hand, by task or instance name.
+    pub log_folds: HashMap<String, bool>,
     /// The task card shown open, and the task the Data pane shows.
     pub expanded: Option<String>,
     pub inspect: inspect::Inspect,
@@ -807,6 +812,7 @@ impl App {
         self.unfolded.clear();
         self.compare_to = None;
         self.log_task = None;
+        self.log_folds.clear();
         self.pack_file = None;
         self.pack_source = None;
         self.draft_note = None;
@@ -849,7 +855,14 @@ impl App {
         };
     }
 
+    /// Show only `task`'s lines, its block opened, or every line again.
     pub fn filter_log(&mut self, task: Option<&str>) {
+        if let Some(task) = task {
+            self.log_folds.insert(task.to_string(), true);
+            if let Some((parent, _)) = task.split_once('[') {
+                self.log_folds.insert(parent.to_string(), true);
+            }
+        }
         self.log_task = task.map(ToString::to_string);
     }
 
@@ -929,6 +942,8 @@ fn init() -> App {
         log_source: LogSource::Transcript,
         log_chatter: false,
         log_task: None,
+        log_mode: None,
+        log_folds: HashMap::new(),
         expanded: None,
         inspect: inspect::Inspect::default(),
         unfolded: HashSet::new(),

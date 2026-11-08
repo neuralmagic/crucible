@@ -184,7 +184,14 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
                     .color(p.c.text_muted),
             ),
         PaneKind::Launch => launch::launch_view(pane.launch.as_ref(), p),
-        PaneKind::Log => log::log_pane(&pane.transcript, &pane.log, pane.log_font, app, p),
+        PaneKind::Log => log::log_pane(
+            &pane.transcript,
+            &pane.log,
+            &pane.tasks,
+            pane.log_font,
+            app,
+            p,
+        ),
     }
 }
 
