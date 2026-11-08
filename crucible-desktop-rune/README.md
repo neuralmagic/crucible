@@ -122,6 +122,16 @@ reused and which run again, and the ceilings. A task changed since the run canno
 `Rerun those too` adds it. The controller reruns a run only as the same playbook or draft it ran
 as, so a registered run's fix goes out as a fresh draft launch.
 
+## Fix with agent
+
+A failed run, and each failed task in it, has `Fix with agent`. It copies a brief for a coding
+agent and writes the same text under `~/Library/Caches/crucible-playbooks/handoff`
+(`$CRUCIBLE_HANDOFF_DIR` overrides it): what failed, the task's last log lines, crucible-lsp's
+problems, the draft and the folder to work in, and the `crux` commands that save a fix and rerun
+from the failure, reusing what passed. A registered playbook's brief drafts from it and launches
+fresh, since the controller reruns a run only as what it ran as. Paste it into an agent, or
+`claude "$(cat <brief>)"`.
+
 ## Links
 
 The app opens `crucible-playbooks://` links, so a run can be handed to someone, or to an agent,

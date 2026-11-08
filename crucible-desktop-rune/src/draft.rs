@@ -52,6 +52,11 @@ fn file_name(draft: &str) -> String {
         .collect()
 }
 
+/// Where `draft`'s working copy lives under `root`, pulled or not.
+pub fn dir(root: &Path, draft: &str) -> PathBuf {
+    root.join(file_name(draft))
+}
+
 /// The pack's files and its tree digest, read the way a save reads them.
 pub fn read(dir: &Path) -> Result<(BTreeMap<String, String>, String), String> {
     let pack = walk_dir(dir).map_err(|e| format!("reading {}: {e}", dir.display()))?;
@@ -74,7 +79,7 @@ impl Working {
     /// The working copy of `draft` under `root`, when there is one.
     pub fn open(root: &Path, draft: &str) -> Option<Working> {
         let name = file_name(draft);
-        let dir = root.join(&name);
+        let dir = dir(root, draft);
         let sidecar: Sidecar =
             serde_json::from_slice(&fs::read(root.join(format!("{name}.json"))).ok()?).ok()?;
         dir.is_dir().then(|| Working {

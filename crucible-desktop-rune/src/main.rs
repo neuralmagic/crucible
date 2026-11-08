@@ -7,6 +7,7 @@ mod editor;
 mod filter;
 mod form;
 mod gfx;
+mod handoff;
 mod link;
 mod live;
 mod logline;
@@ -198,6 +199,8 @@ pub struct App {
     pub draft_note: Option<Result<String, String>>,
     pub draft_busy: bool,
     draft_after: u64,
+    /// Where the last brief for an agent was written, or why it was not.
+    pub handoff_note: Option<Result<PathBuf, String>>,
     /// The controller a browser sign-in goes to, and how the last one went.
     pub sign_in_url: TextEdit,
     pub signing_in: bool,
@@ -752,6 +755,7 @@ impl App {
         self.pack_file = None;
         self.pack_source = None;
         self.draft_note = None;
+        self.handoff_note = None;
     }
 
     pub fn toggle_task(&mut self, name: &str) {
@@ -848,6 +852,7 @@ fn init() -> App {
         logo_clicks: 0,
         logo_screen: [0.0; 2],
         notified: 0,
+        handoff_note: None,
         sign_in_url: TextEdit::new(
             crux::config::ConnectArgs::from_env()
                 .resolve()

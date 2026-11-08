@@ -50,6 +50,28 @@ pub(crate) fn launch_button(app: &App, playbook: &str, p: &Paint) -> Option<El> 
     )
 }
 
+/// Writes the shown failed run up for a coding agent and copies it.
+pub(crate) fn fix_button(app: &App, p: &Paint) -> Option<El> {
+    let launch = app.selected_live()?;
+    let detail = app.selected_detail()?;
+    if launch.status == "running" || detail.verdict == crate::model::Verdict::Valid {
+        return None;
+    }
+    app.draft_target()?;
+    Some(
+        Button::new("Fix with agent")
+            .variant(ButtonVariant::Neutral)
+            .on_press_tx(|app: &mut App, tx: &mut rune::Tx| {
+                if let Some(brief) = app.hand_off(None) {
+                    tx.copy(brief);
+                }
+            })
+            .build(p.k)
+            .help("Copy a brief for a coding agent to fix the pack and rerun")
+            .key("fix-with-agent"),
+    )
+}
+
 /// The Rerun button for a finished run that did not pass.
 pub(crate) fn rerun_button(app: &App, p: &Paint) -> Option<El> {
     app.rerunnable()?;

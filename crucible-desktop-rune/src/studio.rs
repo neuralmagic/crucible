@@ -307,6 +307,123 @@ impl App {
         self.replies = self.replies.max(reran.seq);
     }
 
+    /// The shown run written up for a coding agent, about `task` when one is named.
+    pub fn handoff(&self, task: Option<&str>) -> Option<crate::handoff::Handoff> {
+        use crate::handoff::{Fix, Handoff, LOG_LINES};
+        use crate::session::TaskState;
+        use crucible_contract::session::TaskStatus;
+
+        let launch = self.selected_live()?;
+        let detail = self.selected_detail()?;
+        let record = detail.launch.as_ref()?;
+        let (draft, template) = self.draft_target()?;
+        let root = crate::draft::root()?;
+        let mine = self.working.as_ref().filter(|w| w.draft == draft);
+        let pulled = mine
+            .is_some_and(|w| !self.working_edited && Some(w.base) == record.launch.draft_version);
+        let dir = match mine {
+            Some(working) if pulled => working.dir.clone(),
+            Some(_) => crate::draft::dir(&root, &format!("{draft}-agent")),
+            None => crate::draft::dir(&root, &draft),
+        };
+        let fix = match template {
+            Some(playbook) => Fix::Registered { playbook, draft },
+            None => Fix::Draft { draft, pulled },
+        };
+        let failed = detail
+            .fold
+            .tasks
+            .iter()
+            .flat_map(|t| {
+                let own = (t.name.clone(), t.state(), t.result.as_ref().map(|r| r.note.clone()));
+                let instances = t.instances.iter().map(|i| {
+                    (
+                        format!("{}[{}]", t.name, i.key),
+                        i.state(),
+                        i.result.as_ref().map(|r| r.note.clone()),
+                    )
+                });
+                std::iter::once(own).chain(instances)
+            })
+            .filter(|(_, state, _)| {
+                matches!(state, TaskState::Settled(status) if *status != TaskStatus::Pass)
+            })
+            .map(|(name, _, note)| (name, note.unwrap_or_default()))
+            .collect();
+        let mut log: Vec<String> = detail
+            .log
+            .iter()
+            .filter(|line| task.is_none_or(|task| line.is_for(task)))
+            .map(|line| line.raw.clone())
+            .rev()
+            .take(LOG_LINES)
+            .collect();
+        log.reverse();
+        let pack_dir = self
+            .shown_pack()
+            .and_then(|pack| pack.disk.as_ref())
+            .map(|d| d.dir().to_path_buf());
+        let mut problems: Vec<String> = self
+            .checks
+            .problems
+            .iter()
+            .flat_map(|(path, found)| {
+                let file = pack_dir
+                    .as_deref()
+                    .and_then(|dir| path.strip_prefix(dir).ok())
+                    .unwrap_or(path)
+                    .display()
+                    .to_string();
+                found.iter().map(move |p| {
+                    format!(
+                        "{file}:{}:{} {}: {}",
+                        p.start.line + 1,
+                        p.start.character + 1,
+                        format!("{:?}", p.severity).to_lowercase(),
+                        p.message
+                    )
+                })
+            })
+            .collect();
+        problems.sort();
+        Some(Handoff {
+            playbook: launch.id.clone(),
+            key: launch.key.clone(),
+            run: record.runs.first().map(|run| run.run_id.clone()),
+            tracker: self.link_here(task)?.url(),
+            task: task.map(ToString::to_string),
+            why: launch.why.clone(),
+            failed,
+            log,
+            problems,
+            fix,
+            dir,
+            max_cost: record.launch.max_cost,
+            max_time: Some(record.launch.max_time.clone())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "30m".to_string()),
+        })
+    }
+
+    /// Write the brief for the shown run, about `task` when one is named, and return its text
+    /// for the clipboard.
+    pub fn hand_off(&mut self, task: Option<&str>) -> Option<String> {
+        let Some(handoff) = self.handoff(task) else {
+            self.handoff_note = Some(Err("This run has no pack to fix".to_string()));
+            return None;
+        };
+        let text = crate::handoff::brief(&handoff);
+        self.handoff_note = Some(
+            crate::handoff::root()
+                .ok_or_else(|| "no home directory for briefs".to_string())
+                .and_then(|root| {
+                    crate::handoff::save(&root, &handoff.key, task, &text)
+                        .map_err(|e| format!("writing the brief: {e}"))
+                }),
+        );
+        Some(text)
+    }
+
     /// Open `file` at `line` on the Git host the shown pack is pinned to.
     pub fn open_on_git(&mut self, file: &str, line: usize) {
         let Some(url) = self.shown_pack().and_then(|pack| pack.web_url(file, line)) else {

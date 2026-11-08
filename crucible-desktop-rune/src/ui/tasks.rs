@@ -569,6 +569,8 @@ fn provider_mark(provider: &str) -> String {
 }
 
 fn expanded(task: &TaskView, rerun: bool, link: Option<String>, p: &Paint) -> El {
+    let fix =
+        rerun && matches!(task.state(), TaskState::Settled(status) if status != TaskStatus::Pass);
     let mut panel = col()
         .key(format!("task-open-{}", task.name))
         .w_full()
@@ -704,6 +706,20 @@ fn expanded(task: &TaskView, rerun: bool, link: Option<String>, p: &Paint) -> El
                     app.open_rerun(vec![from.clone()])
                 })
                 .key(key)
+            }))
+            .children(fix.then(|| {
+                let key = format!("fix-{}", task.name);
+                let task = task.name.clone();
+                Button::new("Fix with agent")
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Small)
+                    .on_press_tx(move |app: &mut App, tx: &mut Tx| {
+                        if let Some(brief) = app.hand_off(Some(&task)) {
+                            tx.copy(brief);
+                        }
+                    })
+                    .build(p.k)
+                    .key(key)
             }))
             .children(link.map(|url| {
                 Button::new("Copy link")

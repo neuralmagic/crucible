@@ -966,6 +966,24 @@ fn detail(app: &App, p: &Paint) -> El {
     if let Some(error) = &app.error {
         body = body.child(banner(error, p));
     }
+    if let Some(note) = &app.handoff_note {
+        let (line, color) = match note {
+            Ok(path) => (
+                format!("Brief copied \u{b7} {}", path.display()),
+                p.c.text_muted,
+            ),
+            Err(why) => (why.clone(), p.fail),
+        };
+        body = body.child(
+            text(line)
+                .font(p.k.ty.small)
+                .color(color)
+                .selectable(true)
+                .selection_color(p.k.selection())
+                .truncate()
+                .key("handoff-note"),
+        );
+    }
 
     body.child(stats(&pane, p))
         .child(dock::workspace(&pane, app, p))
@@ -1017,6 +1035,11 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                 .child(el().grow(1.0))
                 .children(dock::tools(app, p))
                 .children(link_button(app, p))
+                .children(
+                    (!pane.launchable)
+                        .then(|| launcher::fix_button(app, p))
+                        .flatten(),
+                )
                 .children(pane.launchable.then(|| run_button(pane, p)))
                 .children(
                     (!pane.launchable)
