@@ -521,6 +521,19 @@ impl Client {
             .await
     }
 
+    /// What rerunning finished run `run_id` from `from` would reuse and dispatch again. An empty
+    /// `from` reruns only what did not pass.
+    pub async fn rerun_preview<T: DeserializeOwned>(
+        &self,
+        run_id: &str,
+        from: &[String],
+    ) -> Result<T> {
+        let mut q = Query::new();
+        q.push("from", Some(&from.join(",")));
+        self.get(&format!("/api/runs/{}/rerun{}", encode(run_id), q.finish()))
+            .await
+    }
+
     pub async fn playbook_runs<T: DeserializeOwned>(
         &self,
         status: Option<&str>,

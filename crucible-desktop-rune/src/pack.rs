@@ -15,6 +15,8 @@ pub struct PackFiles {
     pub files: Vec<PackFile>,
     /// Where the files are on disk, for the language server and the editor.
     pub disk: Option<Disk>,
+    /// The pack's directory on the Git host at the pinned commit, ending in `/`.
+    pub web: Option<String>,
 }
 
 /// A pack's directory: the checkout it was read from, or a copy of a controller's pack.
@@ -50,6 +52,7 @@ impl PackFiles {
             origin,
             files,
             disk: None,
+            web: None,
         }
     }
 
@@ -88,6 +91,32 @@ impl PackFiles {
         }
         self.disk = Some(Disk::Copy(dir.to_path_buf()));
         Ok(())
+    }
+
+    /// Pin the files to `repo` (`owner/name` or a URL) at commit `rev`, under `path`.
+    pub fn on_git(&mut self, repo: &str, rev: &str, path: &str) {
+        let repo = repo.trim().trim_end_matches('/').trim_end_matches(".git");
+        if repo.is_empty() || rev.is_empty() {
+            return;
+        }
+        let host = if repo.contains("://") {
+            repo.to_string()
+        } else {
+            format!("https://github.com/{repo}")
+        };
+        let path = path.trim_matches('/');
+        let dir = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        };
+        self.web = Some(format!("{host}/blob/{rev}/{dir}"));
+    }
+
+    /// `file` on the Git host, at 1-based `line`.
+    pub fn web_url(&self, file: &str, line: usize) -> Option<String> {
+        let base = self.web.as_ref()?;
+        Some(format!("{base}{file}#L{line}"))
     }
 
     /// The file's path on disk.
@@ -169,6 +198,27 @@ fn walk(root: &Path, dir: &Path, depth: usize, files: &mut Vec<(String, Option<S
 mod tests {
     use crate::pack::PackFiles;
     use std::fs;
+
+    #[test]
+    fn a_git_pin_links_each_file_and_line_at_its_commit() {
+        let mut pack = PackFiles::new("pin".into(), []);
+        assert_eq!(pack.web_url("workflow.star", 3), None);
+        pack.on_git("neuralmagic/crucible", "091a008", "examples/triage/");
+        assert_eq!(
+            pack.web_url("workflow.star", 12).as_deref(),
+            Some(
+                "https://github.com/neuralmagic/crucible/blob/091a008/examples/triage/workflow.star#L12"
+            )
+        );
+        pack.on_git("https://gitlab.example.com/team/packs.git", "abc", "");
+        assert_eq!(
+            pack.web_url("lib/x.star", 1).as_deref(),
+            Some("https://gitlab.example.com/team/packs/blob/abc/lib/x.star#L1")
+        );
+        let mut unpinned = PackFiles::new("pin".into(), []);
+        unpinned.on_git("neuralmagic/crucible", "", "examples/triage");
+        assert_eq!(unpinned.web, None);
+    }
 
     #[test]
     fn the_manifest_leads_then_the_plan_and_workflow_source() {

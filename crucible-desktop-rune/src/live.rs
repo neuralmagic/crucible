@@ -16,6 +16,7 @@ use tokio::sync::oneshot;
 
 use rune::Waker;
 
+use crate::draft::Working;
 use crate::filter::LaunchFilter;
 use crate::logline::LogLine;
 use crate::model::Verdict;
@@ -225,19 +226,54 @@ enum Msg {
     Select(Option<String>),
     /// A session stream delivered lines.
     Streamed,
-    /// Read a playbook's params schema and the admin caps, for a launch form.
-    Prepare(String),
-    /// Launch a playbook with this body (`params`, `max_cost`, `max_time`).
-    Launch { playbook: String, body: Value },
+    /// Read a target's params schema and the admin caps, for a launch form.
+    Prepare(Target),
+    /// Launch a target with this body (`params`, `max_cost`, `max_time`, maybe `rerun`).
+    Launch { target: Target, body: Value },
+    /// What rerunning a finished run from these tasks would reuse.
+    Rerun { run: String, from: Vec<String> },
+    /// Pull a draft's newest save into its working copy, creating the draft from `template`
+    /// first when it does not exist.
+    Pull {
+        draft: String,
+        template: Option<String>,
+    },
+    /// Save a working copy as its draft's next version.
+    Save(Working),
+}
+
+/// What a launch form starts: a registered playbook, or a draft's newest save.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Playbook(String),
+    Draft(String),
+}
+
+impl Target {
+    pub fn id(&self) -> &str {
+        match self {
+            Target::Playbook(id) | Target::Draft(id) => id,
+        }
+    }
+}
+
+/// What a launch form is filled against.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Form {
+    pub schema: Value,
+    /// A draft's schema digest, so a save that lands meanwhile refuses the launch.
+    pub digest: Option<String>,
+    /// The admin caps: dollars and a duration such as `3h`.
+    pub max_cost: f64,
+    pub max_time: String,
 }
 
 /// A launch form's schema and the caps its ceilings must stay under.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Prepared {
     pub seq: u64,
-    pub playbook: String,
-    /// The schema, then the admin caps: dollars and a duration such as `3h`.
-    pub result: Result<(Value, f64, String), String>,
+    pub target: Target,
+    pub result: Result<Form, String>,
 }
 
 /// What a launch came back with: the new launch's key, or why it was refused.
@@ -246,6 +282,23 @@ pub struct Launched {
     pub seq: u64,
     pub playbook: String,
     pub result: Result<String, String>,
+}
+
+/// What a rerun would do, for the form asking for one.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reran {
+    pub seq: u64,
+    pub run: String,
+    pub from: Vec<String>,
+    pub result: Result<crux::dto::RerunPreview, String>,
+}
+
+/// A working copy pulled or saved, and what the controller said of the save.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Synced {
+    pub seq: u64,
+    pub draft: String,
+    pub result: Result<(Working, Option<String>), String>,
 }
 
 /// A launch that stopped running, for the window to announce. `seq` only grows.
@@ -277,7 +330,11 @@ struct Fetcher {
     registered_at: Option<Instant>,
     prepared: Option<Prepared>,
     launched: Option<Launched>,
+    reran: Option<Reran>,
+    synced: Option<Synced>,
     replies: u64,
+    /// Where draft working copies go.
+    drafts: Option<std::path::PathBuf>,
 }
 
 /// The crux client and the runtime its calls block on.
@@ -445,7 +502,10 @@ impl Fetcher {
             registered_at: None,
             prepared: None,
             launched: None,
+            reran: None,
+            synced: None,
             replies: 0,
+            drafts: crate::draft::root(),
         }
     }
 
@@ -474,43 +534,167 @@ impl Fetcher {
         changed
     }
 
-    fn prepare(&mut self, playbook: String) {
+    fn prepare(&mut self, target: Target) {
         self.replies += 1;
         let seq = self.replies;
         let result = self.connection().and_then(|connection| {
-            let schema: Value = connection.call(
-                "the params schema",
-                connection.client.playbook_schema(&playbook),
-            )?;
+            let (schema, digest) = match &target {
+                Target::Playbook(id) => (
+                    connection.call(
+                        "the params schema",
+                        connection.client.playbook_schema::<Value>(id),
+                    )?,
+                    None,
+                ),
+                Target::Draft(id) => {
+                    let head: crux::dto::DraftCompile = connection.call(
+                        "the draft's schema",
+                        connection.client.draft_preview(id, None),
+                    )?;
+                    (
+                        head.params_schema.unwrap_or(Value::Null),
+                        head.schema_digest,
+                    )
+                }
+            };
             let caps: crux::dto::PlaybookCaps =
                 connection.call("the launch caps", connection.client.playbook_caps())?;
-            Ok((schema, caps.max_cost, caps.max_time))
+            Ok(Form {
+                schema,
+                digest,
+                max_cost: caps.max_cost,
+                max_time: caps.max_time,
+            })
         });
         self.prepared = Some(Prepared {
             seq,
-            playbook,
+            target,
             result,
         });
     }
 
-    fn send_launch(&mut self, playbook: String, body: Value) {
+    fn send_launch(&mut self, target: Target, body: Value) {
         self.replies += 1;
         let seq = self.replies;
         let result = self.connection().and_then(|connection| {
-            connection
-                .call(
-                    "the launch",
-                    connection
-                        .client
-                        .launch::<crux::dto::LaunchAck>(&playbook, &body),
-                )
-                .map(|ack| ack.key)
+            let ack: crux::dto::LaunchAck = match &target {
+                Target::Playbook(id) => {
+                    connection.call("the launch", connection.client.launch(id, &body))?
+                }
+                Target::Draft(id) => {
+                    connection.call("the launch", connection.client.launch_draft(id, &body))?
+                }
+            };
+            Ok(ack.key)
         });
         self.launched = Some(Launched {
             seq,
-            playbook,
+            playbook: target.id().to_string(),
             result,
         });
+    }
+
+    fn preview_rerun(&mut self, run: String, from: Vec<String>) {
+        self.replies += 1;
+        let seq = self.replies;
+        let result = self.connection().and_then(|connection| {
+            connection.call(
+                "the rerun preview",
+                connection.client.rerun_preview(&run, &from),
+            )
+        });
+        self.reran = Some(Reran {
+            seq,
+            run,
+            from,
+            result,
+        });
+    }
+
+    /// Pull `draft`'s newest save into its working copy, creating it from `template` first when
+    /// the controller has no such draft.
+    fn pull(&mut self, draft: String, template: Option<String>) {
+        self.replies += 1;
+        let seq = self.replies;
+        let drafts = self.drafts.clone();
+        let result = self.connection().and_then(|connection| {
+            let root = drafts
+                .as_deref()
+                .ok_or("no home directory for working copies")?;
+            let newest = connection.call(
+                "the draft",
+                connection
+                    .client
+                    .draft_files::<crux::dto::DraftFiles>(&draft, None),
+            );
+            let (files, note) = match (newest, &template) {
+                (Ok(files), _) => (files, None),
+                (Err(_), Some(template)) => {
+                    let _: crux::dto::DraftCompile = connection.call(
+                        "creating the draft",
+                        connection.client.create_draft(
+                            &draft,
+                            &format!("Drafted from {template}"),
+                            Some(template),
+                        ),
+                    )?;
+                    let files = connection
+                        .call("the new draft", connection.client.draft_files(&draft, None))?;
+                    (
+                        files,
+                        Some(format!("Created draft {draft} from {template}")),
+                    )
+                }
+                (Err(error), None) => return Err(error),
+            };
+            let working = Working::write(root, &draft, files.version, &files.files)?;
+            Ok((working, note))
+        });
+        self.synced = Some(Synced { seq, draft, result });
+    }
+
+    /// Save a working copy as its draft's next version.
+    fn save(&mut self, mut working: Working) {
+        self.replies += 1;
+        let seq = self.replies;
+        let drafts = self.drafts.clone();
+        let draft = working.draft.clone();
+        let result = self.connection().and_then(|connection| {
+            let root = drafts
+                .as_deref()
+                .ok_or("no home directory for working copies")?;
+            let (files, digest) = crate::draft::read(&working.dir)?;
+            if files.is_empty() {
+                return Err("The working copy holds no files".to_string());
+            }
+            match connection.call(
+                "the save",
+                connection.client.save_draft(&draft, &files, working.base),
+            )? {
+                crux::client::DraftSave::Saved(raw) => {
+                    let saved: crux::dto::DraftCompile = serde_json::from_value(raw)
+                        .map_err(|e| format!("reading the save: {e}"))?;
+                    working.saved(root, saved.version, digest)?;
+                    let errors: Vec<&str> = saved
+                        .diagnostics
+                        .iter()
+                        .map(|d| d.message.as_str())
+                        .collect();
+                    let note = if saved.schema_digest.is_none() || !errors.is_empty() {
+                        format!(
+                            "Saved version {}, which does not compile: {}",
+                            saved.version,
+                            errors.join("; ")
+                        )
+                    } else {
+                        format!("Saved version {}", saved.version)
+                    };
+                    Ok((working, Some(note)))
+                }
+                crux::client::DraftSave::Stale(stale) => Err(stale.error),
+            }
+        });
+        self.synced = Some(Synced { seq, draft, result });
     }
 
     /// Records each launch the new list shows stopped that the old list showed running.
@@ -709,13 +893,19 @@ impl Fetcher {
             None => {
                 let registered: crux::dto::PlaybookDetail =
                     connection.call("the playbook", connection.client.playbook(playbook))?;
-                PackFiles::new(
+                let mut pack = PackFiles::new(
                     pin_label(&registered.playbook),
                     registered
                         .files
                         .into_iter()
                         .map(|(path, text)| (path, Some(text))),
-                )
+                );
+                if let crux::dto::PlaybookSource::Git { repo, path, .. } =
+                    &registered.playbook.source
+                {
+                    pack.on_git(repo, &registered.playbook.rev, path);
+                }
+                pack
             }
         };
         if let Some(dir) = crate::pack::cache_dir(&key) {
@@ -1092,6 +1282,8 @@ pub struct Snapshot {
     pub registered: Vec<String>,
     pub prepared: Option<Prepared>,
     pub launched: Option<Launched>,
+    pub reran: Option<Reran>,
+    pub synced: Option<Synced>,
 }
 
 /// The UI-side handle to the live worker. Dropping it stops the thread.
@@ -1129,6 +1321,8 @@ impl Client {
                     registered: Vec::new(),
                     prepared: None,
                     launched: None,
+                    reran: None,
+                    synced: None,
                 },
             );
         }
@@ -1141,20 +1335,38 @@ impl Client {
         }
     }
 
-    /// Which live playbook's graph to keep current; `None` stops fetching graphs.
-    /// Read `playbook`'s params schema and the caps, for a launch form.
-    pub fn prepare(&self, playbook: &str) {
-        let _ = self.tx.send(Msg::Prepare(playbook.to_string()));
+    /// Read `target`'s params schema and the caps, for a launch form.
+    pub fn prepare(&self, target: Target) {
+        let _ = self.tx.send(Msg::Prepare(target));
     }
 
-    /// Launch `playbook`; the result comes back in a snapshot.
-    pub fn launch(&self, playbook: &str, body: Value) {
-        let _ = self.tx.send(Msg::Launch {
-            playbook: playbook.to_string(),
-            body,
+    /// Launch `target`; the result comes back in a snapshot.
+    pub fn launch(&self, target: Target, body: Value) {
+        let _ = self.tx.send(Msg::Launch { target, body });
+    }
+
+    /// Ask what rerunning `run` from `from` would reuse.
+    pub fn preview_rerun(&self, run: &str, from: Vec<String>) {
+        let _ = self.tx.send(Msg::Rerun {
+            run: run.to_string(),
+            from,
         });
     }
 
+    /// Pull `draft` into its working copy, creating it from `template` when it is missing.
+    pub fn pull(&self, draft: &str, template: Option<&str>) {
+        let _ = self.tx.send(Msg::Pull {
+            draft: draft.to_string(),
+            template: template.map(ToString::to_string),
+        });
+    }
+
+    /// Save `working` as its draft's next version.
+    pub fn save(&self, working: Working) {
+        let _ = self.tx.send(Msg::Save(working));
+    }
+
+    /// Which live playbook's graph to keep current; `None` stops fetching graphs.
     pub fn select(&self, playbook: Option<&str>) {
         let _ = self.tx.send(Msg::Select(playbook.map(ToString::to_string)));
     }
@@ -1201,13 +1413,25 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
             Ok(Msg::Streamed) => {
                 next_stream.get_or_insert_with(|| Instant::now() + STREAM_BATCH);
             }
-            Ok(Msg::Prepare(playbook)) => {
-                fetcher.prepare(playbook);
+            Ok(Msg::Prepare(target)) => {
+                fetcher.prepare(target);
                 force = true;
             }
-            Ok(Msg::Launch { playbook, body }) => {
-                fetcher.send_launch(playbook, body);
+            Ok(Msg::Launch { target, body }) => {
+                fetcher.send_launch(target, body);
                 next_list = Instant::now();
+                force = true;
+            }
+            Ok(Msg::Rerun { run, from }) => {
+                fetcher.preview_rerun(run, from);
+                force = true;
+            }
+            Ok(Msg::Pull { draft, template }) => {
+                fetcher.pull(draft, template);
+                force = true;
+            }
+            Ok(Msg::Save(working)) => {
+                fetcher.save(working);
                 force = true;
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -1253,6 +1477,8 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
                     registered: fetcher.registered.clone(),
                     prepared: fetcher.prepared.clone(),
                     launched: fetcher.launched.clone(),
+                    reran: fetcher.reran.clone(),
+                    synced: fetcher.synced.clone(),
                 },
             );
         }
@@ -1644,5 +1870,82 @@ mod tests {
         assert_eq!(detail.verdict, Verdict::Error);
         assert!(detail.fold.tasks.is_empty());
         assert_eq!(detail.spent, 0.5);
+    }
+
+    /// Against the controller `crux` is configured for: read a registered pack with its Git
+    /// links, pull a draft into a working copy, and preview rerunning the draft's newest finished
+    /// run. None of it writes to the controller. `CRUCIBLE_E2E_PLAYBOOK` and `CRUCIBLE_E2E_DRAFT`
+    /// name the two; run with `cargo test -- --ignored`.
+    #[test]
+    #[ignore = "needs a live controller"]
+    fn a_live_draft_pulls_into_a_working_copy_and_its_run_previews_a_rerun() {
+        let draft =
+            std::env::var("CRUCIBLE_E2E_DRAFT").unwrap_or_else(|_| "vllm-agent-fanout".into());
+        let (wake, _rx) = std::sync::mpsc::channel();
+        let mut fetcher = Fetcher::new(wake);
+        let root = tempfile::tempdir().unwrap();
+        fetcher.drafts = Some(root.path().to_path_buf());
+
+        fetcher.pull(draft.clone(), None);
+        let synced = fetcher.synced.clone().expect("a pull reply");
+        let (working, note) = synced.result.expect("the draft pulls");
+        assert_eq!(note, None, "an existing draft is pulled, not created");
+        assert!(working.base > 0);
+        assert!(working.dir.join("crucible.toml").is_file());
+        assert!(!working.edited());
+        assert_eq!(
+            crate::draft::Working::open(root.path(), &draft).as_ref(),
+            Some(&working)
+        );
+
+        let registered = std::env::var("CRUCIBLE_E2E_PLAYBOOK").unwrap_or_else(|_| "triage".into());
+        let pinned = fetcher
+            .pack(&registered, None)
+            .expect("the registered pack reads");
+        assert!(pinned.file("crucible.toml").is_some());
+        assert!(
+            pinned
+                .web_url("crucible.toml", 1)
+                .is_some_and(|url| url.starts_with("https://") && url.ends_with("crucible.toml#L1")),
+            "{:?}",
+            pinned.web
+        );
+
+        fetcher.prepare(Target::Draft(draft.clone()));
+        let form = fetcher
+            .prepared
+            .clone()
+            .unwrap()
+            .result
+            .expect("the draft's form");
+        assert!(
+            form.digest.is_some(),
+            "a compiling draft has a schema digest"
+        );
+        assert!(form.max_cost > 0.0);
+
+        fetcher.refresh_list().expect("the launch list");
+        let launch = fetcher
+            .view()
+            .launches_of(&draft)
+            .find(|launch| launch.status != "running" && launch.runs > 0)
+            .cloned()
+            .expect("a finished launch of the draft");
+        let record = fetcher.launch_detail(&launch).expect("the launch detail");
+        let run = record.runs.first().expect("a run").run_id.clone();
+        fetcher.preview_rerun(run.clone(), Vec::new());
+        let reran = fetcher.reran.clone().unwrap();
+        assert_eq!(reran.run, run);
+        match reran.result {
+            Ok(preview) => {
+                assert_eq!(preview.run_id, run);
+                assert_eq!(preview.playbook, draft);
+                assert!(preview.draft_version.is_some());
+            }
+            Err(error) => assert!(
+                error.contains("git memory") || error.contains("rerun"),
+                "a refusal names why: {error}"
+            ),
+        }
     }
 }

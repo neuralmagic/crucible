@@ -115,6 +115,15 @@ pub fn open_file(editor: Editor, path: &Path, line: usize) -> Result<(), String>
         .map_err(|e| format!("opening {}: {e}", editor.label()))
 }
 
+/// Open `url` in the default browser.
+pub fn open_url(url: &str) -> Result<(), String> {
+    Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("opening {url}: {e}"))
+}
+
 /// Open `text` in `editor` as an unsaved buffer.
 pub fn open_text(editor: Editor, text: &str) -> Result<(), String> {
     let program = cli(editor)

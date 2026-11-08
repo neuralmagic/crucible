@@ -6,6 +6,7 @@ use rune_kit::{Button, ButtonVariant, Dialog, SegmentedControl, Spinner, Switch,
 use rune_theme_opencode::icons as oc;
 
 use crate::form::Kind;
+use crate::live::Target;
 use crate::ui::{Paint, Tone};
 use crate::{App, Stage};
 
@@ -37,18 +38,31 @@ fn edit(app: &mut App, slot: Slot) -> &mut TextEdit {
     &mut app.scratch
 }
 
-/// The Launch button for `playbook`, when the controller has it registered.
+/// The Launch button for `playbook`, when it is registered or the shown run is its draft's.
 pub(crate) fn launch_button(app: &App, playbook: &str, p: &Paint) -> Option<El> {
-    if !app.registered.iter().any(|id| id == playbook) {
-        return None;
-    }
-    let id = playbook.to_string();
+    let target = app.launch_target(playbook)?;
     Some(
         Button::new("Launch")
             .variant(ButtonVariant::Submit)
-            .on_press(move |app: &mut App| app.open_launcher(&id))
+            .on_press(move |app: &mut App| app.open_launcher(target.clone()))
             .build(p.k)
             .key("open-launcher"),
+    )
+}
+
+/// The Rerun button for a finished run that did not pass.
+pub(crate) fn rerun_button(app: &App, p: &Paint) -> Option<El> {
+    app.rerunnable()?;
+    if app.selected_detail()?.verdict == crate::model::Verdict::Valid {
+        return None;
+    }
+    Some(
+        Button::new("Rerun")
+            .variant(ButtonVariant::Neutral)
+            .on_press(|app: &mut App| app.open_rerun(Vec::new()))
+            .build(p.k)
+            .help("Run what did not pass again, reusing what did")
+            .key("open-rerun"),
     )
 }
 
@@ -71,19 +85,30 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
         Stage::Failed(error) => problem(error, p),
         Stage::Ready | Stage::Sending => form(app, p),
     };
+    let blocked = launcher.rerun.as_ref().and_then(|r| r.blocked()).is_some();
+    let (verb, going) = if launcher.rerun.is_some() {
+        ("Rerun", "Rerunning\u{2026}")
+    } else {
+        ("Launch", "Launching\u{2026}")
+    };
     let sending = launcher.stage == Stage::Sending;
     let ready = matches!(launcher.stage, Stage::Ready | Stage::Sending);
     let launch = if sending {
-        Button::new("Launching\u{2026}")
+        Button::new(going)
             .variant(ButtonVariant::Loading)
             .disabled(true)
     } else {
-        Button::new("Launch")
+        Button::new(verb)
             .variant(ButtonVariant::Submit)
-            .disabled(!ready)
+            .disabled(!ready || blocked)
             .on_press(|app: &mut App| app.submit_launch())
     };
-    Dialog::new("launcher", format!("Launch {}", launcher.playbook))
+    let title = match (&launcher.target, &launcher.rerun) {
+        (target, Some(_)) => format!("Rerun {}", target.id()),
+        (Target::Draft(id), None) => format!("Launch draft {id}"),
+        (Target::Playbook(id), None) => format!("Launch {id}"),
+    };
+    Dialog::new("launcher", title)
         .open(true)
         .width(SHEET)
         .on_close(|app: &mut App| app.launcher = None)
@@ -143,10 +168,112 @@ fn label(name: &str, help: &str, required: bool, p: &Paint) -> El {
     row_
 }
 
+/// What a rerun reuses and dispatches again, or why it cannot go yet.
+fn rerun_summary(rerun: &crate::studio::Rerun, p: &Paint) -> El {
+    let from = if rerun.from.is_empty() {
+        "what did not pass".to_string()
+    } else {
+        rerun.from.join(", ")
+    };
+    let mut summary = col()
+        .w_full()
+        .gap(10.0)
+        .key("rerun-summary")
+        .child(fact("Run", rerun.run.clone(), p))
+        .child(fact("From", from, p));
+    match &rerun.preview {
+        None => {
+            summary = summary.child(
+                row()
+                    .gap(8.0)
+                    .center_y()
+                    .child(Spinner::new().size(14.0).build(p.k))
+                    .child(
+                        text("Reading what the rerun reuses\u{2026}")
+                            .font(p.k.ty.ui)
+                            .color(p.c.text_muted),
+                    ),
+            );
+        }
+        Some(Err(error)) => summary = summary.child(problem(error, p)),
+        Some(Ok(preview)) => {
+            let reused = preview
+                .reused
+                .iter()
+                .map(|task| task.task.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            summary = summary
+                .child(fact(
+                    "Reuses",
+                    if reused.is_empty() {
+                        "nothing".to_string()
+                    } else {
+                        format!("{reused} (${:.2})", preview.reused_usd)
+                    },
+                    p,
+                ))
+                .child(fact("Runs", preview.rerun.join(", "), p));
+            if !preview.changed.is_empty() {
+                summary = summary
+                    .child(problem(
+                        &format!(
+                            "Changed since the run, so they cannot be reused: {}",
+                            preview.changed.join(", ")
+                        ),
+                        p,
+                    ))
+                    .child(
+                        row().child(
+                            Button::new("Rerun those too")
+                                .variant(ButtonVariant::Neutral)
+                                .on_press(|app: &mut App| app.widen_rerun())
+                                .build(p.k)
+                                .key("rerun-widen"),
+                        ),
+                    );
+            }
+        }
+    }
+    summary
+}
+
+fn fact(name: &str, value: String, p: &Paint) -> El {
+    row()
+        .w_full()
+        .gap(10.0)
+        .child(
+            text(name.to_string())
+                .font(p.k.ty.ui)
+                .color(p.c.text_muted)
+                .w(70.0),
+        )
+        .child(
+            text(value)
+                .font(p.k.ty.ui)
+                .color(p.c.text_base)
+                .grow(1.0)
+                .min_w(0.0)
+                .selectable(true)
+                .selection_color(p.k.selection())
+                .wrap(),
+        )
+}
+
 fn form(app: &App, p: &Paint) -> El {
     let Some(launcher) = &app.launcher else {
         return el();
     };
+    if let Some(rerun) = &launcher.rerun {
+        return col()
+            .w_full()
+            .gap(16.0)
+            .pt(4.0)
+            .child(rerun_summary(rerun, p))
+            .child(el().h(p.hair).w_full().fill(p.c.border_muted))
+            .child(ceilings(app, p))
+            .children(launcher.refusal.as_ref().map(|why| problem(why, p)));
+    }
     let mut fields = col().w_full().gap(14.0);
     for (i, field) in launcher.fields.iter().enumerate() {
         let answer = launcher
@@ -204,8 +331,22 @@ fn form(app: &App, p: &Paint) -> El {
                 .color(p.c.text_muted),
         );
     }
+    col()
+        .w_full()
+        .gap(16.0)
+        .pt(4.0)
+        .child(fields)
+        .child(el().h(p.hair).w_full().fill(p.c.border_muted))
+        .child(ceilings(app, p))
+        .children(launcher.refusal.as_ref().map(|why| problem(why, p)))
+}
+
+fn ceilings(app: &App, p: &Paint) -> El {
+    let Some(launcher) = &app.launcher else {
+        return el();
+    };
     let (cap_cost, cap_time) = &launcher.caps;
-    let ceilings = row()
+    row()
         .w_full()
         .gap(12.0)
         .child(
@@ -238,13 +379,5 @@ fn form(app: &App, p: &Paint) -> El {
                         .on_edit(|app: &mut App| edit(app, Slot::Time))
                         .build(p.k),
                 ),
-        );
-    col()
-        .w_full()
-        .gap(16.0)
-        .pt(4.0)
-        .child(fields)
-        .child(el().h(p.hair).w_full().fill(p.c.border_muted))
-        .child(ceilings)
-        .children(launcher.refusal.as_ref().map(|why| problem(why, p)))
+        )
 }

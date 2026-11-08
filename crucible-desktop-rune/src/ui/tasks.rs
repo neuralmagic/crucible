@@ -67,6 +67,7 @@ pub(crate) fn task_list(
         }
         return list;
     }
+    let rerunnable = app.rerunnable().is_some();
     for task in tasks {
         let open = app.expanded.as_deref() == Some(task.name.as_str());
         let tail: Vec<&LogLine> = if task.state().is_running() {
@@ -81,12 +82,27 @@ pub(crate) fn task_list(
         } else {
             Vec::new()
         };
-        list = list.child(card(task, &activity(log, &task.name), &tail, open, p));
+        let rerun = rerunnable && !task.state().is_running();
+        list = list.child(card(
+            task,
+            &activity(log, &task.name),
+            &tail,
+            open,
+            rerun,
+            p,
+        ));
     }
     list
 }
 
-fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], open: bool, p: &Paint) -> El {
+fn card(
+    task: &TaskView,
+    activity: &Activity,
+    tail: &[&LogLine],
+    open: bool,
+    rerun: bool,
+    p: &Paint,
+) -> El {
     let state = task.state();
     let name = task.name.clone();
 
@@ -144,7 +160,7 @@ fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], open: bool, p: 
         body = body.child(link_chips(&links, p));
     }
     if open {
-        body = body.child(expanded(task, p));
+        body = body.child(expanded(task, rerun, p));
     }
 
     row()
@@ -546,7 +562,7 @@ fn provider_mark(provider: &str) -> String {
     }
 }
 
-fn expanded(task: &TaskView, p: &Paint) -> El {
+fn expanded(task: &TaskView, rerun: bool, p: &Paint) -> El {
     let mut panel = col()
         .key(format!("task-open-{}", task.name))
         .w_full()
@@ -668,12 +684,20 @@ fn expanded(task: &TaskView, p: &Paint) -> El {
         );
     }
     let name = task.name.clone();
+    let from = task.name.clone();
     panel.child(
         row()
             .w_full()
             .gap(6.0)
             .child(button("Show in log", p, move |app: &mut App| {
                 app.filter_log(Some(&name))
+            }))
+            .children(rerun.then(|| {
+                let key = format!("rerun-from-{from}");
+                button("Rerun from here", p, move |app: &mut App| {
+                    app.open_rerun(vec![from.clone()])
+                })
+                .key(key)
             })),
     )
 }

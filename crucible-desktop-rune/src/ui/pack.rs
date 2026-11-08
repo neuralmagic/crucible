@@ -4,15 +4,15 @@ use std::ops::Range;
 
 use rune::{Color, El, ScrollSpec, Span, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::syntax::SyntaxTheme;
-use rune_kit::{IconButton, IconButtonVariant};
+use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, SegmentedControl, Spinner};
 use rune_theme_opencode::icons as oc;
 
-use crate::App;
 use crate::lsp::{self, Problem, Severity};
 use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
 use crate::syntax;
 use crate::ui::{Paint, mono};
+use crate::{App, PackSource};
 
 /// Lines drawn per file; a longer file says how much it left out.
 const LINES: usize = 4000;
@@ -26,10 +26,12 @@ pub(crate) fn pack_view(
     app: &App,
     p: &Paint,
 ) -> El {
-    let pack = match pack {
-        Ok(pack) if !pack.files.is_empty() => pack,
-        Ok(_) => return note("This pack has no files to show.", "", p),
-        Err(error) => return note("Could not read the pack.", error, p),
+    let working = app.working_pack.as_ref().filter(|_| app.showing_working());
+    let pack = match (working, pack) {
+        (Some(pack), _) => pack,
+        (None, Ok(pack)) if !pack.files.is_empty() => pack,
+        (None, Ok(_)) => return note("This pack has no files to show.", "", p),
+        (None, Err(error)) => return note("Could not read the pack.", error, p),
     };
     let open = app
         .pack_file
@@ -66,14 +68,20 @@ pub(crate) fn pack_view(
         .grow(1.0)
         .min_h(0.0)
         .gap(8.0)
-        .child(
-            text(pack.origin.clone())
-                .font(mono(11.0, 400.0))
-                .color(p.c.text_faint)
+        .child(toolbar(app, pack, p))
+        .children(app.draft_note.as_ref().map(|note| {
+            let (message, color) = match note {
+                Ok(message) => (message, p.c.text_muted),
+                Err(error) => (error, p.fail),
+            };
+            text(message.clone())
+                .font(p.k.ty.small)
+                .color(color)
                 .selectable(true)
                 .selection_color(p.k.selection())
-                .truncate(),
-        )
+                .wrap()
+                .key("pack-draft-note")
+        }))
         .child(
             row()
                 .w_full()
@@ -86,6 +94,97 @@ pub(crate) fn pack_view(
                     None => el().grow(1.0),
                 }),
         )
+}
+
+/// Where the pack came from, the switch between the run's pack and a working copy, and the
+/// draft's pull, save and launch.
+fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
+    let mut bar = row().w_full().gap(8.0).center_y().h(28.0);
+    let draft = app.draft_target();
+    if app.working_pack.is_some() {
+        let showing = usize::from(app.showing_working());
+        bar = bar.child(
+            SegmentedControl::new(&["Run", "Draft"], Some(showing))
+                .label("Pack")
+                .width(Some(130.0))
+                .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+                    app.show_pack(if i == 1 {
+                        PackSource::Working
+                    } else {
+                        PackSource::Run
+                    })
+                })
+                .build(p.k)
+                .key("pack-source"),
+        );
+    }
+    bar = bar.child(
+        text(pack.origin.clone())
+            .font(mono(11.0, 400.0))
+            .color(p.c.text_faint)
+            .selectable(true)
+            .selection_color(p.k.selection())
+            .grow(1.0)
+            .min_w(0.0)
+            .truncate(),
+    );
+    if app.draft_busy {
+        return bar.child(Spinner::new().size(14.0).build(p.k));
+    }
+    let Some((draft, template)) = draft else {
+        return bar;
+    };
+    if !app.showing_working() {
+        if app.working_pack.is_none() {
+            let label = if template.is_some() { "Draft" } else { "Edit" };
+            bar = bar.child(
+                Button::new(label)
+                    .variant(ButtonVariant::Neutral)
+                    .on_press(|app: &mut App| app.pull_draft())
+                    .build(p.k)
+                    .help(match &template {
+                        Some(template) => format!("Copy {template} into draft {draft}"),
+                        None => format!("Pull draft {draft} into a local folder"),
+                    })
+                    .key("pack-draft"),
+            );
+        }
+        return bar;
+    }
+    let edited = app.working_edited;
+    bar.child(
+        Button::new("Pull")
+            .variant(ButtonVariant::Neutral)
+            .disabled(edited)
+            .on_press(|app: &mut App| app.pull_draft())
+            .build(p.k)
+            .help(if edited {
+                "Save or undo your edits first".to_string()
+            } else {
+                format!("Replace with draft {draft}'s newest save")
+            })
+            .key("pack-pull"),
+    )
+    .child(
+        Button::new("Save")
+            .variant(if edited {
+                ButtonVariant::Submit
+            } else {
+                ButtonVariant::Neutral
+            })
+            .disabled(!edited)
+            .on_press(|app: &mut App| app.save_draft())
+            .build(p.k)
+            .key("pack-save"),
+    )
+    .child(
+        Button::new("Launch")
+            .variant(ButtonVariant::Neutral)
+            .disabled(edited)
+            .on_press(|app: &mut App| app.launch_working())
+            .build(p.k)
+            .key("pack-launch"),
+    )
 }
 
 /// What the language server found in `file` of `pack`.
@@ -318,6 +417,7 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
                         .color(p.c.text_faint),
                 )
                 .child(el().grow(1.0))
+                .children(git_link(app, &file.path, found_problems, p))
                 .children(copy_path(app, &file.path, p))
                 .child(open_button(&file.path, found_problems, p)),
         )
@@ -415,13 +515,34 @@ fn problem_list(file: &str, found: &[Problem], p: &Paint) -> Option<El> {
 }
 
 /// Opens the file in the user's editor, at its first error when it has one.
-fn open_button(file: &str, found: &[Problem], p: &Paint) -> El {
-    let line = found
+/// The first line with an error or warning, else the first.
+fn first_line(found: &[Problem]) -> usize {
+    found
         .iter()
         .filter(|problem| problem.severity <= Severity::Warning)
         .map(|problem| problem.start.line as usize + 1)
         .min()
-        .unwrap_or(1);
+        .unwrap_or(1)
+}
+
+/// Opens the file on the Git host the pack is pinned to.
+fn git_link(app: &App, file: &str, found: &[Problem], p: &Paint) -> Option<El> {
+    let line = first_line(found);
+    let url = app.shown_pack()?.web_url(file, line)?;
+    let path = file.to_string();
+    Some(
+        IconButton::new(&oc::BRANCH)
+            .variant(IconButtonVariant::GhostMuted)
+            .label("Open on Git")
+            .help(url)
+            .on_press(move |app: &mut App| app.open_on_git(&path, line))
+            .build(p.k)
+            .key("pack-git"),
+    )
+}
+
+fn open_button(file: &str, found: &[Problem], p: &Paint) -> El {
+    let line = first_line(found);
     let path = file.to_string();
     IconButton::new(&oc::EDIT)
         .variant(IconButtonVariant::GhostMuted)

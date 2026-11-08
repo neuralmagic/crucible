@@ -95,7 +95,24 @@ Files are edited elsewhere. The edit button, and each listed problem, open the f
 Cursor or Zed at the line (Settings picks the editor, else `$VISUAL`/`$EDITOR` or the first one
 installed). A local pack opens by deep link; a controller's file opens as an unsaved buffer over
 the editor's stdin. The copy button copies the file's path, to hand to an agent. Saving a local
-pack re-reads it and re-checks it.
+pack re-reads it and re-checks it. A registered pack's files also link to their lines on the Git
+host, at the commit the playbook is pinned to.
+
+## Fix and rerun
+
+`Edit` on a draft run's pack, or `Draft` on a registered one, pulls the draft into a working copy
+under `~/Library/Application Support/crucible-playbooks/drafts` (`$CRUCIBLE_DRAFTS_DIR`
+overrides it). A registered playbook's draft is `<playbook>-<user>`, created from the playbook
+the first time. The Pack tab then switches between the run's pack and the working copy, which
+opens in the editor, is checked by `crucible-lsp`, and is re-read once a second. `Save` sends it
+as the draft's next version, refused when someone saved since; `Pull` replaces it with the
+newest save; `Launch` launches the draft.
+
+A finished run that did not pass has a `Rerun` button, and each settled task a `Rerun from here`.
+Both open the launch form with the run's params, the controller's preview of which tasks are
+reused and which run again, and the ceilings. A task changed since the run cannot be reused;
+`Rerun those too` adds it. The controller reruns a run only as the same playbook or draft it ran
+as, so a registered run's fix goes out as a fresh draft launch.
 
 ## What the local backend tracks
 
@@ -142,7 +159,7 @@ fails without a shutdown and the test asserts its stderr reaches the failure ban
 
 ## Limits
 
-- Tracking and local launch only. No drafting, editing, or graph authoring.
+- Packs are edited in the user's editor, not in the app. No graph authoring.
 - Playbook manifests only; scored loops are not listed.
 - Live launches are started with `crux launch`; the local run ceiling is fixed at 10 minutes and
   its budget comes from the plan file.

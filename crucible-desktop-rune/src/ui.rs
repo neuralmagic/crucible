@@ -982,6 +982,11 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                 .children(pane.launchable.then(|| run_button(pane, p)))
                 .children(
                     (!pane.launchable)
+                        .then(|| launcher::rerun_button(app, p))
+                        .flatten(),
+                )
+                .children(
+                    (!pane.launchable)
                         .then(|| app.selected_playbook())
                         .flatten()
                         .and_then(|playbook| launcher::launch_button(app, playbook, p)),

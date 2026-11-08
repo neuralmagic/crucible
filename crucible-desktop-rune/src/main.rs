@@ -2,6 +2,7 @@
 //! playbooks (through `crux`, with the same config a terminal uses) and the local `examples/` packs
 //! (through each pack's `state/session.jsonl`).
 
+mod draft;
 mod editor;
 mod filter;
 mod form;
@@ -15,6 +16,7 @@ mod pack;
 mod runs;
 mod session;
 mod settings;
+mod studio;
 mod syntax;
 mod timeline;
 mod ui;
@@ -25,9 +27,10 @@ use std::sync::OnceLock;
 
 use rune::{AppSpec, TextEdit, Tx, Waker};
 
+use crate::draft::Working;
 use crate::editor::Editor;
 use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
-use crate::live::{LiveDetail, LivePlaybook, LiveView};
+use crate::live::{LiveDetail, LivePlaybook, LiveView, Target};
 use crate::logline::LogView;
 use crate::model::{Client, PackView, Snapshot, Verdict};
 use crate::pack::{Disk, PackFile, PackFiles};
@@ -99,10 +102,10 @@ pub enum Stage {
     Sending,
 }
 
-/// A launch form for one playbook: its fields from the params schema, the answers so far, and
-/// the ceilings, prefilled from the playbook's newest launch.
+/// A launch form for one playbook or draft: its fields from the params schema, the answers so
+/// far, and the ceilings, prefilled from the playbook's newest launch.
 pub struct Launcher {
-    pub playbook: String,
+    pub target: Target,
     pub stage: Stage,
     pub fields: Vec<form::Field>,
     pub answers: Vec<TextEdit>,
@@ -113,8 +116,21 @@ pub struct Launcher {
     pub problems: form::Problems,
     /// Why the controller refused the launch, or a ceiling over its cap.
     pub refusal: Option<String>,
+    /// A draft's schema digest, sent so a save that lands meanwhile refuses the launch.
+    digest: Option<String>,
+    /// Set when this form reruns a finished run instead of starting afresh.
+    pub rerun: Option<studio::Rerun>,
     /// Only replies newer than this one answer this form.
     after: u64,
+    /// The newest schema reply this form took, so a repeated snapshot does not refill it.
+    filled: u64,
+}
+
+/// Which pack the Pack tab shows when there is a working copy beside the run's own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackSource {
+    Run,
+    Working,
 }
 
 pub struct App {
@@ -168,6 +184,17 @@ pub struct App {
     pub logo_screen: [f32; 2],
     /// The newest finished launch already announced.
     notified: u64,
+    /// The working copy of the draft the shown pack edits, and its files as last read.
+    pub working: Option<Working>,
+    pub working_pack: Option<PackFiles>,
+    pub working_edited: bool,
+    working_read: Option<std::time::Instant>,
+    /// The pack the user picked to show; `None` shows a draft run's working copy.
+    pub pack_source: Option<PackSource>,
+    /// What the last pull or save said, and whether one is on its way.
+    pub draft_note: Option<Result<String, String>>,
+    pub draft_busy: bool,
+    draft_after: u64,
     /// Playbooks the controller has registered: the ones a launch form can start.
     pub registered: Vec<String>,
     /// The open launch form, when there is one.
@@ -316,6 +343,7 @@ impl App {
     pub fn shown_pack(&self) -> Option<&PackFiles> {
         match &self.selection {
             Some(Selection::Local(_)) => self.selected_pack().map(|pack| &pack.pack),
+            Some(Selection::Live { .. }) if self.showing_working() => self.working_pack.as_ref(),
             Some(Selection::Live { .. }) => self.selected_detail()?.pack.as_ref().ok(),
             None => None,
         }
@@ -401,10 +429,10 @@ impl App {
         }
     }
 
-    /// Opens a launch form for `playbook` and asks for its schema.
-    pub fn open_launcher(&mut self, playbook: &str) {
+    /// Opens a launch form for `target` and asks for its schema.
+    pub fn open_launcher(&mut self, target: Target) {
         self.launcher = Some(Launcher {
-            playbook: playbook.to_string(),
+            target: target.clone(),
             stage: Stage::Reading,
             fields: Vec::new(),
             answers: Vec::new(),
@@ -413,9 +441,12 @@ impl App {
             caps: (0.0, String::new()),
             problems: Vec::new(),
             refusal: None,
+            digest: None,
+            rerun: None,
             after: self.replies,
+            filled: 0,
         });
-        self.live_client.prepare(playbook);
+        self.live_client.prepare(target);
     }
 
     /// Sends the form, or marks what has to change first.
@@ -424,7 +455,10 @@ impl App {
             return;
         };
         let answers: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
-        let params = form::params(&launcher.fields, &answers);
+        let params = match &launcher.rerun {
+            Some(rerun) => Ok(rerun.params.clone()),
+            None => form::params(&launcher.fields, &answers),
+        };
         let ceilings = form::ceilings(
             &launcher.cost.text,
             &launcher.time.text,
@@ -436,12 +470,21 @@ impl App {
         let (Ok(params), Ok((max_cost, max_time))) = (params, ceilings) else {
             return;
         };
+        if let Some(why) = launcher.rerun.as_ref().and_then(studio::Rerun::blocked) {
+            launcher.refusal = Some(why);
+            return;
+        }
+        let body = studio::launch_body(
+            &launcher.target,
+            params,
+            max_cost,
+            &max_time,
+            launcher.digest.as_deref(),
+            launcher.rerun.as_ref(),
+        );
         launcher.stage = Stage::Sending;
         launcher.after = self.replies;
-        self.live_client.launch(
-            &launcher.playbook,
-            serde_json::json!({"params": params, "max_cost": max_cost, "max_time": max_time}),
-        );
+        self.live_client.launch(launcher.target.clone(), body);
     }
 
     /// The newest launch of `playbook` the list shows, to prefill a form from.
@@ -480,23 +523,31 @@ impl App {
             }
             return;
         }
-        let Some(prepared) = prepared.filter(|p| p.seq > after) else {
+        let filled = self.launcher.as_ref().map_or(0, |l| l.filled);
+        let Some(prepared) = prepared.filter(|p| p.seq > after && p.seq > filled) else {
             return;
         };
         self.replies = self.replies.max(prepared.seq);
-        let newest = self.newest_launch(&prepared.playbook).cloned();
+        let newest = self.newest_launch(prepared.target.id()).cloned();
         let previous = self
             .selected_live()
-            .filter(|live| live.id == prepared.playbook)
+            .filter(|live| live.id == prepared.target.id())
             .and(self.selected_detail())
             .and_then(|detail| detail.launch.as_ref())
             .map(|record| record.launch.params.clone());
         let Some(launcher) = &mut self.launcher else {
             return;
         };
+        launcher.filled = prepared.seq;
         match prepared.result {
             Err(error) => launcher.stage = Stage::Failed(error),
-            Ok((schema, max_cost, max_time)) => {
+            Ok(live::Form {
+                schema,
+                digest,
+                max_cost,
+                max_time,
+            }) => {
+                launcher.digest = digest;
                 launcher.fields = form::fields(&schema);
                 launcher.answers = launcher
                     .fields
@@ -530,7 +581,9 @@ impl App {
         self.live = snapshot.view;
         self.live_detail = snapshot.detail;
         self.registered = snapshot.registered;
+        self.answer_rerun(snapshot.reran);
         self.answer_launcher(snapshot.prepared, snapshot.launched);
+        self.answer_draft(snapshot.synced);
         self.announce(&snapshot.finished);
         self.reconcile();
     }
@@ -601,6 +654,8 @@ impl App {
         self.expanded = None;
         self.log_task = None;
         self.pack_file = None;
+        self.pack_source = None;
+        self.draft_note = None;
     }
 
     pub fn toggle_task(&mut self, name: &str) {
@@ -697,6 +752,14 @@ fn init() -> App {
         logo_clicks: 0,
         logo_screen: [0.0; 2],
         notified: 0,
+        working: None,
+        working_pack: None,
+        working_edited: false,
+        working_read: None,
+        pack_source: None,
+        draft_note: None,
+        draft_busy: false,
+        draft_after: 0,
         registered: Vec::new(),
         launcher: None,
         replies: 0,
@@ -728,6 +791,7 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         changed = true;
     }
     app.sync_live();
+    changed |= app.refresh_working();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
         app.lsp_seen = version;
         app.checks = view;
