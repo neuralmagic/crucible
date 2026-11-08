@@ -80,8 +80,10 @@ Until a pane is moved, resized or closed, each run gets a fitted layout: the gra
 tasks, taller the deeper the graph, beside the log. Once arranged, the layout is saved to the app's
 config and kept across runs; `Reset layout` goes back to the fitted one.
 
-The Timeline places each task from its recorded duration, starting when its dependencies settle,
-with a strip of how many ran at once and the critical path drawn solid.
+The Timeline draws each task and fan-out instance when it ran, from the `at` stamps on its
+session events, with a strip of how many ran at once and the critical path drawn solid. A log
+from before those stamps is placed from each task's duration, starting when its dependencies
+settle.
 
 ## The Pack pane
 

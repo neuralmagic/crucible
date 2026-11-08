@@ -43,6 +43,8 @@ pub struct TaskView {
     pub attempt: Option<Attempt>,
     pub result: Option<Outcome>,
     pub instances: Vec<Instance>,
+    /// When its first attempt started, in Unix seconds, from logs that record it.
+    pub started_at: Option<f64>,
 }
 
 /// The newest attempt the engine started.
@@ -58,6 +60,8 @@ pub struct Instance {
     pub key: String,
     pub attempt: Option<Attempt>,
     pub result: Option<Outcome>,
+    /// When its first attempt started, in Unix seconds, from logs that record it.
+    pub started_at: Option<f64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +70,8 @@ pub struct Outcome {
     pub attempts: u32,
     pub cost_usd: f64,
     pub secs: f64,
+    /// When it settled, in Unix seconds, from logs that record it.
+    pub at: Option<f64>,
     pub output: Option<Value>,
     pub note: String,
     pub links: Vec<LinkView>,
@@ -125,6 +131,7 @@ impl TaskView {
             files: task.emits_files.into_iter().map(|file| file.path).collect(),
             attempt: None,
             result: None,
+            started_at: None,
             instances: Vec::new(),
         }
     }
@@ -277,15 +284,23 @@ impl RunFold {
                 task,
                 attempt,
                 estimate_usd,
+                at,
             } => {
                 let attempt = Attempt {
                     number: attempt,
                     estimate_usd,
                 };
-                match self.slot(&task) {
-                    Some(Slot::Task(task)) => task.attempt = Some(attempt),
-                    Some(Slot::Instance(instance)) => instance.attempt = Some(attempt),
+                let at = at.as_deref().and_then(crate::clock::secs);
+                let (newest, first) = match self.slot(&task) {
+                    Some(Slot::Task(task)) => (&mut task.attempt, &mut task.started_at),
+                    Some(Slot::Instance(instance)) => {
+                        (&mut instance.attempt, &mut instance.started_at)
+                    }
                     None => return false,
+                };
+                *newest = Some(attempt);
+                if first.is_none() {
+                    *first = at;
                 }
                 true
             }
@@ -302,6 +317,7 @@ impl RunFold {
                 blocked,
                 transport,
                 secs,
+                at,
                 reused_from,
                 ..
             } => {
@@ -310,6 +326,7 @@ impl RunFold {
                     attempts,
                     cost_usd: cost_usd.max(0.0),
                     secs,
+                    at: at.as_deref().and_then(crate::clock::secs),
                     output,
                     note,
                     links: links
@@ -371,6 +388,7 @@ impl RunFold {
                     key: key.to_string(),
                     attempt: None,
                     result: None,
+                    started_at: None,
                 });
                 task.instances.len() - 1
             }

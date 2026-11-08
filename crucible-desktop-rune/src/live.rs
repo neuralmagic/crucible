@@ -1210,36 +1210,9 @@ fn unix_now() -> i64 {
         .unwrap_or_default()
 }
 
-/// Unix seconds from a `YYYY-MM-DDTHH:MM:SSZ` stamp; `None` when it is not that shape.
+/// Whole Unix seconds from an RFC 3339 stamp.
 fn epoch(stamp: &str) -> Option<i64> {
-    let (date, rest) = stamp.split_once('T')?;
-    let mut date = date.split('-');
-    let year: i64 = date.next()?.parse().ok()?;
-    let month: i64 = date.next()?.parse().ok()?;
-    let day: i64 = date.next()?.parse().ok()?;
-    let mut rest = rest.split(':');
-    let hour: i64 = rest.next()?.parse().ok()?;
-    let minute: i64 = rest.next()?.parse().ok()?;
-    let second: i64 = rest
-        .next()?
-        .chars()
-        .take(2)
-        .collect::<String>()
-        .parse()
-        .ok()?;
-    let days = days_from_civil(year, month, day);
-    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-/// Howard Hinnant's days-from-civil, with 1970-01-01 as day zero.
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = year.div_euclid(400);
-    let yoe = year - era * 400;
-    let month = month + if month > 2 { -3 } else { 9 };
-    let doy = (153 * month + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    crate::clock::secs(stamp).map(|secs| secs.floor() as i64)
 }
 
 const MONTHS: [&str; 12] = [

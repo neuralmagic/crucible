@@ -1,9 +1,8 @@
 //! A run's tasks laid out in time for the Timeline pane.
 //!
-//! The session log records how long each attempt took but not when it started, so the schedule
-//! is derived: a task starts when the last of its dependencies settles, and a fan-out's
-//! instances all start with it. That is when the engine would start them with no cap on
-//! concurrency.
+//! A log whose task events carry `at` is drawn as it ran, from the run's first start. An older
+//! log records only how long each task took, so its schedule is derived: a task starts when the
+//! last of its dependencies settles, and a fan-out's instances all start with it.
 
 use std::collections::HashMap;
 
@@ -29,18 +28,88 @@ pub struct Schedule {
     pub span: f64,
 }
 
-/// The run's tasks in plan order, each placed after its dependencies.
+/// When a task, or the earliest of its instances, first started, in Unix seconds.
+fn first_start(task: &TaskView) -> Option<f64> {
+    task.started_at.or_else(|| {
+        task.instances
+            .iter()
+            .filter_map(|instance| instance.started_at)
+            .reduce(f64::min)
+    })
+}
+
+/// Where each task sits, by index into the run's tasks: its start, and `Some(end)` once placed,
+/// where `end` is `None` while it runs. `origin` is the run's first start in Unix seconds when the
+/// placement came from stamps.
+struct Placement {
+    starts: Vec<f64>,
+    ends: Vec<Option<Option<f64>>>,
+    origin: Option<f64>,
+}
+
+/// Each task's start and end from the stamps in the log, against the run's first start; `None`
+/// when a task with a bar has no start stamp, so the whole run is derived instead.
+fn clocked(tasks: &[TaskView]) -> Option<Placement> {
+    let placed: Vec<&TaskView> = tasks
+        .iter()
+        .filter(|task| task.state() != TaskState::Pending)
+        .collect();
+    if placed.is_empty() || placed.iter().any(|task| first_start(task).is_none()) {
+        return None;
+    }
+    let origin = placed
+        .iter()
+        .filter_map(|task| first_start(task))
+        .reduce(f64::min)?;
+    let mut starts = vec![0.0; tasks.len()];
+    let mut ends = vec![None; tasks.len()];
+    for (i, task) in tasks.iter().enumerate() {
+        let Some(start) = first_start(task).map(|at| at - origin) else {
+            continue;
+        };
+        starts[i] = start;
+        ends[i] = Some(match task.state() {
+            TaskState::Settled(_) => task
+                .result
+                .as_ref()
+                .map(|r| r.at.map_or(start + r.secs.max(0.0), |at| at - origin)),
+            _ => None,
+        });
+    }
+    Some(Placement {
+        starts,
+        ends,
+        origin: Some(origin),
+    })
+}
+
+/// Each task placed after its dependencies, from its recorded duration.
+fn derived(tasks: &[TaskView], index: &HashMap<&str, usize>) -> Placement {
+    let mut ends: Vec<Option<Option<f64>>> = vec![None; tasks.len()];
+    let mut starts = vec![0.0; tasks.len()];
+    for i in 0..tasks.len() {
+        place(i, tasks, index, &mut starts, &mut ends, 0);
+    }
+    Placement {
+        starts,
+        ends,
+        origin: None,
+    }
+}
+
+/// The run's tasks in plan order: as they ran when the log says when, else each placed after
+/// its dependencies.
 pub fn schedule(tasks: &[TaskView]) -> Schedule {
     let index: HashMap<&str, usize> = tasks
         .iter()
         .enumerate()
         .map(|(i, task)| (task.name.as_str(), i))
         .collect();
-    let mut ends: Vec<Option<Option<f64>>> = vec![None; tasks.len()];
-    let mut starts = vec![0.0; tasks.len()];
-    for i in 0..tasks.len() {
-        place(i, tasks, &index, &mut starts, &mut ends, 0);
-    }
+    let Placement {
+        starts,
+        ends,
+        origin,
+    } = clocked(tasks).unwrap_or_else(|| derived(tasks, &index));
 
     let mut bars: Vec<Bar> = tasks
         .iter()
@@ -53,8 +122,15 @@ pub fn schedule(tasks: &[TaskView]) -> Schedule {
                 .iter()
                 .filter(|instance| instance.state() != TaskState::Pending)
                 .map(|instance| {
-                    let end = instance.result.as_ref().map(|r| start + r.secs.max(0.0));
-                    (start, end, instance.state())
+                    let from = match (origin, instance.started_at) {
+                        (Some(origin), Some(at)) => at - origin,
+                        _ => start,
+                    };
+                    let end = instance.result.as_ref().map(|r| match (origin, r.at) {
+                        (Some(origin), Some(at)) => at - origin,
+                        _ => from + r.secs.max(0.0),
+                    });
+                    (from, end, instance.state())
                 })
                 .collect();
             Bar {
@@ -297,6 +373,113 @@ mod tests {
             &[],
         );
         assert_eq!(schedule(&tasks).bars.len(), 2);
+    }
+
+    /// A fold of stamped session lines: `(kind, task, at, extra)` with `at` in seconds past
+    /// 12:00:00Z and `extra` merged into the event.
+    fn stamped(
+        plan: &[(&str, &[&str])],
+        events: &[(&str, &str, f64, serde_json::Value)],
+    ) -> Vec<TaskView> {
+        let tasks: Vec<_> = plan
+            .iter()
+            .map(|(name, deps)| {
+                json!({"name": name, "kind": "command", "depends_on": deps, "required": true})
+            })
+            .collect();
+        let mut fold = RunFold::default();
+        let admitted = json!({"v": 1, "kind": "plan_admitted", "plan_version": 1, "budget_usd": 1.0, "tasks": tasks});
+        assert!(fold.apply_line(&admitted.to_string()));
+        for (kind, task, at, extra) in events {
+            let at = format!("2026-11-08T12:00:{:06.3}Z", at);
+            let mut event = match *kind {
+                "start" => {
+                    json!({"v": 1, "kind": "task_started", "task": task, "attempt": 1, "estimate_usd": 0.0, "at": at})
+                }
+                _ => {
+                    json!({"v": 1, "kind": "task_result", "task": task, "status": "pass", "task_kind": "command", "attempts": 1, "cost_usd": 0.0, "note": "", "secs": 0.0, "at": at})
+                }
+            };
+            if let (Some(event), Some(extra)) = (event.as_object_mut(), extra.as_object()) {
+                event.extend(extra.clone());
+            }
+            assert!(fold.apply_line(&event.to_string()), "{event}");
+        }
+        fold.tasks
+    }
+
+    #[test]
+    fn a_stamped_run_is_drawn_as_it_ran() {
+        let none = json!({});
+        let tasks = stamped(
+            &[("a", &[]), ("b", &[]), ("c", &["a", "b"])],
+            &[
+                ("start", "a", 2.0, none.clone()),
+                ("start", "b", 3.5, none.clone()),
+                ("start", "a", 6.0, json!({"attempt": 2})),
+                ("result", "a", 8.0, json!({"attempts": 2})),
+                ("result", "b", 5.0, none.clone()),
+                ("start", "c", 9.0, none.clone()),
+            ],
+        );
+        let s = schedule(&tasks);
+        let bar = |name: &str| s.bars.iter().find(|b| b.name == name).unwrap();
+        assert_eq!(
+            (bar("a").start, bar("a").end),
+            (0.0, Some(6.0)),
+            "a retry does not move the task's start"
+        );
+        assert_eq!(
+            (bar("b").start, bar("b").end),
+            (1.5, Some(3.0)),
+            "b started when it did, not with the run"
+        );
+        assert_eq!((bar("c").start, bar("c").end), (7.0, None));
+        assert!(bar("a").critical && !bar("b").critical);
+        assert_eq!(s.span, 6.0);
+    }
+
+    #[test]
+    fn a_stamped_fan_out_draws_each_instance_when_it_ran() {
+        let none = json!({});
+        let tasks = stamped(
+            &[("edit", &[])],
+            &[
+                ("start", "edit[x]", 1.0, none.clone()),
+                ("start", "edit[y]", 4.0, none.clone()),
+                ("result", "edit[x]", 3.0, none.clone()),
+                ("result", "edit[y]", 7.0, none.clone()),
+                ("result", "edit", 7.0, none.clone()),
+            ],
+        );
+        let s = schedule(&tasks);
+        let edit = &s.bars[0];
+        assert_eq!(
+            edit.start, 0.0,
+            "the node starts with its earliest instance"
+        );
+        let lanes: Vec<(f64, Option<f64>)> = edit.lanes.iter().map(|(a, b, _)| (*a, *b)).collect();
+        assert_eq!(lanes, vec![(0.0, Some(2.0)), (3.0, Some(6.0))]);
+    }
+
+    #[test]
+    fn a_run_with_any_unstamped_task_is_derived_whole() {
+        let mut tasks = stamped(
+            &[("a", &[]), ("b", &["a"])],
+            &[
+                ("start", "a", 2.0, json!({})),
+                ("result", "a", 5.0, json!({"secs": 3.0})),
+            ],
+        );
+        let unstamped = run(&[("a", &[]), ("b", &["a"])], &[("b", 4.0)], &[]);
+        tasks[1] = unstamped[1].clone();
+        let s = schedule(&tasks);
+        let b = s.bars.iter().find(|bar| bar.name == "b").unwrap();
+        assert_eq!(
+            (b.start, b.end),
+            (3.0, Some(7.0)),
+            "b is placed after a's recorded duration"
+        );
     }
 
     #[test]

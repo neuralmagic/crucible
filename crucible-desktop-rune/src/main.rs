@@ -2,6 +2,7 @@
 //! playbooks (through `crux`, with the same config a terminal uses) and the local `examples/` packs
 //! (through each pack's `state/session.jsonl`).
 
+mod clock;
 mod draft;
 mod editor;
 mod filter;
