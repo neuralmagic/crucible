@@ -25,8 +25,7 @@ use tokio::sync::Mutex;
 
 /// Claim naming the caller's Kubernetes user.
 pub const USER_CLAIM: &str = "kube_user";
-/// The prefix of every identity the crucible issuer mints for runs: a person's token can never
-/// stand in for one, and a run's user can never stand in for a person.
+/// The prefix of every Kubernetes identity the crucible issuer mints for runs.
 pub const CRUCIBLE_PREFIX: &str = "crucible:";
 /// Claim listing the caller's Kubernetes groups, when groups come from the token.
 pub const GROUPS_CLAIM: &str = "kube_groups";
@@ -38,8 +37,7 @@ const OPENSHIFT_OAUTH: &str = "system:authenticated:oauth";
 
 const ALLOW_TTL: Duration = Duration::from_secs(30);
 const GROUPS_TTL: Duration = Duration::from_secs(15);
-/// Attempts at one review. The second rides out an API server that dropped the request or
-/// answered 5xx; it is never taken against a server that answered.
+/// Attempts at one review. A retry is taken only when the API server did not answer.
 const REVIEW_ATTEMPTS: u32 = 2;
 const REVIEW_RETRY_DELAY: Duration = Duration::from_millis(100);
 
@@ -78,8 +76,8 @@ pub struct KubeIdentity {
 }
 
 /// The caller's user, from `kube_user`. A `system:` user is refused so no token can stand in for
-/// a node, a service account or the cluster itself; a person's user may not carry the `crucible:`
-/// prefix and a run's must, so neither kind of token can act as the other.
+/// a node, a service account or the cluster itself. A person's user may not carry the `crucible:`
+/// prefix and a run's must.
 pub fn kube_user(principal: &Principal) -> Result<String, KubeIdentityError> {
     let user = principal
         .claims
@@ -108,9 +106,8 @@ pub fn kube_user(principal: &Principal) -> Result<String, KubeIdentityError> {
     Ok(user.to_string())
 }
 
-/// Groups from the token's `kube_groups`, plus `system:authenticated`. A `system:` group is
-/// always dropped, so no token can claim cluster powers (`system:masters`); a `crucible:` group
-/// is dropped for people, so a person's issuer cannot smuggle a run's scope in.
+/// Groups from the token's `kube_groups`, plus `system:authenticated`, without `system:` groups
+/// and, for a person, without `crucible:` groups.
 pub fn token_groups(principal: &Principal) -> Result<Vec<String>, KubeIdentityError> {
     let listed = match principal.claims.get(GROUPS_CLAIM) {
         None | Some(Value::Null) => Vec::new(),
@@ -224,8 +221,8 @@ impl SubjectAccessReviewer {
         }
     }
 
-    /// The caller's Kubernetes identity. A run's groups always come from its token, which the
-    /// issuer mints with its scope; a person's come from the configured source.
+    /// The caller's Kubernetes identity: a run's groups from its token, a person's from the
+    /// configured source.
     pub async fn identity(&self, principal: &Principal) -> Result<KubeIdentity, KubeIdentityError> {
         let user = kube_user(principal)?;
         let groups = match (principal.callers, self.groups) {
@@ -422,8 +419,7 @@ mod tests {
         }
     }
 
-    /// A person's user may not carry the crucible: prefix and a run's must, so neither kind of
-    /// token can stand in for the other.
+    /// A person's user may not carry the `crucible:` prefix and a run's must.
     #[test]
     fn the_user_prefix_is_refused_both_ways() {
         let run = principal(json!({"sub": "s", "kube_user": "crucible:run:crucible-run-x"}));

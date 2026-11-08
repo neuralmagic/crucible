@@ -255,8 +255,6 @@ fn refused_tool_result(refusal: &Refusal) -> Value {
         "error": refusal.to_string(),
         "retryable": refusal.retryable(),
     });
-    // Protocol 2026-07-28 requires the discriminator; a client that enforces it discards the
-    // refusal, and the caller reads a schema error instead of the reason.
     json!({
         "resultType": "complete",
         "content": [{"type": "text", "text": text.to_string()}],

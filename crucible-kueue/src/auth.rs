@@ -6,8 +6,7 @@
 //! issuer), and either way names the Kubernetes user it acts as (`kube_user`): the run's own pod
 //! user for a run, the person themselves otherwise. That user's RBAC decides every call; the
 //! token's `namespace` claim is only a default. Which of a person's claims play those parts is a
-//! [`ClaimMap`], applied before anything else reads them; a run's claims are the issuer's own
-//! spelling and pass through unchanged.
+//! [`ClaimMap`], applied before anything else reads them; a run's claims are used as issued.
 
 use crate::caller::{Identity, NameError, Namespace};
 use crate::config::{self, ClaimMap, NAMESPACE_CLAIM, NAMESPACES_CLAIM, RUN_ID_CLAIM};
@@ -142,8 +141,6 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
             return auth.oidc.challenge(headers, &error);
         }
     };
-    // A run's claims are the issuer's own spelling; a claim map describes a person's stock
-    // OIDC token and would rewrite the run's identity.
     if principal.callers == Callers::People {
         auth.claims.canonicalize(&mut principal);
     }
@@ -344,8 +341,7 @@ mod tests {
         assert_eq!(id.run_id.as_str(), id.launched_by.as_str());
     }
 
-    /// A run's claims are the issuer's own: a claim map configured for people's stock OIDC
-    /// tokens must not rewrite a run's identity or drop its groups.
+    /// A configured claim map leaves a run's claims unchanged.
     #[tokio::test]
     async fn a_run_token_passes_through_a_configured_claim_map_unchanged() {
         let jwks =

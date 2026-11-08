@@ -1784,8 +1784,7 @@ async fn a_run_token_needs_its_teams_rolebinding_in_a_team_namespace() {
     let _ = namespace.delete(&team_ns, &DeleteParams::default()).await;
 }
 
-/// A person's token claiming a crucible: identity is refused, as a system: one is: neither kind
-/// of token can stand in for the other.
+/// A person's token claiming a `crucible:` identity is refused.
 #[tokio::test]
 #[ignore = "needs a cluster with Kueue; see the module docs"]
 async fn a_person_token_claiming_a_crucible_identity_is_refused() {

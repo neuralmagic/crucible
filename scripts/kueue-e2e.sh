@@ -346,8 +346,8 @@ for _ in $(seq 30); do
 done
 [ -n "$PORT" ] || fail "the port-forward to the controller never listened: $(cat "$WORK/forward.log")"
 printf 'url = "http://127.0.0.1:%s"\n' "$PORT" > "$WORK/crux.toml"
-# The launcher as a person the controller knows, with no linked Kubernetes username — the run's
-# tokens act as the run itself — and an api key of their own for crux.
+# The launcher as a person the controller knows, with no linked Kubernetes username, and an api
+# key of their own for crux.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 KEY_ID=$(openssl rand -hex 16)
 KEY_SECRET=$(openssl rand -hex 32)

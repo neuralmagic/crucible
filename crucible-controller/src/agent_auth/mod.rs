@@ -650,8 +650,8 @@ mod tests {
         .unwrap();
     }
 
-    /// A run's token acts as the run itself to Kubernetes RBAC: its own pod user, and the groups
-    /// of its scope, whoever launched it and whether or not they linked a username.
+    /// A run's token carries the run's own Kubernetes identity, whether or not its launcher
+    /// linked a username.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_runs_token_carries_its_own_identity_whoever_launched_it(pool: PgPool) {
         bound_unlinked(&pool, "sbx-1").await;

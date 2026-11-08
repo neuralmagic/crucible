@@ -8206,9 +8206,8 @@ async fn a_fired_one_shot_becomes_a_deferred_run_with_the_frozen_snapshot(
 
 // --- schedules ----------------------------------------------------------------
 
-/// Activate the default policy set plus one rule letting a team dispatch onto the platform's
-/// targets, which the shipped set reserves for users: the launch surfaces under test here are
-/// about ownership, not about who may pick a cluster.
+/// Activate the default policy set plus a rule letting a team dispatch onto the platform's
+/// targets.
 async fn activate_team_dispatch(app: &Router) {
     let text = format!(
         "{}\n@id(\"team-dispatch-platform-targets\")\npermit(principal, action == \
@@ -8237,9 +8236,8 @@ async fn activate_team_dispatch(app: &Router) {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// A one-shot created while acting as a team fires a launch the team owns: the launch row records
-/// the team as owner and the person as creator, so the run's spend attributes to the team and its
-/// dispatch is stamped for the team, not for platform-administrators (RFC-0003 C-HIERARCHY).
+/// A one-shot created acting as a team fires a launch the team owns, and its run is attributed
+/// and dispatched as the team.
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_team_owned_one_shot_fire_attributes_its_run_to_the_team(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);

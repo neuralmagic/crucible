@@ -442,9 +442,8 @@ pub enum GrantError {
     NoLauncher { run_id: String },
 }
 
-/// The subject a run's token acts for: whoever asked for the dispatch, else the launch's owner,
-/// with a `user:` prefix stripped so the login-shaped subject keeps its value. A team stays
-/// `team:<slug>`.
+/// The `sub` of a run's token: whoever asked for the dispatch, else the launch's owner, without a
+/// `user:` prefix.
 pub fn launcher(run: &BoundRun) -> Result<String, GrantError> {
     run.dispatched_by
         .as_deref()
@@ -482,9 +481,7 @@ pub fn granted_scopes(
     Ok(granted)
 }
 
-/// Who a run's token is to Kubernetes RBAC: its own user, `crucible:run:<pod>`, and the groups
-/// that scope it — every run plus its owner's team or user group, so a RoleBinding can grant a
-/// team's runs what the team's own calls already have.
+/// A run's Kubernetes user and groups, for the `kube_user` and `kube_groups` claims.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunIdentity {
     pub user: String,
@@ -492,9 +489,8 @@ pub struct RunIdentity {
 }
 
 impl RunIdentity {
-    /// The identity of the run whose pod is `pod_name`, owned by `owner` (a principal string, or
-    /// `None` on rows attributed before owners were recorded: such a run carries only the group
-    /// every run shares).
+    /// The identity of the run in pod `pod_name` owned by `owner`. A run with no recorded owner
+    /// gets only `crucible:runs`.
     pub fn of(pod_name: &str, owner: Option<&str>) -> Self {
         let scope = owner
             .and_then(|owner| crate::authz::model::Principal::parse(owner).ok())
@@ -513,9 +509,14 @@ impl RunIdentity {
             groups.push(scope);
         }
         Self {
-            user: format!("crucible:run:{pod_name}"),
+            user: Self::user_of(pod_name),
             groups,
         }
+    }
+
+    /// The Kubernetes user of the run whose pod is `pod_name`.
+    pub fn user_of(pod_name: &str) -> String {
+        format!("crucible:run:{pod_name}")
     }
 }
 

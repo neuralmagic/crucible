@@ -184,10 +184,9 @@ pub struct KueueCfg {
     /// `workload_namespace = "..."` for one.
     #[serde(alias = "workload_namespace", deserialize_with = "one_or_many_names")]
     pub workload_namespaces: Vec<KubeName>,
-    /// The workload namespaces every run may act in, through the caller role the render binds to
-    /// Group `crucible:runs`: `shared_namespaces = [...]`, or `shared_namespace = "..."` for one.
-    /// Must be a subset of `workload_namespaces`; naming a team namespace there later never
-    /// silently opens it to every run.
+    /// The workload namespaces every run may act in through the caller role:
+    /// `shared_namespaces = [...]`, or `shared_namespace = "..."` for one. A subset of
+    /// `workload_namespaces`.
     #[serde(
         default,
         alias = "shared_namespace",
@@ -1209,9 +1208,7 @@ pub struct NamespaceOverlap {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error(
-    "kueue.shared_namespaces names {namespace:?}, which kueue.workload_namespaces does not; a      shared namespace must be a workload namespace"
-)]
+#[error("kueue.shared_namespaces names {namespace:?}, which kueue.workload_namespaces does not")]
 pub struct NotSharedNamespace {
     pub namespace: String,
 }
@@ -1304,9 +1301,7 @@ impl DeployProfile {
         Ok(())
     }
 
-    /// Refuse a `[kueue] shared_namespaces` entry that is not a `workload_namespaces` entry:
-    /// the caller role is bound only where workloads run, so a shared namespace outside the
-    /// workload set would render a binding that grants nothing.
+    /// Refuse a `[kueue] shared_namespaces` entry that is not in `workload_namespaces`.
     pub fn check_shared_namespaces(&self) -> Result<(), NotSharedNamespace> {
         let Some(kueue) = &self.kueue else {
             return Ok(());

@@ -120,8 +120,7 @@ fn signing_key_pem() -> String {
 }
 
 /// The run the spike's sandbox belongs to: a running run pod on the `dev` cluster, launched by
-/// alice, who has linked no Kubernetes username anywhere — the run's token acts as the run
-/// itself, not as her.
+/// alice, who has linked no Kubernetes username.
 async fn seed_run(pool: &sqlx::PgPool) {
     for sql in [
         "DELETE FROM run_sandboxes WHERE sandbox_id = $1 OR pod_name = $2",
@@ -553,8 +552,8 @@ async fn a_tampered_svid_or_a_foreign_audience_gets_no_token() {
     assert_eq!(body["error"], "invalid_target", "{body}");
 }
 
-/// Bind the caller role to runs in the spike's namespace, as the deploy render does for a
-/// shared namespace: the run's token is refused without it, whoever launched the run.
+/// Bind the caller role to Group `crucible:runs` in the spike's namespace, as the deploy render
+/// does for a shared namespace.
 async fn caller_role(kube: &kube::Client, env: &Env) {
     use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
     async fn apply(kube: &kube::Client, env: &Env, object: Value, namespaced: bool) {

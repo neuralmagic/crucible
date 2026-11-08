@@ -876,7 +876,14 @@ pub(crate) async fn dispatch_run(
             delivery.merge(access).map_err(|e| {
                 anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
             })?;
-            crate::runs::agent_tools::grant(db, &agent_servers, run_id, &cluster, &tokens)
+            crate::runs::agent_tools::grant(
+                db,
+                &agent_servers,
+                run_id,
+                &pod_name,
+                &cluster,
+                &tokens,
+            )
                 .await
                 .context("recording the run's agent tools")?;
         }

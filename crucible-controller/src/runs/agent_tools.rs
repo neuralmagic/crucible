@@ -1,7 +1,7 @@
 //! The MCP servers a run's agent is granted by default, from the deploy profile's server
 //! descriptions ([`DeployProfile::agent_servers`]), where the issuer mints their tokens and with
-//! the scopes it mints. Dispatch records what a run got, as the run's Kubernetes identity, the run
-//! page shows it, and a revision of the configured set tells people when it changes.
+//! the scopes it mints. Dispatch records what a run got, the run page shows it, and a revision of
+//! the configured set tells people when it changes.
 
 use crate::runs::workpod::agent_servers::AgentTokens;
 use anyhow::{Context, Result};
@@ -196,20 +196,18 @@ pub async fn for_runs(
     Ok(by_run)
 }
 
-/// Record what run `run_id`, dispatched onto `cluster`, is granted. Each tool carries the
-/// Kubernetes identity its tokens will hold: the run's own pod user, known at dispatch.
+/// Record what run `run_id`, dispatched onto `cluster` as pod `pod_name`, is granted, each tool
+/// with the Kubernetes user its tokens carry.
 pub async fn grant(
     db: &crate::Db,
     servers: &[ServerSpec],
     run_id: &str,
+    pod_name: &str,
     cluster: &str,
     tokens: &AgentTokens,
 ) -> Result<Vec<AgentTool>> {
     let mut tools = granted(servers, cluster, tokens);
-    let kube_user = format!(
-        "crucible:run:{}",
-        crate::runs::workpod::run_pod_name(run_id)
-    );
+    let kube_user = crate::agent_auth::issuer::RunIdentity::user_of(pod_name);
     for tool in &mut tools {
         tool.kube_user = Some(kube_user.clone());
     }
@@ -419,21 +417,28 @@ mod tests {
             .unwrap();
     }
 
-    /// The record carries the run's Kubernetes identity, as its tokens will, and the issue's
-    /// event log says what the run got, one line per server.
+    /// The record carries the run's Kubernetes user, and the issue's event log says what the run
+    /// got, one line per server.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_grant_records_the_runs_identity_and_is_told_on_the_issue(pool: PgPool) {
         let db = crate::Db::new(pool.clone());
         run_dispatched_for(&pool, "run-1", "user:alice").await;
         let all = tokens(&["ocp", "k8s"]);
-        let tools = grant(&db, &servers(PROFILE), "run-1", "k8s", &all)
-            .await
-            .unwrap();
+        let tools = grant(
+            &db,
+            &servers(PROFILE),
+            "run-1",
+            "crucible-run-brave-otter",
+            "k8s",
+            &all,
+        )
+        .await
+        .unwrap();
         assert_eq!(tools.len(), 2);
         for tool in &tools {
             assert_eq!(
                 tool.kube_user.as_deref(),
-                Some("crucible:run:crucible-run-run-1"),
+                Some("crucible:run:crucible-run-brave-otter"),
                 "the identity its tokens carry, known at dispatch"
             );
         }
@@ -448,8 +453,8 @@ mod tests {
         assert_eq!(
             reasons,
             [
-                "granted buildit/k8s as crucible:run:crucible-run-run-1 (buildit.read buildit.build)",
-                "granted kueue/k8s as crucible:run:crucible-run-run-1 (kueue.read kueue.submit)"
+                "granted buildit/k8s as crucible:run:crucible-run-brave-otter (buildit.read buildit.build)",
+                "granted kueue/k8s as crucible:run:crucible-run-brave-otter (kueue.read kueue.submit)"
             ]
         );
         assert!(

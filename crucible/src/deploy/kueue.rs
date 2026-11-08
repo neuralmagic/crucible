@@ -440,13 +440,11 @@ fn workload_binding(cfg: &KueueCfg, namespace: &KubeName) -> rbac::RoleBinding {
     }
 }
 
-/// Every group every run's token carries, and so the one a RoleBinding can grant runs through.
+/// The group every run's token carries.
 const RUNS_GROUP: &str = "crucible:runs";
 
-/// What a run's own token may do, bound only in `[kueue] shared_namespaces`: every verb the
-/// crucible-kueue access checks can ask of a caller, so a run can submit and read its workloads
-/// without the server acting for it. Secrets are narrowed to the profile's pull secrets, so a run
-/// in a shared namespace cannot read every Secret there.
+/// Every verb crucible-kueue's access checks can ask of a caller, with Secret reads limited to
+/// the profile's pull secrets.
 fn caller_cluster_role(cfg: &KueueCfg) -> rbac::ClusterRole {
     let mut rules = vec![
         rule(&[KUEUE_GROUP], &["localqueues"], &["get", "list", "use"]),
@@ -478,8 +476,7 @@ fn caller_cluster_role(cfg: &KueueCfg) -> rbac::ClusterRole {
     }
 }
 
-/// The (group, plural) of every kind crucible-kueue serves, the same set its manifest allowlist
-/// holds; access checks ask about each under its own group.
+/// The (group, plural) of every kind crucible-kueue serves.
 const SERVED_KINDS: &[(&str, &str)] = &[
     ("batch", "jobs"),
     ("ray.io", "rayjobs"),
@@ -492,8 +489,7 @@ const SERVED_KINDS: &[(&str, &str)] = &[
 
 const CALLER_KIND_VERBS: &[&str] = &["create", "get", "list", "patch", "update", "delete"];
 
-/// Runs' own access in one shared namespace: the caller role, bound to the group every run's
-/// token carries.
+/// The caller role bound to Group `crucible:runs` in `namespace`.
 fn caller_binding(_cfg: &KueueCfg, namespace: &KubeName) -> rbac::RoleBinding {
     rbac::RoleBinding {
         metadata: meta(format!("{NAME}-runs"), Some(namespace.as_str())),
@@ -921,9 +917,8 @@ mod tests {
         assert!(toml::from_str::<DeployProfile>(&empty).is_err());
     }
 
-    /// The caller role and its bindings: runs get the access checks' verbs in exactly the
-    /// shared namespaces, through the group every run's token carries, and its Secret reads are
-    /// limited to the profile's pull secrets.
+    /// The caller role is bound to `crucible:runs` in exactly the shared namespaces, and reads
+    /// only the profile's pull secrets.
     #[test]
     fn the_caller_role_is_bound_to_runs_only_in_the_shared_namespaces() {
         let shared = PROFILE.replace(
@@ -949,7 +944,6 @@ mod tests {
             binding["subjects"],
             serde_json::json!([{"kind": "Group", "name": "crucible:runs"}])
         );
-        // No shared namespaces: no caller binding at all.
         let plain = docs(PROFILE);
         assert!(
             !plain
@@ -975,9 +969,7 @@ mod tests {
         );
     }
 
-    /// Every access check crucible-kueue can produce is covered by the caller role, so a new tool
-    /// cannot ship without its RBAC. Secret reads are covered only for the pull secrets the
-    /// profile names, which is the narrowing the role intends.
+    /// The caller role covers every access check crucible-kueue can produce.
     #[test]
     fn the_caller_role_covers_every_access_check_crucible_kueue_can_produce() {
         use crucible_kueue::access::KueueRules;

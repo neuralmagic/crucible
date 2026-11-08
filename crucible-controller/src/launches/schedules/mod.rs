@@ -1793,6 +1793,44 @@ mod tests {
         Ok(())
     }
 
+    /// A transferred schedule launches with its owner's login and groups.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_transferred_schedule_launches_as_its_owner(pool: PgPool) -> Result<()> {
+        register_row(&pool, "survey").await;
+        bind_playbook_secret(&pool, "survey").await;
+        let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
+        own_schedule(
+            &pool,
+            &row.id,
+            "user:bob",
+            &["/groups/team-y"],
+            "2026-08-23T12:00:00Z",
+        )
+        .await;
+        let db = Db::new(pool.clone());
+        let fired = fire_due(
+            &db,
+            ts("2026-08-23T12:00:30Z"),
+            8,
+            5,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert_eq!(fired.len(), 1, "the firing launched");
+        let launch = crate::launches::store::get_playbook_launch(&pool, &fired[0])
+            .await?
+            .expect("a launch row");
+        assert_eq!(launch.created_by.as_deref(), Some("bob"));
+        assert_eq!(launch.launcher_groups, vec!["/groups/team-y".to_string()]);
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner FROM playbook_launches WHERE key = $1")
+                .bind(&fired[0])
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(owner.as_deref(), Some("user:bob"));
+        Ok(())
+    }
+
     /// Past the TTL there is no authorization left to launch a bound scope under, so the firing
     /// parks with the reason rather than dispatching. A re-save re-owns the row and expires it.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

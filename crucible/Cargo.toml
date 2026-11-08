@@ -162,8 +162,6 @@ opentelemetry-otlp = { version = "0.33", default-features = false, features = [
 ] }
 
 [dev-dependencies]
-# The caller-role render test walks every access check crucible-kueue can produce, so a new tool
-# cannot ship without its RBAC.
 crucible-kueue = { path = "../crucible-kueue" }
 crucible-mcp-auth = { path = "../crucible-mcp-auth" }
 

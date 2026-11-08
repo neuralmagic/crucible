@@ -221,8 +221,8 @@ pub struct BoundRun {
     /// The principal the run was dispatched for (`user:<login>` for a person, `team:<slug>` when
     /// a team asked for the dispatch).
     pub dispatched_by: Option<String>,
-    /// The principal the run's launch is owned by: the team a standing launch fires for, or the
-    /// user whose launch it is. `None` on rows attributed before owners were recorded.
+    /// The principal the run's launch is owned by. `None` on rows attributed before owners were
+    /// recorded.
     pub owner: Option<String>,
     /// `None` for a sandbox bound before names were recorded.
     pub sandbox_name: Option<String>,
