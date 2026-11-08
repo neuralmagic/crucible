@@ -26,17 +26,19 @@ pub enum PaneKind {
     Timeline,
     Graph,
     Data,
+    Compare,
     Pack,
     Launch,
     Log,
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 7] = [
+    pub const ALL: [PaneKind; 8] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
         PaneKind::Data,
+        PaneKind::Compare,
         PaneKind::Pack,
         PaneKind::Launch,
         PaneKind::Log,
@@ -48,6 +50,7 @@ impl PaneKind {
             PaneKind::Timeline => "Timeline",
             PaneKind::Graph => "Graph",
             PaneKind::Data => "Data",
+            PaneKind::Compare => "Compare",
             PaneKind::Pack => "Pack",
             PaneKind::Launch => "Launch",
             PaneKind::Log => "Log",
@@ -131,7 +134,12 @@ impl Workspace {
                     groups: vec![
                         group(&[PaneKind::Graph, PaneKind::Timeline], graph),
                         group(
-                            &[PaneKind::Tasks, PaneKind::Pack, PaneKind::Launch],
+                            &[
+                                PaneKind::Tasks,
+                                PaneKind::Compare,
+                                PaneKind::Pack,
+                                PaneKind::Launch,
+                            ],
                             1.0 - graph,
                         ),
                     ],
@@ -449,7 +457,7 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 mod tests {
     use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit};
 
-    use PaneKind::{Data, Graph, Launch, Log, Pack, Tasks, Timeline};
+    use PaneKind::{Compare, Data, Graph, Launch, Log, Pack, Tasks, Timeline};
 
     fn tabs(w: &Workspace) -> Vec<Vec<Vec<PaneKind>>> {
         w.columns
@@ -473,7 +481,7 @@ mod tests {
         assert_eq!(
             tabs(&w),
             vec![
-                vec![vec![Graph, Timeline], vec![Tasks, Pack, Launch]],
+                vec![vec![Graph, Timeline], vec![Tasks, Compare, Pack, Launch]],
                 vec![vec![Log, Data]]
             ]
         );
@@ -516,7 +524,10 @@ mod tests {
         assert_eq!(
             tabs(&w),
             vec![
-                vec![vec![Graph, Timeline], vec![Tasks, Pack, Launch, Log]],
+                vec![
+                    vec![Graph, Timeline],
+                    vec![Tasks, Compare, Pack, Launch, Log]
+                ],
                 vec![vec![Data]]
             ]
         );
@@ -531,7 +542,11 @@ mod tests {
         w.dock(Pack, Dock::Split(Tasks, Edge::Bottom));
         assert_eq!(
             tabs(&w)[0],
-            vec![vec![Graph, Timeline], vec![Tasks, Launch], vec![Pack]]
+            vec![
+                vec![Graph, Timeline],
+                vec![Tasks, Compare, Launch],
+                vec![Pack]
+            ]
         );
         assert!((w.columns[0].groups[2].share - tasks_share / 2.0).abs() < 1e-6);
         sums_to_one(&w);
@@ -540,7 +555,7 @@ mod tests {
         assert_eq!(
             tabs(&w),
             vec![
-                vec![vec![Timeline], vec![Tasks, Launch], vec![Pack]],
+                vec![vec![Timeline], vec![Tasks, Compare, Launch], vec![Pack]],
                 vec![vec![Log, Data]],
                 vec![vec![Graph]]
             ]
@@ -558,7 +573,11 @@ mod tests {
         w.dock(Pack, Dock::Split(Pack, Edge::Top));
         assert_eq!(
             tabs(&w)[0],
-            vec![vec![Graph, Timeline], vec![Pack], vec![Tasks, Launch]]
+            vec![
+                vec![Graph, Timeline],
+                vec![Pack],
+                vec![Tasks, Compare, Launch]
+            ]
         );
         let before = w.clone();
         w.dock(Pack, Dock::Split(Pack, Edge::Left));
@@ -579,9 +598,10 @@ mod tests {
         w.close(Graph);
         w.close(Pack);
         w.close(Launch);
+        w.close(Compare);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 6);
+        assert_eq!(w.closed().count(), 7);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
@@ -600,7 +620,10 @@ mod tests {
         w.activate(Data);
         assert_eq!(
             tabs(&w),
-            vec![vec![vec![Graph, Timeline, Data], vec![Tasks, Pack, Launch]]]
+            vec![vec![
+                vec![Graph, Timeline, Data],
+                vec![Tasks, Compare, Pack, Launch]
+            ]]
         );
     }
 

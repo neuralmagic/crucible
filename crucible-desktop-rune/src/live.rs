@@ -213,6 +213,15 @@ pub struct LiveDetail {
     pub pack: Result<PackFiles, String>,
 }
 
+/// The launch a run is compared against: its tasks as its stored session left them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Base {
+    pub key: String,
+    pub fold: RunFold,
+    /// Why its run could not be read, when it could not.
+    pub error: Option<String>,
+}
+
 /// The controller's `parked` token is always a launch error on playbook runs; relabeled here
 /// only, the wire token is unchanged.
 fn shown_status(status: &str) -> &str {
@@ -244,6 +253,8 @@ enum Msg {
     Save(Working),
     /// Drop the connection and who it named, and read crux's config afresh.
     Reconnect,
+    /// Which launch to read as the base of a comparison; `None` stops.
+    Compare(Option<String>),
 }
 
 /// What a launch form starts: a registered playbook, or a draft's newest save.
@@ -322,6 +333,7 @@ struct Fetcher {
     identity: Option<(String, Identity)>,
     view: LiveView,
     detail: Option<LiveDetail>,
+    base: Option<Base>,
     launches: HashMap<String, CachedLaunch>,
     packs: HashMap<String, PackFiles>,
     runs: HashMap<String, CachedRun>,
@@ -496,6 +508,7 @@ impl Fetcher {
             identity: None,
             view: LiveView::Loading,
             detail: None,
+            base: None,
             launches: HashMap::new(),
             packs: HashMap::new(),
             runs: HashMap::new(),
@@ -732,6 +745,51 @@ impl Fetcher {
 
     fn detail(&self) -> Option<&LiveDetail> {
         self.detail.as_ref()
+    }
+
+    /// Read launch `key`'s run as the comparison base, once: a stopped run never changes, so a
+    /// base already read stays. A launch the list does not show yet is tried again later.
+    fn refresh_base(&mut self, key: Option<&str>) -> bool {
+        let Some(key) = key else {
+            let changed = self.base.is_some();
+            self.base = None;
+            return changed;
+        };
+        if self
+            .base
+            .as_ref()
+            .is_some_and(|base| base.key == key && base.error.is_none())
+        {
+            return false;
+        }
+        let Some(launch) = self.view.launch(key).cloned() else {
+            return false;
+        };
+        let run_id = self
+            .launch_detail(&launch)
+            .and_then(|record| record.runs.first().map(|run| run.run_id.clone()));
+        let next = match (&run_id, self.connection.as_ref()) {
+            (Some(run_id), Some(connection)) => {
+                let run = self.runs.entry(run_id.clone()).or_default();
+                if !run.settled {
+                    settle(run, connection, run_id);
+                }
+                Base {
+                    key: key.to_string(),
+                    fold: run.fold.clone(),
+                    error: run.error.clone(),
+                }
+            }
+            (None, _) => Base {
+                key: key.to_string(),
+                fold: RunFold::default(),
+                error: Some("that launch never dispatched a run".to_string()),
+            },
+            (Some(_), None) => return false,
+        };
+        let changed = self.base.as_ref() != Some(&next);
+        self.base = Some(next);
+        changed
     }
 
     fn any_running(&self) -> bool {
@@ -1234,6 +1292,8 @@ fn landed_label(stamp: &str) -> String {
 pub struct Snapshot {
     pub view: LiveView,
     pub detail: Option<LiveDetail>,
+    /// The launch the selected one is compared against.
+    pub base: Option<Base>,
     /// Recently finished launches, oldest first.
     pub finished: Vec<Finished>,
     /// Registered playbook ids: the ones the app can launch.
@@ -1275,6 +1335,7 @@ impl Client {
                 Snapshot {
                     view: LiveView::Unavailable(format!("starting the live worker: {error}")),
                     detail: None,
+                    base: None,
                     finished: Vec::new(),
                     registered: Vec::new(),
                     prepared: None,
@@ -1334,6 +1395,10 @@ impl Client {
         let _ = self.tx.send(Msg::Select(playbook.map(ToString::to_string)));
     }
 
+    pub fn compare(&self, base: Option<&str>) {
+        let _ = self.tx.send(Msg::Compare(base.map(ToString::to_string)));
+    }
+
     pub fn take(&self, seen: u64) -> Option<(u64, Snapshot)> {
         let shared = self.shared.lock().ok()?;
         (shared.version > seen).then(|| (shared.version, shared.snapshot.clone()))
@@ -1357,6 +1422,7 @@ fn publish(shared: &Mutex<Shared>, snapshot: Snapshot) {
 fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) {
     let mut fetcher = Fetcher::new(wake);
     let mut selected: Option<String> = None;
+    let mut compare: Option<String> = None;
     let mut next_list = Instant::now();
     let mut next_detail = Instant::now();
     let mut next_stream: Option<Instant> = None;
@@ -1397,6 +1463,10 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
                 fetcher.save(working);
                 force = true;
             }
+            Ok(Msg::Compare(base)) => {
+                compare = base;
+                force = fetcher.refresh_base(compare.as_deref());
+            }
             Ok(Msg::Reconnect) => {
                 fetcher.connection = None;
                 fetcher.identity = None;
@@ -1417,6 +1487,7 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
                 Err(error) => changed |= fetcher.unavailable(error),
             }
             changed |= fetcher.refresh_registered();
+            changed |= fetcher.refresh_base(compare.as_deref());
             next_list = now
                 + if fetcher.any_running() {
                     Duration::from_secs(2)
@@ -1444,6 +1515,7 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
                 Snapshot {
                     view: fetcher.view().clone(),
                     detail: fetcher.detail().cloned(),
+                    base: fetcher.base.clone(),
                     finished: fetcher.finished.clone(),
                     registered: fetcher.registered.clone(),
                     prepared: fetcher.prepared.clone(),

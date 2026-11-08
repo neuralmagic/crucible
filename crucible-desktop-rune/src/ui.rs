@@ -1,5 +1,6 @@
 //! The window: live playbooks and local packs on the left, the selected run on the right.
 
+mod compare;
 mod data;
 mod dock;
 mod graph;

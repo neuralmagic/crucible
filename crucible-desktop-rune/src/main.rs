@@ -2,6 +2,7 @@
 //! playbooks (through `crux`, with the same config a terminal uses) and the local `examples/` packs
 //! (through each pack's `state/session.jsonl`).
 
+mod diff;
 mod draft;
 mod editor;
 mod filter;
@@ -155,6 +156,12 @@ pub struct App {
     pub editor_error: Option<String>,
     /// The launch key the live worker was last told to read.
     live_sent: Option<String>,
+    /// The launch the Compare pane reads against, as last asked of the worker.
+    compare_sent: Option<String>,
+    /// The launch picked to compare against; `None` takes the one before.
+    pub compare_to: Option<String>,
+    /// That launch's run, once read.
+    pub live_base: Option<live::Base>,
     pub backend: Backend,
     pub packs: Vec<PackView>,
     pub playbook_search: TextEdit,
@@ -597,6 +604,7 @@ impl App {
     fn apply_live(&mut self, snapshot: live::Snapshot) {
         self.live = snapshot.view;
         self.live_detail = snapshot.detail;
+        self.live_base = snapshot.base;
         self.registered = snapshot.registered;
         self.answer_rerun(snapshot.reran);
         self.answer_launcher(snapshot.prepared, snapshot.launched);
@@ -657,6 +665,45 @@ impl App {
             self.live_client.select(key.as_deref());
             self.live_sent = key;
         }
+        let base = self
+            .workspace()
+            .locate(PaneKind::Compare)
+            .and_then(|_| self.compare_base())
+            .map(|launch| launch.key.clone());
+        if base != self.compare_sent {
+            self.live_client.compare(base.as_deref());
+            self.compare_sent = base;
+        }
+    }
+
+    /// Earlier launches of the selected one's playbook that ran, newest first.
+    pub fn compare_candidates(&self) -> Vec<&live::LivePlaybook> {
+        let Some(selected) = self.selected_live() else {
+            return Vec::new();
+        };
+        let mut earlier: Vec<&live::LivePlaybook> = self
+            .live
+            .launches_of(&selected.id)
+            .filter(|launch| launch.key != selected.key && launch.runs > 0)
+            .collect();
+        earlier.sort_by_key(|launch| std::cmp::Reverse(launch.landed));
+        earlier
+    }
+
+    /// The launch the selected one is compared against: the picked one, else the newest that
+    /// landed before it.
+    pub fn compare_base(&self) -> Option<&live::LivePlaybook> {
+        let selected = self.selected_live()?;
+        let candidates = self.compare_candidates();
+        candidates
+            .iter()
+            .find(|launch| Some(&launch.key) == self.compare_to.as_ref())
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .find(|launch| launch.landed < selected.landed)
+            })
+            .copied()
     }
 
     /// Sign in to the controller at the sign-in field's URL through the browser, on a thread of
@@ -758,6 +805,7 @@ impl App {
         self.expanded = None;
         self.inspect = inspect::Inspect::default();
         self.unfolded.clear();
+        self.compare_to = None;
         self.log_task = None;
         self.pack_file = None;
         self.pack_source = None;
@@ -864,6 +912,9 @@ fn init() -> App {
         lsp_sent: None,
         editor_error: None,
         live_sent: None,
+        compare_sent: None,
+        compare_to: None,
+        live_base: None,
         backend: Backend::Controller,
         packs: Vec::new(),
         playbook_search: TextEdit::new(""),
