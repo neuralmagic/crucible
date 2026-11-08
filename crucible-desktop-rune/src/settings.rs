@@ -3,6 +3,7 @@
 //! The sans is the theme's Inter. The mono slot and the log fonts are the theme's IBM Plex Mono (OFL)
 //! or a font read from this machine's font store at startup; no proprietary font is ever bundled.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -121,6 +122,8 @@ pub struct Settings {
     pub notify: bool,
     /// The editor pack files open in; `None` finds one.
     pub editor: Option<Editor>,
+    /// Keys bound by hand, by command id; a command left out keeps its defaults.
+    pub keys: BTreeMap<String, Vec<String>>,
     path: PathBuf,
 }
 
@@ -139,6 +142,8 @@ struct Config {
     notify: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<Editor>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    keys: BTreeMap<String, Vec<String>>,
 }
 
 impl Settings {
@@ -167,6 +172,7 @@ impl Settings {
             crt: config.crt.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
             editor: config.editor,
+            keys: config.keys,
             path,
         }
     }
@@ -210,6 +216,15 @@ impl Settings {
         self.save();
     }
 
+    /// Bind `command` to `keys`, or back to its defaults with `None`.
+    pub fn set_keys(&mut self, command: &str, keys: Option<Vec<String>>) {
+        match keys {
+            Some(keys) => self.keys.insert(command.to_string(), keys),
+            None => self.keys.remove(command),
+        };
+        self.save();
+    }
+
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.appearance = appearance;
         self.save();
@@ -225,6 +240,7 @@ impl Settings {
             crt: Some(self.crt),
             notify: Some(self.notify),
             editor: self.editor,
+            keys: self.keys.clone(),
         };
         let Ok(text) = toml::to_string(&config) else {
             return;

@@ -121,7 +121,14 @@ fn group_view(at: At, group: &Group, pane: &Pane, app: &App, p: &Paint) -> El {
         .min_h(0.0)
         .radius(p.k.radius.lg)
         .fill(p.c.bg_base)
-        .border(p.hair, p.c.border_muted)
+        .border(
+            p.hair,
+            if app.pane_focus.is_some() && app.focused_pane() == group.active {
+                p.c.text_accent
+            } else {
+                p.c.border_muted
+            },
+        )
         .clip_rounded(p.k.radius.lg)
         .on_layout_tx(move |app: &mut App, rect, tx: &mut Tx| {
             app.geometry.groups.insert(at, rect);

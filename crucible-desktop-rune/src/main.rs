@@ -2,6 +2,7 @@
 //! playbooks (through `crux`, with the same config a terminal uses) and the local `examples/` packs
 //! (through each pack's `state/session.jsonl`).
 
+mod commands;
 mod diff;
 mod draft;
 mod editor;
@@ -10,6 +11,7 @@ mod form;
 mod gfx;
 mod handoff;
 mod inspect;
+mod keymap;
 mod link;
 mod live;
 mod logline;
@@ -17,6 +19,7 @@ mod lsp;
 mod model;
 mod notify;
 mod pack;
+mod palette;
 mod runs;
 mod session;
 mod settings;
@@ -189,6 +192,15 @@ pub struct App {
     pub inspect: inspect::Inspect,
     /// Fan-outs the graph draws with their instances.
     pub unfolded: HashSet<String>,
+    /// Which keys run which commands, and the bindings in the config file it could not use.
+    pub keymap: keymap::Keymap,
+    pub keys_refused: Vec<keymap::Refused>,
+    /// The command palette, while open.
+    pub palette: Option<palette::Palette>,
+    /// The pane keyboard navigation starts from.
+    pub pane_focus: Option<PaneKind>,
+    /// Each command's key recorder in Settings, once touched.
+    pub recorders: HashMap<keymap::Command, rune_kit::ShortcutRecorderState>,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
@@ -913,6 +925,7 @@ fn repo_from_args() -> Option<PathBuf> {
 fn init() -> App {
     let repo = repo_from_args().unwrap_or_else(model::default_repo);
     let settings = SETTINGS.get().cloned().unwrap_or_else(Settings::load);
+    let (keymap, keys_refused) = keymap::Keymap::new(&settings.keys);
     App {
         repo: repo.display().to_string(),
         local: Client::spawn(repo),
@@ -947,6 +960,11 @@ fn init() -> App {
         expanded: None,
         inspect: inspect::Inspect::default(),
         unfolded: HashSet::new(),
+        keymap,
+        keys_refused,
+        palette: None,
+        pane_focus: None,
+        recorders: HashMap::new(),
         pack_file: None,
         layout: settings.layout.clone(),
         shown: Vec::new(),
@@ -1058,6 +1076,7 @@ fn main() {
         families: settings::families(),
         setup: Some(setup),
         poll: Some(poll),
+        on_key: Some(commands::on_key),
         scenes: &[
             // `CRUCIBLE_TAB` shows that pane (tasks, timeline, graph, pack, launch or log).
             ("local", |app: &mut App| {

@@ -8,6 +8,7 @@ mod launch;
 mod launcher;
 mod log;
 mod pack;
+mod palette;
 mod runs;
 mod tasks;
 mod theme;
@@ -242,6 +243,7 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
         .child(fx(gfx::GRAIN, gfx::data(Color::WHITE, 0.035), 0.0));
     let mut layer = Vec::new();
     launcher::sheet(app, &p, &mut layer);
+    palette::palette(app, &p, &mut layer);
     rune_kit::root(window, layer)
 }
 
@@ -1278,7 +1280,12 @@ fn settings_pane(app: &App, p: &Paint) -> El {
         .min_w(0.0)
         .px(40.0)
         .pt(32.0)
+        .pb(32.0)
         .gap(24.0)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_edge_fade(8.0)
         .child(
             row()
                 .w_full()
@@ -1398,6 +1405,71 @@ fn settings_pane(app: &App, p: &Paint) -> El {
             p,
         ))
         .child(settings_section("log-viewer", "Log font", rows, p))
+        .child(settings_section("keys", "Keys", key_rows(app, p), p))
+}
+
+/// A row per command: its first key in a recorder, any others beside it, and a reset when the
+/// config file binds it; the bindings the config file could not use come first.
+fn key_rows(app: &App, p: &Paint) -> Vec<El> {
+    let mut rows: Vec<El> = app
+        .keys_refused
+        .iter()
+        .map(|refused| {
+            text(format!(
+                "{} {}: {}",
+                refused.command, refused.key, refused.why
+            ))
+            .font(p.k.ty.small)
+            .color(p.fail)
+            .py(6.0)
+        })
+        .collect();
+    for (i, command) in crate::keymap::Command::ALL.into_iter().enumerate() {
+        if i > 0 {
+            rows.push(rule(&format!("keys-sep-{i}"), false, p));
+        }
+        let state = app.recorders.get(&command).cloned().unwrap_or_else(|| {
+            rune_kit::ShortcutRecorderState::new(app.keymap.keys(command).first().cloned())
+        });
+        let others: Vec<String> = app
+            .keymap
+            .keys(command)
+            .iter()
+            .skip(1)
+            .map(|key| key.keycaps().join(""))
+            .collect();
+        let id = command.id();
+        let recorder =
+            rune_kit::ShortcutRecorder::new(format!("key-{id}"), &state, move |app: &mut App| {
+                app.recorder(command)
+            })
+            .label(command.title())
+            .allow_unmodified()
+            .width(200.0)
+            .on_change(move |app: &mut App, shortcut, _: &mut Tx| app.rebind(command, shortcut))
+            .build(p.k);
+        let mut control = row().gap(8.0).center_y();
+        if !others.is_empty() {
+            control = control.child(
+                text(others.join("  "))
+                    .font(mono(11.0, 400.0))
+                    .color(p.c.text_faint),
+            );
+        }
+        control = control.child(recorder);
+        if app.settings.keys.contains_key(&id) {
+            control = control.child(
+                Button::new("Reset")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press(move |app: &mut App| app.reset_keys(command))
+                    .build(p.k)
+                    .key(format!("key-reset-{id}")),
+            );
+        }
+        rows.push(setting_row(&command.title(), control, p));
+    }
+    rows
 }
 
 /// A titled card of rows, as a settings page lays them out.

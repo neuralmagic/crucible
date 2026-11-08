@@ -76,7 +76,7 @@ pub struct Workspace {
     pub columns: Vec<Column>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Edge {
     Left,
     Right,
@@ -423,6 +423,43 @@ pub fn depth<'a>(tasks: impl IntoIterator<Item = (&'a str, &'a [String])>) -> us
         .unwrap_or(0)
 }
 
+/// The group on `edge`'s side of `from` in the laid-out `rects` (`[x, y, w, h]`): of those wholly
+/// past that side, the ones that line up with it across first, then the nearest.
+pub fn neighbour(
+    rects: &std::collections::HashMap<At, [f32; 4]>,
+    from: At,
+    edge: Edge,
+) -> Option<At> {
+    let [fx, fy, fw, fh] = *rects.get(&from)?;
+    let overlap = |a0: f32, a1: f32, b0: f32, b1: f32| (a1.min(b1) - a0.max(b0)).max(0.0);
+    rects
+        .iter()
+        .filter(|(at, _)| **at != from)
+        .filter_map(|(at, &[x, y, w, h])| {
+            let (gap, across, offset) = match edge {
+                Edge::Left => (fx - (x + w), overlap(y, y + h, fy, fy + fh), (y - fy).abs()),
+                Edge::Right => (
+                    x - (fx + fw),
+                    overlap(y, y + h, fy, fy + fh),
+                    (y - fy).abs(),
+                ),
+                Edge::Top => (fy - (y + h), overlap(x, x + w, fx, fx + fw), (x - fx).abs()),
+                Edge::Bottom => (
+                    y - (fy + fh),
+                    overlap(x, x + w, fx, fx + fw),
+                    (x - fx).abs(),
+                ),
+            };
+            (gap > -1.0).then_some((*at, across <= 0.0, gap + offset))
+        })
+        .min_by(|a, b| {
+            (a.1, a.2)
+                .partial_cmp(&(b.1, b.2))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(at, _, _)| at)
+}
+
 fn group(tabs: &[PaneKind], share: f32) -> Group {
     Group {
         tabs: tabs.to_vec(),
@@ -455,9 +492,41 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit};
+    use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit, neighbour};
 
     use PaneKind::{Compare, Data, Graph, Launch, Log, Pack, Tasks, Timeline};
+
+    #[test]
+    fn a_neighbour_is_the_nearest_group_on_that_side_lined_up_first() {
+        //   +------+-----+
+        //   | 0,0  |     |
+        //   +------+ 1,0 |
+        //   | 0,1  |     |
+        //   +--+---+-----+
+        //   |0,2|
+        //   +---+
+        let rects = std::collections::HashMap::from([
+            ((0, 0), [0.0, 0.0, 600.0, 300.0]),
+            ((0, 1), [0.0, 304.0, 600.0, 300.0]),
+            ((0, 2), [0.0, 608.0, 200.0, 100.0]),
+            ((1, 0), [604.0, 0.0, 400.0, 604.0]),
+        ]);
+        let go = |from, edge| neighbour(&rects, from, edge);
+        assert_eq!(go((0, 0), Edge::Bottom), Some((0, 1)));
+        assert_eq!(go((0, 1), Edge::Bottom), Some((0, 2)));
+        assert_eq!(go((0, 1), Edge::Top), Some((0, 0)));
+        assert_eq!(go((0, 0), Edge::Right), Some((1, 0)));
+        assert_eq!(go((0, 1), Edge::Right), Some((1, 0)));
+        assert_eq!(go((1, 0), Edge::Left), Some((0, 0)));
+        assert_eq!(go((0, 0), Edge::Left), None);
+        assert_eq!(go((0, 0), Edge::Top), None);
+        assert_eq!(
+            go((1, 0), Edge::Bottom),
+            Some((0, 2)),
+            "nothing lines up, so the nearest"
+        );
+        assert_eq!(go((9, 9), Edge::Left), None);
+    }
 
     fn tabs(w: &Workspace) -> Vec<Vec<Vec<PaneKind>>> {
         w.columns
