@@ -67,13 +67,14 @@ pub(crate) fn plan_admitted_event(
 /// `plan run`); fields belonging to other emitters stay at their defaults. `trace_id`/`span_id`
 /// carry the emitter's current trace context (the iteration's span) so a RESULTS row links
 /// straight to its trace; no active span leaves them empty. `args` carries the run's agent knobs
-/// a task's own are resolved against; None reports no agent.
+/// a task's own are resolved against; None reports no agent. `secs` is the task's wall time.
 pub(crate) fn task_result_event(
     plan_version: u32,
     iter: u32,
     task: &crate::plan::ir::Task,
     r: &crate::plan::exec::TaskResult,
     args: Option<&crate::args::Args>,
+    secs: f64,
 ) -> crate::report::session::SessionEvent {
     let (trace_id, span_id) = crate::agent::engine::current_trace_env()
         .and_then(|(tp, _)| {
@@ -107,7 +108,8 @@ pub(crate) fn task_result_event(
             .as_ref()
             .map(crate::plan::machine::BlockedReason::wire),
         transport: r.transport,
-        secs: 0.0,
+        secs,
+        at: Some(crate::plan::admission::stamp()),
         trace_id,
         span_id,
         agent: args
@@ -125,7 +127,7 @@ pub(crate) fn reused_result_event(
     r: &crate::plan::exec::TaskResult,
     from: &str,
 ) -> crate::report::session::SessionEvent {
-    let mut event = task_result_event(plan_version, 0, task, r, None);
+    let mut event = task_result_event(plan_version, 0, task, r, None, 0.0);
     if let crate::report::session::SessionEvent::TaskResult { reused_from, .. } = &mut event {
         *reused_from = Some(from.to_string());
     }
@@ -360,7 +362,7 @@ mod tests {
             repairs: Vec::new(),
         };
         let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None)
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None, 0.0)
         else {
             panic!("not a task_result event");
         };
@@ -376,7 +378,7 @@ mod tests {
             ..result
         };
         let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none, None)
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none, None, 0.0)
         else {
             panic!("not a task_result event");
         };
@@ -410,7 +412,7 @@ mod tests {
             repairs: vec![repair.clone()],
         };
         let event =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None);
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None, 0.0);
         let SessionEvent::TaskResult { repairs, .. } = &event else {
             panic!("not a task_result event");
         };
@@ -540,7 +542,7 @@ mod tests {
             |task, result| {
                 log.push('\n');
                 log.push_str(&crucible_contract::session::encode(
-                    &crate::plan::events::task_result_event(1, 0, task, result, None),
+                    &crate::plan::events::task_result_event(1, 0, task, result, None, 0.0),
                 ));
                 written.push((task.name.clone(), result.clone()));
             },

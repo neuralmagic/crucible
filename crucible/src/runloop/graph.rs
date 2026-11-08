@@ -109,6 +109,7 @@ pub(crate) fn run_iteration(
     let mut task_events = Vec::new();
     let agent_args = runner.args.clone();
     let files = crate::plan::files::CapturedFiles::new(&runner.p.state);
+    let clock = crate::plan::admission::TaskClock::default();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -116,6 +117,7 @@ pub(crate) fn run_iteration(
             &crucible::inference::from_process_env()?,
         ),
         ExecCfg {
+            clock: Some(&clock),
             wall_clock: cx.time_left,
             files: Some(&files),
             ..ExecCfg::default()
@@ -129,6 +131,7 @@ pub(crate) fn run_iteration(
                 task,
                 result,
                 Some(&agent_args),
+                clock.secs(&task.name),
             ));
         },
     )?;
@@ -273,6 +276,7 @@ pub(crate) fn run_epilogue(
         kept.to_value(),
     )]);
     let mut task_events = Vec::new();
+    let clock = crate::plan::admission::TaskClock::default();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -280,6 +284,7 @@ pub(crate) fn run_epilogue(
             &crucible::inference::from_process_env()?,
         ),
         ExecCfg {
+            clock: Some(&clock),
             files: Some(&files),
             run_inputs: Some(&run_inputs),
             ..ExecCfg::default()
@@ -292,6 +297,7 @@ pub(crate) fn run_epilogue(
                 task,
                 result,
                 Some(args),
+                clock.secs(&task.name),
             ));
         },
     )?;
@@ -921,6 +927,7 @@ pub(crate) fn run_wide_tournament(
         fatal: None,
     };
     let mut task_events = Vec::new();
+    let clock = crate::plan::admission::TaskClock::default();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -928,6 +935,7 @@ pub(crate) fn run_wide_tournament(
             &crucible::inference::from_process_env()?,
         ),
         ExecCfg {
+            clock: Some(&clock),
             wall_clock: time_left,
             ..ExecCfg::default()
         },
@@ -939,6 +947,7 @@ pub(crate) fn run_wide_tournament(
                 task,
                 result,
                 Some(args),
+                clock.secs(&task.name),
             ));
         },
     )?;

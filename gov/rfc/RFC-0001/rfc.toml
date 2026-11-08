@@ -89,6 +89,7 @@ changed = [
     "C-CAPABILITY-DISCLOSURE: each variable a table declares for host-side commands is disclosed with its table",
     "C-WIRE: task_started { task, attempt, estimate_usd } is an additive event kind a playbook writes before each attempt",
     "C-WIRE: task_agent { task, attempt, event } records each playbook agent attempt's transcript in the session log",
+    "C-WIRE: task_started and task_result carry at, when each was written, and task_result's secs is the task's wall time",
     "options are compile-time except a dynamic choice's, which a dependency supplies (C-ROUTE)",
     "C-COMMANDS: a declared NAME? is optional, passed to the command when the engine sets it and left out otherwise; only a required name the engine lacks refuses the run",
     "C-CAPABILITY-DISCLOSURE: an optional declared variable is disclosed with its table and marked optional",
