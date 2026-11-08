@@ -7,6 +7,7 @@ mod editor;
 mod filter;
 mod form;
 mod gfx;
+mod link;
 mod live;
 mod logline;
 mod lsp;
@@ -30,6 +31,7 @@ use rune::{AppSpec, TextEdit, Tx, Waker};
 use crate::draft::Working;
 use crate::editor::Editor;
 use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
+use crate::link::Link;
 use crate::live::{LiveDetail, LivePlaybook, LiveView, Target};
 use crate::logline::LogView;
 use crate::model::{Client, PackView, Snapshot, Verdict};
@@ -642,6 +644,52 @@ impl App {
         }
     }
 
+    /// Open what `link` names: a playbook, one of its launches with a task open, or a local pack.
+    pub fn follow(&mut self, link: &Link) {
+        self.settings_open = false;
+        match link {
+            Link::Playbook { id } => {
+                self.backend = Backend::Controller;
+                self.select(Selection::playbook(id));
+            }
+            Link::Launch {
+                playbook,
+                key,
+                task,
+            } => {
+                self.backend = Backend::Controller;
+                self.select(Selection::Live {
+                    playbook: playbook.clone(),
+                    launch: Some(key.clone()),
+                });
+                if let Some(task) = task {
+                    self.expanded = Some(task.clone());
+                    self.show_pane(PaneKind::Tasks);
+                }
+            }
+            Link::Local { pack } => {
+                self.backend = Backend::Local;
+                self.select(Selection::Local(pack.clone()));
+            }
+        }
+    }
+
+    /// The link to the run on screen, with `task` open when one is named.
+    pub fn link_here(&self, task: Option<&str>) -> Option<Link> {
+        match &self.selection {
+            Some(Selection::Live { .. }) => {
+                let launch = self.selected_live()?;
+                Some(Link::Launch {
+                    playbook: launch.id.clone(),
+                    key: launch.key.clone(),
+                    task: task.map(ToString::to_string),
+                })
+            }
+            Some(Selection::Local(pack)) => Some(Link::Local { pack: pack.clone() }),
+            None => None,
+        }
+    }
+
     pub fn select(&mut self, selection: Selection) {
         if self.selection.as_ref() != Some(&selection) {
             self.forget_run_view();
@@ -823,6 +871,15 @@ fn scene_tab(app: &mut App) {
     }
 }
 
+/// A link the system opened with the app. It comes from outside, so anything that does not
+/// parse is dropped.
+#[cfg(not(feature = "hot"))]
+fn open_link(app: &mut App, url: &str, _tx: &mut Tx) {
+    if let Some(link) = Link::parse(url) {
+        app.follow(&link);
+    }
+}
+
 fn main() {
     let settings = Settings::load();
     let fonts = settings::fonts(&settings);
@@ -843,12 +900,19 @@ fn main() {
                 scene_tab(app);
                 app.settings_open = true;
             }),
-            // `CRUCIBLE_LIVE_SCENE=<playbook id>` opens that live playbook headlessly.
+            // `CRUCIBLE_LIVE_SCENE=<playbook id>` opens that live playbook headlessly, and
+            // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.
             ("live", |app: &mut App| {
                 app.backend = Backend::Controller;
                 scene_tab(app);
                 if let Ok(id) = std::env::var("CRUCIBLE_LIVE_SCENE") {
                     app.select(Selection::playbook(&id));
+                }
+                if let Some(link) = std::env::var("CRUCIBLE_LINK")
+                    .ok()
+                    .and_then(|url| Link::parse(&url))
+                {
+                    app.follow(&link);
                 }
             }),
         ],
@@ -859,6 +923,7 @@ fn main() {
     rune::run(spec);
     #[cfg(not(feature = "hot"))]
     rune::App::new(spec)
+        .on_open_url(open_link)
         .chrome(rune::Chrome {
             traffic_lights: Some(ui::TRAFFIC_LIGHTS),
             ..rune::Chrome::DEFAULT

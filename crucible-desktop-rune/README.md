@@ -116,6 +116,22 @@ reused and which run again, and the ceilings. A task changed since the run canno
 `Rerun those too` adds it. The controller reruns a run only as the same playbook or draft it ran
 as, so a registered run's fix goes out as a fresh draft launch.
 
+## Links
+
+The app opens `crucible-playbooks://` links, so a run can be handed to someone, or to an agent,
+as a link:
+
+```text
+crucible-playbooks://playbook/<id>
+crucible-playbooks://playbook/<id>/launch/<launch key>[?task=<task>]
+crucible-playbooks://local/<pack>
+```
+
+A launch link opens that launch pinned, with the task open in the Tasks pane. The copy button in
+the run header copies the link to the run on screen, and an open task card's `Copy link` copies
+one to that task. The bundle `just playbooks-install` builds declares the scheme; `open
+'<link>'` or a click anywhere opens the app on it.
+
 ## What the local backend tracks
 
 `state/session.jsonl` is the record. The app folds `plan_admitted` into the graph, `task_result`

@@ -948,6 +948,20 @@ fn detail(app: &App, p: &Paint) -> El {
         .child(dock::workspace(&pane, app, p))
 }
 
+/// Copies the `crucible-playbooks://` link to the run on screen.
+fn link_button(app: &App, p: &Paint) -> Option<El> {
+    let url = app.link_here(None)?.url();
+    Some(
+        IconButton::new(&oc::COPY)
+            .variant(IconButtonVariant::GhostMuted)
+            .label("Copy link")
+            .help(url.clone())
+            .on_press_tx(move |_: &mut App, tx: &mut Tx| tx.copy(url.clone()))
+            .build(p.k)
+            .key("copy-link"),
+    )
+}
+
 fn header(pane: &Pane, app: &App, p: &Paint) -> El {
     let about = match &pane.meta {
         Some(meta) => format!("{}\n{meta}", pane.path),
@@ -979,6 +993,7 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                 }))
                 .child(el().grow(1.0))
                 .children(dock::tools(app, p))
+                .children(link_button(app, p))
                 .children(pane.launchable.then(|| run_button(pane, p)))
                 .children(
                     (!pane.launchable)

@@ -336,33 +336,14 @@ fn language(path: &Path) -> &'static str {
 
 /// A `file://` URI for an absolute path, percent-encoding what a URI path cannot carry.
 pub fn uri(path: &Path) -> String {
-    let mut out = String::from("file://");
-    for byte in path.to_string_lossy().bytes() {
-        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
-            out.push(char::from(byte));
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
+    format!(
+        "file://{}",
+        crate::link::encode(&path.to_string_lossy(), b"/")
+    )
 }
 
 pub fn path_of(uri: &str) -> Option<PathBuf> {
-    let rest = uri.strip_prefix("file://")?;
-    let bytes = rest.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' {
-            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
-            out.push(u8::from_str_radix(hex, 16).ok()?);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    Some(PathBuf::from(String::from_utf8(out).ok()?))
+    crate::link::decode(uri.strip_prefix("file://")?).map(PathBuf::from)
 }
 
 /// One message framed with its `Content-Length` header.

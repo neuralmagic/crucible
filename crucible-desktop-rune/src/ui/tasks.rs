@@ -1,7 +1,7 @@
 //! The run's tasks as cards: what each one is, what it ran on, what it did and what it left.
 
 use crucible_contract::session::{BlockedReasonKind, TaskStatus, TransportCause};
-use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
+use rune::{Color, El, ScrollSpec, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, Spinner};
 use rune_theme_opencode::icons as oc;
 use serde_json::Value;
@@ -83,12 +83,17 @@ pub(crate) fn task_list(
             Vec::new()
         };
         let rerun = rerunnable && !task.state().is_running();
+        let link = open
+            .then(|| app.link_here(Some(&task.name)))
+            .flatten()
+            .map(|link| link.url());
         list = list.child(card(
             task,
             &activity(log, &task.name),
             &tail,
             open,
             rerun,
+            link,
             p,
         ));
     }
@@ -101,6 +106,7 @@ fn card(
     tail: &[&LogLine],
     open: bool,
     rerun: bool,
+    link: Option<String>,
     p: &Paint,
 ) -> El {
     let state = task.state();
@@ -160,7 +166,7 @@ fn card(
         body = body.child(link_chips(&links, p));
     }
     if open {
-        body = body.child(expanded(task, rerun, p));
+        body = body.child(expanded(task, rerun, link, p));
     }
 
     row()
@@ -562,7 +568,7 @@ fn provider_mark(provider: &str) -> String {
     }
 }
 
-fn expanded(task: &TaskView, rerun: bool, p: &Paint) -> El {
+fn expanded(task: &TaskView, rerun: bool, link: Option<String>, p: &Paint) -> El {
     let mut panel = col()
         .key(format!("task-open-{}", task.name))
         .w_full()
@@ -698,6 +704,14 @@ fn expanded(task: &TaskView, rerun: bool, p: &Paint) -> El {
                     app.open_rerun(vec![from.clone()])
                 })
                 .key(key)
+            }))
+            .children(link.map(|url| {
+                Button::new("Copy link")
+                    .variant(ButtonVariant::Neutral)
+                    .control_size(ControlSize::Small)
+                    .on_press_tx(move |_: &mut App, tx: &mut Tx| tx.copy(url.clone()))
+                    .build(p.k)
+                    .key(format!("copy-link-{}", task.name))
             })),
     )
 }

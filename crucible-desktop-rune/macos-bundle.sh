@@ -37,6 +37,17 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
     <true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>dev.crucible.playbooks-rune</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>crucible-playbooks</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 EOF
