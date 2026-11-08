@@ -29,7 +29,15 @@ pub fn router(state: AuthState) -> Router {
     let mut router = Router::new()
         .route("/auth/login", get(login))
         .route("/auth/callback", get(callback))
-        .route("/auth/logout", get(logout));
+        .route("/auth/logout", get(logout))
+        .route(
+            crate::identity::native_sign_in::NATIVE_PATH,
+            get(crate::identity::native_sign_in::ask).post(crate::identity::native_sign_in::decide),
+        )
+        .route(
+            crate::identity::native_sign_in::NATIVE_TOKEN_PATH,
+            axum::routing::post(crate::identity::native_sign_in::redeem),
+        );
     if let Some(path) = state
         .oidc
         .as_ref()
