@@ -2,6 +2,7 @@
 //! NDJSON lines, decoded with the engine's own wire types.
 
 use crucible_contract::emits::{DeclaredFile, EmitWire};
+use crucible_contract::event::AgentEvent;
 use crucible_contract::session::{
     PlanTaskWire, SessionEvent, TaskAgent, TaskBlocked, TaskRepair, TaskStatus, TransportCause,
 };
@@ -20,6 +21,17 @@ pub struct RunFold {
     pub shutdown: Option<Shutdown>,
     /// Every agent task's transcript, in the order the engine recorded it.
     pub transcript: Vec<LogLine>,
+    /// The same events whole, for reading one turn at a time.
+    pub agent_events: Vec<AgentStep>,
+}
+
+/// One event from an agent task's attempt, as the session recorded it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentStep {
+    /// The task, or `task[key]` for a fan-out instance.
+    pub task: String,
+    pub attempt: u32,
+    pub event: AgentEvent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -364,14 +376,22 @@ impl RunFold {
                 }
                 true
             }
-            SessionEvent::TaskAgent { task, event, .. } => {
-                match LogLine::from_agent(&task, &event) {
-                    Some(line) => {
-                        self.transcript.push(line);
-                        true
-                    }
-                    None => false,
+            SessionEvent::TaskAgent {
+                task,
+                attempt,
+                event,
+            } => {
+                let line = LogLine::from_agent(&task, &event);
+                let kept = line.is_some();
+                if let Some(line) = line {
+                    self.transcript.push(line);
+                    self.agent_events.push(AgentStep {
+                        task,
+                        attempt,
+                        event,
+                    });
                 }
+                kept
             }
             SessionEvent::Shutdown { outcome, reason } => {
                 self.shutdown = Some(Shutdown { outcome, reason });
@@ -586,6 +606,14 @@ not json at all
         );
         let fold = fold(&text);
         assert_eq!(fold.transcript.len(), 4, "raw output has no line");
+        assert_eq!(fold.agent_events.len(), 4);
+        assert_eq!(
+            (
+                fold.agent_events[2].task.as_str(),
+                fold.agent_events[2].attempt
+            ),
+            ("edit[b]", 1)
+        );
         let said = &fold.transcript[1];
         assert_eq!(said.task.as_deref(), Some("edit[a]"));
         assert!(said.is_for("edit"));

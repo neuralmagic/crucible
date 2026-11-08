@@ -27,6 +27,7 @@ mod signin;
 mod studio;
 mod syntax;
 mod timeline;
+mod transcript;
 mod ui;
 mod unfurl;
 mod workspace;

@@ -26,6 +26,7 @@ pub enum PaneKind {
     Timeline,
     Graph,
     Data,
+    Transcript,
     Compare,
     Pack,
     Launch,
@@ -33,11 +34,12 @@ pub enum PaneKind {
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 8] = [
+    pub const ALL: [PaneKind; 9] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
         PaneKind::Data,
+        PaneKind::Transcript,
         PaneKind::Compare,
         PaneKind::Pack,
         PaneKind::Launch,
@@ -50,6 +52,7 @@ impl PaneKind {
             PaneKind::Timeline => "Timeline",
             PaneKind::Graph => "Graph",
             PaneKind::Data => "Data",
+            PaneKind::Transcript => "Transcript",
             PaneKind::Compare => "Compare",
             PaneKind::Pack => "Pack",
             PaneKind::Launch => "Launch",
@@ -146,7 +149,10 @@ impl Workspace {
                     share: 0.56,
                 },
                 Column {
-                    groups: vec![group(&[PaneKind::Log, PaneKind::Data], 1.0)],
+                    groups: vec![group(
+                        &[PaneKind::Log, PaneKind::Data, PaneKind::Transcript],
+                        1.0,
+                    )],
                     share: 0.44,
                 },
             ],
@@ -494,7 +500,7 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 mod tests {
     use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit, neighbour};
 
-    use PaneKind::{Compare, Data, Graph, Launch, Log, Pack, Tasks, Timeline};
+    use PaneKind::{Compare, Data, Graph, Launch, Log, Pack, Tasks, Timeline, Transcript};
 
     #[test]
     fn a_neighbour_is_the_nearest_group_on_that_side_lined_up_first() {
@@ -551,7 +557,7 @@ mod tests {
             tabs(&w),
             vec![
                 vec![vec![Graph, Timeline], vec![Tasks, Compare, Pack, Launch]],
-                vec![vec![Log, Data]]
+                vec![vec![Log, Data, Transcript]]
             ]
         );
         sums_to_one(&w);
@@ -597,7 +603,7 @@ mod tests {
                     vec![Graph, Timeline],
                     vec![Tasks, Compare, Pack, Launch, Log]
                 ],
-                vec![vec![Data]]
+                vec![vec![Data, Transcript]]
             ]
         );
         assert_eq!(w.columns[0].groups[1].active, Log);
@@ -625,7 +631,7 @@ mod tests {
             tabs(&w),
             vec![
                 vec![vec![Timeline], vec![Tasks, Compare, Launch], vec![Pack]],
-                vec![vec![Log, Data]],
+                vec![vec![Log, Data, Transcript]],
                 vec![vec![Graph]]
             ]
         );
@@ -661,6 +667,7 @@ mod tests {
         let mut w = Workspace::for_depth(2);
         w.close(Log);
         w.close(Data);
+        w.close(Transcript);
         assert_eq!(w.columns.len(), 1);
         sums_to_one(&w);
         w.close(Timeline);
@@ -670,7 +677,7 @@ mod tests {
         w.close(Compare);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 7);
+        assert_eq!(w.closed().count(), 8);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
@@ -682,10 +689,11 @@ mod tests {
         w.close(Data);
         assert!(!w.showing(Data));
         w.activate(Data);
-        assert_eq!(tabs(&w)[1], vec![vec![Log, Data]]);
+        assert_eq!(tabs(&w)[1], vec![vec![Log, Transcript, Data]]);
         assert!(w.showing(Data) && !w.showing(Log));
         w.close(Data);
         w.close(Log);
+        w.close(Transcript);
         w.activate(Data);
         assert_eq!(
             tabs(&w),

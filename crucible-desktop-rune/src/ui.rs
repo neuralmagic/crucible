@@ -13,6 +13,7 @@ mod runs;
 mod tasks;
 mod theme;
 mod timeline;
+mod transcript;
 
 use rune::{Color, Cx, El, Icon, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::RowStatus;
@@ -268,6 +269,8 @@ struct Pane {
     log: Vec<LogLine>,
     /// The agents' session transcript; empty for a run whose engine did not record one.
     transcript: Vec<LogLine>,
+    /// The same, event by event, for reading a turn.
+    agent_events: Vec<crate::session::AgentStep>,
     /// Why there is no task list, when there is none.
     empty: (&'static str, String),
     pack: Result<PackFiles, String>,
@@ -317,6 +320,7 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
             .flatten(),
         log: pack.log.clone(),
         transcript: pack.transcript.clone(),
+        agent_events: pack.agent_events.clone(),
         log_font,
         launchable: true,
         pack: Ok(pack.pack.clone()),
@@ -377,6 +381,9 @@ fn live_pane(
         log: detail.map(|detail| detail.log.clone()).unwrap_or_default(),
         transcript: detail
             .map(|detail| detail.fold.transcript.clone())
+            .unwrap_or_default(),
+        agent_events: detail
+            .map(|detail| detail.fold.agent_events.clone())
             .unwrap_or_default(),
         log_font,
         launchable: false,

@@ -19,7 +19,7 @@ const TREE_ENTRIES: usize = 200;
 const INSTANCE_CHIPS: usize = 48;
 const INDENT: f32 = 14.0;
 /// How deep a tree shows open until clicked: data two levels, a schema only its top.
-const DATA_OPEN: usize = 2;
+pub(crate) const DATA_OPEN: usize = 2;
 const SCHEMA_OPEN: usize = 1;
 
 pub(crate) fn data_view(pane: &Pane, app: &App, p: &Paint) -> El {
@@ -276,7 +276,7 @@ fn pick_chips(task: &TaskView, shown: Option<&Pick>, p: &Paint) -> El {
     chips
 }
 
-fn json_box(tree: El, p: &Paint) -> El {
+pub(crate) fn json_box(tree: El, p: &Paint) -> El {
     col()
         .w_full()
         .max_h(420.0)
@@ -301,14 +301,14 @@ fn copy_button(label: &str, value: &Value, key: &str, p: &Paint) -> El {
         .key(key.to_string())
 }
 
-fn faint(label: &str, p: &Paint) -> El {
+pub(crate) fn faint(label: &str, p: &Paint) -> El {
     text(label.to_string())
         .font(mono(10.5, 400.0))
         .color(p.c.text_faint)
 }
 
 /// `value` as a tree of rows, objects and lists folding open or shut at a click.
-fn tree(value: &Value, root: &str, open: usize, inspect: &Inspect, p: &Paint) -> El {
+pub(crate) fn tree(value: &Value, root: &str, open: usize, inspect: &Inspect, p: &Paint) -> El {
     let mut walk = Walk {
         inspect,
         open,

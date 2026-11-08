@@ -27,7 +27,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 21] = [
+    pub const ALL: [Command; 22] = [
         Command::Palette,
         Command::Focus(Edge::Left),
         Command::Focus(Edge::Bottom),
@@ -39,6 +39,7 @@ impl Command {
         Command::Show(PaneKind::Graph),
         Command::Show(PaneKind::Timeline),
         Command::Show(PaneKind::Data),
+        Command::Show(PaneKind::Transcript),
         Command::Show(PaneKind::Compare),
         Command::Show(PaneKind::Log),
         Command::Show(PaneKind::Pack),
@@ -110,6 +111,7 @@ impl Command {
             Command::Show(PaneKind::Compare) => vec![primary("cmd+5", "ctrl+5")],
             Command::Show(PaneKind::Log) => vec![primary("cmd+6", "ctrl+6")],
             Command::Show(PaneKind::Pack) => vec![primary("cmd+7", "ctrl+7")],
+            Command::Show(PaneKind::Transcript) => vec![primary("cmd+8", "ctrl+8")],
             Command::Settings => vec![primary("cmd+,", "ctrl+,")],
             _ => Vec::new(),
         }

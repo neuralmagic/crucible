@@ -90,6 +90,7 @@ pub struct PackView {
     pub detail: Option<String>,
     pub log: Vec<LogLine>,
     pub transcript: Vec<LogLine>,
+    pub agent_events: Vec<crate::session::AgentStep>,
     pub pack: PackFiles,
 }
 
@@ -431,6 +432,7 @@ impl Pack {
             detail: self.run.detail(),
             log: self.run.log.clone(),
             transcript: self.run.fold.transcript.clone(),
+            agent_events: self.run.fold.agent_events.clone(),
             pack: self.files.clone(),
         }
     }

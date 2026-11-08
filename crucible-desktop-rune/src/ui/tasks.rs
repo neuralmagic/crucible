@@ -714,6 +714,14 @@ fn expanded(task: &TaskView, rerun: bool, link: Option<String>, p: &Paint) -> El
             .child(button("Show in log", p, move |app: &mut App| {
                 app.filter_log(Some(&name))
             }))
+            .children((task.kind == "agent").then(|| {
+                let name = task.name.clone();
+                button("Transcript", p, move |app: &mut App| {
+                    app.expanded = Some(name.clone());
+                    app.show_pane(crate::workspace::PaneKind::Transcript);
+                })
+                .key(format!("transcript-{}", task.name))
+            }))
             .children(rerun.then(|| {
                 let key = format!("rerun-from-{from}");
                 button("Rerun from here", p, move |app: &mut App| {
