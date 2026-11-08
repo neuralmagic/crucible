@@ -1041,6 +1041,15 @@ impl Query {
     }
 }
 
+/// The `crucible-playbooks://` link that opens launch `key` of `playbook` in the desktop tracker.
+pub fn tracker_url(playbook: &str, key: &str) -> String {
+    format!(
+        "crucible-playbooks://playbook/{}/launch/{}",
+        encode(playbook),
+        encode(key)
+    )
+}
+
 /// Percent-encode one path segment or query value.
 ///
 /// RFC 3986 unreserved set only. Deliberately stricter than a URL library's per-component rules:
