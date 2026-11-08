@@ -6,7 +6,7 @@
 //! wants to act as somebody mints a key as that somebody.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// What a key minted in the SPA starts with; the controller's `api_key::PREFIX`.
@@ -93,10 +93,12 @@ pub struct ConnectArgs {
 
 /// `config.toml`: the settings that describe a deployment rather than one invocation. Every key
 /// is optional. Unknown keys are refused, so a typo is an error and not a silently ignored line.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
 }
 
@@ -121,6 +123,34 @@ impl FileConfig {
             Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
         };
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+    }
+
+    /// Write this config to `path`, or the default location, readable by its owner alone since it
+    /// holds a key. The file is replaced whole, through a sibling written first.
+    pub fn save(&self, path: Option<&Path>) -> Result<PathBuf> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = match path {
+            Some(p) => p.to_path_buf(),
+            None => Self::default_path()?,
+        };
+        let dir = path.parent().context("the config path has no directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let text = toml::to_string(self).context("encoding the config")?;
+        let staged = path.with_extension("toml.new");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&staged)
+            .with_context(|| format!("writing {}", staged.display()))?;
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("writing {}", staged.display()))?;
+        std::fs::rename(&staged, &path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(path)
     }
 }
 
@@ -189,6 +219,34 @@ fn config_dir_from(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_saved_config_reads_back_and_only_its_owner_can_read_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+        let config = crate::config::FileConfig {
+            url: Some("https://crucible.example.com".into()),
+            api_token: Some("crk_a_b".into()),
+        };
+        assert_eq!(config.save(Some(&path)).unwrap(), path);
+        assert_eq!(
+            crate::config::FileConfig::load(Some(&path)).unwrap(),
+            config
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let replaced = crate::config::FileConfig {
+            url: Some("https://other.example.com".into()),
+            api_token: None,
+        };
+        replaced.save(Some(&path)).unwrap();
+        assert_eq!(
+            crate::config::FileConfig::load(Some(&path)).unwrap(),
+            replaced
+        );
+        assert!(!path.with_extension("toml.new").exists());
+    }
+
     use crate::config::*;
 
     #[cfg(feature = "cli")]
