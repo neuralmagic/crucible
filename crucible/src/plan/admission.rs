@@ -10,6 +10,7 @@ use std::panic::AssertUnwindSafe;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
+use crucible_contract::event::AgentEvent;
 use crucible_contract::session::SessionEvent;
 
 use crate::deadline::{Deadline, RunCeiling};
@@ -20,21 +21,15 @@ use crate::plan::machine::BlockedReason;
 /// Lanes of one dispatch in flight at once, unless the executor is configured otherwise.
 pub const DEFAULT_WIDTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
 
-/// Record an attempt in the session log before it runs, synced to disk, so a resumed run can
-/// charge one whose process died before it settled (RFC-0002:C-PLAYBOOK-RESUME).
-fn journal_started(mut journal: &File, task: &TaskName, attempt: u32, estimate_usd: f64) {
-    let mut line = crucible_contract::session::encode(&SessionEvent::TaskStarted {
-        task: task.0.clone(),
-        attempt,
-        estimate_usd,
-    });
+/// Append one event to the session log as a single write, synced to disk when `sync` asks.
+fn journal(mut journal: &File, event: &SessionEvent, sync: bool) -> std::io::Result<()> {
+    let mut line = crucible_contract::session::encode(event);
     line.push('\n');
-    if let Err(error) = journal
-        .write_all(line.as_bytes())
-        .and_then(|()| journal.sync_data())
-    {
-        tracing::warn!(task = %task, attempt, %error, "journaling an attempt start failed");
+    journal.write_all(line.as_bytes())?;
+    if sync {
+        journal.sync_data()?;
     }
+    Ok(())
 }
 
 fn panicked() -> Attempt {
@@ -81,6 +76,8 @@ pub struct Admission<'j> {
     width: NonZeroUsize,
     tally: Mutex<Tally>,
     journal: Option<&'j File>,
+    /// Lanes on several threads append to the one journal; this keeps their lines whole.
+    journal_lock: Mutex<()>,
 }
 
 #[derive(Default)]
@@ -102,10 +99,25 @@ impl Tally {
 pub struct Lane<'a> {
     admission: &'a Admission<'a>,
     id: u64,
+    task: TaskName,
+    attempt: u32,
     deadline: Option<Deadline>,
 }
 
 impl Lane<'_> {
+    /// Add one of this attempt's agent events to the session's transcript. A failed write costs
+    /// the transcript a line, never the attempt.
+    pub fn record(&self, event: AgentEvent) {
+        let event = SessionEvent::TaskAgent {
+            task: self.task.0.clone(),
+            attempt: self.attempt,
+            event,
+        };
+        if let Err(error) = self.admission.append(&event, false) {
+            tracing::warn!(task = %self.task, attempt = self.attempt, %error, "recording an agent event failed");
+        }
+    }
+
     pub fn deadline(&self) -> Option<Deadline> {
         self.deadline
     }
@@ -146,12 +158,24 @@ impl<'j> Admission<'j> {
                 ..Tally::default()
             }),
             journal: None,
+            journal_lock: Mutex::new(()),
         }
     }
 
     /// Record every admitted lane in `journal` before it runs.
     pub fn journaled(self, journal: Option<&'j File>) -> Self {
         Admission { journal, ..self }
+    }
+
+    fn append(&self, event: &SessionEvent, sync: bool) -> std::io::Result<()> {
+        let Some(file) = self.journal else {
+            return Ok(());
+        };
+        let _whole = self
+            .journal_lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        journal(file, event, sync)
     }
 
     fn tally(&self) -> MutexGuard<'_, Tally> {
@@ -173,17 +197,23 @@ impl<'j> Admission<'j> {
         tally.next += 1;
         tally.live.insert(id, 0.0);
         drop(tally);
-        if let Some(journal) = self.journal {
-            journal_started(
-                journal,
-                &task.name,
-                lane.attempt,
-                estimate_usd(task, self.budget, self.width),
-            );
+        // Synced, so a resumed run can charge an attempt whose process died before it settled
+        // (RFC-0002:C-PLAYBOOK-RESUME).
+        if let Err(error) = self.append(
+            &SessionEvent::TaskStarted {
+                task: task.name.0.clone(),
+                attempt: lane.attempt,
+                estimate_usd: estimate_usd(task, self.budget, self.width),
+            },
+            true,
+        ) {
+            tracing::warn!(task = %task.name, attempt = lane.attempt, %error, "journaling an attempt start failed");
         }
         Ok(Lane {
             admission: self,
             id,
+            task: task.name.clone(),
+            attempt: lane.attempt,
             deadline: Deadline::for_attempt(Instant::now(), task.timeout, self.run_ceiling),
         })
     }
@@ -485,6 +515,60 @@ mod tests {
 
     /// A lane is recorded as it is admitted, with its attempt and what a resume would charge
     /// for it, so a lane the ceiling refused leaves nothing to charge.
+    #[test]
+    fn lanes_on_several_threads_record_whole_lines_tagged_with_their_attempt() {
+        use crucible_contract::event::AgentEvent;
+        use crucible_contract::session::{SessionEvent, decode};
+
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let admission =
+            Admission::new(100.0, 0.0, None, width(8)).journaled(Some(journal.as_file()));
+        let tasks: Vec<Task> = (0..4).map(|n| agent(&format!("edit[k{n}]"))).collect();
+        let block = "y".repeat(48 * 1024);
+        std::thread::scope(|scope| {
+            for task in &tasks {
+                let (admission, block) = (&admission, &block);
+                scope.spawn(move || {
+                    let item = BatchItem {
+                        task,
+                        attempt: 3,
+                        ..one(task)
+                    };
+                    let ran = admission.run(&item, |lane| {
+                        for _ in 0..20 {
+                            lane.record(AgentEvent::Text {
+                                delta: block.clone(),
+                            });
+                        }
+                        costing(0.0)
+                    });
+                    assert!(ran.is_ok());
+                });
+            }
+        });
+        let text = std::fs::read_to_string(journal.path()).unwrap();
+        let mut recorded = 0;
+        for line in text.lines() {
+            match decode(line)
+                .unwrap_or_else(|| panic!("a torn line: {}", &line[..80.min(line.len())]))
+            {
+                SessionEvent::TaskAgent {
+                    task,
+                    attempt,
+                    event: AgentEvent::Text { delta },
+                } => {
+                    assert!(task.starts_with("edit[k"), "{task}");
+                    assert_eq!(attempt, 3);
+                    assert_eq!(delta.len(), block.len());
+                    recorded += 1;
+                }
+                SessionEvent::TaskStarted { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(recorded, 80);
+    }
+
     #[test]
     fn an_admitted_lane_is_journaled_before_it_runs_and_a_refused_one_is_not() {
         use crucible_contract::session::{SessionEvent, decode};

@@ -22,6 +22,7 @@ use crate::plan::exec::TaskRunner;
 use crate::plan::files::CapturedFiles;
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
+use crate::plan::transcript::Transcript;
 use crate::plan::turn_log::{Heartbeat, TurnLog};
 use crucible_contract::TransportCause;
 use crucible_contract::emits::DeclaredFile;
@@ -224,8 +225,9 @@ impl TaskRunner for HarnessRunner {
         task: &Task,
         attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
+        let deadline = lane.and_then(Lane::deadline);
         run_task(
             &Dispatch {
                 args: &self.args,
@@ -239,7 +241,7 @@ impl TaskRunner for HarnessRunner {
                 inputs,
                 deadline,
                 budget_left: self.budget_left,
-                lane: None,
+                lane,
             },
             None,
         )
@@ -856,7 +858,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs, deadline)
             } else {
-                shell.run(task, attempt, inputs, deadline)
+                shell.run(task, attempt, inputs, lane)
             };
         }
         TaskKind::TopK { .. } => {
@@ -977,7 +979,19 @@ fn agent_turn(
     let result_path = cx.paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
     let _ = std::fs::remove_file(&result_path);
-    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_, _, _| {});
+    let mut transcript = Transcript::new(crate::turn_trace::redact_enabled());
+    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_, _, ev| {
+        if let (Some(lane), Some(ev)) = (cx.lane, ev) {
+            for event in transcript.on_event(ev, Instant::now()) {
+                lane.record(event);
+            }
+        }
+    });
+    if let Some(lane) = cx.lane {
+        for event in transcript.finish() {
+            lane.record(event);
+        }
+    }
     let transport_error = match stop {
         TurnStop::TimedOut(deadline) => {
             let _ = std::fs::remove_file(&result_path);

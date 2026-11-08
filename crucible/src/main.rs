@@ -73,6 +73,7 @@ mod plan {
     pub mod events;
     pub mod harness;
     pub mod template;
+    pub mod transcript;
     pub mod turn_log;
 }
 

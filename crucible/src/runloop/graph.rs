@@ -18,7 +18,7 @@ use crate::args::{Args, Paths, Prepared};
 
 use crate::agent;
 use crate::control;
-use crate::plan::admission::{Admission, Refusal};
+use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
 use crate::plan::exec::{ExecCfg, Substrate, TaskRunner, execute};
 use crate::plan::harness::CandidateEvent;
@@ -732,14 +732,15 @@ impl TaskRunner for LoopTaskRunner<'_> {
         task: &Task,
         attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
+        let deadline = lane.and_then(Lane::deadline);
         match &task.task {
             TaskKind::Agent { .. }
             | TaskKind::Command { .. }
             | TaskKind::Evaluate { .. }
             | TaskKind::Route { .. }
-            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs, deadline),
+            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs, lane),
             TaskKind::Engine {
                 op: EngineOp::Propose,
                 ..
@@ -1262,8 +1263,9 @@ impl TaskRunner for WideRunner<'_> {
         task: &Task,
         _attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
+        let deadline = lane.and_then(Lane::deadline);
         match &task.task {
             TaskKind::Agent { prompt, .. } => {
                 // A batch of one (wide n=1) lands here instead of run_many.
