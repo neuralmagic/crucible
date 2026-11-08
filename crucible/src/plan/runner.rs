@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::crucible::Direction;
 use crate::deadline::{Deadline, Supervised};
+use crate::plan::admission::Lane;
 use crate::plan::attempt::{Attempt, AttemptOutcome, own_note};
 use crate::plan::exec::TaskRunner;
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
@@ -55,8 +56,9 @@ impl TaskRunner for ShellRunner {
         task: &Task,
         _attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
+        let deadline = lane.and_then(Lane::deadline);
         if task.isolation.is_some() {
             // Fail loud: a runner that quietly ran an isolation-marked task in the shared
             // workdir would hand back a result the plan's author has no reason to trust.
