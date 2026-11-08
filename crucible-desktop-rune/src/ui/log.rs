@@ -269,7 +269,7 @@ fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {
 }
 
 /// The tag, its colour, the text and its colour for one line.
-fn parts(line: &LogLine, p: &Paint) -> (Option<&'static str>, Color, String, Color) {
+pub(crate) fn parts(line: &LogLine, p: &Paint) -> (Option<&'static str>, Color, String, Color) {
     let dim = p.c.text_muted;
     match &line.body {
         Body::Tool {

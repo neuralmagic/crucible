@@ -273,7 +273,7 @@ fn span_bar(
     if running {
         bar = bar
             .clip_rounded(3.0)
-            .child(fx(gfx::SHIMMER, gfx::data(Color::WHITE, 0.35), 0.0));
+            .child(fx(gfx::SHIMMER, gfx::data(Color::WHITE, 0.35), 0.0).radius(3.0));
     }
     row()
         .w_full()

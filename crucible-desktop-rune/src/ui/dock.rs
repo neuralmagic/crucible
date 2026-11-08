@@ -142,9 +142,14 @@ fn group_view(at: At, group: &Group, pane: &Pane, app: &App, p: &Paint) -> El {
 
 fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
     match kind {
-        PaneKind::Tasks => {
-            tasks::task_list(app, &pane.tasks, pane.agent_lines(), empty_run(pane, p), p)
-        }
+        PaneKind::Tasks => tasks::task_list(
+            app,
+            &pane.tasks,
+            pane.agent_lines(),
+            pane.verdict == crate::model::Verdict::Running,
+            empty_run(pane, p),
+            p,
+        ),
         PaneKind::Timeline => col()
             .key("crt-timeline")
             .w_full()
@@ -321,7 +326,7 @@ fn drop_preview(at: At, group: &Group, app: &App, p: &Paint) -> Option<El> {
             .radius(p.k.radius.md)
             .fill(p.c.bg_accent.alpha(0.12))
             .border(1.5, p.c.bg_accent.alpha(0.7))
-            .child(fx(gfx::GLOW, gfx::data(p.c.bg_accent, 0.6), 16.0)),
+            .child(fx(gfx::GLOW, gfx::data(p.c.bg_accent, 0.6), 16.0).radius(p.k.radius.md)),
     )
 }
 

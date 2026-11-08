@@ -10,9 +10,12 @@ use crate::App;
 use crate::gfx;
 use crate::logline::{Activity, LogLine, activity};
 use crate::session::{Instance, InstanceCounts, LinkView, Outcome, TaskState, TaskView};
+use crate::ui::log;
 use crate::ui::{Paint, Tone, flag, fx, meter, mono, pulsing, tag};
 
 const LINK_CHIPS: usize = 4;
+/// Agent lines a running task's card streams.
+const TAIL: usize = 3;
 const OUTPUT_CHARS: usize = 12_000;
 const INSTANCE_CHIPS: usize = 48;
 
@@ -25,10 +28,13 @@ pub(crate) fn status_color(status: TaskStatus, p: &Paint) -> Color {
     }
 }
 
+/// The run's tasks as cards. Before a live run's session arrives (a run on a spoke cluster
+/// streams only its log until it ends), each task its log names gets a card of its own.
 pub(crate) fn task_list(
     app: &App,
     tasks: &[TaskView],
     log: &[LogLine],
+    live: bool,
     empty: El,
     p: &Paint,
 ) -> El {
@@ -45,16 +51,42 @@ pub(crate) fn task_list(
         })
         .scroll_edge_fade(10.0);
     if tasks.is_empty() {
-        return list.child(empty);
+        let named = streamed_tasks(log);
+        if !live || named.is_empty() {
+            return list.child(empty);
+        }
+        for name in named {
+            let mut recent: Vec<&LogLine> = log
+                .iter()
+                .rev()
+                .filter(|line| line.task.as_deref() == Some(name))
+                .take(TAIL)
+                .collect();
+            recent.reverse();
+            list = list.child(streamed_card(name, &recent, p));
+        }
+        return list;
     }
     for task in tasks {
         let open = app.expanded.as_deref() == Some(task.name.as_str());
-        list = list.child(card(task, &activity(log, &task.name), open, p));
+        let tail: Vec<&LogLine> = if task.state().is_running() {
+            let mut recent: Vec<&LogLine> = log
+                .iter()
+                .rev()
+                .filter(|line| line.is_for(&task.name))
+                .take(TAIL)
+                .collect();
+            recent.reverse();
+            recent
+        } else {
+            Vec::new()
+        };
+        list = list.child(card(task, &activity(log, &task.name), &tail, open, p));
     }
     list
 }
 
-fn card(task: &TaskView, activity: &Activity, open: bool, p: &Paint) -> El {
+fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], open: bool, p: &Paint) -> El {
     let state = task.state();
     let name = task.name.clone();
 
@@ -102,7 +134,9 @@ fn card(task: &TaskView, activity: &Activity, open: bool, p: &Paint) -> El {
     if !task.instances.is_empty() {
         body = body.child(fanout_bar(task.instance_counts(), &task.name, p));
     }
-    if let Some(line) = headline(task, state, activity, p) {
+    if !tail.is_empty() {
+        body = body.child(live_tail(&task.name, tail, p));
+    } else if let Some(line) = headline(task, state, activity, p) {
         body = body.child(line);
     }
     let links = task.links();
@@ -138,7 +172,7 @@ fn card(task: &TaskView, activity: &Activity, open: bool, p: &Paint) -> El {
         .children(
             state
                 .is_running()
-                .then(|| fx(gfx::SHIMMER, gfx::data(p.live, 0.08), 0.0)),
+                .then(|| fx(gfx::SHIMMER, gfx::data(p.live, 0.08), 0.0).radius(p.k.radius.lg)),
         )
         .child(row().size(16.0, 18.0).center().child(state_mark(state, p)))
         .child(body.grow(1.0).min_w(0.0))
@@ -169,6 +203,92 @@ pub(crate) fn state_mark(state: TaskState, p: &Paint) -> El {
             }
         },
     }
+}
+
+/// The tasks a log names, in the order they first spoke.
+pub(crate) fn streamed_tasks(log: &[LogLine]) -> Vec<&str> {
+    let mut seen: Vec<&str> = Vec::new();
+    for name in log.iter().filter_map(|line| line.task.as_deref()) {
+        if !seen.contains(&name) {
+            seen.push(name);
+        }
+    }
+    seen
+}
+
+/// A task known only from the log streaming in: its name and its newest lines.
+fn streamed_card(name: &str, tail: &[&LogLine], p: &Paint) -> El {
+    row()
+        .key(format!("streamed-{name}"))
+        .role("listitem")
+        .label(format!("{name} \u{2014} running"))
+        .w_full()
+        .gap(10.0)
+        .px(12.0)
+        .py(10.0)
+        .radius(p.k.radius.lg)
+        .fill(p.c.layer_01)
+        .border(p.hair, p.c.border_muted)
+        .child(fx(gfx::SHIMMER, gfx::data(p.live, 0.08), 0.0).radius(p.k.radius.lg))
+        .child(
+            row()
+                .size(16.0, 18.0)
+                .center()
+                .child(state_mark(TaskState::Running(1), p)),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(6.0)
+                .child(
+                    text(name.to_string())
+                        .font(mono(12.5, 500.0))
+                        .color(p.c.text_base)
+                        .truncate(),
+                )
+                .child(live_tail(name, tail, p)),
+        )
+}
+
+/// The newest lines a running task's agent wrote, oldest first and fading, as they stream in.
+fn live_tail(task: &str, tail: &[&LogLine], p: &Paint) -> El {
+    let mut lines = col()
+        .key(format!("tail-{task}"))
+        .w_full()
+        .gap(2.0)
+        .px(10.0)
+        .py(8.0)
+        .radius(p.k.radius.md)
+        .fill(p.c.bg_base)
+        .border(p.hair, p.c.border_muted);
+    let last = tail.len().saturating_sub(1);
+    for (i, line) in tail.iter().enumerate() {
+        let (tag, tag_ink, content, ink) = log::parts(line, p);
+        let fade = if i == last { 1.0 } else { 0.55 };
+        lines = lines.child(
+            row()
+                .key(format!("tail-{i}"))
+                .w_full()
+                .gap(8.0)
+                .children(tag.map(|tag| {
+                    text(tag)
+                        .font(rune::TextStyle::new(9.5, 600.0).lh(15.0).tracking(0.4))
+                        .color(tag_ink.alpha(fade))
+                        .w(48.0)
+                }))
+                .child(
+                    text(content)
+                        .font(mono(11.0, 400.0).lh(15.0))
+                        .color(ink.alpha(fade))
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .truncate(),
+                )
+                .transition(rune::Transition::opacity()),
+        );
+    }
+    lines
 }
 
 /// Only states that need attention get a colour; the rest read as plain text.
@@ -686,7 +806,8 @@ pub(crate) fn count(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::ui::tasks::{count, duration, output_headline};
+    use crate::logline::LogLine;
+    use crate::ui::tasks::{count, duration, output_headline, streamed_tasks};
     use serde_json::json;
 
     #[test]
@@ -718,6 +839,21 @@ mod tests {
             Some("flaws={1}  kernels=[2]  seconds=474")
         );
         assert_eq!(output_headline(&json!([1, 2])), None);
+    }
+
+    #[test]
+    fn a_streaming_log_names_its_tasks_in_the_order_they_spoke() {
+        let mut lines: Vec<LogLine> = ["scan", "", "triage[12]", "scan", "triage[7]"]
+            .iter()
+            .map(|task| {
+                let mut line = LogLine::parse("x");
+                line.task = (!task.is_empty()).then(|| task.to_string());
+                line
+            })
+            .collect();
+        assert_eq!(streamed_tasks(&lines), ["scan", "triage[12]", "triage[7]"]);
+        lines.clear();
+        assert!(streamed_tasks(&lines).is_empty());
     }
 
     #[test]

@@ -23,6 +23,13 @@ use crate::pack::PackFiles;
 use crate::session::RunFold;
 
 const TIMEOUT: Duration = Duration::from_secs(25);
+/// How long streamed session lines gather before they are folded and shown, so a burst of agent
+/// output is one redraw rather than dozens.
+const STREAM_BATCH: Duration = Duration::from_millis(40);
+/// Console lines kept per run.
+const LOG_LINES: usize = 4000;
+/// Finished launches kept for the window to notify about.
+const FINISHED: usize = 32;
 /// How long a live session follow that failed waits before it is tried again.
 const FOLLOW_RETRY: Duration = Duration::from_secs(15);
 /// How long a follow that ended cleanly, while the list still says running, waits before the
@@ -185,6 +192,8 @@ impl LivePlaybook {
 #[derive(Clone, PartialEq)]
 pub struct LiveDetail {
     pub key: String,
+    /// The run's session is being streamed as it is written.
+    pub streaming: bool,
     pub fold: RunFold,
     pub spent: f64,
     pub verdict: Verdict,
@@ -210,6 +219,24 @@ fn shown_status(status: &str) -> &str {
     }
 }
 
+/// What the window and the session streams tell the worker.
+enum Msg {
+    /// Which launch to keep current; `None` stops reading details.
+    Select(Option<String>),
+    /// A session stream delivered lines.
+    Streamed,
+}
+
+/// A launch that stopped running, for the window to announce. `seq` only grows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Finished {
+    pub seq: u64,
+    pub playbook: String,
+    pub status: String,
+    pub by: String,
+    pub why: Option<String>,
+}
+
 /// The controller fetcher. One instance lives on its own worker thread, so a slow controller
 /// query never delays local log tracking.
 struct Fetcher {
@@ -220,6 +247,10 @@ struct Fetcher {
     launches: HashMap<String, CachedLaunch>,
     packs: HashMap<String, PackFiles>,
     runs: HashMap<String, CachedRun>,
+    finished: Vec<Finished>,
+    finished_seq: u64,
+    /// Handed to each session stream, so new lines wake the worker.
+    wake: Sender<Msg>,
 }
 
 /// The crux client and the runtime its calls block on.
@@ -279,15 +310,17 @@ struct CachedRun {
     error: Option<String>,
     follow: Option<SessionFollow>,
     retry_at: Option<Instant>,
-    /// A new stream replays the session from its start; the fold it replaces stays on screen
-    /// until the replay's first lines land.
+    /// A new stream replays the session and the log from their starts; what each replaces stays
+    /// on screen until that replay's first lines land.
     replaying: bool,
+    replaying_log: bool,
 }
 
-/// A running run's session, streamed by [`crux::Client::follow_session`] on its own thread and
-/// collected for the worker to fold. Dropping it ends the stream.
+/// A running run's session and pod log, streamed by [`crux::Client::follow_run`] on its own
+/// thread and collected for the worker to fold. Dropping it ends the stream.
 struct SessionFollow {
     lines: Arc<Mutex<Vec<String>>>,
+    logs: Arc<Mutex<Vec<String>>>,
     ended: Arc<Mutex<Option<Result<(), String>>>>,
     stop: Option<oneshot::Sender<()>>,
 }
@@ -295,21 +328,36 @@ struct SessionFollow {
 impl SessionFollow {
     /// Start the stream as a task on the connection's runtime, the one that drives every pooled
     /// connection the client holds.
-    fn spawn(connection: &Connection, run_id: &str) -> Self {
+    fn spawn(connection: &Connection, run_id: &str, wake: Sender<Msg>) -> Self {
         let lines = Arc::new(Mutex::new(Vec::new()));
+        let logs = Arc::new(Mutex::new(Vec::new()));
         let ended = Arc::new(Mutex::new(None));
         let (stop, stopped) = oneshot::channel::<()>();
         let (sink, outcome) = (Arc::clone(&lines), Arc::clone(&ended));
+        let log_sink = Arc::clone(&logs);
+        let log_wake = wake.clone();
         let (client, run_id) = (connection.client.clone(), run_id.to_string());
         connection.runtime.spawn(async move {
             let mut collect = move |line: &str| {
                 if let Ok(mut lines) = sink.lock() {
+                    if lines.is_empty() {
+                        let _ = wake.send(Msg::Streamed);
+                    }
                     lines.push(line.to_string());
                 }
                 Ok(())
             };
+            let mut collect_log = move |line: &str| {
+                if let Ok(mut logs) = log_sink.lock() {
+                    if logs.is_empty() {
+                        let _ = log_wake.send(Msg::Streamed);
+                    }
+                    logs.push(line.to_string());
+                }
+                Ok(())
+            };
             let result = tokio::select! {
-                followed = client.follow_session(&run_id, &mut collect) => {
+                followed = client.follow_run(&run_id, &mut collect, &mut collect_log) => {
                     followed.map_err(|error| format!("{error:#}"))
                 }
                 _ = stopped => Ok(()),
@@ -320,6 +368,7 @@ impl SessionFollow {
         });
         SessionFollow {
             lines,
+            logs,
             ended,
             stop: Some(stop),
         }
@@ -329,6 +378,13 @@ impl SessionFollow {
         self.lines
             .lock()
             .map(|mut lines| std::mem::take(&mut *lines))
+            .unwrap_or_default()
+    }
+
+    fn drain_logs(&self) -> Vec<String> {
+        self.logs
+            .lock()
+            .map(|mut logs| std::mem::take(&mut *logs))
             .unwrap_or_default()
     }
 
@@ -346,7 +402,7 @@ impl Drop for SessionFollow {
 }
 
 impl Fetcher {
-    fn new() -> Self {
+    fn new(wake: Sender<Msg>) -> Self {
         Fetcher {
             connection: None,
             identity: None,
@@ -355,7 +411,35 @@ impl Fetcher {
             launches: HashMap::new(),
             packs: HashMap::new(),
             runs: HashMap::new(),
+            finished: Vec::new(),
+            finished_seq: 0,
+            wake,
         }
+    }
+
+    /// Records each launch the new list shows stopped that the old list showed running.
+    fn note_finished(&mut self, next: &[LivePlaybook]) {
+        let was_running: HashSet<&str> = self
+            .view
+            .launches()
+            .iter()
+            .filter(|launch| launch.status == "running")
+            .map(|launch| launch.key.as_str())
+            .collect();
+        for launch in next {
+            if launch.status != "running" && was_running.contains(launch.key.as_str()) {
+                self.finished_seq += 1;
+                self.finished.push(Finished {
+                    seq: self.finished_seq,
+                    playbook: launch.id.clone(),
+                    status: launch.status.clone(),
+                    by: launch.by.clone(),
+                    why: launch.why.clone(),
+                });
+            }
+        }
+        let excess = self.finished.len().saturating_sub(FINISHED);
+        self.finished.drain(..excess);
     }
 
     fn view(&self) -> &LiveView {
@@ -460,6 +544,7 @@ impl Fetcher {
             .collect();
         launches.sort_by_key(|launch| std::cmp::Reverse(launch.landed));
 
+        self.note_finished(&launches);
         let now = unix_now();
         let next = LiveView::Ready {
             endpoint,
@@ -543,24 +628,31 @@ impl Fetcher {
 
     /// Rebuild the detail pane for the selected launch. A running run streams its session and
     /// re-reads its console; a stopped one reads its stored session once and is then settled.
-    fn refresh_detail(&mut self, selected: Option<&str>) -> bool {
+    /// `poll` also re-reads the console; a streamed batch only folds the new session lines.
+    fn refresh_detail(&mut self, selected: Option<&str>, poll: bool) -> bool {
         let Some(launch) = self.launch(selected).cloned() else {
             let changed = self.detail.is_some();
             self.detail = None;
             return changed;
         };
         let running = launch.status == "running";
-        let record = self.launch_detail(&launch);
+        let record = match (poll, &self.detail) {
+            (false, Some(detail)) if detail.key == launch.key => detail.launch.clone(),
+            _ => self.launch_detail(&launch),
+        };
         let run_id = record
             .as_ref()
             .and_then(|record| record.runs.first())
             .map(|run| run.run_id.clone());
-        let pack = self.pack(
-            &launch.id,
-            record
-                .as_ref()
-                .and_then(|record| record.launch.draft_version),
-        );
+        let pack = match (poll, &self.detail) {
+            (false, Some(detail)) if detail.key == launch.key => detail.pack.clone(),
+            _ => self.pack(
+                &launch.id,
+                record
+                    .as_ref()
+                    .and_then(|record| record.launch.draft_version),
+            ),
+        };
         for (id, run) in &mut self.runs {
             if Some(id) != run_id.as_ref() {
                 run.follow = None;
@@ -570,15 +662,17 @@ impl Fetcher {
         if self.connection().is_err() {
             return false;
         }
-        let (fold, log, source, error) = match &run_id {
+        let wake = self.wake.clone();
+        let (fold, log, source, error, streaming) = match &run_id {
             Some(run_id) => {
                 let Some(connection) = self.connection.as_ref() else {
                     return false;
                 };
                 let run = self.runs.entry(run_id.clone()).or_default();
                 if running {
-                    follow_session(run, connection, run_id);
-                    if let Ok(log) = console(connection, run_id)
+                    follow_session(run, connection, run_id, wake);
+                    if poll
+                        && let Ok(log) = console(connection, run_id)
                         && log.len() >= run.log.len().min(1)
                     {
                         run.log = log;
@@ -597,15 +691,17 @@ impl Fetcher {
                     run.log.clone(),
                     run.source,
                     run.error.clone(),
+                    run.follow.is_some(),
                 )
             }
-            None => (RunFold::default(), Vec::new(), "", None),
+            None => (RunFold::default(), Vec::new(), "", None, false),
         };
         let mut next = build_detail(&launch, fold, log);
         next.source = source;
         next.error = error;
         next.launch = record;
         next.pack = pack;
+        next.streaming = streaming;
         let changed = self.detail.as_ref() != Some(&next);
         self.detail = Some(next);
         changed
@@ -614,16 +710,24 @@ impl Fetcher {
 
 /// Keep a session stream on a running run and fold what it has delivered. A stream that ended
 /// cleanly is started again on the next read; one that failed waits [`FOLLOW_RETRY`].
-fn follow_session(run: &mut CachedRun, connection: &Connection, run_id: &str) {
+fn follow_session(run: &mut CachedRun, connection: &Connection, run_id: &str, wake: Sender<Msg>) {
     if let Some(follow) = &run.follow {
-        let lines = follow.drain();
+        let (lines, logs) = (follow.drain(), follow.drain_logs());
+        // A new stream replays from the start, so its first lines replace what the last one left.
         if run.replaying && !lines.is_empty() {
             run.fold = RunFold::default();
             run.replaying = false;
         }
+        if run.replaying_log && !logs.is_empty() {
+            run.log.clear();
+            run.replaying_log = false;
+        }
         for line in lines {
             run.fold.apply_line(&line);
         }
+        run.log.extend(logs.iter().map(|raw| LogLine::parse(raw)));
+        let excess = run.log.len().saturating_sub(LOG_LINES);
+        run.log.drain(..excess);
         match follow.ended() {
             None => return,
             Some(Ok(())) => run.retry_at = Some(Instant::now() + FOLLOW_REST),
@@ -639,9 +743,10 @@ fn follow_session(run: &mut CachedRun, connection: &Connection, run_id: &str) {
         return;
     }
     run.replaying = true;
+    run.replaying_log = true;
     run.source = "session";
     run.error = None;
-    run.follow = Some(SessionFollow::spawn(connection, run_id));
+    run.follow = Some(SessionFollow::spawn(connection, run_id, wake));
 }
 
 /// Read a stopped run once: its stored session, or the graph the controller keeps when no
@@ -787,6 +892,7 @@ fn build_detail(launch: &LivePlaybook, fold: RunFold, log: Vec<LogLine>) -> Live
         fold.spent()
     };
     LiveDetail {
+        streaming: false,
         key: launch.key.clone(),
         spent,
         verdict,
@@ -881,11 +987,13 @@ fn landed_label(stamp: &str) -> String {
 pub struct Snapshot {
     pub view: LiveView,
     pub detail: Option<LiveDetail>,
+    /// Recently finished launches, oldest first.
+    pub finished: Vec<Finished>,
 }
 
 /// The UI-side handle to the live worker. Dropping it stops the thread.
 pub struct Client {
-    tx: Sender<Option<String>>,
+    tx: Sender<Msg>,
     shared: Arc<Mutex<Shared>>,
 }
 
@@ -904,15 +1012,17 @@ impl Client {
             waker: None,
         }));
         let worker = Arc::clone(&shared);
+        let wake = tx.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("crucible-playbooks-live".into())
-            .spawn(move || run_client(rx, worker))
+            .spawn(move || run_client(rx, wake, worker))
         {
             publish(
                 &shared,
                 Snapshot {
                     view: LiveView::Unavailable(format!("starting the live worker: {error}")),
                     detail: None,
+                    finished: Vec::new(),
                 },
             );
         }
@@ -927,7 +1037,7 @@ impl Client {
 
     /// Which live playbook's graph to keep current; `None` stops fetching graphs.
     pub fn select(&self, playbook: Option<&str>) {
-        let _ = self.tx.send(playbook.map(ToString::to_string));
+        let _ = self.tx.send(Msg::Select(playbook.map(ToString::to_string)));
     }
 
     pub fn take(&self, seen: u64) -> Option<(u64, Snapshot)> {
@@ -950,20 +1060,26 @@ fn publish(shared: &Mutex<Shared>, snapshot: Snapshot) {
     }
 }
 
-fn run_client(rx: Receiver<Option<String>>, shared: Arc<Mutex<Shared>>) {
-    let mut fetcher = Fetcher::new();
+fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) {
+    let mut fetcher = Fetcher::new(wake);
     let mut selected: Option<String> = None;
     let mut next_list = Instant::now();
     let mut next_detail = Instant::now();
+    let mut next_stream: Option<Instant> = None;
     loop {
-        let wait = next_list
-            .min(next_detail)
+        let due = next_stream.map_or(next_list.min(next_detail), |at| {
+            at.min(next_list).min(next_detail)
+        });
+        let wait = due
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(500));
         match rx.recv_timeout(wait) {
-            Ok(playbook) => {
+            Ok(Msg::Select(playbook)) => {
                 selected = playbook;
                 next_detail = Instant::now();
+            }
+            Ok(Msg::Streamed) => {
+                next_stream.get_or_insert_with(|| Instant::now() + STREAM_BATCH);
             }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
@@ -985,13 +1101,17 @@ fn run_client(rx: Receiver<Option<String>>, shared: Arc<Mutex<Shared>>) {
             next_detail = now;
         }
         if now >= next_detail {
-            changed |= fetcher.refresh_detail(selected.as_deref());
+            changed |= fetcher.refresh_detail(selected.as_deref(), true);
             next_detail = now
                 + if fetcher.selected_live(selected.as_deref()) {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_secs(60)
                 };
+            next_stream = None;
+        } else if next_stream.is_some_and(|at| now >= at) {
+            changed |= fetcher.refresh_detail(selected.as_deref(), false);
+            next_stream = None;
         }
         if changed {
             publish(
@@ -999,6 +1119,7 @@ fn run_client(rx: Receiver<Option<String>>, shared: Arc<Mutex<Shared>>) {
                 Snapshot {
                     view: fetcher.view().clone(),
                     detail: fetcher.detail().cloned(),
+                    finished: fetcher.finished.clone(),
                 },
             );
         }
@@ -1057,6 +1178,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_launch_that_stops_running_is_noted_once_and_the_list_is_bounded() {
+        let (wake, _rx) = mpsc::channel();
+        let mut fetcher = Fetcher::new(wake);
+        let first = vec![
+            firing("a", 1, "draft", "running"),
+            firing("b", 2, "draft", "done"),
+        ];
+        fetcher.note_finished(&first);
+        assert!(
+            fetcher.finished.is_empty(),
+            "a first list has nothing to compare"
+        );
+        fetcher.view = ready(first);
+
+        let mut stopped = firing("a", 1, "draft", "error");
+        stopped.why = Some("budget ran out".into());
+        let second = vec![stopped, firing("b", 2, "draft", "done")];
+        fetcher.note_finished(&second);
+        assert_eq!(fetcher.finished.len(), 1);
+        let done = &fetcher.finished[0];
+        assert_eq!((done.seq, done.playbook.as_str()), (1, "a"));
+        assert_eq!((done.status.as_str(), done.by.as_str()), ("error", "wren"));
+        assert_eq!(done.why.as_deref(), Some("budget ran out"));
+
+        fetcher.view = ready(second.clone());
+        fetcher.note_finished(&second);
+        assert_eq!(fetcher.finished.len(), 1, "a stopped launch is noted once");
+
+        for n in 0..(FINISHED as i64 + 5) {
+            fetcher.view = ready(vec![firing("c", 10 + n, "schedule", "running")]);
+            fetcher.note_finished(&[firing("c", 10 + n, "schedule", "done")]);
+        }
+        assert_eq!(fetcher.finished.len(), FINISHED);
+        assert!(fetcher.finished.windows(2).all(|w| w[0].seq < w[1].seq));
+    }
+
     fn everything() -> LaunchFilter {
         LaunchFilter {
             query: String::new(),
@@ -1089,7 +1247,8 @@ mod tests {
 
     #[test]
     fn a_failed_refresh_keeps_the_last_list_and_says_why() {
-        let mut fetcher = Fetcher::new();
+        let (wake, _rx) = mpsc::channel();
+        let mut fetcher = Fetcher::new(wake);
         assert!(fetcher.unavailable("dial refused".into()));
         assert!(matches!(fetcher.view, LiveView::Unavailable(_)));
 

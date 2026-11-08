@@ -7,6 +7,7 @@ mod gfx;
 mod live;
 mod logline;
 mod model;
+mod notify;
 mod pack;
 mod runs;
 mod session;
@@ -121,6 +122,8 @@ pub struct App {
     pub logo_clicks: u32,
     /// The logo's top-left on screen, in points; a window move sloshes it.
     pub logo_screen: [f32; 2],
+    /// The newest finished launch already announced.
+    notified: u64,
     pub settings: Settings,
     pub settings_open: bool,
     pub error: Option<String>,
@@ -263,9 +266,26 @@ impl App {
         self.reconcile();
     }
 
+    /// Announces launches by the signed-in user that finished since the last snapshot.
+    fn announce(&mut self, finished: &[live::Finished]) {
+        let me = match &self.live {
+            LiveView::Ready { identity, .. } => identity.user.clone(),
+            _ => String::new(),
+        };
+        let seen = self.notified;
+        for done in finished.iter().filter(|done| done.seq > seen) {
+            self.notified = done.seq;
+            if self.settings.notify && !me.is_empty() && done.by == me {
+                let (title, body) = notify::message(done);
+                notify::post(&title, &body);
+            }
+        }
+    }
+
     fn apply_live(&mut self, snapshot: live::Snapshot) {
         self.live = snapshot.view;
         self.live_detail = snapshot.detail;
+        self.announce(&snapshot.finished);
         self.reconcile();
     }
 
@@ -425,6 +445,7 @@ fn init() -> App {
         geometry: Geometry::default(),
         logo_clicks: 0,
         logo_screen: [0.0; 2],
+        notified: 0,
         settings,
         settings_open: false,
         error: None,

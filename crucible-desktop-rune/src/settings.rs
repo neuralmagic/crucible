@@ -116,6 +116,8 @@ pub struct Settings {
     pub appearance: Appearance,
     /// Draw charts through the CRT pass.
     pub crt: bool,
+    /// Announce the signed-in user's runs as they finish.
+    pub notify: bool,
     path: PathBuf,
 }
 
@@ -131,6 +133,7 @@ struct Config {
     theme: Theme,
     appearance: Appearance,
     crt: Option<bool>,
+    notify: Option<bool>,
 }
 
 impl Settings {
@@ -157,6 +160,7 @@ impl Settings {
             theme: config.theme,
             appearance: config.appearance,
             crt: config.crt.unwrap_or(true),
+            notify: config.notify.unwrap_or(true),
             path,
         }
     }
@@ -190,6 +194,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_notify(&mut self, on: bool) {
+        self.notify = on;
+        self.save();
+    }
+
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.appearance = appearance;
         self.save();
@@ -203,6 +212,7 @@ impl Settings {
             theme: self.theme,
             appearance: self.appearance,
             crt: Some(self.crt),
+            notify: Some(self.notify),
         };
         let Ok(text) = toml::to_string(&config) else {
             return;

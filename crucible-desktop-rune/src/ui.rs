@@ -109,7 +109,7 @@ fn pulsing(mark: El, color: Color, size: f32) -> El {
         .size(size, size)
         .center()
         .radius(size / 2.0)
-        .child(fx(gfx::PULSE, gfx::data(color, 0.6), 14.0))
+        .child(fx(gfx::PULSE, gfx::data(color, 0.6), 14.0).radius(size / 2.0))
         .child(mark)
 }
 
@@ -253,6 +253,8 @@ struct Pane {
     meta: Option<String>,
     /// Why a failed run failed: the engine's stderr, an error or its shutdown reason.
     problem: Option<String>,
+    /// Its session is streaming in as the engine writes it.
+    streaming: bool,
     log: Vec<LogLine>,
     /// The agents' session transcript; empty for a run whose engine did not record one.
     transcript: Vec<LogLine>,
@@ -299,6 +301,7 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
             .unwrap_or_else(|| "—".to_string()),
         time_note: Some(format!("{MAX_TIME} cap")),
         meta: None,
+        streaming: false,
         problem: matches!(pack.verdict, Verdict::Invalid | Verdict::Error)
             .then(|| pack.detail.clone())
             .flatten(),
@@ -338,11 +341,7 @@ fn live_pane(
         } else {
             launch.id.clone()
         },
-        subtitle: launch
-            .why
-            .clone()
-            .or_else(|| launch.description.clone())
-            .unwrap_or(byline),
+        subtitle: launch.description.clone().unwrap_or(byline),
         path: launch.key.clone(),
         verdict: detail.map_or_else(|| launch.verdict(), |detail| detail.verdict),
         spent: detail.map_or_else(|| launch.cost.unwrap_or(0.0), |detail| detail.spent),
@@ -355,6 +354,7 @@ fn live_pane(
         time: format!("at {}", launch.created),
         time_note: Some(cap_note(&launch.max_time)),
         meta: Some(live_meta(&launch.origin, launch.runs, &launch.landed_at)),
+        streaming: detail.is_some_and(|detail| detail.streaming),
         problem: detail.and_then(|detail| detail.error.clone()).or_else(|| {
             let verdict = detail.map_or_else(|| launch.verdict(), |detail| detail.verdict);
             matches!(verdict, Verdict::Invalid | Verdict::Error).then(|| {
@@ -962,6 +962,10 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                         .selection_color(p.k.selection())
                         .help(about),
                 )
+                .children(pane.streaming.then(|| {
+                    pulsing(el().size(7.0, 7.0).radius(3.5).fill(p.live), p.live, 12.0)
+                        .help("Streaming")
+                }))
                 .child(el().grow(1.0))
                 .children(dock::tools(app, p))
                 .children(pane.launchable.then(|| run_button(pane, p))),
@@ -1075,7 +1079,10 @@ fn status_stat(pane: &Pane, p: &Paint) -> El {
         row()
             .gap(6.0)
             .center_y()
-            .children(glyph.map(|glyph| icon(glyph, 16.0).color(ink)))
+            .children(match pane.verdict {
+                Verdict::Running => Some(Spinner::new().size(16.0).color(ink).build(p.k)),
+                _ => glyph.map(|glyph| icon(glyph, 16.0).color(ink)),
+            })
             .child(
                 text(pane.verdict.label())
                     .font(VALUE)
@@ -1355,6 +1362,24 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                     })
                     .build(p.k)
                     .key("crt-switch"),
+                p,
+            )],
+            p,
+        ))
+        .child(settings_section(
+            "notifications",
+            "Notifications",
+            vec![setting_row(
+                "When my runs finish",
+                Switch::new(app.settings.notify)
+                    .label("When my runs finish")
+                    .hide_label()
+                    .on_toggle(|app: &mut App| {
+                        let on = !app.settings.notify;
+                        app.settings.set_notify(on);
+                    })
+                    .build(p.k)
+                    .key("notify-switch"),
                 p,
             )],
             p,

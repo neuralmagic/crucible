@@ -10,6 +10,7 @@ use crate::ui::{
     Paint, SECTION, TITLE, age, meter, mono, pulsing, runs_note, stat, verdict_color, verdict_tone,
 };
 use crate::{App, Selection};
+use rune_kit::Spinner;
 
 const DOT: f32 = 12.0;
 const LANE: f32 = 18.0;
@@ -378,6 +379,7 @@ fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
 fn list_row(i: usize, launch: &LivePlaybook, now: i64, p: &Paint) -> El {
     let verdict = launch.verdict();
     let glyph = match verdict_tone(verdict) {
+        _ if verdict == Verdict::Running => Spinner::new().size(14.0).color(p.live).build(p.k),
         Some((_, glyph)) => icon(glyph, 14.0).color(verdict_color(verdict, p)),
         None => el()
             .size(10.0, 10.0)
