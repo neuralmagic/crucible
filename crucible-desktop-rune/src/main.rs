@@ -21,6 +21,7 @@ mod model;
 mod notify;
 mod pack;
 mod palette;
+mod preview;
 mod runs;
 mod session;
 mod settings;

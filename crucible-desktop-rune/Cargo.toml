@@ -19,6 +19,7 @@ rune-fx = { path = "../vendor/rune/crates/rune-fx" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
 crucible-contract = { path = "../crucible-contract" }
 crux = { path = "../crux", default-features = false }
+crucible = { path = "../crucible", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -29,7 +30,7 @@ sha2 = "0.10"
 anyhow = "1"
 async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false }
-rusqlite = { version = "0.41", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 url = "2"
 toml = "0.8"
 
