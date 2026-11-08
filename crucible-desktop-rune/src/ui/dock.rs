@@ -7,7 +7,7 @@ use rune_kit::{Button, ButtonVariant, ControlSize};
 use rune_theme_opencode::icons as oc;
 
 use crate::ui::{
-    Paint, Pane, data, empty_run, fx, graph_view, launch, log, pack, tasks, timeline, tube,
+    Paint, Pane, data, empty_run, fx, graph, launch, log, pack, tasks, timeline, tube,
 };
 use crate::workspace::{At, Divider, Dock, Edge, Group, PaneDrag, PaneKind, hit};
 use crate::{App, gfx};
@@ -165,7 +165,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(graph_view(pane, app, p))
+            .child(graph::graph_view(pane, app, p))
             .children(tube(app)),
         PaneKind::Data => data::data_view(pane, app, p),
         PaneKind::Pack => pack::pack_view(&pane.pack, pane.log_font, app, p),
