@@ -276,6 +276,11 @@ fn run_turn_with(
     deadline: Option<Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
+    let redactor = crucible_harness::redact::Redactor::with_rules(args.secret_rules.clone());
+    let mut sink = |line: &str, stream: RawStream, ev: Option<&AgentEvent>| {
+        let ev = ev.map(|ev| redactor.event(ev));
+        sink(&redactor.text(line), stream, ev.as_deref());
+    };
     // Start the in-process OTLP collector for a local claude turn when telemetry is opted in
     // . A bind failure degrades to telemetry-off: no collector, no otel_summary, the
     // pricing-table estimate stays the cost fallback. The `otel.jsonl` lands next to the session
@@ -289,7 +294,7 @@ fn run_turn_with(
             "127.0.0.1",
             0,
             otel_forward(&args.env),
-            crucible_harness::redact::Redactor::default(),
+            redactor.clone(),
         ) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -484,7 +489,9 @@ mod tests {
     fn args(extra: &[&str]) -> Args {
         let mut argv = vec!["crucible"];
         argv.extend_from_slice(extra);
-        crate::cli::Cli::parse_from(argv).run
+        let mut args = crate::cli::Cli::parse_from(argv).run;
+        args.secret_rules = crate::testing::secret_rules();
+        args
     }
 
     #[test]

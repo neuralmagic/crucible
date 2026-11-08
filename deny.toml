@@ -63,6 +63,11 @@ allow = [
     "PostgreSQL",
 ]
 
+# kingfisher-rules: CC-BY-SA-4.0 covers its bundled rule data.
+[[licenses.exceptions]]
+crate = "kingfisher-rules"
+allow = ["CC-BY-SA-4.0"]
+
 # ring's license file is the historical OpenSSL/ISC/MIT aggregate; declare it so the checker
 # doesn't have to guess.
 [[licenses.clarify]]

@@ -1879,6 +1879,7 @@ mod tests {
         let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
+        runner.args.secret_rules = crate::testing::secret_rules();
         let out = execute(
             &plan,
             &Substrate::default(),

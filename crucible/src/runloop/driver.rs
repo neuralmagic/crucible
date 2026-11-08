@@ -3099,6 +3099,7 @@ if [ -f "$d/turn-$n.json" ]; then cat "$d/turn-$n.json"; elif [ -f "$d/default.j
             sandbox_run_id: None,
             gateway_boot: Default::default(),
             engine: None,
+            secret_rules: crate::testing::secret_rules(),
         };
         let paths = Paths {
             workspace,

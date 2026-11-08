@@ -123,7 +123,7 @@ pub fn turn(
     deadline: Option<crucible::deadline::Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
-    let redactor = Redactor::default();
+    let redactor = Redactor::with_rules(turn.secret_rules.clone());
     let mut sink = |line: &str, stream: RawStream, ev: Option<&AgentEvent>| {
         let ev = ev.map(|ev| redactor.event(ev));
         sink(&redactor.text(line), stream, ev.as_deref());

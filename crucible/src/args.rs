@@ -37,6 +37,9 @@ pub(crate) struct Args {
     /// (the openshell turn, the S3 publish and fetch) run on it.
     #[arg(skip)]
     pub engine: Option<tokio::runtime::Handle>,
+    /// The secret rules every turn of this process scrubs its stream with.
+    #[arg(skip)]
+    pub secret_rules: crucible_harness::redact::SecretRules,
     /// The domain manifest: the engine reads it, builds a World + Judge, and works in its
     /// workspace. Required (every run is a manifest run).
     #[arg(long)]
@@ -318,6 +321,7 @@ impl Args {
             run_id: self.sandbox_run_id.as_ref(),
             gateway_boot: &self.gateway_boot,
             engine: self.engine.as_ref(),
+            secret_rules: &self.secret_rules,
             tool_plugins: self.tool_plugins.as_deref(),
             buildit_socket: self.buildit_socket.as_ref(),
         }
@@ -367,6 +371,7 @@ pub(crate) struct SandboxTurn<'a> {
     pub gateway_boot: &'a crucible::openshell::gateway::BootLock,
     /// The engine runtime the turn runs on; `None` fails the turn as an orchestration error.
     pub engine: Option<&'a tokio::runtime::Handle>,
+    pub secret_rules: &'a crucible_harness::redact::SecretRules,
     /// The declared tool plugin chain; `None` runs the default chain.
     pub tool_plugins: Option<&'a [manifest::ToolPluginSpec]>,
     pub buildit_socket: Option<&'a crate::openshell::buildit::RunSocket>,
