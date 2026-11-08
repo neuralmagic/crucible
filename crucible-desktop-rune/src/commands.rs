@@ -44,6 +44,37 @@ impl App {
                 Backend::Local => Backend::Controller,
             }),
             Command::Settings => self.toggle_settings(),
+            Command::SaveDraft => {
+                if self.working_edited && !self.draft_busy {
+                    self.save_draft();
+                }
+            }
+            Command::LaunchWorkingCopy => match self.backend {
+                Backend::Local => self.launch(),
+                Backend::Controller => self.launch_working(),
+            },
+            Command::EditTask => {
+                if let Some(task) = self.expanded.clone() {
+                    self.edit_task(&task);
+                }
+            }
+        }
+    }
+
+    /// The pack as it compiles now, for what the views show: a local pack's, else the working
+    /// copy's.
+    pub fn shown_preview(&self) -> Option<&crate::preview::Preview> {
+        match self.backend {
+            Backend::Local => self.selected_pack().map(|pack| &pack.preview),
+            Backend::Controller => self.working_preview.as_ref(),
+        }
+    }
+
+    /// Open `task`'s definition in the editor.
+    pub fn edit_task(&mut self, task: &str) {
+        let task = task.split_once('[').map_or(task, |(name, _)| name);
+        if let Some((path, line)) = self.shown_preview().and_then(|p| p.definition(task)) {
+            self.open_path_in_editor(&path, line);
         }
     }
 

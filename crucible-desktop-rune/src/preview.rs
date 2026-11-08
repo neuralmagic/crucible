@@ -20,6 +20,37 @@ pub struct Preview {
     pub params_schema: Option<Value>,
     /// The engine's refusals, verbatim, each with the first `file:line` it names.
     pub problems: Vec<Problem>,
+    /// The workflow source the pack names, when it names one.
+    pub source: Option<PathBuf>,
+}
+
+impl Preview {
+    /// Where `task` is defined: its source and the 1-based line of its `name = "…"`, or the first
+    /// line when the name is built rather than written out.
+    pub fn definition(&self, task: &str) -> Option<(PathBuf, usize)> {
+        let source = self.source.clone()?;
+        let text = std::fs::read_to_string(&source).unwrap_or_default();
+        Some((source, definition_line(&text, task)))
+    }
+}
+
+/// The 1-based line naming `task` in `text`: a `name = "task"` (spaced or not, either quote),
+/// else any line carrying `"task"`, else 1.
+fn definition_line(text: &str, task: &str) -> usize {
+    let quoted = [format!("\"{task}\""), format!("'{task}'")];
+    let named = |line: &str| {
+        let squeezed: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        quoted
+            .iter()
+            .any(|q| squeezed.contains(&format!("name={q}")))
+    };
+    let mentioned = |line: &str| quoted.iter().any(|q| line.contains(q.as_str()));
+    let lines: Vec<&str> = text.lines().collect();
+    lines
+        .iter()
+        .position(|line| named(line))
+        .or_else(|| lines.iter().position(|line| mentioned(line)))
+        .map_or(1, |i| i + 1)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +107,7 @@ pub fn compile(pack: &Path) -> Preview {
         return preview;
     };
     let source = pack.join(file);
+    preview.source = Some(source.clone());
     let text = match std::fs::read_to_string(&source) {
         Ok(text) => text,
         Err(e) => {
@@ -163,7 +195,20 @@ fn location(message: &str, pack: &Path) -> Option<(PathBuf, u32)> {
 mod tests {
     use std::path::Path;
 
-    use crate::preview::compile;
+    use crate::preview::{compile, definition_line};
+
+    #[test]
+    fn a_task_is_found_where_its_name_is_written() {
+        let text = "scribe = session(name = \"scribe\")\n\ndraft = agent(\n    name = \"draft\",\n    prompt = \"see draft\",\n)\nshape = command(name='shape', run = \"x\")\n";
+        assert_eq!(definition_line(text, "draft"), 4);
+        assert_eq!(definition_line(text, "shape"), 7);
+        assert_eq!(definition_line(text, "scribe"), 1);
+        assert_eq!(
+            definition_line(text, "audit-headings"),
+            1,
+            "a built name lands at the top"
+        );
+    }
     use crate::session::TaskState;
 
     fn pack(dir: &Path, workflow: &str) {

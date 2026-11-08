@@ -68,6 +68,7 @@ pub(crate) fn task_list(
         return list;
     }
     let rerunnable = app.rerunnable().is_some();
+    let editable = app.shown_preview().is_some_and(|p| p.source.is_some());
     for task in tasks {
         let open = app.expanded.as_deref() == Some(task.name.as_str());
         let tail: Vec<&LogLine> = if task.state().is_running() {
@@ -87,28 +88,34 @@ pub(crate) fn task_list(
             .then(|| app.link_here(Some(&task.name)))
             .flatten()
             .map(|link| link.url());
-        list = list.child(card(
-            task,
-            &activity(log, &task.name),
-            &tail,
+        let shown = Shown {
             open,
             rerun,
+            editable,
             link,
-            p,
-        ));
+        };
+        list = list.child(card(task, &activity(log, &task.name), &tail, shown, p));
     }
     list
 }
 
-fn card(
-    task: &TaskView,
-    activity: &Activity,
-    tail: &[&LogLine],
+/// How a card shows: open or not, and what its open panel offers.
+struct Shown {
     open: bool,
+    /// The run can be rerun from this task.
     rerun: bool,
+    /// The task's definition can be opened in the editor.
+    editable: bool,
     link: Option<String>,
-    p: &Paint,
-) -> El {
+}
+
+fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], shown: Shown, p: &Paint) -> El {
+    let Shown {
+        open,
+        rerun,
+        editable,
+        link,
+    } = shown;
     let state = task.state();
     let name = task.name.clone();
 
@@ -166,7 +173,7 @@ fn card(
         body = body.child(link_chips(&links, p));
     }
     if open {
-        body = body.child(expanded(task, rerun, link, p));
+        body = body.child(expanded(task, rerun, editable, link, p));
     }
 
     row()
@@ -568,7 +575,7 @@ fn provider_mark(provider: &str) -> String {
     }
 }
 
-fn expanded(task: &TaskView, rerun: bool, link: Option<String>, p: &Paint) -> El {
+fn expanded(task: &TaskView, rerun: bool, editable: bool, link: Option<String>, p: &Paint) -> El {
     let fix =
         rerun && matches!(task.state(), TaskState::Settled(status) if status != TaskStatus::Pass);
     let mut panel = col()
@@ -713,6 +720,11 @@ fn expanded(task: &TaskView, rerun: bool, link: Option<String>, p: &Paint) -> El
             .gap(6.0)
             .child(button("Show in log", p, move |app: &mut App| {
                 app.filter_log(Some(&name))
+            }))
+            .children(editable.then(|| {
+                let name = task.name.clone();
+                button("Edit", p, move |app: &mut App| app.edit_task(&name))
+                    .key(format!("edit-{}", task.name))
             }))
             .children((task.kind == "agent").then(|| {
                 let name = task.name.clone();

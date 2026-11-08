@@ -24,10 +24,16 @@ pub enum Command {
     FixWithAgent,
     SwitchBackend,
     Settings,
+    /// Save the working copy as the draft's next version.
+    SaveDraft,
+    /// Launch the pack as it stands: a local pack, or the working copy's draft.
+    LaunchWorkingCopy,
+    /// Open the selected task's definition in the editor.
+    EditTask,
 }
 
 impl Command {
-    pub const ALL: [Command; 22] = [
+    pub const ALL: [Command; 25] = [
         Command::Palette,
         Command::Focus(Edge::Left),
         Command::Focus(Edge::Bottom),
@@ -50,6 +56,9 @@ impl Command {
         Command::FixWithAgent,
         Command::SwitchBackend,
         Command::Settings,
+        Command::SaveDraft,
+        Command::LaunchWorkingCopy,
+        Command::EditTask,
     ];
 
     /// Its name in the config file's `[keys]` table.
@@ -67,6 +76,9 @@ impl Command {
             Command::FixWithAgent => "fix-with-agent".into(),
             Command::SwitchBackend => "switch-backend".into(),
             Command::Settings => "settings".into(),
+            Command::SaveDraft => "save-draft".into(),
+            Command::LaunchWorkingCopy => "launch-working-copy".into(),
+            Command::EditTask => "edit-task".into(),
         }
     }
 
@@ -84,6 +96,9 @@ impl Command {
             Command::FixWithAgent => "Fix with agent".into(),
             Command::SwitchBackend => "Switch between controller and local".into(),
             Command::Settings => "Settings".into(),
+            Command::SaveDraft => "Save the working copy".into(),
+            Command::LaunchWorkingCopy => "Launch the working copy".into(),
+            Command::EditTask => "Edit the selected task".into(),
         }
     }
 
@@ -113,6 +128,9 @@ impl Command {
             Command::Show(PaneKind::Pack) => vec![primary("cmd+7", "ctrl+7")],
             Command::Show(PaneKind::Transcript) => vec![primary("cmd+8", "ctrl+8")],
             Command::Settings => vec![primary("cmd+,", "ctrl+,")],
+            Command::SaveDraft => vec![primary("cmd+s", "ctrl+s")],
+            Command::LaunchWorkingCopy => vec![primary("cmd+enter", "ctrl+enter")],
+            Command::EditTask => vec![primary("cmd+e", "ctrl+e")],
             _ => Vec::new(),
         }
     }
