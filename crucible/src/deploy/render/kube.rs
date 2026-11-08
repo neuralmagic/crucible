@@ -613,6 +613,43 @@ impl Renderer<'_> {
         })
     }
 
+    /// Echo each `state/session.jsonl` line into the pod log as it lands, numbered by its line
+    /// in the file, so a viewer on a spoke follows the session live. A start that does not resume
+    /// begins the file afresh first, so the numbering never runs over a truncation. Returns the
+    /// lines that start the echo and the lines that stop it once the engine has exited.
+    ///
+    /// ```text
+    /// read fd 3 ──> line? ──yes──> number it, print it
+    ///                 └──no (EOF)──> engine exited? ──yes──> done
+    ///                                     └──no──> sleep 0.2s, read again
+    /// ```
+    fn session_echo(&self) -> (String, String) {
+        let clear = if self.resumable() {
+            ""
+        } else {
+            "\n  rm -f \"$D/state/session.jsonl\""
+        };
+        let marker = crucible_contract::RUN_SESSION_ECHO_MARKER;
+        let max = crucible_contract::RUN_SESSION_ECHO_MAX;
+        let start = format!(
+            r#"{clear}
+  touch "$D/state/session.jsonl"
+  echo_done="${{TMPDIR:-/tmp}}/crucible-session-echo.$$"; rm -f "$echo_done"
+  {{ exec 3< "$D/state/session.jsonl"; i=0; part=
+    echo_line() {{ i=$((i+1)); [ ${{#1}} -le {max} ] && printf '%s%s %s\n' '{marker}' "$i" "$1"; }}
+    while :; do
+      if IFS= read -r l <&3; then echo_line "$part$l"; part=
+      else part="$part$l"; [ -e "$echo_done" ] && break; sleep 0.2; fi
+    done
+    [ -n "$part" ] && echo_line "$part"; }} &
+  echo_loop=$!"#
+        );
+        let stop = r#"
+  touch "$echo_done"; wait "$echo_loop"; rm -f "$echo_done""#
+            .to_string();
+        (start, stop)
+    }
+
     fn resume_flag(&self) -> &'static str {
         if self.resumable() {
             r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
@@ -1047,15 +1084,16 @@ impl Renderer<'_> {
                 .map(|v| format!(" --variant {v}"))
                 .unwrap_or_default();
             let (rerun_setup, resume_flag) = self.playbook_resume(pb)?;
+            let (echo_setup, echo_stop) = self.session_echo();
             let invalid_verdict = crate::plan::INVALID_VERDICT_EXIT;
             return Ok(format!(
                 r#"D={domain_dir}
 mkdir -p "$D/state"
 n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$D/state/starts"
-if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}
+if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}{echo_setup}
   crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{variant_flag}{param_flags}{resume_flag}
-  rc=$?
+  rc=$?{echo_stop}
 else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
   rc=0
@@ -6247,19 +6285,24 @@ mod tests {
 
     impl Starts {
         fn new(yaml: &str) -> Self {
+            Self::with_engine(
+                yaml,
+                "#!/bin/sh\necho \"$*\" >> \"$FAKE_DIR/calls\"\necho row >> \"$FAKE_DIR/state/session.jsonl\"\nexit \"$FAKE_RC\"\n",
+            )
+        }
+
+        /// The wrapper with `engine` as its `crucible`.
+        fn with_engine(yaml: &str, engine: &str) -> Self {
             let tmp = Scratch::new("wrapper");
             let domain = tmp.path().join("domain");
             let bin = tmp.path().join("bin");
             std::fs::create_dir_all(&domain).expect("mkdir domain");
             std::fs::create_dir_all(&bin).expect("mkdir bin");
             let fake = bin.join("crucible");
-            std::fs::write(
-                &fake,
-                "#!/bin/sh\necho \"$*\" >> \"$FAKE_DIR/calls\"\necho row >> \"$FAKE_DIR/state/session.jsonl\"\nexit \"$FAKE_RC\"\n",
-            )
-            .expect("fake crucible");
+            std::fs::write(&fake, engine).expect("fake crucible");
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
             let wrapper = wrapper_of(yaml);
             let (first, rest) = wrapper.split_once('\n').expect("a D= line");
             assert!(first.starts_with("D="), "{wrapper}");
@@ -6275,7 +6318,12 @@ mod tests {
         }
 
         fn start(&self, rc: i32) -> Option<i32> {
-            std::process::Command::new("sh")
+            self.run(rc).0
+        }
+
+        /// One start's exit code and stdout.
+        fn run(&self, rc: i32) -> (Option<i32>, String) {
+            let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&self.script)
                 .env("PATH", &self.path)
@@ -6283,9 +6331,11 @@ mod tests {
                 .env("FAKE_DIR", &self.domain)
                 .env("CRUCIBLE_INGEST_URL", "https://ingest.example")
                 .output()
-                .expect("run the wrapper")
-                .status
-                .code()
+                .expect("run the wrapper");
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
         }
 
         fn calls(&self) -> Vec<String> {
@@ -6338,6 +6388,59 @@ mod tests {
             "an engine error is still an error"
         );
         assert_eq!(starts.start(137), Some(137), "a killed engine restarts");
+    }
+
+    /// The echoed lines of one start's stdout, as `(index, line)`.
+    fn echoed(stdout: &str) -> Vec<(u64, String)> {
+        stdout
+            .lines()
+            .filter_map(crucible_contract::parse_session_echo)
+            .map(|(seq, line)| (seq, line.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_playbook_wrapper_echoes_session_lines_by_their_index_in_the_file() {
+        let long = "x".repeat(crucible_contract::RUN_SESSION_ECHO_MAX + 1);
+        let starts = Starts::with_engine(
+            &render_playbook(&k8s_profile(""), playbook_launch()),
+            &format!(
+                "#!/bin/sh\ns=\"$FAKE_DIR/state/session.jsonl\"\n\
+                 echo '{{\"n\":1}}' >> \"$s\"\nsleep 1\n\
+                 printf '{{\"n\":' >> \"$s\"\nsleep 1\necho '2}}' >> \"$s\"\necho '{long}' >> \"$s\"\necho 'a b  c' >> \"$s\"\n\
+                 sleep 1\nexit \"$FAKE_RC\"\n"
+            ),
+        );
+        std::fs::create_dir_all(starts.domain.join("state")).expect("state dir");
+        std::fs::write(starts.domain.join("state/session.jsonl"), "stale\n").expect("stale log");
+
+        let (rc, stdout) = starts.run(0);
+        assert_eq!(rc, Some(0));
+        assert_eq!(
+            echoed(&stdout),
+            vec![
+                (1, r#"{"n":1}"#.to_string()),
+                (2, r#"{"n":2}"#.to_string()),
+                (4, "a b  c".to_string()),
+            ],
+            "a start that cannot resume drops the old log, a line written in two pieces is echoed \
+             whole, and an over-long line keeps its index without being echoed: {stdout}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_playbook_echoes_the_lines_before_it_under_their_own_indices() {
+        let starts = Starts::new(&render_playbook(
+            &k8s_profile(r#"state_pvc = "shared""#),
+            playbook_launch(),
+        ));
+        let (_, first) = starts.run(137);
+        assert_eq!(echoed(&first), vec![(1, "row".to_string())]);
+        let (_, second) = starts.run(0);
+        assert_eq!(
+            echoed(&second),
+            vec![(1, "row".to_string()), (2, "row".to_string())]
+        );
     }
 
     #[test]
