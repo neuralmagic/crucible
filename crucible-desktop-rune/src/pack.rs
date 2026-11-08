@@ -131,7 +131,7 @@ impl PackFiles {
 
 /// Where copies of controller packs go: the user's cache directory.
 pub fn cache_dir(key: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
+    let root = crate::httpcache::cache_root()?;
     let name: String = key
         .chars()
         .map(|c| {
@@ -142,11 +142,7 @@ pub fn cache_dir(key: &str) -> Option<PathBuf> {
             }
         })
         .collect();
-    Some(
-        PathBuf::from(home)
-            .join("Library/Caches/crucible-playbooks/packs")
-            .join(name),
-    )
+    Some(root.join("packs").join(name))
 }
 
 /// `crucible.toml`, then the plan and workflow source, then the rest.

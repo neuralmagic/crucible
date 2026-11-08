@@ -173,8 +173,7 @@ pub fn root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CRUCIBLE_HANDOFF_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Caches/crucible-playbooks/handoff"))
+    Some(crate::httpcache::cache_root()?.join("handoff"))
 }
 
 #[cfg(test)]

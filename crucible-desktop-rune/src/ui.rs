@@ -462,7 +462,7 @@ fn sidebar(app: &App, p: &Paint) -> El {
     ) = (app.backend, &app.live)
     {
         head = head.child(
-            text(format!("Refresh failed; showing the last list. {error}"))
+            text(error.clone())
                 .font(p.k.ty.caption())
                 .color(p.c.warning.fg)
                 .max_lines(2)

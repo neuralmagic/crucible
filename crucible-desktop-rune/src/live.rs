@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -20,6 +21,7 @@ use rune::Waker;
 
 use crate::draft::Working;
 use crate::filter::LaunchFilter;
+use crate::httpcache::{CachedTransport, Store};
 use crate::logline::LogLine;
 use crate::model::Verdict;
 use crate::pack::PackFiles;
@@ -330,6 +332,7 @@ pub struct Finished {
 /// query never delays local log tracking.
 struct Fetcher {
     connection: Option<Connection>,
+    cache: Option<Cache>,
     identity: Option<(String, Identity)>,
     view: LiveView,
     detail: Option<LiveDetail>,
@@ -353,6 +356,26 @@ struct Fetcher {
     drafts: Option<std::path::PathBuf>,
 }
 
+/// What the controller last answered, on disk, and whether answers are coming from it now.
+struct Cache {
+    store: Arc<Store>,
+    offline: Arc<AtomicBool>,
+}
+
+impl Cache {
+    fn open() -> Option<Cache> {
+        let path = crate::httpcache::cache_root()?.join("controller.sqlite");
+        Some(Cache {
+            store: Arc::new(Store::open(&path).ok()?),
+            offline: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    fn offline(&self) -> bool {
+        self.offline.load(Ordering::Relaxed)
+    }
+}
+
 /// The crux client and the runtime its calls block on.
 struct Connection {
     client: crux::Client,
@@ -360,11 +383,22 @@ struct Connection {
 }
 
 impl Connection {
-    fn open() -> Result<Self, String> {
+    /// The controller the config names, read through `cache` when there is one.
+    fn open(cache: Option<&Cache>) -> Result<Self, String> {
         let config = crux::config::ConnectArgs::from_env()
             .resolve()
             .map_err(|error| format!("{error:#}"))?;
-        let client = crux::Client::connect(&config).map_err(|error| format!("{error:#}"))?;
+        let wire =
+            crux::client::HttpTransport::connect(&config).map_err(|error| format!("{error:#}"))?;
+        let transport: Arc<dyn crux::client::Transport> = match cache {
+            Some(cache) => Arc::new(CachedTransport::new(
+                Arc::new(wire),
+                cache.store.clone(),
+                cache.offline.clone(),
+            )),
+            None => Arc::new(wire),
+        };
+        let client = crux::Client::new(transport);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("crucible-playbooks-http")
@@ -505,6 +539,7 @@ impl Fetcher {
     fn new(wake: Sender<Msg>) -> Self {
         Fetcher {
             connection: None,
+            cache: Cache::open(),
             identity: None,
             view: LiveView::Loading,
             detail: None,
@@ -823,8 +858,9 @@ impl Fetcher {
     fn unavailable(&mut self, error: String) -> bool {
         match &mut self.view {
             LiveView::Ready { stale, .. } => {
-                let changed = stale.as_deref() != Some(error.as_str());
-                *stale = Some(error);
+                let said = format!("Refresh failed; showing the last list. {error}");
+                let changed = stale.as_deref() != Some(said.as_str());
+                *stale = Some(said);
                 changed
             }
             view => {
@@ -837,7 +873,7 @@ impl Fetcher {
 
     fn connection(&mut self) -> Result<&Connection, String> {
         if self.connection.is_none() {
-            self.connection = Some(Connection::open()?);
+            self.connection = Some(Connection::open(self.cache.as_ref())?);
         }
         self.connection
             .as_ref()
@@ -893,7 +929,11 @@ impl Fetcher {
             identity,
             now: now - now % 60,
             launches,
-            stale: None,
+            stale: self
+                .cache
+                .as_ref()
+                .filter(|cache| cache.offline())
+                .map(|_| "Offline; showing what the controller last answered".to_string()),
         };
         let changed = next != self.view;
         self.view = next;
@@ -1663,7 +1703,10 @@ mod tests {
             panic!("a failed refresh dropped the list");
         };
         assert_eq!(launches.len(), 1);
-        assert_eq!(stale.as_deref(), Some("replica b: 502"));
+        assert_eq!(
+            stale.as_deref(),
+            Some("Refresh failed; showing the last list. replica b: 502")
+        );
         assert!(
             !fetcher.unavailable("replica b: 502".into()),
             "the same failure again is no change to draw"

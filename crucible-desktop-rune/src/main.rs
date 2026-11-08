@@ -10,6 +10,7 @@ mod filter;
 mod form;
 mod gfx;
 mod handoff;
+mod httpcache;
 mod inspect;
 mod keymap;
 mod link;
@@ -685,8 +686,9 @@ impl App {
         }
         let base = self
             .workspace()
-            .locate(PaneKind::Compare)
-            .and_then(|_| self.compare_base())
+            .showing(PaneKind::Compare)
+            .then(|| self.compare_base())
+            .flatten()
             .map(|launch| launch.key.clone());
         if base != self.compare_sent {
             self.live_client.compare(base.as_deref());
