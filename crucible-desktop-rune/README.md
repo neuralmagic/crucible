@@ -163,6 +163,6 @@ fails without a shutdown and the test asserts its stderr reaches the failure ban
 - Playbook manifests only; scored loops are not listed.
 - Live launches are started with `crux launch`; the local run ceiling is fixed at 10 minutes and
   its budget comes from the plan file.
-- A local task that is in flight shows as `pending`, because the session log records terminal
-  results, not dispatches. The same goes for the live graph.
+- A task shows as running from the engine's `task_started` line. A run on a spoke cluster streams
+  its session through its pod's log, so a line too long to echo there arrives when the run ends.
 - The local task list and the live graph are separate backends, not merged into one inventory.
