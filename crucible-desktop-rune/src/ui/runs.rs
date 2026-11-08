@@ -18,7 +18,13 @@ const CELL: f32 = 14.0;
 const CELL_GAP: f32 = 3.0;
 const WEEKS: usize = 12;
 
-pub(crate) fn runs_page(playbook: &str, launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
+pub(crate) fn runs_page(
+    launch: Option<El>,
+    playbook: &str,
+    launches: &[&LivePlaybook],
+    now: i64,
+    p: &Paint,
+) -> El {
     let summary = Summary::of(
         &launches
             .iter()
@@ -53,7 +59,9 @@ pub(crate) fn runs_page(playbook: &str, launches: &[&LivePlaybook], now: i64, p:
                         .h(52.0)
                         .center_y()
                         .window_drag()
-                        .child(text(playbook.to_string()).font(TITLE).color(p.c.text_base)),
+                        .child(text(playbook.to_string()).font(TITLE).color(p.c.text_base))
+                        .child(el().grow(1.0))
+                        .children(launch),
                 )
                 .children((!description.is_empty()).then(|| {
                     text(description)

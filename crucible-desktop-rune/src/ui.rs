@@ -2,6 +2,7 @@
 
 mod dock;
 mod launch;
+mod launcher;
 mod log;
 mod pack;
 mod runs;
@@ -231,10 +232,13 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
         .fill(p.c.bg_base)
         .child(sidebar(app, &p))
         .child(rule("sidebar-edge", true, &p));
-    window
+    let window = window
         .child(detail(app, &p))
         .children(dock::ghost(app, &p))
-        .child(fx(gfx::GRAIN, gfx::data(Color::WHITE, 0.035), 0.0))
+        .child(fx(gfx::GRAIN, gfx::data(Color::WHITE, 0.035), 0.0));
+    let mut layer = Vec::new();
+    launcher::sheet(app, &p, &mut layer);
+    rune_kit::root(window, layer)
 }
 
 /// One run, from whichever source, in the shape the detail pane draws.
@@ -881,7 +885,13 @@ fn detail(app: &App, p: &Paint) -> El {
         LiveView::Ready { now, .. },
     ) = (&app.selection, playbook_launches(app), &app.live)
     {
-        return runs::runs_page(playbook, &launches, *now, p);
+        return runs::runs_page(
+            launcher::launch_button(app, playbook, p),
+            playbook,
+            &launches,
+            *now,
+            p,
+        );
     }
     let font = app.settings.log_font;
     let pane = match &app.selection {
@@ -968,7 +978,13 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                 }))
                 .child(el().grow(1.0))
                 .children(dock::tools(app, p))
-                .children(pane.launchable.then(|| run_button(pane, p))),
+                .children(pane.launchable.then(|| run_button(pane, p)))
+                .children(
+                    (!pane.launchable)
+                        .then(|| app.selected_playbook())
+                        .flatten()
+                        .and_then(|playbook| launcher::launch_button(app, playbook, p)),
+                ),
         )
         .child(
             text(pane.subtitle.clone())

@@ -38,8 +38,10 @@ ended, and the full list. Picking a launch there pins it until it leaves the con
 plus the task graph from `crux graph` with each task's latest status. Every fetch has a hard deadline; the live
 worker fetches in the background, so a slow controller never stalls local log tracking.
 
-Launching is not wired to the live list: a live launch needs the playbook's params schema and its
-registered ceilings, so start those with `crux launch` and track them here.
+A registered playbook has a Launch button on its runs page and run header. It opens a form built
+from the playbook's params schema (`crux playbook-schema`), prefilled from the launch on screen,
+with cost and time ceilings held under the admin caps (`crux playbook-caps`). The controller
+validates the params; a refusal shows in the form. A launch that lands opens, pinned, and streams.
 
 It is its own Cargo workspace, like `crucible-desktop`, because Rune is pre-release and pinned to a
 dev rev the engine workspace must not inherit.

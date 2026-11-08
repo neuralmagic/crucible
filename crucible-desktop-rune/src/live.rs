@@ -225,6 +225,27 @@ enum Msg {
     Select(Option<String>),
     /// A session stream delivered lines.
     Streamed,
+    /// Read a playbook's params schema and the admin caps, for a launch form.
+    Prepare(String),
+    /// Launch a playbook with this body (`params`, `max_cost`, `max_time`).
+    Launch { playbook: String, body: Value },
+}
+
+/// A launch form's schema and the caps its ceilings must stay under.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prepared {
+    pub seq: u64,
+    pub playbook: String,
+    /// The schema, then the admin caps: dollars and a duration such as `3h`.
+    pub result: Result<(Value, f64, String), String>,
+}
+
+/// What a launch came back with: the new launch's key, or why it was refused.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Launched {
+    pub seq: u64,
+    pub playbook: String,
+    pub result: Result<String, String>,
 }
 
 /// A launch that stopped running, for the window to announce. `seq` only grows.
@@ -251,6 +272,12 @@ struct Fetcher {
     finished_seq: u64,
     /// Handed to each session stream, so new lines wake the worker.
     wake: Sender<Msg>,
+    /// Registered playbook ids, the ones a launch form can start, and when they were read.
+    registered: Vec<String>,
+    registered_at: Option<Instant>,
+    prepared: Option<Prepared>,
+    launched: Option<Launched>,
+    replies: u64,
 }
 
 /// The crux client and the runtime its calls block on.
@@ -414,7 +441,76 @@ impl Fetcher {
             finished: Vec::new(),
             finished_seq: 0,
             wake,
+            registered: Vec::new(),
+            registered_at: None,
+            prepared: None,
+            launched: None,
+            replies: 0,
         }
+    }
+
+    /// Re-reads the registered playbooks at most once a minute.
+    fn refresh_registered(&mut self) -> bool {
+        if self
+            .registered_at
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+        {
+            return false;
+        }
+        self.registered_at = Some(Instant::now());
+        let Ok(connection) = self.connection() else {
+            return false;
+        };
+        let Ok(playbooks) = connection.call(
+            "the playbooks",
+            connection.client.playbooks::<Vec<crux::dto::Playbook>>(),
+        ) else {
+            return false;
+        };
+        let mut ids: Vec<String> = playbooks.into_iter().map(|p| p.id).collect();
+        ids.sort();
+        let changed = ids != self.registered;
+        self.registered = ids;
+        changed
+    }
+
+    fn prepare(&mut self, playbook: String) {
+        self.replies += 1;
+        let seq = self.replies;
+        let result = self.connection().and_then(|connection| {
+            let schema: Value = connection.call(
+                "the params schema",
+                connection.client.playbook_schema(&playbook),
+            )?;
+            let caps: crux::dto::PlaybookCaps =
+                connection.call("the launch caps", connection.client.playbook_caps())?;
+            Ok((schema, caps.max_cost, caps.max_time))
+        });
+        self.prepared = Some(Prepared {
+            seq,
+            playbook,
+            result,
+        });
+    }
+
+    fn send_launch(&mut self, playbook: String, body: Value) {
+        self.replies += 1;
+        let seq = self.replies;
+        let result = self.connection().and_then(|connection| {
+            connection
+                .call(
+                    "the launch",
+                    connection
+                        .client
+                        .launch::<crux::dto::LaunchAck>(&playbook, &body),
+                )
+                .map(|ack| ack.key)
+        });
+        self.launched = Some(Launched {
+            seq,
+            playbook,
+            result,
+        });
     }
 
     /// Records each launch the new list shows stopped that the old list showed running.
@@ -989,6 +1085,10 @@ pub struct Snapshot {
     pub detail: Option<LiveDetail>,
     /// Recently finished launches, oldest first.
     pub finished: Vec<Finished>,
+    /// Registered playbook ids: the ones the app can launch.
+    pub registered: Vec<String>,
+    pub prepared: Option<Prepared>,
+    pub launched: Option<Launched>,
 }
 
 /// The UI-side handle to the live worker. Dropping it stops the thread.
@@ -1023,6 +1123,9 @@ impl Client {
                     view: LiveView::Unavailable(format!("starting the live worker: {error}")),
                     detail: None,
                     finished: Vec::new(),
+                    registered: Vec::new(),
+                    prepared: None,
+                    launched: None,
                 },
             );
         }
@@ -1036,6 +1139,19 @@ impl Client {
     }
 
     /// Which live playbook's graph to keep current; `None` stops fetching graphs.
+    /// Read `playbook`'s params schema and the caps, for a launch form.
+    pub fn prepare(&self, playbook: &str) {
+        let _ = self.tx.send(Msg::Prepare(playbook.to_string()));
+    }
+
+    /// Launch `playbook`; the result comes back in a snapshot.
+    pub fn launch(&self, playbook: &str, body: Value) {
+        let _ = self.tx.send(Msg::Launch {
+            playbook: playbook.to_string(),
+            body,
+        });
+    }
+
     pub fn select(&self, playbook: Option<&str>) {
         let _ = self.tx.send(Msg::Select(playbook.map(ToString::to_string)));
     }
@@ -1067,6 +1183,7 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
     let mut next_detail = Instant::now();
     let mut next_stream: Option<Instant> = None;
     loop {
+        let mut force = false;
         let due = next_stream.map_or(next_list.min(next_detail), |at| {
             at.min(next_list).min(next_detail)
         });
@@ -1081,17 +1198,27 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
             Ok(Msg::Streamed) => {
                 next_stream.get_or_insert_with(|| Instant::now() + STREAM_BATCH);
             }
+            Ok(Msg::Prepare(playbook)) => {
+                fetcher.prepare(playbook);
+                force = true;
+            }
+            Ok(Msg::Launch { playbook, body }) => {
+                fetcher.send_launch(playbook, body);
+                next_list = Instant::now();
+                force = true;
+            }
             Err(RecvTimeoutError::Disconnected) => return,
             Err(RecvTimeoutError::Timeout) => {}
         }
 
         let now = Instant::now();
-        let mut changed = false;
+        let mut changed = force;
         if now >= next_list {
             match fetcher.refresh_list() {
                 Ok(list_changed) => changed |= list_changed,
                 Err(error) => changed |= fetcher.unavailable(error),
             }
+            changed |= fetcher.refresh_registered();
             next_list = now
                 + if fetcher.any_running() {
                     Duration::from_secs(2)
@@ -1120,6 +1247,9 @@ fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) 
                     view: fetcher.view().clone(),
                     detail: fetcher.detail().cloned(),
                     finished: fetcher.finished.clone(),
+                    registered: fetcher.registered.clone(),
+                    prepared: fetcher.prepared.clone(),
+                    launched: fetcher.launched.clone(),
                 },
             );
         }

@@ -3,6 +3,7 @@
 //! (through each pack's `state/session.jsonl`).
 
 mod filter;
+mod form;
 mod gfx;
 mod live;
 mod logline;
@@ -81,6 +82,36 @@ impl Selection {
     }
 }
 
+/// Where a launch form stands.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stage {
+    /// Reading the params schema and the caps.
+    Reading,
+    Ready,
+    /// The schema could not be read.
+    Failed(String),
+    /// The launch is on its way.
+    Sending,
+}
+
+/// A launch form for one playbook: its fields from the params schema, the answers so far, and
+/// the ceilings, prefilled from the playbook's newest launch.
+pub struct Launcher {
+    pub playbook: String,
+    pub stage: Stage,
+    pub fields: Vec<form::Field>,
+    pub answers: Vec<TextEdit>,
+    pub cost: TextEdit,
+    pub time: TextEdit,
+    /// The admin caps: dollars and a duration.
+    pub caps: (f64, String),
+    pub problems: form::Problems,
+    /// Why the controller refused the launch, or a ceiling over its cap.
+    pub refusal: Option<String>,
+    /// Only replies newer than this one answer this form.
+    after: u64,
+}
+
 pub struct App {
     pub repo: String,
     local: Client,
@@ -124,6 +155,14 @@ pub struct App {
     pub logo_screen: [f32; 2],
     /// The newest finished launch already announced.
     notified: u64,
+    /// Playbooks the controller has registered: the ones a launch form can start.
+    pub registered: Vec<String>,
+    /// The open launch form, when there is one.
+    pub launcher: Option<Launcher>,
+    /// The newest worker reply a launch form has taken.
+    replies: u64,
+    /// Where a text field's edits land once its form has closed.
+    pub scratch: TextEdit,
     pub settings: Settings,
     pub settings_open: bool,
     pub error: Option<String>,
@@ -282,9 +321,136 @@ impl App {
         }
     }
 
+    /// Opens a launch form for `playbook` and asks for its schema.
+    pub fn open_launcher(&mut self, playbook: &str) {
+        self.launcher = Some(Launcher {
+            playbook: playbook.to_string(),
+            stage: Stage::Reading,
+            fields: Vec::new(),
+            answers: Vec::new(),
+            cost: TextEdit::new(""),
+            time: TextEdit::new(""),
+            caps: (0.0, String::new()),
+            problems: Vec::new(),
+            refusal: None,
+            after: self.replies,
+        });
+        self.live_client.prepare(playbook);
+    }
+
+    /// Sends the form, or marks what has to change first.
+    pub fn submit_launch(&mut self) {
+        let Some(launcher) = &mut self.launcher else {
+            return;
+        };
+        let answers: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
+        let params = form::params(&launcher.fields, &answers);
+        let ceilings = form::ceilings(
+            &launcher.cost.text,
+            &launcher.time.text,
+            launcher.caps.0,
+            &launcher.caps.1,
+        );
+        launcher.problems = params.as_ref().err().cloned().unwrap_or_default();
+        launcher.refusal = ceilings.as_ref().err().cloned();
+        let (Ok(params), Ok((max_cost, max_time))) = (params, ceilings) else {
+            return;
+        };
+        launcher.stage = Stage::Sending;
+        launcher.after = self.replies;
+        self.live_client.launch(
+            &launcher.playbook,
+            serde_json::json!({"params": params, "max_cost": max_cost, "max_time": max_time}),
+        );
+    }
+
+    /// The newest launch of `playbook` the list shows, to prefill a form from.
+    fn newest_launch(&self, playbook: &str) -> Option<&LivePlaybook> {
+        self.live
+            .launches_of(playbook)
+            .max_by_key(|launch| launch.landed)
+    }
+
+    /// Fills an open form from the schema the worker read, or lands the launch it sent.
+    fn answer_launcher(
+        &mut self,
+        prepared: Option<live::Prepared>,
+        launched: Option<live::Launched>,
+    ) {
+        let Some(after) = self.launcher.as_ref().map(|l| l.after) else {
+            return;
+        };
+        if let Some(launched) = launched.filter(|l| l.seq > after) {
+            self.replies = self.replies.max(launched.seq);
+            match launched.result {
+                Ok(key) => {
+                    self.launcher = None;
+                    self.backend = Backend::Controller;
+                    self.select(Selection::Live {
+                        playbook: launched.playbook,
+                        launch: Some(key),
+                    });
+                }
+                Err(error) => {
+                    if let Some(launcher) = &mut self.launcher {
+                        launcher.stage = Stage::Ready;
+                        launcher.refusal = Some(error);
+                    }
+                }
+            }
+            return;
+        }
+        let Some(prepared) = prepared.filter(|p| p.seq > after) else {
+            return;
+        };
+        self.replies = self.replies.max(prepared.seq);
+        let newest = self.newest_launch(&prepared.playbook).cloned();
+        let previous = self
+            .selected_live()
+            .filter(|live| live.id == prepared.playbook)
+            .and(self.selected_detail())
+            .and_then(|detail| detail.launch.as_ref())
+            .map(|record| record.launch.params.clone());
+        let Some(launcher) = &mut self.launcher else {
+            return;
+        };
+        match prepared.result {
+            Err(error) => launcher.stage = Stage::Failed(error),
+            Ok((schema, max_cost, max_time)) => {
+                launcher.fields = form::fields(&schema);
+                launcher.answers = launcher
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        let before = previous
+                            .as_ref()
+                            .and_then(|params| params.get(&field.name))
+                            .map(|value| match value {
+                                serde_json::Value::String(text) => text.clone(),
+                                other => other.to_string(),
+                            });
+                        TextEdit::new(before.unwrap_or_else(|| field.default.clone()))
+                    })
+                    .collect();
+                let cost = newest.as_ref().map_or(5.0, |n| n.cap).min(max_cost);
+                let time = newest
+                    .as_ref()
+                    .map(|n| n.max_time.clone())
+                    .filter(|t| form::minutes(t).is_some())
+                    .unwrap_or_else(|| "30m".to_string());
+                launcher.cost = TextEdit::new(format!("{cost:.2}"));
+                launcher.time = TextEdit::new(&time);
+                launcher.caps = (max_cost, max_time);
+                launcher.stage = Stage::Ready;
+            }
+        }
+    }
+
     fn apply_live(&mut self, snapshot: live::Snapshot) {
         self.live = snapshot.view;
         self.live_detail = snapshot.detail;
+        self.registered = snapshot.registered;
+        self.answer_launcher(snapshot.prepared, snapshot.launched);
         self.announce(&snapshot.finished);
         self.reconcile();
     }
@@ -446,6 +612,10 @@ fn init() -> App {
         logo_clicks: 0,
         logo_screen: [0.0; 2],
         notified: 0,
+        registered: Vec::new(),
+        launcher: None,
+        replies: 0,
+        scratch: TextEdit::new(""),
         settings,
         settings_open: false,
         error: None,
