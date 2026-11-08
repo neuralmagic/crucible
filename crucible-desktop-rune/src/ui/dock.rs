@@ -6,7 +6,9 @@ use rune::{Color, Cursor, Drag, El, Icon, Phase, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize};
 use rune_theme_opencode::icons as oc;
 
-use crate::ui::{Paint, Pane, empty_run, fx, graph_view, launch, log, pack, tasks, timeline, tube};
+use crate::ui::{
+    Paint, Pane, data, empty_run, fx, graph_view, launch, log, pack, tasks, timeline, tube,
+};
 use crate::workspace::{At, Divider, Dock, Edge, Group, PaneDrag, PaneKind, hit};
 use crate::{App, gfx};
 
@@ -89,6 +91,7 @@ pub(crate) fn glyph(kind: PaneKind) -> &'static Icon {
         PaneKind::Tasks => &oc::CHECKLIST,
         PaneKind::Timeline => &oc::STATUS,
         PaneKind::Graph => &oc::FILE_TREE,
+        PaneKind::Data => &oc::CODE_LINES,
         PaneKind::Pack => &oc::FOLDER,
         PaneKind::Launch => &oc::GLOBE,
         PaneKind::Log => &oc::CONSOLE,
@@ -164,6 +167,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
             .min_h(0.0)
             .child(graph_view(pane, app, p))
             .children(tube(app)),
+        PaneKind::Data => data::data_view(pane, app, p),
         PaneKind::Pack => pack::pack_view(&pane.pack, pane.log_font, app, p),
         PaneKind::Launch if pane.launchable => col()
             .key("launch-local")

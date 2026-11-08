@@ -314,7 +314,7 @@ fn live_tail(task: &str, tail: &[&LogLine], p: &Paint) -> El {
 }
 
 /// Only states that need attention get a colour; the rest read as plain text.
-fn label_ink(state: TaskState, p: &Paint) -> Color {
+pub(crate) fn label_ink(state: TaskState, p: &Paint) -> Color {
     match state {
         TaskState::Running(_) => p.live,
         TaskState::Settled(
@@ -324,7 +324,7 @@ fn label_ink(state: TaskState, p: &Paint) -> Color {
     }
 }
 
-fn state_label(state: TaskState) -> String {
+pub(crate) fn state_label(state: TaskState) -> String {
     match state {
         TaskState::Running(attempt) if attempt > 1 => format!("running \u{b7} try {attempt}"),
         state => state.label().replace('_', " "),
@@ -584,8 +584,22 @@ fn expanded(task: &TaskView, rerun: bool, link: Option<String>, p: &Paint) -> El
         ("When", task.when.clone()),
         ("Session", task.session.clone()),
         ("Timeout", task.timeout.clone()),
-        ("Emits", task.emits.join(", ")),
-        ("Files", task.files.join(", ")),
+        (
+            "Emits",
+            task.emits
+                .iter()
+                .map(|emit| emit.field.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+        (
+            "Files",
+            task.files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         (
             "Reused",
             task.result
@@ -803,7 +817,7 @@ fn instance_row(task: &str, instance: &Instance, p: &Paint) -> El {
         )
 }
 
-fn fact_row(label: &str, value: String, p: &Paint) -> El {
+pub(crate) fn fact_row(label: &str, value: String, p: &Paint) -> El {
     row()
         .w_full()
         .gap(8.0)
@@ -826,7 +840,7 @@ fn fact_row(label: &str, value: String, p: &Paint) -> El {
         )
 }
 
-fn section(label: &str, p: &Paint) -> El {
+pub(crate) fn section(label: &str, p: &Paint) -> El {
     text(label.to_string())
         .font(p.k.ty.small_medium)
         .color(p.c.text_muted)

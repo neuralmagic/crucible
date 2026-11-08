@@ -8,6 +8,7 @@ mod filter;
 mod form;
 mod gfx;
 mod handoff;
+mod inspect;
 mod link;
 mod live;
 mod logline;
@@ -170,8 +171,9 @@ pub struct App {
     pub log_chatter: bool,
     /// Only lines from this task or fan-out instance.
     pub log_task: Option<String>,
-    /// The task card shown open.
+    /// The task card shown open, and the task the Data pane shows.
     pub expanded: Option<String>,
+    pub inspect: inspect::Inspect,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
@@ -751,11 +753,27 @@ impl App {
 
     fn forget_run_view(&mut self) {
         self.expanded = None;
+        self.inspect = inspect::Inspect::default();
         self.log_task = None;
         self.pack_file = None;
         self.pack_source = None;
         self.draft_note = None;
         self.handoff_note = None;
+    }
+
+    /// Selects `task` from the graph, with `from` when its edge from that dependency was picked:
+    /// the Data pane shows it when in front, else the edge opens Data and a node opens Tasks.
+    pub fn pick_task(&mut self, task: &str, from: Option<&str>) {
+        self.expanded = Some(task.to_string());
+        self.inspect.from = from.map(ToString::to_string);
+        self.inspect.instance = None;
+        if !self.workspace().showing(PaneKind::Data) {
+            self.show_pane(if from.is_some() {
+                PaneKind::Data
+            } else {
+                PaneKind::Tasks
+            });
+        }
     }
 
     pub fn toggle_task(&mut self, name: &str) {
@@ -843,6 +861,7 @@ fn init() -> App {
         log_chatter: false,
         log_task: None,
         expanded: None,
+        inspect: inspect::Inspect::default(),
         pack_file: None,
         layout: settings.layout.clone(),
         shown: Vec::new(),

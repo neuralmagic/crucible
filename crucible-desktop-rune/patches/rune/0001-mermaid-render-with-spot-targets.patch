@@ -101,7 +101,7 @@ index b5940cc..f644e4a 100644
          spots
      }
 diff --git a/crates/rune-mermaid/src/hover_tests.rs b/crates/rune-mermaid/src/hover_tests.rs
-index 446ac35..489e140 100644
+index 446ac35..39ff0a0 100644
 --- a/crates/rune-mermaid/src/hover_tests.rs
 +++ b/crates/rune-mermaid/src/hover_tests.rs
 @@ -1,4 +1,4 @@
@@ -110,7 +110,7 @@ index 446ac35..489e140 100644
  
  use super::*;
  use crate::canvas::Scene;
-@@ -184,3 +184,32 @@ fn a_still_pointer_keeps_what_it_hovers_or_lets_go_as_a_streaming_diagram_moves(
+@@ -184,3 +184,60 @@ fn a_still_pointer_keeps_what_it_hovers_or_lets_go_as_a_streaming_diagram_moves(
          assert!((y2[1] - y[1]).abs() > 8.0, "{over}: the diagram moved under the pointer: {y:?} → {y2:?}");
      }
  }
@@ -141,6 +141,34 @@ index 446ac35..489e140 100644
 +    let keys: Vec<String> = rt.elements().into_iter().filter_map(|e| e.key).filter(|k| k.starts_with("pick:")).collect();
 +    for id in ["A", "B", "C"] {
 +        assert!(keys.iter().any(|k| k == &format!("pick:{id}")), "{id} decorated: {keys:?}");
++    }
++}
++
++#[test]
++fn a_decorated_node_or_edge_takes_a_press() {
++    fn view(_: &String, _: &mut Cx<String>) -> El {
++        let decorate = |t: &Target, spot: El| {
++            let said = match t {
++                Target::Node(id) => id.clone(),
++                Target::Edge { from, to } => format!("{from}>{to}"),
++            };
++            spot.on_press(move |s: &mut String| *s = said.clone())
++        };
++        col().w_full().child(crate::render_with("flowchart TD\n  A --> B", &DiagramStyle::neutral(false), Hover::Edges, LIT, &decorate).expect("draws"))
++    }
++    let mut rt = Runtime::new(String::new(), view, (400.0, 600.0), Env::new(false, 1.0));
++    rt.frame(0.0);
++    for (key, said) in [("hover:n:B", "B"), ("hover:e:A>B.0", "A>B")] {
++        let r = rt.elements().into_iter().find(|e| e.key.as_deref() == Some(key)).unwrap_or_else(|| panic!("no {key}")).rect;
++        let (x, y) = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
++        rt.pointer_move(x, y);
++        rt.frame(0.1);
++        rt.pointer_down(x, y);
++        rt.pointer_up(x, y);
++        rt.frame(0.2);
++        let mut now = String::new();
++        rt.update(|s, _| now = s.clone());
++        assert_eq!(now, said, "{key} at {r:?}");
 +    }
 +}
 diff --git a/crates/rune-mermaid/src/lib.rs b/crates/rune-mermaid/src/lib.rs

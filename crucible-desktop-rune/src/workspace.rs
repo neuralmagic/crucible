@@ -3,7 +3,7 @@
 //! ```text
 //!   column 0 (share .55)        column 1 (share .45)
 //!  +---------------------------+----------------------+
-//!  | [Graph]                   | [Log]                |  group 0 of each column
+//!  | [Graph]                   | [Log] Data           |  group 0 of each column
 //!  |                           |                      |
 //!  +---------------------------+                      |
 //!  | [Tasks] Pack  Launch      |                      |  group 1 of column 0
@@ -25,16 +25,18 @@ pub enum PaneKind {
     Tasks,
     Timeline,
     Graph,
+    Data,
     Pack,
     Launch,
     Log,
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 6] = [
+    pub const ALL: [PaneKind; 7] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
+        PaneKind::Data,
         PaneKind::Pack,
         PaneKind::Launch,
         PaneKind::Log,
@@ -45,6 +47,7 @@ impl PaneKind {
             PaneKind::Tasks => "Tasks",
             PaneKind::Timeline => "Timeline",
             PaneKind::Graph => "Graph",
+            PaneKind::Data => "Data",
             PaneKind::Pack => "Pack",
             PaneKind::Launch => "Launch",
             PaneKind::Log => "Log",
@@ -135,7 +138,7 @@ impl Workspace {
                     share: 0.56,
                 },
                 Column {
-                    groups: vec![group(&[PaneKind::Log], 1.0)],
+                    groups: vec![group(&[PaneKind::Log, PaneKind::Data], 1.0)],
                     share: 0.44,
                 },
             ],
@@ -156,25 +159,43 @@ impl Workspace {
         })
     }
 
+    /// Whether `kind` is the front tab of its group.
+    pub fn showing(&self, kind: PaneKind) -> bool {
+        self.locate(kind)
+            .and_then(|at| self.group(at))
+            .is_some_and(|group| group.active == kind)
+    }
+
     pub fn closed(&self) -> impl Iterator<Item = PaneKind> + '_ {
         PaneKind::ALL
             .into_iter()
             .filter(|kind| self.locate(*kind).is_none())
     }
 
-    /// Shows `kind`: brings it to the front of its group, or reopens it as a tab of the first
-    /// group when it was closed.
+    /// Shows `kind`: brings it to the front of its group, or reopens it when it was closed,
+    /// beside a pane it shares a group with by default, else in the first group.
     pub fn activate(&mut self, kind: PaneKind) {
         let at = match self.locate(kind) {
             Some(at) => at,
             None => {
-                let Some(first) = self.columns.first_mut().and_then(|c| c.groups.first_mut())
+                let default = Workspace::for_depth(0);
+                let home = default
+                    .locate(kind)
+                    .and_then(|at| default.group(at))
+                    .into_iter()
+                    .flat_map(|group| group.tabs.iter())
+                    .find_map(|other| self.locate(*other))
+                    .unwrap_or((0, 0));
+                let Some(group) = self
+                    .columns
+                    .get_mut(home.0)
+                    .and_then(|c| c.groups.get_mut(home.1))
                 else {
-                    *self = Workspace::for_depth(0);
+                    *self = default;
                     return self.activate(kind);
                 };
-                first.tabs.push(kind);
-                (0, 0)
+                group.tabs.push(kind);
+                home
             }
         };
         if let Some(group) = self.columns[at.0].groups.get_mut(at.1) {
@@ -428,7 +449,7 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 mod tests {
     use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit};
 
-    use PaneKind::{Graph, Launch, Log, Pack, Tasks, Timeline};
+    use PaneKind::{Data, Graph, Launch, Log, Pack, Tasks, Timeline};
 
     fn tabs(w: &Workspace) -> Vec<Vec<Vec<PaneKind>>> {
         w.columns
@@ -453,7 +474,7 @@ mod tests {
             tabs(&w),
             vec![
                 vec![vec![Graph, Timeline], vec![Tasks, Pack, Launch]],
-                vec![vec![Log]]
+                vec![vec![Log, Data]]
             ]
         );
         sums_to_one(&w);
@@ -494,7 +515,10 @@ mod tests {
         w.dock(Log, Dock::Into(Tasks));
         assert_eq!(
             tabs(&w),
-            vec![vec![vec![Graph, Timeline], vec![Tasks, Pack, Launch, Log]]]
+            vec![
+                vec![vec![Graph, Timeline], vec![Tasks, Pack, Launch, Log]],
+                vec![vec![Data]]
+            ]
         );
         assert_eq!(w.columns[0].groups[1].active, Log);
         sums_to_one(&w);
@@ -517,7 +541,7 @@ mod tests {
             tabs(&w),
             vec![
                 vec![vec![Timeline], vec![Tasks, Launch], vec![Pack]],
-                vec![vec![Log]],
+                vec![vec![Log, Data]],
                 vec![vec![Graph]]
             ]
         );
@@ -548,6 +572,7 @@ mod tests {
     fn closing_folds_space_back_and_never_closes_the_last_pane() {
         let mut w = Workspace::for_depth(2);
         w.close(Log);
+        w.close(Data);
         assert_eq!(w.columns.len(), 1);
         sums_to_one(&w);
         w.close(Timeline);
@@ -556,10 +581,27 @@ mod tests {
         w.close(Launch);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 5);
+        assert_eq!(w.closed().count(), 6);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
+    }
+
+    #[test]
+    fn a_closed_pane_reopens_beside_its_default_neighbours_and_shows() {
+        let mut w = Workspace::for_depth(2);
+        w.close(Data);
+        assert!(!w.showing(Data));
+        w.activate(Data);
+        assert_eq!(tabs(&w)[1], vec![vec![Log, Data]]);
+        assert!(w.showing(Data) && !w.showing(Log));
+        w.close(Data);
+        w.close(Log);
+        w.activate(Data);
+        assert_eq!(
+            tabs(&w),
+            vec![vec![vec![Graph, Timeline, Data], vec![Tasks, Pack, Launch]]]
+        );
     }
 
     #[test]

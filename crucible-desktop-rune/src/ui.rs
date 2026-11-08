@@ -1,5 +1,6 @@
 //! The window: live playbooks and local packs on the left, the selected run on the right.
 
+mod data;
 mod dock;
 mod launch;
 mod launcher;
@@ -1279,19 +1280,27 @@ fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
     style.text = p.c.text_base;
     style.muted = p.c.text_muted;
     let decorate = |target: &rune_mermaid::Target, spot: El| {
-        let rune_mermaid::Target::Node(id) = target else {
-            return spot;
-        };
-        let Some(task) = graph_task(&pane.tasks, id) else {
-            return spot;
+        let (task, from, help) = match target {
+            rune_mermaid::Target::Node(id) => {
+                let Some(task) = graph_task(&pane.tasks, id) else {
+                    return spot;
+                };
+                (task, None, task.name.clone())
+            }
+            rune_mermaid::Target::Edge { from, to } => {
+                let (Some(from), Some(task)) =
+                    (graph_task(&pane.tasks, from), graph_task(&pane.tasks, to))
+                else {
+                    return spot;
+                };
+                let help = format!("What {} hands {}", from.name, task.name);
+                (task, Some(from.name.clone()), help)
+            }
         };
         let name = task.name.clone();
         spot.cursor(rune::Cursor::Pointer)
-            .help(format!("Open {name} in Tasks"))
-            .on_press(move |app: &mut App| {
-                app.expanded = Some(name.clone());
-                app.show_pane(crate::workspace::PaneKind::Tasks);
-            })
+            .help(help)
+            .on_press(move |app: &mut App| app.pick_task(&name, from.as_deref()))
     };
     let card = rune_mermaid::render_with(
         &source,

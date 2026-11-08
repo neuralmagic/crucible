@@ -1,6 +1,7 @@
 //! The engine's session log folded into what the run pane draws. Both backends feed it the same
 //! NDJSON lines, decoded with the engine's own wire types.
 
+use crucible_contract::emits::{DeclaredFile, EmitWire};
 use crucible_contract::session::{
     PlanTaskWire, SessionEvent, TaskAgent, TaskBlocked, TaskRepair, TaskStatus, TransportCause,
 };
@@ -38,8 +39,12 @@ pub struct TaskView {
     pub over: String,
     pub when: String,
     pub timeout: String,
-    pub emits: Vec<String>,
-    pub files: Vec<String>,
+    /// The fields its output promises, typed when the pack says.
+    pub emits: Vec<EmitWire>,
+    /// The files its output includes, with their schemas when the pack gives them.
+    pub files: Vec<DeclaredFile>,
+    /// `producer.field` references each instance gets narrowed to its own entry.
+    pub keyed: Vec<String>,
     pub attempt: Option<Attempt>,
     pub result: Option<Outcome>,
     pub instances: Vec<Instance>,
@@ -127,8 +132,9 @@ impl TaskView {
             over: task.over,
             when: task.when,
             timeout: task.timeout,
-            emits: task.emits.into_iter().map(|emit| emit.field).collect(),
-            files: task.emits_files.into_iter().map(|file| file.path).collect(),
+            emits: task.emits,
+            files: task.emits_files,
+            keyed: task.keyed,
             attempt: None,
             result: None,
             started_at: None,
@@ -453,6 +459,7 @@ enum Slot<'a> {
 #[cfg(test)]
 mod tests {
     use crate::session::{RunFold, TaskState};
+    use crucible_contract::emits::{DeclaredFile, EmitWire};
     use crucible_contract::session::{BlockedReasonKind, TaskStatus};
 
     const FANOUT: &str = r##"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":10.0,"tasks":[{"name":"seed","kind":"command","depends_on":[],"required":true,"emits":[{"field":"kernels"}],"emits_files":["traces/seed.log"],"timeout":"90m"},{"name":"edit","kind":"agent","depends_on":["seed"],"required":true,"over":"seed.kernels"},{"name":"audit","kind":"agent","depends_on":["edit"],"required":false}]}
@@ -483,8 +490,14 @@ not json at all
 
         let seed = &fold.tasks[0];
         assert_eq!(seed.state(), TaskState::Settled(TaskStatus::Pass));
-        assert_eq!(seed.emits, ["kernels"]);
-        assert_eq!(seed.files, ["traces/seed.log"]);
+        assert_eq!(
+            seed.emits,
+            [EmitWire {
+                field: "kernels".into(),
+                ty: None
+            }]
+        );
+        assert_eq!(seed.files, [DeclaredFile::from("traces/seed.log")]);
         assert_eq!(seed.timeout, "90m");
         assert!((seed.result.as_ref().unwrap().secs - 3.5).abs() < 1e-9);
 
