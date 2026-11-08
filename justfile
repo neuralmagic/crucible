@@ -290,14 +290,16 @@ desktop-check:
 playbooks-run:
     cd crucible-desktop-rune && cargo run
 
-# Build the release binary and open it as a bundled .app with the dock icon.
+# Build the release binary and open it as a bundled .app with the dock icon, crucible-lsp inside.
 playbooks-release *args:
+    cargo build --release -p crucible-lsp
     cd crucible-desktop-rune && cargo build --release
     sh crucible-desktop-rune/macos-bundle.sh
     open "crucible-desktop-rune/target/release/Crucible Playbooks.app" --args {{ args }}
 
-# Build and install the release .app into ~/Applications.
+# Build and install the release .app, crucible-lsp inside, into ~/Applications.
 playbooks-install:
+    cargo build --release -p crucible-lsp
     cd crucible-desktop-rune && cargo build --release
     sh crucible-desktop-rune/macos-bundle.sh
     mkdir -p ~/Applications

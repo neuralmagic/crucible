@@ -18,6 +18,7 @@ use rune_kit::{
 };
 use rune_theme_opencode::icons as oc;
 
+use crate::editor::Editor;
 use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
 use crate::live::{LiveDetail, LivePlaybook, LiveView};
 use crate::logline::{LogLine, activity};
@@ -1396,6 +1397,32 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                     })
                     .build(p.k)
                     .key("notify-switch"),
+                p,
+            )],
+            p,
+        ))
+        .child(settings_section(
+            "packs",
+            "Packs",
+            vec![setting_row(
+                "Editor",
+                SegmentedControl::new(
+                    &["Auto", "VS Code", "Cursor", "Zed"],
+                    Some(
+                        app.settings
+                            .editor
+                            .and_then(|e| Editor::ALL.iter().position(|x| *x == e))
+                            .map_or(0, |i| i + 1),
+                    ),
+                )
+                .label("Editor")
+                .width(Some(320.0))
+                .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+                    app.settings
+                        .set_editor(i.checked_sub(1).and_then(|i| Editor::ALL.get(i).copied()));
+                })
+                .build(p.k)
+                .key("editor"),
                 p,
             )],
             p,

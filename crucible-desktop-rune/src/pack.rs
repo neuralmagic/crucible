@@ -2,7 +2,7 @@
 //! source, then everything else.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// Files bigger than this are listed by name only.
 const MAX_BYTES: u64 = 512 * 1024;
@@ -13,6 +13,23 @@ pub struct PackFiles {
     /// Where the files came from: a draft version, a Git pin, or a directory.
     pub origin: String,
     pub files: Vec<PackFile>,
+    /// Where the files are on disk, for the language server and the editor.
+    pub disk: Option<Disk>,
+}
+
+/// A pack's directory: the checkout it was read from, or a copy of a controller's pack.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Disk {
+    Checkout(PathBuf),
+    Copy(PathBuf),
+}
+
+impl Disk {
+    pub fn dir(&self) -> &Path {
+        match self {
+            Disk::Checkout(dir) | Disk::Copy(dir) => dir,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,19 +46,78 @@ impl PackFiles {
             .map(|(path, text)| PackFile { path, text })
             .collect();
         files.sort_by(|a, b| rank(&a.path).cmp(&rank(&b.path)).then(a.path.cmp(&b.path)));
-        PackFiles { origin, files }
+        PackFiles {
+            origin,
+            files,
+            disk: None,
+        }
     }
 
     /// A local pack directory, skipping its `state/` and hidden entries.
     pub fn read_dir(dir: &Path) -> Self {
         let mut files = Vec::new();
         walk(dir, dir, 0, &mut files);
-        PackFiles::new(dir.display().to_string(), files)
+        PackFiles {
+            disk: Some(Disk::Checkout(dir.to_path_buf())),
+            ..PackFiles::new(dir.display().to_string(), files)
+        }
+    }
+
+    /// Write the text files to `dir`, replacing what was there, and remember it as their copy.
+    /// A path that would leave `dir` is skipped.
+    pub fn copy_to(&mut self, dir: &Path) -> std::io::Result<()> {
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        for file in &self.files {
+            let Some(text) = &file.text else {
+                continue;
+            };
+            let relative = Path::new(&file.path);
+            if !relative
+                .components()
+                .all(|part| matches!(part, Component::Normal(_)))
+            {
+                continue;
+            }
+            let target = dir.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(target, text)?;
+        }
+        self.disk = Some(Disk::Copy(dir.to_path_buf()));
+        Ok(())
+    }
+
+    /// The file's path on disk.
+    pub fn path_of(&self, file: &str) -> Option<PathBuf> {
+        Some(self.disk.as_ref()?.dir().join(file))
     }
 
     pub fn file(&self, path: &str) -> Option<&PackFile> {
         self.files.iter().find(|file| file.path == path)
     }
+}
+
+/// Where copies of controller packs go: the user's cache directory.
+pub fn cache_dir(key: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let name: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "-_.".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Some(
+        PathBuf::from(home)
+            .join("Library/Caches/crucible-playbooks/packs")
+            .join(name),
+    )
 }
 
 /// `crucible.toml`, then the plan and workflow source, then the rest.
@@ -156,5 +232,50 @@ mod tests {
             Some("def main(): pass\n")
         );
         assert_eq!(pack.file("blob.bin").map(|f| f.text.is_none()), Some(true));
+    }
+
+    #[test]
+    fn a_copy_writes_the_text_files_and_nothing_outside() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("pack");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("stale.star"), "old").unwrap();
+        let mut pack = PackFiles::new(
+            "draft v2".into(),
+            [
+                ("workflow.star".to_string(), Some("x = 1".to_string())),
+                ("lib/a.star".into(), Some("y = 2".into())),
+                ("blob.bin".into(), None),
+                ("../escape.star".into(), Some("no".into())),
+                ("/abs.star".into(), Some("no".into())),
+            ],
+        );
+        pack.copy_to(&target).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.join("lib/a.star")).unwrap(),
+            "y = 2"
+        );
+        assert_eq!(
+            pack.path_of("workflow.star"),
+            Some(target.join("workflow.star"))
+        );
+        assert!(matches!(pack.disk, Some(crate::pack::Disk::Copy(_))));
+        for gone in ["stale.star", "blob.bin"] {
+            assert!(!target.join(gone).exists(), "{gone}");
+        }
+        assert!(!dir.path().join("escape.star").exists());
+    }
+
+    #[test]
+    fn a_checkout_is_its_own_disk_and_cache_names_are_plain() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("workflow.star"), "x = 1").unwrap();
+        let pack = PackFiles::read_dir(dir.path());
+        assert_eq!(
+            pack.disk,
+            Some(crate::pack::Disk::Checkout(dir.path().to_path_buf()))
+        );
+        let cache = crate::pack::cache_dir("triage@draft-3/x").unwrap();
+        assert!(cache.ends_with("packs/triage_draft-3_x"), "{cache:?}");
     }
 }

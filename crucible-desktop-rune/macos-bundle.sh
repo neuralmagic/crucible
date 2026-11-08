@@ -1,11 +1,14 @@
 #!/bin/sh
-# Assemble the release .app bundle with the blue-shaded icon. Run after `cargo build --release`.
+# Assemble the release .app bundle with the blue-shaded icon and the workspace's crucible-lsp
+# beside the executable. Run after `cargo build --release` here and `cargo build --release -p
+# crucible-lsp` at the repo root.
 set -eu
 cd "$(dirname "$0")"
 
 APP="target/release/Crucible Playbooks.app"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/crucible-playbooks "$APP/Contents/MacOS/crucible-playbooks"
+cp ../target/release/crucible-lsp "$APP/Contents/MacOS/crucible-lsp"
 cp assets/icon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

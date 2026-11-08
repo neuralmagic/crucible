@@ -350,6 +350,11 @@ impl Pack {
         }
 
         let mut changed = self.run.read_new() | start_changed;
+        let files = PackFiles::read_dir(&self.dir);
+        if files != self.files {
+            self.files = files;
+            changed = true;
+        }
         if let Some(mut child) = self.run.child.take() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -881,6 +886,30 @@ printf '%s\n' '{SHUTDOWN}' >> "$d/state/session.jsonl"
         assert_eq!(demo.passed, 1);
         assert_eq!(demo.failed, 1);
         assert_eq!(demo.detail.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn a_pack_file_saved_elsewhere_shows_its_new_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = fake_repo(dir.path());
+        let workflow = repo.join("examples/demo/workflow.star");
+        fs::write(&workflow, "x = 1\n").unwrap();
+        let client = Client::spawn(repo);
+        let mut seen = 0;
+        let text = |snapshot: &Snapshot| {
+            snapshot
+                .packs
+                .first()
+                .and_then(|pack| pack.pack.file("workflow.star"))
+                .and_then(|file| file.text.clone())
+        };
+        wait_for(&client, &mut seen, "discovery", |snapshot| {
+            text(snapshot).as_deref() == Some("x = 1\n")
+        });
+        fs::write(&workflow, "x = 2\n").unwrap();
+        wait_for(&client, &mut seen, "the saved text", |snapshot| {
+            text(snapshot).as_deref() == Some("x = 2\n")
+        });
     }
 
     #[test]

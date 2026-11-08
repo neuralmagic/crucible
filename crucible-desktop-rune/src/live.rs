@@ -688,7 +688,7 @@ impl Fetcher {
             return Ok(pack.clone());
         }
         let connection = self.connection()?;
-        let pack = match draft_version {
+        let mut pack = match draft_version {
             Some(version) => {
                 let draft: crux::dto::DraftFiles = connection.call(
                     "the draft",
@@ -718,6 +718,9 @@ impl Fetcher {
                 )
             }
         };
+        if let Some(dir) = crate::pack::cache_dir(&key) {
+            let _ = pack.copy_to(&dir);
+        }
         self.packs.insert(key, pack.clone());
         Ok(pack)
     }

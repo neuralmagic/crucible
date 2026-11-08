@@ -2,11 +2,13 @@
 //! playbooks (through `crux`, with the same config a terminal uses) and the local `examples/` packs
 //! (through each pack's `state/session.jsonl`).
 
+mod editor;
 mod filter;
 mod form;
 mod gfx;
 mod live;
 mod logline;
+mod lsp;
 mod model;
 mod notify;
 mod pack;
@@ -23,10 +25,12 @@ use std::sync::OnceLock;
 
 use rune::{AppSpec, TextEdit, Tx, Waker};
 
+use crate::editor::Editor;
 use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
 use crate::live::{LiveDetail, LivePlaybook, LiveView};
 use crate::logline::LogView;
 use crate::model::{Client, PackView, Snapshot, Verdict};
+use crate::pack::{Disk, PackFile, PackFiles};
 use crate::session::TaskView;
 use crate::settings::{LogFont, Settings, Theme};
 use crate::workspace::{Divider, Geometry, PaneDrag, PaneKind, Workspace};
@@ -119,6 +123,14 @@ pub struct App {
     local_seen: u64,
     live_client: live::Client,
     live_seen: u64,
+    lsp: lsp::Lsp,
+    lsp_seen: u64,
+    /// What `crucible-lsp` last said about the packs on screen.
+    pub checks: lsp::View,
+    /// The file last handed to the language server, and a hash of its text.
+    lsp_sent: Option<(PathBuf, u64)>,
+    /// Why the last hand-off to the editor failed.
+    pub editor_error: Option<String>,
     /// The launch key the live worker was last told to read.
     live_sent: Option<String>,
     pub backend: Backend,
@@ -298,6 +310,73 @@ impl App {
         self.live_detail
             .as_ref()
             .filter(|detail| detail.key == launch.key)
+    }
+
+    /// The pack the Pack tab shows, local or from the controller.
+    pub fn shown_pack(&self) -> Option<&PackFiles> {
+        match &self.selection {
+            Some(Selection::Local(_)) => self.selected_pack().map(|pack| &pack.pack),
+            Some(Selection::Live { .. }) => self.selected_detail()?.pack.as_ref().ok(),
+            None => None,
+        }
+    }
+
+    /// The file the Pack tab shows: the one picked, else the first.
+    pub fn shown_file(&self) -> Option<(&PackFiles, &PackFile)> {
+        let pack = self.shown_pack()?;
+        let file = self
+            .pack_file
+            .as_deref()
+            .and_then(|path| pack.file(path))
+            .or_else(|| pack.files.first())?;
+        Some((pack, file))
+    }
+
+    /// Hand the language server the shown Starlark file, or its pack's workflow when the file
+    /// is not Starlark, so the pack's diagnostics stay current as it changes on disk.
+    fn sync_checks(&mut self) {
+        let Some((pack, shown)) = self.shown_file() else {
+            return;
+        };
+        let file = match syntax::language(&shown.path) {
+            Some("starlark") => Some(shown),
+            _ => pack.file("workflow.star"),
+        };
+        let Some((path, text)) =
+            file.and_then(|file| Some((pack.path_of(&file.path)?, file.text.as_deref()?)))
+        else {
+            return;
+        };
+        let mut hasher = std::hash::DefaultHasher::new();
+        std::hash::Hash::hash(text, &mut hasher);
+        let sent = (path, std::hash::Hasher::finish(&hasher));
+        if self.lsp_sent.as_ref() != Some(&sent) {
+            self.lsp.show(&sent.0, text);
+            self.lsp_sent = Some(sent);
+        }
+    }
+
+    /// Open line `line` (1-based) of pack file `file` in the user's editor: the file itself from
+    /// a checkout, or its text as a scratch buffer from a controller's copy.
+    pub fn open_in_editor(&mut self, file: &str, line: usize) {
+        let Some(editor) = self.settings.editor.or_else(Editor::detect) else {
+            self.editor_error = Some("No editor found. Pick one in Settings.".to_string());
+            return;
+        };
+        let Some(pack) = self.shown_pack() else {
+            return;
+        };
+        let result = match (&pack.disk, pack.file(file)) {
+            (Some(Disk::Checkout(dir)), _) => editor::open_file(editor, &dir.join(file), line),
+            (
+                _,
+                Some(PackFile {
+                    text: Some(text), ..
+                }),
+            ) => editor::open_text(editor, text),
+            _ => Err(format!("{file} has no text to open")),
+        };
+        self.editor_error = result.err();
     }
 
     fn apply_local(&mut self, snapshot: Snapshot) {
@@ -588,6 +667,11 @@ fn init() -> App {
         local_seen: 0,
         live_client: live::Client::spawn(),
         live_seen: 0,
+        lsp: lsp::Lsp::spawn(),
+        lsp_seen: 0,
+        checks: lsp::View::default(),
+        lsp_sent: None,
+        editor_error: None,
         live_sent: None,
         backend: Backend::Controller,
         packs: Vec::new(),
@@ -625,7 +709,8 @@ fn init() -> App {
 
 fn setup(app: &mut App, waker: Waker) {
     app.local.set_waker(waker.clone());
-    app.live_client.set_waker(waker);
+    app.live_client.set_waker(waker.clone());
+    app.lsp.set_waker(waker);
 }
 
 /// Nothing here touches a file, a process or the network: the workers own all of that and wake the
@@ -643,6 +728,12 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         changed = true;
     }
     app.sync_live();
+    if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
+        app.lsp_seen = version;
+        app.checks = view;
+        changed = true;
+    }
+    app.sync_checks();
     changed
 }
 

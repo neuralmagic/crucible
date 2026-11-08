@@ -83,6 +83,20 @@ config and kept across runs; `Reset layout` goes back to the fitted one.
 The Timeline places each task from its recorded duration, starting when its dependencies settle,
 with a strip of how many ran at once and the critical path drawn solid.
 
+## The Pack pane
+
+The Pack pane shows a pack's files, highlighted, with `crucible-lsp`'s diagnostics: underlined in
+the source, coloured in the gutter (hover a line number for the message), as a dot on each file,
+and as a list under the file. The app runs `crucible-lsp` as a child process: `$CRUCIBLE_LSP`, the
+copy `just playbooks-install` bundles beside the executable, or the first on `PATH`. A controller's
+pack is copied to `~/Library/Caches/crucible-playbooks/packs` so the server can read it.
+
+Files are edited elsewhere. The edit button, and each listed problem, open the file in VS Code,
+Cursor or Zed at the line (Settings picks the editor, else `$VISUAL`/`$EDITOR` or the first one
+installed). A local pack opens by deep link; a controller's file opens as an unsaved buffer over
+the editor's stdin. The copy button copies the file's path, to hand to an agent. Saving a local
+pack re-reads it and re-checks it.
+
 ## What the local backend tracks
 
 `state/session.jsonl` is the record. The app folds `plan_admitted` into the graph, `task_result`

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use rune::tok::Family;
 use serde::{Deserialize, Serialize};
 
+use crate::editor::Editor;
 use crate::workspace::Workspace;
 
 /// The colours the app paints with.
@@ -118,6 +119,8 @@ pub struct Settings {
     pub crt: bool,
     /// Announce the signed-in user's runs as they finish.
     pub notify: bool,
+    /// The editor pack files open in; `None` finds one.
+    pub editor: Option<Editor>,
     path: PathBuf,
 }
 
@@ -134,6 +137,8 @@ struct Config {
     appearance: Appearance,
     crt: Option<bool>,
     notify: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor: Option<Editor>,
 }
 
 impl Settings {
@@ -161,6 +166,7 @@ impl Settings {
             appearance: config.appearance,
             crt: config.crt.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
+            editor: config.editor,
             path,
         }
     }
@@ -199,6 +205,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_editor(&mut self, editor: Option<Editor>) {
+        self.editor = editor;
+        self.save();
+    }
+
     pub fn set_appearance(&mut self, appearance: Appearance) {
         self.appearance = appearance;
         self.save();
@@ -213,6 +224,7 @@ impl Settings {
             appearance: self.appearance,
             crt: Some(self.crt),
             notify: Some(self.notify),
+            editor: self.editor,
         };
         let Ok(text) = toml::to_string(&config) else {
             return;
