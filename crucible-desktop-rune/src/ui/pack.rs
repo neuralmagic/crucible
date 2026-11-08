@@ -1,11 +1,13 @@
 //! The Pack tab: the workflow pack a run came from, file by file.
 
 use rune::{Color, El, ScrollSpec, TextStyle, col, el, icon, row, text};
+use rune_kit::syntax::SyntaxTheme;
 use rune_theme_opencode::icons as oc;
 
 use crate::App;
 use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
+use crate::syntax;
 use crate::ui::{Paint, mono};
 
 /// Lines drawn per file; a longer file says how much it left out.
@@ -100,7 +102,7 @@ fn file_row(file: &PackFile, selected: bool, p: &Paint) -> El {
         .hover(p.c.hover)
         .focusable(true)
         .on_press(move |app: &mut App| app.pack_file = Some(path.clone()))
-        .child(icon(&oc::CODE_LINES, 14.0).color(if selected {
+        .child(icon(&oc::CODE_LINES, 14.0).min_w(14.0).color(if selected {
             p.c.icon_base
         } else {
             p.c.icon_faint
@@ -109,7 +111,10 @@ fn file_row(file: &PackFile, selected: bool, p: &Paint) -> El {
             row()
                 .grow(1.0)
                 .min_w(0.0)
-                .child(text(dir).font(mono(11.0, 400.0)).color(p.c.text_faint))
+                .children(
+                    (!dir.is_empty())
+                        .then(|| text(dir).font(mono(11.0, 400.0)).color(p.c.text_faint)),
+                )
                 .child(
                     text(name)
                         .font(mono(11.0, if selected { 500.0 } else { 400.0 }))
@@ -131,12 +136,14 @@ fn source(file: &PackFile, font: LogFont, p: &Paint) -> El {
             p,
         );
     };
-    let kind = Kind::of(&file.path);
-    let lines: Vec<&str> = text_body.lines().collect();
+    let lines = syntax::lines(text_body);
+    let found = syntax::highlighter().highlight(syntax::language(&file.path), text_body);
+    let theme = SyntaxTheme::from_kit(p.k);
     let width = lines.len().max(1).to_string().len();
     let style = TextStyle::new(11.5, 400.0).lh(18.0).family(font.family());
     let mut body = col().gap(0.0).py(10.0);
     for (n, line) in lines.iter().take(LINES).enumerate() {
+        let spans = theme.spans(&syntax::on_line(&found, line.clone()), 0);
         body = body.child(
             row()
                 .gap(14.0)
@@ -146,9 +153,10 @@ fn source(file: &PackFile, font: LogFont, p: &Paint) -> El {
                         .color(p.c.text_faint),
                 )
                 .child(
-                    text(line.to_string())
+                    text(text_body[line.clone()].to_string())
                         .font(style)
-                        .color(kind.ink(line, p))
+                        .color(p.c.text_base)
+                        .spans(spans)
                         .selectable(true)
                         .selection_color(p.k.selection()),
                 ),
@@ -205,41 +213,6 @@ fn source(file: &PackFile, font: LogFont, p: &Paint) -> El {
         )
 }
 
-/// Enough syntax to read a manifest or a workflow at a glance: comments recede, sections and
-/// definitions stand out.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
-    Toml,
-    Starlark,
-    Other,
-}
-
-impl Kind {
-    fn of(path: &str) -> Self {
-        if path.ends_with(".toml") {
-            Kind::Toml
-        } else if path.ends_with(".star") || path.ends_with(".bzl") {
-            Kind::Starlark
-        } else {
-            Kind::Other
-        }
-    }
-
-    fn ink(self, line: &str, p: &Paint) -> Color {
-        let trimmed = line.trim_start();
-        if self != Kind::Other && trimmed.starts_with('#') {
-            return p.c.text_faint;
-        }
-        match self {
-            Kind::Toml if trimmed.starts_with('[') => p.c.text_accent,
-            Kind::Starlark if trimmed.starts_with("def ") || trimmed.starts_with("load(") => {
-                p.c.text_accent
-            }
-            _ => p.c.text_base,
-        }
-    }
-}
-
 fn note(headline: &str, detail: &str, p: &Paint) -> El {
     let mut card = col()
         .key("pack-note")
@@ -266,17 +239,4 @@ fn note(headline: &str, detail: &str, p: &Paint) -> El {
         );
     }
     card
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::ui::pack::Kind;
-
-    #[test]
-    fn a_file_reads_as_its_kind_by_extension() {
-        assert_eq!(Kind::of("crucible.toml"), Kind::Toml);
-        assert_eq!(Kind::of("lib/steps.star"), Kind::Starlark);
-        assert_eq!(Kind::of("rules.bzl"), Kind::Starlark);
-        assert_eq!(Kind::of("prompts/edit.md"), Kind::Other);
-    }
 }

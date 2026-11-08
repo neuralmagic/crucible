@@ -13,6 +13,7 @@ mod pack;
 mod runs;
 mod session;
 mod settings;
+mod syntax;
 mod timeline;
 mod ui;
 mod workspace;
