@@ -544,6 +544,10 @@ mod tests {
                 "0083_drop_orphan_run_agent_tools.sql",
                 "0da06c06a8473f4990a68b4e9b4a4ea01eefcefc1d24463fc708dd1b44d52e0d",
             ),
+            (
+                "0084_native_sign_in_codes.sql",
+                "a905630dc8dfe1722c77c790da31758ed0519784ac187cb446e2ef47814d2c5e",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

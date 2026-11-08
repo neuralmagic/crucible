@@ -25,9 +25,16 @@ use url::Url;
 
 use crate::agent_auth::people::clients::{RedirectRule, RuleSource};
 use crate::agent_auth::people::{CodeChallenge, escape, form_page};
-use crate::identity::oidc::routes::AuthState;
 
 pub const NATIVE_PATH: &str = "/auth/native";
+
+/// The approval page, its answer, and the code exchange, over the pool the codes and keys live in.
+pub fn router(pool: sqlx::PgPool) -> axum::Router {
+    axum::Router::new()
+        .route(NATIVE_PATH, axum::routing::get(ask).post(decide))
+        .route(NATIVE_TOKEN_PATH, axum::routing::post(redeem))
+        .with_state(pool)
+}
 pub const NATIVE_TOKEN_PATH: &str = "/auth/native/token";
 /// The redirect every app uses: `/callback` on 127.0.0.1, any port.
 const CALLBACK: &str = "http://127.0.0.1/callback";
@@ -190,7 +197,7 @@ pub struct Decision {
 /// `POST /auth/native`: the person's answer. Approval records a one-minute code and sends the
 /// browser back to the app with it.
 pub async fn decide(
-    State(state): State<AuthState>,
+    State(pool): State<sqlx::PgPool>,
     session: Session,
     Form(form): Form<Decision>,
 ) -> Response {
@@ -229,7 +236,7 @@ pub async fn decide(
     .bind(&request.redirect_uri)
     .bind(&request.challenge)
     .bind(expires)
-    .execute(&state.pool)
+    .execute(&pool)
     .await;
     if let Err(e) = stored {
         tracing::warn!(error = %e, "recording a native sign-in code");
@@ -267,13 +274,13 @@ fn invalid_grant(why: &str) -> Response {
 
 /// `POST /auth/native/token`: the code and the verifier for the key. The code is deleted as it
 /// is read, so it buys one key at most, right or wrong.
-pub async fn redeem(State(state): State<AuthState>, Json(body): Json<Redeem>) -> Response {
+pub async fn redeem(State(pool): State<sqlx::PgPool>, Json(body): Json<Redeem>) -> Response {
     let row = sqlx::query(
         "DELETE FROM native_sign_in_codes WHERE code_hash = $1
          RETURNING sub, name, redirect_uri, challenge, expires_at",
     )
     .bind(crate::identity::api_key::digest(&body.code))
-    .fetch_optional(&state.pool)
+    .fetch_optional(&pool)
     .await;
     let row = match row {
         Ok(Some(row)) => row,
@@ -296,13 +303,8 @@ pub async fn redeem(State(state): State<AuthState>, Json(body): Json<Redeem>) ->
         return invalid_grant(&e.to_string());
     }
     let expires = later(KEY_LIFETIME);
-    match crate::identity::api_key::mint(
-        &state.pool,
-        &field("sub"),
-        &field("name"),
-        expires.as_deref(),
-    )
-    .await
+    match crate::identity::api_key::mint(&pool, &field("sub"), &field("name"), expires.as_deref())
+        .await
     {
         Ok(minted) => (
             StatusCode::OK,
