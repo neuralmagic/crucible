@@ -37,6 +37,8 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 via kingfisher-rules -> liquid-core (rule templating); unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2020-0163", reason = "term_size via kingfisher-core -> tokei; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils via postgresql_embedded -> reqwest-retry -> wasmtimer, a wasm32-only dependency never built for our targets; unmaintained, not vulnerable" },
 ]
 
