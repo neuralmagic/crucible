@@ -162,7 +162,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
             .w_full()
             .grow(1.0)
             .min_h(0.0)
-            .child(graph_view(pane, p))
+            .child(graph_view(pane, app, p))
             .children(tube(app)),
         PaneKind::Pack => pack::pack_view(&pane.pack, pane.log_font, app, p),
         PaneKind::Launch if pane.launchable => col()

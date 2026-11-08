@@ -288,11 +288,13 @@ desktop-check:
 
 # Open the Rune playbook tracker, also its own Cargo workspace.
 playbooks-run:
+    sh crucible-desktop-rune/rune-patches.sh
     cd crucible-desktop-rune && cargo run
 
 # Build the release binary and open it as a bundled .app with the dock icon, crucible-lsp inside.
 playbooks-release *args:
     cargo build --release -p crucible-lsp
+    sh crucible-desktop-rune/rune-patches.sh
     cd crucible-desktop-rune && cargo build --release
     sh crucible-desktop-rune/macos-bundle.sh
     open "crucible-desktop-rune/target/release/Crucible Playbooks.app" --args {{ args }}
@@ -300,6 +302,7 @@ playbooks-release *args:
 # Build and install the release .app, crucible-lsp inside, into ~/Applications.
 playbooks-install:
     cargo build --release -p crucible-lsp
+    sh crucible-desktop-rune/rune-patches.sh
     cd crucible-desktop-rune && cargo build --release
     sh crucible-desktop-rune/macos-bundle.sh
     mkdir -p ~/Applications
@@ -310,11 +313,13 @@ playbooks-install:
 # Hot-reload dev loop: patches src/ui.rs in the open window, rebuilds and relaunches on
 # anything else. Needs Python >= 3.13 (rune-dev uses PurePosixPath.full_match).
 playbooks-hot:
-    python3.14 ~/.cargo/git/checkouts/rune-c9b805e9ed8a3730/4ca6835/scripts/rune-dev \
+    sh crucible-desktop-rune/rune-patches.sh
+    python3.14 vendor/rune/scripts/rune-dev \
         --manifest-path crucible-desktop-rune/Cargo.toml --patch 'src/ui/*.rs' --local -- --scene local
 
 # Format, lint and test the Rune playbook tracker.
 playbooks-check:
+    sh crucible-desktop-rune/rune-patches.sh
     cd crucible-desktop-rune && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
 
 # Prepare a cluster for the gateway isolation e2e (crucible-controller/tests/kueue_gateway_e2e.rs): the

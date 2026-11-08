@@ -1258,7 +1258,7 @@ fn activity_stat(pane: &Pane, p: &Paint) -> El {
     )
 }
 
-fn graph_view(pane: &Pane, p: &Paint) -> El {
+fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
     if pane.tasks.is_empty() {
         return col()
             .key("graph-empty")
@@ -1267,7 +1267,7 @@ fn graph_view(pane: &Pane, p: &Paint) -> El {
             .min_h(0.0)
             .child(empty_run(pane, p));
     }
-    let source = mermaid_source(&pane.tasks, p);
+    let source = mermaid_source(&pane.tasks, app.expanded.as_deref(), p);
     let mut style = rune_mermaid::DiagramStyle::neutral(p.dark);
     style.font = mono(11.5, 400.0);
     style.max_width = 1160.0;
@@ -1278,7 +1278,29 @@ fn graph_view(pane: &Pane, p: &Paint) -> El {
     style.line = p.c.border_strong;
     style.text = p.c.text_base;
     style.muted = p.c.text_muted;
-    let card = rune_mermaid::render(&source, &style).unwrap_or_else(|| {
+    let decorate = |target: &rune_mermaid::Target, spot: El| {
+        let rune_mermaid::Target::Node(id) = target else {
+            return spot;
+        };
+        let Some(task) = graph_task(&pane.tasks, id) else {
+            return spot;
+        };
+        let name = task.name.clone();
+        spot.cursor(rune::Cursor::Pointer)
+            .help(format!("Open {name} in Tasks"))
+            .on_press(move |app: &mut App| {
+                app.expanded = Some(name.clone());
+                app.show_pane(crate::workspace::PaneKind::Tasks);
+            })
+    };
+    let card = rune_mermaid::render_with(
+        &source,
+        &style,
+        rune_mermaid::Hover::Edges,
+        style.text.alpha(0.9),
+        &decorate,
+    )
+    .unwrap_or_else(|| {
         col().key("graph-fallback").w_full().padding(24.0).child(
             text("This run's graph did not read as a flowchart.".to_string())
                 .font(p.k.ty.ui)
@@ -1299,9 +1321,14 @@ fn graph_view(pane: &Pane, p: &Paint) -> El {
         .child(card)
 }
 
-/// The run's tasks as a mermaid flowchart; node colour carries each task's state and a fan-out
-/// node counts its instances.
-fn mermaid_source(tasks: &[TaskView], p: &Paint) -> String {
+/// The task a [`mermaid_source`] node id names.
+fn graph_task<'a>(tasks: &'a [TaskView], id: &str) -> Option<&'a TaskView> {
+    tasks.get(id.strip_prefix('t')?.parse::<usize>().ok()?)
+}
+
+/// The run's tasks as a mermaid flowchart, task `i` as node `t<i>`; node colour carries each
+/// task's state, a fan-out node counts its instances, and the open task has an accent outline.
+fn mermaid_source(tasks: &[TaskView], open: Option<&str>, p: &Paint) -> String {
     let mut source = String::from("flowchart TD\n");
     for (class, s) in [
         ("pass", p.c.success),
@@ -1321,12 +1348,15 @@ fn mermaid_source(tasks: &[TaskView], p: &Paint) -> String {
         p.c.border_strong.hex(),
         p.c.text_muted.hex()
     ));
-    let id = |name: &str| {
-        let cleaned: String = name
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-            .collect();
-        format!("n{cleaned}")
+    let id = |name: &str| match tasks.iter().position(|task| task.name == name) {
+        Some(i) => format!("t{i}"),
+        None => {
+            let cleaned: String = name
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            format!("x{cleaned}")
+        }
     };
     for task in tasks {
         let label = match task.instances.len() {
@@ -1353,6 +1383,13 @@ fn mermaid_source(tasks: &[TaskView], p: &Paint) -> String {
             TaskState::Settled(_) => "fail",
         };
         source.push_str(&format!("  class {} {class}\n", id(&task.name)));
+    }
+    if let Some(open) = open.filter(|open| tasks.iter().any(|task| task.name == *open)) {
+        source.push_str(&format!(
+            "  style {} stroke:{}\n",
+            id(open),
+            p.c.text_accent.hex()
+        ));
     }
     source
 }

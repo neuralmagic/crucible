@@ -1,0 +1,172 @@
+diff --git a/crates/rune-mermaid/src/canvas.rs b/crates/rune-mermaid/src/canvas.rs
+index 3f5d1d4..4a951b2 100644
+--- a/crates/rune-mermaid/src/canvas.rs
++++ b/crates/rune-mermaid/src/canvas.rs
+@@ -3,7 +3,7 @@
+ use rune::{Align, Color, El, LineCap, Shape, TextStyle, Transition, canvas, col, el, text};
+ 
+ use crate::DiagramStyle;
+-use crate::hover::{Hover, Spot, Trace};
++use crate::hover::{Hover, Spot, Target, Trace};
+ use crate::parts::{LabelKey, Mark, Names, Piece, pieces};
+ 
+ /// The card's padding on each side.
+@@ -314,6 +314,11 @@ impl Scene {
+     /// new since the last build comes in on its own ([`crate::parts::Kind::enter`]); otherwise
+     /// everything shows the frame it mounts.
+     pub(crate) fn el(&self, paint: &DiagramStyle, streaming: bool) -> El {
++        self.el_with(paint, streaming, &|_, spot| spot)
++    }
++
++    /// [`Scene::el`], with each hover group passed through `decorate` with what it is over.
++    pub(crate) fn el_with(&self, paint: &DiagramStyle, streaming: bool, decorate: &dyn Fn(&Target, El) -> El) -> El {
+         let [w, h] = self.full;
+         let still = |t: Transition| if streaming { t } else { Transition::none() };
+         // Fit destinations before springing them. Multiplying a springing canvas size by a
+@@ -358,7 +363,8 @@ impl Scene {
+                 }
+             }
+             let exit = if streaming { Transition { insertion: rune::Effect::IDENTITY, ..Transition::opacity() } } else { Transition::none() };
+-            body = body.child(el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).hover_group().transition(exit).child(glow).a11y_hidden());
++            let spot = el().key(s.key.clone()).absolute(0.0, 0.0).offset(r[0] * scale, r[1] * scale).size(r[2] * scale, r[3] * scale).hover_group().transition(exit).child(glow).a11y_hidden();
++            body = body.child(decorate(&s.target, spot));
+         }
+         let mut card = col()
+             .w_full()
+diff --git a/crates/rune-mermaid/src/hover.rs b/crates/rune-mermaid/src/hover.rs
+index b5940cc..f644e4a 100644
+--- a/crates/rune-mermaid/src/hover.rs
++++ b/crates/rune-mermaid/src/hover.rs
+@@ -25,6 +25,13 @@ pub enum Hover {
+     Neighbours,
+ }
+ 
++/// The node or edge under a hover group, by its Mermaid ids, for [`crate::render_with`].
++#[derive(Clone, Debug, PartialEq, Eq, Hash)]
++pub enum Target {
++    Node(String),
++    Edge { from: String, to: String },
++}
++
+ /// How far either side of an edge's line the pointer lights it, in points.
+ pub(crate) const EDGE_SLOP: f32 = 8.0;
+ /// The most rectangles one edge's line is split into, and in a whole diagram.
+@@ -50,6 +57,7 @@ pub(crate) struct Spot {
+     pub rect: [f32; 4],
+     pub lit: Shape,
+     pub labels: Vec<usize>,
++    pub target: Target,
+ }
+ 
+ impl Canvas {
+@@ -115,27 +123,26 @@ impl Canvas {
+             *n += 1;
+             if *n == 1 { base } else { format!("{base}~{}", *n - 1) }
+         };
++        let name = |v: usize| self.names.nodes.get(v).cloned().unwrap_or_else(|| format!("#{v}"));
+         let mut budget = ALL_EDGE_HITS;
+         for (k, t) in self.traces.iter().enumerate() {
+             let edge = key(t.part.clone().unwrap_or(Part::Index(Kind::Edge, k)));
+             let shape = t.ops.iter().fold(Shape::new(), &paint);
+             let labels: Vec<usize> = t.label.iter().map(|l| l.0).collect();
++            let target = Target::Edge { from: name(t.ends.0), to: name(t.ends.1) };
+             let line: Vec<[f32; 2]> = t.line.iter().map(|&p| map(p)).collect();
+             let mut hits = cut_away(line_hits(&line, EDGE_SLOP), &boxes);
+             hits.truncate(budget);
+             budget -= hits.len();
+             for (j, r) in hits.into_iter().enumerate() {
+-                spots.push(Spot { key: format!("{edge}.{j}"), rect: r, lit: shape.clone(), labels: labels.clone() });
++                spots.push(Spot { key: format!("{edge}.{j}"), rect: r, lit: shape.clone(), labels: labels.clone(), target: target.clone() });
+             }
+             if let Some((_, g)) = t.label {
+-                spots.push(Spot { key: format!("{edge}.t"), rect: rect([g[0], g[1]], [g[2], g[3]]), lit: shape.clone(), labels: labels.clone() });
++                spots.push(Spot { key: format!("{edge}.t"), rect: rect([g[0], g[1]], [g[2], g[3]]), lit: shape, labels, target });
+             }
+         }
+         for v in (0..self.regions.len()).filter(|&v| drawn(v)) {
+             let mine: Vec<&Trace> = self.traces.iter().filter(|t| t.ends.0 == v || t.ends.1 == v).collect();
+-            if mine.is_empty() {
+-                continue;
+-            }
+             let mut shape = mine.iter().flat_map(|t| &t.ops).fold(Shape::new(), &paint);
+             if reach == Hover::Neighbours {
+                 let mut near: Vec<usize> = mine.iter().flat_map(|t| [t.ends.0, t.ends.1]).filter(|&u| drawn(u)).collect();
+@@ -145,7 +152,7 @@ impl Canvas {
+             }
+             let (lo, hi) = bounds(&self.regions[v]);
+             let labels = mine.iter().filter_map(|t| t.label.map(|l| l.0)).collect();
+-            spots.push(Spot { key: key(Part::Index(Kind::Node, v)), rect: rect(lo, hi), lit: shape, labels });
++            spots.push(Spot { key: key(Part::Index(Kind::Node, v)), rect: rect(lo, hi), lit: shape, labels, target: Target::Node(name(v)) });
+         }
+         spots
+     }
+diff --git a/crates/rune-mermaid/src/hover_tests.rs b/crates/rune-mermaid/src/hover_tests.rs
+index 446ac35..489e140 100644
+--- a/crates/rune-mermaid/src/hover_tests.rs
++++ b/crates/rune-mermaid/src/hover_tests.rs
+@@ -1,4 +1,4 @@
+-use rune::{Color, Cx, El, Env, Runtime, col};
++use rune::{Color, Cx, El, Env, Runtime, col, el};
+ 
+ use super::*;
+ use crate::canvas::Scene;
+@@ -184,3 +184,32 @@ fn a_still_pointer_keeps_what_it_hovers_or_lets_go_as_a_streaming_diagram_moves(
+         assert!((y2[1] - y[1]).abs() > 8.0, "{over}: the diagram moved under the pointer: {y:?} → {y2:?}");
+     }
+ }
++
++#[test]
++fn every_node_and_edge_spot_names_what_it_is_over() {
++    let s = lit_scene("flowchart TD\n  A --> B\n  C");
++    let node = |id: &str| spots(&s, &format!("hover:n:{id}")).map(|h| h.target.clone()).collect::<Vec<_>>();
++    assert_eq!(node("A"), [Target::Node("A".into())]);
++    assert_eq!(node("B"), [Target::Node("B".into())]);
++    assert_eq!(node("C"), [Target::Node("C".into())], "a node with no edges is a hover target too");
++    let edges: Vec<&Spot> = spots(&s, "hover:e:").collect();
++    assert!(!edges.is_empty());
++    assert!(edges.iter().all(|h| h.target == Target::Edge { from: "A".into(), to: "B".into() }));
++}
++
++#[test]
++fn render_with_passes_every_spot_through_decorate() {
++    fn view(_: &u32, _: &mut Cx<u32>) -> El {
++        let decorate = |t: &Target, spot: El| match t {
++            Target::Node(id) => el().key(format!("pick:{id}")).child(spot),
++            Target::Edge { .. } => spot,
++        };
++        col().w_full().child(crate::render_with("flowchart LR\n  A --> B\n  C", &DiagramStyle::neutral(false), Hover::Edges, LIT, &decorate).expect("draws"))
++    }
++    let mut rt = Runtime::new(0u32, view, (400.0, 400.0), Env::new(false, 1.0));
++    rt.frame(0.0);
++    let keys: Vec<String> = rt.elements().into_iter().filter_map(|e| e.key).filter(|k| k.starts_with("pick:")).collect();
++    for id in ["A", "B", "C"] {
++        assert!(keys.iter().any(|k| k == &format!("pick:{id}")), "{id} decorated: {keys:?}");
++    }
++}
+diff --git a/crates/rune-mermaid/src/lib.rs b/crates/rune-mermaid/src/lib.rs
+index 337084f..f54d8c6 100644
+--- a/crates/rune-mermaid/src/lib.rs
++++ b/crates/rune-mermaid/src/lib.rs
+@@ -142,6 +142,7 @@ use rune::{Color, El, TextStyle, oklch, oklcha, tok};
+ 
+ use canvas::Scene;
+ pub use hover::Hover;
++pub use hover::Target;
+ 
+ /// Colours and type a diagram draws with.
+ #[derive(Clone, Copy, Debug, PartialEq)]
+@@ -226,6 +227,14 @@ pub fn render_with_hover(src: &str, style: &DiagramStyle, hover: Hover, color: C
+     render_inner(src, style, hover, color, Mode::Still)
+ }
+ 
++/// [`render_with_hover`], with every hover group passed through `decorate` with the node or edge
++/// it is over, so an app can make them pressable or give them help. A node with no edges gets a
++/// hover group too.
++pub fn render_with(src: &str, style: &DiagramStyle, hover: Hover, color: Color, decorate: &dyn Fn(&Target, El) -> El) -> Option<El> {
++    let hover = (hover != Hover::Off).then_some((hover, color));
++    scenes::built(src, style, hover, None).0.map(|s| s.el_with(style, false, decorate))
++}
++
+ /// [`render_with_hover`] for a source still arriving (pass only its complete lines): each node,
+ /// edge and frame new since the last build comes in on its own, and the rest glide into place.
+ /// The diagram only grows: what's drawn keeps its order and place, as far as what's new leaves

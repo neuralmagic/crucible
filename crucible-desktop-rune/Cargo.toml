@@ -6,15 +6,16 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 # Its own workspace, like crucible-desktop: Rune is pre-release and pinned to a dev rev, so the
-# engine workspace must not inherit it.
+# engine workspace must not inherit it. Rune itself is ../vendor/rune, upstream at that rev plus
+# patches/rune, which rune-patches.sh lays down.
 [workspace]
 
 [dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "4ca683561a100e16b1ce32f3576f4ade61bd2924" }
-rune-kit = { git = "https://github.com/anomalyco/rune", rev = "4ca683561a100e16b1ce32f3576f4ade61bd2924", default-features = false }
-rune-mermaid = { git = "https://github.com/anomalyco/rune", rev = "4ca683561a100e16b1ce32f3576f4ade61bd2924" }
-rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "4ca683561a100e16b1ce32f3576f4ade61bd2924" }
-rune-fx = { git = "https://github.com/anomalyco/rune", rev = "4ca683561a100e16b1ce32f3576f4ade61bd2924" }
+rune = { path = "../vendor/rune/crates/rune" }
+rune-kit = { path = "../vendor/rune/crates/rune-kit", default-features = false }
+rune-mermaid = { path = "../vendor/rune/crates/rune-mermaid" }
+rune-theme-opencode = { path = "../vendor/rune/themes/opencode" }
+rune-fx = { path = "../vendor/rune/crates/rune-fx" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
 crucible-contract = { path = "../crucible-contract" }
 crux = { path = "../crux", default-features = false }
