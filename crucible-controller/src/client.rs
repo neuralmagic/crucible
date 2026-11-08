@@ -536,6 +536,14 @@ mod tests {
                 "0081_drop_offline_credential.sql",
                 "d89538dcc83635668a87b392bf048d770dc8baafba0ef3beb0707a4b4e1613c7",
             ),
+            (
+                "0082_launch_owner.sql",
+                "f5c5a02a9deb825a4c2da16366a6cf1a100da187b2f86e361663f0d45bce2dff",
+            ),
+            (
+                "0083_drop_orphan_run_agent_tools.sql",
+                "0da06c06a8473f4990a68b4e9b4a4ea01eefcefc1d24463fc708dd1b44d52e0d",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

@@ -733,6 +733,7 @@ pub(crate) async fn launch_playbook(
             Err(refusal) => return refusal.into_response(),
         };
     let actor = saver.actor.as_deref();
+    let owner = caller.subject_principal().map(|p| p.to_string());
     let dispatch_target = saver.dispatch_target.clone();
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
     let launch = crate::launches::model::NewPlaybookLaunch {
@@ -748,6 +749,7 @@ pub(crate) async fn launch_playbook(
         origin: crate::model::LaunchOrigin::Manual,
         draft_version: None,
         created_by: actor,
+        owner: owner.as_deref(),
         launcher_groups: Some(&saver.groups),
         rerun: rerun.as_ref(),
         dispatch: saver.pin(),

@@ -122,7 +122,7 @@ impl AgentAuth {
             kid = issuer_cfg.signing_key.kid(),
             spire = ?issuer_cfg.spire.iter().map(|s| (s.cluster.as_str(), s.svid_issuer.as_str())).collect::<Vec<_>>(),
             discovering = ?discovering,
-            audiences = ?issuer_cfg.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str(), a.requires_kube_user)).collect::<Vec<_>>(),
+            audiences = ?issuer_cfg.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
             "issuing agent access tokens"
         );
         let proxy_keys = |clusters: Arc<crate::runs::clusters::ClusterClients>| {
@@ -277,10 +277,9 @@ impl From<GrantError> for OAuthError {
                 Self::InvalidTarget(e.to_string())
             }
             GrantError::Scope { .. } => Self::InvalidScope(e.to_string()),
-            GrantError::NoLauncher { .. }
-            | GrantError::NoUsername(_)
-            | GrantError::NoKubeUser { .. }
-            | GrantError::WrongCluster { .. } => Self::InvalidGrant(e.to_string()),
+            GrantError::NoLauncher { .. } | GrantError::WrongCluster { .. } => {
+                Self::InvalidGrant(e.to_string())
+            }
         }
     }
 }
@@ -404,50 +403,11 @@ async fn issue(
         .audience(req.audience.as_deref(), &run.cluster)?;
     let launcher = issuer::launcher(&run)?;
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
-    let principal = crate::authz::model::Principal::User(launcher.clone());
-    let resolved = crate::identity::cluster_identity::for_principal(
-        &state.pool,
-        profile,
-        &run.cluster,
-        &principal,
-    )
-    .await
-    .map_err(|e| match e {
-        crate::identity::cluster_identity::PrincipalError::Db(e) => {
-            OAuthError::Server(format!("{e:#}"))
-        }
-        e => GrantError::NoUsername(e.to_string()).into(),
-    })?;
-    let kube_user = match resolved {
-        crate::identity::cluster_identity::Resolution::Known { user, .. } => Some(user),
-        unknown => {
-            let why = match unknown {
-                crate::identity::cluster_identity::Resolution::Unavailable(why) => why,
-                _ => format!("{launcher} has not linked a username on {}", run.cluster),
-            };
-            if audience.requires_kube_user {
-                return Err(GrantError::NoKubeUser {
-                    launcher: launcher.clone(),
-                    cluster: run.cluster.clone(),
-                    audience: audience.resource.clone(),
-                    why,
-                }
-                .into());
-            }
-            tracing::warn!(
-                launcher,
-                sandbox = %sandbox.id,
-                cluster = run.cluster,
-                reason = why,
-                "agent token minted without kube_user"
-            );
-            None
-        }
-    };
+    let kube = issuer::RunIdentity::of(&run.pod_name, run.owner.as_deref());
     let grant = AgentGrant {
         sandbox,
         launcher,
-        kube_user: kube_user.map(|k| k.as_str().to_string()),
+        kube,
         run,
         audience: audience.resource.clone(),
         scopes,
@@ -463,7 +423,7 @@ async fn issue(
         tenant = grant.sandbox.tenant.as_deref(),
         run_id = grant.run.run_id,
         sub = grant.launcher,
-        kube_user = grant.kube_user.as_deref(),
+        kube_user = grant.kube.user,
         aud = grant.audience,
         scope = minted.scope,
         "agent token issued"
@@ -690,98 +650,52 @@ mod tests {
         .unwrap();
     }
 
+    /// A run's token carries the run's own Kubernetes identity, whether or not its launcher
+    /// linked a username.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_launcher_with_a_known_kubernetes_username_gets_kube_user(pool: PgPool) {
-        bound(&pool, "sbx-1").await;
-        link(&pool, "alice-k8s").await;
+    async fn a_runs_token_carries_its_own_identity_whoever_launched_it(pool: PgPool) {
+        bound_unlinked(&pool, "sbx-1").await;
         let h = harness(pool).await;
         let svid = h.spire.svid(&Spire::claims("sbx-1"));
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let claims = claims_of(&body);
+        assert_eq!(claims["sub"].as_str(), Some("alice"));
         assert_eq!(
-            (claims["sub"].as_str(), claims["kube_user"].as_str()),
-            (Some("alice"), Some("alice-k8s"))
+            claims["kube_user"].as_str(),
+            Some("crucible:run:crucible-run-brave-otter")
+        );
+        assert_eq!(
+            claims["kube_groups"],
+            json!(["crucible:runs", "crucible:user:alice"])
         );
     }
 
+    /// A team-owned run carries the team's group, so a RoleBinding for the team admits its runs.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn an_unknown_kubernetes_username_refuses_kueue_tokens_and_only_kueue_tokens(
-        pool: PgPool,
-    ) {
-        bound_unlinked(&pool, "sbx-1").await;
-        let strict = harness(pool.clone()).await;
-        let svid = strict.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
-        assert_eq!(
-            (status, body["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
-            "{body}"
-        );
-        let (status, _, body) =
-            post(&strict.app, &form(&svid, &[("audience", testing::BUILDIT)])).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "a buildit token runs no SubjectAccessReview: {body}"
-        );
-        assert!(claims_of(&body).get("kube_user").is_none());
-
-        link(&pool, "alice-k8s").await;
-        let svid = strict.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(claims_of(&body)["kube_user"], "alice-k8s");
-    }
-
-    /// A spoke checks RBAC as the launcher's username there; the hub's is no stand-in for it.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_token_carries_the_launchers_username_on_the_runs_cluster(pool: PgPool) {
-        bound_unlinked(&pool, "sbx-1").await;
-        crate::identity::oidc::users::record_login(
+    async fn a_team_owned_run_carries_its_teams_group(pool: PgPool) {
+        testing::running_run(&pool, "crucible-run-brave-otter", "run-1", Some("team:ml")).await;
+        sqlx::query("UPDATE runs SET dispatched_by = 'team:ml' WHERE run_id = 'run-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        bindings::bind(
             &pool,
-            "sub-alice",
-            "alice",
-            Some("alice@example.com"),
-            jiff::Timestamp::now(),
+            &bindings::run_pod(&pool, "run-1").await.unwrap(),
+            &testing::binding("sbx-1"),
         )
         .await
         .unwrap();
-        crate::identity::kube_identity::set_override(
-            &pool,
-            "alice",
-            Some(&crate::identity::kube_identity::KubeUser::parse("alice-hub").unwrap()),
-        )
-        .await
-        .unwrap();
-        let h = harness(pool.clone()).await;
+        let h = harness(pool).await;
         let svid = h.spire.svid(&Spire::claims("sbx-1"));
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = claims_of(&body);
+        assert_eq!(claims["sub"].as_str(), Some("team:ml"));
         assert_eq!(
-            (status, body["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
-            "alice's hub username is not hers on the run's cluster: {body}"
+            claims["kube_groups"],
+            json!(["crucible:runs", "crucible:team:ml"])
         );
-
-        let claim = harness_with(
-            pool.clone(),
-            &format!(
-                "{PROFILE}[clusters.{}]\nkubeconfig_secret = \"dev-kubeconfig\"\n\
-                 identity = {{ claim = \"email\", prefix = \"oidc:\" }}\n",
-                testing::CLUSTER
-            ),
-        )
-        .await;
-        let svid = claim.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&claim.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(claims_of(&body)["kube_user"], "oidc:alice@example.com");
-
-        link(&pool, "alice-dev").await;
-        let svid = h.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(claims_of(&body)["kube_user"], "alice-dev");
     }
 
     /// alice launched the issue; bob unparks it. The run that follows was dispatched for bob, so
@@ -882,9 +796,11 @@ mod tests {
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let claims = claims_of(&body);
+        assert_eq!(claims["sub"].as_str(), Some("bob"));
         assert_eq!(
-            (claims["sub"].as_str(), claims["kube_user"].as_str()),
-            (Some("bob"), Some("bob-k8s"))
+            claims["kube_user"].as_str(),
+            Some("crucible:run:crucible-run-again"),
+            "the run's own identity, not bob's username"
         );
     }
 
@@ -1060,16 +976,6 @@ mod tests {
             (
                 "an unbound sandbox",
                 form(&h.spire.svid(&Spire::claims("sbx-unbound")), &[]),
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-            ),
-            (
-                "a run with no person behind it",
-                form(
-                    &h.spire
-                        .svid(&Spire::claims_from("crucible-run-team", "sbx-team")),
-                    &[],
-                ),
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
             ),

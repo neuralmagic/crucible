@@ -281,20 +281,24 @@ scopes and transport (`CRUCIBLE_AGENT_SERVERS`), the token endpoint
 (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`) and the issuer as SVID audience (`CRUCIBLE_AGENT_SVID_AUDIENCE`)
 as plain env. The engine registers a token-grant provider for each, so each sandbox's supervisor obtains its own token and injects it on traffic to the server
 alone; no token is minted per run. A server is granted only on a cluster whose SPIRE
-the issuer trusts. The run records what it got, with the server's scopes and, for a server
-that acts as `kube_user` such as crucible-kueue, the dispatcher's username there, and the run page
-shows it. A third server needs an `[[agent_servers]]` entry with its `url` and `scopes`, nothing
-else.
+the issuer trusts. The run records what it got, with the server's scopes and the run's Kubernetes
+identity its tokens carry, and the run page shows it. A third server needs an
+`[[agent_servers]]` entry with its `url` and `scopes`, nothing else.
 
 The deploy profile describes each server that takes agent tokens (`DeployProfile::agent_servers`):
-`[kueue]` needs a `kube_user` in every token and names `workload_namespaces`, the first as the
-`namespace` claim, for runs on its clusters; `[buildit]` needs neither. Each server's URL on each
+`[kueue]` names `workload_namespaces`, the first as the `namespace` claim, for runs on its
+clusters; `[buildit]` needs neither. `[kueue] shared_namespaces` (a subset of
+`workload_namespaces`, checked at profile load) names the namespaces every run may act in: the
+render binds ClusterRole `crucible-kueue-caller` — every verb the crucible-kueue access checks
+can ask, Secret reads narrowed to `pull_secrets` — to Group `crucible:runs` there. Naming them
+explicitly means adding a team namespace to `workload_namespaces` later never opens it to every
+run. Each server's URL on each
 of its clusters is an agent audience, with its scopes: `kueue.read kueue.submit` for crucible-kueue
 and `buildit.read buildit.build` for buildit. The rendered server trusts runs' tokens from the controller's
 `CONTROLLER_AGENT_ISSUER` (`crucible deploy render --kueue --issuer <it>`), fetching keys from
 `<issuer>/.well-known/jwks.json` unless `run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).
-`kube_authz` (`openshift` or `token`) is where the server takes a caller's groups for its
-SubjectAccessReviews. With `people = true` the rendered server also accepts people's tokens from
+`kube_authz` (`openshift` or `token`) is where the server takes a person's groups for its
+SubjectAccessReviews; a run's groups always come from its own token. With `people = true` the rendered server also accepts people's tokens from
 the same issuer (`--person-issuer`), and each cluster's server becomes a resource people's MCP
 clients get tokens for, at its Service URL or the cluster's `people_urls` entry.
 

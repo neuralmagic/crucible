@@ -1,12 +1,10 @@
 //! The MCP servers a run's agent is granted by default, from the deploy profile's server
 //! descriptions ([`DeployProfile::agent_servers`]), where the issuer mints their tokens and with
-//! the scopes it mints. Dispatch records what a run got, the run's principal fills in who each
-//! server that acts as a Kubernetes user acts as once it is stamped, the run page shows it, and a
-//! revision of the configured set tells people when it changes.
+//! the scopes it mints. Dispatch records what a run got, the run page shows it, and a revision of
+//! the configured set tells people when it changes.
 
 use crate::runs::workpod::agent_servers::AgentTokens;
 use anyhow::{Context, Result};
-use crucible::deploy::profile::DeployProfile;
 use crucible::deploy::servers::ServerSpec;
 use crucible_contract::agent_servers::ServerName;
 use serde::{Deserialize, Serialize};
@@ -23,7 +21,7 @@ pub struct AgentTool {
     pub cluster: String,
     /// The server's MCP URL, the audience of the run's tokens for it.
     pub url: String,
-    /// The Kubernetes username the server acts as, when it acts as one and it is known.
+    /// The Kubernetes username the run's tokens for the server carry, `crucible:run:<pod>`.
     pub kube_user: Option<String>,
     pub scopes: Vec<String>,
     /// What bounds it beyond its scopes: a namespace, a push repository, pull secrets.
@@ -198,60 +196,30 @@ pub async fn for_runs(
     Ok(by_run)
 }
 
-/// Record what run `run_id`, dispatched onto `cluster`, is granted. Who a server acts as is the
-/// run's principal, stamped after dispatch: [`attribute`] fills it in.
+/// Record what run `run_id`, dispatched onto `cluster` as pod `pod_name`, is granted, each tool
+/// with the Kubernetes user its tokens carry.
 pub async fn grant(
     db: &crate::Db,
     servers: &[ServerSpec],
     run_id: &str,
+    pod_name: &str,
     cluster: &str,
     tokens: &AgentTokens,
 ) -> Result<Vec<AgentTool>> {
-    let tools = granted(servers, cluster, tokens);
+    let mut tools = granted(servers, cluster, tokens);
+    let kube_user = crate::agent_auth::issuer::RunIdentity::user_of(pod_name);
+    for tool in &mut tools {
+        tool.kube_user = Some(kube_user.clone());
+    }
     record(db.pool(), run_id, &tools).await?;
     Ok(tools)
 }
 
-/// Fill in who run `run_id`'s tools act as, for each server the profile describes as acting as the
-/// token's `kube_user`: the username its tokens carry, the person it was dispatched for
-/// (`runs.dispatched_by`) under the profile's identity rule for the tool's cluster. Then say what
-/// the run got on the issue's event log, one line per server.
-pub async fn attribute(
-    db: &crate::Db,
-    profile: &DeployProfile,
-    issue_key: &str,
-    run_id: &str,
-) -> Result<()> {
-    let mut tools = for_run(db.pool(), run_id).await?;
+/// Say what run `run_id` got on the issue's event log, one line per server.
+pub async fn attribute(db: &crate::Db, issue_key: &str, run_id: &str) -> Result<()> {
+    let tools = for_run(db.pool(), run_id).await?;
     if tools.is_empty() {
         return Ok(());
-    }
-    let principal = crate::authz::model::Principal::Run(run_id.to_string());
-    let acting: Vec<ServerName> = profile
-        .agent_servers()?
-        .into_iter()
-        .filter(|s| s.requires_kube_user)
-        .map(|s| s.name)
-        .collect();
-    for tool in tools.iter_mut().filter(|t| acting.contains(&t.server)) {
-        use crate::identity::cluster_identity::{PrincipalError, Resolution, for_principal};
-        let resolved = match for_principal(db.pool(), profile, &tool.cluster, &principal).await {
-            Ok(resolved) => resolved,
-            Err(PrincipalError::Db(e)) => return Err(e),
-            Err(_) => break,
-        };
-        if let Resolution::Known { user, .. } = resolved {
-            tool.kube_user = Some(user.as_str().to_string());
-            sqlx::query(
-                "UPDATE run_agent_tools SET kube_user = $3 WHERE run_id = $1 AND server = $2",
-            )
-            .bind(run_id)
-            .bind(tool.server.as_str())
-            .bind(&tool.kube_user)
-            .execute(db.pool())
-            .await
-            .context("recording who a run's agent tool acts as")?;
-        }
     }
     let status = crate::issues::store::get_issue(db.pool(), issue_key)
         .await?
@@ -282,16 +250,11 @@ pub async fn attribute_launched(
     if !cfg.issues_agent_tokens() {
         return;
     }
-    let attributed = match cfg.profile().await {
-        Ok(Some(profile)) => attribute(db, &profile, issue_key, run_id).await,
-        Ok(None) => Ok(()),
-        Err(e) => Err(e),
-    };
-    if let Err(e) = attributed {
+    if let Err(e) = attribute(db, issue_key, run_id).await {
         tracing::warn!(
             run_id,
             error = format!("{e:#}"),
-            "recording who a run's agent tools act as failed"
+            "recording a run's agent tools on the event log failed"
         );
     }
 }
@@ -325,7 +288,7 @@ mod tests {
         push_repo = "quay.io/org/smoke"
     "#;
 
-    fn profile(text: &str) -> DeployProfile {
+    fn profile(text: &str) -> crucible::deploy::profile::DeployProfile {
         toml::from_str(text).expect("profile parses")
     }
 
@@ -454,53 +417,44 @@ mod tests {
             .unwrap();
     }
 
-    /// The record names who kueue acts as from the run's principal, as its tokens do: after a
-    /// redispatch by someone else, the new run acts for them.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_grant_acts_for_the_runs_principal_and_is_told_on_the_issue(pool: PgPool) {
+    /// The record carries the run's Kubernetes user, and the issue's event log says what the run
+    /// got, one line per server.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_grant_records_the_runs_identity_and_is_told_on_the_issue(pool: PgPool) {
         let db = crate::Db::new(pool.clone());
-        for (sub, login) in [("sub-alice", "alice"), ("sub-bob", "bob")] {
-            crate::identity::oidc::users::record_login(
-                &pool,
-                sub,
-                login,
-                Some(&format!("{login}@example.com")),
-                jiff::Timestamp::now(),
-            )
-            .await
-            .unwrap();
-        }
-        let p = profile(PROFILE);
+        run_dispatched_for(&pool, "run-1", "user:alice").await;
         let all = tokens(&["ocp", "k8s"]);
-        let tools = grant(&db, &servers(PROFILE), "run-1", "k8s", &all)
-            .await
-            .unwrap();
+        let tools = grant(
+            &db,
+            &servers(PROFILE),
+            "run-1",
+            "crucible-run-brave-otter",
+            "k8s",
+            &all,
+        )
+        .await
+        .unwrap();
         assert_eq!(tools.len(), 2);
+        for tool in &tools {
+            assert_eq!(
+                tool.kube_user.as_deref(),
+                Some("crucible:run:crucible-run-brave-otter"),
+                "the identity its tokens carry, known at dispatch"
+            );
+        }
         assert_eq!(
             for_run(&pool, "run-1").await.unwrap(),
             tools,
             "read back as recorded"
         );
-
-        run_dispatched_for(&pool, "run-1", "user:alice").await;
-        attribute(&db, &p, "owner/repo#1", "run-1").await.unwrap();
-        let recorded = for_run(&pool, "run-1").await.unwrap();
-        assert_eq!(
-            recorded[1].kube_user.as_deref(),
-            Some("oidc:alice@example.com"),
-            "the username k8s's rule gives alice"
-        );
-        assert_eq!(
-            recorded[0].kube_user, None,
-            "buildit acts as no Kubernetes user"
-        );
+        attribute(&db, "owner/repo#1", "run-1").await.unwrap();
         let events = db.events().read_for_key("owner/repo#1").await.unwrap();
         let reasons: Vec<&str> = events.iter().filter_map(|e| e.reason.as_deref()).collect();
         assert_eq!(
             reasons,
             [
-                "granted buildit/k8s (buildit.read buildit.build)",
-                "granted kueue/k8s as oidc:alice@example.com (kueue.read kueue.submit)"
+                "granted buildit/k8s as crucible:run:crucible-run-brave-otter (buildit.read buildit.build)",
+                "granted kueue/k8s as crucible:run:crucible-run-brave-otter (kueue.read kueue.submit)"
             ]
         );
         assert!(
@@ -508,31 +462,7 @@ mod tests {
                 .iter()
                 .all(|e| e.evidence.as_deref() == Some("run-1"))
         );
-
-        grant(&db, &servers(PROFILE), "run-2", "k8s", &all)
-            .await
-            .unwrap();
-        run_dispatched_for(&pool, "run-2", "user:bob").await;
-        attribute(&db, &p, "owner/repo#1", "run-2").await.unwrap();
-        assert_eq!(
-            for_run(&pool, "run-2").await.unwrap()[1]
-                .kube_user
-                .as_deref(),
-            Some("oidc:bob@example.com"),
-            "a redispatch for bob acts as bob"
-        );
-
-        grant(&db, &servers(PROFILE), "run-3", "ocp", &all)
-            .await
-            .unwrap();
-        run_dispatched_for(&pool, "run-3", "platform").await;
-        attribute(&db, &p, "owner/repo#1", "run-3").await.unwrap();
-        assert_eq!(
-            for_run(&pool, "run-3").await.unwrap()[0].kube_user,
-            None,
-            "no person, no username"
-        );
-        assert!(for_run(&pool, "run-4").await.unwrap().is_empty());
-        attribute(&db, &p, "owner/repo#1", "run-4").await.unwrap();
+        assert!(for_run(&pool, "run-2").await.unwrap().is_empty());
+        attribute(&db, "owner/repo#1", "run-2").await.unwrap();
     }
 }

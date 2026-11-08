@@ -465,8 +465,9 @@ pub(crate) async fn fire(
         created_by: core
             .owner_principal
             .as_deref()
-            .map(strip_user_prefix)
+            .and_then(|owner| owner.strip_prefix("user:"))
             .or(core.created_by.as_deref()),
+        owner: core.owner_principal.as_deref(),
         launcher_groups: core.owner_groups.as_ref(),
         rerun: None,
         dispatch: crate::launches::model::DispatchPin {
@@ -576,12 +577,6 @@ fn overlaid_params(
             cause,
         }
     })
-}
-
-/// The principal spelling a launch row stores. `playbook_launches.created_by` is a login, and the
-/// snapshot is a full principal, so the prefix comes off on the way in.
-pub(crate) fn strip_user_prefix(principal: &str) -> &str {
-    principal.strip_prefix("user:").unwrap_or(principal)
 }
 
 /// The owner principal and group snapshot a standing launch carries, for an update that must keep

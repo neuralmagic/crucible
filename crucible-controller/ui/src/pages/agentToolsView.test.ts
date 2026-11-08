@@ -29,12 +29,12 @@ function defaults(over: Partial<AgentToolDefaults> = {}): AgentToolDefaults {
 }
 
 describe('agentToolRows', () => {
-  it('names each server, who it acts as, its scopes and its limits in name order', () => {
+  it('names each server, the identity it acts as, its scopes and its limits in name order', () => {
     expect(agentToolRows([tool()])).toEqual([
       {
         key: 'kueue/ocp',
         title: 'kueue on ocp',
-        identity: 'as casey',
+        identity: 'acts as casey',
         scopes: 'kueue.read kueue.submit',
         limits: 'namespace crucible-kueue-e2e · pull_secrets quay-pull',
         url: 'http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp',

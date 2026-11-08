@@ -77,7 +77,13 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
         Some(method) => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             if let Err(refusal) = decide(&guard, &mut message, &principal, method).await {
-                tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "request refused");
+                tracing::info!(
+                    sub = %principal.subject,
+                    presenter = principal.presenter(),
+                    run = principal.claims.get("run_id").and_then(|v| v.as_str()).unwrap_or_default(),
+                    %refusal,
+                    "request refused"
+                );
                 return refuse(&guard, &parts.headers, id, method, refusal);
             }
             false
@@ -249,7 +255,11 @@ fn refused_tool_result(refusal: &Refusal) -> Value {
         "error": refusal.to_string(),
         "retryable": refusal.retryable(),
     });
-    json!({"content": [{"type": "text", "text": text.to_string()}], "isError": true})
+    json!({
+        "resultType": "complete",
+        "content": [{"type": "text", "text": text.to_string()}],
+        "isError": true,
+    })
 }
 
 fn plain(status: StatusCode, message: &'static str) -> Response {
@@ -595,6 +605,14 @@ mod tests {
         assert_eq!(body["result"]["isError"], true, "{body}");
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_a_complete_result_the_client_can_parse() {
+        let app = app(guard(None), Some(principal("kueue.submit")), false);
+        let (_, _, body, _) = post(app, call("workload_plan", json!({"queue": "other"}))).await;
+        assert_eq!(body["result"]["resultType"], "complete", "{body}");
+        assert_eq!(body["result"]["isError"], true, "{body}");
     }
 
     #[tokio::test]
