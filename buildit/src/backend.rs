@@ -22,14 +22,14 @@ pub struct PodOpts<'a> {
     pub node: Option<&'a str>,
 }
 
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Resources {
     pub requests: Vec<(String, String)>,
     pub limits: Vec<(String, String)>,
 }
 
 impl Resources {
-    fn requirements(&self) -> Option<core::ResourceRequirements> {
+    pub(crate) fn requirements(&self) -> Option<core::ResourceRequirements> {
         let map = |kvs: &[(String, String)]| {
             (!kvs.is_empty()).then(|| {
                 kvs.iter()

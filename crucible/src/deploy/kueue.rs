@@ -984,32 +984,35 @@ mod tests {
         let rules = role["rules"].as_array().unwrap().clone();
         let covers = |check: &AccessCheck| {
             rules.iter().any(|rule| {
-                rule["apiGroups"].as_array().map_or(false, |g| {
-                    g.iter().any(|g| g.as_str() == Some(check.group.as_str()))
-                }) && rule["resources"].as_array().map_or(false, |r| {
-                    r.iter().any(|r| {
-                        r.as_str().map_or(false, |r| {
-                            r == check.resource
-                                || (!check.subresource.is_empty()
-                                    && r == format!("{}/{}", check.resource, check.subresource))
+                rule["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|g| g.as_str() == Some(check.group.as_str())))
+                    && rule["resources"].as_array().is_some_and(|r| {
+                        r.iter().any(|r| {
+                            r.as_str().is_some_and(|r| {
+                                r == check.resource
+                                    || (!check.subresource.is_empty()
+                                        && r == format!("{}/{}", check.resource, check.subresource))
+                            })
                         })
                     })
-                }) && rule["verbs"].as_array().map_or(false, |v| {
-                    v.iter().any(|v| {
-                        v.as_str() == Some(check.verb.as_str())
-                            || check
-                                .or_verbs
+                    && rule["verbs"].as_array().is_some_and(|v| {
+                        v.iter().any(|v| {
+                            v.as_str() == Some(check.verb.as_str())
+                                || check
+                                    .or_verbs
+                                    .iter()
+                                    .any(|o| v.as_str() == Some(o.as_str()))
+                        })
+                    })
+                    && rule
+                        .get("resourceNames")
+                        .and_then(|n| n.as_array())
+                        .is_none_or(|names| {
+                            names
                                 .iter()
-                                .any(|o| v.as_str() == Some(o.as_str()))
-                    })
-                }) && rule
-                    .get("resourceNames")
-                    .and_then(|n| n.as_array())
-                    .map_or(true, |names| {
-                        names
-                            .iter()
-                            .any(|n| n.as_str() == Some(check.name.as_str()))
-                    })
+                                .any(|n| n.as_str() == Some(check.name.as_str()))
+                        })
             })
         };
         let principal = Principal::from_claims(

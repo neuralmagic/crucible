@@ -13,8 +13,8 @@ Commands:
   playbook-run          One playbook launch whole, as JSON
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
-  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
-  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  schedules             Recurrences: what fires when, and whether each is enabled
+  watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
   webhook               One webhook, as JSON
@@ -113,8 +113,8 @@ Commands:
   playbook-run          One playbook launch whole, as JSON
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
-  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
-  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  schedules             Recurrences: what fires when, and whether each is enabled
+  watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
   webhook               One webhook, as JSON
@@ -609,7 +609,7 @@ Options:
       --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
   -h, --help                   Print help
 ==== crux schedules --help ====
-Recurrences: what fires when, and what is blocked on an owner signing in
+Recurrences: what fires when, and whether each is enabled
 
 Usage: crux schedules [OPTIONS]
 
@@ -635,7 +635,7 @@ Options:
   -h, --help
           Print help
 ==== crux schedules -h ====
-Recurrences: what fires when, and what is blocked on an owner signing in
+Recurrences: what fires when, and whether each is enabled
 
 Usage: crux schedules [OPTIONS]
 
@@ -646,7 +646,7 @@ Options:
       --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
   -h, --help                   Print help
 ==== crux watches --help ====
-Tracker watches: what each sweeps, and what is blocked on an owner signing in
+Tracker watches: what each sweeps, and whether each is enabled
 
 Usage: crux watches [OPTIONS]
 
@@ -672,7 +672,7 @@ Options:
   -h, --help
           Print help
 ==== crux watches -h ====
-Tracker watches: what each sweeps, and what is blocked on an owner signing in
+Tracker watches: what each sweeps, and whether each is enabled
 
 Usage: crux watches [OPTIONS]
 
@@ -3490,8 +3490,8 @@ Commands:
   playbook-run          One playbook launch whole, as JSON
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
-  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
-  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  schedules             Recurrences: what fires when, and whether each is enabled
+  watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
   webhook               One webhook, as JSON
@@ -3568,8 +3568,8 @@ Commands:
   playbook-run          One playbook launch whole, as JSON
   runs                  The runs leaderboard
   run                   One run with its candidates, as JSON
-  schedules             Recurrences: what fires when, and what is blocked on an owner signing in
-  watches               Tracker watches: what each sweeps, and what is blocked on an owner signing in
+  schedules             Recurrences: what fires when, and whether each is enabled
+  watches               Tracker watches: what each sweeps, and whether each is enabled
   watch                 One tracker watch, as JSON
   webhooks              Webhooks: what each launches, how it verifies, and when it last took a delivery
   webhook               One webhook, as JSON

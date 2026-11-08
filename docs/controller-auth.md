@@ -84,7 +84,39 @@ request before it authenticates the request.
 | `CONTROLLER_OIDC_ISSUER` | The issuer URL. The controller reads discovery from `<issuer>/.well-known/openid-configuration`. |
 | `CONTROLLER_OIDC_CLIENT_ID`, `CONTROLLER_OIDC_CLIENT_SECRET` | The confidential client registered on the issuer. |
 | `CONTROLLER_OIDC_REDIRECT_URL` | A callback URL on the host of this controller, registered on the client. The controller answers at that path and at `/auth/callback`. |
-| `CONTROLLER_OIDC_SCOPES` | Default `openid,email,profile,offline_access`. Do not add `groups`. The claim comes from a client mapper, not a scope, and an unregistered scope makes every login fail. |
+| `CONTROLLER_OIDC_SCOPES` | Default `openid,email,profile`. Do not add `groups`. The claim comes from a client mapper, not a scope, and an unregistered scope makes every login fail. |
+| `CONTROLLER_OIDC_POST_LOGOUT_REDIRECT` | The page that the browser opens after RP-initiated logout. |
+| `CONTROLLER_SESSION_SECURE` | Set `true` behind TLS. The cookie is then `Secure` and `SameSite=Lax`. |
+
+The session holds the login, the email, and the `groups` claim from the issuer. Team
+membership rules match on groups. If the issuer emits no `groups` claim, no user gets access
+through groups, and there is no error. Test the claim before you point a deployment at the
+issuer:
+
+```sh
+CONTROLLER_OIDC_ISSUER=https://sso.example.com/realms/crucible \
+CONTROLLER_OIDC_CLIENT_ID=crucible-controller \
+CONTROLLER_OIDC_CLIENT_SECRET=... \
+crucible-controller oidc-claims
+```
+
+`oidc-claims` runs one login and prints every claim that the issuer gives this client. The
+test passes if the output has a `groups` array with the expected paths. After the change,
+`GET /api/whoami` in a browser reports the login and a list of groups that is not empty.
+
+### Groups for scheduled work
+
+A scheduled launch has no session. A schedule, watch, or webhook fires with the group snapshot
+its last save took, and the launch keeps only the groups that its owner's last sign-in still
+holds. A user who leaves a group loses it on scheduled work at their next sign-in.
+
+| Variable | Meaning |
+| --- | --- |
+| `CONTROLLER_AUTH_MODE` | Optional. `native` is the only accepted value. |
+| `CONTROLLER_OIDC_ISSUER` | The issuer URL. The controller reads discovery from `<issuer>/.well-known/openid-configuration`. |
+| `CONTROLLER_OIDC_CLIENT_ID`, `CONTROLLER_OIDC_CLIENT_SECRET` | The confidential client registered on the issuer. |
+| `CONTROLLER_OIDC_REDIRECT_URL` | A callback URL on the host of this controller, registered on the client. The controller answers at that path and at `/auth/callback`. |
+| `CONTROLLER_OIDC_SCOPES` | Default `openid,email,profile`. Do not add `groups`. The claim comes from a client mapper, not a scope, and an unregistered scope makes every login fail. |
 | `CONTROLLER_OIDC_POST_LOGOUT_REDIRECT` | The page that the browser opens after RP-initiated logout. |
 | `CONTROLLER_SESSION_SECURE` | Set `true` behind TLS. The cookie is then `Secure` and `SameSite=Lax`. |
 
@@ -141,9 +173,6 @@ The test suite of the controller uses the realm in
    `groups`, full group path on, added to the ID token and the userinfo endpoint. The
    controller reads groups as paths (`/platform-devs`). Team rules and
    `CONTROLLER_OPERATOR_GROUPS` match against these paths.
-3. **Offline access**, if schedules run with team secrets: assign the `offline_access` role
-   of the realm to the users (or to the default roles), and allow refresh-token reuse on the
-   client (Revoke Refresh Token off, or Refresh Token Max Reuse at least 1).
 
 With the reference realm running locally:
 
@@ -194,9 +223,8 @@ connectors:
             - platform-devs
 ```
 
-Dex issues refresh tokens if the client requests `offline_access` and the connector supports
-it (GitHub, LDAP, and OIDC upstreams do). Before you point the controller at Dex, use
-`oidc-claims` to check that `groups` has the expected format.
+Before you point the controller at Dex, use `oidc-claims` to check that `groups` has the
+expected format.
 
 ## Without an issuer
 

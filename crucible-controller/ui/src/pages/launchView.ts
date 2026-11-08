@@ -2,6 +2,7 @@
 // to. Pure functions so both are testable without a render.
 
 import type { components } from '../api/schema';
+import { issueStatusColor } from './issueStatus';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
 type PlaybookRun = components['schemas']['PlaybookRunDto'];
@@ -57,6 +58,17 @@ const ORIGIN_LABEL: Record<string, string> = {
   schedule: 'schedule',
   draft: 'draft studio',
 };
+
+/** A launch status as the run pages show it: the controller's `parked` token is always a launch
+ * error, so it reads as one. The wire value and the `?status=` filter value stay `parked`. */
+export function launchStatusLabel(status: string): string {
+  return status === 'parked' ? 'error' : status;
+}
+
+/** Swatch color for a launch status: a launch error is red, everything else keeps its issue color. */
+export function launchStatusColor(status: string): string {
+  return status === 'parked' ? 'red' : issueStatusColor(status);
+}
 
 /** How the launch is described in one word: its origin, spelled for a reader. */
 export function originLabel(origin: string): string {

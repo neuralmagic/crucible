@@ -1417,7 +1417,6 @@ mod tests {
             fired_at: Some("2026-08-23T14:00:03Z".to_string()),
             created_by: Some("wren".to_string()),
             owner_principal: Some("user:wren".to_string()),
-            owner_signin_required: false,
             dispatch_target: None,
             agent_provider: None,
             agent_model: None,

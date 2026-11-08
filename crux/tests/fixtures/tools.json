@@ -1027,7 +1027,7 @@
     "name": "crucible_runs"
   },
   {
-    "description": "Recurrences: ID PLAYBOOK CRON STATE NEXT LAST FAILS OWNER. STATE is `blocked` when the owner must sign in again — enabled, and still will not fire.",
+    "description": "Recurrences: ID PLAYBOOK CRON STATE NEXT LAST FAILS OWNER.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1207,7 +1207,7 @@
     "name": "crucible_watch"
   },
   {
-    "description": "Tracker watches: ID PLAYBOOK TRACKER QUERY STATE SWEPT LAUNCHED FAILS OWNER. A watch launches its playbook once per item its query matches, never again for the same item. STATE is `blocked` when the owner must sign in again.",
+    "description": "Tracker watches: ID PLAYBOOK TRACKER QUERY STATE SWEPT LAUNCHED FAILS OWNER. A watch launches its playbook once per item its query matches, never again for the same item.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {
@@ -1259,7 +1259,7 @@
     "name": "crucible_webhook_deliveries"
   },
   {
-    "description": "Webhooks: ID PLAYBOOK VERIFIER STATE RATE DELIVERED FAILS OWNER. A webhook launches its playbook from deliveries a sender outside the controller posts. STATE is `blocked` when the owner must sign in again.",
+    "description": "Webhooks: ID PLAYBOOK VERIFIER STATE RATE DELIVERED FAILS OWNER. A webhook launches its playbook from deliveries a sender outside the controller posts.",
     "inputSchema": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "properties": {

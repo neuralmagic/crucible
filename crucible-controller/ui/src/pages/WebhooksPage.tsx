@@ -83,8 +83,8 @@ const columns = helper.columns([
   }),
 ]);
 
-/// Every webhook the caller may read and whether it will launch: disabled, its owner's failed group
-/// refresh, or when it last took a delivery.
+/// Every webhook the caller may read and whether it will launch: disabled, or when it last took a
+/// delivery.
 export function WebhooksPage() {
   const webhooks = $api.useQuery('get', '/api/webhooks');
   const owner = useOwnerContext();

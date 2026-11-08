@@ -141,11 +141,6 @@ fn internal(e: impl Into<anyhow::Error>) -> Response {
 
 /// The rule that lets a caller manage a team, or the refusal.
 fn may_manage(caller: &Caller, slug: &TeamSlug) -> Result<&'static str, String> {
-    if !caller.path.holds_roles() {
-        return Err(
-            "this session's group refresh was refused; sign in again to manage a team".into(),
-        );
-    }
     if caller.principals.team_role(slug) == Some(TeamRole::Owner) {
         Ok("team-owner-all")
     } else if caller.principals.is_platform_admin() {
@@ -337,7 +332,7 @@ pub(crate) async fn create_team(
     let Some(creator) = caller.actor().cloned() else {
         return forbidden("an anonymous caller has no principal to create a team with");
     };
-    if !caller.path.may_own() || !caller.path.holds_roles() {
+    if !caller.path.may_own() {
         return denied(
             &state,
             team_event(&caller, Verb::Create, &body.slug, false, "no-rule"),

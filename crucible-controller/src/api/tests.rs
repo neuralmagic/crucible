@@ -3357,7 +3357,6 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbooks/imports/{id}/shares/{grantee}",
         "/api/providers/{id}/shares",
         "/api/providers/{id}/shares/{grantee}",
-        "/api/credentials/me",
         "/api/access",
         "/api/prefs",
         "/api/prefs/editor",
@@ -5779,11 +5778,7 @@ async fn app_with_sessions(db: Db, pool: PgPool) -> Router {
         true,
         crate::HumanAuth {
             guard: Arc::new(crate::identity::auth::BearerGuard::default()),
-            routes: crate::identity::oidc::routes::AuthState {
-                oidc: None,
-                pool,
-                credential_keys: None,
-            },
+            routes: crate::identity::oidc::routes::AuthState { oidc: None, pool },
             issuer: None,
         },
         crate::spa::Source::Embedded,
@@ -7644,9 +7639,7 @@ async fn the_runs_list_carries_the_snapshot_and_every_origin(pool: PgPool) -> Re
     assert_eq!(status, StatusCode::CREATED, "{schedule}");
     let schedule_id = schedule["id"].as_str().expect("id").to_string();
     let due: jiff::Timestamp = schedule["next_due_at"].as_str().expect("due").parse()?;
-    let fired =
-        crate::launches::schedules::fire_due(&db, due, 8, 5, std::time::Duration::from_secs(3600))
-            .await?;
+    let fired = crate::launches::schedules::fire_due(&db, due, 8, 5).await?;
     assert_eq!(fired.len(), 1, "{fired:?}");
     let firing = fired[0].as_str();
 
@@ -8216,7 +8209,7 @@ async fn activate_team_dispatch(app: &Router) {
         crate::authz::policy::DEFAULT_POLICY
     );
     let (status, body) = send_as(
-        &app,
+        app,
         "POST",
         "/api/authz/policy-sets",
         "wren",
@@ -8226,7 +8219,7 @@ async fn activate_team_dispatch(app: &Router) {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let digest = body["digest"].as_str().expect("digest").to_string();
     let (status, body) = send_as(
-        &app,
+        app,
         "POST",
         &format!("/api/authz/policy-sets/{digest}/activate"),
         "wren",
@@ -8768,9 +8761,7 @@ async fn a_fired_schedule_becomes_an_ordinary_launch(pool: PgPool) -> Result<()>
     let id = created["id"].as_str().expect("id").to_string();
     let due: jiff::Timestamp = created["next_due_at"].as_str().expect("due").parse()?;
 
-    let fired =
-        crate::launches::schedules::fire_due(&db, due, 8, 5, std::time::Duration::from_secs(3600))
-            .await?;
+    let fired = crate::launches::schedules::fire_due(&db, due, 8, 5).await?;
     assert_eq!(fired.len(), 1, "{fired:?}");
 
     let (status, run) = get_json_value(&app, &format!("/api/playbook-runs/{}", fired[0])).await;
@@ -10965,11 +10956,7 @@ async fn human_app_over(db: Db, pool: PgPool, scratch: &std::path::Path) -> Rout
         true,
         crate::HumanAuth {
             guard: Arc::new(crate::identity::auth::BearerGuard::default()),
-            routes: crate::identity::oidc::routes::AuthState {
-                oidc: None,
-                pool,
-                credential_keys: None,
-            },
+            routes: crate::identity::oidc::routes::AuthState { oidc: None, pool },
             issuer: None,
         },
         crate::spa::Source::Embedded,
@@ -11237,7 +11224,7 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
     drop(conn);
 
     let minted = crate::identity::api_key::mint(&pool, "sub-alice", "laptop", None).await?;
-    let who = crate::identity::api_key::verify(&pool, None, &minted.secret).await;
+    let who = crate::identity::api_key::verify(&pool, &minted.secret).await;
     let who = who.expect("the freshly minted key authenticates");
     assert_eq!(who.login, "alice");
     assert_eq!(who.sub, "sub-alice");
@@ -11252,13 +11239,13 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
         .expect("a minted key has both halves");
     let forged = format!("{}{id}_not-the-secret", crate::identity::api_key::PREFIX);
     assert_eq!(
-        crate::identity::api_key::verify(&pool, None, &forged)
+        crate::identity::api_key::verify(&pool, &forged)
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Unknown
     );
     assert_eq!(
-        crate::identity::api_key::verify(&pool, None, "not-a-key-at-all")
+        crate::identity::api_key::verify(&pool, "not-a-key-at-all")
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Malformed
@@ -11269,7 +11256,7 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
         crate::identity::api_key::mint(&pool, "sub-alice", "old", Some("2020-01-01T00:00:00Z"))
             .await?;
     assert!(matches!(
-        crate::identity::api_key::verify(&pool, None, &stale.secret)
+        crate::identity::api_key::verify(&pool, &stale.secret)
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Expired { .. }
@@ -11278,7 +11265,7 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
     // Revocation is immediate and says so by name.
     assert!(crate::identity::api_key::revoke(&pool, "sub-alice", &minted.key.id).await?);
     assert!(matches!(
-        crate::identity::api_key::verify(&pool, None, &minted.secret)
+        crate::identity::api_key::verify(&pool, &minted.secret)
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Revoked { .. }
@@ -11298,7 +11285,7 @@ async fn a_key_is_revocable_only_by_its_owner(pool: PgPool) -> Result<()> {
 
     assert!(!crate::identity::api_key::revoke(&pool, "sub-bob", &alices.key.id).await?);
     assert!(
-        crate::identity::api_key::verify(&pool, None, &alices.secret)
+        crate::identity::api_key::verify(&pool, &alices.secret)
             .await
             .is_ok(),
         "bob's revoke must not have touched alice's key"
@@ -11331,10 +11318,7 @@ async fn the_mcp_surface_speaks_mcp_to_a_key_and_nothing_to_anyone_else(
     let (db, _d) = db_with(pool.clone());
     let app = crate::mcp::router(
         app(db),
-        crate::identity::auth::KeyGuard {
-            pool,
-            refresh: None,
-        },
+        crate::identity::auth::KeyGuard { pool },
         "https://crucible-api.example.com".to_string(),
     );
 
@@ -14290,8 +14274,7 @@ fn app_with_webhook_keys(db: Db) -> Router {
     router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
         webhook_keys: Some(Arc::new(
-            crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![9u8; 32]])
-                .expect("keys"),
+            crate::launches::webhooks::keys::WebhookKeys::new(vec![vec![9u8; 32]]).expect("keys"),
         )),
         hooks_public_url: Some("https://hooks.example.com/".to_string()),
         ..ApiState::test(db)
@@ -14334,10 +14317,8 @@ async fn sweep_webhooks(db: &Db) -> Vec<String> {
         &crate::launches::webhooks::trigger::WebhookTrigger,
         crate::launches::standing::SweepCfg {
             auto_disable_after: 5,
-            owner_ttl: std::time::Duration::from_secs(3600),
         },
         jiff::Timestamp::now(),
-        None,
         None,
         &[],
     )
@@ -14484,10 +14465,6 @@ async fn a_webhook_save_refuses_each_bad_field(pool: PgPool) -> Result<()> {
     let app = app_with_webhook_keys(db.clone());
     let keyless = router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
-        credential_keys: Some(Arc::new(
-            crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![5u8; 32]])
-                .expect("keys"),
-        )),
         ..ApiState::test(db.clone())
     });
     register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
@@ -14836,12 +14813,8 @@ async fn a_webhook_transform_is_checked_with_positions_and_its_url_is_readable(
 const TEAM_GROUP: &str = "/groups/tibrahim-all";
 
 /// Team `tibrahim-all` with group [`TEAM_GROUP`] as a member, tibrahim's draft `cve-triage` whose
-/// playbook scope binds a secret the team owns, and a router that takes api keys whose stale owner
-/// groups are re-read through `refresh`.
-async fn team_secret_draft(
-    pool: &PgPool,
-    refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
-) -> Result<Router> {
+/// playbook scope binds a secret the team owns, and a router that takes api keys.
+async fn team_secret_draft(pool: &PgPool) -> Result<Router> {
     let (db, _d) = db_with(pool.clone());
     let state = ApiState {
         playbook_caps: crate::config::PlaybookCaps {
@@ -14851,11 +14824,10 @@ async fn team_secret_draft(
         ..ApiState::test(db)
     };
     let open = router(state.clone());
-    let mut guard = crate::identity::auth::BearerGuard::new(
+    let guard = crate::identity::auth::BearerGuard::new(
         crate::identity::auth::SharedToken::new("s3cr3t"),
         None,
     )?;
-    guard.refresh = refresh;
     let keyed = router(state).layer(axum::middleware::from_fn_with_state(
         crate::identity::auth::HumanOrKeyGuard {
             guard: Arc::new(guard),
@@ -14944,7 +14916,6 @@ async fn team_secret_draft(
 async fn launch_draft_with_key(
     app: &Router,
     pool: &PgPool,
-    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
     key: &str,
 ) -> Result<(
     Vec<String>,
@@ -14975,12 +14946,10 @@ async fn launch_draft_with_key(
         .expect("launch row");
     let launcher = crate::authz::resolve::dispatch_principals(
         pool,
-        refresh,
         launch.created_by.as_deref(),
         &launch.launcher_groups,
-        &launch.created_at,
     )
-    .await??;
+    .await?;
     let resolved = crate::secrets::launch::resolve(
         pool,
         &crate::authz::policy::Engine::load(crate::authz::policy::DEFAULT_POLICY)
@@ -14995,11 +14964,16 @@ async fn launch_draft_with_key(
     Ok((launch.launcher_groups, resolved))
 }
 
-/// Stamp `tibrahim`'s stored groups `hours` ago.
-async fn stamp_groups(pool: &PgPool, groups: &[String], hours: i64) -> Result<()> {
-    let at = jiff::Timestamp::now().checked_sub(jiff::SignedDuration::from_hours(hours))?;
+/// Stamp `tibrahim`'s stored groups, as a sign-in does.
+async fn stamp_groups(pool: &PgPool, groups: &[String]) -> Result<()> {
     let mut conn = pool.acquire().await?;
-    crate::identity::oidc::users::record_groups_on(&mut conn, "sub-tibrahim", groups, at).await
+    crate::identity::oidc::users::record_groups_on(
+        &mut conn,
+        "sub-tibrahim",
+        groups,
+        jiff::Timestamp::now(),
+    )
+    .await
 }
 
 fn team_not_owned(
@@ -15021,7 +14995,7 @@ fn team_not_owned(
 async fn an_api_key_launch_reaches_the_teams_its_owners_stored_groups_reach(
     pool: PgPool,
 ) -> Result<()> {
-    let keyed = team_secret_draft(&pool, None).await?;
+    let keyed = team_secret_draft(&pool).await?;
     crate::identity::oidc::users::record_login(
         &pool,
         "sub-tibrahim",
@@ -15030,185 +15004,58 @@ async fn an_api_key_launch_reaches_the_teams_its_owners_stored_groups_reach(
         jiff::Timestamp::now(),
     )
     .await?;
-    stamp_groups(&pool, &[TEAM_GROUP.to_string()], 0).await?;
+    stamp_groups(&pool, &[TEAM_GROUP.to_string()]).await?;
     let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
 
-    let (groups, resolved) = launch_draft_with_key(&keyed, &pool, None, &key.secret).await?;
+    let (groups, resolved) = launch_draft_with_key(&keyed, &pool, &key.secret).await?;
     assert_eq!(groups, vec![TEAM_GROUP.to_string()]);
     assert_eq!(resolved?.len(), 1, "the group reaches the owning team");
 
-    stamp_groups(&pool, &[], 0).await?;
-    let (groups, resolved) = launch_draft_with_key(&keyed, &pool, None, &key.secret).await?;
+    stamp_groups(&pool, &[]).await?;
+    let (groups, resolved) = launch_draft_with_key(&keyed, &pool, &key.secret).await?;
     assert!(groups.is_empty(), "{groups:?}");
     assert!(team_not_owned(&resolved), "{resolved:?}");
     Ok(())
 }
 
-/// Sign `tibrahim` in with `groups` stamped two hours ago and an offline credential sealed under the
-/// returned keys.
-async fn stale_owner(
-    pool: &PgPool,
-    groups: &[String],
-) -> Result<Arc<crate::identity::oidc::credentials::CredentialKeys>> {
-    let now = jiff::Timestamp::now();
-    crate::identity::oidc::users::record_login(pool, "sub-tibrahim", "tibrahim", None, now).await?;
-    stamp_groups(pool, groups, 2).await?;
-    let keys = Arc::new(crate::identity::oidc::credentials::CredentialKeys::new(
-        vec![vec![7u8; 32]],
-    )?);
-    let mut conn = pool.acquire().await?;
-    crate::identity::oidc::credentials::upsert(&mut conn, &keys, "sub-tibrahim", "offline", now)
-        .await?;
-    Ok(keys)
-}
-
-/// A refresher spending `tibrahim`'s credential against a local issuer whose ID token names `sub`
-/// with `groups`.
-async fn issuer_refresh(
-    pool: &PgPool,
-    keys: &Arc<crate::identity::oidc::credentials::CredentialKeys>,
-    sub: &str,
-    groups: &[&str],
-) -> (
-    wiremock::MockServer,
-    Arc<crate::identity::oidc::credentials::OwnerRefresh>,
-) {
-    let (server, provider) = crate::identity::oidc::tests::issuer_signing_for(sub, groups).await;
-    let refresh = Arc::new(crate::identity::oidc::credentials::OwnerRefresh::new(
-        pool.clone(),
-        provider,
-        keys.clone(),
-    ));
-    (server, refresh)
-}
-
-/// An api key whose owner's stamp has aged past the session window re-reads their groups through
-/// the offline credential, takes the issuer's current answer, and reaches the team it names.
+/// At dispatch the recorded groups the launcher's last sign-in still holds are kept and one it
+/// dropped is removed.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_stale_api_key_owner_is_refreshed_into_the_issuers_groups(pool: PgPool) -> Result<()> {
-    let keys = stale_owner(&pool, &["/groups/left".to_string()]).await?;
-    let (_issuer, refresh) = issuer_refresh(&pool, &keys, "sub-tibrahim", &[TEAM_GROUP]).await;
-    let keyed = team_secret_draft(&pool, Some(refresh.clone())).await?;
-    let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
+async fn a_dispatch_keeps_only_the_groups_the_last_sign_in_holds(pool: PgPool) -> Result<()> {
+    let _ = team_secret_draft(&pool).await?;
+    crate::identity::oidc::users::record_login(
+        &pool,
+        "sub-tibrahim",
+        "tibrahim",
+        None,
+        jiff::Timestamp::now(),
+    )
+    .await?;
+    let recorded = [TEAM_GROUP.to_string(), "/groups/dropped".to_string()];
+    stamp_groups(&pool, &[TEAM_GROUP.to_string()]).await?;
+    let held =
+        crate::authz::resolve::dispatch_principals(&pool, Some("tibrahim"), &recorded).await?;
+    assert_eq!(held.group_paths().collect::<Vec<_>>(), vec![TEAM_GROUP]);
+    assert!(!held.teams().is_empty(), "{held:?}");
 
-    let (groups, resolved) =
-        launch_draft_with_key(&keyed, &pool, Some(&refresh), &key.secret).await?;
-    assert_eq!(groups, vec![TEAM_GROUP.to_string()]);
-    assert_eq!(resolved?.len(), 1);
-    let (_, stored, at) = crate::identity::oidc::users::stamped(&pool, "tibrahim")
-        .await?
-        .expect("users row");
-    assert_eq!(stored, vec![TEAM_GROUP.to_string()]);
-    let at: jiff::Timestamp = at.expect("stamped").parse()?;
-    assert!(
-        jiff::Timestamp::now().duration_since(at) < jiff::SignedDuration::from_mins(1),
-        "the refresh restamped the row: {at}"
-    );
+    stamp_groups(&pool, &[]).await?;
+    let held =
+        crate::authz::resolve::dispatch_principals(&pool, Some("tibrahim"), &recorded).await?;
+    assert_eq!(held.group_paths().count(), 0, "{held:?}");
+    assert!(held.teams().is_empty(), "{held:?}");
     Ok(())
 }
 
-/// An api key whose owner's stale stamp meets a refused refresh holds no groups, and its launch
-/// cannot reach the team secret.
+/// A launcher with no `users` row holds none of its recorded groups, nor does a launch that
+/// names no launcher.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_refused_refresh_leaves_a_stale_api_key_outside_the_team(pool: PgPool) -> Result<()> {
-    let keys = stale_owner(&pool, &[TEAM_GROUP.to_string()]).await?;
-    let (_issuer, refresh) = issuer_refresh(&pool, &keys, "sub-mallory", &[TEAM_GROUP]).await;
-    let keyed = team_secret_draft(&pool, Some(refresh.clone())).await?;
-    let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
-
-    let (groups, resolved) =
-        launch_draft_with_key(&keyed, &pool, Some(&refresh), &key.secret).await?;
-    assert!(groups.is_empty(), "{groups:?}");
-    assert!(team_not_owned(&resolved), "{resolved:?}");
-    let status = crate::identity::oidc::credentials::status(&pool, "sub-tibrahim")
-        .await?
-        .expect("credential row");
-    assert_eq!(status.failures, 1, "one refusal, recorded once");
-    Ok(())
-}
-
-/// At dispatch a stale stamp is refreshed: the recorded groups the issuer still asserts are kept,
-/// one it dropped is removed, and an issuer that cannot be reached defers the dispatch. With no
-/// refresher the stale stamp stands, as a session's does.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
-    use crate::identity::oidc::credentials::OwnerRefresh;
-    let recorded = [TEAM_GROUP.to_string(), "/groups/left".to_string()];
-    let keys = stale_owner(&pool, &recorded).await?;
-    let _ = team_secret_draft(&pool, None).await?;
-    let launched_at = jiff::Timestamp::now().to_string();
-    let dispatch = async |refresh: Option<&OwnerRefresh>| {
-        crate::authz::resolve::dispatch_principals(
-            &pool,
-            refresh,
-            Some("tibrahim"),
-            &recorded,
-            &launched_at,
-        )
-        .await
-    };
-
-    let (_kept, refresh) = issuer_refresh(&pool, &keys, "sub-tibrahim", &[TEAM_GROUP]).await;
-    let launcher = dispatch(Some(&refresh)).await??;
-    assert_eq!(launcher.group_paths().collect::<Vec<_>>(), vec![TEAM_GROUP]);
-    assert!(!launcher.teams().is_empty(), "{launcher:?}");
-
-    stamp_groups(&pool, &recorded, 2).await?;
-    let (_dropped, refresh) = issuer_refresh(&pool, &keys, "sub-tibrahim", &["/groups/left"]).await;
-    let launcher = dispatch(Some(&refresh)).await??;
-    assert_eq!(
-        launcher.group_paths().collect::<Vec<_>>(),
-        vec!["/groups/left"]
-    );
-    assert!(launcher.teams().is_empty(), "{launcher:?}");
-
-    stamp_groups(&pool, &recorded, 2).await?;
-    let unreachable = OwnerRefresh::new(
-        pool.clone(),
-        crate::identity::oidc::tests::provider_at("http://127.0.0.1:1/realms/nobody"),
-        keys,
-    );
-    let launcher = dispatch(Some(&unreachable)).await?;
-    assert!(launcher.is_err(), "{launcher:?}");
-    let (_, stored, _) = crate::identity::oidc::users::stamped(&pool, "tibrahim")
-        .await?
-        .expect("users row");
-    assert_eq!(stored, recorded, "an outage leaves the stored groups alone");
-
-    let launcher = dispatch(None).await??;
-    assert_eq!(launcher.group_paths().collect::<Vec<_>>(), recorded);
-    assert!(!launcher.teams().is_empty(), "{launcher:?}");
-    Ok(())
-}
-
-/// A launcher with no `users` row keeps its recorded groups while the launch is younger than the
-/// session group refresh window and holds none after, as does a launch that names no launcher.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_launcher_with_no_users_row_holds_groups_by_launch_age(pool: PgPool) -> Result<()> {
-    let _ = team_secret_draft(&pool, None).await?;
+async fn a_launcher_with_no_users_row_holds_no_groups(pool: PgPool) -> Result<()> {
+    let _ = team_secret_draft(&pool).await?;
     let team = [TEAM_GROUP.to_string()];
-    let window = jiff::SignedDuration::try_from(
-        crate::identity::oidc::users::session_group_refresh_interval(),
-    )?;
-    let now = jiff::Timestamp::now();
-    let young = now.checked_sub(window / 2)?.to_string();
-    let old = now
-        .checked_sub(window + jiff::SignedDuration::from_mins(1))?
-        .to_string();
-    let dispatch = async |login, launched_at: &str| {
-        crate::authz::resolve::dispatch_principals(&pool, None, login, &team, launched_at).await
-    };
     for login in [Some("cli-user"), None] {
-        let fresh = dispatch(login, &young).await??;
-        assert_eq!(
-            fresh.group_paths().collect::<Vec<_>>(),
-            vec![TEAM_GROUP],
-            "{login:?}"
-        );
-        assert!(!fresh.teams().is_empty(), "{login:?}: {fresh:?}");
-        let aged = dispatch(login, &old).await??;
-        assert_eq!(aged.group_paths().count(), 0, "{login:?}: {aged:?}");
-        assert!(aged.teams().is_empty(), "{login:?}: {aged:?}");
+        let held = crate::authz::resolve::dispatch_principals(&pool, login, &team).await?;
+        assert_eq!(held.group_paths().count(), 0, "{login:?}: {held:?}");
+        assert!(held.teams().is_empty(), "{login:?}: {held:?}");
     }
     Ok(())
 }

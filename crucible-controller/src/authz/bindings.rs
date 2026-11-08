@@ -822,8 +822,6 @@ pub static BINDINGS: &[Binding] = &[
     bind("GET", "/api/keys", R::ApiKey, V::Read, Route),
     bind("POST", "/api/keys", R::ApiKey, V::Create, Route),
     bind("DELETE", "/api/keys/{id}", R::ApiKey, V::Delete, Route),
-    bind("GET", "/api/credentials/me", R::ApiKey, V::Read, Route),
-    bind("DELETE", "/api/credentials/me", R::ApiKey, V::Delete, Route),
     bind("GET", "/api/prefs", R::UserPrefs, V::Read, Route),
     bind("PUT", "/api/prefs", R::UserPrefs, V::Update, Route),
     bind("GET", "/api/prefs/editor", R::UserPrefs, V::Read, Route),

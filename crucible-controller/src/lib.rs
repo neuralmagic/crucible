@@ -175,21 +175,12 @@ impl Surface {
         config::refuse_retired_settings(|var| std::env::var(var).ok())?;
         let oidc =
             identity::oidc::OidcProvider::from_env().context("reading the oidc registration")?;
-        let credential_keys = identity::oidc::credentials::CredentialKeys::from_env()
-            .context("reading the offline credential key")?;
-        if oidc.is_some() && credential_keys.is_none() {
-            tracing::warn!(
-                "no credential key mounted: logins store no offline credential, so scheduled launches stay on the schedule-row snapshot"
-            );
-        }
-        let webhook_keys = identity::oidc::credentials::CredentialKeys::webhook_from_env()
-            .context("reading the webhook key")?;
+        let webhook_keys =
+            launches::webhooks::keys::WebhookKeys::from_env().context("reading the webhook key")?;
         let pool_for_hooks = state.db.pool().clone();
-        let state = state
-            .with_oidc(oidc.clone(), credential_keys.clone())
-            .with_webhook_keys(webhook_keys.clone());
+        let state = state.with_webhook_keys(webhook_keys.clone());
         let guard = Arc::new(
-            identity::auth::BearerGuard::from_env(oidc.clone(), Some(state.db.pool().clone()))
+            identity::auth::BearerGuard::from_env(oidc.clone())
                 .context("building the bearer guard")?,
         );
         let bind_addr = if guard.is_open() {
@@ -217,7 +208,6 @@ impl Surface {
             api::router(state.clone()),
             identity::auth::KeyGuard {
                 pool: db.pool().clone(),
-                refresh: guard.refresh.clone(),
             },
             state.public_url.clone().unwrap_or_default(),
         );
@@ -235,7 +225,6 @@ impl Surface {
                 routes: identity::oidc::routes::AuthState {
                     oidc,
                     pool: db.pool().clone(),
-                    credential_keys,
                 },
                 issuer: agent_auth.clone(),
             },

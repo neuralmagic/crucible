@@ -808,7 +808,6 @@ The steps are these:
    redirect URI with `error`, `state` and `iss`.
 5. Without a native session, the controller sends the browser to `/auth/login`. After the
    login, the browser returns to `/oauth/authorize`.
-   A session whose group refresh failed counts as no session.
 6. The request waits on the session under a random id. The consent page shows it only to the
    same browser and the same person. The page names the client and shows the `host:port` that
    the code goes to (section 4.1.5). No page may frame it: every SPA response and the authorize
@@ -885,17 +884,13 @@ approval loses the approval.
 Every refresh reads the person again (`crucible-controller/src/identity/people_directory.rs:35`):
 
 - A deleted `users` row revokes the approval.
-- A stored offline credential that the upstream SSO refused (`user_credentials.last_error`)
-  revokes the approval.
 - An unlinked cluster username revokes the approval. A new link appears in the next token.
 
 Warning: A refresh does not ask the upstream identity provider. A person deactivated there keeps
-refreshing until something else refuses them: a stored offline credential the SSO then refuses,
-the 14-day idle limit, or the 90-day cap on an approval (`REFRESH_IDLE_SECS`,
-`REFRESH_ABSOLUTE_SECS` in `crucible-controller/src/agent_auth/people/grants.rs`). Without a
-stored credential (`CONTROLLER_CREDENTIAL_KEY` unset, or a person who never stored one), nothing
-else does. To cut a person off sooner, delete their `users` row, which also drops their stored
-credential and API keys.
+refreshing until the 14-day idle limit or the 90-day cap on an approval refuses them
+(`REFRESH_IDLE_SECS`, `REFRESH_ABSOLUTE_SECS` in
+`crucible-controller/src/agent_auth/people/grants.rs`). To cut a person off sooner, delete their
+`users` row, which also drops their API keys.
 
 Warning: A client that retries a refresh after a lost response presents a spent token. The
 controller treats that as reuse and revokes the approval. The person must approve the client

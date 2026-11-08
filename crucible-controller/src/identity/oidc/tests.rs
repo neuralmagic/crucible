@@ -100,8 +100,8 @@ async fn the_registration_reads_off_the_environment_and_refuses_half_of_one() {
     let cfg = OidcCfg::from_env().expect("reads").expect("configured");
     assert_eq!(
         cfg.scopes,
-        vec!["openid", "email", "profile", "offline_access"],
-        "the default scope set carries offline_access"
+        vec!["openid", "email", "profile"],
+        "the default scope set"
     );
     assert!(cfg.client_secret.is_none());
 
@@ -240,62 +240,13 @@ pub(crate) async fn issuer_answering(
     (server, provider)
 }
 
-/// A real HTTP issuer that signs: its key set holds a freshly generated RS256 key, and its token
-/// endpoint answers every grant with an ID token for `sub` carrying `groups`, signed by that key,
-/// plus the rotated refresh token `rotated`.
-pub(crate) async fn issuer_signing_for(
-    sub: &str,
-    groups: &[&str],
-) -> (wiremock::MockServer, Arc<OidcProvider>) {
-    use aws_lc_rs::rsa::{KeyPair, KeySize, PublicKeyComponents};
-    use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256};
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    let server = wiremock::MockServer::start().await;
-    let base = server.uri();
-    let key = KeyPair::generate(KeySize::Rsa2048).expect("rsa key");
-    let public = PublicKeyComponents::<Vec<u8>>::from(key.public_key());
-    let now = jiff::Timestamp::now().as_second();
-    let header = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": "local"});
-    let claims = serde_json::json!({
-        "iss": base,
-        "aud": "rp",
-        "sub": sub,
-        "iat": now,
-        "exp": now + 300,
-        "preferred_username": "local-user",
-        "groups": groups,
-    });
-    let signing_input = format!(
-        "{}.{}",
-        b64.encode(header.to_string()),
-        b64.encode(claims.to_string())
-    );
-    let mut signature = vec![0u8; key.public_modulus_len()];
-    key.sign(
-        &RSA_PKCS1_SHA256,
-        &aws_lc_rs::rand::SystemRandom::new(),
-        signing_input.as_bytes(),
-        &mut signature,
-    )
-    .expect("sign");
-    let jwks = serde_json::json!({ "keys": [{
-        "kty": "RSA",
-        "use": "sig",
-        "alg": "RS256",
-        "kid": "local",
-        "n": b64.encode(&public.n),
-        "e": b64.encode(&public.e),
-    }]});
-    let token = wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-        "access_token": "opaque-access",
-        "token_type": "Bearer",
-        "expires_in": 300,
-        "id_token": format!("{signing_input}.{}", b64.encode(signature)),
-        "refresh_token": "rotated",
-    }));
-    serve_issuer(&server, jwks, token).await;
-    (server, provider_at(&base))
+fn login_flow() -> crate::identity::session::LoginFlow {
+    crate::identity::session::LoginFlow {
+        state: "state".to_string(),
+        nonce: "nonce".to_string(),
+        pkce_verifier: "verifier-verifier-verifier-verifier-verifier-0".to_string(),
+        redirect_to: "/".to_string(),
+    }
 }
 
 async fn serve_issuer(
@@ -334,8 +285,8 @@ async fn serve_issuer(
 
 /// Everything short of an issuer-authored refusal is the issuer being unreachable. A 5xx from the
 /// route in front of a restarting Keycloak carries an HTML or empty body, which the oauth2 client
-/// reports as a parse or "other" failure — classifying those as refusals would count a failure on
-/// the credential, downgrade live sessions, and park schedules over a rollout.
+/// reports as a parse or "other" failure — classifying those as refusals would tell a user signing
+/// in during a rollout that their login is bad.
 #[tokio::test]
 async fn an_issuer_front_door_error_is_unreachable_not_a_refusal() {
     let cases = [
@@ -361,16 +312,18 @@ async fn an_issuer_front_door_error_is_unreachable_not_a_refusal() {
     ];
     for (what, template) in cases {
         let (_server, provider) = issuer_answering(template).await;
-        let err = provider.refresh("offline-token").await.expect_err("fails");
+        let err = provider
+            .exchange("code".to_string(), &login_flow())
+            .await
+            .expect_err("fails");
         assert!(
             matches!(err, OidcError::Unavailable(_)),
-            "{what} must retry, not kill the credential: {err:?}"
+            "{what} must read as unreachable, not a refused login: {err:?}"
         );
     }
 }
 
-/// The other side of the split: an OAuth error document naming a dead grant is definitive, and
-/// costs the user a fresh sign-in.
+/// The other side of the split: an OAuth error document naming a dead grant is definitive.
 #[tokio::test]
 async fn a_revoked_grant_is_a_refusal() {
     for code in ["invalid_grant", "invalid_client", "unauthorized_client"] {
@@ -379,7 +332,10 @@ async fn a_revoked_grant_is_a_refusal() {
                 .set_body_json(serde_json::json!({ "error": code })),
         )
         .await;
-        let err = provider.refresh("offline-token").await.expect_err("fails");
+        let err = provider
+            .exchange("code".to_string(), &login_flow())
+            .await
+            .expect_err("fails");
         assert!(
             matches!(err, OidcError::Rejected(_)),
             "{code} is definitive: {err:?}"
@@ -412,7 +368,6 @@ async fn the_callback_is_mounted_at_the_redirect_urls_path(pool: sqlx::PgPool) {
     let app = routes::router(routes::AuthState {
         oidc: Some(Arc::new(provider)),
         pool,
-        credential_keys: None,
     });
     for path in ["/oauth2/callback", "/auth/callback"] {
         let res = app

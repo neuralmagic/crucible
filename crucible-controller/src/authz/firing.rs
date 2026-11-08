@@ -12,8 +12,8 @@ use crate::authz::store::{self, AuditEvent};
 use anyhow::{Context, Result};
 use sqlx::PgPool;
 
-/// The subject a firing runs as. A user owner acts with the groups the last save or refresh
-/// snapshotted and the teams those reach; a team owner acts as the team at `maintainer`.
+/// The subject a firing runs as. A user owner acts with the groups the last save snapshotted and
+/// the teams those reach; a team owner acts as the team at `maintainer`.
 pub async fn subject_for_owner(
     pool: &PgPool,
     owner: &Principal,

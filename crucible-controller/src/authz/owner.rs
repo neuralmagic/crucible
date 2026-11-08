@@ -451,7 +451,7 @@ mod tests {
     fn a_credential_that_may_not_own_and_an_anonymous_caller_are_refused() {
         let anon = caller(None, &[], &[], AuthPath::Session);
         assert_eq!(resolve_owner(&anon, None), Err(OwnerRefusal::Anonymous));
-        let unknown = caller(Some("x"), &[], &[], AuthPath::DowngradedSession);
+        let unknown = caller(Some("x"), &[], &[], AuthPath::Impersonated);
         assert_eq!(resolve_owner(&unknown, None), Err(OwnerRefusal::CannotOwn));
     }
 }

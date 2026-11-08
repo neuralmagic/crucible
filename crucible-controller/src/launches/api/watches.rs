@@ -55,14 +55,8 @@ dto! {
         /// Sweeps that did not launch since the last one that did.
         pub consecutive_failures: i64,
         pub created_by: Option<String>,
-        /// The principal this watch's launches run under, and when its group snapshot was last taken.
+        /// The principal this watch's launches run under.
         pub owner_principal: Option<String>,
-        pub owner_groups_at: Option<String>,
-        /// The fire-time group refresh, for the watches view: whether the owner has to sign in again
-        /// before this watch can launch, why the last refresh did not land, and when it was tried.
-        pub owner_signin_required: bool,
-        pub owner_refresh_error: Option<String>,
-        pub owner_refresh_at: Option<String>,
         pub dispatch_target: Option<String>,
         pub agent_provider: Option<String>,
         pub agent_model: Option<String>,
@@ -571,15 +565,6 @@ pub(crate) async fn update_watch(
         Ok(None) => return not_found(format!("no watch {id:?}")),
         Err(e) => return crate::launches::api::save_failed(e),
     };
-    // The re-save re-owned the row, so the launches that parked under the old snapshot will never
-    // run.
-    match crate::launches::watches::expire_stale_owner_parks(state.db.pool(), &id).await {
-        Ok(expired) if !expired.is_empty() => {
-            tracing::info!(watch = %id, expired = expired.len(), "watches: re-save expired stale-owner parks");
-        }
-        Ok(_) => {}
-        Err(e) => return ApiError::from(e).into_response(),
-    }
     let audit_reason = format!(
         "playbook {} rewatching {} {:?} from {} as {}",
         stored.playbook,

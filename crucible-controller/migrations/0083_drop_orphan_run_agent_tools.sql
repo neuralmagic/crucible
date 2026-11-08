@@ -1,4 +1,4 @@
--- 0082_drop_orphan_run_agent_tools.sql — delete run_agent_tools rows whose run is gone, older
+-- 0083_drop_orphan_run_agent_tools.sql — delete run_agent_tools rows whose run is gone, older
 -- than a day so a dispatch still writing its row is never raced. New orphans cannot appear:
 -- delete_unstarted_run drops the run's rows in the same transaction.
 DELETE FROM run_agent_tools

@@ -36,8 +36,6 @@ pub(crate) mod tests;
         system::healthz,
         system::version,
         system::whoami,
-        crate::identity::api::credentials::get_credential,
-        crate::identity::api::credentials::revoke_credential,
         crate::identity::api::keys::list_keys,
         crate::identity::api::keys::mint_key,
         crate::identity::api::keys::revoke_key,
@@ -446,10 +444,6 @@ pub fn router(state: ApiState) -> Router {
             crate::authz::impersonation::stop
         ))
         .routes(routes!(crate::authz::explain::explain))
-        .routes(routes!(
-            crate::identity::api::credentials::get_credential,
-            crate::identity::api::credentials::revoke_credential
-        ))
         .routes(routes!(
             crate::identity::api::keys::list_keys,
             crate::identity::api::keys::mint_key

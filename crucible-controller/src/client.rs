@@ -533,12 +533,16 @@ mod tests {
                 "2e532fda4c9b1b68bc93d305d00ed31865931eaca09610ba1712e0692b4b1f0c",
             ),
             (
-                "0081_launch_owner.sql",
-                "ccc7f9c1918fccb241910869b401abe0fd9df94a97d5090a3ef9ad55f1f0bb47",
+                "0081_drop_offline_credential.sql",
+                "d89538dcc83635668a87b392bf048d770dc8baafba0ef3beb0707a4b4e1613c7",
             ),
             (
-                "0082_drop_orphan_run_agent_tools.sql",
-                "8a8721e5949744fa0f42df4fb46029f684fd0e4541d65d63168d9361b35062fc",
+                "0082_launch_owner.sql",
+                "f5c5a02a9deb825a4c2da16366a6cf1a100da187b2f86e361663f0d45bce2dff",
+            ),
+            (
+                "0083_drop_orphan_run_agent_tools.sql",
+                "0da06c06a8473f4990a68b4e9b4a4ea01eefcefc1d24463fc708dd1b44d52e0d",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
