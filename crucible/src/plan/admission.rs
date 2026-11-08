@@ -2,7 +2,7 @@
 //! starts, not when its batch is handed to the runner, so a wide fan-out stops at the cost ceiling
 //! partway through rather than after every lane has run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Write;
 use std::num::NonZeroUsize;
@@ -17,6 +17,39 @@ use crate::deadline::{Deadline, RunCeiling};
 use crate::plan::attempt::{Attempt, BatchItem};
 use crate::plan::ir::{Task, TaskName};
 use crate::plan::machine::BlockedReason;
+
+/// When each task's first attempt started in this process, so its result can say how long the
+/// task took. A fan-out node's time runs from its earliest instance.
+#[derive(Debug, Default)]
+pub struct TaskClock(Mutex<HashMap<String, Instant>>);
+
+impl TaskClock {
+    fn started(&self, task: &TaskName) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(task.0.clone())
+            .or_insert_with(Instant::now);
+    }
+
+    /// Seconds since `task`, or the earliest of its instances, first started; zero when none did.
+    pub fn secs(&self, task: &TaskName) -> f64 {
+        let instance = format!("{}[", task.0);
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|(name, _)| **name == task.0 || name.starts_with(&instance))
+            .map(|(_, at)| *at)
+            .min()
+            .map_or(0.0, |at| at.elapsed().as_secs_f64())
+    }
+}
+
+/// The current time as the session log writes it.
+pub fn stamp() -> String {
+    jiff::Timestamp::now().to_string()
+}
 
 /// Lanes of one dispatch in flight at once, unless the executor is configured otherwise.
 pub const DEFAULT_WIDTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
@@ -78,6 +111,7 @@ pub struct Admission<'j> {
     journal: Option<&'j File>,
     /// Lanes on several threads append to the one journal; this keeps their lines whole.
     journal_lock: Mutex<()>,
+    clock: Option<&'j TaskClock>,
 }
 
 #[derive(Default)]
@@ -159,12 +193,18 @@ impl<'j> Admission<'j> {
             }),
             journal: None,
             journal_lock: Mutex::new(()),
+            clock: None,
         }
     }
 
     /// Record every admitted lane in `journal` before it runs.
     pub fn journaled(self, journal: Option<&'j File>) -> Self {
         Admission { journal, ..self }
+    }
+
+    /// Note on `clock` when each task first starts.
+    pub fn clocked(self, clock: Option<&'j TaskClock>) -> Self {
+        Admission { clock, ..self }
     }
 
     fn append(&self, event: &SessionEvent, sync: bool) -> std::io::Result<()> {
@@ -197,6 +237,9 @@ impl<'j> Admission<'j> {
         tally.next += 1;
         tally.live.insert(id, 0.0);
         drop(tally);
+        if let Some(clock) = self.clock {
+            clock.started(&task.name);
+        }
         // Synced, so a resumed run can charge an attempt whose process died before it settled
         // (RFC-0002:C-PLAYBOOK-RESUME).
         if let Err(error) = self.append(
@@ -204,6 +247,7 @@ impl<'j> Admission<'j> {
                 task: task.name.0.clone(),
                 attempt: lane.attempt,
                 estimate_usd: estimate_usd(task, self.budget, self.width),
+                at: Some(stamp()),
             },
             true,
         ) {
@@ -290,7 +334,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::deadline::{Bound, RunCeiling};
-    use crate::plan::admission::{Admission, Refusal};
+    use crate::plan::admission::{Admission, Refusal, TaskClock};
     use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
     use crate::plan::ir::{Join, Stage, Task, TaskKind};
 
@@ -513,6 +557,46 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_task_is_timed_from_its_first_attempt_and_a_fan_out_from_its_earliest_instance() {
+        let clock = TaskClock::default();
+        let admission = Admission::new(10.0, 0.0, None, width(4)).clocked(Some(&clock));
+        let fetch = command("fetch");
+        let first = admission.run(&one(&fetch), |_| {
+            std::thread::sleep(Duration::from_millis(200));
+            costing(0.0)
+        });
+        assert!(first.is_ok());
+        let retry = BatchItem {
+            task: &fetch,
+            attempt: 2,
+            ..one(&fetch)
+        };
+        assert!(admission.run(&retry, |_| costing(0.0)).is_ok());
+        let fetch_secs = clock.secs(&fetch.name);
+        assert!(
+            fetch_secs >= 0.2,
+            "a retry does not restart the task's clock: {fetch_secs}"
+        );
+
+        let a = agent("edit[a]");
+        let b = agent("edit[b]");
+        assert!(admission.run(&one(&a), |_| costing(0.0)).is_ok());
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(admission.run(&one(&b), |_| costing(0.0)).is_ok());
+        let edit = clock.secs(&crate::plan::ir::TaskName("edit".into()));
+        let edit_b = clock.secs(&b.name);
+        assert!(
+            edit >= edit_b + 0.09,
+            "the node runs from its earliest instance: {edit} vs {edit_b}"
+        );
+        assert_eq!(
+            clock.secs(&crate::plan::ir::TaskName("editor".into())),
+            0.0,
+            "a task that only shares a prefix never started"
+        );
+    }
+
     /// A lane is recorded as it is admitted, with its attempt and what a resume would charge
     /// for it, so a lane the ceiling refused leaves nothing to charge.
     #[test]
@@ -583,7 +667,15 @@ mod tests {
                         task,
                         attempt,
                         estimate_usd,
-                    } => (task, attempt, estimate_usd),
+                        at,
+                    } => {
+                        assert!(
+                            at.as_deref()
+                                .is_some_and(|at| at.parse::<jiff::Timestamp>().is_ok()),
+                            "a start says when: {at:?}"
+                        );
+                        (task, attempt, estimate_usd)
+                    }
                     other => panic!("not a task start: {other:?}"),
                 })
                 .collect()

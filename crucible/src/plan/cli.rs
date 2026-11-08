@@ -970,6 +970,7 @@ pub fn run(
     let files = evidence
         .as_ref()
         .map(|p| crate::plan::files::CapturedFiles::new(&p.state));
+    let clock = crate::plan::admission::TaskClock::default();
     let out = execute(
         &plan,
         &substrate,
@@ -979,6 +980,7 @@ pub fn run(
             early_completion: playbook,
             prior: prior.as_ref(),
             journal: events.as_ref(),
+            clock: Some(&clock),
             files: files.as_ref(),
             decisions: desk
                 .as_ref()
@@ -997,6 +999,7 @@ pub fn run(
                         task,
                         result,
                         agent_args.as_ref(),
+                        clock.secs(&task.name),
                     ),
                 );
             }
@@ -1671,7 +1674,7 @@ mod tests {
             repairs: Vec::new(),
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
-            &crate::plan::events::task_result_event(1, 0, t, &r, None),
+            &crate::plan::events::task_result_event(1, 0, t, &r, None, 0.0),
         ))
         .unwrap();
         match back {

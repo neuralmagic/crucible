@@ -511,6 +511,9 @@ pub enum SessionEvent {
         task: String,
         attempt: u32,
         estimate_usd: f64,
+        /// When the attempt started, RFC 3339 UTC. Absent from logs written before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
     },
     /// One event from a playbook agent task's attempt, so a reader can follow each task's turn
     /// on its own. `task` names a fan-out instance by its raw key. Text and thinking arrive as
@@ -566,8 +569,12 @@ pub enum SessionEvent {
         /// Present exactly when `status` is `transport`: what the last attempt died on.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transport: Option<TransportCause>,
+        /// Wall time from the task's first attempt starting to this result, retries included.
         #[serde(default)]
         secs: f64,
+        /// When the task settled, RFC 3339 UTC. Absent from logs written before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
         #[serde(default)]
         trace_id: String,
         #[serde(default)]
@@ -1046,6 +1053,31 @@ mod tests {
         assert!(line.contains(r#""event":{"kind":"retry""#), "{line}");
     }
     #[test]
+    fn a_task_event_without_a_time_still_decodes() {
+        let started =
+            decode(r#"{"v":1,"kind":"task_started","task":"a","attempt":1,"estimate_usd":0.5}"#);
+        assert!(
+            matches!(started, Some(SessionEvent::TaskStarted { at: None, .. })),
+            "{started:?}"
+        );
+        let result = decode(r#"{"v":1,"kind":"task_result","task":"a","status":"pass"}"#);
+        assert!(
+            matches!(result, Some(SessionEvent::TaskResult { at: None, .. })),
+            "{result:?}"
+        );
+        let line = encode(&SessionEvent::TaskStarted {
+            task: "a".into(),
+            attempt: 1,
+            estimate_usd: 0.5,
+            at: None,
+        });
+        assert!(
+            !line.contains("\"at\""),
+            "an absent time is left out: {line}"
+        );
+    }
+
+    #[test]
     fn plan_admitted_round_trips() {
         assert_round_trips(SessionEvent::PlanAdmitted {
             plan_version: 2,
@@ -1226,6 +1258,7 @@ mod tests {
             task: "audit[a]".into(),
             attempt: 2,
             estimate_usd: 0.125,
+            at: Some("2026-11-08T13:30:00.25Z".into()),
         });
     }
 
@@ -1251,6 +1284,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: None,
             repairs: vec![TaskRepair {
                 label: "measure-a repair 1/2".into(),
@@ -1310,6 +1344,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1368,6 +1403,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1414,6 +1450,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: Some(Box::new(TaskAgent {
                 harness: "claude".into(),
                 model: "glm-5.3".into(),
