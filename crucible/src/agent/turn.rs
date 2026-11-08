@@ -108,19 +108,17 @@ pub(crate) fn otel_forward(
     ))
 }
 
-/// Whether session-log tool events carry full inputs and result excerpts
-/// (`CRUCIBLE_SESSION_TOOL_IO=full` in the manifest `[agent].env` or the process
-/// env). Off by default: the compact name+summary form keeps the log small, but
-/// made a run's edits unreconstructable without diffing the PR — this flag exists
-/// for runs someone will want to review.
+/// Whether session-log tool events carry bounded inputs and result excerpts. On unless
+/// `CRUCIBLE_SESSION_TOOL_IO=compact` in the manifest `[agent].env` or the process env, which
+/// keeps only the name+summary form.
 pub(crate) fn tool_io_full(env: &[(String, String)]) -> bool {
-    let full = |v: &str| v.trim().eq_ignore_ascii_case("full");
+    let full = |v: &str| !v.trim().eq_ignore_ascii_case("compact");
     if let Some((_, v)) = env.iter().find(|(k, _)| k == "CRUCIBLE_SESSION_TOOL_IO") {
         return full(v);
     }
     std::env::var("CRUCIBLE_SESSION_TOOL_IO")
         .map(|v| full(&v))
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// What a drained agent stream amounted to: its running cost, and the tool chain stop that cut it

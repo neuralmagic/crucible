@@ -94,8 +94,8 @@ pub enum AgentEvent {
         delta: String,
     },
     /// A tool or subagent invocation, with the compact summary line. `input`/`result`
-    /// are populated only under verbose tool IO (`CRUCIBLE_SESSION_TOOL_IO=full`),
-    /// bounded producer-side; the default stays name+summary so the log stays compact.
+    /// carry bounded, scrubbed tool IO unless the turn sets `CRUCIBLE_SESSION_TOOL_IO=compact`,
+    /// which keeps only name+summary.
     Tool {
         #[serde(default)]
         name: String,

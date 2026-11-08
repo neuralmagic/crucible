@@ -506,17 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_io_defaults_compact_and_manifest_env_opts_in() {
+    fn tool_io_defaults_full_and_manifest_env_opts_out_with_compact() {
         let mut a = args(&[]);
-        assert!(!tool_io_full(&a.env), "compact by default");
-        a.env
-            .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "full".to_string()));
-        assert!(tool_io_full(&a.env));
-        // Any value other than "full" stays compact.
-        a.env.pop();
-        a.env
-            .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "yes".to_string()));
-        assert!(!tool_io_full(&a.env));
+        assert!(tool_io_full(&a.env), "full by default");
+        for (value, full) in [
+            ("full", true),
+            ("yes", true),
+            ("compact", false),
+            (" Compact\n", false),
+        ] {
+            a.env
+                .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), value.to_string()));
+            assert_eq!(tool_io_full(&a.env), full, "{value:?}");
+            a.env.pop();
+        }
     }
 
     /// A temp workspace for a real turn (the `command` backend shells out for real).
