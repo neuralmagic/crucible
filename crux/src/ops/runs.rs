@@ -234,6 +234,44 @@ impl Follow {
     }
 }
 
+/// A run's engine session, one JSON event per line exactly as the engine wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct RunSession {
+    pub run_id: String,
+    /// Stream a running run's events as they land, until it stops. A run that is not running
+    /// prints its stored session instead.
+    #[arg(long, short = 'f')]
+    pub follow: bool,
+}
+
+impl Operation for RunSession {
+    type Output = String;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        Ok(Value::String(c.run_session(&self.run_id).await?))
+    }
+
+    fn render(&self, _c: &Client, text: Self::Output) -> Result<String> {
+        Ok(text)
+    }
+
+    fn json(&self) -> bool {
+        false
+    }
+}
+
+impl RunSession {
+    /// Relay the live session lines to `out` until the run stops.
+    pub async fn follow(&self, c: &Client, out: &mut (dyn std::io::Write + Send)) -> Result<()> {
+        c.follow_session(&self.run_id, &mut |line| {
+            writeln!(out, "{line}")?;
+            out.flush()?;
+            Ok(())
+        })
+        .await
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
 pub struct RunFiles {
     pub run_id: String,
@@ -384,6 +422,7 @@ impl Operation for Deployed {
 #[cfg(test)]
 mod tests {
     use crate::ops::runs::*;
+
     use crate::ops::test_client;
 
     /// Following prints only what is new on each poll and stops the moment the run is no

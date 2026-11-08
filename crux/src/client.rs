@@ -17,10 +17,14 @@
 
 use crate::config::{Auth, Config};
 use crate::dto;
+use crate::sse::{SseEvent, SseParser};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::time::Duration;
+
+/// The whole-request deadline on an event stream.
+const EVENT_STREAM_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// How a [`Client`] reaches the controller: one request in, its status and body text out.
 ///
@@ -41,6 +45,17 @@ pub trait Transport: Send + Sync {
     async fn get_bytes(&self, path: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
         let (status, text) = self.send(reqwest::Method::GET, path, None).await?;
         Ok((status, text.into_bytes()))
+    }
+
+    /// GET a server-sent event stream, handing each event to `on_event` as it arrives, until the
+    /// server closes it. A non-2xx comes back as its status and body, with no events.
+    async fn events(
+        &self,
+        path: &str,
+        _last_event_id: Option<&str>,
+        _on_event: &mut (dyn FnMut(SseEvent) -> Result<()> + Send),
+    ) -> Result<(reqwest::StatusCode, String)> {
+        bail!("{path} is an event stream, and this transport cannot stream")
     }
 
     /// The origin human-facing links are built against.
@@ -105,6 +120,7 @@ pub struct PackImportSource<'a> {
     pub variant: Option<&'a str>,
 }
 
+#[derive(Clone)]
 pub struct Client {
     transport: std::sync::Arc<dyn Transport>,
 }
@@ -128,10 +144,19 @@ impl HttpTransport {
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        self.req_accepting(method, path, "application/json")
+    }
+
+    fn req_accepting(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        accept: &str,
+    ) -> reqwest::RequestBuilder {
         let mut req = self
             .http
             .request(method, format!("{}{path}", self.endpoint.base()))
-            .header("accept", "application/json");
+            .header("accept", accept);
         for (name, value) in self.auth.headers() {
             req = req.header(name, value);
         }
@@ -174,6 +199,39 @@ impl Transport for HttpTransport {
             .await
             .with_context(|| format!("reading the body of {path}"))?;
         Ok((status, bytes.to_vec()))
+    }
+
+    async fn events(
+        &self,
+        path: &str,
+        last_event_id: Option<&str>,
+        on_event: &mut (dyn FnMut(SseEvent) -> Result<()> + Send),
+    ) -> Result<(reqwest::StatusCode, String)> {
+        let mut req = self
+            .req_accepting(reqwest::Method::GET, path, "text/event-stream")
+            .timeout(EVENT_STREAM_TIMEOUT);
+        if let Some(id) = last_event_id {
+            req = req.header("last-event-id", id);
+        }
+        let mut resp = req
+            .send()
+            .await
+            .with_context(|| format!("requesting {path}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Ok((status, resp.text().await.unwrap_or_default()));
+        }
+        let mut parser = SseParser::default();
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .with_context(|| format!("reading the stream of {path}"))?
+        {
+            for event in parser.push(&chunk) {
+                on_event(event)?;
+            }
+        }
+        Ok((status, String::new()))
     }
 
     fn base(&self) -> &str {
@@ -359,6 +417,43 @@ impl Client {
 
     /// One captured file's bytes. The key's `/` separates the task directory from the declared
     /// path and must survive as a path separator, so each segment is encoded on its own.
+    /// A finished run's stored `session.jsonl`.
+    pub async fn run_session(&self, run_id: &str) -> Result<String> {
+        let path = format!("/api/runs/{}/artifacts/session.jsonl", encode(run_id));
+        let (status, bytes) = self.transport.get_bytes(&path).await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if !status.is_success() {
+            bail!(
+                "{path} -> HTTP {status}: {}{}",
+                text.trim(),
+                self.hint_for(status)
+            );
+        }
+        Ok(text)
+    }
+
+    /// A running run's live event relay, resumed after `last_event_id` when given.
+    pub async fn run_live(
+        &self,
+        run_id: &str,
+        last_event_id: Option<&str>,
+        on_event: &mut (dyn FnMut(SseEvent) -> Result<()> + Send),
+    ) -> Result<()> {
+        let path = format!("/api/runs/{}/live", encode(run_id));
+        let (status, text) = self
+            .transport
+            .events(&path, last_event_id, on_event)
+            .await?;
+        if !status.is_success() {
+            bail!(
+                "{path} -> HTTP {status}: {}{}",
+                text.trim(),
+                self.hint_for(status)
+            );
+        }
+        Ok(())
+    }
+
     pub async fn run_file(&self, run_id: &str, key: &str) -> Result<Vec<u8>> {
         let key: Vec<String> = key.split('/').map(|s| encode(s).to_string()).collect();
         let path = format!("/api/runs/{}/files/{}", encode(run_id), key.join("/"));
@@ -426,6 +521,19 @@ impl Client {
             .await
     }
 
+    /// What rerunning finished run `run_id` from `from` would reuse and dispatch again. An empty
+    /// `from` reruns only what did not pass.
+    pub async fn rerun_preview<T: DeserializeOwned>(
+        &self,
+        run_id: &str,
+        from: &[String],
+    ) -> Result<T> {
+        let mut q = Query::new();
+        q.push("from", Some(&from.join(",")));
+        self.get(&format!("/api/runs/{}/rerun{}", encode(run_id), q.finish()))
+            .await
+    }
+
     pub async fn playbook_runs<T: DeserializeOwned>(
         &self,
         status: Option<&str>,
@@ -435,6 +543,11 @@ impl Client {
         q.push("status", status);
         q.push("playbook", playbook);
         self.get(&format!("/api/playbook-runs{}", q.finish())).await
+    }
+
+    /// A registered playbook and its pack files at the pinned rev.
+    pub async fn playbook<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
+        self.get(&format!("/api/playbooks/{}", encode(id))).await
     }
 
     pub async fn playbook_run<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
@@ -790,9 +903,119 @@ fn parse<T: DeserializeOwned>(body: String, what: &str) -> Result<T> {
     serde_json::from_str(&body).with_context(|| {
         format!(
             "parsing the {what} response: {}",
-            crate::render::truncate(&body, 400)
+            crate::text::truncate(&body, 400)
         )
     })
+}
+
+/// How long a session follow waits on a running run whose pod is not reachable yet.
+const POD_WAITS: u32 = 24;
+const POD_WAIT: Duration = Duration::from_secs(5);
+/// Back-to-back connections that end with nothing on them before a follow gives up.
+const EMPTY_STREAMS: u32 = 5;
+
+/// How one live connection ended.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveEnd {
+    /// The run is not running and nothing was streamed: its stored session is the record.
+    Stored,
+    Finished,
+    WaitForPod,
+    Resume,
+    Failed(String),
+}
+
+impl LiveEnd {
+    fn of(reason: Option<&str>, streamed: usize) -> Self {
+        match reason {
+            Some("run-not-running") if streamed == 0 => LiveEnd::Stored,
+            Some("run-not-running" | "bridge-closed") => LiveEnd::Finished,
+            Some(reason) if reason.starts_with("completed") => LiveEnd::Finished,
+            Some("pod-gone") => LiveEnd::WaitForPod,
+            Some(reason) if reason.starts_with("error") => LiveEnd::Failed(reason.to_string()),
+            Some(_) | None => LiveEnd::Resume,
+        }
+    }
+}
+
+impl Client {
+    /// Hand every line of a run's session to `on_line`: a running run's lines as they land,
+    /// resuming after the last event id whenever the relay times out or the connection drops,
+    /// and a stopped run's stored session whole.
+    pub async fn follow_session(
+        &self,
+        run_id: &str,
+        on_line: &mut (dyn FnMut(&str) -> Result<()> + Send),
+    ) -> Result<()> {
+        self.follow_run(run_id, on_line, &mut |_| Ok(())).await
+    }
+
+    /// [`Self::follow_session`], also handing each pod log line to `on_log` as it lands. A run on
+    /// a spoke cluster streams only its pod's log until it ends, and its session lines after.
+    pub async fn follow_run(
+        &self,
+        run_id: &str,
+        on_line: &mut (dyn FnMut(&str) -> Result<()> + Send),
+        on_log: &mut (dyn FnMut(&str) -> Result<()> + Send),
+    ) -> Result<()> {
+        let mut last_id: Option<String> = None;
+        let mut streamed = 0usize;
+        let mut pod_waits = 0u32;
+        let mut empty = 0u32;
+        loop {
+            let mut reason: Option<String> = None;
+            let mut events = 0usize;
+            let resume = last_id.clone();
+            {
+                let mut on_event = |event: SseEvent| -> Result<()> {
+                    events += 1;
+                    match event.event.as_str() {
+                        "session" => {
+                            on_line(&event.data)?;
+                            streamed += 1;
+                        }
+                        "log" => on_log(&event.data)?,
+                        "end" => reason = Some(event.data),
+                        _ => {}
+                    }
+                    if event.id.is_some() {
+                        last_id = event.id;
+                    }
+                    Ok(())
+                };
+                self.run_live(run_id, resume.as_deref(), &mut on_event)
+                    .await?;
+            }
+            match LiveEnd::of(reason.as_deref(), streamed) {
+                LiveEnd::Stored => {
+                    for line in self.run_session(run_id).await?.lines() {
+                        on_line(line)?;
+                    }
+                    return Ok(());
+                }
+                LiveEnd::Finished => return Ok(()),
+                LiveEnd::Failed(reason) => {
+                    bail!("the live relay for {} ended: {reason}", run_id)
+                }
+                LiveEnd::WaitForPod => {
+                    pod_waits += 1;
+                    if pod_waits > POD_WAITS {
+                        bail!("run {} is running but its pod never came up", run_id);
+                    }
+                    tokio::time::sleep(POD_WAIT).await;
+                }
+                LiveEnd::Resume => {
+                    empty = if events == 0 { empty + 1 } else { 0 };
+                    if empty >= EMPTY_STREAMS {
+                        bail!(
+                            "the live relay for {} kept closing with nothing on it",
+                            run_id
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Accumulates `?a=1&b=2`, skipping absent filters.
@@ -838,7 +1061,7 @@ pub fn encode(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::client::*;
 
     /// The bug this prevents: `GET /api/issues/owner/repo#12` reaches a route that doesn't exist
     /// and 404s, which reads exactly like "no such issue".
@@ -882,6 +1105,80 @@ mod tests {
         let text = format!("{e:#}");
         assert!(text.contains("502 Bad Gateway"), "{text}");
         assert!(text.contains("GET /api/whoami"), "{text}");
+    }
+
+    /// A relay that serves one scripted event stream: what a spoke run's `/live` looks like.
+    struct Scripted(Vec<SseEvent>);
+
+    #[async_trait::async_trait]
+    impl Transport for Scripted {
+        async fn send(
+            &self,
+            _method: reqwest::Method,
+            path: &str,
+            _body: Option<&serde_json::Value>,
+        ) -> Result<(reqwest::StatusCode, String)> {
+            bail!("{path}: the scripted relay only streams")
+        }
+        async fn events(
+            &self,
+            _path: &str,
+            _last_event_id: Option<&str>,
+            on_event: &mut (dyn FnMut(SseEvent) -> Result<()> + Send),
+        ) -> Result<(reqwest::StatusCode, String)> {
+            for event in &self.0 {
+                on_event(event.clone())?;
+            }
+            Ok((reqwest::StatusCode::OK, String::new()))
+        }
+        fn base(&self) -> &str {
+            "http://relay.test"
+        }
+    }
+
+    fn event(kind: &str, data: &str, id: &str) -> SseEvent {
+        SseEvent {
+            event: kind.into(),
+            data: data.into(),
+            id: Some(id.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn following_a_run_hands_over_log_and_session_lines_in_order() {
+        let client = Client::new(std::sync::Arc::new(Scripted(vec![
+            event("log", "pulling sandbox image", "0.1"),
+            event("log", "scan: 2 issues", "0.2"),
+            event("session", r#"{"v":1,"kind":"note","msg":"hi"}"#, "1.2"),
+            event("end", "completed: Succeeded", "1.2"),
+        ])));
+        let (mut sessions, mut logs) = (Vec::new(), Vec::new());
+        client
+            .follow_run(
+                "r1",
+                &mut |line| {
+                    sessions.push(line.to_string());
+                    Ok(())
+                },
+                &mut |line| {
+                    logs.push(line.to_string());
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs, ["pulling sandbox image", "scan: 2 issues"]);
+        assert_eq!(sessions, [r#"{"v":1,"kind":"note","msg":"hi"}"#]);
+
+        let mut only = Vec::new();
+        client
+            .follow_session("r1", &mut |line| {
+                only.push(line.to_string());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(only, sessions, "following the session alone skips the log");
     }
 
     /// The link a human is handed hangs off the base this client dialled.
@@ -1009,5 +1306,23 @@ mod tests {
         assert_eq!(json["authoritative"], false);
         assert!(json.get("git_ref").is_none(), "absent, not null: {json}");
         assert!(json.get("codegen_contract").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_live_end_reason_decides_whether_to_stop_wait_or_resume() {
+        assert_eq!(LiveEnd::of(Some("run-not-running"), 0), LiveEnd::Stored);
+        assert_eq!(LiveEnd::of(Some("run-not-running"), 3), LiveEnd::Finished);
+        assert_eq!(LiveEnd::of(Some("bridge-closed"), 3), LiveEnd::Finished);
+        assert_eq!(
+            LiveEnd::of(Some("completed: Succeeded"), 0),
+            LiveEnd::Finished
+        );
+        assert_eq!(LiveEnd::of(Some("pod-gone"), 0), LiveEnd::WaitForPod);
+        assert_eq!(
+            LiveEnd::of(Some("error: dial refused"), 1),
+            LiveEnd::Failed("error: dial refused".into())
+        );
+        assert_eq!(LiveEnd::of(Some("timeout"), 9), LiveEnd::Resume);
+        assert_eq!(LiveEnd::of(None, 9), LiveEnd::Resume);
     }
 }
