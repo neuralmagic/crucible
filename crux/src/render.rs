@@ -1537,6 +1537,12 @@ pub fn launched(ack: &dto::LaunchAck, run_url: &str) -> String {
         }
     }
     out.push_str(&format!("  {run_url}\n"));
+    if !ack.playbook.is_empty() {
+        out.push_str(&format!(
+            "  {}\n",
+            crate::client::tracker_url(&ack.playbook, &ack.key)
+        ));
+    }
     out
 }
 
@@ -1966,6 +1972,10 @@ mod tests {
         assert!(out.contains("agent plat-openai · gpt-5.6-luna"), "{out}");
         assert!(
             out.contains("https://crucible.example.com/playbook-runs/pb-9"),
+            "{out}"
+        );
+        assert!(
+            out.contains("crucible-playbooks://playbook/report/launch/pb-9"),
             "{out}"
         );
         assert!(

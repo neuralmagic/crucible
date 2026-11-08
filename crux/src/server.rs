@@ -262,7 +262,8 @@ impl CrucibleMcp {
     #[tool(
         description = "Test-fire a draft pack. Runs the newest save, validated against its stored \
         schema and held to the same admin cost ceiling a registered launch is. Costs money \
-        against max_cost. Returns the issue key to watch it by with crucible_playbook_run. Pass \
+        against max_cost. Returns the issue key to watch it by with crucible_playbook_run, and a \
+        crucible-playbooks:// link that opens it in the user's desktop tracker. Pass \
         schema_digest to be refused rather than launched if a save landed since you read it. \
         Pass provider (and optionally model) to run the pack's agent tasks on a registered \
         inference provider instead of the crucible.toml [agent] harness and model."
@@ -345,8 +346,9 @@ impl CrucibleMcp {
 
     #[tool(
         description = "Launch a playbook. Costs money against max_cost, which the controller caps \
-        at the admin ceiling. Returns the issue key to watch it by with crucible_playbook_run. \
-        Pass provider (and optionally model) to run the pack's agent tasks on a registered \
+        at the admin ceiling. Returns the issue key to watch it by with crucible_playbook_run, \
+        and a crucible-playbooks:// link that opens it in the user's desktop tracker. Pass \
+        provider (and optionally model) to run the pack's agent tasks on a registered \
         inference provider instead of the crucible.toml [agent] harness and model."
     )]
     async fn crucible_launch(&self, Parameters(a): Parameters<Launch>) -> String {
@@ -362,7 +364,10 @@ impl CrucibleMcp {
         self.run(&a).await
     }
 
-    #[tool(description = "One playbook launch whole: its params, caps, and any refusal, as JSON.")]
+    #[tool(
+        description = "One playbook launch whole: its params, caps, any refusal, and its \
+        crucible-playbooks:// tracker link, as JSON."
+    )]
     async fn crucible_playbook_run(&self, Parameters(a): Parameters<PlaybookRun>) -> String {
         self.run(&a).await
     }
