@@ -98,7 +98,9 @@ impl CoDraft {
              studio at {base}, over the crucible MCP tools. Use when asked to write, edit or fix a \
              playbook pack, a workflow.star, or a crucible draft.\nallowed-tools: Read, Glob, \
              Grep, mcp__crucible__crucible_draft_create, mcp__crucible__crucible_draft_files, \
-             mcp__crucible__crucible_draft_save, mcp__crucible__crucible_whoami\n---\n\n"
+             mcp__crucible__crucible_draft_save, mcp__crucible__crucible_draft_launch, \
+             mcp__crucible__crucible_playbook_run, mcp__crucible__crucible_whoami, \
+             Bash(open crucible-playbooks://*)\n---\n\n"
         ));
         out.push_str(&format!(
             "# Co-drafting a playbook pack\n\n\
@@ -145,6 +147,15 @@ impl CoDraft {
             self.studio_url("<draft_id>")
         ));
         out.push_str(
+            "## Launching and watching\n\n\
+             `crucible_draft_launch` test-fires the newest save and costs money against \
+             `max_cost`, so launch only when asked. It returns the launch key and a \
+             `crucible-playbooks://` link that opens the run in the human's desktop tracker. Give \
+             them that link on a line of its own. When they ask you to watch the run, open it for \
+             them with `open '<link>'`; the tracker follows it live. `crucible_playbook_run` \
+             reads the launch back, with the same link.\n\n",
+        );
+        out.push_str(
             "## If a call 403s\n\n\
              Run `crucible_whoami`. It reports the identity the controller resolved and how you \
              authenticated. Authoring needs an operator or admin session; a read-only identity can \
@@ -175,6 +186,8 @@ mod tests {
         assert!(skill.contains("https://crucible.example.com/playbooks/drafts/<draft_id>"));
         assert!(skill.contains("crucible_draft_create"));
         assert!(skill.contains("base_version"));
+        assert!(skill.contains("Bash(open crucible-playbooks://*)"));
+        assert!(skill.contains("## Launching and watching"));
         assert!(!skill.contains("localhost"));
     }
 

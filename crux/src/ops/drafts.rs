@@ -523,7 +523,9 @@ impl Operation for DraftLaunch {
         put_trimmed(&mut body, "provider", self.provider.as_deref());
         put_trimmed(&mut body, "model", self.model.as_deref());
         put_rerun(&mut body, self.rerun_of.as_deref(), &self.from);
-        c.launch_draft(&self.draft_id, &body).await
+        Ok(crate::ops::playbooks::with_tracker_url(
+            c.launch_draft(&self.draft_id, &body).await?,
+        ))
     }
 
     fn render(&self, c: &Client, ack: Self::Output) -> Result<String> {

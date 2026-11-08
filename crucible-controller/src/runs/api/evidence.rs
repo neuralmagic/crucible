@@ -258,8 +258,9 @@ async fn pod_run_log(
     }
 }
 
-/// The live pod's log on whichever cluster the run's ledger row names. `None` when the run recorded
-/// no pod, or the pod is already gone.
+/// The live pod's engine output on whichever cluster the run's ledger row names, without the
+/// session lines the wrapper echoes into it. `None` when the run recorded no pod, or the pod is
+/// already gone.
 async fn live_pod_log(state: &ApiState, run: &crate::runs::model::Run) -> Option<String> {
     let pod = run.pod.as_deref()?;
     let api =
@@ -267,7 +268,7 @@ async fn live_pod_log(state: &ApiState, run: &crate::runs::model::Run) -> Option
             .await
             .ok()?;
     match api.logs(pod, &kube::api::LogParams::default()).await {
-        Ok(text) => Some(text),
+        Ok(text) => Some(crate::runs::workpod::engine_log_of(&text)),
         Err(e) => {
             tracing::debug!(pod, cluster = run.location.cluster, error = %e, "live pod log unavailable");
             None
