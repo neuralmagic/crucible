@@ -647,6 +647,9 @@ pub struct DraftCompile {
     pub saved_at: String,
     #[serde(default)]
     pub schema_digest: Option<String>,
+    /// The params schema this version's launches are validated against.
+    #[serde(default)]
+    pub params_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
     #[serde(default)]
@@ -799,6 +802,32 @@ pub struct StaleBase {
 pub struct PlaybookCaps {
     pub max_cost: f64,
     pub max_time: String,
+}
+
+/// One task a rerun reuses, with what it cost the run that settled it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReusedTask {
+    pub task: String,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// `GET /api/runs/{id}/rerun`: what a rerun would reuse and dispatch again, against the pack it
+/// would run. A non-empty `changed` means it is refused until those tasks rerun too.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RerunPreview {
+    pub run_id: String,
+    pub playbook: String,
+    #[serde(default)]
+    pub draft_version: Option<i64>,
+    #[serde(default)]
+    pub reused: Vec<ReusedTask>,
+    #[serde(default)]
+    pub rerun: Vec<String>,
+    #[serde(default)]
+    pub reused_usd: f64,
+    #[serde(default)]
+    pub changed: Vec<String>,
 }
 
 /// An inference provider registration as the admin list returns it.
@@ -992,6 +1021,7 @@ pub struct LaunchRun {
 /// `GET /api/playbooks/{id}`: a registered playbook and its pack at the pinned rev.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PlaybookDetail {
+    #[serde(flatten)]
     pub playbook: Playbook,
     #[serde(default)]
     pub files: std::collections::BTreeMap<String, String>,
@@ -1230,8 +1260,30 @@ impl std::str::FromStr for IssueStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dto::*;
     use std::str::FromStr;
+
+    /// The controller flattens the playbook into its detail, beside the pinned files.
+    #[test]
+    fn a_playbook_detail_reads_the_flattened_playbook_and_its_files() {
+        let detail: PlaybookDetail = serde_json::from_str(
+            r#"{"id":"triage","description":"issue triage","source":{"kind":"git",
+                "repo":"neuralmagic/crucible","git_ref":"main","path":"examples/triage"},
+                "rev":"091a0089278439d8be1745357278ad44422bd56b","tree_digest":"sha256:aa",
+                "files":{"crucible.toml":"[workflow]\n"}}"#,
+        )
+        .expect("a playbook detail");
+        assert_eq!(detail.playbook.id, "triage");
+        assert_eq!(
+            detail.playbook.rev,
+            "091a0089278439d8be1745357278ad44422bd56b"
+        );
+        assert!(matches!(
+            detail.playbook.source,
+            PlaybookSource::Git { ref path, .. } if path == "examples/triage"
+        ));
+        assert_eq!(detail.files["crucible.toml"], "[workflow]\n");
+    }
 
     /// A pack that compiles and still cannot be dispatched is the case the tag exists for: without
     /// it both kinds read as one undifferentiated list, and an agent cannot tell a pack it must fix
