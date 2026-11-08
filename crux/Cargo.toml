@@ -7,7 +7,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-clap.workspace = true
+clap = { workspace = true, optional = true }
 crucible-contract = { path = "../crucible-contract" }
 serde.workspace = true
 serde_json.workspace = true
@@ -18,9 +18,28 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # boxes the futures. Same version the controller already uses.
 async-trait = "0.1"
 # The MCP tool surface the controller hosts. Version tracks the controller's.
-rmcp = { workspace = true, features = ["server", "macros"] }
+rmcp = { workspace = true, features = ["server", "macros"], optional = true }
 # The config file. Same version the controller reads manifests with.
 toml = "1.1"
+
+[features]
+default = ["cli"]
+# The command line, the operations it shares with the MCP tools, and that tool surface. Without
+# it the crate is the client: config, transport and DTOs.
+cli = ["dep:clap", "dep:rmcp"]
+
+[[bin]]
+name = "crux"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[[test]]
+name = "surface"
+required-features = ["cli"]
+
+[[test]]
+name = "roundtrip"
+required-features = ["cli"]
 
 [dev-dependencies]
 # Stands in for the controller in the client tests — same version family as the controller's own

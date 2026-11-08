@@ -11,13 +11,20 @@
 //! - [`ops`] is each operation once, shared by the CLI and the MCP tools.
 //! - [`server`] is the MCP tool surface, which the controller serves in process at `/mcp`.
 
+#[cfg(feature = "cli")]
 pub mod cli;
 pub mod client;
 pub mod config;
 pub mod dto;
+#[cfg(feature = "cli")]
 pub mod ops;
+#[cfg(feature = "cli")]
 pub mod render;
+#[cfg(feature = "cli")]
 pub mod server;
+pub mod sse;
+pub mod text;
 
 pub use client::Client;
+#[cfg(feature = "cli")]
 pub use server::CrucibleMcp;

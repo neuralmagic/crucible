@@ -902,6 +902,99 @@ pub struct PlaybookRun {
     /// The model pinned alongside it; absent takes the provider's default.
     #[serde(default)]
     pub agent_model: Option<String>,
+    /// What authorized it: `manual`, `schedule`, `draft`, `watch`, `webhook`, `deferred`.
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// One launch whole: what it was launched with, where its engine went, and the runs it
+/// dispatched, newest first.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PlaybookLaunch {
+    pub launch: LaunchRecord,
+    /// Whether the draft or registry row it was launched from still exists.
+    #[serde(default)]
+    pub source_exists: bool,
+    pub dispatch: LaunchDispatch,
+    #[serde(default)]
+    pub runs: Vec<LaunchRun>,
+}
+
+/// The frozen launch: its params and the ceilings and agent it was authorized with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LaunchRecord {
+    #[serde(default)]
+    pub params: serde_json::Value,
+    #[serde(default)]
+    pub schema_digest: String,
+    #[serde(default)]
+    pub current_schema_digest: Option<String>,
+    #[serde(default)]
+    pub schema_drifted: bool,
+    #[serde(default)]
+    pub max_cost: f64,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub draft_version: Option<i64>,
+    #[serde(default)]
+    pub schedule: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
+    #[serde(default)]
+    pub agent_model: Option<String>,
+    #[serde(default)]
+    pub transport_losses: i64,
+    #[serde(default)]
+    pub advance_dedupe: bool,
+}
+
+/// Whether the engine ever started: `pending`, `failed` or `dispatched`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LaunchDispatch {
+    pub state: String,
+    #[serde(default)]
+    pub failure: Option<String>,
+    #[serde(default)]
+    pub failed_at: Option<String>,
+    #[serde(default)]
+    pub failures: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LaunchRun {
+    pub run_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    /// `pod` or `local`.
+    #[serde(default)]
+    pub dispatch: String,
+    #[serde(default)]
+    pub cluster: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub pod: Option<String>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+}
+
+/// `GET /api/playbooks/{id}`: a registered playbook and its pack at the pinned rev.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaybookDetail {
+    pub playbook: Playbook,
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
 }
 
 /// A row of the runs leaderboard.

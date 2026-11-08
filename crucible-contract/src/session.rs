@@ -512,6 +512,14 @@ pub enum SessionEvent {
         attempt: u32,
         estimate_usd: f64,
     },
+    /// One event from a playbook agent task's attempt, so a reader can follow each task's turn
+    /// on its own. `task` names a fan-out instance by its raw key. Text and thinking arrive as
+    /// whole blocks rather than deltas, each capped by the engine with the cut marked.
+    TaskAgent {
+        task: String,
+        attempt: u32,
+        event: AgentEvent,
+    },
     /// One work-graph task attempt reached a terminal status. Covers both the plan executor
     /// (`plan_version` + `kind` + `output`) and measure-DAG walks (`iter` + `digest` + `job` +
     /// `metric`); fields outside the emitting context default to empty. `status` is one of
@@ -1015,6 +1023,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_task_agent_event_round_trips_with_its_task_and_attempt() {
+        let ev = SessionEvent::TaskAgent {
+            task: "edit[layernorm]".into(),
+            attempt: 2,
+            event: AgentEvent::Text {
+                delta: "The build failed; retrying.\nSecond line kept.".into(),
+            },
+        };
+        assert_round_trips(ev);
+        let line = encode(&SessionEvent::TaskAgent {
+            task: "edit".into(),
+            attempt: 1,
+            event: AgentEvent::Retry {
+                attempt: 1,
+                max: 3,
+                error: "529".into(),
+            },
+        });
+        assert!(line.contains(r#""kind":"task_agent""#), "{line}");
+        assert!(line.contains(r#""event":{"kind":"retry""#), "{line}");
+    }
     #[test]
     fn plan_admitted_round_trips() {
         assert_round_trips(SessionEvent::PlanAdmitted {

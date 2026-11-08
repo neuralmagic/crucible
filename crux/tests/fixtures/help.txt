@@ -46,6 +46,7 @@ Commands:
   graph                 A run's task graph in dependency order, each task with its latest status
   deployed              Which build the controller is running, and whether it is the commit you expected
   run-log               One window of a run's engine output, resumable by cursor
+  run-session           A run's engine session as NDJSON, one event per line; -f streams a running one
   run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
   run-file              One captured file's content, by the key `run-files` listed it under
   contracts             The broker contract names this controller accepts
@@ -146,6 +147,7 @@ Commands:
   graph                 A run's task graph in dependency order, each task with its latest status
   deployed              Which build the controller is running, and whether it is the commit you expected
   run-log               One window of a run's engine output, resumable by cursor
+  run-session           A run's engine session as NDJSON, one event per line; -f streams a running one
   run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
   run-file              One captured file's content, by the key `run-files` listed it under
   contracts             The broker contract names this controller accepts
@@ -2052,6 +2054,50 @@ Options:
       --interval <INTERVAL>    Seconds between polls under --follow [default: 5]
       --json                   
   -h, --help                   Print help
+==== crux run-session --help ====
+A run's engine session as NDJSON, one event per line; -f streams a running one
+
+Usage: crux run-session [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>
+          
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+  -f, --follow
+          Stream a running run's events as they land, until it stops. A run that is not running prints its stored session instead
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux run-session -h ====
+A run's engine session as NDJSON, one event per line; -f streams a running one
+
+Usage: crux run-session [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>  
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+  -f, --follow                 Stream a running run's events as they land, until it stops. A run that is not running prints its stored session instead
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the controller's static token, which authenticates as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
 ==== crux run-files --help ====
 The files a run's tasks captured: what the run produced, as opposed to what it narrated
 
@@ -3523,6 +3569,7 @@ Commands:
   graph                 A run's task graph in dependency order, each task with its latest status
   deployed              Which build the controller is running, and whether it is the commit you expected
   run-log               One window of a run's engine output, resumable by cursor
+  run-session           A run's engine session as NDJSON, one event per line; -f streams a running one
   run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
   run-file              One captured file's content, by the key `run-files` listed it under
   contracts             The broker contract names this controller accepts
@@ -3601,6 +3648,7 @@ Commands:
   graph                 A run's task graph in dependency order, each task with its latest status
   deployed              Which build the controller is running, and whether it is the commit you expected
   run-log               One window of a run's engine output, resumable by cursor
+  run-session           A run's engine session as NDJSON, one event per line; -f streams a running one
   run-files             The files a run's tasks captured: what the run produced, as opposed to what it narrated
   run-file              One captured file's content, by the key `run-files` listed it under
   contracts             The broker contract names this controller accepts
