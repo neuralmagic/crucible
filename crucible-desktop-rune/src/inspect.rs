@@ -8,23 +8,22 @@ use serde_json::Value;
 
 use crate::session::TaskView;
 
-/// JSON nested this deep or less shows open until clicked shut.
-const OPEN_DEPTH: usize = 2;
-
 /// What the Data pane is looking at beyond the selected task.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Inspect {
     /// The dependency whose edge was picked in the graph.
     pub from: Option<String>,
-    /// The fan-out instance whose output shows, by key.
-    pub instance: Option<String>,
+    /// Which of a fan-out's outputs shows; `None` shows the first instance with one.
+    pub pick: Option<Pick>,
     /// JSON paths toggled away from their default open state.
     flipped: HashSet<String>,
 }
 
 impl Inspect {
-    pub fn is_open(&self, path: &str, depth: usize) -> bool {
-        (depth < OPEN_DEPTH) != self.flipped.contains(path)
+    /// Whether the object or list at `path` shows open: those shallower than `open` do until
+    /// clicked shut, the rest the other way round.
+    pub fn is_open(&self, path: &str, depth: usize, open: usize) -> bool {
+        (depth < open) != self.flipped.contains(path)
     }
 
     pub fn flip(&mut self, path: &str) {
@@ -90,26 +89,39 @@ pub fn flows<'a>(tasks: &'a [TaskView], task: &'a TaskView) -> Vec<Flow<'a>> {
         .collect()
 }
 
-/// The output to show: the picked instance's, else the task's own, else its first instance's.
-pub fn output<'a>(task: &'a TaskView, instance: Option<&str>) -> Option<&'a Value> {
-    let of_instance = |key: &str| {
-        task.instances
-            .iter()
-            .find(|i| i.key == key)
-            .and_then(|i| i.result.as_ref())
+/// One of a fan-out's outputs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pick {
+    /// The fan-out's own tally of its instances.
+    Summary,
+    /// One instance's, by key.
+    Instance(String),
+}
+
+/// The output to show and which it is: `pick` when it has one, else the first instance with
+/// one, else the task's own.
+pub fn output<'a>(task: &'a TaskView, pick: Option<&Pick>) -> Option<(Pick, &'a Value)> {
+    let own = || {
+        task.result
+            .as_ref()
             .and_then(|r| r.output.as_ref())
+            .map(|out| (Pick::Summary, out))
     };
-    if let Some(found) = instance.and_then(of_instance) {
-        return Some(found);
-    }
-    task.result
-        .as_ref()
-        .and_then(|r| r.output.as_ref())
-        .or_else(|| {
-            task.instances
-                .iter()
-                .find_map(|i| i.result.as_ref().and_then(|r| r.output.as_ref()))
-        })
+    let of = |instance: &'a crate::session::Instance| {
+        instance
+            .result
+            .as_ref()
+            .and_then(|r| r.output.as_ref())
+            .map(|out| (Pick::Instance(instance.key.clone()), out))
+    };
+    let picked = match pick {
+        Some(Pick::Summary) => own(),
+        Some(Pick::Instance(key)) => task.instances.iter().find(|i| i.key == *key).and_then(of),
+        None => None,
+    };
+    picked
+        .or_else(|| task.instances.iter().find_map(of))
+        .or_else(own)
 }
 
 /// A declared field against the output that should carry it.
@@ -148,7 +160,7 @@ mod tests {
     use crucible_contract::emits::{EmitWire, FieldType, JsonSchema};
     use serde_json::json;
 
-    use crate::inspect::{Check, Flow, Inspect, Via, check, document, flows, output};
+    use crate::inspect::{Check, Flow, Inspect, Pick, Via, check, document, flows, output};
     use crate::session::RunFold;
 
     const RUN: &str = concat!(
@@ -208,13 +220,26 @@ mod tests {
     }
 
     #[test]
-    fn a_fanout_shows_the_picked_instance_or_falls_back_to_one_that_finished() {
-        let fold = run();
+    fn a_fanout_shows_an_instance_first_and_its_summary_on_request() {
+        let mut fold = run();
+        fold.apply_line(
+            r#"{"v":1,"kind":"task_result","task":"fix","status":"pass","attempts":1,"cost_usd":0.0,"secs":1.0,"note":"","output":{"instances":1}}"#,
+        );
         let fix = &fold.tasks[1];
-        let patched = json!({"patched": "a"});
-        assert_eq!(output(fix, Some("a")), Some(&patched));
-        assert_eq!(output(fix, Some("zz")), Some(&patched));
-        assert_eq!(output(fix, None), Some(&patched));
+        let a = Pick::Instance("a".into());
+        let (patched, tally) = (json!({"patched": "a"}), json!({"instances": 1}));
+        assert_eq!(output(fix, None), Some((a.clone(), &patched)));
+        assert_eq!(output(fix, Some(&a)), Some((a.clone(), &patched)));
+        assert_eq!(
+            output(fix, Some(&Pick::Instance("zz".into()))),
+            Some((a, &patched))
+        );
+        assert_eq!(
+            output(fix, Some(&Pick::Summary)),
+            Some((Pick::Summary, &tally))
+        );
+        let scan = json!({"cves": ["a", "b"], "repo": 7});
+        assert_eq!(output(&fold.tasks[0], None), Some((Pick::Summary, &scan)));
         assert_eq!(output(&fold.tasks[2], None), None);
     }
 
@@ -222,7 +247,7 @@ mod tests {
     fn declared_fields_check_against_the_output() {
         let fold = run();
         let scan = &fold.tasks[0];
-        let out = output(scan, None);
+        let out = output(scan, None).map(|(_, out)| out);
         assert_eq!(check(&scan.emits[0], out), Check::Fits);
         assert_eq!(check(&scan.emits[1], out), Check::Refused("integer"));
         let absent = EmitWire {
@@ -248,12 +273,12 @@ mod tests {
     #[test]
     fn json_opens_shallow_and_each_click_flips_one_path() {
         let mut inspect = Inspect::default();
-        assert!(inspect.is_open("a", 0) && inspect.is_open("a/b", 1));
-        assert!(!inspect.is_open("a/b/c", 2));
+        assert!(inspect.is_open("a", 0, 2) && inspect.is_open("a/b", 1, 2));
+        assert!(!inspect.is_open("a/b/c", 2, 2) && !inspect.is_open("a/b", 1, 1));
         inspect.flip("a/b/c");
         inspect.flip("a");
-        assert!(inspect.is_open("a/b/c", 2) && !inspect.is_open("a", 0));
+        assert!(inspect.is_open("a/b/c", 2, 2) && !inspect.is_open("a", 0, 2));
         inspect.flip("a");
-        assert!(inspect.is_open("a", 0));
+        assert!(inspect.is_open("a", 0, 2));
     }
 }

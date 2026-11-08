@@ -7,7 +7,7 @@ use rune_theme_opencode::icons as oc;
 use serde_json::Value;
 
 use crate::App;
-use crate::inspect::{self, Check, Flow, Inspect, Via};
+use crate::inspect::{self, Check, Flow, Inspect, Pick, Via};
 use crate::session::TaskView;
 use crate::ui::tasks::{label_ink, section, state_label, state_mark};
 use crate::ui::{Paint, Pane, mono, tag};
@@ -18,6 +18,9 @@ const TREE_ROWS: usize = 1500;
 const TREE_ENTRIES: usize = 200;
 const INSTANCE_CHIPS: usize = 48;
 const INDENT: f32 = 14.0;
+/// How deep a tree shows open until clicked: data two levels, a schema only its top.
+const DATA_OPEN: usize = 2;
+const SCHEMA_OPEN: usize = 1;
 
 pub(crate) fn data_view(pane: &Pane, app: &App, p: &Paint) -> El {
     let task = app
@@ -45,7 +48,8 @@ pub(crate) fn data_view(pane: &Pane, app: &App, p: &Paint) -> El {
         }
         body = body.child(section("Inputs", p)).child(list);
     }
-    let output = inspect::output(task, app.inspect.instance.as_deref());
+    let shown = inspect::output(task, app.inspect.pick.as_ref());
+    let output = shown.as_ref().map(|(_, value)| *value);
     if !task.emits.is_empty() || !task.files.is_empty() {
         body = body
             .child(section("Declared", p))
@@ -53,14 +57,20 @@ pub(crate) fn data_view(pane: &Pane, app: &App, p: &Paint) -> El {
     }
     body = body.child(section("Output", p));
     if !task.instances.is_empty() {
-        body = body.child(instance_chips(task, app.inspect.instance.as_deref(), p));
+        body = body.child(pick_chips(task, shown.as_ref().map(|(pick, _)| pick), p));
     }
     body = body.child(match output {
         Some(value) => col()
             .w_full()
             .gap(6.0)
             .child(json_box(
-                tree(value, &format!("out:{}", task.name), &app.inspect, p),
+                tree(
+                    value,
+                    &format!("out:{}", task.name),
+                    DATA_OPEN,
+                    &app.inspect,
+                    p,
+                ),
                 p,
             ))
             .child(row().child(copy_button("Copy JSON", value, "data-copy-output", p))),
@@ -130,7 +140,13 @@ fn flow_card(flow: &Flow, inspect: &Inspect, p: &Paint) -> El {
                 copy_button("Copy", value, &format!("copy-in-{}-{path}", flow.from), p)
             }));
     let body = match flow.value {
-        Some(value) => tree(value, &format!("in:{}:{path}", flow.from), inspect, p),
+        Some(value) => tree(
+            value,
+            &format!("in:{}:{path}", flow.from),
+            DATA_OPEN,
+            inspect,
+            p,
+        ),
         None => faint("Not settled", p),
     };
     col()
@@ -203,56 +219,59 @@ fn declared(task: &TaskView, output: Option<&Value>, inspect: &Inspect, p: &Pain
                         .truncate(),
                 )
                 .child(
-                    text(schema.map_or("file".to_string(), ToString::to_string))
-                        .font(mono(10.5, 400.0))
-                        .color(p.c.text_muted)
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .truncate(),
+                    text(schema.map_or("file".to_string(), |schema| {
+                        schema
+                            .coarse()
+                            .map_or("schema".to_string(), |ty| format!("schema, {ty}"))
+                    }))
+                    .font(mono(10.5, 400.0))
+                    .color(p.c.text_muted)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate(),
                 ),
         );
         if let Some(document) = schema.and_then(inspect::document) {
             let path = format!("schema:{}:{}", task.name, file.path);
-            list = list.child(json_box(tree(&document, &path, inspect, p), p));
+            list = list.child(json_box(tree(&document, &path, SCHEMA_OPEN, inspect, p), p));
         }
     }
     list
 }
 
-fn instance_chips(task: &TaskView, picked: Option<&str>, p: &Paint) -> El {
-    let shown = inspect::output(task, picked);
+/// A chip per instance and one for the fan-out's summary; the one showing is filled.
+fn pick_chips(task: &TaskView, shown: Option<&Pick>, p: &Paint) -> El {
+    let chip = |pick: Pick, label: String, ink: rune::Color| {
+        let on = shown == Some(&pick);
+        row()
+            .key(format!("pick-{label}"))
+            .role("button")
+            .label(format!("Show {label}"))
+            .h(20.0)
+            .px(7.0)
+            .center_y()
+            .radius(p.k.radius.sm)
+            .fill(if on { p.c.bg_accent } else { p.c.layer_02 })
+            .border(p.hair, p.c.border_muted)
+            .hover(p.c.hover)
+            .focusable(true)
+            .on_press(move |app: &mut App| app.inspect.pick = Some(pick.clone()))
+            .child(
+                text(label)
+                    .font(mono(10.0, 500.0))
+                    .color(if on { p.c.text_base } else { ink }),
+            )
+    };
     let mut chips = row().w_full().gap(4.0).wrap();
+    if task.result.as_ref().is_some_and(|r| r.output.is_some()) {
+        chips = chips.child(chip(Pick::Summary, "summary".to_string(), p.c.text_muted));
+    }
     for instance in task.instances.iter().take(INSTANCE_CHIPS) {
-        let on = instance
-            .result
-            .as_ref()
-            .and_then(|r| r.output.as_ref())
-            .is_some_and(|out| shown.is_some_and(|s| std::ptr::eq(s, out)));
-        let key = instance.key.clone();
-        chips = chips.child(
-            row()
-                .key(format!("instance-{key}"))
-                .role("button")
-                .label(format!("Show {}[{key}]", task.name))
-                .h(20.0)
-                .px(7.0)
-                .center_y()
-                .radius(p.k.radius.sm)
-                .fill(if on { p.c.bg_accent } else { p.c.layer_02 })
-                .border(p.hair, p.c.border_muted)
-                .hover(p.c.hover)
-                .focusable(true)
-                .on_press(move |app: &mut App| app.inspect.instance = Some(key.clone()))
-                .child(
-                    text(instance.key.clone())
-                        .font(mono(10.0, 500.0))
-                        .color(if on {
-                            p.c.text_base
-                        } else {
-                            label_ink(instance.state(), p)
-                        }),
-                ),
-        );
+        chips = chips.child(chip(
+            Pick::Instance(instance.key.clone()),
+            instance.key.clone(),
+            label_ink(instance.state(), p),
+        ));
     }
     chips
 }
@@ -289,9 +308,10 @@ fn faint(label: &str, p: &Paint) -> El {
 }
 
 /// `value` as a tree of rows, objects and lists folding open or shut at a click.
-fn tree(value: &Value, root: &str, inspect: &Inspect, p: &Paint) -> El {
+fn tree(value: &Value, root: &str, open: usize, inspect: &Inspect, p: &Paint) -> El {
     let mut walk = Walk {
         inspect,
+        open,
         p,
         budget: TREE_ROWS,
         rows: Vec::new(),
@@ -306,6 +326,8 @@ fn tree(value: &Value, root: &str, inspect: &Inspect, p: &Paint) -> El {
 
 struct Walk<'a> {
     inspect: &'a Inspect,
+    /// How deep it shows open until clicked.
+    open: usize,
     p: &'a Paint,
     /// Rows left to draw.
     budget: usize,
@@ -346,7 +368,7 @@ impl Walk<'_> {
                 return;
             }
         };
-        let open = self.inspect.is_open(path, depth);
+        let open = self.inspect.is_open(path, depth, self.open);
         let summary = match value {
             Value::Object(_) => format!("{{{}}}", children.len()),
             _ => format!("[{}]", children.len()),

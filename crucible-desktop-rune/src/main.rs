@@ -766,7 +766,7 @@ impl App {
     pub fn pick_task(&mut self, task: &str, from: Option<&str>) {
         self.expanded = Some(task.to_string());
         self.inspect.from = from.map(ToString::to_string);
-        self.inspect.instance = None;
+        self.inspect.pick = None;
         if !self.workspace().showing(PaneKind::Data) {
             self.show_pane(if from.is_some() {
                 PaneKind::Data
