@@ -1400,6 +1400,24 @@ fn settings_pane(app: &App, p: &Paint) -> El {
             p,
         ))
         .child(settings_section(
+            "checks",
+            "Checks",
+            vec![setting_row(
+                "Check pack files",
+                Switch::new(app.settings.checks)
+                    .label("Check pack files")
+                    .hide_label()
+                    .on_toggle(|app: &mut App| {
+                        let on = !app.settings.checks;
+                        app.set_checks(on);
+                    })
+                    .build(p.k)
+                    .key("checks-switch"),
+                p,
+            )],
+            p,
+        ))
+        .child(settings_section(
             "notifications",
             "Notifications",
             vec![setting_row(

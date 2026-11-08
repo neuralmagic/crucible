@@ -422,7 +422,12 @@ impl App {
 
     /// Hand the language server the shown Starlark file, or its pack's workflow when the file
     /// is not Starlark, so the pack's diagnostics stay current as it changes on disk.
+    /// Have crucible-lsp check the shown pack file, while checks are on and the Pack tab is in
+    /// front.
     fn sync_checks(&mut self) {
+        if !self.settings.checks || !self.workspace().showing(PaneKind::Pack) {
+            return;
+        }
         let Some((pack, shown)) = self.shown_file() else {
             return;
         };
@@ -917,6 +922,14 @@ impl App {
 
     pub fn set_log_font(&mut self, font: LogFont) {
         self.settings.set_log_font(font);
+    }
+
+    pub fn set_checks(&mut self, on: bool) {
+        self.settings.set_checks(on);
+        if !on {
+            self.lsp.stop();
+            self.lsp_sent = None;
+        }
     }
 
     pub fn toggle_settings(&mut self) {

@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rune::Waker;
 use serde_json::{Value, json};
@@ -52,8 +53,17 @@ pub struct View {
     pub problems: HashMap<PathBuf, Vec<Problem>>,
 }
 
+/// How long the server runs with nothing new to check before it is stopped. The next file
+/// shown starts it again.
+const IDLE: Duration = Duration::from_secs(300);
+
 enum Cmd {
-    Show { path: PathBuf, text: String },
+    Show {
+        path: PathBuf,
+        text: String,
+    },
+    /// Stop the server and forget what it reported.
+    Stop,
     Incoming(Value),
     Exited(String),
 }
@@ -102,6 +112,11 @@ impl Lsp {
             path: path.to_path_buf(),
             text: text.to_string(),
         });
+    }
+
+    /// Stop the server, if one runs, and clear its problems.
+    pub fn stop(&self) {
+        let _ = self.tx.send(Cmd::Stop);
     }
 
     pub fn take(&self, seen: u64) -> Option<(u64, View)> {
@@ -227,7 +242,25 @@ fn run(rx: Receiver<Cmd>, wake: Sender<Cmd>, shared: Arc<Mutex<Shared>>) {
     let mut server: Option<Server> = None;
     let mut docs: HashMap<PathBuf, Doc> = HashMap::new();
     let mut failed = false;
-    while let Ok(cmd) = rx.recv() {
+    loop {
+        let cmd = match rx.recv_timeout(IDLE) {
+            Ok(cmd) => cmd,
+            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Timeout) => {
+                if server.take().is_some() {
+                    docs.clear();
+                    update(&shared, |view| view.status = Status::Idle);
+                }
+                continue;
+            }
+        };
+        if let Cmd::Stop = cmd {
+            server = None;
+            docs.clear();
+            failed = false;
+            update(&shared, |view| *view = View::default());
+            continue;
+        }
         if let Cmd::Exited(why) = cmd {
             server = None;
             failed = true;

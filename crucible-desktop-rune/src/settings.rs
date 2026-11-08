@@ -124,6 +124,8 @@ pub struct Settings {
     pub editor: Option<Editor>,
     /// Keys bound by hand, by command id; a command left out keeps its defaults.
     pub keys: BTreeMap<String, Vec<String>>,
+    /// Check the shown pack file with crucible-lsp.
+    pub checks: bool,
     path: PathBuf,
 }
 
@@ -144,6 +146,7 @@ struct Config {
     editor: Option<Editor>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keys: BTreeMap<String, Vec<String>>,
+    checks: Option<bool>,
 }
 
 impl Settings {
@@ -173,6 +176,7 @@ impl Settings {
             notify: config.notify.unwrap_or(true),
             editor: config.editor,
             keys: config.keys,
+            checks: config.checks.unwrap_or(true),
             path,
         }
     }
@@ -203,6 +207,11 @@ impl Settings {
 
     pub fn set_crt(&mut self, on: bool) {
         self.crt = on;
+        self.save();
+    }
+
+    pub fn set_checks(&mut self, on: bool) {
+        self.checks = on;
         self.save();
     }
 
@@ -241,6 +250,7 @@ impl Settings {
             notify: Some(self.notify),
             editor: self.editor,
             keys: self.keys.clone(),
+            checks: Some(self.checks),
         };
         let Ok(text) = toml::to_string(&config) else {
             return;
