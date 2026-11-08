@@ -62,10 +62,6 @@ impl SessionSeq {
     pub(crate) const fn new(seq: u64) -> Self {
         SessionSeq(seq)
     }
-
-    fn next(self) -> Self {
-        SessionSeq(self.0.saturating_add(1))
-    }
 }
 
 impl std::fmt::Display for SessionSeq {
@@ -577,19 +573,27 @@ pub(crate) async fn spoke_pod_api(
 #[derive(Debug, Default)]
 struct PodCursor {
     in_session: bool,
+    /// The newest session seq forwarded or skipped, echoed live or dumped after the delimiter.
     session: SessionSeq,
     log: LogOrdinal,
+    /// Lines seen after the delimiter: the dump's own seq, its line index in the session file.
+    dumped: u64,
 }
 
-/// Classify one line off a loop pod's log stream. Before the wrapper's session delimiter every line
-/// is pod output carrying a log ordinal; after it, every line is a session NDJSON record carrying a
-/// seq. Lines at or below the matching half of `resume` are already on the client and are dropped.
+/// Classify one line off a loop pod's log stream. A line the wrapper echoed from the session file
+/// while the run was live is a session record under the seq it carries. Otherwise, before the
+/// wrapper's session delimiter a line is pod output carrying a log ordinal; after it, a line is the
+/// dump of the session file, its seq its index there. A seq already forwarded, by echo or dump, and
+/// anything at or below the matching half of `resume`, is dropped.
 fn classify_pod_line(
     line: &str,
     cursor: &mut PodCursor,
     resume: StreamCursor,
 ) -> Option<RelayEvent> {
     let trimmed = line.trim_end();
+    if let Some((seq, session)) = crucible_contract::parse_session_echo(trimmed) {
+        return next_session(cursor, SessionSeq::new(seq), session, resume);
+    }
     if !cursor.in_session {
         if trimmed.contains(crucible_contract::RUN_SESSION_DELIMITER) {
             cursor.in_session = true;
@@ -604,13 +608,24 @@ fn classify_pod_line(
             line: cap_line(trimmed, LOG_LINE_CAP),
         });
     }
-    if trimmed.is_empty() {
+    cursor.dumped = cursor.dumped.saturating_add(1);
+    next_session(cursor, SessionSeq::new(cursor.dumped), trimmed, resume)
+}
+
+/// Forward session line `seq` unless it is blank or already on its way or on the client.
+fn next_session(
+    cursor: &mut PodCursor,
+    seq: SessionSeq,
+    line: &str,
+    resume: StreamCursor,
+) -> Option<RelayEvent> {
+    if seq <= cursor.session {
         return None;
     }
-    cursor.session = cursor.session.next();
-    (cursor.session > resume.session).then(|| RelayEvent::Session {
-        seq: cursor.session,
-        line: trimmed.to_string(),
+    cursor.session = seq;
+    (!line.is_empty() && seq > resume.session).then(|| RelayEvent::Session {
+        seq,
+        line: line.to_string(),
     })
 }
 
@@ -1058,6 +1073,83 @@ mod tests {
 
     /// The spoke relay's whole job: pod output while the run is in flight, then the session NDJSON
     /// the wrapper cats after the delimiter, carrying the seq a resuming viewer keys on.
+    #[test]
+    fn echoed_session_lines_stream_live_and_the_dump_does_not_repeat_them() {
+        let echo = crucible_contract::RUN_SESSION_ECHO_MARKER;
+        let session = |seq: u64, line: &str| {
+            Some(RelayEvent::Session {
+                seq: SessionSeq::new(seq),
+                line: line.to_string(),
+            })
+        };
+        let mut cursor = PodCursor::default();
+        let resume = StreamCursor::default();
+        let mut feed = |line: &str| classify_pod_line(line, &mut cursor, resume);
+
+        assert_eq!(
+            feed("TASK one pass"),
+            Some(RelayEvent::Log {
+                ord: LogOrdinal::new(1),
+                line: "TASK one pass".to_string()
+            })
+        );
+        assert_eq!(
+            feed(&format!("{echo}1 {{\"a\":1}}")),
+            session(1, r#"{"a":1}"#)
+        );
+        assert_eq!(
+            feed(&format!("{echo}3 {{\"c\":3}}")),
+            session(3, r#"{"c":3}"#),
+            "a line too long to echo leaves a gap, not a renumbering"
+        );
+        assert_eq!(
+            feed("TASK two pass"),
+            Some(RelayEvent::Log {
+                ord: LogOrdinal::new(2),
+                line: "TASK two pass".to_string()
+            }),
+            "an echo takes no log ordinal"
+        );
+        assert_eq!(
+            feed(&format!("{echo}3 {{\"c\":3}}")),
+            None,
+            "a restart re-echoes"
+        );
+        assert_eq!(
+            feed(&format!(
+                "=== {} 0) ===",
+                crucible_contract::RUN_SESSION_DELIMITER
+            )),
+            None
+        );
+        assert_eq!(feed(r#"{"a":1}"#), None, "dump line 1 was echoed");
+        assert_eq!(
+            feed(r#"{"b":2}"#),
+            None,
+            "dump line 2 sits below the newest echo"
+        );
+        assert_eq!(
+            feed(&format!("{echo}4 {{\"d\":4}}")),
+            session(4, r#"{"d":4}"#)
+        );
+        assert_eq!(feed(r#"{"c":3}"#), None);
+        assert_eq!(feed(r#"{"d":4}"#), None);
+        assert_eq!(feed(""), None, "a blank line keeps its index");
+        assert_eq!(feed(r#"{"f":6}"#), session(6, r#"{"f":6}"#));
+
+        let mut cursor = PodCursor::default();
+        let resumed = StreamCursor::from_session(3);
+        assert_eq!(
+            classify_pod_line(&format!("{echo}3 {{\"c\":3}}"), &mut cursor, resumed),
+            None,
+            "a viewer that resumes past an echo does not get it again"
+        );
+        assert_eq!(
+            classify_pod_line(&format!("{echo}4 {{\"d\":4}}"), &mut cursor, resumed),
+            session(4, r#"{"d":4}"#)
+        );
+    }
+
     #[test]
     fn the_delimiter_switches_pod_output_to_session_lines() {
         let mut cursor = PodCursor::default();

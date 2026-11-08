@@ -1052,6 +1052,7 @@ mod tests {
         assert!(line.contains(r#""kind":"task_agent""#), "{line}");
         assert!(line.contains(r#""event":{"kind":"retry""#), "{line}");
     }
+
     #[test]
     fn a_task_event_without_a_time_still_decodes() {
         let started =

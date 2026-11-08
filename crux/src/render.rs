@@ -12,22 +12,11 @@
 
 use crate::client::{Credential, Endpoint};
 use crate::dto;
+use crate::text::truncate;
 use std::fmt::Write as _;
 
 /// How much of a title survives on a list line.
 const TITLE_MAX: usize = 68;
-
-/// Char-safe truncation. Byte slicing panics mid-UTF-8, and issue titles carry em dashes and
-/// arrows often enough for that to be a real crash rather than a theoretical one.
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    format!(
-        "{}…",
-        s.chars().take(max.saturating_sub(1)).collect::<String>()
-    )
-}
 
 /// The placeholder for a column with nothing in it.
 fn or_dash(s: Option<&str>) -> String {

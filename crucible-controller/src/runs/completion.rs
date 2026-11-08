@@ -457,7 +457,7 @@ async fn pod_session(
         let engine = crate::runs::workpod::engine_log_of(logs);
         if !engine.trim().is_empty()
             && let Err(e) =
-                crate::runs::blob_store::put_run_engine_log(db.pool(), &run.run_id, engine).await
+                crate::runs::blob_store::put_run_engine_log(db.pool(), &run.run_id, &engine).await
         {
             tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: keeping the pod's engine log failed");
         }
