@@ -187,6 +187,7 @@ cleanup() {
     if [ "$rc" -ne 0 ]; then
         mkdir -p "$ARTIFACTS"
         docker logs "$REG" >"$ARTIFACTS/registry.log" 2>&1 || true
+        { df -h; docker system df; docker ps -a; } >"$ARTIFACTS/host.txt" 2>&1 || true
         echo "artifacts: $ARTIFACTS" >&2
     fi
     if [ "${KEEP:-0}" = 1 ]; then
@@ -844,7 +845,7 @@ KUBECONFIG
 log "creating kind clusters for ${SHARDS[*]}"
 for shard in "${SHARDS[@]}"; do
     mkdir -p "$TOP/$shard"
-    kind create cluster -q --name "$(cluster_name "$shard")" --config "$FIX/cluster.yaml" --wait 120s \
+    kind create cluster --retain --name "$(cluster_name "$shard")" --config "$FIX/cluster.yaml" --wait 120s \
         --kubeconfig "$TOP/$shard/kubeconfig" >"$TOP/$shard/kind-create.log" 2>&1 &
     CREATE_PIDS+=($!)
 done
@@ -900,8 +901,14 @@ CONTRACT_VERSION=$("$AUTORESEARCH_ENGINE" --contract-version)
 cp "$ROOT/tools/fake-agent.py" "$TOP/image/fake-agent.py"
 cp "$FIX/openshell-gateway" "$FIX/openshell" "$TOP/image/"
 
-for p in ${CREATE_PIDS[@]+"${CREATE_PIDS[@]}"}; do
-    wait "$p" || fail "creating a kind cluster failed: $(cat "$TOP"/*/kind-create.log)"
+for i in "${!CREATE_PIDS[@]}"; do
+    shard=${SHARDS[$i]}
+    if ! wait "${CREATE_PIDS[$i]}"; then
+        mkdir -p "$ARTIFACTS"
+        cp "$TOP/$shard/kind-create.log" "$ARTIFACTS/kind-create-$shard.log"
+        kind export logs --name "$(cluster_name "$shard")" "$ARTIFACTS/kind-$shard" >/dev/null 2>&1 || true
+        fail "creating the kind cluster for $shard failed: $(tail -n 40 "$TOP/$shard/kind-create.log")"
+    fi
 done
 CREATE_PIDS=()
 
