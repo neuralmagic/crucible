@@ -15,6 +15,7 @@
 //! url = "https://crucible-api.internal.example.com"
 //! proxy = "socks5h://127.0.0.1:1080"
 //! tunnel = "ssh -N -D 1080 jumpbox"     # kept running while the app is
+//! shell = "/bin/bash"                    # what runs it, `-l -c`; `$SHELL` when unset
 //!
 //! [profiles.local]
 //! url = "http://127.0.0.1:8870"         # starts `just controller-local 8870` in the repo
@@ -46,6 +47,8 @@ const TAIL: usize = 6;
 /// The flag that runs the app as a tunnel's supervisor, and where the command goes.
 pub const KEEP_FLAG: &str = "--keep";
 const KEEP: &str = "CRUCIBLE_PLAYBOOKS_KEEP";
+/// The shell the supervisor runs the command under, when the profile names one.
+const KEEP_SHELL: &str = "CRUCIBLE_PLAYBOOKS_KEEP_SHELL";
 /// How long a tunnel has to stop on TERM before it is killed.
 const KILL_AFTER: Duration = Duration::from_secs(3);
 
@@ -77,6 +80,10 @@ pub struct Profile {
     /// port forward. The profile waits for its proxy, or its URL, to answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<String>,
+    /// The shell the tunnel or local controller runs under, as `<shell> -l -c <command>`;
+    /// `$SHELL` when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
 }
 
 fn is_own(auth: &Auth) -> bool {
@@ -116,6 +123,9 @@ impl Profile {
         }
         if self.tunnel.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(format!("profile {name}: tunnel is a command"));
+        }
+        if self.shell.as_deref().is_some_and(|s| s.trim().is_empty()) {
+            return Err(format!("profile {name}: shell is a program"));
         }
         Ok(())
     }
@@ -336,7 +346,8 @@ impl Target {
             return None;
         }
         self.set(Readiness::Starting(what.to_string()));
-        let keeper = match supervisor.and_then(|s| Keeper::spawn(s, &command, repo)) {
+        let shell = self.profile.shell.as_deref().map(str::trim);
+        let keeper = match supervisor.and_then(|s| Keeper::spawn(s, &command, shell, repo)) {
             Ok(keeper) => keeper,
             Err(why) => {
                 self.set(Readiness::Failed(format!("starting `{command}`: {why}")));
@@ -420,8 +431,17 @@ pub struct Keeper {
 }
 
 impl Keeper {
-    /// Run `command` under `supervisor`, which [`keep`]s it.
-    fn spawn(mut supervisor: Command, command: &str, dir: &Path) -> std::io::Result<Keeper> {
+    /// Run `command` under `supervisor`, which [`keep`]s it in `shell`, else `$SHELL`.
+    fn spawn(
+        mut supervisor: Command,
+        command: &str,
+        shell: Option<&str>,
+        dir: &Path,
+    ) -> std::io::Result<Keeper> {
+        match shell {
+            Some(shell) => supervisor.env(KEEP_SHELL, shell),
+            None => supervisor.env_remove(KEEP_SHELL),
+        };
         let mut child = supervisor
             .env(KEEP, command)
             .current_dir(dir)
@@ -488,10 +508,14 @@ pub fn keep() -> i32 {
         eprintln!("{KEEP_FLAG} needs the command in {KEEP}");
         return 2;
     };
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = std::env::var(KEEP_SHELL)
+        .ok()
+        .filter(|shell| !shell.is_empty())
+        .unwrap_or_else(|| crate::editor::Os::HOST.login_shell());
     let mut child = match Command::new(&shell)
         .args(["-l", "-c", &command])
         .env_remove(KEEP)
+        .env_remove(KEEP_SHELL)
         .stdin(Stdio::null())
         .process_group(0)
         .spawn()
@@ -590,6 +614,7 @@ pub fn from_tauri(text: &str, crux_url: &str) -> Tauri {
                 proxy: old.proxy,
                 resolve,
                 tunnel: None,
+                shell: None,
             };
             profile.check(&name).ok().map(|()| (name, profile))
         })
@@ -640,6 +665,7 @@ pub struct Form {
     pub url: rune::TextEdit,
     pub proxy: rune::TextEdit,
     pub tunnel: rune::TextEdit,
+    pub shell: rune::TextEdit,
     /// `host = address` pairs, one per line or comma-separated.
     pub resolve: rune::TextEdit,
     pub auth: Auth,
@@ -663,6 +689,7 @@ impl Form {
             url: rune::TextEdit::new(&profile.url),
             proxy: rune::TextEdit::new(profile.proxy.as_deref().unwrap_or_default()),
             tunnel: rune::TextEdit::new(profile.tunnel.as_deref().unwrap_or_default()),
+            shell: rune::TextEdit::new(profile.shell.as_deref().unwrap_or_default()),
             resolve: rune::TextEdit::new(resolve.join(", ")),
             auth: profile.auth,
             error: None,
@@ -695,6 +722,7 @@ impl Form {
             proxy: some(&self.proxy),
             resolve,
             tunnel: some(&self.tunnel),
+            shell: some(&self.shell),
         };
         profile.check(&name)?;
         Ok((name, profile))
@@ -1069,6 +1097,35 @@ url = "https://crucible.ext.wdc.example.com"
             !answers(&format!("127.0.0.1:{port}")),
             "dropping the keeper ends the tunnel"
         );
+    }
+
+    #[test]
+    fn a_tunnel_runs_under_the_profiles_shell() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut p = profile(&format!("http://127.0.0.1:{port}"));
+        p.tunnel = Some("echo \"ran under $0\" >&2; exit 3".into());
+        p.shell = Some("/bin/sh".into());
+        let dir = tempfile::tempdir().unwrap();
+        let target = Target::new("t", p.clone(), dir.path());
+        let _keeper = target.start(dir.path(), test_supervisor());
+        let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
+        let Readiness::Failed(why) = failed else {
+            panic!("{failed:?}");
+        };
+        assert!(why.contains("ran under /bin/sh"), "{why}");
+
+        p.shell = Some("/no/such/shell".into());
+        let target = Target::new("t", p, dir.path());
+        let _keeper = target.start(dir.path(), test_supervisor());
+        let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
+        let Readiness::Failed(why) = failed else {
+            panic!("{failed:?}");
+        };
+        assert!(why.contains("starting /no/such/shell"), "{why}");
     }
 
     #[test]
