@@ -61,8 +61,7 @@ check = command(
     name = "check",
     run = "./count.sh",
     depends_on = [poem],
-    revise = poem,
-    max_rounds = 2,
+    revise = send_back(poem, rounds = 2),
 )
 
 workflow(type = "playbook", tasks = [poem, check])

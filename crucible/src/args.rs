@@ -142,7 +142,7 @@ pub(crate) struct Args {
     /// Overrides the manifest's `[agent].harness`; when neither is set the engine defaults to
     /// claude (see `apply_agent_cfg`).
     #[arg(long, value_enum)]
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// Codex-harness tuning (from `[agent.codex]`). No CLI flag.
     #[arg(skip)]
     pub codex: manifest::CodexCfg,
@@ -153,7 +153,7 @@ pub(crate) struct Args {
     /// `[agent].reasoning_effort`; when neither is set the engine defaults to `medium` (see
     /// `apply_agent_cfg`).
     #[arg(long = "effort", value_enum)]
-    pub reasoning_effort: Option<crate::manifest::ReasoningEffort>,
+    pub reasoning_effort: Option<crate::knobs::ReasoningEffort>,
     /// Backend for the agent turn: `local` (default) runs it here; `openshell` runs
     /// it in an OpenShell sandbox (what an in-pod loop uses). Needs `--sandbox-image`.
     #[arg(long, value_enum, default_value_t = manifest::AgentBackend::Local)]
@@ -265,7 +265,7 @@ impl Args {
     /// The resolved agent harness: CLI `--harness` > manifest `[agent].harness` (folded on by
     /// `apply_agent_cfg`) > claude. Paths that never see a manifest (rank-grounded, scope) get
     /// the claude default.
-    pub(crate) fn harness(&self) -> crate::manifest::Harness {
+    pub(crate) fn harness(&self) -> crate::knobs::Harness {
         self.harness.unwrap_or_default()
     }
 
@@ -350,9 +350,9 @@ pub(crate) struct EngineUninitialized;
 /// the agent knobs, and the manifest `[agent].env`.
 #[derive(Clone, Copy)]
 pub(crate) struct TurnAgent<'a> {
-    pub harness: manifest::Harness,
+    pub harness: crate::knobs::Harness,
     pub model: &'a str,
-    pub reasoning_effort: Option<manifest::ReasoningEffort>,
+    pub reasoning_effort: Option<crate::knobs::ReasoningEffort>,
     pub disallowed_tools: &'a [String],
     pub codex: &'a manifest::CodexCfg,
     pub env: &'a [(String, String)],
@@ -501,6 +501,6 @@ pub(crate) struct Prepared {
 /// supplied.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AgentOverride {
-    pub harness: Option<manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     pub model: Option<String>,
 }

@@ -186,13 +186,13 @@ impl ShellRunner {
                     }
                 }
                 if let Some(h) = harness {
-                    cmd.env("CRUCIBLE_HARNESS", h);
+                    cmd.env("CRUCIBLE_HARNESS", h.as_str());
                 }
                 if let Some(m) = model {
                     cmd.env("CRUCIBLE_MODEL", m);
                 }
                 if let Some(e) = effort {
-                    cmd.env("CRUCIBLE_EFFORT", e);
+                    cmd.env("CRUCIBLE_EFFORT", e.as_flag());
                 }
             }
             TaskKind::Report {
@@ -1464,7 +1464,7 @@ mod tests {
             name: "a".into(),
             task: TaskKind::Agent {
                 prompt: "improve the cache".into(),
-                harness: Some("hermes".into()),
+                harness: Some(crate::knobs::Harness::Codex),
                 model: Some("codex".into()),
                 effort: None,
                 sandbox: None,
@@ -1497,7 +1497,7 @@ mod tests {
         assert!(out.valid, "{:?}", out.results);
         let v = out.results[&"a".into()].output.as_ref().unwrap();
         assert_eq!(v["prompt"], "improve the cache");
-        assert_eq!(v["harness"], "hermes");
+        assert_eq!(v["harness"], "codex");
         assert_eq!(v["model"], "codex");
     }
 

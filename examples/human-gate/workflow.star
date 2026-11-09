@@ -15,10 +15,7 @@ lint = command(name = "lint", run = "./act.sh lint", depends_on = [plan])
 
 gate = route(
     name = "gate",
-    depends_on = [plan],
-    human = True,
-    review = "reviews/gate.md.j2",
-    timeout = "20m",
+    decider = human(review = "reviews/gate.md.j2", timeout = "20m"),
     questions = {
         "launch": choice(
             ask = "Launch the training job?",
@@ -47,35 +44,26 @@ gate = route(
 launch = command(
     name = "launch",
     run = "./act.sh launch",
-    depends_on = [gate],
-    when = gate.launch,
-    answers = "approve",
-    over = gate.nodes,
-    max_fanout = 8,
+    when = gate.launch.any_of("approve"),
+    over = each(gate.nodes, max = 8),
 )
 
 smoke = command(
     name = "smoke",
     run = "./act.sh smoke",
-    depends_on = [gate],
-    when = gate.checks,
-    answers = "smoke",
+    when = gate.checks.any_of("smoke"),
 )
 
 held_out = command(
     name = "eval",
     run = "./act.sh eval",
-    depends_on = [gate],
-    when = gate.checks,
-    answers = "eval",
+    when = gate.checks.any_of("eval"),
 )
 
 shelve = command(
     name = "shelve",
     run = "./act.sh shelve",
-    depends_on = [gate],
-    when = gate.launch,
-    otherwise = True,
+    when = gate.launch.otherwise(),
 )
 
 done = command(

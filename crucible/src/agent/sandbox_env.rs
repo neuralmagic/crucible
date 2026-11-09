@@ -197,7 +197,7 @@ pub(crate) fn sh_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::agent::sandbox_env::*;
-    use crate::manifest::Harness;
+    use crate::knobs::Harness;
 
     fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {

@@ -79,11 +79,11 @@ pub(crate) fn broker_bounds_env(
 /// preferred harness when that harness speaks the binding's protocol, else the one that does.
 /// Without a binding the launch's own flag wins over the manifest's `[agent]`.
 pub(crate) fn select_agent(
-    flag_harness: Option<manifest::Harness>,
+    flag_harness: Option<crate::knobs::Harness>,
     flag_model: Option<&str>,
     agent: &manifest::AgentCfg,
     inference: &crate::agent::inference::InferenceEnv,
-) -> (manifest::Harness, String) {
+) -> (crate::knobs::Harness, String) {
     let preferred = flag_harness.unwrap_or(agent.harness);
     let asked = flag_model.unwrap_or(&agent.model);
     let Some(selection) = &inference.selection else {
@@ -105,7 +105,10 @@ pub(crate) fn select_agent(
 
 /// Resolve [`select_agent`] against the process environment and pin the result, with the agent
 /// binding's price, on `args`.
-pub(crate) fn pin_agent(args: &mut Args, agent: &manifest::AgentCfg) -> Result<manifest::Harness> {
+pub(crate) fn pin_agent(
+    args: &mut Args,
+    agent: &manifest::AgentCfg,
+) -> Result<crate::knobs::Harness> {
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
     let (harness, model) = select_agent(args.harness, args.model.as_deref(), agent, &inference);
     args.harness = Some(harness);
@@ -169,7 +172,7 @@ pub(crate) fn apply_agent_cfg(
         args.reasoning_effort = agent.reasoning_effort;
     }
     if args.reasoning_effort.is_none() {
-        args.reasoning_effort = Some(crate::manifest::ReasoningEffort::Medium);
+        args.reasoning_effort = Some(crate::knobs::ReasoningEffort::Medium);
     }
     // Backend: the manifest decides by default, but a CLI `--agent-backend openshell` overrides it
     // (the same manifest runs `local` on a laptop and `openshell` in the pod). Default
@@ -641,7 +644,7 @@ mod tests {
 
     #[test]
     fn without_a_binding_the_flag_wins_over_the_manifest() {
-        use manifest::Harness;
+        use crate::knobs::Harness;
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         let none = Default::default();
         assert_eq!(
@@ -656,8 +659,8 @@ mod tests {
 
     #[test]
     fn a_binding_fixes_the_model_and_keeps_or_replaces_the_harness_by_protocol() {
+        use crate::knobs::Harness;
         use crucible_contract::inference::InferenceProtocol;
-        use manifest::Harness;
         let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
         assert_eq!(
             select_agent(
@@ -777,7 +780,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             a.reasoning_effort,
-            Some(crate::manifest::ReasoningEffort::Medium)
+            Some(crate::knobs::ReasoningEffort::Medium)
         );
     }
 
@@ -794,10 +797,7 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(
-            a.reasoning_effort,
-            Some(crate::manifest::ReasoningEffort::Max)
-        );
+        assert_eq!(a.reasoning_effort, Some(crate::knobs::ReasoningEffort::Max));
     }
 
     #[test]
@@ -812,7 +812,7 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(a.harness(), crate::manifest::Harness::Claude);
+        assert_eq!(a.harness(), crate::knobs::Harness::Claude);
 
         let m: manifest::Manifest = toml::from_str(&manifest_toml("harness = \"pi\"")).unwrap();
         let mut a = args_from(&["crucible"]);
@@ -824,7 +824,7 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(a.harness(), crate::manifest::Harness::Pi);
+        assert_eq!(a.harness(), crate::knobs::Harness::Pi);
     }
 
     #[test]
@@ -839,7 +839,7 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(a.harness(), crate::manifest::Harness::Claude);
+        assert_eq!(a.harness(), crate::knobs::Harness::Claude);
     }
 
     #[test]
@@ -847,7 +847,7 @@ mod tests {
         let m: manifest::Manifest =
             toml::from_str(&manifest_toml("model = \"claude-haiku-4-5\"")).unwrap();
         let mut a = args_from(&["crucible"]);
-        assert_eq!(a.model(), crate::manifest::Harness::Claude.default_model());
+        assert_eq!(a.model(), crate::knobs::Harness::Claude.default_model());
         apply_agent_cfg(
             &mut a,
             &m.agent,
@@ -896,7 +896,7 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(a.harness(), crate::manifest::Harness::Codex);
+        assert_eq!(a.harness(), crate::knobs::Harness::Codex);
         assert_eq!(a.codex.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(a.codex.auth, manifest::CodexAuthMode::Api);
         assert_eq!(a.codex.api_key.as_deref(), Some("WORK"));
@@ -931,10 +931,7 @@ mod tests {
             &FrozenProjection::default(),
         )
         .unwrap();
-        assert_eq!(
-            a.reasoning_effort,
-            Some(crate::manifest::ReasoningEffort::Low)
-        );
+        assert_eq!(a.reasoning_effort, Some(crate::knobs::ReasoningEffort::Low));
     }
 
     /// A manifest without `[agent.env]` (a controller-drafted pack) still gets the pod's Vertex
