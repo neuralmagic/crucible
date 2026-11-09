@@ -519,6 +519,15 @@ impl Client {
         self.get("/api/providers").await
     }
 
+    /// The clusters the caller may dispatch onto, default first, narrowed to what registered
+    /// playbook `playbook` can run on when one is named.
+    pub async fn dispatch_targets<T: DeserializeOwned>(&self, playbook: Option<&str>) -> Result<T> {
+        let mut q = Query::new();
+        q.push("playbook", playbook);
+        self.get(&format!("/api/dispatch-targets{}", q.finish()))
+            .await
+    }
+
     /// The secrets the caller owns or is an owner-group member of. Metadata only.
     pub async fn secrets<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/secrets").await

@@ -1,7 +1,7 @@
-//! Launch-form choices a producer task supplies ([ADR-0073]): the latest passing value of the
+//! Launch-form choices a producer task supplies ([ADR-0074]): the latest passing value of the
 //! producer's field among this playbook's runs, attached to the schema the form and admission read.
 //!
-//! [ADR-0073]: ../../../docs/adr/ADR-0073.md
+//! [ADR-0074]: ../../../docs/adr/ADR-0074.md
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};

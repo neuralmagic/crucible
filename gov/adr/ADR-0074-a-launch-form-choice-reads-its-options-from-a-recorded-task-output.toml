@@ -1,7 +1,7 @@
 #:schema ../schema/adr.schema.json
 
 [govctl]
-id = "ADR-0073"
+id = "ADR-0074"
 title = "A launch-form choice reads its options from a recorded task output"
 status = "proposed"
 date = "2026-11-09"

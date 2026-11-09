@@ -550,7 +550,7 @@ mod tests {
             ),
             (
                 "0085_launch_choice_snapshots.sql",
-                "6179152d06b849a24ac56ec1b14d60272250deac9e91c2e21d90806ae25f879b",
+                "1a16cb0896ccc1dab6280ff9bad3a2b3f011b4efda5397727ba82feb05c0215c",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

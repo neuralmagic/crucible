@@ -1,7 +1,7 @@
 #:schema ../schema/adr.schema.json
 
 [govctl]
-id = "ADR-0072"
+id = "ADR-0073"
 title = "A run acts as its own scope to Kubernetes, not as its launcher"
 status = "proposed"
 date = "2026-11-04"
