@@ -912,13 +912,20 @@ pub struct RerunPreview {
 }
 
 /// An inference provider registration as the admin list returns it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Provider {
     pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub default_model: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// What the provider serves: `agent`, and others a launch does not pick.
+    #[serde(default)]
+    pub roles: Vec<String>,
     #[serde(default)]
     pub harness: Option<String>,
     #[serde(default)]
@@ -929,8 +936,33 @@ pub struct Provider {
     pub owner: String,
 }
 
+/// `GET /api/dispatch-targets`: where the caller may dispatch, default first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct DispatchTargets {
+    #[serde(default)]
+    pub targets: Vec<DispatchTarget>,
+    /// Why the list is empty, when it is.
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DispatchTarget {
+    /// What a launch sends back as `dispatch_target`.
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    /// `hub`, `spoke` or `personal`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
 /// USD per million tokens for each billed bucket.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct ProviderPrice {
     pub input: f64,
     pub output: f64,

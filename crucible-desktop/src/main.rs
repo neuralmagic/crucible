@@ -29,6 +29,7 @@ mod palette;
 mod preview;
 mod profile;
 mod runs;
+mod runs_on;
 mod search;
 mod session;
 mod settings;
@@ -141,6 +142,8 @@ pub struct Launcher {
     pub answers: Vec<TextEdit>,
     pub cost: TextEdit,
     pub time: TextEdit,
+    /// Where it runs: the dispatch target, and the agent's provider and model.
+    pub runs_on: runs_on::RunsOnForm,
     /// The admin caps: dollars and a duration.
     pub caps: (f64, String),
     pub problems: form::Problems,
@@ -272,6 +275,8 @@ pub struct App {
     clicks: Option<std::sync::mpsc::Receiver<String>>,
     /// Each command's key recorder in Settings, once touched.
     pub recorders: HashMap<keymap::Command, rune_kit::ShortcutRecorderState>,
+    /// Where the provider picker's state goes once the launch sheet has closed.
+    pub provider_scratch: rune_kit::ComboboxState,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
@@ -669,6 +674,7 @@ impl App {
             answers: Vec::new(),
             cost: TextEdit::new(""),
             time: TextEdit::new(""),
+            runs_on: runs_on::RunsOnForm::default(),
             caps: (0.0, String::new()),
             problems: Vec::new(),
             refusal: None,
@@ -719,6 +725,7 @@ impl App {
             launcher.refusal = Some(why);
             return;
         }
+        let runs_on = launcher.runs_on.runs_on();
         if let Some(schedule) = &launcher.schedule {
             match schedule.body(
                 &launcher.target,
@@ -727,7 +734,8 @@ impl App {
                 &max_time,
                 launcher.digest.as_deref(),
             ) {
-                Ok(body) => {
+                Ok(mut body) => {
+                    runs_on.pin(&mut body);
                     let id = schedule.stored.as_ref().map(|s| s.id.clone());
                     launcher.stage = Stage::Sending;
                     self.act(admin::Action::SaveSchedule { id, body });
@@ -736,7 +744,7 @@ impl App {
             }
             return;
         }
-        let body = studio::launch_body(
+        let mut body = studio::launch_body(
             &launcher.target,
             params,
             max_cost,
@@ -744,6 +752,7 @@ impl App {
             launcher.digest.as_deref(),
             launcher.rerun.as_ref(),
         );
+        runs_on.pin(&mut body);
         launcher.stage = Stage::Sending;
         launcher.after = self.replies;
         self.live_client.launch(launcher.target.clone(), body);
@@ -779,7 +788,7 @@ impl App {
                 Err(error) => {
                     if let Some(launcher) = &mut self.launcher {
                         launcher.stage = Stage::Ready;
-                        launcher.refusal = Some(error);
+                        launcher.refusal = Some(form::Refusal::from(error.as_str()).0);
                     }
                 }
             }
@@ -797,14 +806,20 @@ impl App {
             .and_then(|l| l.schedule.as_ref())
             .and_then(|s| s.stored.as_deref())
             .cloned();
+        let shown = self
+            .selected_live()
+            .filter(|live| live.id == prepared.target.id())
+            .and(self.selected_detail())
+            .and_then(|detail| detail.launch.as_ref());
         let previous = match &stored {
             Some(stored) => Some(serde_json::Value::Object(stored.params.clone())),
-            None => self
-                .selected_live()
-                .filter(|live| live.id == prepared.target.id())
-                .and(self.selected_detail())
-                .and_then(|detail| detail.launch.as_ref())
-                .map(|record| record.launch.params.clone()),
+            None => shown.map(|record| record.launch.params.clone()),
+        };
+        let before = match &stored {
+            Some(stored) => runs_on::RunsOn::from(stored),
+            None => shown
+                .and_then(|record| runs_on::RunsOn::try_from(record).ok())
+                .unwrap_or_default(),
         };
         let Some(launcher) = &mut self.launcher else {
             return;
@@ -817,7 +832,10 @@ impl App {
                 digest,
                 max_cost,
                 max_time,
+                targets,
+                providers,
             }) => {
+                launcher.runs_on = runs_on::RunsOnForm::new(&targets, &providers, before);
                 launcher.digest = digest;
                 launcher.fields = form::fields(&schema);
                 launcher.answers = launcher
@@ -1281,6 +1299,7 @@ fn init() -> App {
         notifier: None,
         clicks: None,
         recorders: HashMap::new(),
+        provider_scratch: rune_kit::ComboboxState::default(),
         pack_file: None,
         layout: settings.layout.clone(),
         shown: Vec::new(),
