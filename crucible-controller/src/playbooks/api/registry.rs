@@ -567,7 +567,11 @@ pub(crate) async fn get_playbook_schema(
         return Ok(refused);
     }
     match crate::playbooks::registry::schema(state.db.pool(), &id).await? {
-        Some(schema) => Ok(Json(schema).into_response()),
+        Some(schema) => {
+            let (served, _) =
+                crate::playbooks::choices::attach(state.db.pool(), &id, &schema).await?;
+            Ok(Json(served).into_response())
+        }
         None => Ok(not_found(format!("no playbook {id:?}"))),
     }
 }
@@ -737,6 +741,7 @@ pub(crate) async fn launch_playbook(
     let dispatch_target = saver.dispatch_target.clone();
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
     let launch = crate::launches::model::NewPlaybookLaunch {
+        choice_snapshots: Some(&authorized.choice_snapshots),
         playbook: &pack.id,
         repo: pack.source.launch_repo(),
         title: &pack.description,

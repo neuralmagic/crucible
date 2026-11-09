@@ -2623,6 +2623,7 @@ fn compile_source_here(
     if !dropped.is_empty() {
         return Err(CompileError::DroppedTasks { sites: dropped });
     }
+    check_choice_producers(&declared_params, &workflow)?;
     if !context.sessions.is_empty() && !context.string_session_refs.is_empty() {
         let refs: Vec<Site> = context
             .string_session_refs
@@ -2649,6 +2650,39 @@ fn compile_source_here(
         canonical_json,
         declares_params,
     })
+}
+
+/// A parameter's choices_from must name an unmapped task in this workflow that promises the field
+/// as a list, so the controller has one value to offer.
+fn check_choice_producers(declared: &params::Params, workflow: &WorkflowCfg) -> Result<()> {
+    for spec in declared.specs() {
+        let Some(from) = &spec.choices_from else {
+            continue;
+        };
+        let invalid = |detail| CompileError::ParamChoicesFromInvalid {
+            param: spec.name.clone(),
+            task: from.task.clone(),
+            field: from.field.clone(),
+            detail,
+        };
+        let Some(producer) = workflow.tasks.iter().find(|t| t.name.0 == from.task) else {
+            return Err(invalid("that task is not in the workflow"));
+        };
+        if producer.over.is_some() {
+            return Err(invalid("that task is mapped, so it has no single output"));
+        }
+        match producer.emits.field(&from.field) {
+            crate::plan::ir::Declared::Untyped => {}
+            crate::plan::ir::Declared::Typed(ty) if ty.is_list() => {}
+            crate::plan::ir::Declared::Typed(_) => {
+                return Err(invalid("that field is not declared a list"));
+            }
+            crate::plan::ir::Declared::Unchecked | crate::plan::ir::Declared::Omitted => {
+                return Err(invalid("that task does not declare the field in emits"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The evaluation ceilings every module runs under. A budget setter only fails when it is set
@@ -5964,6 +5998,109 @@ fail("evaluating this source is a bug")
 
     /// Values bind before evaluation, so the compiled graph is what they produced rather than a
     /// template of them: nothing downstream has a parameter left to resolve.
+    /// A choice list a task produces at run time: the schema names the producer for the controller,
+    /// and allow_other turns any list into suggestions the engine no longer enforces.
+    #[test]
+    fn choices_from_names_a_producer_and_allow_other_makes_choices_suggestions() {
+        let pack = temp_pack("params-choices-from");
+        let source = r#"
+params = {
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}, "allow_other": True},
+    "size": {"type": "string", "default": "s", "choices": ["s", "m"], "allow_other": True},
+    "mode": {"type": "string", "default": "a", "choices": ["a", "b"]},
+}
+options = command(name = "options", run = "./options.sh", emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [options])
+"#;
+        let path = pack.join("workflow.star");
+        let schema = declared_params(source, &path)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let release = &schema["properties"]["release"];
+        assert_eq!(
+            release["x-choices-from"],
+            serde_json::json!({"task": "options", "field": "releases"})
+        );
+        assert_eq!(release["x-allow-other"], true);
+        assert_eq!(
+            schema["properties"]["size"]["x-choices"],
+            serde_json::json!(["s", "m"])
+        );
+        assert!(schema["properties"]["size"].get("enum").is_none());
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["a", "b"])
+        );
+        let with = |pairs: &[(&str, &str)]| {
+            let supplied = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            compile_source_with(source, &path, &pack, &supplied)
+        };
+        assert!(with(&[("size", "xl"), ("release", "3.9 GA")]).is_ok());
+        assert!(matches!(
+            with(&[("mode", "c")]),
+            Err(CompileError::ParamConstraintFailed { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn choices_from_must_name_an_unmapped_task_promising_a_list() {
+        let pack = temp_pack("params-choices-from-invalid");
+        let path = pack.join("workflow.star");
+        let decl = r#"params = {"release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}}}"#;
+        for (tasks, detail) in [
+            (
+                r#"other = command(name = "other", run = "./o.sh")
+workflow(type = "playbook", tasks = [other])"#,
+                "that task is not in the workflow",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh", emits = ["ok"])
+workflow(type = "playbook", tasks = [options])"#,
+                "that task does not declare the field in emits",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh", emits = {"releases": "string"})
+workflow(type = "playbook", tasks = [options])"#,
+                "that field is not declared a list",
+            ),
+        ] {
+            let source = format!("{decl}\n{tasks}\n");
+            let error = compile_source_with(&source, &path, &pack, &BTreeMap::new()).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ParamChoicesFromInvalid { detail: d, .. } if *d == detail),
+                "{detail}: {}",
+                crate::errors::report(&error)
+            );
+        }
+        let declaration = |fields: &str| {
+            read_params(&format!("params = {{\"p\": {{{fields}}}}}\n"), &path).map(|_| ())
+        };
+        assert!(matches!(
+            declaration(
+                r#""type": "string", "default": "", "choices": ["a"], "choices_from": {"task": "t", "field": "f"}"#
+            ),
+            Err(CompileError::ParamChoicesConflict { .. })
+        ));
+        assert!(matches!(
+            declaration(r#""type": "string", "default": "", "allow_other": True"#),
+            Err(CompileError::ParamAllowOtherWithoutChoices { .. })
+        ));
+        assert!(matches!(
+            declaration(
+                r#""type": "int", "default": 1, "choices_from": {"task": "t", "field": "f"}"#
+            ),
+            Err(CompileError::ParamConstraintMismatch { .. })
+        ));
+        assert!(
+            declaration(r#""type": "string", "default": "", "choices_from": {"task": "t"}"#)
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
     #[test]
     fn parameter_values_are_bound_into_the_compiled_graph() {
         let pack = temp_pack("params-bind");

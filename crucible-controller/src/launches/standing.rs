@@ -451,6 +451,7 @@ pub(crate) async fn fire(
         MaxTime::parse(&core.max_time).map_err(|e| format!("{noun} stored max_time: {e}"))?;
     let params = overlaid_params(core, schema, firing.overlay)?;
     let launch = NewPlaybookLaunch {
+        choice_snapshots: None,
         playbook: &core.playbook,
         repo: &row.repo,
         title: firing.title.unwrap_or(description),

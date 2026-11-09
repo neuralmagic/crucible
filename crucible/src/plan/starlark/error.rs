@@ -205,6 +205,17 @@ pub enum CompileError {
     },
     #[error("parameter {param:?} pattern does not compile: {detail}")]
     ParamBadPattern { param: String, detail: String },
+    #[error("parameter {param:?} declares both choices and choices_from; offer one list")]
+    ParamChoicesConflict { param: String },
+    #[error("parameter {param:?} sets allow_other without choices or choices_from")]
+    ParamAllowOtherWithoutChoices { param: String },
+    #[error("parameter {param:?} takes choices from {task}.{field}, but {detail}")]
+    ParamChoicesFromInvalid {
+        param: String,
+        task: String,
+        field: String,
+        detail: &'static str,
+    },
     #[error(
         "no value for required parameter {name:?}{}",
         if doc.is_empty() { String::new() } else { format!(" ({doc})") }

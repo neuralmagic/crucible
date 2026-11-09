@@ -1362,6 +1362,16 @@ pub fn validate_params(
             .iter()
             .map(|(k, v)| {
                 let value = match schema.pointer(&format!("/properties/{}", pointer_token(k))) {
+                    Some(property) if crate::playbooks::choices::outside_snapshot(property, v) => {
+                        errors.push(FieldError {
+                            field: k.clone(),
+                            message: format!(
+                                "{v:?} is not among the current choices; pick one from the form or \
+                                 refresh its producer task"
+                            ),
+                        });
+                        serde_json::Value::Null
+                    }
                     Some(property) => match ParamType::from_schema(property).read(v) {
                         Ok(read) => read.json(),
                         Err(expected) => {

@@ -1293,6 +1293,7 @@ mod tests {
         let max_time = MaxTime::parse("30m").expect("duration");
         let params = params();
         let launch = NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/packs",
             title: "reads a paper",
@@ -2068,6 +2069,7 @@ mod tests {
                 &pool,
                 key,
                 &NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/packs",
                     title: "reads a paper",

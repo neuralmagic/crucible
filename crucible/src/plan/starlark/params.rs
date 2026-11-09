@@ -130,6 +130,19 @@ pub struct ParamSpec {
     /// A string a launch form takes in a text area. The bound value is the same string.
     #[serde(default)]
     pub multiline: bool,
+    /// The producer task output whose latest passing value offers this parameter's choices.
+    #[serde(default)]
+    pub choices_from: Option<ChoicesFrom>,
+    /// The choices are suggestions: a value outside them is accepted.
+    #[serde(default)]
+    pub allow_other: bool,
+}
+
+/// A task in the same workflow and the list-of-strings field it emits as a parameter's choices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChoicesFrom {
+    pub task: String,
+    pub field: String,
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
@@ -143,6 +156,8 @@ pub const FIELDS: &[&str] = &[
     "max",
     "choices",
     "multiline",
+    "choices_from",
+    "allow_other",
 ];
 
 /// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
@@ -280,7 +295,21 @@ impl Params {
                 property.insert("maximum".into(), serde_json::json!(max));
             }
             if !spec.choices.is_empty() {
-                property.insert("enum".into(), serde_json::json!(spec.choices));
+                let key = if spec.allow_other {
+                    "x-choices"
+                } else {
+                    "enum"
+                };
+                property.insert(key.into(), serde_json::json!(spec.choices));
+            }
+            if let Some(from) = &spec.choices_from {
+                property.insert(
+                    "x-choices-from".into(),
+                    serde_json::json!({"task": from.task, "field": from.field}),
+                );
+            }
+            if spec.allow_other {
+                property.insert("x-allow-other".into(), serde_json::json!(true));
             }
             if spec.multiline {
                 property.insert("x-multiline".into(), serde_json::json!(true));
@@ -396,6 +425,38 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             ty: ty.as_str(),
         });
     }
+    let choices_from = field(
+        &declared,
+        name,
+        "choices_from",
+        "a dictionary literal {\"task\": ..., \"field\": ...}",
+        literal_choices_from,
+    )?;
+    if choices_from.is_some() && ty != ParamType::String {
+        return Err(CompileError::ParamConstraintMismatch {
+            param: name.to_owned(),
+            constraint: "choices_from",
+            ty: ty.as_str(),
+        });
+    }
+    if choices_from.is_some() && !choices.is_empty() {
+        return Err(CompileError::ParamChoicesConflict {
+            param: name.to_owned(),
+        });
+    }
+    let allow_other = field(
+        &declared,
+        name,
+        "allow_other",
+        "True or False",
+        literal_bool,
+    )?
+    .unwrap_or(false);
+    if allow_other && choices.is_empty() && choices_from.is_none() {
+        return Err(CompileError::ParamAllowOtherWithoutChoices {
+            param: name.to_owned(),
+        });
+    }
     let multiline =
         field(&declared, name, "multiline", "True or False", literal_bool)?.unwrap_or(false);
     if multiline && ty != ParamType::String {
@@ -417,6 +478,8 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         max,
         choices,
         multiline,
+        choices_from,
+        allow_other,
     })
 }
 
@@ -448,6 +511,28 @@ fn literal_string(expression: &Expr) -> Option<String> {
         Expr::Literal(AstLiteral::String(s)) => Some(s.node.clone()),
         _ => None,
     }
+}
+
+fn literal_choices_from(expression: &Expr) -> Option<ChoicesFrom> {
+    let Expr::Dict(entries) = expression else {
+        return None;
+    };
+    let mut task = None;
+    let mut field = None;
+    for (key, value) in entries {
+        let slot = match literal_string(&key.node)?.as_str() {
+            "task" => &mut task,
+            "field" => &mut field,
+            _ => return None,
+        };
+        if slot.replace(literal_string(&value.node)?).is_some() {
+            return None;
+        }
+    }
+    Some(ChoicesFrom {
+        task: task?,
+        field: field?,
+    })
 }
 
 fn literal_bool(expression: &Expr) -> Option<bool> {
@@ -535,7 +620,7 @@ fn check(spec: &ParamSpec, value: &ParamValue) -> Result<()> {
                     detail: format!("must match {pattern}"),
                 });
             }
-            if !spec.choices.is_empty() && !spec.choices.contains(s) {
+            if !spec.allow_other && !spec.choices.is_empty() && !spec.choices.contains(s) {
                 return Err(CompileError::ParamConstraintFailed {
                     param: spec.name.clone(),
                     got: s.clone(),
