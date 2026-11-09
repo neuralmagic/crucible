@@ -1,6 +1,7 @@
 """Check vLLM out at vllm_ref, build it once through the run's own buildit (whose builds write the
-shared cache), push the image, and count what ccache served. The last stdout line emits the seed
-image every candidate is layered on, and the seed's build time and cache counts."""
+shared cache), push the image, and count what ccache served. The last stdout line emits the
+pushed seed image, the same image by digest in the builder registry (what layer builds start
+from, since builder pods pull nothing else), and the seed's build time and cache counts."""
 
 import json
 import os
@@ -112,10 +113,12 @@ def main() -> None:
     else:
         print(f"no ccache log came back from the run: {json.dumps(ran)[:2000]}", flush=True)
         ccache = None
+    digest = str(pushed["image"]).split("@", 1)[1]
     print(
         json.dumps(
             {
                 "seed_image": pushed["image"],
+                "seed_base": f"{params['builder_registry']}@{digest}",
                 "seed_build_id": build_id,
                 "seed_build_seconds": build_seconds,
                 "seed_push_seconds": push_seconds,

@@ -30,7 +30,8 @@ dummy weights, then `vllm bench serve`.
 ## How candidates build
 
 `hc.py stage` diffs the checkout against the seed. Edits that are all Python or JSON under
-`vllm/` build as a buildit layer over the seed image: the edited files appended as one layer,
+`vllm/` build as a buildit layer over the seed image, as `builder_registry` holds it (builder pods
+pull from the cluster's registry only): the edited files appended as one layer,
 nothing compiled, the seed's layers neither pulled nor pushed. Anything else (csrc, CMake) builds
 from the Dockerfile with the run's ccache and cluster `.deps` caches. `hc.py keep` makes a
 candidate the tree the next round starts from; `best.patch` is the kept diff.

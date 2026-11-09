@@ -8,8 +8,9 @@ is missing, write `report.json` with an `error` saying so and stop. Do not look 
 
 ## What is measured
 
-The seed task built vLLM at `vllm_ref` (below) and pushed it as `seed_image`, which your task
-inputs carry. The image holds `/bench/moe_bench.py`, which you cannot change. At Qwen3-30B-A3B's
+The seed task built vLLM at `vllm_ref` (below) and pushed it as `seed_image`. Your task inputs
+carry it, and `seed_base`: the same image in the registry builds pull from. The image holds
+`/bench/moe_bench.py`, which you cannot change. At Qwen3-30B-A3B's
 shapes (128 experts, top 8, hidden 2048, intermediate 768, bf16) and token counts 1 to 8192, it
 runs `fused_topk` then `fused_experts`, checks the output against a float32 reference, times both
 replayed from a CUDA graph, and prints one line:
@@ -37,7 +38,7 @@ its `run_id`. Every Job is named `hc-<tag>-<label>`, and every label is new.
 
 `<label>` is a short lowercase word naming the change (`baseline` for the seed itself).
 
-1. Edit files under `build/vllm/`, then `python3 hc.py stage <label> <seed_image>`. It prints
+1. Edit files under `build/vllm/`, then `python3 hc.py stage <label> <seed_base>`. It prints
    `recipe` and `build`, the arguments for buildit `build`. For `recipe` `dockerfile`, add
    build_args `BASE`, `CUDA_ARCH_LIST`, `MAX_JOBS` and `SERVE_MODEL` from below, `timeout_s`
    3600, and these caches, unchanged:

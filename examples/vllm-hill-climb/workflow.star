@@ -5,13 +5,14 @@ params = {
     "max_jobs": {"type": "int", "default": 64, "min": 1, "max": 128},
     "serve_model": {"type": "string", "default": "Qwen/Qwen3-30B-A3B", "doc": "config and tokenizer the serving check runs with dummy weights"},
     "queue": {"type": "string", "default": "crucible-e2e", "doc": "the LocalQueue the GPU Jobs go to"},
+    "builder_registry": {"type": "string", "default": "image-registry.openshift-image-registry.svc:5000/crucible-builds/buildit", "doc": "where buildit's builds land, which layer builds pull their base from"},
     "rounds": {"type": "int", "default": 3, "min": 1, "max": 6, "doc": "climb rounds after the baseline"},
 }
 
 seed = command(
     name = "seed",
     run = "python3 seed.py",
-    emits = ["seed_image", "seed_build_id", "seed_build_seconds", "seed_push_seconds", "seed_ccache"],
+    emits = ["seed_image", "seed_base", "seed_build_id", "seed_build_seconds", "seed_push_seconds", "seed_ccache"],
     timeout = "60m",
 )
 
