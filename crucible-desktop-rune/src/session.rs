@@ -389,6 +389,21 @@ impl RunFold {
                 }
                 kept
             }
+            SessionEvent::TaskOutput {
+                task,
+                stream,
+                lines,
+                ..
+            } => {
+                let stderr = stream == crucible_contract::event::RawStream::Stderr;
+                self.transcript
+                    .extend(LogLine::from_output(&task, stderr, &lines));
+                true
+            }
+            SessionEvent::TaskOutputDropped { task, lines, .. } => {
+                self.transcript.push(LogLine::dropped_output(&task, lines));
+                true
+            }
             SessionEvent::Shutdown { outcome, reason } => {
                 self.shutdown = Some(Shutdown { outcome, reason });
                 true
@@ -588,6 +603,45 @@ not json at all
         );
         assert!(fold.tasks[0].result.is_some());
         assert_eq!(fold.tasks[1].state(), TaskState::Pending);
+    }
+
+    #[test]
+    fn command_output_folds_into_the_tasks_log_by_stream_with_the_cut_said() {
+        let text = format!(
+            "{FANOUT}{}\n{}\n{}\n",
+            r#"{"v":1,"kind":"task_output","task":"edit[a]","attempt":1,"stream":"stdout","lines":["fetching RHAI-21041","2 tickets"]}"#,
+            r#"{"v":1,"kind":"task_output","task":"edit[a]","attempt":1,"stream":"stderr","lines":["warning: slow"]}"#,
+            r#"{"v":1,"kind":"task_output_dropped","task":"edit[a]","attempt":1,"lines":41}"#,
+        );
+        let fold = fold(&text);
+        use crate::logline::{Body, Group};
+        let bodies: Vec<&Body> = fold.transcript.iter().map(|l| &l.body).collect();
+        assert_eq!(
+            bodies[..3],
+            [
+                &Body::Output {
+                    stderr: false,
+                    text: "fetching RHAI-21041".into()
+                },
+                &Body::Output {
+                    stderr: false,
+                    text: "2 tickets".into()
+                },
+                &Body::Output {
+                    stderr: true,
+                    text: "warning: slow".into()
+                },
+            ]
+        );
+        assert!(fold.transcript.iter().all(|l| l.is_for("edit")));
+        assert_eq!(fold.transcript[0].group(), Group::Task);
+        let dropped = &fold.transcript[3];
+        assert!(dropped.is_problem());
+        assert_eq!(
+            dropped.summary().as_deref(),
+            Some("41 more output lines past the cap were not recorded")
+        );
+        assert!(fold.agent_events.is_empty(), "output is not an agent turn");
     }
 
     #[test]

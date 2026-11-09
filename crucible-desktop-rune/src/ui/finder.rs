@@ -179,7 +179,7 @@ fn launch_head(app: &App, key: &str, count: usize, p: &Paint) -> El {
 fn hit_row(i: usize, hit: &crate::search::Hit, on: bool, query: &str, p: &Paint) -> El {
     let source = match hit.source {
         Source::Output => "output",
-        Source::Transcript => "agent",
+        Source::Transcript => "session",
         Source::Console => "log",
         Source::Params => "params",
     };

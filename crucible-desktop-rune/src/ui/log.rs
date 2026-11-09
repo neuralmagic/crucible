@@ -577,6 +577,11 @@ pub(crate) fn parts(line: &LogLine, p: &Paint) -> (Option<&'static str>, Color, 
         }
         Body::Summary(text) => (Some("RUN"), p.accent, text.clone(), p.c.text_base),
         Body::Note(text) => (Some("TURN"), dim, text.clone(), dim),
+        Body::Output {
+            stderr: false,
+            text,
+        } => (Some("OUT"), dim, text.clone(), p.c.text_base),
+        Body::Output { stderr: true, text } => (Some("ERR"), p.live, text.clone(), p.c.text_base),
         Body::Plain(text) => (None, dim, text.clone(), dim),
     }
 }

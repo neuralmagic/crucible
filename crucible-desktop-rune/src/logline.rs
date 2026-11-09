@@ -91,6 +91,11 @@ pub enum Body {
     Summary(String),
     /// An agent lifecycle line from a session transcript: init, gates, sandbox, exit.
     Note(String),
+    /// A line a command task printed, from its session's `task_output` events.
+    Output {
+        stderr: bool,
+        text: String,
+    },
     Plain(String),
 }
 
@@ -115,6 +120,36 @@ pub enum Group {
 }
 
 impl LogLine {
+    /// The lines a command task printed, from one `task_output` event, each a line for `task`.
+    pub fn from_output(task: &str, stderr: bool, lines: &[String]) -> Vec<Self> {
+        lines
+            .iter()
+            .map(|text| LogLine {
+                at: None,
+                task: Some(task.to_string()),
+                body: Body::Output {
+                    stderr,
+                    text: text.clone(),
+                },
+                raw: text.clone(),
+            })
+            .collect()
+    }
+
+    /// What `task_output_dropped` says: the lines past the engine's cap that were not kept.
+    pub fn dropped_output(task: &str, lines: u64) -> Self {
+        let text = format!("{lines} more output lines past the cap were not recorded");
+        LogLine {
+            at: None,
+            task: Some(task.to_string()),
+            body: Body::Notice {
+                text: text.clone(),
+                warning: true,
+            },
+            raw: text,
+        }
+    }
+
     /// One event from a session's agent transcript, as a log line for `task`. Undecoded output
     /// has no line.
     pub fn from_agent(task: &str, event: &AgentEvent) -> Option<Self> {
@@ -258,7 +293,7 @@ impl LogLine {
             Body::Notice { .. } | Body::Trace { .. } | Body::Summary(_) | Body::Plain(_) => {
                 Group::Engine
             }
-            Body::TaskRow { .. } => Group::Task,
+            Body::TaskRow { .. } | Body::Output { .. } => Group::Task,
             _ => Group::Agent,
         }
     }
@@ -402,6 +437,7 @@ impl LogLine {
             Body::Notice { text, .. }
             | Body::Summary(text)
             | Body::Note(text)
+            | Body::Output { text, .. }
             | Body::Plain(text) => text.clone(),
             Body::Trace { text, .. } => text.clone(),
             Body::TaskRow { name, status, .. } => format!("{name} {status}"),
