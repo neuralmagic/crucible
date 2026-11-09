@@ -127,11 +127,20 @@ pub struct Client {
 
 impl HttpTransport {
     pub fn connect(cfg: &Config) -> Result<Self> {
+        Self::with_client(cfg, Self::builder())
+    }
+
+    /// The builder [`HttpTransport::connect`] starts from, for a caller that adds a proxy or
+    /// resolver overrides before handing it to [`HttpTransport::with_client`].
+    pub fn builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder().timeout(Duration::from_secs(120))
+    }
+
+    pub fn with_client(cfg: &Config, builder: reqwest::ClientBuilder) -> Result<Self> {
         if cfg.url.is_empty() {
             bail!("no controller to talk to: set CONTROLLER_URL, or `url` in the config file");
         }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+        let http = builder
             .build()
             .context("building the controller http client")?;
         Ok(Self {
@@ -509,6 +518,97 @@ impl Client {
         .await
     }
 
+    /// Hand secret `id` to `owner` (`user:<login>` or `team:<slug>`).
+    pub async fn transfer_secret(&self, id: &str, owner: &str) -> Result<dto::Secret> {
+        self.put(
+            &format!("/api/secrets/{}/owner", encode(id)),
+            &serde_json::json!({ "owner": owner }),
+        )
+        .await
+    }
+
+    /// A secret and its bindings.
+    pub async fn secret(&self, id: &str) -> Result<dto::SecretDetail> {
+        self.get(&format!("/api/secrets/{}", encode(id))).await
+    }
+
+    /// Who did what to a secret, newest first.
+    pub async fn secret_audit(&self, id: &str) -> Result<Vec<dto::SecretAudit>> {
+        self.get(&format!("/api/secrets/{}/audit", encode(id)))
+            .await
+    }
+
+    /// Write `value` as the secret's next version.
+    pub async fn rotate_secret(&self, id: &str, value: &str) -> Result<dto::Secret> {
+        self.post(
+            &format!("/api/secrets/{}/rotate", encode(id)),
+            Some(&serde_json::json!({ "value": value })),
+        )
+        .await
+    }
+
+    pub async fn unbind_secret(&self, id: &str, binding: &str) -> Result<()> {
+        self.delete(&format!(
+            "/api/secrets/{}/bindings/{}",
+            encode(id),
+            encode(binding)
+        ))
+        .await
+    }
+
+    pub async fn shares(&self, of: &Shared) -> Result<Vec<dto::Share>> {
+        self.get(&format!("{}/shares", of.path())).await
+    }
+
+    /// Give `grantee` (`user:<login>` or `team:<slug>`) `role` until `not_after`, replacing any
+    /// share it had.
+    pub async fn grant_share(
+        &self,
+        of: &Shared,
+        grantee: &str,
+        role: &str,
+        not_after: Option<&str>,
+    ) -> Result<dto::Share> {
+        self.put(
+            &format!("{}/shares/{}", of.path(), encode(grantee)),
+            &serde_json::json!({ "role": role, "not_after": not_after }),
+        )
+        .await
+    }
+
+    pub async fn revoke_share(&self, of: &Shared, grantee: &str) -> Result<()> {
+        self.delete(&format!("{}/shares/{}", of.path(), encode(grantee)))
+            .await
+    }
+
+    /// The open decision requests the caller may answer.
+    pub async fn decisions(&self) -> Result<dto::Decisions> {
+        self.get("/api/decisions").await
+    }
+
+    pub async fn decision(&self, id: &str) -> Result<dto::Decision> {
+        self.get(&format!("/api/decisions/{}", encode(id))).await
+    }
+
+    /// Answer every question of request `id`, as of the evidence `digest` names.
+    pub async fn answer_decision(
+        &self,
+        id: &str,
+        labels: &std::collections::BTreeMap<String, Vec<String>>,
+        digest: &str,
+        note: Option<&str>,
+    ) -> Result<dto::Decision> {
+        self.post(
+            &format!("/api/decisions/{}/answer", encode(id)),
+            Some(&serde_json::json!({
+                "labels": labels,
+                "evidence_digest": digest,
+                "note": note,
+            })),
+        )
+        .await
+    }
+
     /// The parameter schema a launch is validated against. An agent reads this before filling one
     /// in; guessing the field names is how a launch turns into a 422.
     pub async fn playbook_schema<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
@@ -576,6 +676,24 @@ impl Client {
 
     pub async fn schedules<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/schedules").await
+    }
+
+    pub async fn create_schedule<T: DeserializeOwned>(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        self.post("/api/schedules", Some(body)).await
+    }
+
+    /// Replace schedule `id` whole with `body`; [`dto::Schedule::body`] builds one from a stored
+    /// schedule.
+    pub async fn update_schedule<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        self.put(&format!("/api/schedules/{}", encode(id)), body)
+            .await
     }
 
     pub async fn watches<T: DeserializeOwned>(&self) -> Result<T> {
@@ -1055,6 +1173,24 @@ pub fn tracker_url(playbook: &str, key: &str) -> String {
 /// RFC 3986 unreserved set only. Deliberately stricter than a URL library's per-component rules:
 /// an issue key is `owner/repo#12`, and both `/` and `#` MUST encode or the request goes to a
 /// different path (or drops everything after the fragment marker).
+/// Something the controller lets its owner share.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Shared {
+    Playbook(String),
+    Draft(String),
+    Provider(String),
+}
+
+impl Shared {
+    fn path(&self) -> String {
+        match self {
+            Shared::Playbook(id) => format!("/api/playbooks/{}", encode(id)),
+            Shared::Draft(id) => format!("/api/playbook-drafts/{}", encode(id)),
+            Shared::Provider(id) => format!("/api/providers/{}", encode(id)),
+        }
+    }
+}
+
 pub fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {

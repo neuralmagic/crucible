@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A telemetry sample the agent emits roughly every few thousand tokens.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct Tokens {
     #[serde(default)]
     pub input: u64,
@@ -45,7 +45,7 @@ pub struct ModelUsage {
 /// One normalized event from the agent run. `#[serde(tag = "kind")]` decodes the
 /// NDJSON directly; unknown fields (like `v`) are ignored, and an unknown `kind`
 /// fails to decode so the caller can fall back to the scraper.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// One-shot run header. The schema also carries backend/harness/workdir;

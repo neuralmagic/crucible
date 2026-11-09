@@ -1,0 +1,48 @@
+[package]
+name = "crucible-playbooks"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, like crucible-desktop: Rune is pre-release and pinned to a dev rev, so the
+# engine workspace must not inherit it. Rune itself is ../vendor/rune, upstream at that rev plus
+# patches/rune, which rune-patches.sh lays down.
+[workspace]
+
+[dependencies]
+rune = { path = "../vendor/rune/crates/rune" }
+rune-kit = { path = "../vendor/rune/crates/rune-kit", default-features = false, features = ["markdown", "mermaid"] }
+rune-mermaid = { path = "../vendor/rune/crates/rune-mermaid" }
+rune-theme-opencode = { path = "../vendor/rune/themes/opencode" }
+rune-fx = { path = "../vendor/rune/crates/rune-fx" }
+rune-knobs = { path = "../vendor/rune/crates/rune-knobs" }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+crucible-contract = { path = "../crucible-contract" }
+crux = { path = "../crux", default-features = false }
+crucible = { path = "../crucible", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jiff = "0.2"
+base64 = "0.23"
+rand = "0.10"
+sha2 = "0.10"
+anyhow = "1"
+async-trait = "0.1"
+reqwest = { version = "0.13", default-features = false, features = ["socks"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+rune-mac = { path = "../vendor/rune/crates/rune-mac" }
+zbus = { version = "6", default-features = false, features = ["tokio"] }
+futures-util = "0.3"
+url = "2"
+toml = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+hot = ["rune/hot"]
+# The ⌘⇧K panel that tunes effects and layout live. Off, every knob reads its default.
+knobs = ["rune-knobs/panel"]

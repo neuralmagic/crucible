@@ -7,7 +7,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A string the list endpoints cut and the detail endpoints send whole.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -536,6 +536,32 @@ pub struct Whoami {
     pub groups: Vec<String>,
     #[serde(default)]
     pub mode: Option<ControllerAuthMode>,
+    /// The teams the caller belongs to, which it may act and own things as.
+    #[serde(default)]
+    pub teams: Vec<WhoamiTeam>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhoamiTeam {
+    pub team: String,
+    #[serde(default)]
+    pub role: String,
+}
+
+/// Param values as a schedule stores them: every one a string.
+pub fn string_params(
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    params
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            (name.clone(), serde_json::Value::String(text))
+        })
+        .collect()
 }
 
 /// `POST /api/playbooks/imports`: a proposal frozen at the commit the fetch resolved to.
@@ -870,6 +896,151 @@ pub struct Secret {
     pub visibility: String,
     #[serde(default)]
     pub mode: String,
+    #[serde(default)]
+    pub consumer: String,
+    /// The Vault version a managed secret is at; references and minted secrets have none.
+    #[serde(default)]
+    pub current_version: Option<i64>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// A secret and every scope it is bound at.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecretDetail {
+    #[serde(flatten)]
+    pub secret: Secret,
+    #[serde(default)]
+    pub bindings: Vec<SecretBinding>,
+}
+
+/// One entry of a secret's audit trail.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecretAudit {
+    pub id: i64,
+    pub action: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub at: String,
+}
+
+/// Who else may use a playbook, draft or provider, at what role, until when.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Share {
+    pub grantee: String,
+    /// `viewer`, `launcher` or `editor`.
+    pub role: String,
+    #[serde(default)]
+    pub not_after: Option<String>,
+    #[serde(default)]
+    pub expired: bool,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+/// The open decision requests the caller may answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Decisions {
+    pub open: Vec<DecisionSummary>,
+}
+
+/// An open decision request, as the queue lists it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionSummary {
+    pub id: String,
+    pub run_id: String,
+    pub task: String,
+    #[serde(default)]
+    pub launch_key: Option<String>,
+    #[serde(default)]
+    pub questions: Vec<String>,
+    pub opened_at: String,
+    pub expires_at: String,
+}
+
+/// A decision request with the evidence it was opened on.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Decision {
+    pub id: String,
+    pub run_id: String,
+    pub task: String,
+    #[serde(default)]
+    pub launch_key: Option<String>,
+    /// `open`, `answered`, `expired` or `withdrawn`.
+    pub state: String,
+    pub opened_at: String,
+    pub expires_at: String,
+    pub questions: Vec<DecisionQuestion>,
+    #[serde(default)]
+    pub inputs: Vec<DecisionInput>,
+    #[serde(default)]
+    pub spent_usd: f64,
+    #[serde(default)]
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub max_cost_usd: f64,
+    #[serde(default)]
+    pub max_time_secs: Option<u64>,
+    #[serde(default)]
+    pub gated: Vec<DecisionGated>,
+    /// The rendered review, CommonMark.
+    #[serde(default)]
+    pub review: Option<String>,
+    pub evidence_digest: String,
+    #[serde(default)]
+    pub answer: Option<DecisionAnswer>,
+    #[serde(default)]
+    pub can_answer: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionQuestion {
+    pub id: String,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// `noul`, `choice`, `score` or `pick`.
+    pub kind: String,
+    #[serde(default)]
+    pub multiple: bool,
+    pub options: Vec<String>,
+}
+
+/// An upstream task's result the request shows.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionInput {
+    pub task: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+}
+
+/// A task the answer decides whether to run.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionGated {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    pub question: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionAnswer {
+    pub labels: std::collections::BTreeMap<String, Vec<String>>,
+    pub decided_by: String,
+    pub decided_at: String,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// A secret attached to a scope: what a run at that scope gets, and under which name.
@@ -1069,6 +1240,68 @@ pub struct Schedule {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
+    /// `adopted` (a frozen Git revision) or `draft_head` (the latest successful draft save).
+    #[serde(default)]
+    pub target_kind: String,
+    /// The values every firing launches.
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub schema_digest: String,
+    #[serde(default)]
+    pub max_cost: f64,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub advance_dedupe: bool,
+    /// The recurring-input cursor, when it declares one.
+    #[serde(default)]
+    pub cursor: Option<ScheduleCursor>,
+    /// The IANA zone `cron_expr` is read in.
+    #[serde(default)]
+    pub tz: String,
+    #[serde(default)]
+    pub dispatch_target: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
+    #[serde(default)]
+    pub agent_model: Option<String>,
+}
+
+/// Where a schedule's next firing takes its input from: a result path passed as `param`, or a
+/// run file written at `path`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ScheduleCursor {
+    pub from: String,
+    #[serde(default)]
+    pub param: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Schedule {
+    /// The body that saves this schedule back as it stands, but `enabled`. The controller's PUT
+    /// replaces a schedule whole, so every field it stored goes back with it.
+    pub fn body(&self, enabled: bool) -> serde_json::Value {
+        let params = string_params(&self.params);
+        serde_json::json!({
+            "owner": self.owner_principal,
+            "playbook": self.playbook,
+            "target_kind": self.target_kind,
+            "params": params,
+            "max_cost": self.max_cost,
+            "max_time": self.max_time,
+            "cron_expr": self.cron_expr,
+            "tz": self.tz,
+            "schema_digest": (!self.schema_digest.is_empty()).then_some(&self.schema_digest),
+            "advance_dedupe": self.advance_dedupe,
+            "enabled": enabled,
+            "dispatch_target": self.dispatch_target,
+            "provider": self.agent_provider,
+            "model": self.agent_model,
+            "cursor": self.cursor,
+        })
+    }
 }
 
 /// The provider a scope's unpinned dispatches of one workload class take.
@@ -1330,5 +1563,102 @@ mod tests {
             assert!(msg.contains("awaiting-approval"), "{msg}");
             assert!(msg.contains("pr-open"), "{msg}");
         }
+    }
+
+    #[test]
+    fn a_schedule_saves_back_whole_with_only_enabled_changed() {
+        let stored: Schedule = serde_json::from_str(
+            r#"{"id":"s1","playbook":"report","cron_expr":"0 9 * * MON-FRI","enabled":true,
+                "next_due_at":null,"last_fired_at":null,"consecutive_failures":0,
+                "owner_principal":"team:infra","target_kind":"draft_head",
+                "params":{"repo":"owner/repo","limit":5,"dry":true},"schema_digest":"abc",
+                "max_cost":2.5,"max_time":"45m","advance_dedupe":false,"tz":"America/New_York",
+                "dispatch_target":"wharf","agent_provider":"vertex","agent_model":"m",
+                "cursor":{"from":"result","param":"since","path":null}}"#,
+        )
+        .expect("wire shape");
+        assert_eq!(
+            stored.body(false),
+            serde_json::json!({
+                "owner": "team:infra", "playbook": "report", "target_kind": "draft_head",
+                "params": {"repo": "owner/repo", "limit": "5", "dry": "true"},
+                "max_cost": 2.5, "max_time": "45m", "cron_expr": "0 9 * * MON-FRI",
+                "tz": "America/New_York", "schema_digest": "abc", "advance_dedupe": false,
+                "enabled": false, "dispatch_target": "wharf", "provider": "vertex", "model": "m",
+                "cursor": {"from": "result", "param": "since", "path": null},
+            })
+        );
+    }
+
+    #[test]
+    fn a_schedule_with_no_stored_digest_sends_none() {
+        let stored: Schedule = serde_json::from_str(
+            r#"{"id":"s1","playbook":"report","cron_expr":"0 9 * * *","enabled":false,
+                "next_due_at":null,"last_fired_at":null,"consecutive_failures":0}"#,
+        )
+        .expect("wire shape");
+        let body = stored.body(true);
+        assert_eq!(body["schema_digest"], serde_json::Value::Null);
+        assert_eq!(body["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(body["cursor"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_secret_detail_reads_the_flattened_secret_and_its_bindings() {
+        let detail: SecretDetail = serde_json::from_str(
+            r#"{"id":"s1","name":"gh","owner":"user:wren","kind":"opaque",
+                "visibility":"agent_visible","consumer":"run","mode":"managed",
+                "vault_path":"registry/user:wren/gh","current_version":2,"created_by":"wren",
+                "created_at":"2026-08-31T20:15:07Z","updated_at":"2026-09-01T00:00:00Z",
+                "bindings":[{"id":"b1","secret_id":"s1","scope_kind":"playbook",
+                  "scope_id":"triage","projection_kind":"env","projection":"GH_TOKEN",
+                  "declared_name":"gh","created_by":"wren"}]}"#,
+        )
+        .expect("wire shape");
+        assert_eq!(detail.secret.name, "gh");
+        assert_eq!(detail.secret.current_version, Some(2));
+        assert_eq!(detail.bindings[0].projection, "GH_TOKEN");
+    }
+
+    #[test]
+    fn a_decision_request_reads_its_questions_evidence_and_answer() {
+        let decision: Decision = serde_json::from_str(
+            r##"{"id":"d1","run_id":"run-1","task":"review","launch_key":"playbook:triage:3",
+                "state":"answered","opened_at":"2026-11-08T10:00:00Z",
+                "expires_at":"2026-11-09T10:00:00Z",
+                "questions":[{"id":"ship","instructions":"Ship it?","kind":"choice",
+                  "multiple":false,"options":["yes","no"]}],
+                "inputs":[{"task":"build","status":"passed","output":{"ok":true},"files":[]}],
+                "spent_usd":0.5,"elapsed_secs":120,"max_cost_usd":2.0,"max_time_secs":1800,
+                "gated":[{"name":"publish","kind":"command","question":"ship","labels":["yes"]}],
+                "review":"# Review","evidence_digest":"sha256:ab",
+                "answer":{"labels":{"ship":["yes"]},"decided_by":"wren",
+                  "decided_at":"2026-11-08T11:00:00Z","note":null},
+                "can_answer":false}"##,
+        )
+        .expect("wire shape");
+        assert_eq!(decision.questions[0].options, ["yes", "no"]);
+        assert_eq!(decision.gated[0].labels, ["yes"]);
+        assert_eq!(decision.answer.expect("answered").labels["ship"], ["yes"]);
+        let queue: Decisions = serde_json::from_str(
+            r#"{"open":[{"id":"d1","run_id":"run-1","task":"review","launch_key":null,
+                "questions":["ship"],"opened_at":"2026-11-08T10:00:00Z",
+                "expires_at":"2026-11-09T10:00:00Z"}]}"#,
+        )
+        .expect("wire shape");
+        assert_eq!(queue.open[0].questions, ["ship"]);
+    }
+
+    #[test]
+    fn a_share_reads_with_and_without_an_end() {
+        let shares: Vec<Share> = serde_json::from_str(
+            r#"[{"grantee":"team:infra","role":"launcher","not_after":null,"expired":false,
+                 "created_by":"wren","created_at":"x","updated_at":"x"},
+                {"grantee":"user:bo","role":"viewer","not_after":"2026-01-01T23:59:59Z",
+                 "expired":true,"created_by":null,"created_at":"x","updated_at":"x"}]"#,
+        )
+        .expect("wire shape");
+        assert_eq!(shares[0].not_after, None);
+        assert!(shares[1].expired);
     }
 }
