@@ -12,6 +12,7 @@ mod launcher;
 mod log;
 mod pack;
 mod palette;
+mod profiles;
 mod runs;
 mod schedules;
 mod secrets;
@@ -513,9 +514,9 @@ fn live_empty(launch: &LivePlaybook, detail: Option<&LiveDetail>) -> (&'static s
 fn sidebar(app: &App, p: &Paint) -> El {
     let source = match app.backend {
         Backend::Controller => match &app.live {
-            LiveView::Ready { endpoint, .. } => endpoint.clone(),
-            LiveView::Loading => "crux".to_string(),
-            LiveView::Unavailable(_) => "crux · not connected".to_string(),
+            LiveView::Ready { endpoint, .. } => format!("{} \u{b7} {endpoint}", app.target.name),
+            LiveView::Loading => app.target.name.clone(),
+            LiveView::Unavailable(_) => format!("{} \u{b7} not connected", app.target.name),
         },
         Backend::Local => app.repo.clone(),
     };
@@ -856,6 +857,21 @@ fn note(label: &str, p: &Paint) -> El {
 }
 
 fn unavailable(error: &str, app: &App, p: &Paint) -> El {
+    if let crate::profile::Readiness::Starting(what) = app.target.readiness() {
+        return row()
+            .key("live-starting")
+            .w_full()
+            .gap(8.0)
+            .padding(10.0)
+            .center_y()
+            .child(Spinner::new().size(14.0).build(p.k))
+            .child(
+                text(format!("{what}\u{2026}"))
+                    .font(p.k.ty.ui)
+                    .color(p.c.text_muted)
+                    .wrap(),
+            );
+    }
     let s = p.tone(Tone::Danger);
     let action = if app.signing_in {
         row()
@@ -899,15 +915,22 @@ fn unavailable(error: &str, app: &App, p: &Paint) -> El {
                 .wrap(),
         )
         .child(
-            TextInput::new(&app.sign_in_url)
-                .placeholder("https://crucible.example.com")
-                .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD - 20.0))
-                .disabled(app.signing_in)
-                .on_edit(|app: &mut App| &mut app.sign_in_url)
-                .build(p.k)
-                .key("sign-in-url"),
+            text(format!("{} \u{b7} {}", app.target.name, app.target.url()))
+                .font(p.mono(11.0, 400.0))
+                .color(p.c.text_muted)
+                .truncate(),
         )
         .child(action)
+        .child(
+            TextInput::new(&app.key_paste)
+                .placeholder("or paste a crk_ key")
+                .secure()
+                .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD - 20.0))
+                .on_edit(|app: &mut App| &mut app.key_paste)
+                .on_submit(|app: &mut App, _: &mut Tx| app.save_pasted_key())
+                .build(p.k)
+                .key("sign-in-key"),
+        )
         .children(
             app.sign_in_error
                 .as_ref()
@@ -1486,6 +1509,12 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                         .key("settings-done"),
                 ),
         )
+        .child(settings_section(
+            "profiles",
+            "Profiles",
+            profiles::rows(app, p),
+            p,
+        ))
         .child(settings_section(
             "appearance",
             "Appearance",

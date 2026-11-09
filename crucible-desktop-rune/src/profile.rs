@@ -1,0 +1,1077 @@
+//! Profiles: the controllers the app can talk to, and how each one is reached.
+//!
+//! ```text
+//! profile = "wdc"
+//!
+//! [profiles.mpp]
+//! url = "https://crucible-api.example.com"
+//! auth = "crux"                         # the key in crux's config.toml
+//!
+//! [profiles.wdc]
+//! url = "https://crucible-api.wdc.example.com"
+//! resolve = { "crucible-api.wdc.example.com" = "lb.example.net" }
+//!
+//! [profiles.jump]
+//! url = "https://crucible-api.internal.example.com"
+//! proxy = "socks5h://127.0.0.1:1080"
+//! tunnel = "ssh -N -D 1080 jumpbox"     # kept running while the app is
+//!
+//! [profiles.local]
+//! url = "http://127.0.0.1:8870"         # starts `just controller-local 8870` in the repo
+//! ```
+//!
+//! macOS cannot tie a child's life to its parent's, so a tunnel runs under the app's own binary
+//! as a supervisor ([`keep`]), which ends the tunnel when the app's end of a pipe closes, however
+//! the app ends.
+
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader};
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
+use url::Url;
+
+/// How long a tunnel has to start answering.
+const TUNNEL_WAIT: Duration = Duration::from_secs(60);
+/// How long the local controller has to build and bind.
+const LOCAL_WAIT: Duration = Duration::from_secs(900);
+const PROBE: Duration = Duration::from_millis(800);
+/// Lines of a tunnel's output kept to say why it stopped.
+const TAIL: usize = 6;
+
+/// The flag that runs the app as a tunnel's supervisor, and where the command goes.
+pub const KEEP_FLAG: &str = "--keep";
+const KEEP: &str = "CRUCIBLE_PLAYBOOKS_KEEP";
+/// How long a tunnel has to stop on TERM before it is killed.
+const KILL_AFTER: Duration = Duration::from_secs(3);
+
+/// Where a profile's key is kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Auth {
+    /// The app's own file for this profile.
+    #[default]
+    Own,
+    /// crux's `config.toml`, shared with the CLI.
+    Crux,
+}
+
+/// One controller, as the config file names it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Profile {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "is_own")]
+    pub auth: Auth,
+    /// An `http://`, `https://`, `socks5://` or `socks5h://` proxy for every request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy: Option<String>,
+    /// Hosts reached at another address: an IP, or a name looked up instead.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub resolve: BTreeMap<String, String>,
+    /// A command kept running while the profile is in use, such as `ssh -N -D 1080 host` or a
+    /// port forward. The profile waits for its proxy, or its URL, to answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<String>,
+}
+
+fn is_own(auth: &Auth) -> bool {
+    *auth == Auth::Own
+}
+
+impl Profile {
+    /// Why this profile cannot be used, if it cannot.
+    pub fn check(&self, name: &str) -> Result<(), String> {
+        if !valid_name(name) {
+            return Err(format!(
+                "profile {name:?}: a name is letters, digits, - and _"
+            ));
+        }
+        let url =
+            Url::parse(self.url.trim()).map_err(|_| format!("profile {name}: url is not a URL"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(format!(
+                "profile {name}: url starts with http:// or https://"
+            ));
+        }
+        if let Some(proxy) = &self.proxy {
+            let ok = Url::parse(proxy).is_ok_and(|u| {
+                matches!(u.scheme(), "http" | "https" | "socks5" | "socks5h")
+                    && u.host_str().is_some()
+            });
+            if !ok {
+                return Err(format!(
+                    "profile {name}: proxy is an http://, https://, socks5:// or socks5h:// URL"
+                ));
+            }
+        }
+        for (host, to) in &self.resolve {
+            if host.trim().is_empty() || to.trim().is_empty() {
+                return Err(format!("profile {name}: resolve maps a host to an address"));
+            }
+        }
+        if self.tunnel.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(format!("profile {name}: tunnel is a command"));
+        }
+        Ok(())
+    }
+
+    /// Whether the URL is on this machine.
+    pub fn loopback(&self) -> bool {
+        Url::parse(&self.url).is_ok_and(|url| match url.host() {
+            Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            None => false,
+        })
+    }
+
+    /// What the profile goes through, for a one-line summary.
+    pub fn route(&self) -> Vec<String> {
+        let mut route = Vec::new();
+        if let Some(tunnel) = &self.tunnel {
+            route.push(format!("tunnel {}", tunnel.trim()));
+        } else if self.loopback() {
+            route.push("local controller".into());
+        }
+        if let Some(proxy) = &self.proxy {
+            route.push(format!("via {proxy}"));
+        }
+        for (host, to) in &self.resolve {
+            route.push(format!("{host} \u{2192} {to}"));
+        }
+        route
+    }
+}
+
+pub fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The profiles to offer: those configured, or one named `default` from crux's resolution
+/// (`CONTROLLER_URL`, then crux's config file) when none is.
+pub fn or_default(configured: &BTreeMap<String, Profile>) -> BTreeMap<String, Profile> {
+    if !configured.is_empty() {
+        return configured.clone();
+    }
+    let url = crux::config::ConnectArgs::from_env()
+        .resolve()
+        .map(|config| config.url)
+        .unwrap_or_else(|_| "http://127.0.0.1:8870".to_string());
+    BTreeMap::from([(
+        "default".to_string(),
+        Profile {
+            url,
+            auth: Auth::Crux,
+            ..Profile::default()
+        },
+    )])
+}
+
+/// Whether a profile can be talked to yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Readiness {
+    Ready,
+    /// Waiting on its tunnel or local controller, which this says.
+    Starting(String),
+    Failed(String),
+}
+
+/// A profile in use: where it is, how requests reach it, and whether it answers yet. Workers each
+/// hold a clone; the readiness is shared with the tunnel's keeper.
+#[derive(Clone)]
+pub struct Target {
+    pub name: String,
+    pub profile: Profile,
+    key_file: Option<PathBuf>,
+    ready: Arc<Mutex<Readiness>>,
+}
+
+impl Target {
+    /// `name`'s target, its key in `keys` unless the profile uses crux's.
+    pub fn new(name: &str, profile: Profile, keys: &Path) -> Target {
+        let key_file = match profile.auth {
+            Auth::Own => Some(keys.join(format!("{name}.toml"))),
+            Auth::Crux => None,
+        };
+        Target {
+            name: name.to_string(),
+            profile,
+            key_file,
+            ready: Arc::new(Mutex::new(Readiness::Ready)),
+        }
+    }
+
+    /// A target nothing answers at, for workers under test.
+    #[cfg(test)]
+    pub fn unreachable() -> Target {
+        let profile = Profile {
+            url: "http://127.0.0.1:9".into(),
+            ..Profile::default()
+        };
+        Target::new("test", profile, "/nonexistent".as_ref())
+    }
+
+    pub fn url(&self) -> String {
+        self.profile.url.trim().trim_end_matches('/').to_string()
+    }
+
+    pub fn readiness(&self) -> Readiness {
+        self.ready
+            .lock()
+            .map(|r| r.clone())
+            .unwrap_or_else(|_| Readiness::Failed("the profile's state is poisoned".into()))
+    }
+
+    fn set(&self, readiness: Readiness) {
+        if let Ok(mut r) = self.ready.lock() {
+            *r = readiness;
+        }
+    }
+
+    /// The key requests carry, read now so a sign-in takes effect on the next connection.
+    pub fn key(&self) -> Result<Option<String>, String> {
+        let file = match &self.key_file {
+            Some(file) if !file.exists() => return Ok(None),
+            Some(file) => crux::config::FileConfig::load(Some(file)),
+            None => crux::config::FileConfig::load(None),
+        };
+        file.map(|f| f.api_token).map_err(|e| format!("{e:#}"))
+    }
+
+    /// Keep `key` as this profile's.
+    pub fn save_key(&self, key: String) -> Result<(), String> {
+        crux::config::FileConfig {
+            url: Some(self.url()),
+            api_token: Some(key),
+        }
+        .save(self.key_file.as_deref())
+        .map(drop)
+        .map_err(|e| format!("{e:#}"))
+    }
+
+    /// The crux config requests are made with.
+    pub fn config(&self) -> Result<crux::config::Config, String> {
+        Ok(crux::config::Config {
+            url: self.url(),
+            auth: crux::config::Auth::from_token(self.key()?),
+        })
+    }
+
+    /// An HTTP client builder with the profile's proxy and resolver overrides. Names in
+    /// `resolve` are looked up here, so this blocks on DNS.
+    pub fn http(&self) -> Result<reqwest::ClientBuilder, String> {
+        let mut builder = crux::client::HttpTransport::builder();
+        if let Some(proxy) = &self.profile.proxy {
+            let proxy = reqwest::Proxy::all(proxy.as_str())
+                .map_err(|e| format!("profile {}: proxy: {e}", self.name))?;
+            builder = builder.proxy(proxy);
+        }
+        for (host, to) in &self.profile.resolve {
+            let addrs =
+                addresses(to).map_err(|e| format!("profile {}: resolving {to}: {e}", self.name))?;
+            builder = builder.resolve_to_addrs(host.trim(), &addrs);
+        }
+        Ok(builder)
+    }
+
+    /// A connection's precondition: the profile answers, or why not yet.
+    pub fn ready(&self) -> Result<(), String> {
+        match self.readiness() {
+            Readiness::Ready => Ok(()),
+            Readiness::Starting(what) => Err(format!("{what}\u{2026}")),
+            Readiness::Failed(why) => Err(why),
+        }
+    }
+
+    /// The command this profile keeps running, and how long it has to answer: its tunnel, or for
+    /// a profile on this machine with none, the local controller from `repo`.
+    fn kept(&self) -> Option<(String, Duration, &'static str)> {
+        if let Some(tunnel) = &self.profile.tunnel {
+            return Some((
+                tunnel.trim().to_string(),
+                TUNNEL_WAIT,
+                "Starting the tunnel",
+            ));
+        }
+        let port = Url::parse(&self.profile.url)
+            .ok()
+            .filter(|_| self.profile.loopback())?
+            .port_or_known_default()?;
+        Some((
+            format!("just controller-local {port}"),
+            LOCAL_WAIT,
+            "Building and starting the local controller",
+        ))
+    }
+
+    /// Where answering means the kept command is up: the proxy when there is one, else the URL.
+    fn probe_addr(&self) -> Option<String> {
+        let url = Url::parse(self.profile.proxy.as_deref().unwrap_or(&self.profile.url)).ok()?;
+        Some(format!(
+            "{}:{}",
+            url.host_str()?.trim_matches(['[', ']']),
+            url.port_or_known_default().or(match url.scheme() {
+                "socks5" | "socks5h" => Some(1080),
+                _ => None,
+            })?
+        ))
+    }
+
+    /// Start what the profile keeps running, unless something already answers in its place, and
+    /// mark the target ready once it answers. The keeper stops it when dropped.
+    pub fn start(&self, repo: &Path, supervisor: std::io::Result<Command>) -> Option<Keeper> {
+        let (command, wait, what) = self.kept()?;
+        let addr = self.probe_addr()?;
+        if answers(&addr) {
+            self.set(Readiness::Ready);
+            return None;
+        }
+        self.set(Readiness::Starting(what.to_string()));
+        let keeper = match supervisor.and_then(|s| Keeper::spawn(s, &command, repo)) {
+            Ok(keeper) => keeper,
+            Err(why) => {
+                self.set(Readiness::Failed(format!("starting `{command}`: {why}")));
+                return None;
+            }
+        };
+        let target = self.clone();
+        let child = Arc::clone(&keeper.child);
+        let tail = Arc::clone(&keeper.tail);
+        let _ = std::thread::Builder::new()
+            .name("crucible-playbooks-tunnel".into())
+            .spawn(move || {
+                let until = Instant::now() + wait;
+                loop {
+                    if answers(&addr) {
+                        target.set(Readiness::Ready);
+                        return;
+                    }
+                    let exited = child
+                        .lock()
+                        .ok()
+                        .and_then(|mut c| c.try_wait().ok().flatten());
+                    if let Some(status) = exited {
+                        let said = tail.lock().map(|t| t.join("\n")).unwrap_or_default();
+                        target.set(Readiness::Failed(stopped(&command, status, &said)));
+                        return;
+                    }
+                    if Instant::now() > until {
+                        target.set(Readiness::Failed(format!(
+                            "`{command}` did not answer on {addr} within {}s",
+                            wait.as_secs()
+                        )));
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(400));
+                }
+            });
+        Some(keeper)
+    }
+}
+
+fn stopped(command: &str, status: std::process::ExitStatus, said: &str) -> String {
+    let mut why = format!("`{command}` stopped ({status})");
+    if !said.trim().is_empty() {
+        why.push_str(": ");
+        why.push_str(said.trim());
+    }
+    why
+}
+
+/// `to` as addresses: an IP, an `ip:port`, or a name looked up now.
+fn addresses(to: &str) -> std::io::Result<Vec<SocketAddr>> {
+    let to = to.trim();
+    if let Ok(ip) = to.parse::<IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, 0)]);
+    }
+    if let Ok(addr) = to.parse::<SocketAddr>() {
+        return Ok(vec![addr]);
+    }
+    let found: Vec<SocketAddr> = (to, 0).to_socket_addrs()?.collect();
+    if found.is_empty() {
+        return Err(std::io::Error::other("no address"));
+    }
+    Ok(found)
+}
+
+fn answers(addr: &str) -> bool {
+    addr.to_socket_addrs()
+        .ok()
+        .into_iter()
+        .flatten()
+        .any(|a| TcpStream::connect_timeout(&a, PROBE).is_ok())
+}
+
+/// A command kept running for a profile. Dropping it closes the pipe its supervisor reads, which
+/// then kills the command's process group.
+pub struct Keeper {
+    child: Arc<Mutex<Child>>,
+    stdin: Option<ChildStdin>,
+    tail: Arc<Mutex<Vec<String>>>,
+}
+
+impl Keeper {
+    /// Run `command` under `supervisor`, which [`keep`]s it.
+    fn spawn(mut supervisor: Command, command: &str, dir: &Path) -> std::io::Result<Keeper> {
+        let mut child = supervisor
+            .env(KEEP, command)
+            .current_dir(dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let stdin = child.stdin.take();
+        let tail = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stderr) = child.stderr.take() {
+            let tail = Arc::clone(&tail);
+            let _ = std::thread::Builder::new()
+                .name("crucible-playbooks-tunnel-err".into())
+                .spawn(move || {
+                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                        if let Ok(mut tail) = tail.lock() {
+                            tail.push(line);
+                            let over = tail.len().saturating_sub(TAIL);
+                            tail.drain(..over);
+                        }
+                    }
+                });
+        }
+        Ok(Keeper {
+            child: Arc::new(Mutex::new(child)),
+            stdin,
+            tail,
+        })
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        drop(self.stdin.take());
+        let child = Arc::clone(&self.child);
+        let _ = std::thread::Builder::new()
+            .name("crucible-playbooks-tunnel-reap".into())
+            .spawn(move || {
+                if let Ok(mut child) = child.lock() {
+                    let _ = child.wait();
+                }
+            });
+    }
+}
+
+/// The app itself as a supervisor: `crucible-playbooks --keep`, the command in [`KEEP`].
+pub fn supervisor() -> std::io::Result<Command> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command.arg(KEEP_FLAG);
+    Ok(command)
+}
+
+/// Supervise the command in [`KEEP`], as `--keep`: run it under the login shell in a process group
+/// of its own, kill that group once stdin closes, and return the command's exit code.
+///
+/// ```text
+/// app ──stdin pipe──▶ supervisor ──spawns, own pgid──▶ $SHELL -l -c <command> ──▶ ssh …
+///      app exits, crashes or is killed: the pipe closes ──▶ killpg(TERM), then KILL
+///      the command exits first: the supervisor exits with its code
+/// ```
+pub fn keep() -> i32 {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let Ok(command) = std::env::var(KEEP) else {
+        eprintln!("{KEEP_FLAG} needs the command in {KEEP}");
+        return 2;
+    };
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let mut child = match Command::new(&shell)
+        .args(["-l", "-c", &command])
+        .env_remove(KEEP)
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("starting {shell}: {e}");
+            return 127;
+        }
+    };
+    let Ok(group) = libc::pid_t::try_from(child.id()) else {
+        let _ = child.kill();
+        return 1;
+    };
+    let _ = std::thread::Builder::new()
+        .name("keep-watch".into())
+        .spawn(move || {
+            let mut sink = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut sink);
+            // SAFETY: killpg only sends a signal; `group` is the group this process created.
+            unsafe { libc::killpg(group, libc::SIGTERM) };
+            std::thread::sleep(KILL_AFTER);
+            // SAFETY: as above.
+            unsafe { libc::killpg(group, libc::SIGKILL) };
+        });
+    match child.wait() {
+        Ok(status) => status
+            .code()
+            .or_else(|| status.signal().map(|s| 128 + s))
+            .unwrap_or(1),
+        Err(_) => 1,
+    }
+}
+
+/// The profiles that can be used: the configured ones that read, or the default from crux.
+pub fn usable(settings: &crate::settings::Settings) -> BTreeMap<String, Profile> {
+    let good: BTreeMap<String, Profile> = settings
+        .profiles()
+        .into_iter()
+        .filter_map(|(name, profile)| profile.ok().map(|p| (name, p)))
+        .collect();
+    or_default(&good)
+}
+
+/// The profile to start in: the one last used, else the first.
+pub fn pick(settings: &crate::settings::Settings) -> (String, Profile) {
+    let mut usable = usable(settings);
+    if let Some(name) = &settings.profile
+        && let Some(profile) = usable.remove(name)
+    {
+        return (name.clone(), profile);
+    }
+    usable
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| ("default".into(), Profile::default()))
+}
+
+/// The Settings form for adding or editing a profile.
+pub struct Form {
+    /// The profile being edited, by its name before the edit.
+    pub editing: Option<String>,
+    pub name: rune::TextEdit,
+    pub url: rune::TextEdit,
+    pub proxy: rune::TextEdit,
+    pub tunnel: rune::TextEdit,
+    /// `host = address` pairs, one per line or comma-separated.
+    pub resolve: rune::TextEdit,
+    pub auth: Auth,
+    pub error: Option<String>,
+}
+
+impl Form {
+    pub fn new() -> Form {
+        Form::of(None, &Profile::default())
+    }
+
+    pub fn of(name: Option<&str>, profile: &Profile) -> Form {
+        let resolve: Vec<String> = profile
+            .resolve
+            .iter()
+            .map(|(host, to)| format!("{host} = {to}"))
+            .collect();
+        Form {
+            editing: name.map(str::to_string),
+            name: rune::TextEdit::new(name.unwrap_or_default()),
+            url: rune::TextEdit::new(&profile.url),
+            proxy: rune::TextEdit::new(profile.proxy.as_deref().unwrap_or_default()),
+            tunnel: rune::TextEdit::new(profile.tunnel.as_deref().unwrap_or_default()),
+            resolve: rune::TextEdit::new(resolve.join(", ")),
+            auth: profile.auth,
+            error: None,
+        }
+    }
+
+    /// The named profile the form describes, or why it does not describe one.
+    pub fn profile(&self) -> Result<(String, Profile), String> {
+        let name = self.name.text.trim().to_string();
+        let some = |edit: &rune::TextEdit| {
+            let text = edit.text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        };
+        let mut resolve = BTreeMap::new();
+        for pair in self
+            .resolve
+            .text
+            .split([',', '\n'])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            let (host, to) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("resolve: {pair:?} is host = address"))?;
+            resolve.insert(host.trim().to_string(), to.trim().to_string());
+        }
+        let profile = Profile {
+            url: self.url.text.trim().trim_end_matches('/').to_string(),
+            auth: self.auth,
+            proxy: some(&self.proxy),
+            resolve,
+            tunnel: some(&self.tunnel),
+        };
+        profile.check(&name)?;
+        Ok((name, profile))
+    }
+}
+
+impl crate::App {
+    /// Use profile `name`: start what it keeps running if it is not yet, and talk to it from
+    /// fresh workers, forgetting what the last profile showed.
+    pub fn use_profile(&mut self, name: &str) {
+        let Some(profile) = usable(&self.settings).remove(name) else {
+            return;
+        };
+        if self.target.name == name && self.target.profile == profile {
+            return;
+        }
+        let target = match self.targets.get(name) {
+            Some((target, _)) if target.profile == profile => target.clone(),
+            _ => {
+                let target = Target::new(name, profile, &self.settings.keys_dir());
+                let keeper = target.start(Path::new(&self.repo), supervisor());
+                self.targets
+                    .insert(name.to_string(), (target.clone(), keeper));
+                target
+            }
+        };
+        self.settings.use_profile(name);
+        self.connect(target);
+    }
+
+    /// The `n`th usable profile, from 0.
+    pub fn use_profile_at(&mut self, n: usize) {
+        if let Some(name) = usable(&self.settings).into_keys().nth(n) {
+            self.use_profile(&name);
+        }
+    }
+
+    fn connect(&mut self, target: Target) {
+        self.target = target.clone();
+        self.live_client = crate::live::Client::spawn(target.clone());
+        self.admin_client = crate::admin::Client::spawn(target.clone());
+        self.finder_client = crate::finder::Client::spawn(target);
+        if let Some(waker) = &self.waker {
+            self.live_client.set_waker(waker.clone());
+            self.admin_client.set_waker(waker.clone());
+            self.finder_client.set_waker(waker.clone());
+        }
+        self.live_seen = 0;
+        self.admin_seen = 0;
+        self.finder_seen = 0;
+        self.admin_sent = None;
+        self.admin = crate::admin::AdminView::default();
+        self.desk = crate::admin::Desk::default();
+        self.live = crate::live::LiveView::Loading;
+        self.live_detail = None;
+        self.live_base = None;
+        self.live_sent = None;
+        self.compare_sent = None;
+        self.finder = None;
+        self.registered.clear();
+        self.launcher = None;
+        self.notified = 0;
+        self.working = None;
+        self.working_pack = None;
+        self.working_preview = None;
+        self.working_edited = false;
+        self.working_read = None;
+        self.graph_source = None;
+        self.draft_busy = false;
+        self.sign_in_error = None;
+        self.key_paste = rune::TextEdit::new("");
+        if matches!(self.selection, Some(crate::Selection::Live { .. })) {
+            self.selection = None;
+        }
+        self.forget_run_view();
+    }
+
+    /// Keep the profile form's profile, and use it when it is the one in use or the first.
+    pub fn save_profile_form(&mut self) {
+        let Some(form) = &mut self.profile_form else {
+            return;
+        };
+        let (name, profile) = match form.profile() {
+            Ok(named) => named,
+            Err(why) => {
+                form.error = Some(why);
+                return;
+            }
+        };
+        let renamed = form.editing.clone().filter(|old| *old != name);
+        if let Err(why) = self.settings.set_profile_def(&name, &profile) {
+            form.error = Some(why);
+            return;
+        }
+        let was_current = form.editing.as_deref() == Some(self.target.name.as_str());
+        if let Some(old) = renamed {
+            self.settings.remove_profile(&old);
+            if let Some((_, keeper)) = self.targets.remove(&old) {
+                drop(keeper);
+            }
+        }
+        self.profile_form = None;
+        if was_current || self.target.name == name || self.settings.profile.is_none() {
+            self.use_profile(&name);
+        }
+    }
+
+    /// Forget profile `name`, stopping what it kept running. The profile in use moves to another.
+    pub fn remove_profile(&mut self, name: &str) {
+        self.settings.remove_profile(name);
+        self.targets.remove(name);
+        if self.target.name == name {
+            let (next, _) = pick(&self.settings);
+            self.use_profile(&next);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::net::TcpListener;
+    use std::time::{Duration, Instant};
+
+    use crate::profile::{Auth, Profile, Readiness, Target, addresses, answers, keep};
+
+    const AS_SUPERVISOR: &str = "CRUCIBLE_PLAYBOOKS_TEST_SUPERVISOR";
+
+    /// This test binary as the supervisor: it reruns itself on [`supervisor`] alone.
+    fn test_supervisor() -> std::io::Result<std::process::Command> {
+        let mut command = std::process::Command::new(std::env::current_exe()?);
+        command
+            .args(["profile::tests::supervisor", "--exact", "--nocapture"])
+            .env(AS_SUPERVISOR, "1");
+        Ok(command)
+    }
+
+    #[test]
+    fn supervisor() {
+        if std::env::var_os(AS_SUPERVISOR).is_some() {
+            std::process::exit(keep());
+        }
+    }
+
+    fn profile(url: &str) -> Profile {
+        Profile {
+            url: url.into(),
+            ..Profile::default()
+        }
+    }
+
+    fn wait_for(target: &Target, done: impl Fn(&Readiness) -> bool) -> Readiness {
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            let now = target.readiness();
+            if done(&now) || Instant::now() > until {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn profiles_parse_with_every_route() {
+        #[derive(serde::Deserialize)]
+        struct File {
+            profiles: BTreeMap<String, Profile>,
+        }
+        let file: File = toml::from_str(
+            r#"
+[profiles.mpp]
+url = "https://api.example.com"
+auth = "crux"
+
+[profiles.wdc]
+url = "https://api.wdc.example.com"
+resolve = { "api.wdc.example.com" = "10.0.0.7" }
+
+[profiles.jump]
+url = "https://api.internal.example.com"
+proxy = "socks5h://127.0.0.1:1080"
+tunnel = "ssh -N -D 1080 jumpbox"
+"#,
+        )
+        .unwrap();
+        assert_eq!(file.profiles["mpp"].auth, Auth::Crux);
+        assert_eq!(file.profiles["wdc"].auth, Auth::Own);
+        assert_eq!(
+            file.profiles["jump"].route(),
+            [
+                "tunnel ssh -N -D 1080 jumpbox",
+                "via socks5h://127.0.0.1:1080"
+            ]
+        );
+        for (name, p) in &file.profiles {
+            p.check(name).unwrap();
+        }
+        assert!(
+            toml::from_str::<File>("[profiles.x]\nurl = \"https://a\"\nproxxy = \"x\"").is_err(),
+            "a typo is refused"
+        );
+    }
+
+    #[test]
+    fn a_bad_profile_says_which_part() {
+        let bad = |p: Profile, name: &str, part: &str| {
+            let why = p.check(name).unwrap_err();
+            assert!(why.contains(part), "{why}");
+        };
+        bad(profile("https://a"), "has space", "name");
+        bad(profile("ftp://a"), "x", "url");
+        bad(profile("nope"), "x", "url");
+        let mut p = profile("https://a");
+        p.proxy = Some("ftp://proxy".into());
+        bad(p.clone(), "x", "proxy");
+        p.proxy = None;
+        p.resolve.insert("a".into(), " ".into());
+        bad(p.clone(), "x", "resolve");
+        p.resolve.clear();
+        p.tunnel = Some("  ".into());
+        bad(p, "x", "tunnel");
+    }
+
+    #[test]
+    fn loopback_profiles_start_the_local_controller() {
+        let local = Target::new("local", profile("http://127.0.0.1:8870"), "/k".as_ref());
+        assert_eq!(
+            local.kept().map(|k| k.0),
+            Some("just controller-local 8870".to_string())
+        );
+        assert!(profile("http://localhost:9000").loopback());
+        assert!(profile("http://[::1]:9000").loopback());
+        let remote = Target::new("r", profile("https://api.example.com"), "/k".as_ref());
+        assert_eq!(remote.kept(), None);
+    }
+
+    #[test]
+    fn a_tunnel_is_probed_at_its_proxy_and_otherwise_at_the_url() {
+        let mut p = profile("https://api.example.com");
+        p.tunnel = Some("ssh -N -D 1080 j".into());
+        p.proxy = Some("socks5h://127.0.0.1:1081".into());
+        let t = Target::new("j", p.clone(), "/k".as_ref());
+        assert_eq!(t.probe_addr().as_deref(), Some("127.0.0.1:1081"));
+        p.proxy = Some("socks5://127.0.0.1".into());
+        let t = Target::new("j", p.clone(), "/k".as_ref());
+        assert_eq!(t.probe_addr().as_deref(), Some("127.0.0.1:1080"));
+        p.proxy = None;
+        p.url = "http://127.0.0.1:18870".into();
+        let t = Target::new("j", p, "/k".as_ref());
+        assert_eq!(t.probe_addr().as_deref(), Some("127.0.0.1:18870"));
+    }
+
+    #[test]
+    fn resolve_takes_an_ip_an_ip_and_port_or_a_name() {
+        assert_eq!(addresses("10.0.0.7").unwrap()[0].to_string(), "10.0.0.7:0");
+        assert_eq!(
+            addresses("10.0.0.7:8443").unwrap()[0].to_string(),
+            "10.0.0.7:8443"
+        );
+        assert!(addresses("localhost").unwrap()[0].ip().is_loopback());
+    }
+
+    #[test]
+    fn each_profile_keeps_its_own_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = Target::new("a", profile("https://a.example.com/"), dir.path());
+        let b = Target::new("b", profile("https://b.example.com"), dir.path());
+        assert_eq!(a.key().unwrap(), None, "no file yet is no key");
+        a.save_key("crk_a".into()).unwrap();
+        assert_eq!(a.key().unwrap().as_deref(), Some("crk_a"));
+        assert_eq!(b.key().unwrap(), None);
+        assert_eq!(a.config().unwrap().url, "https://a.example.com");
+        let saved = std::fs::read_to_string(dir.path().join("a.toml")).unwrap();
+        assert!(saved.contains("https://a.example.com"), "{saved}");
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path().join("a.toml"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn a_tunnel_that_comes_up_makes_the_profile_ready_and_dies_with_its_keeper() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut p = profile(&format!("http://127.0.0.1:{port}"));
+        p.tunnel = Some(format!(
+            "exec python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\", {port})); s.listen(); time.sleep(60)'"
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let target = Target::new("t", p, dir.path());
+        let keeper = target
+            .start(dir.path(), test_supervisor())
+            .expect("a keeper");
+        assert!(matches!(target.readiness(), Readiness::Starting(_)));
+        assert_eq!(
+            wait_for(&target, |r| *r
+                != Readiness::Starting("Starting the tunnel".into())),
+            Readiness::Ready
+        );
+        assert!(target.ready().is_ok());
+        drop(keeper);
+        let until = Instant::now() + Duration::from_secs(10);
+        while answers(&format!("127.0.0.1:{port}")) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !answers(&format!("127.0.0.1:{port}")),
+            "dropping the keeper ends the tunnel"
+        );
+    }
+
+    #[test]
+    fn a_tunnel_that_exits_says_what_it_printed() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut p = profile(&format!("http://127.0.0.1:{port}"));
+        p.tunnel = Some("echo 'ssh: Could not resolve hostname jumpbox' >&2; exit 255".into());
+        let dir = tempfile::tempdir().unwrap();
+        let target = Target::new("t", p, dir.path());
+        let _keeper = target.start(dir.path(), test_supervisor());
+        let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
+        let Readiness::Failed(why) = failed else {
+            panic!("{failed:?}");
+        };
+        assert!(why.contains("Could not resolve hostname jumpbox"), "{why}");
+        assert!(target.ready().is_err());
+    }
+
+    /// An HTTP server answering every request with `body`, and its port.
+    fn http_server(body: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        port
+    }
+
+    /// A SOCKS5 server, no auth, CONNECT only, that sends every connection to 127.0.0.1:`to` and
+    /// records the host each one asked for. Returns its port.
+    fn socks_server(to: u16, asked: std::sync::Arc<std::sync::Mutex<Vec<String>>>) -> u16 {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for client in listener.incoming() {
+                let mut client = client.unwrap();
+                let asked = asked.clone();
+                std::thread::spawn(move || {
+                    let mut hello = [0u8; 2];
+                    client.read_exact(&mut hello).unwrap();
+                    let mut methods = vec![0u8; hello[1] as usize];
+                    client.read_exact(&mut methods).unwrap();
+                    client.write_all(&[5, 0]).unwrap();
+                    let mut head = [0u8; 4];
+                    client.read_exact(&mut head).unwrap();
+                    let host = match head[3] {
+                        3 => {
+                            let mut len = [0u8; 1];
+                            client.read_exact(&mut len).unwrap();
+                            let mut name = vec![0u8; len[0] as usize];
+                            client.read_exact(&mut name).unwrap();
+                            String::from_utf8(name).unwrap()
+                        }
+                        1 => {
+                            let mut ip = [0u8; 4];
+                            client.read_exact(&mut ip).unwrap();
+                            std::net::Ipv4Addr::from(ip).to_string()
+                        }
+                        other => panic!("address type {other}"),
+                    };
+                    let mut dest_port = [0u8; 2];
+                    client.read_exact(&mut dest_port).unwrap();
+                    asked.lock().unwrap().push(host);
+                    let upstream = std::net::TcpStream::connect(("127.0.0.1", to)).unwrap();
+                    client.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                    let (mut a, mut b) =
+                        (client.try_clone().unwrap(), upstream.try_clone().unwrap());
+                    let mut client = client;
+                    let mut upstream = upstream;
+                    std::thread::spawn(move || std::io::copy(&mut a, &mut upstream));
+                    let _ = std::io::copy(&mut b, &mut client);
+                });
+            }
+        });
+        port
+    }
+
+    fn get(target: &Target) -> Result<String, String> {
+        let client = target.http()?.build().map_err(|e| e.to_string())?;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let response = client
+                .get(format!("{}/healthz", target.url()))
+                .send()
+                .await
+                .map_err(|e| format!("{e:?}"))?;
+            response.text().await.map_err(|e| e.to_string())
+        })
+    }
+
+    #[test]
+    fn requests_go_through_a_socks5h_proxy_which_resolves_the_name() {
+        let server = http_server("through the proxy");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let socks = socks_server(server, asked.clone());
+        let mut p = profile(&format!("http://controller.internal.invalid:{server}"));
+        p.proxy = Some(format!("socks5h://127.0.0.1:{socks}"));
+        let target = Target::new("jump", p, "/k".as_ref());
+        assert_eq!(get(&target).unwrap(), "through the proxy");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            ["controller.internal.invalid"],
+            "socks5h hands the name to the proxy rather than resolving it here"
+        );
+    }
+
+    #[test]
+    fn a_resolve_pin_reaches_a_name_dns_does_not_know() {
+        let server = http_server("pinned");
+        let mut p = profile(&format!("http://api.wdc.invalid:{server}"));
+        p.resolve
+            .insert("api.wdc.invalid".into(), "127.0.0.1".into());
+        let pinned = Target::new("wdc", p.clone(), "/k".as_ref());
+        assert_eq!(get(&pinned).unwrap(), "pinned");
+        p.resolve.clear();
+        assert!(get(&Target::new("wdc", p, "/k".as_ref())).is_err());
+    }
+
+    #[test]
+    fn something_already_answering_is_used_without_starting_anything() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut p = profile(&format!("http://127.0.0.1:{port}"));
+        p.tunnel = Some("exit 1".into());
+        let dir = tempfile::tempdir().unwrap();
+        let target = Target::new("t", p, dir.path());
+        assert!(target.start(dir.path(), test_supervisor()).is_none());
+        assert_eq!(target.readiness(), Readiness::Ready);
+    }
+}

@@ -9,6 +9,7 @@ use rune::{TextEdit, Waker};
 use serde_json::Value;
 
 use crate::live::{Cache, Connection};
+use crate::profile::Target;
 use crate::search::Hit;
 
 /// Hits read for one query.
@@ -55,13 +56,13 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn spawn() -> Self {
+    pub fn spawn(target: Target) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new((0, Found::default(), None)));
         let worker = Arc::clone(&shared);
         let _ = std::thread::Builder::new()
             .name("crucible-playbooks-finder".into())
-            .spawn(move || run(rx, worker));
+            .spawn(move || run(target, rx, worker));
         Client { tx, shared }
     }
 
@@ -95,7 +96,7 @@ fn publish(shared: &Mutex<(u64, Found, Option<Waker>)>, found: Found) {
     }
 }
 
-fn run(rx: Receiver<Ask>, shared: Arc<Mutex<(u64, Found, Option<Waker>)>>) {
+fn run(target: Target, rx: Receiver<Ask>, shared: Arc<Mutex<(u64, Found, Option<Waker>)>>) {
     let Some(cache) = Cache::open() else {
         publish(
             &shared,
@@ -127,7 +128,7 @@ fn run(rx: Receiver<Ask>, shared: Arc<Mutex<(u64, Found, Option<Waker>)>>) {
         }
         let Some(current) = &ask else { continue };
         if connection.is_none() {
-            match Connection::open(Some(&cache)) {
+            match Connection::open(&target, Some(&cache)) {
                 Ok(open) => connection = Some(open),
                 Err(why) => {
                     publish(

@@ -4,7 +4,7 @@
 //! ```text
 //! bind 127.0.0.1:0 ──▶ open <controller>/auth/native?redirect_uri&state&code_challenge
 //!   browser: sign in, approve ──▶ GET 127.0.0.1:<port>/callback?code&state
-//!   POST /auth/native/token {code, code_verifier} ──▶ key ──▶ crux's config.toml
+//!   POST /auth/native/token {code, code_verifier} ──▶ key ──▶ the profile's key file
 //! ```
 
 use std::io::{BufRead, BufReader, Write};
@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
+
+use crate::profile::Target;
 
 /// How long the browser has to come back.
 const WAIT: Duration = Duration::from_secs(300);
@@ -141,13 +143,15 @@ struct Issued {
     key: String,
 }
 
-/// Trade the code for a key at `base`.
-fn redeem(base: &str, code: &str, verifier: &str, port: u16) -> Result<String, String> {
+/// Trade the code for a key at `target`, the way its other requests go.
+fn redeem(target: &Target, code: &str, verifier: &str, port: u16) -> Result<String, String> {
     let config = crux::config::Config {
-        url: base.trim_end_matches('/').to_string(),
+        url: target.url(),
         auth: crux::config::Auth::None,
     };
-    let client = crux::Client::connect(&config).map_err(|e| format!("{e:#}"))?;
+    let wire = crux::client::HttpTransport::with_client(&config, target.http()?)
+        .map_err(|e| format!("{e:#}"))?;
+    let client = crux::Client::new(std::sync::Arc::new(wire));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -163,13 +167,10 @@ fn redeem(base: &str, code: &str, verifier: &str, port: u16) -> Result<String, S
     Ok(issued.key)
 }
 
-/// Sign in to the controller at `base` through the browser, and keep the key in crux's config so
-/// the app and the CLI both use it. Blocks until the browser comes back.
-pub fn sign_in(base: &str) -> Result<(), String> {
-    let base = base.trim().trim_end_matches('/');
-    if !(base.starts_with("https://") || base.starts_with("http://")) {
-        return Err("the controller URL starts with https://".into());
-    }
+/// Sign in to `target`'s controller through the browser, and keep the key where the profile keeps
+/// it. Blocks until the browser comes back.
+pub fn sign_in(target: &Target) -> Result<(), String> {
+    let base = target.url();
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("listening for the browser: {e}"))?;
     let port = listener
@@ -178,16 +179,10 @@ pub fn sign_in(base: &str) -> Result<(), String> {
         .port();
     let pkce = Pkce::new();
     let state = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>());
-    crate::editor::open_url(&authorize_url(base, port, &state, &pkce.challenge))?;
+    crate::editor::open_url(&authorize_url(&base, port, &state, &pkce.challenge))?;
     let code = await_code(&listener, &state)?;
-    let key = redeem(base, &code, &pkce.verifier, port)?;
-    crux::config::FileConfig {
-        url: Some(base.to_string()),
-        api_token: Some(key),
-    }
-    .save(None)
-    .map(drop)
-    .map_err(|e| format!("{e:#}"))
+    let key = redeem(target, &code, &pkce.verifier, port)?;
+    target.save_key(key)
 }
 
 #[cfg(test)]

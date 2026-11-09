@@ -59,6 +59,10 @@ impl App {
                 self.set_zoom(crate::settings::zoom_step(self.settings.zoom, -1));
             }
             Command::ZoomReset => self.set_zoom(1.0),
+            Command::Profile(n) => {
+                self.switch(Backend::Controller);
+                self.use_profile_at(n as usize);
+            }
             Command::EditTask => {
                 if let Some(task) = self.expanded.clone() {
                     self.edit_task(&task);
@@ -105,7 +109,12 @@ impl App {
             .map(|p| p.id.as_str())
             .collect();
         let packs: Vec<&str> = self.packs.iter().map(|p| p.name.as_str()).collect();
-        palette::entries(&tasks, &playbooks, &packs)
+        let profiles: Vec<String> = crate::profile::usable(&self.settings)
+            .into_keys()
+            .filter(|name| *name != self.target.name)
+            .collect();
+        let profiles: Vec<&str> = profiles.iter().map(String::as_str).collect();
+        palette::entries(&tasks, &playbooks, &packs, &profiles)
     }
 
     /// Run the palette's highlighted entry, or the one at `index` of its ranked list.
@@ -130,6 +139,10 @@ impl App {
             Item::Pack(name) => {
                 self.switch(Backend::Local);
                 self.select(Selection::Local(name));
+            }
+            Item::Profile(name) => {
+                self.switch(Backend::Controller);
+                self.use_profile(&name);
             }
         }
     }

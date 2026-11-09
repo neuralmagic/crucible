@@ -24,6 +24,7 @@ mod notify;
 mod pack;
 mod palette;
 mod preview;
+mod profile;
 mod runs;
 mod search;
 mod session;
@@ -298,8 +299,14 @@ pub struct App {
     draft_after: u64,
     /// Where the last brief for an agent was written, or why it was not.
     pub handoff_note: Option<Result<PathBuf, String>>,
-    /// The controller a browser sign-in goes to, and how the last one went.
-    pub sign_in_url: TextEdit,
+    /// The profile in use, and every profile started so far with what it keeps running.
+    pub target: profile::Target,
+    targets: HashMap<String, (profile::Target, Option<profile::Keeper>)>,
+    /// The profile being added or edited in Settings.
+    pub profile_form: Option<profile::Form>,
+    /// A key pasted for the profile in use, for one the browser cannot reach.
+    pub key_paste: TextEdit,
+    /// How the last browser sign-in went.
     pub signing_in: bool,
     pub sign_in_error: Option<String>,
     sign_in_done: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
@@ -918,13 +925,13 @@ impl App {
             .copied()
     }
 
-    /// Sign in to the controller at the sign-in field's URL through the browser, on a thread of
-    /// its own since it waits for the person.
+    /// Sign in to the profile in use through the browser, on a thread of its own since it waits
+    /// for the person.
     pub fn sign_in(&mut self) {
         if self.signing_in {
             return;
         }
-        let url = self.sign_in_url.text.trim().to_string();
+        let target = self.target.clone();
         let waker = self.waker.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         self.signing_in = true;
@@ -933,7 +940,7 @@ impl App {
         let spawned = std::thread::Builder::new()
             .name("crucible-playbooks-sign-in".into())
             .spawn(move || {
-                let _ = tx.send(signin::sign_in(&url));
+                let _ = tx.send(signin::sign_in(&target));
                 if let Some(waker) = waker {
                     waker();
                 }
@@ -945,7 +952,7 @@ impl App {
         }
     }
 
-    /// Take a finished sign-in's answer; a key now in crux's config means connecting again.
+    /// Take a finished sign-in's answer; a new key means connecting again.
     fn finish_sign_in(&mut self) -> bool {
         let Some(answer) = self.sign_in_done.as_ref().and_then(|rx| rx.try_recv().ok()) else {
             return false;
@@ -953,13 +960,31 @@ impl App {
         self.sign_in_done = None;
         self.signing_in = false;
         match answer {
-            Ok(()) => {
-                self.live_client.reconnect();
-                self.admin_client.reconnect();
-            }
+            Ok(()) => self.reconnect(),
             Err(why) => self.sign_in_error = Some(why),
         }
         true
+    }
+
+    /// Keep the pasted key as the profile's, and connect with it.
+    pub fn save_pasted_key(&mut self) {
+        let key = self.key_paste.text.trim().to_string();
+        if key.is_empty() {
+            return;
+        }
+        match self.target.save_key(key) {
+            Ok(()) => {
+                self.key_paste = TextEdit::new("");
+                self.sign_in_error = None;
+                self.reconnect();
+            }
+            Err(why) => self.sign_in_error = Some(why),
+        }
+    }
+
+    fn reconnect(&mut self) {
+        self.live_client.reconnect();
+        self.admin_client.reconnect();
     }
 
     /// Open what `link` names: a playbook, one of its launches with a task open, or a local pack.
@@ -1156,13 +1181,16 @@ fn init() -> App {
     let settings = SETTINGS.get().cloned().unwrap_or_else(Settings::load);
     let (keymap, keys_refused) = keymap::Keymap::new(&settings.keys);
     let editor_command = TextEdit::new(&settings.editor_command);
+    let (name, chosen) = profile::pick(&settings);
+    let target = profile::Target::new(&name, chosen, &settings.keys_dir());
+    let keeper = target.start(&repo, profile::supervisor());
     App {
         repo: repo.display().to_string(),
         local: Client::spawn(repo),
         local_seen: 0,
-        live_client: live::Client::spawn(),
+        live_client: live::Client::spawn(target.clone()),
         live_seen: 0,
-        admin_client: admin::Client::spawn(),
+        admin_client: admin::Client::spawn(target.clone()),
         admin_seen: 0,
         admin_sent: None,
         admin: admin::AdminView::default(),
@@ -1199,7 +1227,7 @@ fn init() -> App {
         keys_refused,
         palette: None,
         finder: None,
-        finder_client: finder::Client::spawn(),
+        finder_client: finder::Client::spawn(target.clone()),
         finder_seen: 0,
         pane_focus: None,
         notifier: None,
@@ -1215,12 +1243,10 @@ fn init() -> App {
         logo_screen: [0.0; 2],
         notified: 0,
         handoff_note: None,
-        sign_in_url: TextEdit::new(
-            crux::config::ConnectArgs::from_env()
-                .resolve()
-                .map(|config| config.url)
-                .unwrap_or_default(),
-        ),
+        targets: HashMap::from([(name, (target.clone(), keeper))]),
+        target,
+        profile_form: None,
+        key_paste: TextEdit::new(""),
         signing_in: false,
         sign_in_error: None,
         sign_in_done: None,
@@ -1349,6 +1375,9 @@ fn open_link(app: &mut App, url: &str, _tx: &mut Tx) {
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some(profile::KEEP_FLAG) {
+        std::process::exit(profile::keep());
+    }
     let settings = Settings::load();
     let fonts = settings::fonts(&settings);
     let _ = SETTINGS.set(settings);

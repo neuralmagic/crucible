@@ -14,16 +14,45 @@ Two backends, picked with the switch under the title:
 
 ## The live controller
 
-Live tracking shells out to `crux`, the controller's own CLI over its HTTP API. That means the app
-reads exactly the config a terminal does: `CONTROLLER_URL`, `CONTROLLER_API_TOKEN`, then
-`~/.config/crux/config.toml` (or `$XDG_CONFIG_HOME/crux`). No credential is copied, stored or
-logged by the app; `crux` resolves it per call. `CRUX_BIN` points the app at another `crux`.
+The app talks to one controller at a time, its profile, through the `crux` client library. With no
+profiles configured there is one, `default`, from crux's own resolution: `CONTROLLER_URL`, then
+`~/.config/crux/config.toml`. Profiles live in `~/.config/crucible-playbooks/config.toml`, are
+edited from Settings, and switch with ⌘⌥1 to ⌘⌥9 or the palette:
+
+```toml
+profile = "wdc"
+
+[profiles.mpp]
+url = "https://crucible-api.example.com"
+auth = "crux"                          # the key in crux's config.toml
+
+[profiles.wdc]
+url = "https://crucible-api.wdc.example.com"
+resolve = { "crucible-api.wdc.example.com" = "lb.example.net" }   # an IP, ip:port or a name
+
+[profiles.jump]
+url = "https://crucible-api.internal.example.com"
+proxy = "socks5h://127.0.0.1:1080"     # http, https, socks5 or socks5h
+tunnel = "ssh -N -D 1080 jumpbox"      # kept running while the app is
+
+[profiles.local]
+url = "http://127.0.0.1:8870"          # starts `just controller-local 8870` in the repo
+```
+
+A tunnel (or, for a loopback profile, the local controller) starts the first time its profile is
+used, unless something already answers at its proxy or URL, and the profile waits until it does.
+It runs under the app's own binary (`crucible-playbooks --keep`) as a supervisor, which kills the
+tunnel's process group when the app's end of a pipe closes, so it stops with the app however the
+app stops, crash included. A profile that fails to read is shown with why in Settings and left as
+written in the file.
 
 With no working credential, the sidebar offers `Sign in with browser`: the app opens the
 controller's `/auth/native` page, you sign in and approve, and the controller hands the app a
-90-day api key over a loopback redirect with PKCE. The key is saved to crux's `config.toml`
-(owner-readable only), so the `crux` CLI is signed in too, and it can be revoked in the
-controller's Settings like any other key.
+90-day api key over a loopback redirect with PKCE. A profile keeps its key in
+`~/.config/crucible-playbooks/profiles/<name>.toml` (owner-readable only), or in crux's
+`config.toml` with `auth = "crux"`, so the `crux` CLI is signed in too. For a controller the
+browser cannot reach, paste a `crk_` key instead. Keys can be revoked in the controller's Settings
+like any other key.
 
 The account row at the bottom of the sidebar names the user `crux whoami` reports for that
 credential (its tooltip adds the role and endpoint), so the list can be read against the principal

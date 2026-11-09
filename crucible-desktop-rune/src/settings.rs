@@ -1,4 +1,4 @@
-//! The app's own settings. Only the log viewer's font so far.
+//! The app's own settings, in `~/.config/crucible-playbooks/config.toml`.
 //!
 //! The sans is the theme's Inter. The mono slot and the log fonts are the theme's IBM Plex Mono (OFL)
 //! or a font read from this machine's font store at startup; no proprietary font is ever bundled.
@@ -11,6 +11,7 @@ use rune::tok::Family;
 use serde::{Deserialize, Serialize};
 
 use crate::editor::Editor;
+use crate::profile::Profile;
 use crate::workspace::Workspace;
 
 /// The colours the app paints with.
@@ -190,6 +191,10 @@ pub struct Settings {
     pub keys: BTreeMap<String, Vec<String>>,
     /// Check the shown pack file with crucible-lsp.
     pub checks: bool,
+    /// The profiles as written, each read on its own so one bad profile spoils only itself.
+    profiles: BTreeMap<String, toml::Value>,
+    /// The profile in use, by name.
+    pub profile: Option<String>,
     path: PathBuf,
 }
 
@@ -217,11 +222,18 @@ struct Config {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keys: BTreeMap<String, Vec<String>>,
     checks: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    profiles: BTreeMap<String, toml::Value>,
 }
 
 impl Settings {
     pub fn load() -> Self {
-        let path = config_path();
+        Settings::load_from(config_path())
+    }
+
+    fn load_from(path: PathBuf) -> Self {
         let config: Config = fs::read_to_string(&path)
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
@@ -255,8 +267,57 @@ impl Settings {
             editor_command: config.editor_command.unwrap_or_default(),
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
+            profiles: config.profiles,
+            profile: config.profile,
             path,
         }
+    }
+
+    /// Each configured profile, or why it cannot be read.
+    pub fn profiles(&self) -> BTreeMap<String, Result<Profile, String>> {
+        self.profiles
+            .iter()
+            .map(|(name, raw)| {
+                let profile = raw
+                    .clone()
+                    .try_into::<Profile>()
+                    .map_err(|e| format!("profile {name}: {}", e.message()))
+                    .and_then(|p| p.check(name).map(|()| p));
+                (name.clone(), profile)
+            })
+            .collect()
+    }
+
+    /// Add `profile` as `name`, or replace the one by that name.
+    pub fn set_profile_def(&mut self, name: &str, profile: &Profile) -> Result<(), String> {
+        profile.check(name)?;
+        let raw = toml::Value::try_from(profile).map_err(|e| format!("{e}"))?;
+        self.profiles.insert(name.to_string(), raw);
+        self.save();
+        Ok(())
+    }
+
+    pub fn remove_profile(&mut self, name: &str) {
+        if self.profiles.remove(name).is_some() {
+            if self.profile.as_deref() == Some(name) {
+                self.profile = None;
+            }
+            self.save();
+        }
+    }
+
+    pub fn use_profile(&mut self, name: &str) {
+        if self.profile.as_deref() != Some(name) {
+            self.profile = Some(name.to_string());
+            self.save();
+        }
+    }
+
+    /// Where profiles keep their own keys.
+    pub fn keys_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map_or_else(|| PathBuf::from("profiles"), |dir| dir.join("profiles"))
     }
 
     pub fn config_path(&self) -> &Path {
@@ -356,6 +417,8 @@ impl Settings {
             editor_command: (!self.editor_command.is_empty()).then(|| self.editor_command.clone()),
             keys: self.keys.clone(),
             checks: Some(self.checks),
+            profile: self.profile.clone(),
+            profiles: self.profiles.clone(),
         };
         let Ok(text) = toml::to_string(&config) else {
             return;
@@ -475,6 +538,69 @@ mod tests {
     }
 
     use crate::settings::*;
+
+    #[test]
+    fn a_bad_profile_spoils_only_itself_and_survives_a_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+theme = "moss"
+profile = "good"
+
+[profiles.good]
+url = "https://api.example.com"
+
+[profiles.typo]
+url = "https://api.example.com"
+proxxy = "socks5://127.0.0.1:1080"
+"#,
+        )
+        .unwrap();
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(
+            settings.theme,
+            Theme::Moss,
+            "the rest of the file still reads"
+        );
+        let profiles = settings.profiles();
+        assert!(profiles["good"].is_ok());
+        assert!(profiles["typo"].as_ref().unwrap_err().contains("proxxy"));
+
+        settings.set_theme(Theme::Ember);
+        let again = Settings::load_from(path.clone());
+        assert!(
+            fs::read_to_string(&path).unwrap().contains("proxxy"),
+            "the bad profile is kept as written for its owner to fix"
+        );
+        assert_eq!(again.profile.as_deref(), Some("good"));
+
+        let jump = Profile {
+            url: "https://internal.example.com".into(),
+            proxy: Some("socks5h://127.0.0.1:1080".into()),
+            tunnel: Some("ssh -N -D 1080 jumpbox".into()),
+            ..Profile::default()
+        };
+        settings.set_profile_def("jump", &jump).unwrap();
+        assert_eq!(
+            Settings::load_from(path.clone()).profiles()["jump"],
+            Ok(jump)
+        );
+        assert!(
+            settings
+                .set_profile_def("bad name", &Profile::default())
+                .is_err()
+        );
+        settings.use_profile("jump");
+        settings.remove_profile("jump");
+        let after = Settings::load_from(path);
+        assert_eq!(
+            after.profile, None,
+            "removing the profile in use forgets it"
+        );
+        assert!(!after.profiles().contains_key("jump"));
+    }
 
     #[test]
     fn the_tx02_scan_ignores_italic_and_condensed_faces() {

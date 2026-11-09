@@ -1,8 +1,7 @@
 //! The live controller view: registered playbooks and every launch of them, read through the
 //! `crux` client library.
 //!
-//! The library resolves the controller and credential exactly as the `crux` CLI does:
-//! `CONTROLLER_URL`, `CONTROLLER_API_TOKEN`, then `~/.config/crux/config.toml`.
+//! The controller and its key come from the profile in use; see [`crate::profile`].
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -336,6 +335,7 @@ pub struct Finished {
 /// The controller fetcher. One instance lives on its own worker thread, so a slow controller
 /// query never delays local log tracking.
 struct Fetcher {
+    target: crate::profile::Target,
     connection: Option<Connection>,
     cache: Option<Cache>,
     identity: Option<(String, Identity)>,
@@ -388,13 +388,15 @@ pub(crate) struct Connection {
 }
 
 impl Connection {
-    /// The controller the config names, read through `cache` when there is one.
-    pub(crate) fn open(cache: Option<&Cache>) -> Result<Self, String> {
-        let config = crux::config::ConnectArgs::from_env()
-            .resolve()
+    /// The controller `target` names, read through `cache` when there is one.
+    pub(crate) fn open(
+        target: &crate::profile::Target,
+        cache: Option<&Cache>,
+    ) -> Result<Self, String> {
+        target.ready()?;
+        let config = target.config()?;
+        let wire = crux::client::HttpTransport::with_client(&config, target.http()?)
             .map_err(|error| format!("{error:#}"))?;
-        let wire =
-            crux::client::HttpTransport::connect(&config).map_err(|error| format!("{error:#}"))?;
         let transport: Arc<dyn crux::client::Transport> = match cache {
             Some(cache) => Arc::new(CachedTransport::new(
                 Arc::new(wire),
@@ -541,8 +543,9 @@ impl Drop for SessionFollow {
 }
 
 impl Fetcher {
-    fn new(wake: Sender<Msg>) -> Self {
+    fn new(target: crate::profile::Target, wake: Sender<Msg>) -> Self {
         Fetcher {
+            target,
             connection: None,
             cache: Cache::open(),
             identity: None,
@@ -880,7 +883,7 @@ impl Fetcher {
 
     fn connection(&mut self) -> Result<&Connection, String> {
         if self.connection.is_none() {
-            self.connection = Some(Connection::open(self.cache.as_ref())?);
+            self.connection = Some(Connection::open(&self.target, self.cache.as_ref())?);
         }
         self.connection
             .as_ref()
@@ -1371,7 +1374,7 @@ struct Shared {
 }
 
 impl Client {
-    pub fn spawn() -> Self {
+    pub fn spawn(target: crate::profile::Target) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Shared {
             snapshot: Snapshot::default(),
@@ -1382,7 +1385,7 @@ impl Client {
         let wake = tx.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("crucible-playbooks-live".into())
-            .spawn(move || run_client(rx, wake, worker))
+            .spawn(move || run_client(target, rx, wake, worker))
         {
             publish(
                 &shared,
@@ -1473,8 +1476,13 @@ fn publish(shared: &Mutex<Shared>, snapshot: Snapshot) {
     }
 }
 
-fn run_client(rx: Receiver<Msg>, wake: Sender<Msg>, shared: Arc<Mutex<Shared>>) {
-    let mut fetcher = Fetcher::new(wake);
+fn run_client(
+    target: crate::profile::Target,
+    rx: Receiver<Msg>,
+    wake: Sender<Msg>,
+    shared: Arc<Mutex<Shared>>,
+) {
+    let mut fetcher = Fetcher::new(target, wake);
     let mut selected: Option<String> = None;
     let mut compare: Option<String> = None;
     let mut next_list = Instant::now();
@@ -1638,7 +1646,7 @@ mod tests {
     #[test]
     fn a_launch_that_stops_running_is_noted_once_and_the_list_is_bounded() {
         let (wake, _rx) = mpsc::channel();
-        let mut fetcher = Fetcher::new(wake);
+        let mut fetcher = Fetcher::new(crate::profile::Target::unreachable(), wake);
         let first = vec![
             firing("a", 1, "draft", "running"),
             firing("b", 2, "draft", "done"),
@@ -1705,7 +1713,7 @@ mod tests {
     #[test]
     fn a_failed_refresh_keeps_the_last_list_and_says_why() {
         let (wake, _rx) = mpsc::channel();
-        let mut fetcher = Fetcher::new(wake);
+        let mut fetcher = Fetcher::new(crate::profile::Target::unreachable(), wake);
         assert!(fetcher.unavailable("dial refused".into()));
         assert!(matches!(fetcher.view, LiveView::Unavailable(_)));
 
@@ -1983,7 +1991,7 @@ mod tests {
         let draft =
             std::env::var("CRUCIBLE_E2E_DRAFT").unwrap_or_else(|_| "vllm-agent-fanout".into());
         let (wake, _rx) = std::sync::mpsc::channel();
-        let mut fetcher = Fetcher::new(wake);
+        let mut fetcher = Fetcher::new(crate::profile::Target::unreachable(), wake);
         let root = tempfile::tempdir().unwrap();
         fetcher.drafts = Some(root.path().to_path_buf());
 

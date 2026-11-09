@@ -15,6 +15,7 @@ pub enum Item {
     Task(String),
     Playbook(String),
     Pack(String),
+    Profile(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,8 +34,14 @@ pub struct Palette {
     pub selected: usize,
 }
 
-/// Everything the palette can offer: the open run's tasks, the commands, then playbooks and packs.
-pub fn entries(tasks: &[&str], playbooks: &[&str], packs: &[&str]) -> Vec<Entry> {
+/// Everything the palette can offer: the open run's tasks, the commands, then playbooks, packs and
+/// the other profiles.
+pub fn entries(
+    tasks: &[&str],
+    playbooks: &[&str],
+    packs: &[&str],
+    profiles: &[&str],
+) -> Vec<Entry> {
     let entry = |item: Item, title: String, kind: &'static str| Entry { item, title, kind };
     tasks
         .iter()
@@ -42,7 +49,7 @@ pub fn entries(tasks: &[&str], playbooks: &[&str], packs: &[&str]) -> Vec<Entry>
         .chain(
             Command::ALL
                 .iter()
-                .filter(|c| **c != Command::Palette)
+                .filter(|c| !matches!(c, Command::Palette | Command::Profile(_)))
                 .map(|c| entry(Item::Run(*c), c.title(), "command")),
         )
         .chain(
@@ -55,6 +62,13 @@ pub fn entries(tasks: &[&str], playbooks: &[&str], packs: &[&str]) -> Vec<Entry>
                 .iter()
                 .map(|p| entry(Item::Pack(p.to_string()), p.to_string(), "pack")),
         )
+        .chain(profiles.iter().map(|p| {
+            entry(
+                Item::Profile(p.to_string()),
+                format!("Use profile {p}"),
+                "profile",
+            )
+        }))
         .collect()
 }
 
@@ -114,12 +128,26 @@ mod tests {
 
     #[test]
     fn the_list_offers_tasks_then_commands_then_places_and_ranks_by_the_query() {
-        let all = entries(&["analyze", "report"], &["cve-triage-llm-d"], &["playbook"]);
+        let all = entries(
+            &["analyze", "report"],
+            &["cve-triage-llm-d"],
+            &["playbook"],
+            &["wdc"],
+        );
         assert_eq!(all[0].item, Item::Task("analyze".into()));
         assert!(!all.iter().any(|e| e.item == Item::Run(Command::Palette)));
+        assert!(
+            !all.iter()
+                .any(|e| matches!(e.item, Item::Run(Command::Profile(_)))),
+            "profiles are offered by name, not by place"
+        );
         assert_eq!(
             all.last().map(|e| &e.item),
-            Some(&Item::Pack("playbook".into()))
+            Some(&Item::Profile("wdc".into()))
+        );
+        assert_eq!(
+            rank(&all, "wdc").first().map(|e| e.item.clone()),
+            Some(Item::Profile("wdc".into()))
         );
         assert_eq!(rank(&all, "").len(), all.len().min(SHOWN));
         let first = |q: &str| rank(&all, q).first().map(|e| e.item.clone());

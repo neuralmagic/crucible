@@ -127,11 +127,20 @@ pub struct Client {
 
 impl HttpTransport {
     pub fn connect(cfg: &Config) -> Result<Self> {
+        Self::with_client(cfg, Self::builder())
+    }
+
+    /// The builder [`HttpTransport::connect`] starts from, for a caller that adds a proxy or
+    /// resolver overrides before handing it to [`HttpTransport::with_client`].
+    pub fn builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder().timeout(Duration::from_secs(120))
+    }
+
+    pub fn with_client(cfg: &Config, builder: reqwest::ClientBuilder) -> Result<Self> {
         if cfg.url.is_empty() {
             bail!("no controller to talk to: set CONTROLLER_URL, or `url` in the config file");
         }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+        let http = builder
             .build()
             .context("building the controller http client")?;
         Ok(Self {

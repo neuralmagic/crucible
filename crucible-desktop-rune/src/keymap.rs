@@ -36,10 +36,12 @@ pub enum Command {
     ZoomIn,
     ZoomOut,
     ZoomReset,
+    /// Use the profile at this place in the list, from 0.
+    Profile(u8),
 }
 
 impl Command {
-    pub const ALL: [Command; 33] = [
+    pub const ALL: [Command; 42] = [
         Command::Palette,
         Command::Search,
         Command::Focus(Edge::Left),
@@ -73,6 +75,15 @@ impl Command {
         Command::ZoomIn,
         Command::ZoomOut,
         Command::ZoomReset,
+        Command::Profile(0),
+        Command::Profile(1),
+        Command::Profile(2),
+        Command::Profile(3),
+        Command::Profile(4),
+        Command::Profile(5),
+        Command::Profile(6),
+        Command::Profile(7),
+        Command::Profile(8),
     ];
 
     /// Its name in the config file's `[keys]` table.
@@ -97,6 +108,7 @@ impl Command {
             Command::ZoomIn => "zoom-in".into(),
             Command::ZoomOut => "zoom-out".into(),
             Command::ZoomReset => "zoom-reset".into(),
+            Command::Profile(n) => format!("profile-{}", n + 1),
         }
     }
 
@@ -121,6 +133,7 @@ impl Command {
             Command::ZoomIn => "Zoom in".into(),
             Command::ZoomOut => "Zoom out".into(),
             Command::ZoomReset => "Actual size".into(),
+            Command::Profile(n) => format!("Use profile {}", n + 1),
         }
     }
 
@@ -158,10 +171,26 @@ impl Command {
             Command::ZoomIn => vec![primary("cmd+=", "ctrl+=")],
             Command::ZoomOut => vec![primary("cmd+-", "ctrl+-")],
             Command::ZoomReset => vec![primary("cmd+0", "ctrl+0")],
+            Command::Profile(n) => {
+                let (mac, other) = PROFILE_KEYS[n as usize % PROFILE_KEYS.len()];
+                vec![primary(mac, other)]
+            }
             _ => Vec::new(),
         }
     }
 }
+
+const PROFILE_KEYS: [(&str, &str); 9] = [
+    ("cmd+alt+1", "ctrl+alt+1"),
+    ("cmd+alt+2", "ctrl+alt+2"),
+    ("cmd+alt+3", "ctrl+alt+3"),
+    ("cmd+alt+4", "ctrl+alt+4"),
+    ("cmd+alt+5", "ctrl+alt+5"),
+    ("cmd+alt+6", "ctrl+alt+6"),
+    ("cmd+alt+7", "ctrl+alt+7"),
+    ("cmd+alt+8", "ctrl+alt+8"),
+    ("cmd+alt+9", "ctrl+alt+9"),
+];
 
 fn edge_id(edge: Edge) -> &'static str {
     match edge {

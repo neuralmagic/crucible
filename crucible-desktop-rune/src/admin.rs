@@ -175,13 +175,13 @@ struct Published {
 }
 
 impl Client {
-    pub fn spawn() -> Self {
+    pub fn spawn(target: crate::profile::Target) -> Self {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Mutex::new(Published::default()));
         let worker = Arc::clone(&shared);
         if let Err(error) = std::thread::Builder::new()
             .name("crucible-playbooks-admin".into())
-            .spawn(move || run(rx, worker))
+            .spawn(move || run(target, rx, worker))
         {
             let view = AdminView {
                 decisions: Some(Err(format!("starting the admin worker: {error}"))),
@@ -231,6 +231,7 @@ fn publish(shared: &Mutex<Published>, view: AdminView) {
 }
 
 struct Worker {
+    target: crate::profile::Target,
     cache: Option<Cache>,
     connection: Option<Connection>,
     view: AdminView,
@@ -240,7 +241,7 @@ struct Worker {
 impl Worker {
     fn connection(&mut self) -> Result<&Connection, String> {
         if self.connection.is_none() {
-            self.connection = Some(Connection::open(self.cache.as_ref())?);
+            self.connection = Some(Connection::open(&self.target, self.cache.as_ref())?);
         }
         self.connection
             .as_ref()
@@ -392,8 +393,9 @@ fn act(c: &Connection, action: &Action) -> Result<(), String> {
     }
 }
 
-fn run(rx: Receiver<Msg>, shared: Arc<Mutex<Published>>) {
+fn run(target: crate::profile::Target, rx: Receiver<Msg>, shared: Arc<Mutex<Published>>) {
     let mut worker = Worker {
+        target,
         cache: Cache::open(),
         connection: None,
         view: AdminView::default(),

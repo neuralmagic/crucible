@@ -1471,6 +1471,7 @@ dependencies = [
  "crux",
  "futures-util",
  "jiff",
+ "libc",
  "rand 0.10.3",
  "reqwest",
  "rune",
