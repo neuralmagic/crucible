@@ -25,7 +25,19 @@ pub(crate) fn manifest_toml(effort_line: &str) -> String {
 }
 
 pub(crate) fn args_from(argv: &[&str]) -> Args {
-    crate::cli::Cli::parse_from(argv).run
+    let mut args = crate::cli::Cli::parse_from(argv).run;
+    args.secret_rules = secret_rules();
+    args
+}
+
+/// One compiled rule set for the whole test binary, as for one engine process, so no turn under
+/// test spends its timeout compiling.
+pub(crate) fn secret_rules() -> crucible_harness::redact::SecretRules {
+    static RULES: std::sync::OnceLock<crucible_harness::redact::SecretRules> =
+        std::sync::OnceLock::new();
+    let rules = RULES.get_or_init(Default::default).clone();
+    assert!(rules.ready(), "the builtin secret rules compile");
+    rules
 }
 
 pub(crate) fn tempdir(name: &str) -> PathBuf {

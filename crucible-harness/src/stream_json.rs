@@ -66,9 +66,9 @@ pub struct StreamJsonParser {
     // Kept so a live cost sample can never report LESS than the agent has already declared.
     stream_cost: f64,
 
-    // Verbose tool IO (CRUCIBLE_SESSION_TOOL_IO=full): tool events carry bounded
+    // Verbose tool IO (on unless CRUCIBLE_SESSION_TOOL_IO=compact): tool events carry bounded
     // inputs, and every tool result claude echoes back as a `user` message becomes a
-    // result-excerpt event. Off by default, when only failed results become events.
+    // result-excerpt event. Off, only failed results become events.
     tool_io: bool,
     // The open `tool_use` block's id, and id -> name for labeling result events.
     tool_id: Option<String>,
@@ -285,7 +285,7 @@ impl StreamJsonParser {
 
     /// Turn the `tool_result` blocks claude echoes back in a `user` message into Tool events
     /// labeled with the originating tool's name. Under verbose tool IO every result carries a
-    /// bounded excerpt; by default only a failed result shows, as a one-line `failed:` summary.
+    /// bounded excerpt; without it only a failed result shows, as a one-line `failed:` summary.
     fn tool_results(&mut self, msg: &Value, out: &mut Vec<AgentEvent>) {
         let Some(content) = msg
             .get("message")

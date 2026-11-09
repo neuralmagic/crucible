@@ -68,6 +68,9 @@ impl Substrate {
 /// [`Deadline::note`], never a transport failure: rerunning an attempt that exceeded its limit
 /// would repeat the cost.
 pub trait TaskRunner {
+    /// Called once before the plan's clock starts, so no attempt's deadline pays for setup.
+    fn prepare(&mut self) {}
+
     /// Run one attempt of `task` in `lane`, which carries its deadline and takes its spend and
     /// transcript; `None` runs it outside any admission.
     fn run(
@@ -485,6 +488,7 @@ pub fn execute(
     runner: &mut dyn TaskRunner,
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> Result<PlanOutcome, IllegalTransition> {
+    runner.prepare();
     let runnable = runnable_set(plan, substrate);
     let clock = Clock {
         started: Instant::now(),
@@ -3452,6 +3456,8 @@ mod tests {
     struct Sleeper {
         takes: BTreeMap<String, Duration>,
         dispatched: Vec<String>,
+        setup: Duration,
+        prepared: bool,
     }
 
     impl Sleeper {
@@ -3462,11 +3468,19 @@ mod tests {
                     .map(|(task, took)| ((*task).to_string(), *took))
                     .collect(),
                 dispatched: Vec::new(),
+                setup: Duration::ZERO,
+                prepared: false,
             }
         }
     }
 
     impl TaskRunner for Sleeper {
+        fn prepare(&mut self) {
+            assert!(self.dispatched.is_empty(), "prepared after a dispatch");
+            std::thread::sleep(self.setup);
+            self.prepared = true;
+        }
+
         fn run(
             &mut self,
             task: &Task,
@@ -3498,6 +3512,24 @@ mod tests {
     fn limited(mut task: Task, limit: &str) -> Task {
         task.timeout = Some(limit.parse().expect("a timeout"));
         task
+    }
+
+    #[test]
+    fn a_runners_setup_is_not_charged_to_any_attempts_limit() {
+        let plan = valid(vec![limited(task("quick", &[], "any", true), "0.2s")], 10.0);
+        let mut r = Sleeper::new(&[("quick", Duration::from_millis(50))]);
+        r.setup = Duration::from_millis(400);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let quick = &out.results[&"quick".into()];
+        assert!(r.prepared);
+        assert_eq!(quick.status, TaskStatus::Pass, "{:?}", quick.note);
+        assert!(out.valid);
     }
 
     #[test]
