@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use rune::Shortcut;
 
+use crate::Page;
 use crate::workspace::{Edge, PaneKind};
 
 /// Something the person can do from the keyboard or the palette.
@@ -23,7 +24,7 @@ pub enum Command {
     RerunFailed,
     FixWithAgent,
     SwitchBackend,
-    Settings,
+    Open(Page),
     /// Save the working copy as the draft's next version.
     SaveDraft,
     /// Launch the pack as it stands: a local pack, or the working copy's draft.
@@ -33,7 +34,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 25] = [
+    pub const ALL: [Command; 29] = [
         Command::Palette,
         Command::Focus(Edge::Left),
         Command::Focus(Edge::Bottom),
@@ -55,7 +56,11 @@ impl Command {
         Command::RerunFailed,
         Command::FixWithAgent,
         Command::SwitchBackend,
-        Command::Settings,
+        Command::Open(Page::Runs),
+        Command::Open(Page::Schedules),
+        Command::Open(Page::Secrets),
+        Command::Open(Page::Decisions),
+        Command::Open(Page::Settings),
         Command::SaveDraft,
         Command::LaunchWorkingCopy,
         Command::EditTask,
@@ -75,7 +80,7 @@ impl Command {
             Command::RerunFailed => "rerun-failed".into(),
             Command::FixWithAgent => "fix-with-agent".into(),
             Command::SwitchBackend => "switch-backend".into(),
-            Command::Settings => "settings".into(),
+            Command::Open(page) => page.id().into(),
             Command::SaveDraft => "save-draft".into(),
             Command::LaunchWorkingCopy => "launch-working-copy".into(),
             Command::EditTask => "edit-task".into(),
@@ -95,7 +100,7 @@ impl Command {
             Command::RerunFailed => "Rerun what did not pass".into(),
             Command::FixWithAgent => "Fix with agent".into(),
             Command::SwitchBackend => "Switch between controller and local".into(),
-            Command::Settings => "Settings".into(),
+            Command::Open(page) => page.title().into(),
             Command::SaveDraft => "Save the working copy".into(),
             Command::LaunchWorkingCopy => "Launch the working copy".into(),
             Command::EditTask => "Edit the selected task".into(),
@@ -127,7 +132,8 @@ impl Command {
             Command::Show(PaneKind::Log) => vec![primary("cmd+6", "ctrl+6")],
             Command::Show(PaneKind::Pack) => vec![primary("cmd+7", "ctrl+7")],
             Command::Show(PaneKind::Transcript) => vec![primary("cmd+8", "ctrl+8")],
-            Command::Settings => vec![primary("cmd+,", "ctrl+,")],
+            Command::Open(Page::Settings) => vec![primary("cmd+,", "ctrl+,")],
+            Command::Open(Page::Decisions) => vec![primary("cmd+shift+d", "ctrl+shift+d")],
             Command::SaveDraft => vec![primary("cmd+s", "ctrl+s")],
             Command::LaunchWorkingCopy => vec![primary("cmd+enter", "ctrl+enter")],
             Command::EditTask => vec![primary("cmd+e", "ctrl+e")],

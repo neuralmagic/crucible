@@ -43,7 +43,7 @@ impl App {
                 Backend::Controller => Backend::Local,
                 Backend::Local => Backend::Controller,
             }),
-            Command::Settings => self.toggle_settings(),
+            Command::Open(page) => self.toggle_page(page),
             Command::SaveDraft => {
                 if self.working_edited && !self.draft_busy {
                     self.save_draft();

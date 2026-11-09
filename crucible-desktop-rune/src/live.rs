@@ -360,13 +360,13 @@ struct Fetcher {
 }
 
 /// What the controller last answered, on disk, and whether answers are coming from it now.
-struct Cache {
+pub(crate) struct Cache {
     store: Arc<Store>,
     offline: Arc<AtomicBool>,
 }
 
 impl Cache {
-    fn open() -> Option<Cache> {
+    pub(crate) fn open() -> Option<Cache> {
         let path = crate::httpcache::cache_root()?.join("controller.sqlite");
         Some(Cache {
             store: Arc::new(Store::open(&path).ok()?),
@@ -380,14 +380,14 @@ impl Cache {
 }
 
 /// The crux client and the runtime its calls block on.
-struct Connection {
-    client: crux::Client,
+pub(crate) struct Connection {
+    pub(crate) client: crux::Client,
     runtime: tokio::runtime::Runtime,
 }
 
 impl Connection {
     /// The controller the config names, read through `cache` when there is one.
-    fn open(cache: Option<&Cache>) -> Result<Self, String> {
+    pub(crate) fn open(cache: Option<&Cache>) -> Result<Self, String> {
         let config = crux::config::ConnectArgs::from_env()
             .resolve()
             .map_err(|error| format!("{error:#}"))?;
@@ -412,7 +412,7 @@ impl Connection {
     }
 
     /// Run one call to its end or [`TIMEOUT`], whichever comes first.
-    fn call<T, E: std::fmt::Display>(
+    pub(crate) fn call<T, E: std::fmt::Display>(
         &self,
         what: &str,
         call: impl Future<Output = Result<T, E>>,

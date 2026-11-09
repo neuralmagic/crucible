@@ -2,6 +2,7 @@
 //! playbooks (through `crux`, with the same config a terminal uses) and the local `examples/` packs
 //! (through each pack's `state/session.jsonl`).
 
+mod admin;
 mod commands;
 mod diff;
 mod draft;
@@ -147,6 +148,38 @@ pub struct Launcher {
     filled: u64,
 }
 
+/// What the detail area shows: the selected run, or one of the controller's management pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Page {
+    Runs,
+    Schedules,
+    Secrets,
+    Decisions,
+    Settings,
+}
+
+impl Page {
+    pub fn id(self) -> &'static str {
+        match self {
+            Page::Runs => "runs",
+            Page::Schedules => "schedules",
+            Page::Secrets => "secrets",
+            Page::Decisions => "decisions",
+            Page::Settings => "settings",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Page::Runs => "Runs",
+            Page::Schedules => "Schedules",
+            Page::Secrets => "Secrets",
+            Page::Decisions => "Decisions",
+            Page::Settings => "Settings",
+        }
+    }
+}
+
 /// Which pack the Pack tab shows when there is a working copy beside the run's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackSource {
@@ -160,6 +193,13 @@ pub struct App {
     local_seen: u64,
     live_client: live::Client,
     live_seen: u64,
+    admin_client: admin::Client,
+    admin_seen: u64,
+    admin_sent: Option<admin::Watch>,
+    /// Schedules, secrets, shares and decision requests as last read.
+    pub admin: admin::AdminView,
+    /// The management pages' picks and half-filled forms.
+    pub desk: admin::Desk,
     lsp: lsp::Lsp,
     lsp_seen: u64,
     /// What `crucible-lsp` last said about the packs on screen.
@@ -264,7 +304,7 @@ pub struct App {
     /// Where a text field's edits land once its form has closed.
     pub scratch: TextEdit,
     pub settings: Settings,
-    pub settings_open: bool,
+    pub page: Page,
     pub error: Option<String>,
 }
 
@@ -800,7 +840,10 @@ impl App {
         self.sign_in_done = None;
         self.signing_in = false;
         match answer {
-            Ok(()) => self.live_client.reconnect(),
+            Ok(()) => {
+                self.live_client.reconnect();
+                self.admin_client.reconnect();
+            }
             Err(why) => self.sign_in_error = Some(why),
         }
         true
@@ -808,8 +851,13 @@ impl App {
 
     /// Open what `link` names: a playbook, one of its launches with a task open, or a local pack.
     pub fn follow(&mut self, link: &Link) {
-        self.settings_open = false;
+        self.page = Page::Runs;
         match link {
+            Link::Decision { id } => {
+                self.backend = Backend::Controller;
+                self.page = Page::Decisions;
+                self.desk.pick_decision(id);
+            }
             Link::Playbook { id } => {
                 self.backend = Backend::Controller;
                 self.select(Selection::playbook(id));
@@ -857,6 +905,7 @@ impl App {
             self.forget_run_view();
         }
         self.selection = Some(selection);
+        self.page = Page::Runs;
         self.sync_live();
     }
 
@@ -932,8 +981,9 @@ impl App {
         }
     }
 
-    pub fn toggle_settings(&mut self) {
-        self.settings_open = !self.settings_open;
+    /// Show `page`, or the runs when it already shows.
+    pub fn toggle_page(&mut self, page: Page) {
+        self.page = if self.page == page { Page::Runs } else { page };
     }
 
     pub fn switch(&mut self, backend: Backend) {
@@ -982,6 +1032,11 @@ fn init() -> App {
         local_seen: 0,
         live_client: live::Client::spawn(),
         live_seen: 0,
+        admin_client: admin::Client::spawn(),
+        admin_seen: 0,
+        admin_sent: None,
+        admin: admin::AdminView::default(),
+        desk: admin::Desk::default(),
         lsp: lsp::Lsp::spawn(),
         lsp_seen: 0,
         checks: lsp::View::default(),
@@ -1052,7 +1107,7 @@ fn init() -> App {
         replies: 0,
         scratch: TextEdit::new(""),
         settings,
-        settings_open: false,
+        page: Page::Runs,
         error: None,
     }
 }
@@ -1064,6 +1119,7 @@ fn setup(app: &mut App, waker: Waker) {
     app.clicks = Some(clicks);
     app.local.set_waker(waker.clone());
     app.live_client.set_waker(waker.clone());
+    app.admin_client.set_waker(waker.clone());
     app.lsp.set_waker(waker);
 }
 
@@ -1081,6 +1137,11 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         app.apply_live(snapshot);
         changed = true;
     }
+    if let Some((version, view)) = app.admin_client.take(app.admin_seen) {
+        app.admin_seen = version;
+        app.apply_admin(view);
+        changed = true;
+    }
     while let Some(link) = app
         .clicks
         .as_ref()
@@ -1092,6 +1153,7 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         changed = true;
     }
     app.sync_live();
+    app.sync_admin();
     changed |= app.refresh_working();
     changed |= app.finish_sign_in();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
@@ -1153,7 +1215,26 @@ fn main() {
             }),
             ("settings", |app: &mut App| {
                 scene_tab(app);
-                app.settings_open = true;
+                app.page = Page::Settings;
+            }),
+            // `CRUCIBLE_PAGE` opens that page (schedules, secrets or decisions) against the
+            // controller crux's config names.
+            ("page", |app: &mut App| {
+                app.backend = Backend::Controller;
+                let page = std::env::var("CRUCIBLE_PAGE").unwrap_or_default();
+                if let Some(page) = [Page::Schedules, Page::Secrets, Page::Decisions]
+                    .into_iter()
+                    .find(|p| p.id() == page)
+                {
+                    app.page = page;
+                }
+                if let Ok(id) = std::env::var("CRUCIBLE_PICK") {
+                    match app.page {
+                        Page::Secrets => app.desk.secret = Some(id),
+                        Page::Decisions => app.desk.pick_decision(&id),
+                        _ => {}
+                    }
+                }
             }),
             // `CRUCIBLE_LIVE_SCENE=<playbook id>` opens that live playbook headlessly, and
             // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.

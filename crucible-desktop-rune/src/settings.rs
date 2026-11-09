@@ -120,6 +120,8 @@ pub struct Settings {
     pub crt: bool,
     /// Announce the signed-in user's runs as they finish.
     pub notify: bool,
+    /// Announce decision requests the signed-in user may answer as they open.
+    pub ask: bool,
     /// The editor pack files open in; `None` finds one.
     pub editor: Option<Editor>,
     /// Keys bound by hand, by command id; a command left out keeps its defaults.
@@ -142,6 +144,7 @@ struct Config {
     appearance: Appearance,
     crt: Option<bool>,
     notify: Option<bool>,
+    notify_decisions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<Editor>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -174,6 +177,7 @@ impl Settings {
             appearance: config.appearance,
             crt: config.crt.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
+            ask: config.notify_decisions.unwrap_or(true),
             editor: config.editor,
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
@@ -220,6 +224,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_ask(&mut self, on: bool) {
+        self.ask = on;
+        self.save();
+    }
+
     pub fn set_editor(&mut self, editor: Option<Editor>) {
         self.editor = editor;
         self.save();
@@ -248,6 +257,7 @@ impl Settings {
             appearance: self.appearance,
             crt: Some(self.crt),
             notify: Some(self.notify),
+            notify_decisions: Some(self.ask),
             editor: self.editor,
             keys: self.keys.clone(),
             checks: Some(self.checks),

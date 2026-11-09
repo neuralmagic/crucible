@@ -2,6 +2,8 @@
 
 mod compare;
 mod data;
+mod decisions;
+mod desk;
 mod dock;
 mod graph;
 mod launch;
@@ -10,6 +12,9 @@ mod log;
 mod pack;
 mod palette;
 mod runs;
+mod schedules;
+mod secrets;
+mod shares;
 mod tasks;
 mod theme;
 mod timeline;
@@ -512,8 +517,39 @@ fn sidebar(app: &App, p: &Paint) -> El {
         .child(head)
         .child(rule("sidebar-head-rule", false, p))
         .child(pack_list(app, p))
+        .children((app.backend == Backend::Controller).then(|| pages_nav(app, p)))
         .child(rule("sidebar-foot-rule", false, p))
         .child(account(app, source, p))
+}
+
+/// The controller's management pages, under the playbooks.
+fn pages_nav(app: &App, p: &Paint) -> El {
+    let waiting = app.waiting();
+    let entry = |page: crate::Page, glyph: &'static Icon, badge: Option<String>| {
+        let mut entry = SidebarRow::new(page.title())
+            .icon(glyph)
+            .height(32.0)
+            .selected(app.page == page)
+            .on_select(move |app: &mut App, _: &mut Tx| app.toggle_page(page));
+        if let Some(badge) = badge {
+            entry = entry.badge(badge);
+        }
+        entry.build(p.k).key(format!("nav-{}", page.id()))
+    };
+    col()
+        .key("pages-nav")
+        .w_full()
+        .px(8.0)
+        .pb(6.0)
+        .gap(2.0)
+        .child(rule("pages-nav-rule", false, p).mb(6.0))
+        .child(entry(
+            crate::Page::Decisions,
+            &oc::CHECKLIST,
+            (waiting > 0).then(|| waiting.to_string()),
+        ))
+        .child(entry(crate::Page::Schedules, &oc::STATUS, None))
+        .child(entry(crate::Page::Secrets, &rune_kit::glyphs::LOCK, None))
 }
 
 /// Who is signed in, bottom left, with the settings button beside it.
@@ -572,13 +608,13 @@ fn account(app: &App, source: String, p: &Paint) -> El {
         )
         .child(
             IconButton::new(&oc::SETTINGS_GEAR)
-                .variant(if app.settings_open {
+                .variant(if app.page == crate::Page::Settings {
                     IconButtonVariant::Neutral
                 } else {
                     IconButtonVariant::GhostMuted
                 })
                 .label("Settings")
-                .on_press(|app: &mut App| app.toggle_settings())
+                .on_press(|app: &mut App| app.toggle_page(crate::Page::Settings))
                 .build(p.k)
                 .key("settings-open"),
         )
@@ -941,8 +977,12 @@ fn verdict_tone(verdict: Verdict) -> Option<(Tone, &'static Icon)> {
 }
 
 fn detail(app: &App, p: &Paint) -> El {
-    if app.settings_open {
-        return settings_pane(app, p);
+    match app.page {
+        crate::Page::Settings => return settings_pane(app, p),
+        crate::Page::Schedules => return schedules::page(app, p),
+        crate::Page::Secrets => return secrets::page(app, p),
+        crate::Page::Decisions => return decisions::page(app, p),
+        crate::Page::Runs => {}
     }
     if let (
         Some(Selection::Live { launch: None, .. }),
@@ -952,6 +992,7 @@ fn detail(app: &App, p: &Paint) -> El {
     {
         return runs::runs_page(
             launcher::launch_button(app, playbook, p),
+            shares::section(app, p),
             playbook,
             &launches,
             *now,
@@ -1334,7 +1375,7 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                 .child(
                     Button::new("Done")
                         .variant(ButtonVariant::Neutral)
-                        .on_press(|app: &mut App| app.settings_open = false)
+                        .on_press(|app: &mut App| app.page = crate::Page::Runs)
                         .build(p.k)
                         .key("settings-done"),
                 ),
@@ -1420,19 +1461,35 @@ fn settings_pane(app: &App, p: &Paint) -> El {
         .child(settings_section(
             "notifications",
             "Notifications",
-            vec![setting_row(
-                "When my runs finish",
-                Switch::new(app.settings.notify)
-                    .label("When my runs finish")
-                    .hide_label()
-                    .on_toggle(|app: &mut App| {
-                        let on = !app.settings.notify;
-                        app.settings.set_notify(on);
-                    })
-                    .build(p.k)
-                    .key("notify-switch"),
-                p,
-            )],
+            vec![
+                setting_row(
+                    "When my runs finish",
+                    Switch::new(app.settings.notify)
+                        .label("When my runs finish")
+                        .hide_label()
+                        .on_toggle(|app: &mut App| {
+                            let on = !app.settings.notify;
+                            app.settings.set_notify(on);
+                        })
+                        .build(p.k)
+                        .key("notify-switch"),
+                    p,
+                ),
+                rule("notifications-sep", false, p),
+                setting_row(
+                    "When a decision waits on me",
+                    Switch::new(app.settings.ask)
+                        .label("When a decision waits on me")
+                        .hide_label()
+                        .on_toggle(|app: &mut App| {
+                            let on = !app.settings.ask;
+                            app.settings.set_ask(on);
+                        })
+                        .build(p.k)
+                        .key("ask-switch"),
+                    p,
+                ),
+            ],
             p,
         ))
         .child(settings_section(

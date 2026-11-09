@@ -20,6 +20,7 @@ const WEEKS: usize = 12;
 
 pub(crate) fn runs_page(
     launch: Option<El>,
+    shares: Option<El>,
     playbook: &str,
     launches: &[&LivePlaybook],
     now: i64,
@@ -79,7 +80,14 @@ pub(crate) fn runs_page(
                 .grow(1.0)
                 .min_h(0.0)
                 .gap(16.0)
-                .child(col().child(card("Calendar", heatmap(launches, now, p), p)))
+                .child(
+                    col()
+                        .gap(16.0)
+                        .h_full()
+                        .min_h(0.0)
+                        .child(card("Calendar", heatmap(launches, now, p), p))
+                        .children(shares.map(|shares| card("Shares", shares, p))),
+                )
                 .child(
                     card("All runs", list(launches, now, p), p)
                         .grow(1.0)

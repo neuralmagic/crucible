@@ -6590,6 +6590,7 @@ dependencies = [
 name = "rune-kit"
 version = "0.0.1"
 dependencies = [
+ "pulldown-cmark",
  "rune",
  "rune-motion",
  "unicode-segmentation",

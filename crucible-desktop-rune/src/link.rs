@@ -4,6 +4,7 @@
 //! crucible-playbooks://playbook/<id>
 //! crucible-playbooks://playbook/<id>/launch/<key>[?task=<name>]
 //! crucible-playbooks://local/<pack>
+//! crucible-playbooks://decision/<id>
 //! ```
 //!
 //! A link comes from outside the app, so parsing is strict: one scheme, these shapes only, and
@@ -26,6 +27,9 @@ pub enum Link {
     },
     Local {
         pack: String,
+    },
+    Decision {
+        id: String,
     },
 }
 
@@ -59,6 +63,9 @@ impl Link {
             [kind, pack] if kind == "local" && task.is_none() => {
                 Some(Link::Local { pack: pack.clone() })
             }
+            [kind, id] if kind == "decision" && task.is_none() => {
+                Some(Link::Decision { id: id.clone() })
+            }
             _ => None,
         }
     }
@@ -82,6 +89,7 @@ impl Link {
                 )
             }
             Link::Local { pack } => format!("{SCHEME}://local/{}", encode(pack, b"")),
+            Link::Decision { id } => format!("{SCHEME}://decision/{}", encode(id, b"")),
         }
     }
 }
@@ -148,7 +156,11 @@ mod tests {
             Link::Local {
                 pack: "playbook".into(),
             },
+            Link::Decision {
+                id: "01a2c3d4-decision".into(),
+            },
         ];
+        assert_eq!(Link::parse("crucible-playbooks://decision/d1?task=x"), None);
         for link in links {
             assert_eq!(
                 Link::parse(&link.url()),
