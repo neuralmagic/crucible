@@ -3,7 +3,7 @@
 //! ```text
 //!   column 0 (share .55)        column 1 (share .45)
 //!  +---------------------------+----------------------+
-//!  | [Graph]                   | [Log] Data           |  group 0 of each column
+//!  | [Graph]                   | [Log] Data Files ... |  group 0 of each column
 //!  |                           |                      |
 //!  +---------------------------+                      |
 //!  | [Tasks] Pack  Launch      |                      |  group 1 of column 0
@@ -26,6 +26,7 @@ pub enum PaneKind {
     Timeline,
     Graph,
     Data,
+    Files,
     Transcript,
     Compare,
     Pack,
@@ -34,11 +35,12 @@ pub enum PaneKind {
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 9] = [
+    pub const ALL: [PaneKind; 10] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
         PaneKind::Data,
+        PaneKind::Files,
         PaneKind::Transcript,
         PaneKind::Compare,
         PaneKind::Pack,
@@ -52,6 +54,7 @@ impl PaneKind {
             PaneKind::Timeline => "Timeline",
             PaneKind::Graph => "Graph",
             PaneKind::Data => "Data",
+            PaneKind::Files => "Files",
             PaneKind::Transcript => "Transcript",
             PaneKind::Compare => "Compare",
             PaneKind::Pack => "Pack",
@@ -150,7 +153,12 @@ impl Workspace {
                 },
                 Column {
                     groups: vec![group(
-                        &[PaneKind::Log, PaneKind::Data, PaneKind::Transcript],
+                        &[
+                            PaneKind::Log,
+                            PaneKind::Data,
+                            PaneKind::Files,
+                            PaneKind::Transcript,
+                        ],
                         1.0,
                     )],
                     share: 0.44,
@@ -500,7 +508,7 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 mod tests {
     use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit, neighbour};
 
-    use PaneKind::{Compare, Data, Graph, Launch, Log, Pack, Tasks, Timeline, Transcript};
+    use PaneKind::{Compare, Data, Files, Graph, Launch, Log, Pack, Tasks, Timeline, Transcript};
 
     #[test]
     fn a_neighbour_is_the_nearest_group_on_that_side_lined_up_first() {
@@ -557,7 +565,7 @@ mod tests {
             tabs(&w),
             vec![
                 vec![vec![Graph, Timeline], vec![Tasks, Compare, Pack, Launch]],
-                vec![vec![Log, Data, Transcript]]
+                vec![vec![Log, Data, Files, Transcript]]
             ]
         );
         sums_to_one(&w);
@@ -603,7 +611,7 @@ mod tests {
                     vec![Graph, Timeline],
                     vec![Tasks, Compare, Pack, Launch, Log]
                 ],
-                vec![vec![Data, Transcript]]
+                vec![vec![Data, Files, Transcript]]
             ]
         );
         assert_eq!(w.columns[0].groups[1].active, Log);
@@ -631,7 +639,7 @@ mod tests {
             tabs(&w),
             vec![
                 vec![vec![Timeline], vec![Tasks, Compare, Launch], vec![Pack]],
-                vec![vec![Log, Data, Transcript]],
+                vec![vec![Log, Data, Files, Transcript]],
                 vec![vec![Graph]]
             ]
         );
@@ -667,6 +675,7 @@ mod tests {
         let mut w = Workspace::for_depth(2);
         w.close(Log);
         w.close(Data);
+        w.close(Files);
         w.close(Transcript);
         assert_eq!(w.columns.len(), 1);
         sums_to_one(&w);
@@ -677,7 +686,7 @@ mod tests {
         w.close(Compare);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 8);
+        assert_eq!(w.closed().count(), 9);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
@@ -689,9 +698,10 @@ mod tests {
         w.close(Data);
         assert!(!w.showing(Data));
         w.activate(Data);
-        assert_eq!(tabs(&w)[1], vec![vec![Log, Transcript, Data]]);
+        assert_eq!(tabs(&w)[1], vec![vec![Log, Files, Transcript, Data]]);
         assert!(w.showing(Data) && !w.showing(Log));
         w.close(Data);
+        w.close(Files);
         w.close(Log);
         w.close(Transcript);
         w.activate(Data);
