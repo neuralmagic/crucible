@@ -71,6 +71,20 @@ pub fn calendar(launches: &[(i64, Verdict)], today: i64, weeks: usize) -> Vec<Da
 }
 
 /// The UTC calendar date of a day number.
+/// Which week columns carry a month label: the week each month starts in, and the first week
+/// when no month starts in the next `room` weeks, so no label runs into the next.
+pub fn month_labels(days: &[Day], room: usize) -> Vec<bool> {
+    let starts: Vec<bool> = days
+        .chunks(7)
+        .map(|week| week.iter().any(|d| date(d.day).day() == 1))
+        .collect();
+    let mut labels = starts.clone();
+    if let Some(first) = labels.first_mut() {
+        *first = *first || !starts.iter().skip(1).take(room).any(|s| *s);
+    }
+    labels
+}
+
 pub fn date(day: i64) -> Date {
     Timestamp::from_second(day * DAY)
         .map(|at| at.to_zoned(TimeZone::UTC).date())
@@ -123,7 +137,7 @@ impl Summary {
 #[cfg(test)]
 mod tests {
     use crate::model::Verdict;
-    use crate::runs::{DAY, Summary, calendar, date, day_label, lanes, weekday};
+    use crate::runs::{DAY, Day, Summary, calendar, date, day_label, lanes, month_labels, weekday};
 
     #[test]
     fn close_points_take_new_lanes_and_far_ones_reuse_them() {
@@ -176,5 +190,31 @@ mod tests {
         assert!((s.spent - 3.0).abs() < 1e-9);
         assert!((s.pass_rate().unwrap() - 2.0 / 3.0).abs() < 1e-6);
         assert_eq!(Summary::of(&[(Verdict::Running, None)]).pass_rate(), None);
+    }
+
+    fn weeks_from(monday: &str, weeks: i64) -> Vec<Day> {
+        let start = monday
+            .parse::<jiff::Timestamp>()
+            .expect("stamp")
+            .as_second()
+            .div_euclid(DAY);
+        (start..start + weeks * 7)
+            .map(|day| Day {
+                day,
+                runs: 0,
+                passed: 0,
+                failed: 0,
+                running: 0,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_first_week_gives_way_to_a_month_starting_close_behind_it() {
+        let crowded = month_labels(&weeks_from("2026-08-24T00:00:00Z", 6), 2);
+        assert_eq!(crowded, [false, true, false, false, false, true]);
+        let roomy = month_labels(&weeks_from("2026-08-03T00:00:00Z", 6), 2);
+        assert_eq!(roomy, [true, false, false, false, true, false]);
+        assert!(month_labels(&[], 2).is_empty());
     }
 }

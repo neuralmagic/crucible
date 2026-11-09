@@ -5,7 +5,7 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 
 use crate::live::LivePlaybook;
 use crate::model::Verdict;
-use crate::runs::{DAY, Day, Summary, calendar, date, day_label, lanes};
+use crate::runs::{DAY, Day, Summary, calendar, date, day_label, lanes, month_labels};
 use crate::ui::Flight;
 use crate::ui::{
     Paint, SECTION, TITLE, age, meter, mono, pulsing, runs_note, stat, verdict_color, verdict_tone,
@@ -310,10 +310,9 @@ fn heatmap(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
             .map(|day| text(day).font(p.k.ty.small).color(p.c.text_faint).h(CELL)),
     );
     grid = grid.child(labels);
-    for week in days.chunks(7) {
-        let starts_month =
-            week.iter().any(|d| date(d.day).day() == 1) || week[0].day == days[0].day;
-        let month = starts_month.then(|| date(week[6].day).strftime("%b").to_string());
+    let labelled = month_labels(&days, 2);
+    for (week, labelled) in days.chunks(7).zip(labelled) {
+        let month = labelled.then(|| date(week[6].day).strftime("%b").to_string());
         let mut column = col().gap(CELL_GAP).child(
             text(month.unwrap_or_default())
                 .font(p.k.ty.small)
@@ -382,6 +381,8 @@ fn cell(d: &Day, busiest: usize, today: i64, launches: &[&LivePlaybook], p: &Pai
 
 /// Every launch, newest first.
 fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
+    let columns =
+        rune::memo::layout_with("runs-list", |rect| Columns::fit(rect[2])).unwrap_or(Columns::All);
     let mut sorted: Vec<&&LivePlaybook> = launches.iter().collect();
     sorted.sort_by_key(|l| std::cmp::Reverse(l.landed));
     let mut rows = col()
@@ -397,13 +398,32 @@ fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
         if i > 0 {
             rows = rows.child(el().h(p.hair).w_full().fill(p.c.border_muted));
         }
-        rows = rows.child(list_row(i, launch, now, p));
+        rows = rows.child(list_row(i, launch, now, columns, p));
     }
     p.k.scroll_bar(rows).w_full().grow(1.0).min_h(0.0)
 }
 
 /// Row `i` of the list, newest first; keyed by position so a script can pick "run-0".
-fn list_row(i: usize, launch: &LivePlaybook, now: i64, p: &Paint) -> El {
+/// Which of a run row's columns fit the list's width; origin goes first, then status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Columns {
+    Fewest,
+    NoOrigin,
+    All,
+}
+
+impl Columns {
+    /// Every column needs about 440 points; without the origin, 360.
+    fn fit(width: f32) -> Columns {
+        match width {
+            w if w >= 440.0 => Columns::All,
+            w if w >= 360.0 => Columns::NoOrigin,
+            _ => Columns::Fewest,
+        }
+    }
+}
+
+fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Paint) -> El {
     let verdict = launch.verdict();
     let glyph = match verdict_tone(verdict) {
         _ if verdict == Verdict::Running => Spinner::new().size(14.0).color(p.live).build(p.k),
@@ -440,21 +460,22 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, p: &Paint) -> El {
                 .color(p.c.text_base)
                 .w(110.0),
         )
-        .child(
+        .children((columns >= Columns::NoOrigin).then(|| {
             text(launch.status.clone())
                 .font(p.k.ty.ui)
                 .color(p.c.text_muted)
-                .w(80.0),
-        )
+                .w(80.0)
+        }))
         .child(
-            text(
+            text(if columns == Columns::All {
                 if launch.origin.is_empty() {
-                    "launch"
+                    "launch".to_string()
                 } else {
-                    launch.origin.as_str()
+                    launch.origin.clone()
                 }
-                .to_string(),
-            )
+            } else {
+                String::new()
+            })
             .font(p.k.ty.ui)
             .color(p.c.text_muted)
             .grow(1.0)
@@ -473,4 +494,17 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, p: &Paint) -> El {
                 .color(p.c.text_faint)
                 .w(36.0),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ui::runs::Columns;
+
+    #[test]
+    fn a_narrow_list_drops_origin_then_status() {
+        assert_eq!(Columns::fit(600.0), Columns::All);
+        assert_eq!(Columns::fit(440.0), Columns::All);
+        assert_eq!(Columns::fit(400.0), Columns::NoOrigin);
+        assert_eq!(Columns::fit(300.0), Columns::Fewest);
+    }
 }

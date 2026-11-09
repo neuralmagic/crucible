@@ -1795,6 +1795,18 @@ fn banner(message: &str, p: &Paint) -> El {
                 .font(p.k.ty.ui)
                 .color(s.fg)
                 .grow(1.0)
-                .wrap(),
+                .min_w(0.0)
+                .shrink()
+                .wrap_anywhere()
+                .max_lines(4)
+                .help(message.to_string()),
         )
+        .child({
+            let full = message.to_string();
+            IconButton::new(&oc::COPY)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Copy")
+                .on_press_tx(move |_: &mut App, tx: &mut Tx| tx.copy(full.clone()))
+                .build(p.k)
+        })
 }

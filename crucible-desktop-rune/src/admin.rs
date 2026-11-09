@@ -654,9 +654,48 @@ impl crate::App {
     }
 }
 
+/// An open decision request to lay the Decisions page out against.
+fn fixture() -> Result<dto::Decision, String> {
+    serde_json::from_str(include_str!("../fixtures/decision.json"))
+        .map_err(|error| format!("the decision fixture: {error}"))
+}
+
+/// Shows the fixture request on the Decisions page, queued and picked.
+pub fn show_fixture(app: &mut crate::App) {
+    let decision = fixture();
+    if let Ok(d) = &decision {
+        app.admin.decisions = Some(Ok(vec![dto::DecisionSummary {
+            id: d.id.clone(),
+            run_id: d.run_id.clone(),
+            task: d.task.clone(),
+            launch_key: d.launch_key.clone(),
+            questions: d.questions.iter().map(|q| q.id.clone()).collect(),
+            opened_at: d.opened_at.clone(),
+            expires_at: d.expires_at.clone(),
+        }]));
+        app.desk.pick_decision(&d.id);
+        app.admin.decision = Some((d.id.clone(), Some(Ok(d.clone()))));
+    } else {
+        app.admin.decisions = Some(decision.map(|_| Vec::new()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::admin::*;
+
+    #[test]
+    fn the_decision_fixture_reads_as_an_open_answerable_request() {
+        let decision = fixture().expect("fixture");
+        assert_eq!(decision.state, "open");
+        assert!(decision.can_answer);
+        assert_eq!(decision.questions.len(), 2);
+        let mut desk = Desk::default();
+        assert_eq!(desk.unanswered(&decision), ["ship", "repos"]);
+        desk.toggle_pick("ship", "yes", false);
+        desk.toggle_pick("repos", "llm-d/llm-d", true);
+        assert!(desk.unanswered(&decision).is_empty());
+    }
 
     fn summary(id: &str) -> dto::DecisionSummary {
         dto::DecisionSummary {

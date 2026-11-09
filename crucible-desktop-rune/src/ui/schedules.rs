@@ -4,7 +4,7 @@ use rune::{El, col, row, text};
 use rune_kit::Switch;
 
 use crate::admin::{Action, relative};
-use crate::ui::desk::{card, frame, landed, list, none, now};
+use crate::ui::desk::{card, frame, landed, none, now, scrolled, stacked};
 use crate::ui::{Paint, Tone, flag, mono, tag};
 use crate::{App, Selection};
 
@@ -36,7 +36,11 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         .into_iter()
         .map(|schedule| schedule_row(schedule, app, now, p))
         .collect();
-    page.child(card("schedules-card", list("schedules-list", rows, p), p).grow(1.0))
+    page.child(scrolled(
+        "schedules-scroll",
+        card("schedules-card", stacked("schedules-list", rows, p), p),
+        p,
+    ))
 }
 
 fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) -> El {

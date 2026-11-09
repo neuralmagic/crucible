@@ -134,6 +134,33 @@ pub(crate) fn list(key: &str, rows: Vec<El>, p: &Paint) -> El {
     p.k.scroll_bar(column).w_full().grow(1.0).min_h(0.0)
 }
 
+/// `rows` divided by hairlines, as tall as they are.
+pub(crate) fn stacked(key: &str, rows: Vec<El>, p: &Paint) -> El {
+    let mut column = col().key(key.to_string()).w_full();
+    for (i, r) in rows.into_iter().enumerate() {
+        if i > 0 {
+            column = column.child(el().h(p.hair).w_full().fill(p.c.border_muted));
+        }
+        column = column.child(r);
+    }
+    column
+}
+
+/// `body` in a scroll area filling the rest of the page, so a short card keeps its height.
+pub(crate) fn scrolled(key: &str, body: El, p: &Paint) -> El {
+    let area = col()
+        .key(key.to_string())
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_edge_fade(8.0)
+        .child(body);
+    p.k.scroll_bar(area).w_full().grow(1.0).min_h(0.0)
+}
+
 /// A small muted heading over a group of rows.
 pub(crate) fn heading(label: &str, p: &Paint) -> El {
     text(label.to_string())

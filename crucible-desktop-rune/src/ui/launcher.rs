@@ -15,6 +15,8 @@ use crate::{App, Stage};
 const SHEET: f32 = 520.0;
 const PAD: f32 = 20.0;
 const INNER: f32 = SHEET - 2.0 * PAD;
+/// The tallest the form gets before it scrolls.
+const BODY: f32 = 520.0;
 
 /// Which of the form's text fields an edit goes to.
 #[derive(Clone, Copy)]
@@ -131,17 +133,29 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
         (Target::Draft(id), None) => format!("Launch draft {id}"),
         (Target::Playbook(id), None) => format!("Launch {id}"),
     };
+    let body = col()
+        .key("launcher-body")
+        .w_full()
+        .max_h(BODY)
+        .px(PAD)
+        .scroll(rune::ScrollSpec {
+            stick_bottom: false,
+        })
+        .scroll_edge_fade(8.0)
+        .child(body);
     Dialog::new("launcher", title)
         .open(true)
+        .fit()
         .width(SHEET)
         .on_close(|app: &mut App| app.launcher = None)
-        .child(col().w_full().px(PAD).child(body))
+        .child(p.k.scroll_bar(body).w_full())
         .child(
             row()
                 .w_full()
                 .gap(8.0)
                 .px(PAD)
                 .pt(8.0)
+                .pb(16.0)
                 .child(el().grow(1.0))
                 .child(
                     Button::new("Cancel")
@@ -398,14 +412,18 @@ fn ceilings(app: &App, p: &Paint) -> El {
                         .trim_start_matches('$')
                         .parse()
                         .unwrap_or(0.0);
-                    Slider {
-                        key: "launch-cost-slider".into(),
-                        label: "Max cost".into(),
-                        frac: scale.frac(asked),
-                        steps: scale.steps(),
-                        set: set_cost,
-                    }
-                    .build(p)
+                    capped(
+                        Slider {
+                            key: "launch-cost-slider".into(),
+                            label: "Max cost".into(),
+                            frac: scale.frac(asked),
+                            steps: scale.steps(),
+                            set: set_cost,
+                        }
+                        .build(p),
+                        format!("${cap_cost:.2}"),
+                        p,
+                    )
                 })),
         )
         .child(
@@ -423,16 +441,30 @@ fn ceilings(app: &App, p: &Paint) -> El {
                 .children(minutes(cap_time).map(|cap| {
                     let scale = Scale::minutes(cap);
                     let asked = minutes(&launcher.time.text).unwrap_or(0) as f64;
-                    Slider {
-                        key: "launch-time-slider".into(),
-                        label: "Max time".into(),
-                        frac: scale.frac(asked),
-                        steps: scale.steps(),
-                        set: set_time,
-                    }
-                    .build(p)
+                    capped(
+                        Slider {
+                            key: "launch-time-slider".into(),
+                            label: "Max time".into(),
+                            frac: scale.frac(asked),
+                            steps: scale.steps(),
+                            set: set_time,
+                        }
+                        .build(p),
+                        cap_time.clone(),
+                        p,
+                    )
                 })),
         )
+}
+
+/// A slider with the cap it stops at beside its end.
+fn capped(slider: El, cap: String, p: &Paint) -> El {
+    row()
+        .w((INNER - 12.0) / 2.0)
+        .gap(8.0)
+        .center_y()
+        .child(row().grow(1.0).min_w(0.0).child(slider))
+        .child(text(cap).font(p.k.ty.small).color(p.c.text_faint))
 }
 
 fn set_cost(app: &mut App, frac: f32) {

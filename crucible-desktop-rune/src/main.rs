@@ -1243,6 +1243,12 @@ fn main() {
                     }
                 }
             }),
+            // An open decision request from `fixtures/decision.json`, with no controller.
+            ("decision", |app: &mut App| {
+                app.backend = Backend::Local;
+                app.page = Page::Decisions;
+                admin::show_fixture(app);
+            }),
             // `CRUCIBLE_LIVE_SCENE=<playbook id>` opens that live playbook headlessly, and
             // `CRUCIBLE_LINK=<crucible-playbooks:// link>` follows a link as the system would.
             ("live", |app: &mut App| {
