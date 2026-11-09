@@ -5,7 +5,7 @@ use rune_kit::{SegmentedControl, TextInput};
 use rune_theme_opencode::icons as oc;
 
 use crate::logline::{Body, Level, LogLine, LogView};
-use crate::session::{TaskState, TaskView};
+use crate::session::{TaskState, TaskView, split_name};
 use crate::settings::LogFont;
 use crate::ui::Paint;
 use crate::ui::tasks::{count, state_mark, status_color};
@@ -159,20 +159,13 @@ struct Blocks<'a> {
 }
 
 impl Blocks<'_> {
-    /// Where the task or instance `name` stands; `None` for the lines no task owns.
+    /// Where the task, instance or round `name` stands; `None` for the lines no task owns.
     fn state(&self, name: &str) -> Option<TaskState> {
-        let (task, key) = match name.split_once('[') {
-            Some((task, rest)) => (task, rest.strip_suffix(']')),
-            None => (name, None),
-        };
+        let (task, key) = split_name(name);
         let task = self.tasks.iter().find(|t| t.name == task)?;
         match key {
             None => Some(task.state()),
-            Some(key) => task
-                .instances
-                .iter()
-                .find(|i| i.key == key)
-                .map(|i| i.state()),
+            Some(key) => task.part_state(key),
         }
     }
 

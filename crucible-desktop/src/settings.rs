@@ -673,6 +673,7 @@ proxxy = "socks5://127.0.0.1:1080"
             url: "https://internal.example.com".into(),
             proxy: Some("socks5h://127.0.0.1:1080".into()),
             tunnel: Some("ssh -N -D 1080 jumpbox".into()),
+            shell: Some("/bin/bash".into()),
             ..Profile::default()
         };
         settings.set_profile_def("jump", &jump).unwrap();

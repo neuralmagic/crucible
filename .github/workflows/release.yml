@@ -111,6 +111,60 @@ jobs:
             --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
           gh release upload "$tag" dist/* --clobber
 
+  # The desktop app as a Fedora RPM, crucible-lsp beside it, for x86_64 and aarch64.
+  desktop-linux:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: registry.fedoraproject.org/fedora:45
+    steps:
+      - name: git
+        run: dnf -y install git
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Fedora packages
+        run: sh crucible-desktop/linux/deps.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+          cache-workspaces: |
+            . -> target
+            crucible-desktop -> target
+
+      - name: Rune
+        run: sh crucible-desktop/rune-patches.sh
+
+      - name: Build the RPM
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          cargo build --release --locked -p crucible-lsp
+          ( cd crucible-desktop && cargo build --release --locked )
+          VERSION="${tag#v}" sh crucible-desktop/linux-bundle.sh
+          mkdir -p dist
+          cp crucible-desktop/target/linux/*.rpm dist/
+          ( cd dist && for f in *.rpm; do sha256sum "$f" > "$f.sha256"; done )
+          ls -la dist/
+
+      - name: Upload to release
+        if: ${{ github.ref_type == 'tag' || inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dnf -y install gh
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+            --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" dist/* --clobber
+
   # The macOS desktop app (Crucible Playbooks.app, crucible-lsp inside), signed ad hoc: a
   # downloaded copy needs Open Anyway (or `xattr -d com.apple.quarantine`) on first launch.
   desktop:

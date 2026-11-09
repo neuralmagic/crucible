@@ -5,7 +5,7 @@ use rune_theme_opencode::icons as oc;
 
 use crate::gfx;
 use crate::session::TaskState;
-use crate::timeline::{Bar, Schedule, concurrency, schedule, tick};
+use crate::timeline::{Bar, RoundSpan, Schedule, concurrency, schedule, tick};
 use crate::ui::tasks::{duration, status_color};
 use crate::ui::{Paint, Pane, fx};
 
@@ -184,15 +184,20 @@ fn ink(state: TaskState, p: &Paint) -> Color {
 fn bar_row(i: usize, bar: &Bar, span: f64, p: &Paint) -> El {
     let end = bar.end.unwrap_or(span).max(bar.start);
     let fill = ink(bar.state, p);
-    let mut track = col().w_full().gap(2.0).child(span_bar(
-        bar.start,
-        end,
-        span,
-        fill,
-        bar.critical,
-        bar.end.is_none(),
-        p,
-    ));
+    let own = if bar.rounds.is_empty() {
+        span_bar(
+            bar.start,
+            end,
+            span,
+            fill,
+            bar.critical,
+            bar.end.is_none(),
+            p,
+        )
+    } else {
+        round_bars(&bar.name, &bar.rounds, span, bar.critical, p)
+    };
+    let mut track = col().w_full().gap(2.0).child(own);
     for (start, lane_end, state) in &bar.lanes {
         let lane_end = lane_end.unwrap_or(span).max(*start);
         track = track.child(
@@ -249,6 +254,47 @@ fn bar_row(i: usize, bar: &Bar, span: f64, p: &Paint) -> El {
         .center_y()
         .child(row().w(p.tune.timeline_label).px(8.0).child(label))
         .child(track.grow(1.0).min_w(0.0).pr(8.0))
+}
+
+/// A revise loop's rounds on one track, each where it ran and numbered.
+fn round_bars(name: &str, rounds: &[RoundSpan], span: f64, critical: bool, p: &Paint) -> El {
+    let mut track = row().w_full().h(12.0);
+    let mut at = 0.0;
+    for round in rounds {
+        let start = round.start.max(at);
+        let end = round.end.unwrap_or(span).max(start);
+        if start > at {
+            track = track.child(el().w_frac(((start - at) / span) as f32));
+        }
+        let mut bar = row()
+            .key(format!("bar-{name}[round-{}]", round.n))
+            .help(format!("{name} round {}", round.n))
+            .w_frac(((end - start) / span) as f32)
+            .min_w(3.0)
+            .h(12.0)
+            .radius(3.0)
+            .center()
+            .clip_rounded(3.0)
+            .fill(ink(round.state, p).alpha(if critical { 0.95 } else { 0.6 }))
+            .child(
+                text(round.n.to_string())
+                    .font(p.mono(9.0, 600.0))
+                    .color(p.c.text_base.alpha(0.85)),
+            );
+        if round.end.is_none() {
+            bar = bar.child(
+                fx(
+                    gfx::SHIMMER,
+                    gfx::data(Color::WHITE, p.tune.bar_shimmer),
+                    0.0,
+                )
+                .radius(3.0),
+            );
+        }
+        track = track.child(bar);
+        at = end;
+    }
+    track
 }
 
 fn span_bar(

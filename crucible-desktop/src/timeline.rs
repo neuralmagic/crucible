@@ -2,7 +2,8 @@
 //!
 //! A log whose task events carry `at` is drawn as it ran, from the run's first start. An older
 //! log records only how long each task took, so its schedule is derived: a task starts when the
-//! last of its dependencies settles, and a fan-out's instances all start with it.
+//! last of its dependencies settles, a fan-out's instances all start with it, and a revise loop's
+//! rounds run one after another.
 
 use std::collections::HashMap;
 
@@ -19,8 +20,19 @@ pub struct Bar {
     pub end: Option<f64>,
     /// A fan-out's instances, each `(start, end, state)`.
     pub lanes: Vec<(f64, Option<f64>, TaskState)>,
+    /// A revise loop's rounds, in order on the task's own track.
+    pub rounds: Vec<RoundSpan>,
     /// On the chain of dependencies that ends last.
     pub critical: bool,
+}
+
+/// One round of a revise loop, placed like a bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RoundSpan {
+    pub n: u32,
+    pub start: f64,
+    pub end: Option<f64>,
+    pub state: TaskState,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -30,10 +42,22 @@ pub struct Schedule {
     pub span: f64,
 }
 
-/// When a task, or the earliest of its instances, first started.
+/// When a task, or the earliest of its instances or rounds, first started.
 fn first_start(task: &TaskView) -> Option<Timestamp> {
-    task.started_at
-        .or_else(|| task.instances.iter().filter_map(|i| i.started_at).min())
+    task.started_at.or_else(|| {
+        task.instances
+            .iter()
+            .filter_map(|i| i.started_at)
+            .chain(task.rounds.iter().filter_map(|r| r.started_at))
+            .min()
+    })
+}
+
+/// The result a settled task's bar ends on: its own, else its newest round's while its loop runs.
+fn ending(task: &TaskView) -> Option<&crate::session::Outcome> {
+    task.result
+        .as_ref()
+        .or_else(|| task.rounds.last().and_then(|round| round.result.as_ref()))
 }
 
 /// Seconds from `origin` to `at`.
@@ -69,10 +93,9 @@ fn clocked(tasks: &[TaskView]) -> Option<Placement> {
         };
         starts[i] = start;
         ends[i] = Some(match task.state() {
-            TaskState::Settled(_) => task
-                .result
-                .as_ref()
-                .map(|r| r.at.map_or(start + r.secs.max(0.0), |at| since(origin, at))),
+            TaskState::Settled(_) => {
+                ending(task).map(|r| r.at.map_or(start + r.secs.max(0.0), |at| since(origin, at)))
+            }
             _ => None,
         });
     }
@@ -139,6 +162,7 @@ pub fn schedule(tasks: &[TaskView]) -> Schedule {
                 start,
                 end: ends[i].flatten(),
                 lanes,
+                rounds: rounds(task, start, origin),
                 critical: false,
             }
         })
@@ -178,6 +202,34 @@ pub fn schedule(tasks: &[TaskView]) -> Schedule {
     Schedule { bars, span }
 }
 
+/// Each round from its stamps, else after the round before it from its duration.
+fn rounds(task: &TaskView, start: f64, origin: Option<Timestamp>) -> Vec<RoundSpan> {
+    let mut after = start;
+    let mut spans = Vec::new();
+    for round in task
+        .rounds
+        .iter()
+        .filter(|r| r.state() != TaskState::Pending)
+    {
+        let from = match (origin, round.started_at) {
+            (Some(origin), Some(at)) => since(origin, at),
+            _ => after,
+        };
+        let end = round.result.as_ref().map(|r| match (origin, r.at) {
+            (Some(origin), Some(at)) => since(origin, at),
+            _ => from + r.secs.max(0.0),
+        });
+        after = end.unwrap_or(from);
+        spans.push(RoundSpan {
+            n: round.n,
+            start: from,
+            end,
+            state: round.state(),
+        });
+    }
+    spans
+}
+
 /// Places task `i` after its dependencies. `ends[i]` is `Some(end)` once placed, where `end` is
 /// `None` for a task still running or not started.
 fn place(
@@ -202,10 +254,17 @@ fn place(
         .filter_map(|&j| place(j, tasks, index, starts, ends, depth + 1))
         .fold(0.0, f64::max);
     starts[i] = start;
-    let end = match task.state() {
-        TaskState::Settled(_) => {
-            Some(start + task.result.as_ref().map_or(0.0, |r| r.secs.max(0.0)))
-        }
+    let end = match (task.state(), &task.result) {
+        (TaskState::Settled(_), Some(result)) => Some(start + result.secs.max(0.0)),
+        (TaskState::Settled(_), None) => Some(
+            start
+                + task
+                    .rounds
+                    .iter()
+                    .filter_map(|r| r.result.as_ref())
+                    .map(|r| r.secs.max(0.0))
+                    .sum::<f64>(),
+        ),
         _ => None,
     };
     ends[i] = Some(end);
@@ -218,7 +277,12 @@ pub fn concurrency(schedule: &Schedule) -> Vec<(f64, f64, usize)> {
     let span = schedule.span;
     let mut edges: Vec<(f64, i32)> = Vec::new();
     for bar in &schedule.bars {
-        let intervals: Vec<(f64, f64)> = if bar.lanes.is_empty() {
+        let intervals: Vec<(f64, f64)> = if !bar.rounds.is_empty() {
+            bar.rounds
+                .iter()
+                .map(|round| (round.start, round.end.unwrap_or(span)))
+                .collect()
+        } else if bar.lanes.is_empty() {
             vec![(bar.start, bar.end.unwrap_or(span))]
         } else {
             bar.lanes
@@ -480,6 +544,59 @@ mod tests {
             (3.0, Some(7.0)),
             "b is placed after a's recorded duration"
         );
+    }
+
+    const REVISE: &str = include_str!("../fixtures/revise-session.jsonl");
+
+    fn revise(lines: usize) -> Vec<TaskView> {
+        let mut fold = RunFold::default();
+        for line in REVISE.lines().take(lines) {
+            fold.apply_line(line);
+        }
+        fold.tasks
+    }
+
+    #[test]
+    fn a_revise_loop_places_each_round_where_it_ran() {
+        let s = schedule(&revise(usize::MAX));
+        let bar = |name: &str| s.bars.iter().find(|b| b.name == name).unwrap();
+        let (author, review, report) = (bar("author"), bar("review"), bar("report"));
+        assert_eq!(
+            author.rounds.iter().map(|r| r.n).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let ends = |bar: &crate::timeline::Bar| -> Vec<(f64, f64)> {
+            bar.rounds
+                .iter()
+                .map(|r| (r.start, r.end.unwrap()))
+                .collect()
+        };
+        let (a, r) = (ends(author), ends(review));
+        assert_eq!(a[0].0, 0.0);
+        assert!(
+            a[0].1 <= r[0].0 && r[0].1 <= a[1].0 && a[1].1 <= r[1].0,
+            "rounds alternate, author {a:?} review {r:?}"
+        );
+        assert_eq!(
+            review.rounds[0].state,
+            TaskState::Settled(crucible_contract::session::TaskStatus::Fail)
+        );
+        assert!(report.rounds.is_empty());
+        assert!(report.start >= r[1].1);
+
+        let steps = concurrency(&s);
+        assert!(
+            steps.iter().all(|(_, _, n)| *n == 1),
+            "a loop's rounds never overlap: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_loop_between_rounds_ends_its_bar_on_its_newest_round() {
+        let s = schedule(&revise(5));
+        let author = s.bars.iter().find(|b| b.name == "author").unwrap();
+        assert_eq!(author.end, author.rounds[0].end);
+        assert!(author.end.is_some(), "round 1 settled while review runs");
     }
 
     #[test]

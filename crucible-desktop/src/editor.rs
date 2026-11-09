@@ -7,6 +7,43 @@ use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 
+/// The desktop the app runs on, for the commands that differ between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Os {
+    Mac,
+    Linux,
+}
+
+impl Os {
+    pub const HOST: Os = if cfg!(target_os = "macos") {
+        Os::Mac
+    } else {
+        Os::Linux
+    };
+
+    /// The user's shell: `$SHELL`, else the system's default.
+    pub fn login_shell(self) -> String {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|shell| !shell.is_empty())
+            .unwrap_or_else(|| {
+                match self {
+                    Os::Mac => "/bin/zsh",
+                    Os::Linux => "/bin/sh",
+                }
+                .to_string()
+            })
+    }
+
+    /// What hands a link or file to the default app.
+    fn opener(self) -> &'static str {
+        match self {
+            Os::Mac => "open",
+            Os::Linux => "xdg-open",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Editor {
     VsCode,
@@ -42,6 +79,22 @@ impl Editor {
         }
     }
 
+    /// The arguments the command-line tool takes to open `path` at 1-based `line`.
+    fn goto(self, path: &Path, line: usize) -> Vec<String> {
+        let at = format!("{}:{line}", path.display());
+        match self {
+            Editor::VsCode | Editor::Cursor => vec!["--goto".to_string(), format!("{at}:1")],
+            Editor::Zed => vec![at],
+        }
+    }
+
+    fn installed(self) -> bool {
+        match Os::HOST {
+            Os::Mac => bundle(self).is_some(),
+            Os::Linux => cli(self).is_some(),
+        }
+    }
+
     /// A link that opens `path` at 1-based `line`.
     pub fn link(self, path: &Path, line: usize) -> String {
         let encoded = crate::lsp::uri(path);
@@ -63,18 +116,18 @@ impl Editor {
             }
             let terminal = Terminal::ALL
                 .into_iter()
-                .find(|t| t.installed())
+                .find(|t| t.installed(Os::HOST))
                 .ok_or_else(|| {
                     format!(
                         "{named} needs a terminal and none was found. Set an editor command in \
                          Settings, like `{EXAMPLE}`."
                     )
                 })?;
-            return Ok(Err(terminal.command(named)));
+            return Ok(Err(terminal.command(Os::HOST, named)));
         }
         [Editor::Cursor, Editor::Zed, Editor::VsCode]
             .into_iter()
-            .find(|editor| bundle(*editor).is_some())
+            .find(|editor| editor.installed())
             .map(Ok)
             .ok_or_else(|| "No editor found. Pick one in Settings.".to_string())
     }
@@ -88,14 +141,17 @@ pub enum Terminal {
     WezTerm,
     /// macOS's own, always there.
     Apple,
+    /// GNOME's, Fedora's default.
+    Ptyxis,
 }
 
 impl Terminal {
-    pub const ALL: [Terminal; 4] = [
+    pub const ALL: [Terminal; 5] = [
         Terminal::Ghostty,
         Terminal::Kitty,
         Terminal::WezTerm,
         Terminal::Apple,
+        Terminal::Ptyxis,
     ];
 
     fn app(self) -> &'static str {
@@ -104,18 +160,36 @@ impl Terminal {
             Terminal::Kitty => "kitty.app",
             Terminal::WezTerm => "WezTerm.app",
             Terminal::Apple => "Utilities/Terminal.app",
+            Terminal::Ptyxis => "Ptyxis.app",
         }
     }
 
-    fn installed(self) -> bool {
-        self == Terminal::Apple && Path::new("/System/Applications/Utilities/Terminal.app").is_dir()
-            || app_bundle(self.app()).is_some()
+    /// Its program on Linux.
+    fn program(self) -> &'static str {
+        match self {
+            Terminal::Ghostty => "ghostty",
+            Terminal::Kitty => "kitty",
+            Terminal::WezTerm => "wezterm",
+            Terminal::Apple => "Terminal",
+            Terminal::Ptyxis => "ptyxis",
+        }
+    }
+
+    fn installed(self, os: Os) -> bool {
+        match os {
+            Os::Mac => {
+                self == Terminal::Apple
+                    && Path::new("/System/Applications/Utilities/Terminal.app").is_dir()
+                    || app_bundle(self.app()).is_some()
+            }
+            Os::Linux => self != Terminal::Apple && on_path(self.program()).is_some(),
+        }
     }
 
     /// The command that opens `{file}` at `{line}` in `editor`, in a new window of this terminal
     /// in `{dir}`: the terminal opens a script that changes to `{dir}` and runs the editor, which
     /// each of these runs in the user's shell.
-    pub fn command(self, editor: &str) -> String {
+    pub fn command(self, os: Os, editor: &str) -> String {
         let open = if editor
             .split_whitespace()
             .next()
@@ -125,13 +199,18 @@ impl Terminal {
         } else {
             format!("{editor} +{{line}} {{file}}")
         };
-        let app = match self {
-            Terminal::Ghostty => "Ghostty",
-            Terminal::Kitty => "kitty",
-            Terminal::WezTerm => "WezTerm",
-            Terminal::Apple => "Terminal",
+        let opener = match (os, self) {
+            (Os::Mac, Terminal::Ghostty) => "open -na Ghostty {script}",
+            (Os::Mac, Terminal::Kitty) => "open -na kitty {script}",
+            (Os::Mac, Terminal::WezTerm) => "open -na WezTerm {script}",
+            (Os::Mac, Terminal::Apple) => "open -na Terminal {script}",
+            (Os::Mac, Terminal::Ptyxis) => "open -na Ptyxis {script}",
+            (Os::Linux, Terminal::Ghostty) => "ghostty -e {script}",
+            (Os::Linux, Terminal::Kitty) => "kitty {script}",
+            (Os::Linux, Terminal::WezTerm) => "wezterm start -- {script}",
+            (Os::Linux, Terminal::Apple | Terminal::Ptyxis) => "ptyxis --new-window -- {script}",
         };
-        format!("open -na {app} {{script}} {SCRIPT_SPLIT} {open}")
+        format!("{opener} {SCRIPT_SPLIT} {open}")
     }
 }
 
@@ -148,7 +227,7 @@ pub fn login_editor() -> Option<String> {
     if own.is_some() {
         return own;
     }
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let shell = Os::HOST.login_shell();
     let mut child = Command::new(&shell)
         .args([
             "-l",
@@ -194,7 +273,10 @@ fn editor_from_shell(out: &str) -> Option<String> {
 }
 
 /// An editor command a terminal editor fits.
-pub const EXAMPLE: &str = "open -na Ghostty {script} --script-- nvim +{line} {file}";
+pub const EXAMPLE: &str = match Os::HOST {
+    Os::Mac => "open -na Ghostty {script} --script-- nvim +{line} {file}",
+    Os::Linux => "ghostty -e {script} --script-- nvim +{line} {file}",
+};
 
 /// `template` with `{file}`, `{line}` and `{dir}` filled in, the paths quoted for `sh`.
 pub fn command_line(template: &str, path: &Path, line: usize, dir: &Path) -> String {
@@ -318,23 +400,47 @@ fn app_bundle(app: &str) -> Option<PathBuf> {
 
 fn cli(editor: Editor) -> Option<PathBuf> {
     let (name, inside) = editor.cli();
-    std::env::var_os("PATH")
-        .and_then(|paths| {
-            std::env::split_paths(&paths)
-                .chain([
-                    PathBuf::from("/usr/local/bin"),
-                    PathBuf::from("/opt/homebrew/bin"),
-                ])
-                .map(|dir| dir.join(name))
-                .find(|path| path.is_file())
-        })
-        .or_else(|| Some(bundle(editor)?.join(inside)).filter(|path| path.is_file()))
+    on_path(name).or_else(|| Some(bundle(editor)?.join(inside)).filter(|path| path.is_file()))
 }
 
-/// Open `path` at `line` in `editor`.
+/// `name` in a directory of `$PATH`, or where Homebrew and local installs put it.
+fn on_path(name: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain([
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/opt/homebrew/bin"),
+        ])
+        .chain(home.map(|home| home.join(".local/bin")))
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+/// Open `path` at `line` in `editor`: by its deep link on macOS, by its command-line tool on
+/// Linux, where the editors register no link handler.
 pub fn open_file(editor: Editor, path: &Path, line: usize) -> Result<(), String> {
-    Command::new("open")
-        .arg(editor.link(path, line))
+    let mut command = match Os::HOST {
+        Os::Mac => {
+            let mut open = Command::new(Os::Mac.opener());
+            open.arg(editor.link(path, line));
+            open
+        }
+        Os::Linux => {
+            let program = cli(editor).ok_or_else(|| {
+                format!("{}'s command-line tool is not installed", editor.label())
+            })?;
+            let mut run = Command::new(program);
+            run.args(editor.goto(path, line));
+            run
+        }
+    };
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map(drop)
         .map_err(|e| format!("opening {}: {e}", editor.label()))
@@ -342,7 +448,7 @@ pub fn open_file(editor: Editor, path: &Path, line: usize) -> Result<(), String>
 
 /// Open `url` in the default browser.
 pub fn open_url(url: &str) -> Result<(), String> {
-    Command::new("open")
+    Command::new(Os::HOST.opener())
         .arg(url)
         .spawn()
         .map(drop)
@@ -377,7 +483,7 @@ pub fn open_text(editor: Editor, text: &str) -> Result<(), String> {
 mod tests {
     use std::path::Path;
 
-    use crate::editor::{Editor, Terminal, command_line, editor_from_shell, from_command};
+    use crate::editor::{Editor, Os, Terminal, command_line, editor_from_shell, from_command};
 
     #[test]
     fn links_name_the_file_and_line() {
@@ -432,12 +538,42 @@ mod tests {
     #[test]
     fn a_terminal_editor_opens_in_a_new_terminal_window_through_a_script() {
         assert_eq!(
-            Terminal::Ghostty.command("nvim"),
+            Terminal::Ghostty.command(Os::Mac, "nvim"),
             "open -na Ghostty {script} --script-- nvim +{line} {file}"
         );
         assert_eq!(
-            Terminal::Apple.command("hx"),
+            Terminal::Apple.command(Os::Mac, "hx"),
             "open -na Terminal {script} --script-- hx {file}:{line}"
+        );
+        assert_eq!(
+            Terminal::Ghostty.command(Os::Linux, "nvim"),
+            "ghostty -e {script} --script-- nvim +{line} {file}"
+        );
+        assert_eq!(
+            Terminal::WezTerm.command(Os::Linux, "nvim"),
+            "wezterm start -- {script} --script-- nvim +{line} {file}"
+        );
+        assert_eq!(
+            Terminal::Ptyxis.command(Os::Linux, "hx"),
+            "ptyxis --new-window -- {script} --script-- hx {file}:{line}"
+        );
+        assert!(!Terminal::Apple.installed(Os::Linux));
+    }
+
+    #[test]
+    fn on_linux_an_editor_opens_by_its_command_line_tool() {
+        let path = Path::new("/home/me/my packs/workflow.star");
+        assert_eq!(
+            Editor::VsCode.goto(path, 12),
+            ["--goto", "/home/me/my packs/workflow.star:12:1"]
+        );
+        assert_eq!(
+            Editor::Cursor.goto(path, 1),
+            ["--goto", "/home/me/my packs/workflow.star:1:1"]
+        );
+        assert_eq!(
+            Editor::Zed.goto(path, 3),
+            ["/home/me/my packs/workflow.star:3"]
         );
     }
 

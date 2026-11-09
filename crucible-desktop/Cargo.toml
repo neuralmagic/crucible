@@ -33,7 +33,7 @@ async-trait = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["socks"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 rune-mac = { path = "../vendor/rune/crates/rune-mac" }
-zbus = { version = "6", default-features = false, features = ["tokio"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "service"] }
 futures-util = "0.3"
 url = "2"
 toml = "0.8"

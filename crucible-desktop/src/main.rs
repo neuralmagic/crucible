@@ -16,6 +16,8 @@ mod handoff;
 mod history;
 mod httpcache;
 mod inspect;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod instance;
 mod keymap;
 mod link;
 mod live;
@@ -63,6 +65,8 @@ use crate::settings::{LogFont, Settings, Theme};
 use crate::workspace::{Divider, Geometry, PaneDrag, PaneKind, Workspace};
 
 const MAX_TIME: &str = "10m";
+/// The id the desktop matches the window to its `.desktop` entry and icon by.
+const APP_ID: &str = "dev.crucible.playbooks";
 
 static SETTINGS: OnceLock<Settings> = OnceLock::new();
 
@@ -1364,6 +1368,13 @@ fn setup(app: &mut App, waker: Waker) {
     rune::zoom::set(app.settings.zoom);
     app.waker = Some(waker.clone());
     let (clicked, clicks) = std::sync::mpsc::channel();
+    #[cfg(target_os = "linux")]
+    {
+        instance::serve(clicked.clone(), waker.clone());
+        if let Some(link) = instance::launch_link(rune::extra_args()) {
+            let _ = clicked.send(link);
+        }
+    }
     app.notifier = Some(notify::Notifier::start(clicked, waker.clone()));
     app.clicks = Some(clicks);
     let (picked, picks) = std::sync::mpsc::channel();
@@ -1494,6 +1505,13 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some(profile::KEEP_FLAG) {
         std::process::exit(profile::keep());
     }
+    #[cfg(target_os = "linux")]
+    if let Some(link) = instance::launch_link(rune::extra_args())
+        && instance::forward(&link)
+    {
+        return;
+    }
+    rune::set_app_id(APP_ID);
     rune_mac::files::listen();
     let settings = Settings::load();
     let fonts = settings::fonts(&settings);
@@ -1506,9 +1524,11 @@ fn main() {
         on_key: Some(commands::on_key),
         scenes: &[
             // `CRUCIBLE_TAB` shows that pane (tasks, timeline, graph, pack, launch or log).
+            // `CRUCIBLE_PICK` opens that task's card.
             ("local", |app: &mut App| {
                 app.backend = Backend::Local;
                 app.select(Selection::Local("playbook".into()));
+                app.expanded = std::env::var("CRUCIBLE_PICK").ok();
                 scene_tab(app);
             }),
             ("settings", |app: &mut App| {

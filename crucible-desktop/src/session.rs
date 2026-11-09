@@ -28,7 +28,7 @@ pub struct RunFold {
 /// One event from an agent task's attempt, as the session recorded it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentStep {
-    /// The task, or `task[key]` for a fan-out instance.
+    /// The task, `task[key]` for a fan-out instance, or `task[round-N]` for a revise round.
     pub task: String,
     pub attempt: u32,
     pub event: AgentEvent,
@@ -60,7 +60,31 @@ pub struct TaskView {
     pub attempt: Option<Attempt>,
     pub result: Option<Outcome>,
     pub instances: Vec<Instance>,
+    /// The tasks it sends back when it settles failing.
+    pub revise: Vec<String>,
+    /// The most rounds `revise` may run, the first included.
+    pub max_rounds: u32,
+    /// The revise loop it runs in, as the reviser or one of its targets.
+    pub revised: Option<Revised>,
+    pub rounds: Vec<Round>,
     /// When its first attempt started, from logs that record it.
+    pub started_at: Option<jiff::Timestamp>,
+}
+
+/// A revise loop as one of its tasks sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Revised {
+    /// The task whose failing result starts another round.
+    pub by: String,
+    pub max_rounds: u32,
+}
+
+/// One round of a revise loop, `task[round-N]` in the log.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Round {
+    pub n: u32,
+    pub attempt: Option<Attempt>,
+    pub result: Option<Outcome>,
     pub started_at: Option<jiff::Timestamp>,
 }
 
@@ -151,10 +175,19 @@ impl TaskView {
             result: None,
             started_at: None,
             instances: Vec::new(),
+            revise: task.revise,
+            max_rounds: task.max_rounds,
+            revised: None,
+            rounds: Vec::new(),
         }
     }
 
     pub fn state(&self) -> TaskState {
+        if self.result.is_none()
+            && let Some(round) = self.rounds.last()
+        {
+            return round.state();
+        }
         if self.result.is_none() && self.instances.iter().any(|i| i.state().is_running()) {
             let newest = self
                 .instances
@@ -189,37 +222,88 @@ impl TaskView {
         counts
     }
 
-    /// The most attempts any instance, or the task itself, took.
-    pub fn retries(&self) -> u32 {
-        let own = self.result.as_ref().map_or(0, |r| r.attempts);
-        self.instances
+    /// Its own result, then each instance's and each round's.
+    fn results(&self) -> impl Iterator<Item = &Outcome> {
+        self.result
             .iter()
-            .filter_map(|i| i.result.as_ref().map(|r| r.attempts))
-            .chain([own])
+            .chain(self.instances.iter().filter_map(|i| i.result.as_ref()))
+            .chain(self.rounds.iter().filter_map(|r| r.result.as_ref()))
+    }
+
+    /// The most attempts any instance or round, or the task itself, took.
+    pub fn retries(&self) -> u32 {
+        self.results()
+            .map(|r| r.attempts)
             .max()
             .unwrap_or(0)
             .saturating_sub(1)
     }
 
-    /// The agent the task ran on, from its own result or any instance's.
+    /// The agent the task ran on, from its own result or any instance's or round's.
     pub fn agent(&self) -> Option<&TaskAgent> {
-        self.result
-            .as_ref()
-            .and_then(|r| r.agent.as_ref())
-            .or_else(|| {
-                self.instances
-                    .iter()
-                    .find_map(|i| i.result.as_ref().and_then(|r| r.agent.as_ref()))
-            })
+        self.results().find_map(|r| r.agent.as_ref())
     }
 
-    /// Every link the task and its instances reported.
+    /// Every link the task and its instances and rounds reported.
     pub fn links(&self) -> Vec<&LinkView> {
-        self.result
-            .iter()
-            .chain(self.instances.iter().filter_map(|i| i.result.as_ref()))
-            .flat_map(|r| r.links.iter())
-            .collect()
+        self.results().flat_map(|r| r.links.iter()).collect()
+    }
+
+    /// Every repair the task and its instances and rounds made.
+    pub fn repairs(&self) -> Vec<&TaskRepair> {
+        self.results().flat_map(|r| r.repairs.iter()).collect()
+    }
+
+    pub fn round(&self, n: u32) -> Option<&Round> {
+        self.rounds.iter().find(|round| round.n == n)
+    }
+
+    /// Where the instance or round `key` stands.
+    pub fn part_state(&self, key: &str) -> Option<TaskState> {
+        match round_key(key).filter(|_| self.revised.is_some()) {
+            Some(n) => self.round(n).map(Round::state),
+            None => self
+                .instances
+                .iter()
+                .find(|i| i.key == key)
+                .map(Instance::state),
+        }
+    }
+
+    /// The round an event naming only the task belongs to: the one in flight, else the next.
+    /// `None` outside a loop or once the loop settled.
+    fn round_in_flight(&self) -> Option<u32> {
+        if self.revised.is_none() || self.result.is_some() {
+            return None;
+        }
+        Some(match self.rounds.last() {
+            Some(round) if round.result.is_none() => round.n,
+            Some(round) => round.n + 1,
+            None => 1,
+        })
+    }
+}
+
+/// The reviser's failing result that sent `task` into round `n`.
+pub fn sent_back<'a>(tasks: &'a [TaskView], task: &TaskView, n: u32) -> Option<&'a Outcome> {
+    let by = &task.revised.as_ref()?.by;
+    tasks
+        .iter()
+        .find(|t| t.name == *by)?
+        .round(n.checked_sub(1)?)?
+        .result
+        .as_ref()
+        .filter(|result| result.status == TaskStatus::Fail)
+}
+
+impl Round {
+    pub fn state(&self) -> TaskState {
+        TaskState::of(self.attempt.as_ref(), self.result.as_ref())
+    }
+
+    /// `task[round-N]`, as the log names it.
+    pub fn name(&self, task: &str) -> String {
+        format!("{task}[round-{}]", self.n)
     }
 }
 
@@ -250,11 +334,34 @@ impl InstanceCounts {
     }
 }
 
-/// `edit[layernorm]` is instance `layernorm` of `edit`.
-fn split_instance(task: &str) -> (&str, Option<&str>) {
+/// `edit[layernorm]` is instance `layernorm` of `edit`, and `review[round-2]` its second round.
+pub fn split_name(task: &str) -> (&str, Option<&str>) {
     match task.split_once('[') {
         Some((base, rest)) => (base, Some(rest.strip_suffix(']').unwrap_or(rest))),
         None => (task, None),
+    }
+}
+
+/// `round-2` is round 2.
+pub fn round_key(key: &str) -> Option<u32> {
+    key.strip_prefix("round-")?.parse().ok().filter(|n| *n >= 1)
+}
+
+/// Each loop task's reviser and round cap, from the revisers' `revise` lists.
+fn loops(tasks: &mut [TaskView]) {
+    let revisers: Vec<(String, Vec<String>, u32)> = tasks
+        .iter()
+        .filter(|task| !task.revise.is_empty())
+        .map(|task| (task.name.clone(), task.revise.clone(), task.max_rounds))
+        .collect();
+    for task in tasks.iter_mut() {
+        task.revised = revisers
+            .iter()
+            .find(|(by, targets, _)| *by == task.name || targets.contains(&task.name))
+            .map(|(by, _, max_rounds)| Revised {
+                by: by.clone(),
+                max_rounds: *max_rounds,
+            });
     }
 }
 
@@ -286,10 +393,12 @@ impl RunFold {
                             task.attempt = old.attempt;
                             task.result = old.result;
                             task.instances = old.instances;
+                            task.rounds = old.rounds;
                         }
                         task
                     })
                     .collect();
+                loops(&mut self.tasks);
                 self.plan_version = plan_version;
                 self.budget_usd = budget_usd;
                 true
@@ -305,11 +414,13 @@ impl RunFold {
                     estimate_usd,
                 };
                 let at = at.and_then(|at| at.parse().ok());
+                let task = self.placed(task);
                 let (newest, first) = match self.slot(&task) {
                     Some(Slot::Task(task)) => (&mut task.attempt, &mut task.started_at),
                     Some(Slot::Instance(instance)) => {
                         (&mut instance.attempt, &mut instance.started_at)
                     }
+                    Some(Slot::Round(round)) => (&mut round.attempt, &mut round.started_at),
                     None => return false,
                 };
                 *newest = Some(attempt);
@@ -361,6 +472,7 @@ impl RunFold {
                 match self.slot(&task) {
                     Some(Slot::Task(task)) => task.result = Some(outcome),
                     Some(Slot::Instance(instance)) => instance.result = Some(outcome),
+                    Some(Slot::Round(round)) => round.result = Some(outcome),
                     None => return false,
                 }
                 true
@@ -377,6 +489,7 @@ impl RunFold {
                 attempt,
                 event,
             } => {
+                let task = self.placed(task);
                 let line = LogLine::from_agent(&task, &event);
                 let kept = line.is_some();
                 if let Some(line) = line {
@@ -396,11 +509,13 @@ impl RunFold {
                 ..
             } => {
                 let stderr = stream == crucible_contract::event::RawStream::Stderr;
+                let task = self.placed(task);
                 self.transcript
                     .extend(LogLine::from_output(&task, stderr, &lines));
                 true
             }
             SessionEvent::TaskOutputDropped { task, lines, .. } => {
+                let task = self.placed(task);
                 self.transcript.push(LogLine::dropped_output(&task, lines));
                 true
             }
@@ -412,12 +527,44 @@ impl RunFold {
         }
     }
 
+    /// The engine names a loop task's attempts, transcript and output by the task alone and only
+    /// its results by round; rounds run one after another, so each lands in the round in flight.
+    fn placed(&self, name: String) -> String {
+        let round = self
+            .tasks
+            .iter()
+            .find(|task| task.name == name)
+            .and_then(TaskView::round_in_flight);
+        match round {
+            Some(n) => format!("{name}[round-{n}]"),
+            None => name,
+        }
+    }
+
     fn slot(&mut self, name: &str) -> Option<Slot<'_>> {
-        let (base, key) = split_instance(name);
+        let (base, key) = split_name(name);
         let task = self.tasks.iter_mut().find(|task| task.name == base)?;
         let Some(key) = key else {
             return Some(Slot::Task(task));
         };
+        if let Some(n) = round_key(key).filter(|_| task.revised.is_some()) {
+            let at = match task.rounds.binary_search_by_key(&n, |round| round.n) {
+                Ok(at) => at,
+                Err(at) => {
+                    task.rounds.insert(
+                        at,
+                        Round {
+                            n,
+                            attempt: None,
+                            result: None,
+                            started_at: None,
+                        },
+                    );
+                    at
+                }
+            };
+            return task.rounds.get_mut(at).map(Slot::Round);
+        }
         let at = match task.instances.iter().position(|i| i.key == key) {
             Some(at) => at,
             None => {
@@ -485,11 +632,12 @@ impl RunFold {
 enum Slot<'a> {
     Task(&'a mut TaskView),
     Instance(&'a mut Instance),
+    Round(&'a mut Round),
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::session::{RunFold, TaskState};
+    use crate::session::{Revised, RunFold, TaskState, sent_back};
     use crucible_contract::emits::{DeclaredFile, EmitWire};
     use crucible_contract::session::{BlockedReasonKind, TaskStatus};
 
@@ -679,6 +827,163 @@ not json at all
             activity.last.as_deref(),
             Some("result success turns=3 cost=$0.2000")
         );
+    }
+
+    const REVISE: &str = include_str!("../fixtures/revise-session.jsonl");
+
+    /// The first `n` lines of the revise run, as a live follower would have them.
+    fn revise_until(n: usize) -> RunFold {
+        fold(&REVISE.lines().take(n).collect::<Vec<_>>().join("\n"))
+    }
+
+    #[test]
+    fn a_revise_loop_folds_its_rounds_apart_from_fanout_instances() {
+        let fold = fold(REVISE);
+        let [author, review, report] = &fold.tasks[..] else {
+            panic!("three tasks, got {:?}", fold.tasks);
+        };
+        for task in [author, review] {
+            assert!(task.instances.is_empty(), "{} has no instances", task.name);
+            assert!(!task.is_fanout(), "{} is not a fan-out", task.name);
+            assert_eq!(
+                task.revised,
+                Some(Revised {
+                    by: "review".into(),
+                    max_rounds: 3
+                })
+            );
+            assert_eq!(
+                task.rounds.iter().map(|r| r.n).collect::<Vec<_>>(),
+                [1, 2],
+                "{}",
+                task.name
+            );
+            assert!(task.rounds.iter().all(|r| r.started_at.is_some()));
+            assert_eq!(task.state(), TaskState::Settled(TaskStatus::Pass));
+        }
+        assert_eq!(review.revise, ["author"]);
+        assert!(author.revise.is_empty());
+        assert_eq!(report.revised, None);
+        assert!(report.rounds.is_empty());
+
+        let states: Vec<TaskState> = review.rounds.iter().map(|r| r.state()).collect();
+        assert_eq!(
+            states,
+            [
+                TaskState::Settled(TaskStatus::Fail),
+                TaskState::Settled(TaskStatus::Pass)
+            ]
+        );
+        assert_eq!(
+            author
+                .round(2)
+                .and_then(|r| r.result.as_ref()?.output.clone()),
+            Some(serde_json::json!({"draft": 2}))
+        );
+        assert_eq!(
+            author.part_state("round-1"),
+            Some(TaskState::Settled(TaskStatus::Pass))
+        );
+        assert_eq!(author.part_state("round-3"), None);
+        assert!(fold.required_passed());
+    }
+
+    #[test]
+    fn a_round_names_the_reviser_failure_that_sent_it_back() {
+        let fold = fold(REVISE);
+        let (author, review) = (&fold.tasks[0], &fold.tasks[1]);
+        let why = sent_back(&fold.tasks, author, 2).expect("round 2 was sent back");
+        assert_eq!(why.status, TaskStatus::Fail);
+        assert_eq!(why.note, "exit 1: rejected: no verdict in hand");
+        assert_eq!(
+            why.output,
+            Some(serde_json::json!({"accepted": false, "why": "the probe hit an unrelated 400"}))
+        );
+        assert_eq!(sent_back(&fold.tasks, review, 2), Some(why));
+        assert_eq!(
+            sent_back(&fold.tasks, author, 1),
+            None,
+            "the first round is not a revision"
+        );
+        assert_eq!(
+            sent_back(&fold.tasks, author, 3),
+            None,
+            "round 2 passed its review"
+        );
+        assert_eq!(sent_back(&fold.tasks, &fold.tasks[2], 2), None);
+    }
+
+    #[test]
+    fn a_loop_in_flight_places_each_start_in_its_round() {
+        let fold = revise_until(6);
+        let (author, review) = (&fold.tasks[0], &fold.tasks[1]);
+        assert_eq!(author.rounds.len(), 2);
+        assert_eq!(
+            author.round(2).map(|r| r.state()),
+            Some(TaskState::Running(1))
+        );
+        assert_eq!(author.state(), TaskState::Running(1));
+        assert!(author.attempt.is_none(), "the start belongs to the round");
+        assert_eq!(review.rounds.len(), 1);
+        assert_eq!(review.state(), TaskState::Settled(TaskStatus::Fail));
+        assert!(review.result.is_none(), "the loop has not settled");
+
+        let next = revise_until(8);
+        assert_eq!(next.tasks[1].rounds.len(), 2);
+        assert_eq!(next.tasks[1].state(), TaskState::Running(1));
+    }
+
+    #[test]
+    fn a_rounds_transcript_and_output_land_in_that_round() {
+        let mut lines: Vec<&str> = REVISE.lines().collect();
+        let said = r#"{"v":1,"kind":"task_agent","task":"author","attempt":1,"event":{"kind":"text","delta":"Adding the verdict."}}"#;
+        let printed = r#"{"v":1,"kind":"task_output","task":"author","attempt":1,"stream":"stdout","lines":["revising against the review"]}"#;
+        let first = r#"{"v":1,"kind":"task_agent","task":"author","attempt":1,"event":{"kind":"text","delta":"First draft."}}"#;
+        lines.insert(6, printed);
+        lines.insert(6, said);
+        lines.insert(2, first);
+        let fold = fold(&lines.join("\n"));
+        let named: Vec<Option<&str>> = fold.transcript.iter().map(|l| l.task.as_deref()).collect();
+        assert_eq!(
+            named,
+            [
+                Some("author[round-1]"),
+                Some("author[round-2]"),
+                Some("author[round-2]")
+            ]
+        );
+        assert_eq!(
+            fold.agent_events
+                .iter()
+                .map(|e| e.task.as_str())
+                .collect::<Vec<_>>(),
+            ["author[round-1]", "author[round-2]"]
+        );
+        assert!(fold.transcript.iter().all(|l| l.is_for("author")));
+        assert!(fold.transcript[1].is_for("author[round-2]"));
+        assert!(!fold.transcript[0].is_for("author[round-2]"));
+    }
+
+    #[test]
+    fn a_fanout_key_that_reads_like_a_round_stays_an_instance() {
+        let text = format!(
+            "{FANOUT}{}\n",
+            r#"{"v":1,"kind":"task_result","task":"edit[round-1]","status":"pass","attempts":1}"#,
+        );
+        let fold = fold(&text);
+        let edit = &fold.tasks[1];
+        assert!(edit.rounds.is_empty());
+        assert!(edit.instances.iter().any(|i| i.key == "round-1"));
+    }
+
+    #[test]
+    fn a_revised_plan_keeps_the_rounds_its_loop_ran() {
+        let plan = REVISE.lines().next().expect("a plan");
+        let mut fold = revise_until(9);
+        assert!(fold.apply_line(&plan.replace("\"plan_version\":1", "\"plan_version\":2")));
+        assert_eq!(fold.plan_version, 2);
+        assert_eq!(fold.tasks[0].rounds.len(), 2);
+        assert_eq!(fold.tasks[1].rounds.len(), 2);
     }
 
     #[test]
