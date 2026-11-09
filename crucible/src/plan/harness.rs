@@ -220,6 +220,10 @@ fn tree_bytes(dir: &Path) -> u64 {
 }
 
 impl TaskRunner for HarnessRunner {
+    fn prepare(&mut self) {
+        self.args.compile_secret_rules();
+    }
+
     fn run(
         &mut self,
         task: &Task,
@@ -4587,6 +4591,7 @@ workflow(type = "playbook", tasks = [discover, audit])
                 {"result": {"lanes": ["a"]}, "writes": {"RESULT.json": "{\"ok\": true}"}, "sleep_ms": 6000}
             ]}}),
         );
+        crate::testing::secret_rules();
         let started = std::time::Instant::now();
         let out = run_playbook(&dir);
         let plan = &out.results[&"plan".into()];

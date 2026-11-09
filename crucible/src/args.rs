@@ -302,6 +302,15 @@ impl Args {
         }
     }
 
+    /// Compile the secret rules now, outside any turn's deadline.
+    pub(crate) fn compile_secret_rules(&self) {
+        if !self.secret_rules.ready() {
+            tracing::warn!(
+                "the builtin secret rules did not compile; agent output is masked whole"
+            );
+        }
+    }
+
     /// The slice the openshell turn reads.
     pub(crate) fn sandbox_turn(&self) -> SandboxTurn<'_> {
         SandboxTurn {
