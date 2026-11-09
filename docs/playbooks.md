@@ -342,7 +342,6 @@ crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max
 A string parameter that sets `"multiline": True` takes its value in a text area on the control
 plane's launch, schedule and ask forms. The value is still one string.
 
-<<<<<<< HEAD
 A string parameter can take its choices from a task's output instead of a written list:
 
 ```python
@@ -377,7 +376,6 @@ nothing else to run just those tasks and refresh the list:
 crucible plan run --manifest crucible.toml --param choices.refresh=true --max-cost 1 --max-time 10m
 ```
 
-=======
 An optional parameter that sets `"enabled_by": "<bool param>"` is only taken while that boolean
 is true. The forms grey it out until then, and a launch that supplies it with the boolean false is
 refused before anything compiles:
@@ -389,7 +387,6 @@ params = {
 }
 ```
 
->>>>>>> fork/mbonanni/param-enabled-by
 Parameters go into prompts and skill arguments. They do not go into a command line. If you
 put a parameter into `run`, the compiler rejects the pack:
 

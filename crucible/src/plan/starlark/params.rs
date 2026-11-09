@@ -130,7 +130,6 @@ pub struct ParamSpec {
     /// A string a launch form takes in a text area. The bound value is the same string.
     #[serde(default)]
     pub multiline: bool,
-<<<<<<< HEAD
     /// The producer task output whose latest passing value offers this parameter's choices.
     #[serde(default)]
     pub choices_from: Option<ChoicesFrom>,
@@ -141,6 +140,9 @@ pub struct ParamSpec {
     /// a launch form shows greyed out in this parameter's empty input.
     #[serde(default)]
     pub placeholder_from: Option<ChoicesFrom>,
+    /// The boolean parameter that must be true for this one to be supplied.
+    #[serde(default)]
+    pub enabled_by: Option<String>,
 }
 
 /// A task in the same workflow and the field it emits for a parameter's form: a list of strings,
@@ -161,11 +163,6 @@ impl ChoicesFrom {
         }
         out
     }
-=======
-    /// The boolean parameter that must be true for this one to be supplied.
-    #[serde(default)]
-    pub enabled_by: Option<String>,
->>>>>>> fork/mbonanni/param-enabled-by
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
@@ -179,13 +176,10 @@ pub const FIELDS: &[&str] = &[
     "max",
     "choices",
     "multiline",
-<<<<<<< HEAD
     "choices_from",
     "allow_other",
     "placeholder_from",
-=======
     "enabled_by",
->>>>>>> fork/mbonanni/param-enabled-by
 ];
 
 /// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
@@ -237,7 +231,6 @@ impl Params {
             specs.push(spec(&name, &value.node)?);
         }
         for spec in &specs {
-<<<<<<< HEAD
             for from in [&spec.choices_from, &spec.placeholder_from]
                 .into_iter()
                 .flatten()
@@ -253,7 +246,9 @@ impl Params {
                 return Err(CompileError::ParamKeyedByInvalid {
                     param: spec.name.clone(),
                     keyed_by: key.clone(),
-=======
+                    detail,
+                });
+            }
             let Some(gate) = &spec.enabled_by else {
                 continue;
             };
@@ -270,7 +265,6 @@ impl Params {
                 return Err(CompileError::ParamBadEnabledBy {
                     param: spec.name.clone(),
                     gate: gate.clone(),
->>>>>>> fork/mbonanni/param-enabled-by
                     detail,
                 });
             }
@@ -573,11 +567,9 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         max,
         choices,
         multiline,
-<<<<<<< HEAD
         choices_from,
         allow_other,
         placeholder_from,
-=======
         enabled_by: field(
             &declared,
             name,
@@ -585,7 +577,6 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             "a string literal",
             literal_string,
         )?,
->>>>>>> fork/mbonanni/param-enabled-by
     })
 }
 

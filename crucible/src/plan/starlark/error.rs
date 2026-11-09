@@ -205,7 +205,6 @@ pub enum CompileError {
     },
     #[error("parameter {param:?} pattern does not compile: {detail}")]
     ParamBadPattern { param: String, detail: String },
-<<<<<<< HEAD
     #[error("parameter {param:?} declares both choices and choices_from; offer one list")]
     ParamChoicesConflict { param: String },
     #[error("parameter {param:?} sets allow_other without choices or choices_from")]
@@ -233,7 +232,6 @@ pub enum CompileError {
         "a choices refresh needs a parameter that declares choices_from, and this source has none"
     )]
     RefreshWithoutProducers,
-=======
     #[error("parameter {param:?} is enabled_by {gate:?}, which {detail}")]
     ParamBadEnabledBy {
         param: String,
@@ -244,7 +242,6 @@ pub enum CompileError {
         "parameter {name:?} was supplied while {gate:?} is false; set {gate} to true to use it"
     )]
     ParamNotEnabled { name: String, gate: String },
->>>>>>> fork/mbonanni/param-enabled-by
     #[error(
         "no value for required parameter {name:?}{}",
         if doc.is_empty() { String::new() } else { format!(" ({doc})") }
