@@ -1506,9 +1506,11 @@ fn main() {
         on_key: Some(commands::on_key),
         scenes: &[
             // `CRUCIBLE_TAB` shows that pane (tasks, timeline, graph, pack, launch or log).
+            // `CRUCIBLE_PICK` opens that task's card.
             ("local", |app: &mut App| {
                 app.backend = Backend::Local;
                 app.select(Selection::Local("playbook".into()));
+                app.expanded = std::env::var("CRUCIBLE_PICK").ok();
                 scene_tab(app);
             }),
             ("settings", |app: &mut App| {

@@ -131,8 +131,8 @@ Until a pane is moved, resized or closed, each run gets a fitted layout: the gra
 tasks, taller the deeper the graph, beside the log. Once arranged, the layout is saved to the app's
 config and kept across runs; `Reset layout` goes back to the fitted one.
 
-The Timeline draws each task and fan-out instance when it ran, from the `at` stamps on its
-session events, with a strip of how many ran at once and the critical path drawn solid. A log
+The Timeline draws each task and fan-out instance when it ran, and each round of a revise loop
+on its task's own track, from the `at` stamps on its session events, with a strip of how many ran at once and the critical path drawn solid. A log
 from before those stamps is placed from each task's duration, starting when its dependencies
 settle.
 
@@ -246,6 +246,7 @@ Rune renders headlessly, so the layout is inspectable:
 
 ```sh
 cargo run -- --scene local --snap /tmp/playbooks.png --size 1120x720
+CRUCIBLE_PICK=<task> CRUCIBLE_TAB=tasks cargo run -- --scene local --snap /tmp/task.png   # that task's card open
 CRUCIBLE_LIVE_SCENE=<playbook id> cargo run -- --scene live --snap /tmp/live.png --at 200
 CRUCIBLE_LIVE_SCENE=<playbook id> CRUCIBLE_TAB=pack cargo run -- --scene live --snap /tmp/pack.png --at 200
 cargo run -- --scene local --chrome --snap /tmp/chrome.png   # draws the window buttons
