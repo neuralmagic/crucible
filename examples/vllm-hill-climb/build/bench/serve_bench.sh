@@ -1,6 +1,7 @@
 #!/bin/sh
-# Serves /bench/model with dummy weights on one GPU, runs `vllm bench serve` against it, and prints
-# one line: hill-climb-serve {"output_throughput": ..., "median_tpot_ms": ..., ...}
+# Serves /bench/model with dummy weights on one GPU from the built tree, runs the release image's
+# `vllm bench serve` against it, and prints one line:
+# hill-climb-serve {"output_throughput": ..., "median_tpot_ms": ..., ...}
 set -eu
 PROMPTS=${SERVE_PROMPTS:-200}
 CONCURRENCY=${SERVE_CONCURRENCY:-32}
@@ -26,7 +27,8 @@ if [ "$up" != 1 ]; then
     echo 'hill-climb-serve {"ok": false}'
     exit 1
 fi
-python3 -m vllm.entrypoints.cli.main bench serve --backend vllm --model /bench/model \
+cd /tmp
+env -u PYTHONPATH python3 -m vllm.entrypoints.cli.main bench serve --backend vllm --model /bench/model \
     --base-url http://127.0.0.1:8000 --dataset-name random --random-input-len 1024 \
     --random-output-len 256 --num-prompts "$PROMPTS" --max-concurrency "$CONCURRENCY" \
     --seed 20261109 --save-result --result-dir /tmp/serve --result-filename result.json
