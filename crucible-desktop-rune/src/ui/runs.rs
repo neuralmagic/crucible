@@ -6,6 +6,7 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 use crate::live::LivePlaybook;
 use crate::model::Verdict;
 use crate::runs::{DAY, Day, Summary, calendar, date, day_label, lanes};
+use crate::ui::Flight;
 use crate::ui::{
     Paint, SECTION, TITLE, age, meter, mono, pulsing, runs_note, stat, verdict_color, verdict_tone,
 };
@@ -60,7 +61,12 @@ pub(crate) fn runs_page(
                         .h(52.0)
                         .center_y()
                         .window_drag()
-                        .child(text(playbook.to_string()).font(TITLE).color(p.c.text_base))
+                        .child(
+                            text(playbook.to_string())
+                                .font(TITLE)
+                                .color(p.c.text_base)
+                                .matched(crate::ui::title_flight(playbook)),
+                        )
                         .child(el().grow(1.0))
                         .children(launch),
                 )
@@ -179,9 +185,14 @@ fn card(title: &str, body: El, p: &Paint) -> El {
         .child(body)
 }
 
-fn open(launch: &LivePlaybook) -> impl Fn(&mut App) + 'static {
+/// Opens `launch`, its run view flying out of `from`, the matched id of what was clicked.
+fn open(launch: &LivePlaybook, from: Flight) -> impl Fn(&mut App) + 'static {
     let pin = Selection::launch(launch);
-    move |app: &mut App| app.select(pin.clone())
+    let id = from.id(&launch.key);
+    move |app: &mut App| {
+        app.flight = Some(id.clone());
+        app.select(pin.clone())
+    }
 }
 
 fn dot(launch: &LivePlaybook, p: &Paint) -> El {
@@ -207,7 +218,8 @@ fn dot(launch: &LivePlaybook, p: &Paint) -> El {
         .hover(p.c.hover)
         .focusable(true)
         .help(format!("{} \u{b7} {}", launch.landed_at, launch.status))
-        .on_press(open(launch))
+        .matched(Flight::Dot.id(&launch.key))
+        .on_press(open(launch, Flight::Dot))
         .child(mark)
 }
 
@@ -362,7 +374,8 @@ fn cell(d: &Day, busiest: usize, today: i64, launches: &[&LivePlaybook], p: &Pai
             .help(summary)
             .hover(p.c.hover)
             .focusable(true)
-            .on_press(open(launch)),
+            .matched(Flight::Cell.id(&launch.key))
+            .on_press(open(launch, Flight::Cell)),
         None => c,
     }
 }
@@ -418,7 +431,8 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, p: &Paint) -> El {
         .hover(p.c.hover)
         .press(p.c.pressed)
         .focusable(true)
-        .on_press(open(launch))
+        .matched(Flight::Row.id(&launch.key))
+        .on_press(open(launch, Flight::Row))
         .child(row().size(16.0, 16.0).center().child(glyph))
         .child(
             text(launch.landed_at.clone())

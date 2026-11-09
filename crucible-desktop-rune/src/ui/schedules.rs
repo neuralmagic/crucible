@@ -65,6 +65,7 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
             .focusable(true)
             .hover(p.c.hover)
             .help("Open its runs")
+            .matched(crate::ui::title_flight(&schedule.playbook))
             .on_press(move |app: &mut App| app.select(Selection::playbook(&playbook))),
     );
     if schedule.target_kind == "draft_head" {

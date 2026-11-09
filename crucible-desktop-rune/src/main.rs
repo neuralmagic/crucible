@@ -308,6 +308,8 @@ pub struct App {
     /// Effect and layout values tuned live; their defaults unless built with `knobs`.
     pub knobs: rune_knobs::Knobs,
     pub page: Page,
+    /// The matched id of what the shown run was opened from, which its view flies out of.
+    pub flight: Option<String>,
     pub error: Option<String>,
 }
 
@@ -1112,6 +1114,7 @@ fn init() -> App {
         settings,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
+        flight: None,
         error: None,
     }
 }

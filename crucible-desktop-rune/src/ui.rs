@@ -200,6 +200,30 @@ fn rule(key: &str, vertical: bool, p: &Paint) -> El {
     }
 }
 
+/// What a run view flies out of on the runs page: the matched id each one carries.
+#[derive(Clone, Copy)]
+pub(crate) enum Flight {
+    Row,
+    Dot,
+    Cell,
+}
+
+impl Flight {
+    pub(crate) fn id(self, key: &str) -> String {
+        let from = match self {
+            Flight::Row => "row",
+            Flight::Dot => "dot",
+            Flight::Cell => "cell",
+        };
+        format!("run-{key}-{from}")
+    }
+}
+
+/// The matched id a playbook's name carries wherever it is a heading or a way back to it.
+pub(crate) fn title_flight(playbook: &str) -> String {
+    format!("playbook-{playbook}")
+}
+
 /// A neutral tag: a task's kind, a pane's source.
 fn tag(label: &str, p: &Paint) -> El {
     Badge::new(label).build(p.k)
@@ -1091,8 +1115,18 @@ fn detail(app: &App, p: &Paint) -> El {
         );
     }
 
-    body.child(stats(&pane, p))
-        .child(dock::workspace(&pane, app, p))
+    let stats = match app.selected_live() {
+        Some(launch) => {
+            let landing = app
+                .flight
+                .clone()
+                .filter(|id| id.starts_with(&format!("run-{}-", launch.key)))
+                .unwrap_or_else(|| Flight::Row.id(&launch.key));
+            stats(&pane, p).matched(landing)
+        }
+        None => stats(&pane, p),
+    };
+    body.child(stats).child(dock::workspace(&pane, app, p))
 }
 
 /// Copies the `crucible-playbooks://` link to the run on screen.
@@ -1194,7 +1228,8 @@ fn breadcrumb(app: &App, p: &Paint) -> Option<El> {
                     .variant(ButtonVariant::GhostMuted)
                     .on_press(move |app: &mut App| app.select(back.clone()))
                     .build(p.k)
-                    .key("back-to-runs"),
+                    .key("back-to-runs")
+                    .matched(title_flight(playbook)),
             )
             .child(icon(&oc::CHEVRON_RIGHT, 14.0).color(p.c.icon_faint)),
     )
