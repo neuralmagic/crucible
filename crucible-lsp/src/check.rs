@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 use std::ops::Range as Bytes;
 use std::path::{Path, PathBuf};
 
-use crucible::plan::starlark::error::{CompileError, SourceAnchor};
+use crucible::plan::starlark::error::{CompileError, SourceAnchor, Warning, WarningKind};
 use crucible::plan::starlark::placeholder::placeholder;
-use crucible::plan::starlark::{compile_source_with, dialect, read_params, reject_deep_nesting};
+use crucible::plan::starlark::{check_source_with, dialect, read_params, reject_deep_nesting};
 use starlark_syntax::syntax::AstModule;
 use tower_lsp_server::ls_types::{
     Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString, Position, Range,
@@ -104,12 +104,50 @@ pub fn parse(source: &str, path: &Path) -> Result<AstModule, Finding> {
     })
 }
 
-/// Compile `entry`, with placeholders for required parameters, and file the errors by path.
+/// Compile `entry`, with placeholders for required parameters, and file the errors and
+/// warnings by path.
 pub fn compile(entry: &Path, source: &str) -> BTreeMap<PathBuf, Vec<Finding>> {
     let pack_dir = entry.parent().unwrap_or(Path::new("."));
-    match compile_source_with(source, entry, pack_dir, &placeholders(source, entry)) {
+    let checked = check_source_with(source, entry, pack_dir, &placeholders(source, entry));
+    let mut out = match &checked.outcome {
         Ok(_) => BTreeMap::new(),
-        Err(error) => findings(&error, entry),
+        Err(error) => findings(error, entry),
+    };
+    for warning in &checked.warnings {
+        out.entry(PathBuf::from(&warning.at.file))
+            .or_default()
+            .push(warning_finding(warning));
+    }
+    out
+}
+
+fn warning_finding(warning: &Warning) -> Finding {
+    let deprecated = matches!(warning.kind, WarningKind::DeprecatedArgument { .. });
+    Finding {
+        at: chars(&warning.at),
+        severity: if deprecated {
+            DiagnosticSeverity::WARNING
+        } else {
+            DiagnosticSeverity::HINT
+        },
+        code: warning.kind.code().to_owned(),
+        origin: Origin::Compiler,
+        message: warning.kind.to_string(),
+        unnecessary: !deprecated,
+        deprecated,
+    }
+}
+
+fn chars(anchor: &SourceAnchor) -> At {
+    At::Chars {
+        begin: (
+            anchor.span.begin_line.saturating_sub(1) as usize,
+            anchor.span.begin_column.saturating_sub(1) as usize,
+        ),
+        end: (
+            anchor.span.end_line.saturating_sub(1) as usize,
+            anchor.span.end_column.saturating_sub(1) as usize,
+        ),
     }
 }
 
@@ -151,16 +189,7 @@ pub fn findings(error: &CompileError, entry: &Path) -> BTreeMap<PathBuf, Vec<Fin
 
 fn compile_finding(error: &CompileError, anchor: Option<&SourceAnchor>) -> Finding {
     let at = match (anchor, error) {
-        (Some(anchor), _) => At::Chars {
-            begin: (
-                anchor.span.begin_line.saturating_sub(1) as usize,
-                anchor.span.begin_column.saturating_sub(1) as usize,
-            ),
-            end: (
-                anchor.span.end_line.saturating_sub(1) as usize,
-                anchor.span.end_column.saturating_sub(1) as usize,
-            ),
-        },
+        (Some(anchor), _) => chars(anchor),
         (None, CompileError::SourceTooDeep { line, .. }) => At::Chars {
             begin: (line.saturating_sub(1), 0),
             end: (*line, 0),

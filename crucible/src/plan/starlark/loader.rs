@@ -168,7 +168,7 @@ impl Resolver<'_, '_> {
                 eval.extra = Some(state);
                 eval.set_loader(&loader);
                 dsl::budgets(&mut eval)?;
-                let recorded = state.error_count();
+                let recorded = state.recorded();
                 let value = eval.eval_module(ast, globals);
                 state.narrow_from(recorded, &idents);
                 value.map_err(|error| {

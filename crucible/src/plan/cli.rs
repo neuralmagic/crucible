@@ -49,6 +49,9 @@ pub fn compile_workflow(
             params,
         )?,
     };
+    for warning in &compiled.warnings {
+        eprintln!("warning: {warning}");
+    }
     for prompt_file in &compiled.prompt_files {
         eprintln!("embedded prompt: {}", prompt_file.display());
     }

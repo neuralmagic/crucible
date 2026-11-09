@@ -420,6 +420,78 @@ fn deprecated_and_implied_arguments_are_flagged_and_their_quick_fixes_rewrite_th
 }
 
 #[test]
+fn the_compiler_warns_where_no_lint_can_see() {
+    const DYNAMIC: &str = "scan = command(name = \"scan\", run = \"true\", emits = [\"items\"])\n\
+         deps = [scan]\n\
+         width = {\"max_fanout\": 4}\n\
+         fan = command(name = \"fan\", run = \"true\", depends_on = deps, over = scan.items, **width)\n\
+         workflow(type = \"playbook\", tasks = [scan, fan])\n";
+    let (_root, dir) = pack();
+    let entry = dir.join("workflow.star");
+    std::fs::write(&entry, DYNAMIC).expect("entry");
+    let entry_uri = uri(&entry);
+    let mut client = Client::spawn();
+    initialize(&mut client, &dir);
+    client.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": entry_uri, "languageId": "starlark", "version": 1, "text": DYNAMIC}}),
+    );
+
+    let found = client.diagnostics(&entry_uri, |d| d.len() == 2);
+    let said: Vec<(u64, u64, &str, &str)> = found
+        .iter()
+        .map(|d| {
+            (
+                d["range"]["start"]["line"].as_u64().expect("line"),
+                d["severity"].as_u64().expect("severity"),
+                d["code"].as_str().expect("code"),
+                d["message"].as_str().expect("message"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        said,
+        [
+            (
+                3,
+                2,
+                "deprecated-argument",
+                "`max_fanout` is deprecated; write `over = each(producer.field, max = N)`"
+            ),
+            (
+                3,
+                4,
+                "implied-dependency",
+                "`over` already makes `scan` a dependency"
+            ),
+        ],
+        "{found:#?}"
+    );
+    let column = DYNAMIC
+        .lines()
+        .nth(3)
+        .expect("line")
+        .find("depends_on")
+        .expect("argument");
+    assert_eq!(
+        found[1]["range"]["start"]["character"], column,
+        "at the argument, since the list is built elsewhere"
+    );
+
+    let none = client.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": entry_uri},
+            "range": found[1]["range"],
+            "context": {"diagnostics": [found[1]]},
+        }),
+    );
+    assert_eq!(none, json!([]), "nothing here can be rewritten in place");
+
+    client.shutdown();
+}
+
+#[test]
 fn an_error_in_a_loaded_module_is_published_against_that_module() {
     let (_root, dir) = pack();
     let entry = "load(\"lib.star\", \"make\")\nworkflow(type = \"playbook\", tasks = [make()])\n";

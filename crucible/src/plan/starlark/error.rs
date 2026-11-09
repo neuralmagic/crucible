@@ -71,6 +71,55 @@ impl From<&FileSpan> for SourceAnchor {
     }
 }
 
+/// Something a compile noticed that does not stop the pack from compiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Warning {
+    pub at: SourceAnchor,
+    pub kind: WarningKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WarningKind {
+    #[error("`{argument}` is deprecated; write `{replacement}`")]
+    DeprecatedArgument {
+        argument: &'static str,
+        replacement: &'static str,
+    },
+    #[error("`{by}` already makes `{dependency}` a dependency")]
+    ImpliedDependency {
+        dependency: String,
+        by: &'static str,
+    },
+}
+
+impl WarningKind {
+    /// The stable name tooling files the warning under.
+    pub fn code(&self) -> &'static str {
+        match self {
+            WarningKind::DeprecatedArgument { .. } => "deprecated-argument",
+            WarningKind::ImpliedDependency { .. } => "implied-dependency",
+        }
+    }
+
+    /// The argument the warning is about.
+    pub(crate) fn argument(&self) -> &'static str {
+        match self {
+            WarningKind::DeprecatedArgument { argument, .. } => argument,
+            WarningKind::ImpliedDependency { .. } => "depends_on",
+        }
+    }
+}
+
+impl std::fmt::Display for Warning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}:{}:{}: {}",
+            self.at.file, self.at.span.begin_line, self.at.span.begin_column, self.kind
+        )
+    }
+}
+
 fn listed(errors: &[CompileError]) -> String {
     errors
         .iter()

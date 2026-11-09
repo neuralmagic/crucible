@@ -175,6 +175,11 @@ pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
 }
 
 impl Idents {
+    /// Where `argument` was written in the call at `call`, or the call itself.
+    pub(crate) fn argument_or_call(&self, call: FileSpan, argument: &str) -> FileSpan {
+        self.argument_span(&call, None, argument).unwrap_or(call)
+    }
+
     /// The span of `argument` in the call the evaluator reported. Several calls to one
     /// constructor can carry the same argument name, so the call site picks between them; a
     /// call that cannot be identified falls back to the only unambiguous candidate, and to
