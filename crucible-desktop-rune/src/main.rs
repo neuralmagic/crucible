@@ -309,6 +309,8 @@ pub struct App {
     pub settings: Settings,
     /// The Pack tab shows a Markdown file's source rather than its rendering.
     pub pack_md_source: bool,
+    /// `$VISUAL` or `$EDITOR` as the user's shell sets them, read once when first needed.
+    login_editor: std::cell::OnceCell<Option<String>>,
     /// The editor command field in Settings.
     pub editor_command: TextEdit,
     /// Effect and layout values tuned live; their defaults unless built with `knobs`.
@@ -513,7 +515,14 @@ impl App {
                 editor::EXAMPLE
             ));
         }
-        self.settings.editor.map_or_else(Editor::detect, Ok).map(Ok)
+        match self.settings.editor {
+            Some(app) => Ok(Ok(app)),
+            None => Editor::detect(
+                self.login_editor
+                    .get_or_init(editor::login_editor)
+                    .as_deref(),
+            ),
+        }
     }
 
     /// Open line `line` (1-based) of the file at `path` in the user's editor.
@@ -1223,6 +1232,7 @@ fn init() -> App {
         scratch: TextEdit::new(""),
         settings,
         editor_command,
+        login_editor: std::cell::OnceCell::new(),
         pack_md_source: false,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,

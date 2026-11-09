@@ -53,32 +53,148 @@ impl Editor {
         }
     }
 
-    /// The editor `$VISUAL` or `$EDITOR` names, else the first one installed. One they name that
-    /// is not an app this knows, a terminal editor such as `nvim`, is refused rather than passed
-    /// over for an app the user did not pick.
-    pub fn detect() -> Result<Editor, String> {
-        let named = ["VISUAL", "EDITOR"]
-            .into_iter()
-            .find_map(|var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()));
-        if let Some(named) = named {
-            return from_command(&named).ok_or_else(|| {
-                format!(
-                    "$EDITOR is {}, which needs a terminal. Set an editor command in Settings, \
-                     like `{EXAMPLE}`.",
-                    named.trim()
-                )
-            });
+    /// What opens files when Settings leaves it to the app: the editor `named` (the user's
+    /// `$VISUAL` or `$EDITOR`), in the first terminal installed when it is a terminal editor,
+    /// else the first editor app installed. `Err` inside `Ok` is a shell command to run.
+    pub fn detect(named: Option<&str>) -> Result<Result<Editor, String>, String> {
+        if let Some(named) = named.map(str::trim).filter(|n| !n.is_empty()) {
+            if let Some(app) = from_command(named) {
+                return Ok(Ok(app));
+            }
+            let terminal = Terminal::ALL
+                .into_iter()
+                .find(|t| t.installed())
+                .ok_or_else(|| {
+                    format!(
+                        "{named} needs a terminal and none was found. Set an editor command in \
+                         Settings, like `{EXAMPLE}`."
+                    )
+                })?;
+            return Ok(Err(terminal.command(named)));
         }
         [Editor::Cursor, Editor::Zed, Editor::VsCode]
             .into_iter()
             .find(|editor| bundle(*editor).is_some())
+            .map(Ok)
             .ok_or_else(|| "No editor found. Pick one in Settings.".to_string())
     }
 }
 
+/// A terminal app a terminal editor can be opened in, in the order they are tried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Terminal {
+    Ghostty,
+    Kitty,
+    WezTerm,
+    /// macOS's own, always there.
+    Apple,
+}
+
+impl Terminal {
+    pub const ALL: [Terminal; 4] = [
+        Terminal::Ghostty,
+        Terminal::Kitty,
+        Terminal::WezTerm,
+        Terminal::Apple,
+    ];
+
+    fn app(self) -> &'static str {
+        match self {
+            Terminal::Ghostty => "Ghostty.app",
+            Terminal::Kitty => "kitty.app",
+            Terminal::WezTerm => "WezTerm.app",
+            Terminal::Apple => "Utilities/Terminal.app",
+        }
+    }
+
+    fn installed(self) -> bool {
+        self == Terminal::Apple && Path::new("/System/Applications/Utilities/Terminal.app").is_dir()
+            || app_bundle(self.app()).is_some()
+    }
+
+    /// The command that opens `{file}` at `{line}` in `editor`, in a new window of this terminal
+    /// in `{dir}`: the terminal opens a script that changes to `{dir}` and runs the editor, which
+    /// each of these runs in the user's shell.
+    pub fn command(self, editor: &str) -> String {
+        let open = if editor
+            .split_whitespace()
+            .next()
+            .is_some_and(|program| program.ends_with("hx") || program.ends_with("helix"))
+        {
+            format!("{editor} {{file}}:{{line}}")
+        } else {
+            format!("{editor} +{{line}} {{file}}")
+        };
+        let app = match self {
+            Terminal::Ghostty => "Ghostty",
+            Terminal::Kitty => "kitty",
+            Terminal::WezTerm => "WezTerm",
+            Terminal::Apple => "Terminal",
+        };
+        format!("open -na {app} {{script}} {SCRIPT_SPLIT} {open}")
+    }
+}
+
+/// Splits a command that runs through a script: what opens `{script}` before it, what the
+/// script runs after it.
+const SCRIPT_SPLIT: &str = "--script--";
+
+/// `$VISUAL`, else `$EDITOR`: from this process, or, for an app opened from Finder that never
+/// saw the user's shell setup, from an interactive login shell, which is where shells set them.
+pub fn login_editor() -> Option<String> {
+    let own = ["VISUAL", "EDITOR"]
+        .into_iter()
+        .find_map(|var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()));
+    if own.is_some() {
+        return own;
+    }
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+    let mut child = Command::new(&shell)
+        .args([
+            "-l",
+            "-i",
+            "-c",
+            "printf '\\n@@VISUAL=%s\\n@@EDITOR=%s\\n' \"$VISUAL\" \"$EDITOR\"",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take()?, &mut out).ok()?;
+    editor_from_shell(&out)
+}
+
+/// The editor a login shell's marked output names, `$VISUAL` first.
+fn editor_from_shell(out: &str) -> Option<String> {
+    let value = |name: &str| {
+        out.lines()
+            .rev()
+            .find_map(|line| line.strip_prefix(&format!("@@{name}=")))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    value("VISUAL").or_else(|| value("EDITOR"))
+}
+
 /// An editor command a terminal editor fits.
-pub const EXAMPLE: &str =
-    "open -na Ghostty.app --args --working-directory={dir} -e nvim +{line} {file}";
+pub const EXAMPLE: &str = "open -na Ghostty {script} --script-- nvim +{line} {file}";
 
 /// `template` with `{file}`, `{line}` and `{dir}` filled in, the paths quoted for `sh`.
 pub fn command_line(template: &str, path: &Path, line: usize, dir: &Path) -> String {
@@ -99,6 +215,13 @@ pub fn run_command(template: &str, path: &Path, line: usize, dir: &Path) -> Resu
     if !template.contains("{file}") {
         return Err("The editor command needs {file} where the path goes".to_string());
     }
+    let command = match template.split_once(SCRIPT_SPLIT) {
+        Some((opener, inside)) => {
+            let script = launch_script(&command_line(inside.trim(), path, line, dir), dir)?;
+            opener.replace("{script}", &shell_quote(&script.to_string_lossy()))
+        }
+        None => command_line(template, path, line, dir),
+    };
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut dirs: Vec<PathBuf> = [
         "/opt/homebrew/bin",
@@ -120,7 +243,7 @@ pub fn run_command(template: &str, path: &Path, line: usize, dir: &Path) -> Resu
     let search = std::env::join_paths(dirs).map_err(|e| format!("building PATH: {e}"))?;
     Command::new("/bin/sh")
         .arg("-c")
-        .arg(command_line(template, path, line, dir))
+        .arg(command)
         .current_dir(dir)
         .env("PATH", search)
         .stdin(Stdio::null())
@@ -129,6 +252,25 @@ pub fn run_command(template: &str, path: &Path, line: usize, dir: &Path) -> Resu
         .spawn()
         .map(drop)
         .map_err(|e| format!("running the editor command: {e}"))
+}
+
+/// An executable script that changes to `dir` and runs `command`, for a terminal to open.
+fn launch_script(command: &str, dir: &Path) -> Result<PathBuf, String> {
+    let scripts = crate::httpcache::cache_root()
+        .ok_or("no cache directory for the editor script")?
+        .join("open");
+    std::fs::create_dir_all(&scripts)
+        .map_err(|e| format!("creating {}: {e}", scripts.display()))?;
+    let path = scripts.join("editor.command");
+    let body = format!(
+        "#!/bin/sh\ncd {} && exec {command}\n",
+        shell_quote(&dir.to_string_lossy())
+    );
+    std::fs::write(&path, body).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .map_err(|e| format!("making {} executable: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// Write `text` to a scratch file named `name`, for an editor that opens files only.
@@ -158,6 +300,11 @@ fn from_command(command: &str) -> Option<Editor> {
 }
 
 fn bundle(editor: Editor) -> Option<PathBuf> {
+    app_bundle(editor.app())
+}
+
+/// `app` in /Applications or ~/Applications.
+fn app_bundle(app: &str) -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     [
         Some(PathBuf::from("/Applications")),
@@ -165,7 +312,7 @@ fn bundle(editor: Editor) -> Option<PathBuf> {
     ]
     .into_iter()
     .flatten()
-    .map(|dir| dir.join(editor.app()))
+    .map(|dir| dir.join(app))
     .find(|app| app.is_dir())
 }
 
@@ -230,7 +377,7 @@ pub fn open_text(editor: Editor, text: &str) -> Result<(), String> {
 mod tests {
     use std::path::Path;
 
-    use crate::editor::{Editor, command_line, from_command};
+    use crate::editor::{Editor, Terminal, command_line, editor_from_shell, from_command};
 
     #[test]
     fn links_name_the_file_and_line() {
@@ -280,6 +427,57 @@ mod tests {
             "nvim --remote '/a/$(rm -rf ~)'",
             "nothing in the path reaches the shell unquoted"
         );
+    }
+
+    #[test]
+    fn a_terminal_editor_opens_in_a_new_terminal_window_through_a_script() {
+        assert_eq!(
+            Terminal::Ghostty.command("nvim"),
+            "open -na Ghostty {script} --script-- nvim +{line} {file}"
+        );
+        assert_eq!(
+            Terminal::Apple.command("hx"),
+            "open -na Terminal {script} --script-- hx {file}:{line}"
+        );
+    }
+
+    #[test]
+    fn the_launch_script_changes_to_the_pack_and_runs_the_editor() {
+        let dir = Path::new("/Users/me/my packs/demo");
+        let script = crate::editor::launch_script(
+            &command_line("nvim +{line} {file}", &dir.join("workflow.star"), 7, dir),
+            dir,
+        )
+        .expect("script");
+        let body = std::fs::read_to_string(&script).expect("read");
+        assert_eq!(
+            body,
+            "#!/bin/sh\ncd '/Users/me/my packs/demo' && exec nvim +7 \
+             '/Users/me/my packs/demo/workflow.star'\n"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&script)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o111, 0o111, "executable");
+    }
+
+    #[test]
+    fn a_named_app_editor_is_used_as_an_app() {
+        assert_eq!(Editor::detect(Some("code --wait")), Ok(Ok(Editor::VsCode)));
+    }
+
+    #[test]
+    fn the_login_shell_editor_is_read_past_whatever_the_shell_prints() {
+        let noisy = "Welcome to fish\n@@VISUAL=\n@@EDITOR=nvim\n";
+        assert_eq!(editor_from_shell(noisy), Some("nvim".to_string()));
+        assert_eq!(
+            editor_from_shell("@@VISUAL=code -w\n@@EDITOR=nvim\n"),
+            Some("code -w".to_string())
+        );
+        assert_eq!(editor_from_shell("@@VISUAL=\n@@EDITOR=\n"), None);
+        assert_eq!(editor_from_shell("nothing marked"), None);
     }
 
     #[test]
