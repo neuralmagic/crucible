@@ -431,12 +431,58 @@ pub struct KeptPr {
     pub pr_url: String,
 }
 
+/// A pack import waiting for an operator to register or discard it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PendingImport {
+    pub id: String,
+    pub repo: String,
+    #[serde(default)]
+    pub path: String,
+    pub rev: String,
+    #[serde(default)]
+    pub proposed_by: Option<String>,
+    pub created_at: String,
+    /// The pinned engine extracted a form, so the import can be registered.
+    #[serde(default)]
+    pub compiles: bool,
+    #[serde(default)]
+    pub diagnostics: i64,
+    /// The draft seeded from this import, once one was.
+    #[serde(default)]
+    pub draft_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Approvals {
     #[serde(default)]
     pub awaiting_approval: Vec<AwaitingApproval>,
     #[serde(default)]
+    pub pending_imports: Vec<PendingImport>,
+    #[serde(default)]
     pub kept_prs: Vec<KeptPr>,
+}
+
+impl Approvals {
+    /// What waits on a person: scope packs to approve and imports to settle.
+    pub fn waiting(&self) -> usize {
+        self.awaiting_approval.len() + self.pending_imports.len()
+    }
+}
+
+/// `POST /api/playbooks/imports/{id}/register`: the registry id and description to register as.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisterImport<'a> {
+    pub id: &'a str,
+    pub description: &'a str,
+}
+
+/// What a registration pinned.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Registered {
+    pub id: String,
+    pub rev: String,
+    #[serde(default)]
+    pub schema_changed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

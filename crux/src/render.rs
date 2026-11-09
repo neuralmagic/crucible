@@ -705,6 +705,30 @@ pub fn approvals(d: &dto::Approvals) -> String {
             table(&["KEY", "SCOPE", "STALE", "APPROVAL PR"], &rows)
         ));
     }
+    if !d.pending_imports.is_empty() {
+        let rows: Vec<Vec<String>> = d
+            .pending_imports
+            .iter()
+            .map(|i| {
+                vec![
+                    i.id.clone(),
+                    format!("{}/{}", i.repo, i.path),
+                    i.rev.chars().take(12).collect(),
+                    i.proposed_by.clone().unwrap_or_else(|| "-".into()),
+                    if i.compiles {
+                        "yes".into()
+                    } else {
+                        "no".into()
+                    },
+                ]
+            })
+            .collect();
+        out.push_str(&format!(
+            "\n{} pending imports\n{}",
+            d.pending_imports.len(),
+            table(&["ID", "PACK", "REV", "BY", "COMPILES"], &rows)
+        ));
+    }
     if !d.kept_prs.is_empty() {
         out.push_str(&format!("\n{} kept PRs\n", d.kept_prs.len()));
         for p in &d.kept_prs {
@@ -2549,11 +2573,20 @@ mod tests {
         let d: dto::Approvals = serde_json::from_str(
             r#"{"awaiting_approval":[{"key":"owner/repo#12","repo":"owner/repo","scope_id":7,
                  "approval_pr":"https://github.com/owner/repo/pull/9","stale":true}],
+                "pending_imports":[{"id":"01a1a85b","repo":"o/domains","path":"domains/backport",
+                 "rev":"9866066da67cc9c461eeeadaa7122b91de06bf03","proposed_by":"weaton",
+                 "created_at":"2026-11-04T20:58:28Z","compiles":true,"diagnostics":1,"draft_id":null}],
                 "kept_prs":[{"issue":"owner/repo#3","pr_url":"https://github.com/owner/repo/pull/4"}]}"#,
         )
         .expect("parse");
+        assert_eq!(d.waiting(), 2, "a scope to approve and an import to settle");
         let out = approvals(&d);
         assert!(out.starts_with("1 awaiting approval\n"), "{out}");
+        assert!(out.contains("1 pending imports\n"), "{out}");
+        assert!(
+            out.contains("01a1a85b") && out.contains("o/domains/domains/backport  9866066da67c"),
+            "{out}"
+        );
         assert!(
             out.contains("STALE"),
             "a stale pack must not look approvable: {out}"

@@ -75,6 +75,15 @@ pub enum Action {
         id: Option<String>,
         body: serde_json::Value,
     },
+    /// Register pending import `import` as registry id `id`.
+    RegisterImport {
+        import: String,
+        id: String,
+        description: String,
+    },
+    DiscardImport {
+        import: String,
+    },
 }
 
 /// Which kind of action an outcome answers.
@@ -89,6 +98,8 @@ pub enum Did {
     CreateSecret,
     MoveSecret,
     SaveSchedule,
+    RegisterImport,
+    DiscardImport,
 }
 
 impl Action {
@@ -103,6 +114,8 @@ impl Action {
             Action::CreateSecret { .. } => Did::CreateSecret,
             Action::MoveSecret { .. } => Did::MoveSecret,
             Action::SaveSchedule { .. } => Did::SaveSchedule,
+            Action::RegisterImport { .. } => Did::RegisterImport,
+            Action::DiscardImport { .. } => Did::DiscardImport,
         }
     }
 
@@ -124,6 +137,8 @@ impl Action {
             Action::MoveSecret { owner, .. } => format!("Moved to {owner}"),
             Action::SaveSchedule { id: None, .. } => "Scheduled".to_string(),
             Action::SaveSchedule { id: Some(_), .. } => "Saved the schedule".to_string(),
+            Action::RegisterImport { id, .. } => format!("Registered {id}"),
+            Action::DiscardImport { .. } => "Discarded the import".to_string(),
         }
     }
 }
@@ -152,6 +167,8 @@ pub struct AdminView {
     pub shares: Option<(Shared, Loaded<Vec<dto::Share>>)>,
     pub decisions: Loaded<Vec<dto::DecisionSummary>>,
     pub decision: Option<(String, Loaded<dto::Decision>)>,
+    /// Scope packs to approve, imports to settle and kept PRs to review.
+    pub approvals: Loaded<dto::Approvals>,
     pub acted: Option<Acted>,
 }
 
@@ -254,6 +271,7 @@ impl Worker {
             Err(why) => Read::failed(&why, watch),
         };
         self.view.decisions = Some(read.decisions);
+        self.view.approvals = Some(read.approvals);
         if let Some(schedules) = read.schedules {
             self.view.schedules = Some(schedules);
         }
@@ -280,6 +298,7 @@ impl Worker {
 /// One pass over what `Watch` asks for.
 struct Read {
     decisions: Result<Vec<dto::DecisionSummary>, String>,
+    approvals: Result<dto::Approvals, String>,
     schedules: Option<Result<Vec<dto::Schedule>, String>>,
     secrets: Option<Result<Vec<dto::Secret>, String>>,
     secret: Option<(String, Result<SecretView, String>)>,
@@ -292,6 +311,7 @@ impl Read {
         let why = why.to_string();
         Read {
             decisions: Err(why.clone()),
+            approvals: Err(why.clone()),
             schedules: watch.schedules.then(|| Err(why.clone())),
             secrets: watch.secrets.then(|| Err(why.clone())),
             secret: watch.secret.clone().map(|id| (id, Err(why.clone()))),
@@ -307,6 +327,7 @@ fn read(c: &Connection, watch: &Watch) -> Read {
         decisions: c
             .call("the decision queue", client.decisions())
             .map(|queue| queue.open),
+        approvals: c.call("the approval queue", client.approvals()),
         schedules: watch
             .schedules
             .then(|| c.call("the schedules", client.schedules())),
@@ -389,6 +410,19 @@ fn act(c: &Connection, action: &Action) -> Result<(), String> {
                 "the schedule",
                 client.update_schedule::<serde_json::Value>(id, body),
             )
+            .map(drop),
+        Action::RegisterImport {
+            import,
+            id,
+            description,
+        } => c
+            .call(
+                "the registration",
+                client.register_import(import, &dto::RegisterImport { id, description }),
+            )
+            .map(drop),
+        Action::DiscardImport { import } => c
+            .call("the discard", client.discard_import(import))
             .map(drop),
     }
 }
@@ -475,6 +509,8 @@ pub struct Desk {
     pub new_secret: Option<SecretForm>,
     /// The owner picked to move the shown secret to.
     pub move_to: Option<String>,
+    /// The import being registered: its id, and the registry id and description typed.
+    pub register: Option<(String, TextEdit, TextEdit)>,
     /// The decision requests already announced; `None` until the first queue lands.
     seen: Option<HashSet<String>>,
 }
@@ -495,6 +531,7 @@ impl Default for Desk {
             armed: None,
             new_secret: None,
             move_to: None,
+            register: None,
             seen: None,
         }
     }
@@ -860,7 +897,11 @@ impl crate::App {
                         self.launcher = None;
                         self.page = crate::Page::Schedules;
                     }
-                    Did::Enable | Did::Revoke | Did::Unbind => {}
+                    Did::Enable
+                    | Did::Revoke
+                    | Did::Unbind
+                    | Did::RegisterImport
+                    | Did::DiscardImport => {}
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =
@@ -889,6 +930,14 @@ impl crate::App {
     pub fn waiting(&self) -> usize {
         match &self.admin.decisions {
             Some(Ok(open)) => open.len(),
+            _ => 0,
+        }
+    }
+
+    /// Scope packs to approve and imports to settle.
+    pub fn approvals_waiting(&self) -> usize {
+        match &self.admin.approvals {
+            Some(Ok(queue)) => queue.waiting(),
             _ => 0,
         }
     }

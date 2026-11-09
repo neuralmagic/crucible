@@ -11,6 +11,65 @@
 //! every part a short run of printable characters.
 
 pub const SCHEME: &str = "crucible-playbooks";
+/// The scheme the controller's web links use: `crucible://<profile>/<web path>`, or
+/// `crucible://open?url=<web url>` for the profile on that URL's origin.
+pub const WEB_SCHEME: &str = "crucible";
+
+/// Which profile a web link names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Place {
+    Profile(String),
+    /// The scheme, host and port of a web URL.
+    Origin(String),
+}
+
+/// Where in the app a web path lands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Route {
+    Launch {
+        playbook: String,
+        key: String,
+    },
+    Playbook {
+        id: String,
+    },
+    Decision {
+        id: String,
+    },
+    Page(crate::Page),
+    /// Anything else: the profile's runs.
+    Home,
+}
+
+impl Route {
+    /// The web UI path `path` as a place in the app.
+    pub fn of(path: &str) -> Route {
+        let parts: Vec<String> = path
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .filter_map(part)
+            .collect();
+        let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+        match parts.as_slice() {
+            ["playbook-runs", key, ..] => match key.split(':').collect::<Vec<_>>().as_slice() {
+                ["playbook", playbook, _] => Route::Launch {
+                    playbook: playbook.to_string(),
+                    key: key.to_string(),
+                },
+                _ => Route::Home,
+            },
+            ["playbooks", id] if !matches!(*id, "drafts" | "import") => {
+                Route::Playbook { id: id.to_string() }
+            }
+            ["playbooks", id, "launch"] => Route::Playbook { id: id.to_string() },
+            ["decisions", id] => Route::Decision { id: id.to_string() },
+            ["approvals"] => Route::Page(crate::Page::Approvals),
+            ["schedules"] | ["teams", _, "schedules"] => Route::Page(crate::Page::Schedules),
+            ["secrets"] | ["teams", _, "secrets"] => Route::Page(crate::Page::Secrets),
+            _ => Route::Home,
+        }
+    }
+}
 
 /// The longest part a link may carry, decoded.
 const PART: usize = 256;
@@ -31,11 +90,19 @@ pub enum Link {
     Decision {
         id: String,
     },
+    /// A controller web link, to open in the app on the profile it names.
+    Web {
+        place: Place,
+        route: Route,
+    },
 }
 
 impl Link {
     pub fn parse(url: &str) -> Option<Link> {
         let (scheme, rest) = url.trim().split_once("://")?;
+        if scheme.eq_ignore_ascii_case(WEB_SCHEME) {
+            return web(rest);
+        }
         if !scheme.eq_ignore_ascii_case(SCHEME) {
             return None;
         }
@@ -90,8 +157,37 @@ impl Link {
             }
             Link::Local { pack } => format!("{SCHEME}://local/{}", encode(pack, b"")),
             Link::Decision { id } => format!("{SCHEME}://decision/{}", encode(id, b"")),
+            Link::Web { .. } => String::new(),
         }
     }
+}
+
+/// `crucible://<profile>/<path>` or `crucible://open?url=<web url>`.
+fn web(rest: &str) -> Option<Link> {
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, query) = host.split_once('?').unwrap_or((host, ""));
+    let (path, query) = match path.split_once('?') {
+        Some((path, q)) => (path, q),
+        None => (path, query),
+    };
+    if host.eq_ignore_ascii_case("open") {
+        let raw = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("url="))?;
+        let target = url::Url::parse(&decode(raw)?).ok()?;
+        if !matches!(target.scheme(), "http" | "https") {
+            return None;
+        }
+        return Some(Link::Web {
+            place: Place::Origin(target.origin().ascii_serialization()),
+            route: Route::of(target.path()),
+        });
+    }
+    let profile = part(host)?;
+    crate::profile::valid_name(&profile).then(|| Link::Web {
+        place: Place::Profile(profile),
+        route: Route::of(path),
+    })
 }
 
 /// One decoded path part or query value: non-empty, at most [`PART`] bytes, printable, and no
@@ -135,7 +231,52 @@ pub fn decode(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::link::{Link, decode, encode};
+    use crate::link::{Link, Place, Route, decode, encode};
+
+    #[test]
+    fn web_links_name_a_profile_or_an_origin_and_land_on_a_view() {
+        let key = "playbook:cve-triage:01a1aa62-8b52-70c8";
+        assert_eq!(
+            Link::parse(&format!(
+                "crucible://mpp/playbook-runs/{}/runs/r1",
+                encode(key, b"")
+            )),
+            Some(Link::Web {
+                place: Place::Profile("mpp".into()),
+                route: Route::Launch {
+                    playbook: "cve-triage".into(),
+                    key: key.into()
+                }
+            })
+        );
+        assert_eq!(
+            Link::parse("crucible://open?url=https%3A%2F%2Fcrucible.example.com%2Fdecisions%2Fd-7"),
+            Some(Link::Web {
+                place: Place::Origin("https://crucible.example.com".into()),
+                route: Route::Decision { id: "d-7".into() }
+            })
+        );
+        assert_eq!(
+            Route::of("/teams/infra/schedules"),
+            Route::Page(crate::Page::Schedules)
+        );
+        assert_eq!(Route::of("/approvals"), Route::Page(crate::Page::Approvals));
+        assert_eq!(
+            Route::of("/playbooks/triage"),
+            Route::Playbook {
+                id: "triage".into()
+            }
+        );
+        assert_eq!(Route::of("/playbooks/drafts"), Route::Home);
+        assert_eq!(Route::of("/playbook-runs/not-a-key"), Route::Home);
+        assert_eq!(Route::of(""), Route::Home);
+        assert_eq!(
+            Link::parse("crucible://open?url=javascript%3Aalert(1)"),
+            None
+        );
+        assert_eq!(Link::parse("crucible://open"), None);
+        assert_eq!(Link::parse("crucible://bad name/x"), None);
+    }
 
     #[test]
     fn links_round_trip_through_their_urls() {

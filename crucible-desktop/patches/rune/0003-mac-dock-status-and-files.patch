@@ -167,17 +167,263 @@ index 0000000..09c3faf
 +    assert_eq!(bar(100.0, -1.0).1[2], 0.0);
 +    assert_eq!(clamp(f64::NAN), 0.0);
 +}
+diff --git a/crates/rune-mac/src/files.rs b/crates/rune-mac/src/files.rs
+new file mode 100644
+index 0000000..85599a2
+--- /dev/null
++++ b/crates/rune-mac/src/files.rs
+@@ -0,0 +1,199 @@
++//! Files and folders the system opens with the app: dropped on its Dock icon, or opened with it
++//! from Finder. The bundle declares what it takes (`CFBundleDocumentTypes`).
++//!
++//! macOS sends them as an open-documents Apple event, which winit does not forward. Call `listen`
++//! in `main` before the event loop starts, so a drop that launches the app is kept too, then
++//! `on_open` once the app can take them: it gets what arrived so far, then each batch as it
++//! comes. Off macOS neither does anything.
++
++use std::path::PathBuf;
++use std::sync::{Mutex, OnceLock};
++
++type Handler = Box<dyn Fn(Vec<PathBuf>) + Send + Sync>;
++
++/// The app's handler, or the batches that arrived before it had one.
++enum Sink {
++    Waiting(Vec<Vec<PathBuf>>),
++    Handler(Handler),
++}
++
++fn sink() -> &'static Mutex<Sink> {
++    static SINK: OnceLock<Mutex<Sink>> = OnceLock::new();
++    SINK.get_or_init(|| Mutex::new(Sink::Waiting(Vec::new())))
++}
++
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn deliver(paths: Vec<PathBuf>) {
++    if paths.is_empty() {
++        return;
++    }
++    match &mut *sink().lock().unwrap_or_else(|e| e.into_inner()) {
++        Sink::Handler(f) => f(paths),
++        Sink::Waiting(kept) => kept.push(paths),
++    }
++}
++
++/// Starts taking open-documents events, keeping them until `on_open`. Call it in `main` on the
++/// main thread before the event loop runs: AppKit sets its own handler while launching, so this
++/// sets Rune's again when the app is about to finish launching, before AppKit hands it the
++/// documents the app was launched with.
++pub fn listen() {
++    #[cfg(target_os = "macos")]
++    mac::install_at_launch();
++}
++
++/// Calls `f` with each batch of paths the system opens with the app, those kept since `listen`
++/// first, on the main thread (wake the app's loop from it).
++pub fn on_open(f: impl Fn(Vec<PathBuf>) + Send + Sync + 'static) {
++    let kept = {
++        let mut sink = sink().lock().unwrap_or_else(|e| e.into_inner());
++        match std::mem::replace(&mut *sink, Sink::Handler(Box::new(f))) {
++            Sink::Waiting(kept) => kept,
++            Sink::Handler(_) => Vec::new(),
++        }
++    };
++    for paths in kept {
++        deliver(paths);
++    }
++    #[cfg(target_os = "macos")]
++    mac::install();
++}
++
++/// The path a `file://` URL names, percent-decoded and without a trailing slash; `None` for any
++/// other URL.
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn path_of(url: &str) -> Option<PathBuf> {
++    let rest = url.strip_prefix("file://")?;
++    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
++    if !rest.starts_with('/') {
++        return None;
++    }
++    let bytes = rest.as_bytes();
++    let mut out = Vec::with_capacity(bytes.len());
++    let mut i = 0;
++    while i < bytes.len() {
++        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
++        match (bytes[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
++            (b'%', Some(byte)) => {
++                out.push(byte);
++                i += 3;
++            }
++            (byte, _) => {
++                out.push(byte);
++                i += 1;
++            }
++        }
++    }
++    let path = String::from_utf8(out).ok()?;
++    let trimmed = path.trim_end_matches('/');
++    Some(PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed }))
++}
++
++#[cfg(target_os = "macos")]
++mod mac {
++    use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
++    use objc2::{class, msg_send, sel};
++
++    const CORE_EVENT: u32 = u32::from_be_bytes(*b"aevt");
++    const OPEN_DOCUMENTS: u32 = u32::from_be_bytes(*b"odoc");
++    const DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
++    const FILE_URL: u32 = u32::from_be_bytes(*b"furl");
++
++    /// The `file://` URL one descriptor of the event's list holds.
++    unsafe fn url(item: *mut AnyObject) -> Option<String> {
++        unsafe {
++            let furl: *mut AnyObject = msg_send![item, coerceToDescriptorType: FILE_URL];
++            if furl.is_null() {
++                return None;
++            }
++            let data: *mut AnyObject = msg_send![furl, data];
++            if data.is_null() {
++                return None;
++            }
++            let length: usize = msg_send![data, length];
++            let bytes: *const u8 = msg_send![data, bytes];
++            if bytes.is_null() {
++                return None;
++            }
++            let raw = std::slice::from_raw_parts(bytes, length);
++            Some(String::from_utf8_lossy(raw).trim_end_matches('\0').to_string())
++        }
++    }
++
++    extern "C" fn opened(_this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject, _reply: *mut AnyObject) {
++        let paths = objc2::rc::autoreleasepool(|_| unsafe {
++            let list: *mut AnyObject = msg_send![event, paramDescriptorForKeyword: DIRECT_OBJECT];
++            if list.is_null() {
++                return Vec::new();
++            }
++            let n: isize = msg_send![list, numberOfItems];
++            if n == 0 {
++                return url(list).as_deref().and_then(super::path_of).into_iter().collect();
++            }
++            (1..=n)
++                .filter_map(|i| {
++                    let item: *mut AnyObject = msg_send![list, descriptorAtIndex: i];
++                    url(item).as_deref().and_then(super::path_of)
++                })
++                .collect()
++        });
++        super::deliver(paths);
++    }
++
++    fn target_class() -> &'static AnyClass {
++        const NAME: &str = "RuneMacOpenDocumentsTarget";
++        if let Some(c) = AnyClass::get(NAME) {
++            return c;
++        }
++        let mut b = ClassBuilder::new(NAME, class!(NSObject)).expect("open-documents target class");
++        unsafe {
++            b.add_method(sel!(opened:withReply:), opened as extern "C" fn(_, _, _, _));
++        }
++        b.register()
++    }
++
++    /// The object the event manager calls; it holds its handler weakly, so this one lives as long
++    /// as the process.
++    fn target() -> usize {
++        static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++        *TARGET.get_or_init(|| {
++            let made: *mut AnyObject = unsafe { msg_send![target_class(), new] };
++            made as usize
++        })
++    }
++
++    pub(super) fn install_at_launch() {
++        use block2::RcBlock;
++        let installed = RcBlock::new(|_note: *mut AnyObject| install());
++        unsafe {
++            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
++            let name = std::ffi::CString::new("NSApplicationWillFinishLaunchingNotification").unwrap_or_default();
++            let name: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];
++            let _: *mut AnyObject = msg_send![
++                center,
++                addObserverForName: name,
++                object: std::ptr::null_mut::<AnyObject>(),
++                queue: std::ptr::null_mut::<AnyObject>(),
++                usingBlock: &*installed
++            ];
++        }
++    }
++
++    pub(super) fn install() {
++        unsafe {
++            let target = target() as *mut AnyObject;
++            let manager: *mut AnyObject = msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
++            let _: () = msg_send![
++                manager,
++                setEventHandler: target,
++                andSelector: sel!(opened:withReply:),
++                forEventClass: CORE_EVENT,
++                andEventID: OPEN_DOCUMENTS
++            ];
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "files_tests.rs"]
++mod tests;
+diff --git a/crates/rune-mac/src/files_tests.rs b/crates/rune-mac/src/files_tests.rs
+new file mode 100644
+index 0000000..c646b23
+--- /dev/null
++++ b/crates/rune-mac/src/files_tests.rs
+@@ -0,0 +1,34 @@
++use std::path::PathBuf;
++
++use super::{deliver, listen, on_open, path_of};
++
++#[test]
++fn file_urls_become_decoded_paths() {
++    assert_eq!(path_of("file:///Users/me/My%20Pack/"), Some(PathBuf::from("/Users/me/My Pack")));
++    assert_eq!(path_of("file://localhost/tmp/x"), Some(PathBuf::from("/tmp/x")));
++    assert_eq!(path_of("file:///caf%C3%A9"), Some(PathBuf::from("/café")));
++    assert_eq!(path_of("file:///a%2"), Some(PathBuf::from("/a%2")), "a cut escape stays as written");
++    assert_eq!(path_of("file:///"), Some(PathBuf::from("/")));
++}
++
++#[test]
++fn other_urls_are_not_paths() {
++    assert_eq!(path_of("https://example.com/x"), None);
++    assert_eq!(path_of("file://host/x"), None);
++}
++
++#[test]
++fn paths_that_arrive_before_the_app_listens_are_kept_for_it() {
++    listen();
++    deliver(vec![PathBuf::from("/early")]);
++    deliver(Vec::new());
++    let (tx, rx) = std::sync::mpsc::channel();
++    let tx = std::sync::Mutex::new(tx);
++    on_open(move |paths| {
++        let _ = tx.lock().map(|tx| tx.send(paths));
++    });
++    deliver(vec![PathBuf::from("/late")]);
++    assert_eq!(rx.recv().unwrap(), [PathBuf::from("/early")]);
++    assert_eq!(rx.recv().unwrap(), [PathBuf::from("/late")]);
++    assert!(rx.try_recv().is_err(), "an empty batch is not delivered");
++}
 diff --git a/crates/rune-mac/src/lib.rs b/crates/rune-mac/src/lib.rs
-index a91aed8..5b359bf 100644
+index a91aed8..19f87b5 100644
 --- a/crates/rune-mac/src/lib.rs
 +++ b/crates/rune-mac/src/lib.rs
-@@ -4,9 +4,12 @@
+@@ -4,9 +4,13 @@
  //! Off macOS every helper is a no-op: `remember_frame` returns true (so a `poll` that waits on it
  //! stops), `saved_size` returns `None`, `is_full_screen` returns false, and `toggle_full_screen`,
  //! `launch` and `busy` do nothing. `notify` posts nothing and reports `available() == false`.
 +//! `dock` and `status` draw nothing.
  
 +pub mod dock;
++pub mod files;
  pub mod notify;
  mod quiet;
 +pub mod status;

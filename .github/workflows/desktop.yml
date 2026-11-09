@@ -1,9 +1,9 @@
 name: Desktop
 
-# Format, lint and test the macOS desktop app (its own Cargo workspace, so ci.yml never builds it).
-# Runs only when the app, the crates it builds from (crux, crucible-contract, and the root
-# Cargo.toml whose workspace dependencies crux inherits) or this workflow change: macOS runner
-# minutes are billed.
+# Format, lint and test the macOS desktop app (crucible-desktop, its own Cargo workspace on Rune, so
+# ci.yml never builds it), and assemble its .app bundle. Runs only when the app, the crates it
+# builds from (crux, crucible-contract, crucible-lsp, and the root Cargo.toml whose workspace
+# dependencies they inherit) or this workflow change: macOS runner minutes are billed.
 on:
   push:
     branches: [main]
@@ -11,14 +11,18 @@ on:
       - 'crucible-desktop/**'
       - 'crux/**'
       - 'crucible-contract/**'
+      - 'crucible-lsp/**'
       - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/desktop.yml'
   pull_request:
     paths:
       - 'crucible-desktop/**'
       - 'crux/**'
       - 'crucible-contract/**'
+      - 'crucible-lsp/**'
       - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/desktop.yml'
   workflow_dispatch:
 
@@ -47,6 +51,10 @@ jobs:
           components: rustfmt, clippy
           cache-workspaces: crucible-desktop -> target
 
+      # Rune at its pinned revision plus the patches the app carries, into vendor/rune.
+      - name: Rune
+        run: sh crucible-desktop/rune-patches.sh
+
       - name: fmt
         working-directory: crucible-desktop
         run: cargo fmt --check
@@ -55,6 +63,69 @@ jobs:
         working-directory: crucible-desktop
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      # The language-server test drives the real crucible-lsp.
+      - name: crucible-lsp
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --locked -p crucible-lsp
+
       - name: test
         working-directory: crucible-desktop
-        run: cargo test --locked
+        run: CRUCIBLE_LSP="$GITHUB_WORKSPACE/target/debug/crucible-lsp" cargo test --locked
+
+  # The release bundle, built the way the release workflow builds it, so a change that breaks the
+  # bundle fails here rather than on a tag.
+  bundle:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # rustflags off: the action's default `-D warnings` reaches the vendored Rune, whose release
+      # build warns about debug-only tooling. The check job holds the app itself to clippy.
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+          cache-workspaces: |
+            . -> target
+            crucible-desktop -> target
+
+      - name: Rune
+        run: sh crucible-desktop/rune-patches.sh
+
+      - name: Build
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p crucible-lsp
+          ( cd crucible-desktop && cargo build --release --locked )
+          sh crucible-desktop/macos-bundle.sh
+
+      - name: Check the bundle
+        run: |
+          set -euo pipefail
+          app="crucible-desktop/target/release/Crucible Playbooks.app"
+          plutil -lint "$app/Contents/Info.plist"
+          test -x "$app/Contents/MacOS/crucible-playbooks"
+          test -x "$app/Contents/MacOS/crucible-lsp"
+          codesign --verify --deep "$app"
+          # The binary starts: as a tunnel supervisor with no command it refuses with code 2.
+          code=0
+          "$app/Contents/MacOS/crucible-playbooks" --keep </dev/null || code=$?
+          test "$code" -eq 2
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ditto -c -k --keepParent "crucible-desktop/target/release/Crucible Playbooks.app" \
+            "dist/Crucible-Playbooks-${GITHUB_SHA::7}-aarch64-apple-darwin.zip"
+          ls -la dist/
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: crucible-playbooks-app
+          path: dist/*.zip
+          retention-days: 14

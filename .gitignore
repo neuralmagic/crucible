@@ -1,6 +1,6 @@
 # Rust build output.
 target/
-# Upstream checkouts with carried patches (crucible-desktop-rune/rune-patches.sh).
+# Upstream checkouts with carried patches (crucible-desktop/rune-patches.sh).
 /vendor/
 # Runtime loop state + results logs.
 /workspace/

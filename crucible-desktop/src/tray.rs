@@ -98,14 +98,21 @@ pub fn running(app: &App) -> Vec<Running> {
     running.into_iter().map(|l| Running::of(l, *now)).collect()
 }
 
-/// What to show for `running` launches on `profile`, with `waiting` decisions and `pinned` the
-/// launch whose budget the Dock shows.
-pub fn shown(profile: &str, running: &[Running], waiting: usize, pinned: Option<&str>) -> Shown {
+/// What to show for `running` launches on `profile`, with `waiting` decisions and approvals,
+/// `pinned` the launch whose budget the Dock shows, and the `others` profiles as last read.
+pub fn shown(
+    profile: &str,
+    running: &[Running],
+    waiting: usize,
+    pinned: Option<&str>,
+    others: &[crate::fleet::Status],
+) -> Shown {
     let progress = pinned
         .and_then(|key| running.iter().find(|r| r.key == key))
         .and_then(Running::budget)
         .map(|used| (used * 1000.0).round() as u16);
-    let title = match running.len() {
+    let total = running.len() + others.iter().map(|o| o.running.len()).sum::<usize>();
+    let title = match total {
         0 => "\u{25c7}".to_string(),
         n => format!("\u{25c6} {n}"),
     };
@@ -128,18 +135,34 @@ pub fn shown(profile: &str, running: &[Running], waiting: usize, pinned: Option<
                 .checked(pinned == Some(r.key.as_str()))
         }));
     }
+    for other in others.iter().filter(|o| !o.running.is_empty()) {
+        lines.push(Line::Separator);
+        lines.push(Line::Label(format!("Running on {}", other.name)));
+        lines.extend(
+            other
+                .running
+                .iter()
+                .map(|r| Line::item(format!("open@{}:{}", other.name, r.key), r.line())),
+        );
+    }
     lines.push(Line::Separator);
     if waiting > 0 {
-        let noun = if waiting == 1 {
-            "decision"
-        } else {
-            "decisions"
-        };
-        lines.push(Line::item("decisions", format!("{waiting} {noun} waiting")));
+        lines.push(Line::item("decisions", format!("{waiting} waiting on you")));
+    }
+    for other in others.iter().filter(|o| o.waiting() > 0) {
+        lines.push(Line::item(
+            format!("waiting@{}", other.name),
+            format!("{} waiting on {}", other.waiting(), other.name),
+        ));
     }
     lines.push(Line::item("show", "Open Crucible Playbooks"));
+    let badge = waiting
+        + others
+            .iter()
+            .map(crate::fleet::Status::waiting)
+            .sum::<usize>();
     Shown {
-        badge: (waiting > 0).then(|| waiting.to_string()),
+        badge: (badge > 0).then(|| badge.to_string()),
         progress,
         title,
         lines,
@@ -150,12 +173,23 @@ pub fn shown(profile: &str, running: &[Running], waiting: usize, pinned: Option<
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pick {
     Open(String),
+    /// A launch on another profile, by profile and key.
+    OpenOn(String, String),
+    /// What waits on another profile.
+    WaitingOn(String),
     Pin(Option<String>),
     Decisions,
     Show,
 }
 
 pub fn pick(id: &str) -> Option<Pick> {
+    if let Some(rest) = id.strip_prefix("open@") {
+        let (profile, key) = rest.split_once(':')?;
+        return Some(Pick::OpenOn(profile.to_string(), key.to_string()));
+    }
+    if let Some(profile) = id.strip_prefix("waiting@") {
+        return Some(Pick::WaitingOn(profile.to_string()));
+    }
     if let Some(key) = id.strip_prefix("open:") {
         return Some(Pick::Open(key.to_string()));
     }
@@ -185,9 +219,11 @@ impl App {
         let now = shown(
             &self.target.name,
             &running,
-            self.waiting(),
+            self.waiting() + self.approvals_waiting(),
             self.pinned.as_deref(),
+            &self.fleet,
         );
+        self.announce_approvals();
         let last = self.tray.as_ref();
         if last.map(|s| &s.badge) != Some(&now.badge) {
             rune_mac::dock::set_badge(now.badge.as_deref());
@@ -201,6 +237,34 @@ impl App {
         self.tray = Some(now);
     }
 
+    /// Says when the approvals waiting on a profile grow, once each profile's count is known.
+    fn announce_approvals(&mut self) {
+        let mut counts: Vec<(String, usize)> = self
+            .fleet
+            .iter()
+            .filter(|o| o.error.is_none())
+            .map(|o| (o.name.clone(), o.approvals))
+            .collect();
+        if matches!(self.admin.approvals, Some(Ok(_))) {
+            counts.push((self.target.name.clone(), self.approvals_waiting()));
+        }
+        for (profile, now) in counts {
+            let before = self.approvals_known.insert(profile.clone(), now);
+            if let Some(before) = before
+                && now > before
+                && self.settings.ask
+                && let Some(notifier) = &self.notifier
+            {
+                notifier.post(&crate::notify::Note {
+                    id: format!("approvals:{profile}"),
+                    title: format!("{profile}: {now} awaiting approval"),
+                    body: String::new(),
+                    link: String::new(),
+                });
+            }
+        }
+    }
+
     /// Does what the menu bar pick `id` asks.
     pub fn picked(&mut self, id: &str) {
         match pick(id) {
@@ -212,6 +276,24 @@ impl App {
                         task: None,
                     });
                 }
+                crate::notify::bring_to_front();
+            }
+            Some(Pick::OpenOn(profile, key)) => {
+                self.switch(crate::Backend::Controller);
+                self.use_profile(&profile);
+                if let Some(playbook) = key.split(':').nth(1) {
+                    self.follow(&crate::link::Link::Launch {
+                        playbook: playbook.to_string(),
+                        key,
+                        task: None,
+                    });
+                }
+                crate::notify::bring_to_front();
+            }
+            Some(Pick::WaitingOn(profile)) => {
+                self.switch(crate::Backend::Controller);
+                self.use_profile(&profile);
+                self.page = crate::Page::Approvals;
                 crate::notify::bring_to_front();
             }
             Some(Pick::Pin(key)) => self.pinned = key,
@@ -272,7 +354,7 @@ mod tests {
 
     #[test]
     fn nothing_running_shows_no_progress_and_a_quiet_menu() {
-        let s = shown("mpp", &[], 0, Some("gone"));
+        let s = shown("mpp", &[], 0, Some("gone"), &[]);
         assert_eq!(s.badge, None);
         assert_eq!(s.progress, None);
         assert_eq!(s.title, "\u{25c7}");
@@ -289,7 +371,7 @@ mod tests {
     #[test]
     fn a_pinned_launch_draws_its_budget_and_is_checked() {
         let running = [run("a", 1.0, 4.0, 0, None), run("b", 3.0, 4.0, 0, None)];
-        let s = shown("mpp", &running, 2, Some("b"));
+        let s = shown("mpp", &running, 2, Some("b"), &[]);
         assert_eq!(s.badge.as_deref(), Some("2"));
         assert_eq!(s.progress, Some(750));
         assert_eq!(s.title, "\u{25c6} 2");
@@ -297,7 +379,7 @@ mod tests {
         assert!(s.lines.contains(&Line::item("pin:", "None").checked(false)));
         assert!(
             s.lines
-                .contains(&Line::item("decisions", "2 decisions waiting"))
+                .contains(&Line::item("decisions", "2 waiting on you"))
         );
         let opens: Vec<&Line> = s
             .lines
@@ -305,6 +387,48 @@ mod tests {
             .filter(|l| matches!(l, Line::Item { id, .. } if id.starts_with("open:")))
             .collect();
         assert_eq!(opens.len(), 2);
+    }
+
+    #[test]
+    fn other_profiles_list_their_runs_and_add_to_the_badge() {
+        let others = [
+            crate::fleet::Status {
+                name: "wdc".into(),
+                running: vec![run("w", 1.0, 2.0, 60, None)],
+                decisions: 1,
+                approvals: 2,
+                error: None,
+            },
+            crate::fleet::Status {
+                name: "jump".into(),
+                error: Some("not answering".into()),
+                ..Default::default()
+            },
+        ];
+        let s = shown("mpp", &[run("a", 0.0, 0.0, 0, None)], 1, None, &others);
+        assert_eq!(s.title, "\u{25c6} 2", "running launches on every profile");
+        assert_eq!(s.badge.as_deref(), Some("4"));
+        assert!(s.lines.contains(&Line::Label("Running on wdc".into())));
+        assert!(
+            s.lines
+                .iter()
+                .any(|l| matches!(l, Line::Item { id, .. } if id == "open@wdc:w"))
+        );
+        assert!(
+            s.lines
+                .contains(&Line::item("waiting@wdc", "3 waiting on wdc"))
+        );
+        assert!(
+            !s.lines
+                .iter()
+                .any(|l| matches!(l, Line::Label(t) if t.contains("jump"))),
+            "a profile that does not answer lists nothing"
+        );
+        assert_eq!(
+            pick("open@wdc:playbook:x:1"),
+            Some(Pick::OpenOn("wdc".into(), "playbook:x:1".into()))
+        );
+        assert_eq!(pick("waiting@wdc"), Some(Pick::WaitingOn("wdc".into())));
     }
 
     #[test]

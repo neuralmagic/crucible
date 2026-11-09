@@ -254,6 +254,13 @@ enum Msg {
     },
     /// Save a working copy as its draft's next version.
     Save(Working),
+    /// Push a pack folder as the next version of the draft named after it, creating the draft on
+    /// first drop, and test-fire it under these ceilings.
+    Drop {
+        dir: std::path::PathBuf,
+        max_cost: f64,
+        max_time: String,
+    },
     /// Drop the connection and who it named, and read crux's config afresh.
     Reconnect,
     /// Which launch to read as the base of a comparison; `None` stops.
@@ -302,6 +309,15 @@ pub struct Launched {
     pub result: Result<String, String>,
 }
 
+/// What a pack folder dropped on the app came to: its draft, and the launch key or why not.
+#[derive(Clone, Debug)]
+pub struct Dropped {
+    pub seq: u64,
+    pub dir: std::path::PathBuf,
+    pub draft: String,
+    pub result: Result<String, String>,
+}
+
 /// What a rerun would do, for the form asking for one.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Reran {
@@ -332,6 +348,21 @@ pub struct Finished {
     pub cost: Option<f64>,
 }
 
+/// A folder's name as a draft id: lowercase letters, digits and single dashes.
+pub fn draft_id(dir: &std::path::Path) -> Option<String> {
+    let name = dir.file_name()?.to_string_lossy().to_lowercase();
+    let mut id = String::new();
+    for c in name.chars() {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            id.push(c);
+        } else if !id.is_empty() && !id.ends_with('-') {
+            id.push('-');
+        }
+    }
+    let id = id.trim_end_matches('-').to_string();
+    (!id.is_empty()).then_some(id)
+}
+
 /// The controller fetcher. One instance lives on its own worker thread, so a slow controller
 /// query never delays local log tracking.
 struct Fetcher {
@@ -356,6 +387,7 @@ struct Fetcher {
     launched: Option<Launched>,
     reran: Option<Reran>,
     synced: Option<Synced>,
+    dropped: Option<Dropped>,
     replies: u64,
     /// Where draft working copies go.
     drafts: Option<std::path::PathBuf>,
@@ -564,6 +596,7 @@ impl Fetcher {
             launched: None,
             reran: None,
             synced: None,
+            dropped: None,
             replies: 0,
             drafts: crate::draft::root(),
         }
@@ -711,6 +744,66 @@ impl Fetcher {
             Ok((working, note))
         });
         self.synced = Some(Synced { seq, draft, result });
+    }
+
+    /// Push pack folder `dir` as the next version of the draft named after it, creating the draft
+    /// on first drop, and test-fire that version under `max_cost` and `max_time`.
+    fn drop_pack(&mut self, dir: std::path::PathBuf, max_cost: f64, max_time: &str) {
+        self.replies += 1;
+        let seq = self.replies;
+        let draft = draft_id(&dir).unwrap_or_default();
+        let result = self.connection().and_then(|connection| {
+            if draft.is_empty() {
+                return Err(format!(
+                    "{} names no draft: its name has no letters or digits",
+                    dir.display()
+                ));
+            }
+            let (files, _) = crate::draft::read(&dir)?;
+            if files.is_empty() {
+                return Err(format!("{} holds no pack files", dir.display()));
+            }
+            let base = match connection.call(
+                "the draft",
+                connection
+                    .client
+                    .draft_files::<crux::dto::DraftFiles>(&draft, None),
+            ) {
+                Ok(newest) => newest.version,
+                Err(_) => {
+                    let created: crux::dto::DraftCompile = connection.call(
+                        "creating the draft",
+                        connection.client.create_draft(
+                            &draft,
+                            &format!("Dropped on Crucible Playbooks from {}", dir.display()),
+                            None,
+                        ),
+                    )?;
+                    created.version
+                }
+            };
+            match connection.call(
+                "the save",
+                connection.client.save_draft(&draft, &files, base),
+            )? {
+                crux::client::DraftSave::Saved(_) => {}
+                crux::client::DraftSave::Stale(stale) => return Err(stale.error),
+            }
+            let body = serde_json::json!({
+                "params": {},
+                "max_cost": max_cost,
+                "max_time": max_time,
+            });
+            let ack: crux::dto::LaunchAck =
+                connection.call("the launch", connection.client.launch_draft(&draft, &body))?;
+            Ok(ack.key)
+        });
+        self.dropped = Some(Dropped {
+            seq,
+            dir,
+            draft,
+            result,
+        });
     }
 
     /// Save a working copy as its draft's next version.
@@ -1359,6 +1452,7 @@ pub struct Snapshot {
     pub launched: Option<Launched>,
     pub reran: Option<Reran>,
     pub synced: Option<Synced>,
+    pub dropped: Option<Dropped>,
 }
 
 /// The UI-side handle to the live worker. Dropping it stops the thread.
@@ -1399,6 +1493,7 @@ impl Client {
                     launched: None,
                     reran: None,
                     synced: None,
+                    dropped: None,
                 },
             );
         }
@@ -1419,6 +1514,14 @@ impl Client {
     /// Launch `target`; the result comes back in a snapshot.
     pub fn launch(&self, target: Target, body: Value) {
         let _ = self.tx.send(Msg::Launch { target, body });
+    }
+
+    pub fn drop_pack(&self, dir: std::path::PathBuf, max_cost: f64, max_time: String) {
+        let _ = self.tx.send(Msg::Drop {
+            dir,
+            max_cost,
+            max_time,
+        });
     }
 
     /// Ask what rerunning `run` from `from` would reuse.
@@ -1525,6 +1628,15 @@ fn run_client(
                 fetcher.save(working);
                 force = true;
             }
+            Ok(Msg::Drop {
+                dir,
+                max_cost,
+                max_time,
+            }) => {
+                fetcher.drop_pack(dir, max_cost, &max_time);
+                next_list = Instant::now();
+                force = true;
+            }
             Ok(Msg::Compare(base)) => {
                 compare = base;
                 force = fetcher.refresh_base(compare.as_deref());
@@ -1584,6 +1696,7 @@ fn run_client(
                     launched: fetcher.launched.clone(),
                     reran: fetcher.reran.clone(),
                     synced: fetcher.synced.clone(),
+                    dropped: fetcher.dropped.clone(),
                 },
             );
         }

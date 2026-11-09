@@ -484,6 +484,28 @@ impl Client {
         self.get("/api/approvals").await
     }
 
+    /// Register pending import `import` under registry id `body.id`, pinned at its rev.
+    pub async fn register_import(
+        &self,
+        import: &str,
+        body: &crate::dto::RegisterImport<'_>,
+    ) -> Result<crate::dto::Registered> {
+        self.post(
+            &format!("/api/playbooks/imports/{}/register", encode(import)),
+            Some(body),
+        )
+        .await
+    }
+
+    /// Discard pending import `import`.
+    pub async fn discard_import(&self, import: &str) -> Result<serde_json::Value> {
+        self.post(
+            &format!("/api/playbooks/imports/{}/discard", encode(import)),
+            None::<&serde_json::Value>,
+        )
+        .await
+    }
+
     pub async fn playbooks<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/playbooks").await
     }
