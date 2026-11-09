@@ -209,7 +209,13 @@ pub enum CompileError {
     ParamChoicesConflict { param: String },
     #[error("parameter {param:?} sets allow_other without choices or choices_from")]
     ParamAllowOtherWithoutChoices { param: String },
-    #[error("parameter {param:?} takes choices from {task}.{field}, but {detail}")]
+    #[error("parameter {param:?} is keyed by {keyed_by:?}, but {detail}")]
+    ParamKeyedByInvalid {
+        param: String,
+        keyed_by: String,
+        detail: &'static str,
+    },
+    #[error("parameter {param:?} reads its form options from {task}.{field}, but {detail}")]
     ParamChoicesFromInvalid {
         param: String,
         task: String,

@@ -136,13 +136,30 @@ pub struct ParamSpec {
     /// The choices are suggestions: a value outside them is accepted.
     #[serde(default)]
     pub allow_other: bool,
+    /// The producer task output whose latest passing value, keyed by another parameter's value,
+    /// a launch form shows greyed out in this parameter's empty input.
+    #[serde(default)]
+    pub placeholder_from: Option<ChoicesFrom>,
 }
 
-/// A task in the same workflow and the list-of-strings field it emits as a parameter's choices.
+/// A task in the same workflow and the field it emits for a parameter's form: a list of strings,
+/// or with `keyed_by`, an object from another parameter's values to what that value selects.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChoicesFrom {
     pub task: String,
     pub field: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keyed_by: Option<String>,
+}
+
+impl ChoicesFrom {
+    fn schema(&self) -> serde_json::Value {
+        let mut out = serde_json::json!({"task": self.task, "field": self.field});
+        if let Some(key) = &self.keyed_by {
+            out["keyed_by"] = serde_json::json!(key);
+        }
+        out
+    }
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
@@ -158,6 +175,7 @@ pub const FIELDS: &[&str] = &[
     "multiline",
     "choices_from",
     "allow_other",
+    "placeholder_from",
 ];
 
 /// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
@@ -207,6 +225,26 @@ impl Params {
                 return Err(CompileError::ParamNameHasDot { param: name });
             }
             specs.push(spec(&name, &value.node)?);
+        }
+        for spec in &specs {
+            for from in [&spec.choices_from, &spec.placeholder_from]
+                .into_iter()
+                .flatten()
+            {
+                let Some(key) = &from.keyed_by else { continue };
+                let keyed = specs.iter().find(|s| &s.name == key);
+                let detail = match keyed {
+                    None => "that parameter is not declared",
+                    Some(_) if key == &spec.name => "a parameter cannot be keyed by itself",
+                    Some(k) if k.ty != ParamType::String => "that parameter is not a string",
+                    Some(_) => continue,
+                };
+                return Err(CompileError::ParamKeyedByInvalid {
+                    param: spec.name.clone(),
+                    keyed_by: key.clone(),
+                    detail,
+                });
+            }
         }
         Ok(Params(specs))
     }
@@ -303,10 +341,10 @@ impl Params {
                 property.insert(key.into(), serde_json::json!(spec.choices));
             }
             if let Some(from) = &spec.choices_from {
-                property.insert(
-                    "x-choices-from".into(),
-                    serde_json::json!({"task": from.task, "field": from.field}),
-                );
+                property.insert("x-choices-from".into(), from.schema());
+            }
+            if let Some(from) = &spec.placeholder_from {
+                property.insert("x-placeholder-from".into(), from.schema());
             }
             if spec.allow_other {
                 property.insert("x-allow-other".into(), serde_json::json!(true));
@@ -429,7 +467,7 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         &declared,
         name,
         "choices_from",
-        "a dictionary literal {\"task\": ..., \"field\": ...}",
+        "a dictionary literal {\"task\": ..., \"field\": ...}, with an optional \"keyed_by\"",
         literal_choices_from,
     )?;
     if choices_from.is_some() && ty != ParamType::String {
@@ -457,6 +495,20 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             param: name.to_owned(),
         });
     }
+    let placeholder_from = field(
+        &declared,
+        name,
+        "placeholder_from",
+        "a dictionary literal {\"task\": ..., \"field\": ..., \"keyed_by\": ...}",
+        |e| literal_choices_from(e).filter(|f| f.keyed_by.is_some()),
+    )?;
+    if placeholder_from.is_some() && ty != ParamType::String {
+        return Err(CompileError::ParamConstraintMismatch {
+            param: name.to_owned(),
+            constraint: "placeholder_from",
+            ty: ty.as_str(),
+        });
+    }
     let multiline =
         field(&declared, name, "multiline", "True or False", literal_bool)?.unwrap_or(false);
     if multiline && ty != ParamType::String {
@@ -480,6 +532,7 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         multiline,
         choices_from,
         allow_other,
+        placeholder_from,
     })
 }
 
@@ -519,10 +572,12 @@ fn literal_choices_from(expression: &Expr) -> Option<ChoicesFrom> {
     };
     let mut task = None;
     let mut field = None;
+    let mut keyed_by = None;
     for (key, value) in entries {
         let slot = match literal_string(&key.node)?.as_str() {
             "task" => &mut task,
             "field" => &mut field,
+            "keyed_by" => &mut keyed_by,
             _ => return None,
         };
         if slot.replace(literal_string(&value.node)?).is_some() {
@@ -532,6 +587,7 @@ fn literal_choices_from(expression: &Expr) -> Option<ChoicesFrom> {
     Some(ChoicesFrom {
         task: task?,
         field: field?,
+        keyed_by,
     })
 }
 

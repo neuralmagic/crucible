@@ -2617,14 +2617,16 @@ fn probe_value(spec: &params::ParamSpec, second: bool) -> ParamValue {
     }
 }
 
-/// Each choices_from producer task, with the parameter whose choices it supplies.
+/// Each choices_from and placeholder_from producer task, with a parameter it supplies.
 fn choice_producers(declared: &params::Params) -> BTreeMap<String, String> {
     declared
         .specs()
         .iter()
-        .filter_map(|spec| {
-            let from = spec.choices_from.as_ref()?;
-            Some((from.task.clone(), spec.name.clone()))
+        .flat_map(|spec| {
+            [&spec.choices_from, &spec.placeholder_from]
+                .into_iter()
+                .flatten()
+                .map(|from| (from.task.clone(), spec.name.clone()))
         })
         .collect()
 }
@@ -2813,10 +2815,15 @@ fn compile_source_here(
 /// A parameter's choices_from must name an unmapped task in this workflow that promises the field
 /// as a list, so the controller has one value to offer.
 fn check_choice_producers(declared: &params::Params, workflow: &WorkflowCfg) -> Result<()> {
-    for spec in declared.specs() {
-        let Some(from) = &spec.choices_from else {
-            continue;
-        };
+    let sources = declared.specs().iter().flat_map(|spec| {
+        let choices = spec
+            .choices_from
+            .iter()
+            .map(move |f| (spec, f, f.keyed_by.is_some()));
+        let placeholder = spec.placeholder_from.iter().map(move |f| (spec, f, true));
+        choices.chain(placeholder)
+    });
+    for (spec, from, keyed) in sources {
         let invalid = |detail| CompileError::ParamChoicesFromInvalid {
             param: spec.name.clone(),
             task: from.task.clone(),
@@ -2831,7 +2838,13 @@ fn check_choice_producers(declared: &params::Params, workflow: &WorkflowCfg) -> 
         }
         match producer.emits.field(&from.field) {
             crate::plan::ir::Declared::Untyped => {}
-            crate::plan::ir::Declared::Typed(ty) if ty.is_list() => {}
+            crate::plan::ir::Declared::Typed(ty) if keyed && ty.is_object() => {}
+            crate::plan::ir::Declared::Typed(ty) if !keyed && ty.is_list() => {}
+            crate::plan::ir::Declared::Typed(_) if keyed => {
+                return Err(invalid(
+                    "that field is not declared an object, which keyed_by needs",
+                ));
+            }
             crate::plan::ir::Declared::Typed(_) => {
                 return Err(invalid("that field is not declared a list"));
             }
@@ -6199,6 +6212,80 @@ workflow(type = "playbook", tasks = [options])
         assert!(matches!(
             with(&[("mode", "c")]),
             Err(CompileError::ParamConstraintFailed { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// keyed_by makes a choices_from field an object of lists per value of another parameter, and
+    /// placeholder_from reads an object of strings the same way; both reach the schema and both
+    /// producers join the refresh.
+    #[test]
+    fn keyed_choices_and_placeholders_read_objects_keyed_by_another_parameter() {
+        let pack = temp_pack("params-keyed");
+        let path = pack.join("workflow.star");
+        let source = r#"
+params = {
+    "release": {"type": "string", "required": True, "choices_from": {"task": "options", "field": "releases"}},
+    "component": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "components", "keyed_by": "release"}},
+    "branch": {"type": "string", "default": "", "placeholder_from": {"task": "branches", "field": "branch", "keyed_by": "release"}},
+}
+options = command(name = "options", run = "./o.sh", emits = {"releases": "list", "components": "object"})
+branches = command(name = "branches", run = "./b.sh", emits = {"branch": "object"})
+workflow(type = "playbook", tasks = [options, branches])
+"#;
+        std::fs::write(&path, source).unwrap();
+        let schema = declared_params(source, &path)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            schema["properties"]["component"]["x-choices-from"],
+            serde_json::json!({"task": "options", "field": "components", "keyed_by": "release"})
+        );
+        assert_eq!(
+            schema["properties"]["branch"]["x-placeholder-from"],
+            serde_json::json!({"task": "branches", "field": "branch", "keyed_by": "release"})
+        );
+        let refresh = compile_refresh_file(&path, &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(refresh.workflow.tasks.len(), 2);
+
+        let decl = |fields: &str| {
+            read_params(
+                &format!("params = {{\"release\": {{\"type\": \"string\", \"default\": \"\"}}, \"n\": {{\"type\": \"int\", \"default\": 1}}, \"p\": {{\"type\": \"string\", \"default\": \"\", {fields}}}}}\n"),
+                &path,
+            )
+            .map(|_| ())
+        };
+        for (fields, detail) in [
+            (
+                r#""choices_from": {"task": "t", "field": "f", "keyed_by": "nope"}"#,
+                "that parameter is not declared",
+            ),
+            (
+                r#""choices_from": {"task": "t", "field": "f", "keyed_by": "p"}"#,
+                "a parameter cannot be keyed by itself",
+            ),
+            (
+                r#""placeholder_from": {"task": "t", "field": "f", "keyed_by": "n"}"#,
+                "that parameter is not a string",
+            ),
+        ] {
+            assert!(
+                matches!(decl(fields), Err(CompileError::ParamKeyedByInvalid { detail: d, .. }) if d == detail),
+                "{fields}"
+            );
+        }
+        assert!(matches!(
+            decl(r#""placeholder_from": {"task": "t", "field": "f"}"#),
+            Err(CompileError::ParamFieldWrongShape {
+                field: "placeholder_from",
+                ..
+            })
+        ));
+
+        let listy = source.replace(r#""components": "object""#, r#""components": "list""#);
+        assert!(matches!(
+            compile_source_with(&listy, &path, &pack, &BTreeMap::from([("release".to_owned(), "a".to_owned())])),
+            Err(CompileError::ParamChoicesFromInvalid { param, .. }) if param == "component"
         ));
         let _ = std::fs::remove_dir_all(&pack);
     }

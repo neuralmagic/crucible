@@ -1366,7 +1366,9 @@ pub fn validate_params(
             .iter()
             .map(|(k, v)| {
                 let value = match schema.pointer(&format!("/properties/{}", pointer_token(k))) {
-                    Some(property) if crate::playbooks::choices::outside_snapshot(property, v) => {
+                    Some(property)
+                        if crate::playbooks::choices::outside_snapshot(property, v, params) =>
+                    {
                         errors.push(FieldError {
                             field: k.clone(),
                             message: format!(

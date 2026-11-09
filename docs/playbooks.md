@@ -356,6 +356,18 @@ The control plane offers the list from the latest passing run of that task, and 
 launch value outside it. Add `"allow_other": True` to accept other values too. Before the task
 has passed once, the field takes any value.
 
+Add `"keyed_by": "release"` to make the field an object of lists, one per value of the
+`release` parameter, so the form offers the list for the release entered. A parameter can also
+show a value greyed out in its empty input, the one the pack would choose itself:
+
+```python
+"target_branch": {"type": "string", "default": "",
+                  "placeholder_from": {"task": "release_options", "field": "branches",
+                                       "keyed_by": "target_release"}},
+```
+
+The field is an object from each release to one string. It is only shown, never submitted.
+
 The task and everything it depends on must not depend on parameters, so they can run alone.
 The compiler checks this and names the task that does. Launch with `choices.refresh=true` and
 nothing else to run just those tasks and refresh the list:

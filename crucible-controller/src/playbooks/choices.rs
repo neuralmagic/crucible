@@ -13,13 +13,69 @@ pub const MAX_CHOICE_CHARS: usize = 256;
 /// The snapshot key a served schema carries on each property that declares `x-choices-from`.
 pub const SNAPSHOT_KEY: &str = "x-choices-snapshot";
 
+/// The snapshot key a served schema carries on each property that declares
+/// `x-placeholder-from`.
+pub const PLACEHOLDER_KEY: &str = "x-placeholder-snapshot";
+
 /// How many recent passing outputs to try when the newest is out of bounds, so one bad refresh
 /// keeps the previous list instead of emptying the form.
 const CANDIDATES: i64 = 8;
 
+/// What a producer's field holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    /// A list of choices.
+    List,
+    /// An object from another parameter's values to a list of choices each.
+    KeyedLists,
+    /// An object from another parameter's values to one string each.
+    KeyedText,
+}
+
+impl Shape {
+    fn json_type(self) -> &'static str {
+        match self {
+            Shape::List => "array",
+            Shape::KeyedLists | Shape::KeyedText => "object",
+        }
+    }
+
+    /// The field's value within the bounds, normalized: duplicates collapse to the first.
+    /// `None` when it is not this shape or is out of bounds.
+    pub fn bounded(self, value: &serde_json::Value) -> Option<serde_json::Value> {
+        match self {
+            Shape::List => bounded(value).map(|c| serde_json::json!(c)),
+            Shape::KeyedLists | Shape::KeyedText => {
+                let entries = value.as_object()?;
+                if entries.len() > MAX_CHOICES {
+                    return None;
+                }
+                let mut out = serde_json::Map::new();
+                for (key, item) in entries {
+                    if key.chars().count() > MAX_CHOICE_CHARS {
+                        return None;
+                    }
+                    let item = match self {
+                        Shape::KeyedLists => serde_json::json!(bounded(item)?),
+                        _ => {
+                            let text = item.as_str()?;
+                            if text.chars().count() > MAX_CHOICE_CHARS {
+                                return None;
+                            }
+                            serde_json::json!(text)
+                        }
+                    };
+                    out.insert(key.clone(), item);
+                }
+                Some(serde_json::Value::Object(out))
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct Snapshot {
-    pub choices: Vec<String>,
+    pub value: serde_json::Value,
     pub run_id: String,
     pub captured_at: Option<String>,
     pub digest: String,
@@ -45,8 +101,8 @@ pub fn bounded(value: &serde_json::Value) -> Option<Vec<String>> {
     Some(choices)
 }
 
-fn digest(choices: &[String]) -> String {
-    let bytes = serde_json::to_vec(choices).unwrap_or_default();
+fn digest(value: &serde_json::Value) -> String {
+    let bytes = serde_json::to_vec(value).unwrap_or_default();
     format!("sha256:{:x}", Sha256::digest(bytes))
 }
 
@@ -57,14 +113,15 @@ pub async fn latest(
     playbook: &str,
     task: &str,
     field: &str,
+    shape: Shape,
 ) -> Result<Option<Snapshot>> {
     let rows = sqlx::query(
-        "SELECT t.output -> $3 AS choices, t.run_id, r.created_at \
+        "SELECT t.output -> $3 AS value, t.run_id, r.created_at \
          FROM run_task_results t \
          JOIN runs r ON r.run_id = t.run_id \
          JOIN playbook_launches l ON l.key = r.issue \
          WHERE l.playbook = $1 AND t.task = $2 AND t.status = 'pass' \
-           AND jsonb_typeof(t.output -> $3) = 'array' \
+           AND jsonb_typeof(t.output -> $3) = $5 \
          ORDER BY r.created_at DESC NULLS LAST, r.seq DESC, t.iter DESC \
          LIMIT $4",
     )
@@ -72,15 +129,16 @@ pub async fn latest(
     .bind(task)
     .bind(field)
     .bind(CANDIDATES)
+    .bind(shape.json_type())
     .fetch_all(pool)
     .await
     .context("reading a choice producer's outputs")?;
     for row in rows {
-        let value: serde_json::Value = row.try_get("choices")?;
-        if let Some(choices) = bounded(&value) {
+        let value: serde_json::Value = row.try_get("value")?;
+        if let Some(value) = shape.bounded(&value) {
             return Ok(Some(Snapshot {
-                digest: digest(&choices),
-                choices,
+                digest: digest(&value),
+                value,
                 run_id: row.try_get("run_id")?,
                 captured_at: row.try_get("created_at")?,
             }));
@@ -89,8 +147,23 @@ pub async fn latest(
     Ok(None)
 }
 
-/// `schema` with each `x-choices-from` property carrying its snapshot, and the `{param: {run_id,
-/// digest}}` record a launch stores. A property with no snapshot yet is left as declared.
+/// The producer a property names under `key`, and the shape its field holds.
+fn producer<'p>(property: &'p serde_json::Value, key: &str) -> Option<(&'p str, &'p str, Shape)> {
+    let from = property.get(key)?;
+    let task = from.get("task")?.as_str()?;
+    let field = from.get("field")?.as_str()?;
+    let keyed = from.get("keyed_by").is_some();
+    let shape = match (key, keyed) {
+        ("x-placeholder-from", _) => Shape::KeyedText,
+        (_, true) => Shape::KeyedLists,
+        _ => Shape::List,
+    };
+    Some((task, field, shape))
+}
+
+/// `schema` with each `x-choices-from` and `x-placeholder-from` property carrying its snapshot,
+/// and the `{param: {run_id, digest}}` record of the choices a launch stores. A property with no
+/// snapshot yet is left as declared.
 pub async fn attach(
     pool: &PgPool,
     playbook: &str,
@@ -105,39 +178,56 @@ pub async fn attach(
         return Ok((served, serde_json::Value::Object(record)));
     };
     for (name, property) in properties.iter_mut() {
-        let from = property.get("x-choices-from");
-        let (Some(task), Some(field)) = (
-            from.and_then(|f| f.get("task"))
-                .and_then(serde_json::Value::as_str),
-            from.and_then(|f| f.get("field"))
-                .and_then(serde_json::Value::as_str),
-        ) else {
-            continue;
-        };
-        if let Some(snapshot) = latest(pool, playbook, task, field).await? {
-            record.insert(
-                name.clone(),
-                serde_json::json!({"run_id": snapshot.run_id, "digest": snapshot.digest}),
-            );
+        for (from, into) in [
+            ("x-choices-from", SNAPSHOT_KEY),
+            ("x-placeholder-from", PLACEHOLDER_KEY),
+        ] {
+            let Some((task, field, shape)) = producer(property, from) else {
+                continue;
+            };
+            let Some(snapshot) = latest(pool, playbook, task, field, shape).await? else {
+                continue;
+            };
+            if into == SNAPSHOT_KEY {
+                record.insert(
+                    name.clone(),
+                    serde_json::json!({"run_id": snapshot.run_id, "digest": snapshot.digest}),
+                );
+            }
             if let Some(object) = property.as_object_mut() {
-                object.insert(SNAPSHOT_KEY.into(), serde_json::to_value(&snapshot)?);
+                object.insert(into.into(), serde_json::to_value(&snapshot)?);
             }
         }
     }
     Ok((served, serde_json::Value::Object(record)))
 }
 
-/// The supplied value is outside a closed snapshot. Open choices (`x-allow-other`) and properties
-/// with no snapshot accept any value their type and pattern accept.
-pub fn outside_snapshot(property: &serde_json::Value, value: &str) -> bool {
+/// The supplied value is outside a closed snapshot. A keyed snapshot offers the list for the
+/// value `params` supply for its key, and none when there is no list for it. Open choices
+/// (`x-allow-other`) and properties with no snapshot accept any value their type and pattern
+/// accept.
+pub fn outside_snapshot(
+    property: &serde_json::Value,
+    value: &str,
+    params: &std::collections::BTreeMap<String, String>,
+) -> bool {
     if property.get("x-allow-other") == Some(&serde_json::Value::Bool(true)) {
         return false;
     }
-    property
-        .get(SNAPSHOT_KEY)
-        .and_then(|s| s.get("choices"))
+    let Some(offered) = property.get(SNAPSHOT_KEY).and_then(|s| s.get("value")) else {
+        return false;
+    };
+    let list = match property
+        .get("x-choices-from")
+        .and_then(|f| f.get("keyed_by"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(key) => params.get(key).and_then(|k| offered.get(k)),
+        None => Some(offered),
+    };
+    !list
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|choices| !choices.iter().any(|c| c.as_str() == Some(value)))
+        .is_some_and(|choices| choices.iter().any(|c| c.as_str() == Some(value)))
 }
 
 #[cfg(test)]
@@ -233,7 +323,7 @@ mod tests {
             "r2",
             "2026-11-02T00:00:00Z",
             "pass",
-            releases(&["3.6", "3.7"]),
+            serde_json::json!({"releases": ["3.6", "3.7"], "branch": {"3.7": "sync-v0.33.0"}}),
         )
         .await;
         seed(
@@ -265,23 +355,32 @@ mod tests {
         )
         .await;
 
-        let snapshot = latest(&pool, "backport", "options", "releases")
+        let snapshot = latest(&pool, "backport", "options", "releases", Shape::List)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.choices, ["3.6", "3.7"]);
+        assert_eq!(snapshot.value, serde_json::json!(["3.6", "3.7"]));
         assert_eq!(snapshot.run_id, "r2");
 
         let schema = serde_json::json!({"properties": {
             "release": {"type": "string", "x-choices-from": {"task": "options", "field": "releases"}},
             "pr": {"type": "string"},
+            "branch": {"type": "string", "x-placeholder-from": {"task": "options", "field": "branch", "keyed_by": "release"}},
         }});
         let (served, record) = attach(&pool, "backport", &schema).await.unwrap();
         assert_eq!(
-            served["properties"]["release"][SNAPSHOT_KEY]["choices"],
+            served["properties"]["release"][SNAPSHOT_KEY]["value"],
             serde_json::json!(["3.6", "3.7"])
         );
         assert!(served["properties"]["pr"].get(SNAPSHOT_KEY).is_none());
+        assert_eq!(
+            served["properties"]["branch"][PLACEHOLDER_KEY]["value"],
+            serde_json::json!({"3.7": "sync-v0.33.0"})
+        );
+        assert!(
+            record.get("branch").is_none(),
+            "a placeholder is display only"
+        );
         assert_eq!(record["release"]["run_id"], "r2");
         assert_eq!(record["release"]["digest"], snapshot.digest);
         let params =
@@ -350,15 +449,69 @@ workflow(type = "playbook", tasks = [options, work])
 
     #[test]
     fn only_a_closed_snapshot_refuses_a_value() {
-        let closed = serde_json::json!({"x-choices-snapshot": {"choices": ["a", "b"]}});
+        let none = std::collections::BTreeMap::new();
+        let closed = serde_json::json!({"x-choices-snapshot": {"value": ["a", "b"]}});
         let open =
-            serde_json::json!({"x-allow-other": true, "x-choices-snapshot": {"choices": ["a"]}});
-        assert!(outside_snapshot(&closed, "c"));
-        assert!(!outside_snapshot(&closed, "a"));
-        assert!(!outside_snapshot(&open, "c"));
+            serde_json::json!({"x-allow-other": true, "x-choices-snapshot": {"value": ["a"]}});
+        assert!(outside_snapshot(&closed, "c", &none));
+        assert!(!outside_snapshot(&closed, "a", &none));
+        assert!(!outside_snapshot(&open, "c", &none));
         assert!(!outside_snapshot(
             &serde_json::json!({"x-choices-from": {}}),
-            "c"
+            "c",
+            &none
         ));
+    }
+
+    /// A keyed snapshot offers the list for the key's supplied value, and nothing for a key it
+    /// has no list for.
+    #[test]
+    fn a_keyed_snapshot_offers_the_list_for_the_supplied_key() {
+        let keyed = serde_json::json!({
+            "x-choices-from": {"task": "o", "field": "c", "keyed_by": "release"},
+            "x-choices-snapshot": {"value": {"3.7": ["vllm", "flashinfer"], "3.6": ["vllm"]}},
+        });
+        let release =
+            |r: &str| std::collections::BTreeMap::from([("release".to_owned(), r.to_owned())]);
+        assert!(!outside_snapshot(&keyed, "flashinfer", &release("3.7")));
+        assert!(outside_snapshot(&keyed, "flashinfer", &release("3.6")));
+        assert!(outside_snapshot(&keyed, "vllm", &release("3.9")));
+        assert!(outside_snapshot(
+            &keyed,
+            "vllm",
+            &std::collections::BTreeMap::new()
+        ));
+    }
+
+    #[test]
+    fn a_keyed_value_is_bounded_per_key() {
+        let lists = serde_json::json!({"3.7": ["a", "a", "b"], "3.6": []});
+        assert_eq!(
+            Shape::KeyedLists.bounded(&lists),
+            Some(serde_json::json!({"3.6": [], "3.7": ["a", "b"]}))
+        );
+        assert_eq!(
+            Shape::KeyedLists.bounded(&serde_json::json!({"3.7": "a"})),
+            None
+        );
+        assert_eq!(
+            Shape::KeyedText.bounded(&serde_json::json!({"3.7": "sync-v0.33.0"})),
+            Some(serde_json::json!({"3.7": "sync-v0.33.0"}))
+        );
+        assert_eq!(
+            Shape::KeyedText.bounded(&serde_json::json!({"3.7": ["a"]})),
+            None
+        );
+        assert_eq!(
+            Shape::KeyedText.bounded(&serde_json::json!({"3.7": "x".repeat(MAX_CHOICE_CHARS + 1)})),
+            None
+        );
+        let wide: serde_json::Map<String, serde_json::Value> = (0..=MAX_CHOICES)
+            .map(|i| (i.to_string(), serde_json::json!("b")))
+            .collect();
+        assert_eq!(
+            Shape::KeyedText.bounded(&serde_json::Value::Object(wide)),
+            None
+        );
     }
 }
