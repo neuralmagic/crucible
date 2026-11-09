@@ -241,6 +241,40 @@ export function initialValues(
 /// pattern the browser cannot compile (Rust-regex syntax the engine accepts) checks nothing here
 /// rather than failing a value the endpoint would have taken.
 /// Whether a gated param's switch is on, so its value is taken; an ungated param always is.
+/// One block of the rendered form: a lone field, or a boolean gate with the fields it enables.
+export type ParamBlock =
+  | { kind: 'field'; spec: ParamFieldSpec }
+  | { kind: 'gated'; gate: ParamFieldSpec; fields: ParamFieldSpec[] };
+
+/// The form's blocks in declaration order. A boolean another field names in enabled_by renders once,
+/// as the head of a group at its first gated field's position, so the gate sits with what it unlocks.
+export function paramBlocks(specs: readonly ParamFieldSpec[]): ParamBlock[] {
+  const gates = new Map(
+    specs
+      .filter((spec) => specs.some((other) => other.enabledBy === spec.name))
+      .map((spec) => [spec.name, spec])
+  );
+  const blocks: ParamBlock[] = [];
+  const groups = new Map<string, ParamFieldSpec[]>();
+  for (const spec of specs) {
+    if (gates.has(spec.name)) continue;
+    const gate = spec.enabledBy === null ? undefined : gates.get(spec.enabledBy);
+    if (gate === undefined) {
+      blocks.push({ kind: 'field', spec });
+      continue;
+    }
+    const fields = groups.get(gate.name);
+    if (fields === undefined) {
+      const group: ParamFieldSpec[] = [spec];
+      groups.set(gate.name, group);
+      blocks.push({ kind: 'gated', gate, fields: group });
+    } else {
+      fields.push(spec);
+    }
+  }
+  return blocks;
+}
+
 export function isEnabled(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): boolean {
   return spec.enabledBy === null || (values[spec.enabledBy] ?? '').trim().toLowerCase() === 'true';
 }

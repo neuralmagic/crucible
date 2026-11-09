@@ -4,6 +4,7 @@ import {
   initialValues,
   isEnabled,
   launchBody,
+  paramBlocks,
   mapServerRejection,
   parseParamsSchema,
   parseMaxTime,
@@ -500,5 +501,27 @@ describe('runSnapshot', () => {
       max_time: '2h',
       schema_digest: 'sha256:beef',
     });
+  });
+});
+
+describe('paramBlocks', () => {
+  const spec = (name: string, valueType: ParamFieldSpec['valueType'], enabledBy: string | null = null): ParamFieldSpec => ({
+    name, valueType, required: false, defaultValue: null, pattern: null, description: null, multiline: false,
+    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy,
+  });
+
+  it('moves a gate to the head of a group at its first gated field and leaves other booleans alone', () => {
+    const specs = [
+      spec('release', 'string'),
+      spec('override', 'boolean'),
+      spec('branch', 'string', 'override'),
+      spec('tentative', 'boolean'),
+      spec('remote', 'string', 'override'),
+    ];
+    expect(paramBlocks(specs).map((b) => (b.kind === 'field' ? b.spec.name : `${b.gate.name}[${b.fields.map((f) => f.name).join(',')}]`))).toEqual([
+      'release',
+      'override[branch,remote]',
+      'tentative',
+    ]);
   });
 });
