@@ -6,11 +6,14 @@
 //! Output contract, mirroring `measure_cmd`: the last non-empty stdout line is the task's
 //! JSON result. Nonzero exit is a measured failure; failure to spawn is transport. A command
 //! still running at its deadline is killed with its whole process group and fails measured.
+//! Each output line is echoed to the engine's stderr as `[task] line` while the command runs.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, PoisonError};
 
 use serde_json::Value;
 
@@ -266,21 +269,24 @@ impl ShellRunner {
                 return Attempt::failed(0.0, "engine task reached a non-loop runner".to_string());
             }
         }
-        let out = match run_to_completion(&mut cmd, deadline) {
+        let out = match run_echoed(&mut cmd, deadline, &task.name.0, std::io::stderr()) {
             Ok(Finished::Exited(out)) => out,
             Ok(Finished::Killed(deadline)) => return Attempt::timed_out(0.0, deadline),
             Err(e) => {
                 return Attempt::transport(TransportCause::Command, format!("spawn failed: {e}"));
             }
         };
-        let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
-            let output = last_json_line(&stdout).filter(Value::is_object);
+            let output = out
+                .result_line
+                .as_deref()
+                .and_then(json_line)
+                .filter(Value::is_object);
             let reason = output
                 .as_ref()
                 .and_then(own_note)
                 .map(str::to_owned)
-                .unwrap_or_else(|| stderr_tail(&String::from_utf8_lossy(&out.stderr)));
+                .unwrap_or_else(|| stderr_tail(&out.stderr()));
             return Attempt {
                 outcome: AttemptOutcome::failed_as_declared(
                     format!("exit {}: {reason}", out.status.code().unwrap_or(-1)),
@@ -290,7 +296,7 @@ impl ShellRunner {
                 repairs: Vec::new(),
             };
         }
-        let Some(last) = stdout.lines().rev().find(|l| !l.trim().is_empty()) else {
+        let Some(last) = out.result_line.as_deref() else {
             return Attempt::failed(
                 0.0,
                 "no output: expected a JSON result on the last stdout line".to_string(),
@@ -317,54 +323,185 @@ fn inputs_file(json: &str) -> std::io::Result<tempfile::NamedTempFile> {
 }
 
 /// How a command ended: on its own, or killed at its deadline.
-enum Finished {
-    Exited(std::process::Output),
+pub enum Finished {
+    Exited(Captured),
     Killed(Deadline),
 }
 
-/// `Command::output` under a deadline. Stdin is closed, as `output` leaves it; stderr drains on
-/// its own thread so a command filling one pipe cannot wedge the other.
-fn run_to_completion(cmd: &mut Command, deadline: Option<Deadline>) -> std::io::Result<Finished> {
+/// What an exited command left behind: its status, its last non-empty stdout line, and the last
+/// [`TAIL_LINES`] non-empty stderr lines, oldest first.
+pub struct Captured {
+    pub status: std::process::ExitStatus,
+    pub result_line: Option<String>,
+    pub stderr_lines: Vec<String>,
+}
+
+impl Captured {
+    pub fn stderr(&self) -> String {
+        self.stderr_lines.join("\n")
+    }
+}
+
+/// Longest stdout line kept as the result. Past it the line is clipped, so it fails as JSON.
+const RESULT_LINE_BYTES: usize = 8 * 1024 * 1024;
+/// Longest stderr line kept for the tail; [`stderr_tail`] clips far shorter.
+const STDERR_LINE_BYTES: usize = 4096;
+/// Longest line echoed; the rest is replaced by `…`.
+const ECHO_LINE_BYTES: usize = 2048;
+/// Bytes echoed per command, prefixes included, before the rest is counted instead.
+const ECHO_BYTES: usize = 1024 * 1024;
+
+/// Run `cmd` under an optional deadline, echoing each non-blank output line to `sink` as
+/// `[label] line` while it runs. Stdin is closed. Both pipes are read on their own threads so a
+/// command filling one cannot wedge the other.
+pub fn run_echoed(
+    cmd: &mut Command,
+    deadline: Option<Deadline>,
+    label: &str,
+    sink: impl Write + Send,
+) -> std::io::Result<Finished> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = Supervised::spawn(cmd, deadline)?;
     let stdout = child.child().stdout.take();
     let stderr = child.child().stderr.take();
-    let stderr_thread = std::thread::spawn(move || drain(stderr));
-    let stdout = drain(stdout);
-    let stderr = stderr_thread.join().unwrap_or_default();
+    let echo = Mutex::new(Echo::new(label, sink));
+    let (result_line, stderr_lines) = std::thread::scope(|scope| {
+        let echo = &echo;
+        let stderr_thread = scope.spawn(move || {
+            let mut tail = VecDeque::with_capacity(TAIL_LINES);
+            each_line(stderr, STDERR_LINE_BYTES, |line| {
+                echo_line(echo, line);
+                let line = String::from_utf8_lossy(line);
+                if !line.trim().is_empty() {
+                    if tail.len() == TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line.into_owned());
+                }
+            });
+            Vec::from(tail)
+        });
+        let mut result_line = None;
+        each_line(stdout, RESULT_LINE_BYTES, |line| {
+            echo_line(echo, line);
+            if !line.trim_ascii().is_empty() {
+                result_line = Some(String::from_utf8_lossy(line).into_owned());
+            }
+        });
+        (result_line, stderr_thread.join().unwrap_or_default())
+    });
+    echo.into_inner()
+        .unwrap_or_else(PoisonError::into_inner)
+        .finish();
     let reaped = child.wait()?;
     if let Some(deadline) = reaped.killed_at {
         return Ok(Finished::Killed(deadline));
     }
-    Ok(Finished::Exited(std::process::Output {
+    Ok(Finished::Exited(Captured {
         status: reaped.status,
-        stdout,
-        stderr,
+        result_line,
+        stderr_lines,
     }))
 }
 
-fn drain(pipe: Option<impl Read>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut bytes);
+/// Call `f` with each line read from `pipe`, without its `\n` or `\r\n`, clipped to `max` bytes.
+fn each_line(pipe: Option<impl Read>, max: usize, mut f: impl FnMut(&[u8])) {
+    let Some(pipe) = pipe else {
+        return;
+    };
+    let mut reader = BufReader::new(pipe);
+    let mut line = Vec::new();
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        let newline = chunk.iter().position(|&b| b == b'\n');
+        let taken = newline.unwrap_or(chunk.len());
+        let room = max.saturating_sub(line.len());
+        line.extend_from_slice(&chunk[..taken.min(room)]);
+        reader.consume(newline.map_or(taken, |at| at + 1));
+        if newline.is_some() {
+            f(line.strip_suffix(b"\r").unwrap_or(&line));
+            line.clear();
+        }
     }
-    bytes
+    if !line.is_empty() {
+        f(line.strip_suffix(b"\r").unwrap_or(&line));
+    }
 }
 
-/// The task's JSON result, where the last non-empty stdout line carries one.
-fn last_json_line(stdout: &str) -> Option<Value> {
-    stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
+fn echo_line<W: Write>(echo: &Mutex<Echo<'_, W>>, line: &[u8]) {
+    echo.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .line(line);
+}
+
+/// A command's output echo, capped at [`ECHO_BYTES`].
+struct Echo<'a, W> {
+    label: &'a str,
+    sink: W,
+    shown: usize,
+    hidden: u64,
+}
+
+impl<'a, W: Write> Echo<'a, W> {
+    fn new(label: &'a str, sink: W) -> Self {
+        Echo {
+            label,
+            sink,
+            shown: 0,
+            hidden: 0,
+        }
+    }
+
+    fn line(&mut self, line: &[u8]) {
+        if line.trim_ascii().is_empty() {
+            return;
+        }
+        if self.shown >= ECHO_BYTES {
+            self.hidden += 1;
+            return;
+        }
+        let clipped = &line[..line.len().min(ECHO_LINE_BYTES)];
+        let text = String::from_utf8_lossy(clipped);
+        let more = if clipped.len() < line.len() {
+            "…"
+        } else {
+            ""
+        };
+        let echoed = format!("[{}] {text}{more}\n", self.label);
+        self.shown += echoed.len();
+        self.emit(&echoed);
+    }
+
+    fn finish(mut self) {
+        if self.hidden > 0 {
+            let notice = format!("[{}] … {} more lines not shown\n", self.label, self.hidden);
+            self.emit(&notice);
+        }
+    }
+
+    fn emit(&mut self, text: &str) {
+        let _ = self.sink.write_all(text.as_bytes());
+        let _ = self.sink.flush();
+    }
+}
+
+/// The task's JSON result, where its last non-empty stdout line carries one.
+pub fn json_line(line: &str) -> Option<Value> {
+    serde_json::from_str::<Value>(line.trim()).ok()
 }
 
 /// Lines kept from the end of stderr. A build/pytest verdict plus its immediate
 /// context fits well inside this; more would drown the row.
-const TAIL_LINES: usize = 40;
+pub const TAIL_LINES: usize = 40;
 /// Per-line clip. Long torch stack frames and nvcc command echoes are mostly path
 /// noise, and one of them must not eat the whole budget.
 const TAIL_LINE_CHARS: usize = 240;
@@ -1740,6 +1877,186 @@ mod tests {
     #[test]
     fn stderr_tail_escapes_pipes() {
         assert_eq!(stderr_tail("a | b\n"), "a \\| b");
+    }
+
+    /// A sink that stamps each write, to show lines reach it while the command still runs.
+    #[derive(Default)]
+    struct Stamped(Vec<(std::time::Instant, String)>);
+    impl std::io::Write for &mut Stamped {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push((
+                std::time::Instant::now(),
+                String::from_utf8_lossy(buf).into_owned(),
+            ));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn echoed(script: &str, label: &str, deadline: Option<Deadline>) -> (Finished, String) {
+        let mut sink = Vec::new();
+        let finished = run_echoed(
+            std::process::Command::new("sh").arg("-c").arg(script),
+            deadline,
+            label,
+            &mut sink,
+        )
+        .unwrap();
+        (finished, String::from_utf8(sink).unwrap())
+    }
+
+    fn exited(finished: Finished) -> Captured {
+        match finished {
+            Finished::Exited(captured) => captured,
+            Finished::Killed(deadline) => panic!("killed at {}", deadline.note()),
+        }
+    }
+
+    fn lines_of<'a>(echo: &'a str, stream: &str) -> Vec<&'a str> {
+        echo.lines().filter(|line| line.contains(stream)).collect()
+    }
+
+    #[test]
+    fn output_lines_echo_prefixed_with_the_instance_name_and_in_order() {
+        let (finished, echo) = echoed(
+            "echo out1; echo err1 >&2; echo; echo out2; echo '   '; echo err2 >&2; \
+             printf 'out3\\r\\n'; printf 'err3' >&2; echo '{\"score\": 3}'",
+            "task[3]",
+            None,
+        );
+        let captured = exited(finished);
+        assert!(captured.status.success());
+        assert_eq!(
+            lines_of(&echo, "out"),
+            ["[task[3]] out1", "[task[3]] out2", "[task[3]] out3"]
+        );
+        assert_eq!(
+            lines_of(&echo, "err"),
+            ["[task[3]] err1", "[task[3]] err2", "[task[3]] err3"]
+        );
+        assert_eq!(lines_of(&echo, "score"), [r#"[task[3]] {"score": 3}"#]);
+        assert_eq!(echo.lines().count(), 7, "blank lines were echoed: {echo}");
+        assert_eq!(captured.result_line.as_deref(), Some(r#"{"score": 3}"#));
+        assert_eq!(captured.stderr_lines, ["err1", "err2", "err3"]);
+    }
+
+    #[test]
+    fn a_line_reaches_the_sink_while_the_command_still_runs() {
+        let mut sink = Stamped::default();
+        let started = std::time::Instant::now();
+        let finished = run_echoed(
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg("echo early; sleep 1; echo '{}'"),
+            None,
+            "slow",
+            &mut sink,
+        )
+        .unwrap();
+        let ended = std::time::Instant::now();
+        assert!(exited(finished).status.success());
+        let (at, line) = &sink.0[0];
+        assert_eq!(line, "[slow] early\n");
+        assert!(
+            ended.duration_since(*at) >= std::time::Duration::from_millis(500),
+            "the line waited for the exit: echoed {:?} after the start, exit at {:?}",
+            at.duration_since(started),
+            ended.duration_since(started)
+        );
+    }
+
+    #[test]
+    fn a_flood_on_both_pipes_neither_wedges_nor_echoes_past_the_cap() {
+        let lines = 200_000;
+        let (finished, echo) = echoed(
+            &format!(
+                "yes err | head -n {lines} >&2; yes noise | head -n {lines}; \
+                 yes err | head -n {lines} >&2; echo '{{\"ok\": 1}}'"
+            ),
+            "flood",
+            None,
+        );
+        let captured = exited(finished);
+        assert!(captured.status.success());
+        assert_eq!(captured.result_line.as_deref(), Some(r#"{"ok": 1}"#));
+        assert_eq!(captured.stderr_lines.len(), TAIL_LINES);
+        assert!(
+            echo.len() <= ECHO_BYTES + ECHO_LINE_BYTES + 64,
+            "echoed {} bytes",
+            echo.len()
+        );
+        let notice = echo.lines().last().unwrap();
+        let shown = echo.lines().count() - 1;
+        assert_eq!(
+            notice,
+            format!("[flood] … {} more lines not shown", 3 * lines + 1 - shown)
+        );
+    }
+
+    #[test]
+    fn a_long_line_echoes_clipped_and_still_parses_as_the_result() {
+        let (finished, echo) = echoed(
+            r#"head -c 100000 /dev/zero | tr '\0' x; echo; printf '{"blob": "%s"}\n' "$(head -c 50000 /dev/zero | tr '\0' y)""#,
+            "long",
+            None,
+        );
+        let captured = exited(finished);
+        let echoed: Vec<&str> = echo.lines().collect();
+        assert_eq!(echoed.len(), 2);
+        for line in echoed {
+            assert_eq!(line.len(), "[long] ".len() + ECHO_LINE_BYTES + "…".len());
+            assert!(line.ends_with('…'));
+        }
+        let result = json_line(captured.result_line.as_deref().unwrap()).unwrap();
+        assert_eq!(result["blob"].as_str().unwrap().len(), 50_000);
+    }
+
+    #[test]
+    fn a_command_killed_at_its_deadline_reports_the_kill_after_echoing_what_it_printed() {
+        let deadline =
+            Deadline::for_attempt(std::time::Instant::now(), Some("1s".parse().unwrap()), None);
+        let (finished, echo) = echoed("echo started; sleep 30", "hang", deadline);
+        assert!(matches!(finished, Finished::Killed(_)));
+        assert_eq!(echo, "[hang] started\n");
+    }
+
+    #[test]
+    fn a_noisy_command_still_settles_on_its_last_json_line() {
+        let out = run_plan(
+            vec![command(
+                "noisy",
+                r#"for i in $(seq 1 50); do echo "step $i"; echo "warn $i" >&2; done; echo '{"score": 7}'; echo"#,
+                &[],
+            )],
+            None,
+        );
+        let noisy = &out.results[&"noisy".into()];
+        assert_eq!(noisy.status, TaskStatus::Pass);
+        assert_eq!(noisy.output.as_ref().unwrap()["score"], 7);
+    }
+
+    #[test]
+    fn a_stderr_only_failure_notes_the_last_lines_of_a_long_stderr() {
+        let out = run_plan(
+            vec![command(
+                "boom",
+                "for i in $(seq 1 100); do echo err$i >&2; done; exit 2",
+                &[],
+            )],
+            None,
+        );
+        let boom = &out.results[&"boom".into()];
+        assert_eq!(boom.status, TaskStatus::Fail);
+        let tail = (61..=100)
+            .map(|i| format!("err{i}"))
+            .collect::<Vec<_>>()
+            .join(" ⏎ ");
+        assert_eq!(
+            boom.note.as_deref(),
+            Some(format!("exit 2: {tail}").as_str())
+        );
     }
 
     fn limited(mut task: Task, limit: &str) -> Task {

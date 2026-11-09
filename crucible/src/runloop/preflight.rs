@@ -4,8 +4,8 @@
 //! seeds `segment.baseline_score` so the first `decide` compares against a real number.
 //!
 //! Execution contract mirrors [`crate::plan::runner::ShellRunner`]: `sh -c <cmd>` in the
-//! workspace, the last non-empty stdout line is a JSON object, success is exit 0 plus
-//! `pass` absent-or-true.
+//! workspace, output echoed as `[preflight] line`, the last non-empty stdout line is a JSON
+//! object, success is exit 0 plus `pass` absent-or-true.
 
 use std::path::Path;
 use std::process::Command;
@@ -15,6 +15,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::manifest::{MODE_PLACEHOLDER, PreflightCfg};
+use crate::plan::runner::{Finished, json_line, run_echoed};
 use crate::process::STOP;
 use crate::report::reporter::Reporter;
 
@@ -163,23 +164,37 @@ fn substitute_digest(command: &str, digest: Option<&str>) -> Result<String> {
 }
 
 fn run_one(command: &str, workspace: &Path) -> Result<Capture> {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(workspace)
-        .output()
-        .map_err(|e| PreflightFailed {
-            command: command.to_string(),
-            note: format!("spawn failed: {e}"),
-            stderr_tail: String::new(),
-        })?;
-    let stderr_tail = stderr_tail(&String::from_utf8_lossy(&out.stderr));
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let json = stdout
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .and_then(|l| serde_json::from_str::<Value>(l.trim()).ok())
+    let spawn_failed = |e: std::io::Error| PreflightFailed {
+        command: command.to_string(),
+        note: format!("spawn failed: {e}"),
+        stderr_tail: String::new(),
+    };
+    let out = match run_echoed(
+        Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(workspace),
+        None,
+        "preflight",
+        std::io::stderr(),
+    )
+    .map_err(spawn_failed)?
+    {
+        Finished::Exited(out) => out,
+        Finished::Killed(_) => {
+            return Err(PreflightFailed {
+                command: command.to_string(),
+                note: "killed at a deadline".to_string(),
+                stderr_tail: String::new(),
+            }
+            .into());
+        }
+    };
+    let stderr_tail = stderr_tail(&out.stderr());
+    let json = out
+        .result_line
+        .as_deref()
+        .and_then(json_line)
         .filter(Value::is_object);
 
     if !out.status.success() {
