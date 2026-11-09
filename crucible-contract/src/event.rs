@@ -190,7 +190,7 @@ pub enum AgentEvent {
     Raw { text: String, stream: RawStream },
 }
 
-/// Which OS stream an unclassified line came from.
+/// Which OS stream a line came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawStream {

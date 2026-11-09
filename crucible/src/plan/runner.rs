@@ -6,20 +6,21 @@
 //! Output contract, mirroring `measure_cmd`: the last non-empty stdout line is the task's
 //! JSON result. Nonzero exit is a measured failure; failure to spawn is transport. A command
 //! still running at its deadline is killed with its whole process group and fails measured.
+//! Each output line is echoed to the engine's stderr as `[task] line` while the command runs.
 
 use std::collections::BTreeMap;
-use std::io::Read;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use serde_json::Value;
 
 use crate::crucible::Direction;
-use crate::deadline::{Deadline, Supervised};
+use crate::deadline::Deadline;
 use crate::plan::admission::Lane;
 use crate::plan::attempt::{Attempt, AttemptOutcome, own_note};
 use crate::plan::exec::TaskRunner;
 use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
+use crate::plan::output::{Finished, Output, json_line, run_echoed};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 
@@ -71,7 +72,7 @@ impl TaskRunner for ShellRunner {
                 ),
             );
         }
-        self.run_in_workdir(task, inputs, deadline)
+        self.run_in_workdir(task, inputs, deadline, lane)
     }
 }
 
@@ -82,6 +83,7 @@ impl ShellRunner {
         task: &Task,
         inputs: &BTreeMap<TaskName, Value>,
         deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
         if task.isolation != Some(crate::plan::ir::Isolation::Worktree) {
             return Attempt::failed(
@@ -89,7 +91,7 @@ impl ShellRunner {
                 format!("task {} was not declared for worktree isolation", task.name),
             );
         }
-        self.run_in_workdir(task, inputs, deadline)
+        self.run_in_workdir(task, inputs, deadline, lane)
     }
 
     fn run_in_workdir(
@@ -97,6 +99,7 @@ impl ShellRunner {
         task: &Task,
         inputs: &BTreeMap<TaskName, Value>,
         deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
@@ -266,21 +269,29 @@ impl ShellRunner {
                 return Attempt::failed(0.0, "engine task reached a non-loop runner".to_string());
             }
         }
-        let out = match run_to_completion(&mut cmd, deadline) {
+        let record = |output: Output| {
+            if let Some(lane) = lane {
+                lane.record_output(output);
+            }
+        };
+        let out = match run_echoed(&mut cmd, deadline, &task.name.0, std::io::stderr(), record) {
             Ok(Finished::Exited(out)) => out,
             Ok(Finished::Killed(deadline)) => return Attempt::timed_out(0.0, deadline),
             Err(e) => {
                 return Attempt::transport(TransportCause::Command, format!("spawn failed: {e}"));
             }
         };
-        let stdout = String::from_utf8_lossy(&out.stdout);
         if !out.status.success() {
-            let output = last_json_line(&stdout).filter(Value::is_object);
+            let output = out
+                .result_line
+                .as_deref()
+                .and_then(json_line)
+                .filter(Value::is_object);
             let reason = output
                 .as_ref()
                 .and_then(own_note)
                 .map(str::to_owned)
-                .unwrap_or_else(|| stderr_tail(&String::from_utf8_lossy(&out.stderr)));
+                .unwrap_or_else(|| stderr_tail(&out.stderr()));
             return Attempt {
                 outcome: AttemptOutcome::failed_as_declared(
                     format!("exit {}: {reason}", out.status.code().unwrap_or(-1)),
@@ -290,7 +301,7 @@ impl ShellRunner {
                 repairs: Vec::new(),
             };
         }
-        let Some(last) = stdout.lines().rev().find(|l| !l.trim().is_empty()) else {
+        let Some(last) = out.result_line.as_deref() else {
             return Attempt::failed(
                 0.0,
                 "no output: expected a JSON result on the last stdout line".to_string(),
@@ -314,52 +325,6 @@ fn inputs_file(json: &str) -> std::io::Result<tempfile::NamedTempFile> {
         .tempfile()?;
     std::io::Write::write_all(&mut file, json.as_bytes())?;
     Ok(file)
-}
-
-/// How a command ended: on its own, or killed at its deadline.
-enum Finished {
-    Exited(std::process::Output),
-    Killed(Deadline),
-}
-
-/// `Command::output` under a deadline. Stdin is closed, as `output` leaves it; stderr drains on
-/// its own thread so a command filling one pipe cannot wedge the other.
-fn run_to_completion(cmd: &mut Command, deadline: Option<Deadline>) -> std::io::Result<Finished> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = Supervised::spawn(cmd, deadline)?;
-    let stdout = child.child().stdout.take();
-    let stderr = child.child().stderr.take();
-    let stderr_thread = std::thread::spawn(move || drain(stderr));
-    let stdout = drain(stdout);
-    let stderr = stderr_thread.join().unwrap_or_default();
-    let reaped = child.wait()?;
-    if let Some(deadline) = reaped.killed_at {
-        return Ok(Finished::Killed(deadline));
-    }
-    Ok(Finished::Exited(std::process::Output {
-        status: reaped.status,
-        stdout,
-        stderr,
-    }))
-}
-
-fn drain(pipe: Option<impl Read>) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    if let Some(mut pipe) = pipe {
-        let _ = pipe.read_to_end(&mut bytes);
-    }
-    bytes
-}
-
-/// The task's JSON result, where the last non-empty stdout line carries one.
-fn last_json_line(stdout: &str) -> Option<Value> {
-    stdout
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .and_then(|line| serde_json::from_str::<Value>(line.trim()).ok())
 }
 
 /// Lines kept from the end of stderr. A build/pytest verdict plus its immediate
@@ -1740,6 +1705,113 @@ mod tests {
     #[test]
     fn stderr_tail_escapes_pipes() {
         assert_eq!(stderr_tail("a | b\n"), "a \\| b");
+    }
+
+    #[test]
+    fn a_command_tasks_output_lands_in_the_session_journal_under_its_attempt() {
+        use crucible_contract::event::RawStream;
+        use crucible_contract::session::{SessionEvent, decode};
+        let journal = tempfile::NamedTempFile::new().unwrap();
+        let plan = Plan {
+            version: 1,
+            reason: None,
+            budget: PlanBudget { usd: 1.0 },
+            params: std::collections::BTreeMap::new(),
+            tasks: vec![command(
+                "say",
+                r#"echo hello; sleep 0.4; echo oops >&2; sleep 0.4; echo '{"ok": true}'"#,
+                &[],
+            )],
+        }
+        .validate()
+        .unwrap();
+        let out = execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg {
+                journal: Some(journal.as_file()),
+                ..ExecCfg::default()
+            },
+            &mut runner(),
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"say".into()].status, TaskStatus::Pass);
+        let events: Vec<SessionEvent> = std::fs::read_to_string(journal.path())
+            .unwrap()
+            .lines()
+            .filter_map(decode)
+            .collect();
+        let started = events
+            .iter()
+            .position(
+                |event| matches!(event, SessionEvent::TaskStarted { task, .. } if task == "say"),
+            )
+            .expect("no task_started");
+        let output: Vec<(usize, u32, RawStream, Vec<String>)> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                SessionEvent::TaskOutput {
+                    task,
+                    attempt,
+                    stream,
+                    lines,
+                } => {
+                    assert_eq!(task, "say");
+                    Some((at, *attempt, *stream, lines.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(output.iter().all(|(at, ..)| *at > started));
+        assert_eq!(
+            output
+                .into_iter()
+                .map(|(_, attempt, stream, lines)| (attempt, stream, lines))
+                .collect::<Vec<_>>(),
+            [
+                (1, RawStream::Stdout, vec!["hello".to_string()]),
+                (1, RawStream::Stderr, vec!["oops".to_string()]),
+                (1, RawStream::Stdout, vec![r#"{"ok": true}"#.to_string()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_noisy_command_still_settles_on_its_last_json_line() {
+        let out = run_plan(
+            vec![command(
+                "noisy",
+                r#"for i in $(seq 1 50); do echo "step $i"; echo "warn $i" >&2; done; echo '{"score": 7}'; echo"#,
+                &[],
+            )],
+            None,
+        );
+        let noisy = &out.results[&"noisy".into()];
+        assert_eq!(noisy.status, TaskStatus::Pass);
+        assert_eq!(noisy.output.as_ref().unwrap()["score"], 7);
+    }
+
+    #[test]
+    fn a_stderr_only_failure_notes_the_last_lines_of_a_long_stderr() {
+        let out = run_plan(
+            vec![command(
+                "boom",
+                "for i in $(seq 1 100); do echo err$i >&2; done; exit 2",
+                &[],
+            )],
+            None,
+        );
+        let boom = &out.results[&"boom".into()];
+        assert_eq!(boom.status, TaskStatus::Fail);
+        let tail = (61..=100)
+            .map(|i| format!("err{i}"))
+            .collect::<Vec<_>>()
+            .join(" ⏎ ");
+        assert_eq!(
+            boom.note.as_deref(),
+            Some(format!("exit 2: {tail}").as_str())
+        );
     }
 
     fn limited(mut task: Task, limit: &str) -> Task {
