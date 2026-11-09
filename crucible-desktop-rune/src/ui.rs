@@ -1,5 +1,6 @@
 //! The window: live playbooks and local packs on the left, the selected run on the right.
 
+mod approvals;
 mod compare;
 mod data;
 mod decisions;
@@ -607,6 +608,11 @@ fn pages_nav(app: &App, p: &Paint) -> El {
             &oc::CHECKLIST,
             (waiting > 0).then(|| waiting.to_string()),
         ))
+        .child(entry(
+            crate::Page::Approvals,
+            &oc::CHECKLIST,
+            (app.approvals_waiting() > 0).then(|| app.approvals_waiting().to_string()),
+        ))
         .child(entry(crate::Page::Schedules, &oc::STATUS, None))
         .child(entry(crate::Page::Secrets, &rune_kit::glyphs::LOCK, None))
 }
@@ -1124,6 +1130,7 @@ fn detail(app: &App, p: &Paint) -> El {
         crate::Page::Schedules => return schedules::page(app, p),
         crate::Page::Secrets => return secrets::page(app, p),
         crate::Page::Decisions => return decisions::page(app, p),
+        crate::Page::Approvals => return approvals::page(app, p),
         crate::Page::Runs => {}
     }
     if let (

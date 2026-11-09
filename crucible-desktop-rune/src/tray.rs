@@ -185,7 +185,7 @@ impl App {
         let now = shown(
             &self.target.name,
             &running,
-            self.waiting(),
+            self.waiting() + self.approvals_waiting(),
             self.pinned.as_deref(),
         );
         let last = self.tray.as_ref();

@@ -41,7 +41,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 42] = [
+    pub const ALL: [Command; 43] = [
         Command::Palette,
         Command::Search,
         Command::Focus(Edge::Left),
@@ -68,6 +68,7 @@ impl Command {
         Command::Open(Page::Schedules),
         Command::Open(Page::Secrets),
         Command::Open(Page::Decisions),
+        Command::Open(Page::Approvals),
         Command::Open(Page::Settings),
         Command::SaveDraft,
         Command::LaunchWorkingCopy,

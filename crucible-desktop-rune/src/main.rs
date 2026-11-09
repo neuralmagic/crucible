@@ -162,6 +162,7 @@ pub enum Page {
     Schedules,
     Secrets,
     Decisions,
+    Approvals,
     Settings,
 }
 
@@ -172,6 +173,7 @@ impl Page {
             Page::Schedules => "schedules",
             Page::Secrets => "secrets",
             Page::Decisions => "decisions",
+            Page::Approvals => "approvals",
             Page::Settings => "settings",
         }
     }
@@ -182,6 +184,7 @@ impl Page {
             Page::Schedules => "Schedules",
             Page::Secrets => "Secrets",
             Page::Decisions => "Decisions",
+            Page::Approvals => "Approvals",
             Page::Settings => "Settings",
         }
     }
@@ -1423,12 +1426,12 @@ fn main() {
                 scene_tab(app);
                 app.page = Page::Settings;
             }),
-            // `CRUCIBLE_PAGE` opens that page (schedules, secrets or decisions) against the
+            // `CRUCIBLE_PAGE` opens that page (schedules, secrets, decisions or approvals) against the
             // controller crux's config names.
             ("page", |app: &mut App| {
                 app.backend = Backend::Controller;
                 let page = std::env::var("CRUCIBLE_PAGE").unwrap_or_default();
-                if let Some(page) = [Page::Schedules, Page::Secrets, Page::Decisions]
+                if let Some(page) = [Page::Schedules, Page::Secrets, Page::Decisions, Page::Approvals]
                     .into_iter()
                     .find(|p| p.id() == page)
                 {
