@@ -19,6 +19,9 @@ use crate::plan::runner::{Finished, json_line, run_echoed};
 use crate::process::STOP;
 use crate::report::reporter::Reporter;
 
+/// The task name a rung's echoed and recorded output carries.
+const PREFLIGHT_TASK: &str = "preflight";
+
 /// The `{digest}` placeholder, filled from the most recent `digest` a rung emitted.
 const DIGEST_PLACEHOLDER: &str = "{digest}";
 
@@ -124,7 +127,7 @@ fn run_rung(
     }
     let command = substitute_digest(command, digest.as_deref())?;
     r.note(&format!("preflight: {command}"));
-    let cap = run_one(&command, workspace)?;
+    let cap = run_one(&command, workspace, r)?;
     for line in &cap.logs {
         r.note(&format!("preflight log: {line}"));
     }
@@ -163,7 +166,7 @@ fn substitute_digest(command: &str, digest: Option<&str>) -> Result<String> {
     }
 }
 
-fn run_one(command: &str, workspace: &Path) -> Result<Capture> {
+fn run_one(command: &str, workspace: &Path, r: &mut dyn Reporter) -> Result<Capture> {
     let spawn_failed = |e: std::io::Error| PreflightFailed {
         command: command.to_string(),
         note: format!("spawn failed: {e}"),
@@ -175,8 +178,9 @@ fn run_one(command: &str, workspace: &Path) -> Result<Capture> {
             .arg(command)
             .current_dir(workspace),
         None,
-        "preflight",
+        PREFLIGHT_TASK,
         std::io::stderr(),
+        |output| r.plan_event(&output.into_event(PREFLIGHT_TASK.to_string(), 1)),
     )
     .map_err(spawn_failed)?
     {

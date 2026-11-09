@@ -152,6 +152,15 @@ impl Lane<'_> {
         }
     }
 
+    /// Add one of this attempt's output events to the session's transcript. A failed write costs
+    /// the transcript a line, never the attempt.
+    pub fn record_output(&self, output: crate::plan::runner::Output) {
+        let event = output.into_event(self.task.0.clone(), self.attempt);
+        if let Err(error) = self.admission.append(&event, false) {
+            tracing::warn!(task = %self.task, attempt = self.attempt, %error, "recording task output failed");
+        }
+    }
+
     pub fn deadline(&self) -> Option<Deadline> {
         self.deadline
     }

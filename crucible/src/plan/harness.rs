@@ -856,7 +856,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
                 github,
             };
             return if task.isolation == Some(Isolation::Worktree) {
-                shell.run_in_prepared_worktree(task, inputs, deadline)
+                shell.run_in_prepared_worktree(task, inputs, deadline, lane)
             } else {
                 shell.run(task, attempt, inputs, lane)
             };

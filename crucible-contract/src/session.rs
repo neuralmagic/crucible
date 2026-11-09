@@ -5,7 +5,7 @@
 //! This is the wire-only half of the format: plain-data types and the codec, with no dependency
 //! on the CLI's in-process `Row`/`Phase` state (that bridge lives in `crucible::session`).
 
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, RawStream};
 use crate::identity::RunIdentity;
 use serde::{Deserialize, Serialize};
 
@@ -522,6 +522,22 @@ pub enum SessionEvent {
         task: String,
         attempt: u32,
         event: AgentEvent,
+    },
+    /// Lines a playbook command or evaluate attempt printed, in arrival order, batched while
+    /// they come from one stream. `task` names a fan-out instance by its raw key. Each line is
+    /// capped by the engine with the cut marked.
+    TaskOutput {
+        task: String,
+        attempt: u32,
+        stream: RawStream,
+        lines: Vec<String>,
+    },
+    /// The attempt printed `lines` more lines past the engine's per-attempt output cap, none of
+    /// them recorded. Emitted once, after the attempt's last `TaskOutput`.
+    TaskOutputDropped {
+        task: String,
+        attempt: u32,
+        lines: u64,
     },
     /// One work-graph task attempt reached a terminal status. Covers both the plan executor
     /// (`plan_version` + `kind` + `output`) and measure-DAG walks (`iter` + `digest` + `job` +
@@ -1527,6 +1543,44 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn task_output_events_round_trip_with_their_wire_names() {
+        let output = SessionEvent::TaskOutput {
+            task: "build[3]".into(),
+            attempt: 2,
+            stream: RawStream::Stderr,
+            lines: vec!["warning: unused".into(), "error: boom".into()],
+        };
+        assert_eq!(
+            encode(&output),
+            r#"{"v":1,"kind":"task_output","task":"build[3]","attempt":2,"stream":"stderr","lines":["warning: unused","error: boom"]}"#
+        );
+        assert_round_trips(output);
+        let dropped = SessionEvent::TaskOutputDropped {
+            task: "build[3]".into(),
+            attempt: 2,
+            lines: 41,
+        };
+        assert_eq!(
+            encode(&dropped),
+            r#"{"v":1,"kind":"task_output_dropped","task":"build[3]","attempt":2,"lines":41}"#
+        );
+        assert_round_trips(dropped);
+    }
+
+    #[test]
+    fn a_reader_skips_a_kind_it_does_not_know_and_keeps_reading() {
+        let log = [
+            r#"{"v":1,"kind":"task_output_v9","task":"t","attempt":1,"chunks":[]}"#,
+            r#"{"v":1,"kind":"note","msg":"after"}"#,
+        ];
+        let decoded: Vec<SessionEvent> = log.iter().filter_map(|line| decode(line)).collect();
+        assert!(
+            matches!(decoded.as_slice(), [SessionEvent::Note { msg }] if msg == "after"),
+            "{decoded:?}"
+        );
     }
 
     #[test]
