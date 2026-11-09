@@ -257,11 +257,273 @@ pub fn ceilings(
     Ok((cost, time.trim().to_string()))
 }
 
+/// What the controller said when it refused a launch: each field's message, else its `error`,
+/// else the error as it came.
+pub fn refusal(error: &str) -> String {
+    let body = error
+        .find('{')
+        .and_then(|at| serde_json::from_str::<Value>(error[at..].trim()).ok());
+    let Some(body) = body else {
+        return error.to_string();
+    };
+    let fields: Vec<String> = body
+        .get("fields")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f.get("message").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    if !fields.is_empty() {
+        return fields.join("\n");
+    }
+    body.get("error")
+        .and_then(Value::as_str)
+        .map_or_else(|| error.to_string(), str::to_string)
+}
+
+/// The dispatch targets a launch can pick, as (name, label), default first.
+pub fn targets(list: &crux::dto::DispatchTargets) -> Vec<(String, String)> {
+    let mut targets: Vec<&crux::dto::DispatchTarget> = list.targets.iter().collect();
+    targets.sort_by_key(|t| !t.default);
+    targets
+        .into_iter()
+        .map(|t| {
+            let label = if t.label.is_empty() {
+                &t.name
+            } else {
+                &t.label
+            };
+            (t.name.clone(), label.clone())
+        })
+        .collect()
+}
+
+/// The providers an agent can run against, as (id, label), after `Default`, which leaves the
+/// controller's dispatch default to pick.
+pub fn providers(list: &[crux::dto::Provider]) -> Vec<(String, String)> {
+    let mut out = vec![(String::new(), "Default".to_string())];
+    out.extend(
+        list.iter()
+            .filter(|p| p.enabled && (p.roles.is_empty() || p.roles.iter().any(|r| r == "agent")))
+            .map(|p| {
+                let label = p.display_name.clone().filter(|n| !n.is_empty());
+                (p.id.clone(), label.unwrap_or_else(|| p.id.clone()))
+            }),
+    );
+    out
+}
+
+/// The key of the newest of `launches` that dispatched a run.
+pub fn newest_dispatched(launches: &[crux::dto::PlaybookRun]) -> Option<String> {
+    launches
+        .iter()
+        .filter(|l| l.runs > 0)
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))
+        .map(|l| l.key.clone())
+}
+
+/// The target a form starts on: the one asked for before when it is still offered, else the
+/// default.
+pub fn starting_target(before: Option<&str>, list: &crux::dto::DispatchTargets) -> Option<String> {
+    before
+        .filter(|name| list.targets.iter().any(|t| t.name == *name))
+        .map(str::to_string)
+        .or_else(|| {
+            list.targets
+                .iter()
+                .find(|t| t.default)
+                .map(|t| t.name.clone())
+        })
+}
+
+/// Where a launch runs and which agent drives it. `None`, and an empty model, leave the
+/// controller to resolve its default.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunsOn {
+    pub target: Option<String>,
+    pub provider: Option<String>,
+    pub model: String,
+}
+
+impl RunsOn {
+    /// Where `launch` ran and what drove its agent, or `None` when it never dispatched a run.
+    pub fn of(launch: &crux::dto::PlaybookLaunch) -> Option<RunsOn> {
+        let run = launch.runs.first()?;
+        Some(RunsOn {
+            target: Some(run.cluster.clone()).filter(|c| !c.is_empty()),
+            provider: launch.launch.agent_provider.clone(),
+            model: launch.launch.agent_model.clone().unwrap_or_default(),
+        })
+    }
+
+    /// Sets the launch body's `dispatch_target`, `provider` and `model`, each as null when it
+    /// is left to the default, so a schedule saved over a stored one drops a pin cleared here.
+    pub fn apply(&self, body: &mut Value) {
+        let model = self.model.trim();
+        body["dispatch_target"] = self.target.clone().map_or(Value::Null, Value::String);
+        body["provider"] = self
+            .provider
+            .clone()
+            .filter(|p| !p.is_empty())
+            .map_or(Value::Null, Value::String);
+        body["model"] = if model.is_empty() {
+            Value::Null
+        } else {
+            Value::String(model.to_string())
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use crate::form::{Kind, Scale, ceilings, duration, fields, minutes, params};
+    use crate::form::{
+        Kind, RunsOn, Scale, ceilings, duration, fields, minutes, newest_dispatched, params,
+        providers, refusal, starting_target, targets,
+    };
+
+    #[test]
+    fn a_refusal_says_what_the_controller_said_about_each_field() {
+        let raw = r#"/api/playbook-drafts/x/launch -> HTTP 422 Unprocessable Entity: {"error":"the supplied parameters do not satisfy the playbook's schema","fields":[{"field":"max_time","message":"task \"climb\" declares timeout 4h, longer than this run's --max-time 3h"}]}"#;
+        assert_eq!(
+            refusal(raw),
+            "task \"climb\" declares timeout 4h, longer than this run's --max-time 3h"
+        );
+        assert_eq!(
+            refusal(r#"/x -> HTTP 409 Conflict: {"error":"a newer save landed"}"#),
+            "a newer save landed"
+        );
+        assert_eq!(
+            refusal("the launch timed out after 20s"),
+            "the launch timed out after 20s"
+        );
+    }
+
+    #[test]
+    fn a_drop_follows_the_newest_launch_that_dispatched_a_run() {
+        let launches: Vec<crux::dto::PlaybookRun> = serde_json::from_value(json!([
+            {"key": "old", "runs": 1, "created_at": "2026-11-08T10:00:00Z"},
+            {"key": "parked", "runs": 0, "created_at": "2026-11-09T10:00:00Z"},
+            {"key": "newer", "runs": 2, "created_at": "2026-11-09T09:00:00Z"}
+        ]))
+        .unwrap();
+        assert_eq!(newest_dispatched(&launches).as_deref(), Some("newer"));
+        assert_eq!(newest_dispatched(&launches[1..2]), None);
+    }
+
+    #[test]
+    fn a_launch_runs_on_its_newest_run_s_cluster_with_its_pinned_agent() {
+        let launch: crux::dto::PlaybookLaunch = serde_json::from_value(json!({
+            "launch": {"params": {}, "agent_provider": "enmaas",
+                       "agent_model": "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"},
+            "dispatch": {"state": "dispatched"},
+            "runs": [{"run_id": "b", "cluster": "pirate"}, {"run_id": "a", "cluster": "waldorf"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            RunsOn::of(&launch),
+            Some(RunsOn {
+                target: Some("pirate".into()),
+                provider: Some("enmaas".into()),
+                model: "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017".into(),
+            })
+        );
+        let never: crux::dto::PlaybookLaunch = serde_json::from_value(json!({
+            "launch": {"params": {}}, "dispatch": {"state": "pending"}, "runs": []
+        }))
+        .unwrap();
+        assert_eq!(RunsOn::of(&never), None);
+    }
+
+    fn dispatch_targets() -> crux::dto::DispatchTargets {
+        serde_json::from_value(json!({
+            "targets": [
+                {"name": "pirate", "label": "pirate", "kind": "spoke", "default": false},
+                {"name": "waldorf", "label": "waldorf", "kind": "spoke", "default": true},
+                {"name": "personal:01a0", "label": "pirate-dispatch", "kind": "personal",
+                 "default": false, "owner": "user:weaton"}
+            ],
+            "refusal": null
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn targets_list_the_default_first_by_label() {
+        assert_eq!(
+            targets(&dispatch_targets()),
+            [
+                ("waldorf".to_string(), "waldorf".to_string()),
+                ("pirate".to_string(), "pirate".to_string()),
+                ("personal:01a0".to_string(), "pirate-dispatch".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_form_starts_on_the_target_asked_before_while_it_is_offered() {
+        let list = dispatch_targets();
+        assert_eq!(
+            starting_target(Some("pirate"), &list).as_deref(),
+            Some("pirate")
+        );
+        assert_eq!(
+            starting_target(Some("gone"), &list).as_deref(),
+            Some("waldorf"),
+            "a target no longer offered falls back to the default"
+        );
+        assert_eq!(starting_target(None, &list).as_deref(), Some("waldorf"));
+        assert_eq!(starting_target(Some("pirate"), &Default::default()), None);
+    }
+
+    #[test]
+    fn providers_offer_default_then_the_enabled_agent_ones() {
+        let list: Vec<crux::dto::Provider> = serde_json::from_value(json!([
+            {"id": "enmaas", "display_name": "EnMaaS (Claude)", "enabled": true,
+             "roles": ["agent"], "default_model": "claude-opus-5-5"},
+            {"id": "off", "enabled": false, "roles": ["agent"]},
+            {"id": "judge-only", "enabled": true, "roles": ["judge"]},
+            {"id": "openai", "enabled": true}
+        ]))
+        .unwrap();
+        assert_eq!(
+            providers(&list),
+            [
+                (String::new(), "Default".to_string()),
+                ("enmaas".to_string(), "EnMaaS (Claude)".to_string()),
+                ("openai".to_string(), "openai".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn runs_on_pins_what_was_picked_and_nulls_what_was_left_to_the_default() {
+        let mut body = json!({"params": {}, "max_cost": 1.0});
+        RunsOn {
+            target: Some("pirate".into()),
+            provider: Some("enmaas".into()),
+            model: "  rits/deepseek-ai/DeepSeek-V4.1-Flash-1017 ".into(),
+        }
+        .apply(&mut body);
+        assert_eq!(body["dispatch_target"], "pirate");
+        assert_eq!(body["provider"], "enmaas");
+        assert_eq!(body["model"], "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017");
+
+        let mut stored = json!({"dispatch_target": "pirate", "provider": "enmaas", "model": "m"});
+        RunsOn {
+            target: None,
+            provider: Some(String::new()),
+            model: " ".into(),
+        }
+        .apply(&mut stored);
+        assert_eq!(
+            stored,
+            json!({"dispatch_target": null, "provider": null, "model": null}),
+            "a cleared pin replaces the stored one"
+        );
+    }
 
     fn triage() -> serde_json::Value {
         json!({

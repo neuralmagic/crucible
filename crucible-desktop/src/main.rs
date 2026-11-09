@@ -141,6 +141,17 @@ pub struct Launcher {
     pub answers: Vec<TextEdit>,
     pub cost: TextEdit,
     pub time: TextEdit,
+    /// The dispatch target picked, by name; `None` until the targets are read.
+    pub dispatch: Option<String>,
+    /// The provider picked, by id; `None` leaves the controller's default.
+    pub provider: Option<String>,
+    /// The model asked of that provider; empty takes its default.
+    pub model: TextEdit,
+    /// What the target and provider pickers offer, as (value, label).
+    pub targets: Vec<(String, String)>,
+    pub providers: Vec<(String, String)>,
+    /// Each offered provider's default model, shown while `model` is empty.
+    pub default_models: Vec<(String, String)>,
     /// The admin caps: dollars and a duration.
     pub caps: (f64, String),
     pub problems: form::Problems,
@@ -669,6 +680,12 @@ impl App {
             answers: Vec::new(),
             cost: TextEdit::new(""),
             time: TextEdit::new(""),
+            dispatch: None,
+            provider: None,
+            model: TextEdit::new(""),
+            targets: Vec::new(),
+            providers: Vec::new(),
+            default_models: Vec::new(),
             caps: (0.0, String::new()),
             problems: Vec::new(),
             refusal: None,
@@ -719,6 +736,11 @@ impl App {
             launcher.refusal = Some(why);
             return;
         }
+        let runs_on = form::RunsOn {
+            target: launcher.dispatch.clone(),
+            provider: launcher.provider.clone(),
+            model: launcher.model.text.clone(),
+        };
         if let Some(schedule) = &launcher.schedule {
             match schedule.body(
                 &launcher.target,
@@ -727,7 +749,8 @@ impl App {
                 &max_time,
                 launcher.digest.as_deref(),
             ) {
-                Ok(body) => {
+                Ok(mut body) => {
+                    runs_on.apply(&mut body);
                     let id = schedule.stored.as_ref().map(|s| s.id.clone());
                     launcher.stage = Stage::Sending;
                     self.act(admin::Action::SaveSchedule { id, body });
@@ -736,7 +759,7 @@ impl App {
             }
             return;
         }
-        let body = studio::launch_body(
+        let mut body = studio::launch_body(
             &launcher.target,
             params,
             max_cost,
@@ -744,6 +767,7 @@ impl App {
             launcher.digest.as_deref(),
             launcher.rerun.as_ref(),
         );
+        runs_on.apply(&mut body);
         launcher.stage = Stage::Sending;
         launcher.after = self.replies;
         self.live_client.launch(launcher.target.clone(), body);
@@ -779,7 +803,7 @@ impl App {
                 Err(error) => {
                     if let Some(launcher) = &mut self.launcher {
                         launcher.stage = Stage::Ready;
-                        launcher.refusal = Some(error);
+                        launcher.refusal = Some(form::refusal(&error));
                     }
                 }
             }
@@ -797,14 +821,22 @@ impl App {
             .and_then(|l| l.schedule.as_ref())
             .and_then(|s| s.stored.as_deref())
             .cloned();
+        let shown = self
+            .selected_live()
+            .filter(|live| live.id == prepared.target.id())
+            .and(self.selected_detail())
+            .and_then(|detail| detail.launch.as_ref());
         let previous = match &stored {
             Some(stored) => Some(serde_json::Value::Object(stored.params.clone())),
-            None => self
-                .selected_live()
-                .filter(|live| live.id == prepared.target.id())
-                .and(self.selected_detail())
-                .and_then(|detail| detail.launch.as_ref())
-                .map(|record| record.launch.params.clone()),
+            None => shown.map(|record| record.launch.params.clone()),
+        };
+        let before = match &stored {
+            Some(stored) => form::RunsOn {
+                target: stored.dispatch_target.clone(),
+                provider: stored.agent_provider.clone(),
+                model: stored.agent_model.clone().unwrap_or_default(),
+            },
+            None => shown.and_then(form::RunsOn::of).unwrap_or_default(),
         };
         let Some(launcher) = &mut self.launcher else {
             return;
@@ -817,7 +849,20 @@ impl App {
                 digest,
                 max_cost,
                 max_time,
+                targets,
+                providers,
             }) => {
+                launcher.dispatch = form::starting_target(before.target.as_deref(), &targets);
+                launcher.targets = form::targets(&targets);
+                launcher.providers = form::providers(&providers);
+                launcher.provider = before
+                    .provider
+                    .filter(|id| launcher.providers.iter().any(|(value, _)| value == id));
+                launcher.model = TextEdit::new(&before.model);
+                launcher.default_models = providers
+                    .iter()
+                    .map(|p| (p.id.clone(), p.default_model.clone()))
+                    .collect();
                 launcher.digest = digest;
                 launcher.fields = form::fields(&schema);
                 launcher.answers = launcher

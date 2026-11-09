@@ -291,6 +291,10 @@ pub struct Form {
     /// The admin caps: dollars and a duration such as `3h`.
     pub max_cost: f64,
     pub max_time: String,
+    /// Where the caller may dispatch it, default first.
+    pub targets: crux::dto::DispatchTargets,
+    /// The provider registrations the caller may read.
+    pub providers: Vec<crux::dto::Provider>,
 }
 
 /// A launch form's schema and the caps its ceilings must stay under.
@@ -309,13 +313,21 @@ pub struct Launched {
     pub result: Result<String, String>,
 }
 
-/// What a pack folder dropped on the app came to: its draft, and the launch key or why not.
+/// What a pack folder dropped on the app came to: its draft, and what became of it or why not.
 #[derive(Clone, Debug)]
 pub struct Dropped {
     pub seq: u64,
     pub dir: std::path::PathBuf,
     pub draft: String,
-    pub result: Result<String, String>,
+    pub result: Result<DropOutcome, String>,
+}
+
+/// A drop launches the draft where its newest run went, with the same agent; a draft that never
+/// ran is only saved, for a launch form to say where it runs.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DropOutcome {
+    Launched(String),
+    Saved,
 }
 
 /// What a rerun would do, for the form asking for one.
@@ -652,11 +664,22 @@ impl Fetcher {
             };
             let caps: crux::dto::PlaybookCaps =
                 connection.call("the launch caps", connection.client.playbook_caps())?;
+            let registered = match &target {
+                Target::Playbook(id) => Some(id.as_str()),
+                Target::Draft(_) => None,
+            };
+            let targets = connection.call(
+                "the dispatch targets",
+                connection.client.dispatch_targets(registered),
+            )?;
+            let providers = connection.call("the providers", connection.client.providers())?;
             Ok(Form {
                 schema,
                 digest,
                 max_cost: caps.max_cost,
                 max_time: caps.max_time,
+                targets,
+                providers,
             })
         });
         self.prepared = Some(Prepared {
@@ -747,7 +770,8 @@ impl Fetcher {
     }
 
     /// Push pack folder `dir` as the next version of the draft named after it, creating the draft
-    /// on first drop, and test-fire that version under `max_cost` and `max_time`.
+    /// on first drop, and test-fire that version under `max_cost` and `max_time` where the
+    /// draft's newest run went.
     fn drop_pack(&mut self, dir: std::path::PathBuf, max_cost: f64, max_time: &str) {
         self.replies += 1;
         let seq = self.replies;
@@ -789,14 +813,29 @@ impl Fetcher {
                 crux::client::DraftSave::Saved(_) => {}
                 crux::client::DraftSave::Stale(stale) => return Err(stale.error),
             }
-            let body = serde_json::json!({
+            let launches: Vec<crux::dto::PlaybookRun> = connection.call(
+                "the draft's launches",
+                connection.client.playbook_runs(None, Some(&draft)),
+            )?;
+            let Some(newest) = crate::form::newest_dispatched(&launches) else {
+                return Ok(DropOutcome::Saved);
+            };
+            let newest: crux::dto::PlaybookLaunch = connection.call(
+                "the draft's newest launch",
+                connection.client.playbook_run(&newest),
+            )?;
+            let Some(runs_on) = crate::form::RunsOn::of(&newest) else {
+                return Ok(DropOutcome::Saved);
+            };
+            let mut body = serde_json::json!({
                 "params": {},
                 "max_cost": max_cost,
                 "max_time": max_time,
             });
+            runs_on.apply(&mut body);
             let ack: crux::dto::LaunchAck =
                 connection.call("the launch", connection.client.launch_draft(&draft, &body))?;
-            Ok(ack.key)
+            Ok(DropOutcome::Launched(ack.key))
         });
         self.dropped = Some(Dropped {
             seq,
@@ -2095,8 +2134,8 @@ mod tests {
     }
 
     /// Against the controller `crux` is configured for: read a registered pack with its Git
-    /// links, pull a draft into a working copy, and preview rerunning the draft's newest finished
-    /// run. None of it writes to the controller. `CRUCIBLE_E2E_PLAYBOOK` and `CRUCIBLE_E2E_DRAFT`
+    /// links, pull a draft into a working copy, read its launch form with the dispatch targets
+    /// and providers, and preview rerunning the draft's newest finished run. None of it writes to the controller. `CRUCIBLE_E2E_PLAYBOOK` and `CRUCIBLE_E2E_DRAFT`
     /// name the two; run with `cargo test -- --ignored`.
     #[test]
     #[ignore = "needs a live controller"]
@@ -2104,7 +2143,11 @@ mod tests {
         let draft =
             std::env::var("CRUCIBLE_E2E_DRAFT").unwrap_or_else(|_| "vllm-agent-fanout".into());
         let (wake, _rx) = std::sync::mpsc::channel();
-        let mut fetcher = Fetcher::new(crate::profile::Target::unreachable(), wake);
+        let crux = crate::profile::or_default(&std::collections::BTreeMap::new())
+            .remove("default")
+            .expect("crux's own profile");
+        let target = crate::profile::Target::new("default", crux, "/nonexistent".as_ref());
+        let mut fetcher = Fetcher::new(target, wake);
         let root = tempfile::tempdir().unwrap();
         fetcher.drafts = Some(root.path().to_path_buf());
 
@@ -2145,6 +2188,15 @@ mod tests {
             "a compiling draft has a schema digest"
         );
         assert!(form.max_cost > 0.0);
+        assert!(
+            form.targets.targets.iter().filter(|t| t.default).count() == 1,
+            "exactly one offered target is the default: {:?}",
+            form.targets
+        );
+        assert!(
+            crate::form::providers(&form.providers).len() > 1,
+            "an enabled agent provider is offered besides the default"
+        );
 
         fetcher.refresh_list().expect("the launch list");
         let launch = fetcher

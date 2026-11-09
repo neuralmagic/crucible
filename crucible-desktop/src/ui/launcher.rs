@@ -16,8 +16,10 @@ use crate::{App, Stage};
 const SHEET: f32 = 520.0;
 const PAD: f32 = 20.0;
 const INNER: f32 = SHEET - 2.0 * PAD;
-/// The tallest the form gets before it scrolls.
+/// The tallest the form gets before it scrolls, and how much it gives up while a refusal shows
+/// under it: the sheet does not scroll, so anything taller than the window is cut off.
 const BODY: f32 = 520.0;
+const REFUSAL: f32 = 72.0;
 
 /// Which of the form's text fields an edit goes to.
 #[derive(Clone, Copy)]
@@ -25,6 +27,7 @@ enum Slot {
     Answer(usize),
     Cost,
     Time,
+    Model,
 }
 
 /// The form's edit for `slot`, or a scratch edit once the form has closed.
@@ -34,6 +37,7 @@ fn edit(app: &mut App, slot: Slot) -> &mut TextEdit {
             Slot::Answer(i) => launcher.answers.get_mut(i),
             Slot::Cost => Some(&mut launcher.cost),
             Slot::Time => Some(&mut launcher.time),
+            Slot::Model => Some(&mut launcher.model),
         };
         if let Some(edit) = found {
             return edit;
@@ -144,7 +148,11 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
     let body = col()
         .key("launcher-body")
         .w_full()
-        .max_h(BODY)
+        .max_h(if launcher.refusal.is_some() {
+            BODY - REFUSAL
+        } else {
+            BODY
+        })
         .px(PAD)
         .scroll(rune::ScrollSpec {
             stick_bottom: false,
@@ -157,6 +165,18 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
         .width(SHEET)
         .on_close(|app: &mut App| app.launcher = None)
         .child(p.k.scroll_bar(body).w_full())
+        .child(
+            col()
+                .w_full()
+                .children(launcher.refusal.as_ref().map(|why| {
+                    row()
+                        .key("launcher-refusal")
+                        .w_full()
+                        .px(PAD)
+                        .pt(8.0)
+                        .child(problem(why, p))
+                })),
+        )
         .child(
             row()
                 .w_full()
@@ -316,8 +336,8 @@ fn form(app: &App, p: &Paint) -> El {
             .pt(4.0)
             .child(rerun_summary(rerun, p))
             .child(el().h(p.hair).w_full().fill(p.c.border_muted))
-            .child(ceilings(app, p))
-            .children(launcher.refusal.as_ref().map(|why| problem(why, p)));
+            .child(runs_on(app, p))
+            .child(ceilings(app, p));
     }
     let mut fields = col().w_full().gap(14.0);
     for (i, field) in launcher.fields.iter().enumerate() {
@@ -387,6 +407,7 @@ fn form(app: &App, p: &Paint) -> El {
         .children((!editing).then(|| when(app, p)))
         .child(fields)
         .child(el().h(p.hair).w_full().fill(p.c.border_muted))
+        .child(runs_on(app, p))
         .child(ceilings(app, p))
         .children(
             launcher
@@ -394,7 +415,6 @@ fn form(app: &App, p: &Paint) -> El {
                 .as_ref()
                 .map(|s| schedule_fields(s, app, p)),
         )
-        .children(launcher.refusal.as_ref().map(|why| problem(why, p)))
 }
 
 /// Launch now, or save a schedule that launches on a cron.
@@ -473,6 +493,66 @@ fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> E
                 },
                 p,
             ),
+            p,
+        ))
+}
+
+/// The cluster the launch dispatches onto, and the provider and model its agent runs against.
+fn runs_on(app: &App, p: &Paint) -> El {
+    let Some(launcher) = &app.launcher else {
+        return el();
+    };
+    let provider = launcher.provider.clone().unwrap_or_default();
+    let placeholder = launcher
+        .default_models
+        .iter()
+        .find(|(id, _)| *id == provider)
+        .map(|(_, model)| model.clone())
+        .unwrap_or_else(|| "the provider's default".to_string());
+    col()
+        .key("runs-on")
+        .w_full()
+        .gap(12.0)
+        .children((!launcher.targets.is_empty()).then(|| {
+            field(
+                "Target",
+                pills(
+                    "launch-target",
+                    &launcher.targets,
+                    launcher.dispatch.as_deref(),
+                    |app: &mut App, name: &str| {
+                        if let Some(launcher) = app.launcher.as_mut() {
+                            launcher.dispatch = Some(name.to_string());
+                        }
+                    },
+                    p,
+                ),
+                p,
+            )
+        }))
+        .child(field(
+            "Agent",
+            pills(
+                "launch-provider",
+                &launcher.providers,
+                Some(provider.as_str()),
+                |app: &mut App, id: &str| {
+                    if let Some(launcher) = app.launcher.as_mut() {
+                        launcher.provider = (!id.is_empty()).then(|| id.to_string());
+                    }
+                },
+                p,
+            ),
+            p,
+        ))
+        .child(field(
+            "Model",
+            TextInput::new(&launcher.model)
+                .placeholder(placeholder)
+                .width(Some(INNER))
+                .on_edit(|app: &mut App| edit(app, Slot::Model))
+                .build(p.k)
+                .key("launch-model"),
             p,
         ))
 }

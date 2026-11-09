@@ -1,6 +1,7 @@
 //! What the system opens with the app. A pack folder dropped on the Dock icon, or opened with the
 //! app from Finder, is pushed as the next version of the draft named after it and test-fired on
-//! the profile in use under the drop ceilings in Settings, and its launch opens. A controller web
+//! the profile in use under the drop ceilings in Settings, on the target and agent of the draft's
+//! newest run, and its launch opens; a draft that never ran opens its launch form instead. A controller web
 //! link (`crucible://`) opens its view on the profile it names.
 
 use std::path::PathBuf;
@@ -28,7 +29,16 @@ impl App {
         };
         self.dropped_seen = dropped.seq;
         let (title, body, link) = match &dropped.result {
-            Ok(key) => {
+            Ok(crate::live::DropOutcome::Saved) => {
+                self.open_launcher(crate::live::Target::Draft(dropped.draft.clone()));
+                crate::notify::bring_to_front();
+                (
+                    format!("Saved draft {}", dropped.draft),
+                    "It has not run yet: pick where it runs".to_string(),
+                    String::new(),
+                )
+            }
+            Ok(crate::live::DropOutcome::Launched(key)) => {
                 self.select(Selection::Live {
                     playbook: dropped.draft.clone(),
                     launch: Some(key.clone()),
