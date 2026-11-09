@@ -563,6 +563,31 @@ fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 .wrap(),
         );
     }
+    if let Some(why) = &app.drop_failed {
+        head = head.child(
+            row()
+                .key("drop-failed")
+                .w_full()
+                .gap(6.0)
+                .child(
+                    text(why.clone())
+                        .font(p.k.ty.caption())
+                        .color(p.fail)
+                        .max_lines(3)
+                        .wrap()
+                        .grow(1.0)
+                        .min_w(0.0),
+                )
+                .child(
+                    IconButton::new(&rune_kit::glyphs::CLOSE)
+                        .variant(IconButtonVariant::GhostMuted)
+                        .label("Dismiss")
+                        .on_press(|app: &mut App| app.drop_failed = None)
+                        .build(p.k)
+                        .key("drop-failed-dismiss"),
+                ),
+        );
+    }
     if app.backend == Backend::Controller {
         head = head.child(filters(app, p));
     }
@@ -1722,6 +1747,12 @@ fn settings_pane(app: &App, p: &Paint) -> El {
             p,
         ))
         .child(settings_section("packs", "Packs", editor_rows(app, p), p))
+        .child(settings_section(
+            "dropped",
+            "Dropped on the Dock",
+            drop_rows(app, p),
+            p,
+        ))
         .child(settings_section("log-viewer", "Log font", rows, p))
         .child(settings_section("keys", "Keys", key_rows(app, p), p))
 }
@@ -1786,6 +1817,43 @@ fn key_rows(app: &App, p: &Paint) -> Vec<El> {
             );
         }
         rows.push(setting_row(&command.title(), control, p));
+    }
+    rows
+}
+
+/// The ceilings a pack folder dropped on the Dock icon is test-fired under.
+fn drop_rows(app: &App, p: &Paint) -> Vec<El> {
+    let save = |app: &mut App, _: &mut Tx| {
+        let (cost, time) = (app.drop_cost.text.clone(), app.drop_time.text.clone());
+        app.drop_error = app.settings.set_drop(&cost, &time).err();
+    };
+    let mut rows = vec![
+        setting_row(
+            "Cost ceiling",
+            TextInput::new(&app.drop_cost)
+                .placeholder("1.00")
+                .width(Some(160.0))
+                .on_edit(|app: &mut App| &mut app.drop_cost)
+                .on_change(save)
+                .build(p.k)
+                .key("drop-cost"),
+            p,
+        ),
+        rule("drop-sep", false, p),
+        setting_row(
+            "Time ceiling",
+            TextInput::new(&app.drop_time)
+                .placeholder("30m")
+                .width(Some(160.0))
+                .on_edit(|app: &mut App| &mut app.drop_time)
+                .on_change(save)
+                .build(p.k)
+                .key("drop-time"),
+            p,
+        ),
+    ];
+    if let Some(why) = &app.drop_error {
+        rows.push(text(why.clone()).font(p.k.ty.small).color(p.fail).pb(10.0));
     }
     rows
 }

@@ -195,6 +195,9 @@ pub struct Settings {
     profiles: BTreeMap<String, toml::Value>,
     /// The profile in use, by name.
     pub profile: Option<String>,
+    /// The cost and time ceilings a pack folder dropped on the app is test-fired under.
+    pub drop_max_cost: f64,
+    pub drop_max_time: String,
     path: PathBuf,
 }
 
@@ -224,6 +227,9 @@ struct Config {
     checks: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     profile: Option<String>,
+    drop_max_cost: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drop_max_time: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     profiles: BTreeMap<String, toml::Value>,
 }
@@ -269,6 +275,14 @@ impl Settings {
             checks: config.checks.unwrap_or(true),
             profiles: config.profiles,
             profile: config.profile,
+            drop_max_cost: config
+                .drop_max_cost
+                .filter(|c| c.is_finite() && *c > 0.0)
+                .unwrap_or(1.0),
+            drop_max_time: config
+                .drop_max_time
+                .filter(|t| crate::form::minutes(t).is_some())
+                .unwrap_or_else(|| "30m".to_string()),
             path,
         }
     }
@@ -304,6 +318,24 @@ impl Settings {
             }
             self.save();
         }
+    }
+
+    /// Set the drop ceilings, when both read.
+    pub fn set_drop(&mut self, max_cost: &str, max_time: &str) -> Result<(), String> {
+        let cost: f64 = max_cost
+            .trim()
+            .trim_start_matches('$')
+            .parse()
+            .ok()
+            .filter(|c: &f64| c.is_finite() && *c > 0.0)
+            .ok_or("The cost ceiling is a positive number of dollars")?;
+        if crate::form::minutes(max_time.trim()).is_none() {
+            return Err("The time ceiling looks like 30m or 2h".into());
+        }
+        self.drop_max_cost = cost;
+        self.drop_max_time = max_time.trim().to_string();
+        self.save();
+        Ok(())
     }
 
     pub fn use_profile(&mut self, name: &str) {
@@ -419,6 +451,8 @@ impl Settings {
             checks: Some(self.checks),
             profile: self.profile.clone(),
             profiles: self.profiles.clone(),
+            drop_max_cost: Some(self.drop_max_cost),
+            drop_max_time: Some(self.drop_max_time.clone()),
         };
         let Ok(text) = toml::to_string(&config) else {
             return;

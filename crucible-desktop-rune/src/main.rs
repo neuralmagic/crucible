@@ -21,6 +21,7 @@ mod logline;
 mod lsp;
 mod model;
 mod notify;
+mod opened;
 mod pack;
 mod palette;
 mod preview;
@@ -316,6 +317,11 @@ pub struct App {
     tray: Option<tray::Shown>,
     /// Ids of the menu bar lines picked, to act on.
     picks: Option<std::sync::mpsc::Receiver<String>>,
+    /// Folders the system opened with the app, to launch, and the loop's waker once it runs.
+    opened: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
+    open_wake: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
+    /// The newest drop reply taken.
+    dropped_seen: u64,
     /// A key pasted for the profile in use, for one the browser cannot reach.
     pub key_paste: TextEdit,
     /// How the last browser sign-in went.
@@ -338,6 +344,12 @@ pub struct App {
     login_editor: std::cell::OnceCell<Option<String>>,
     /// The editor command field in Settings.
     pub editor_command: TextEdit,
+    /// The drop ceilings as typed in Settings, and why the last pair did not take.
+    pub drop_cost: TextEdit,
+    pub drop_time: TextEdit,
+    pub drop_error: Option<String>,
+    /// Why the last pack folder dropped on the app did not launch.
+    pub drop_failed: Option<String>,
     /// Effect and layout values tuned live; their defaults unless built with `knobs`.
     pub knobs: rune_knobs::Knobs,
     pub page: Page,
@@ -839,6 +851,7 @@ impl App {
         self.answer_rerun(snapshot.reran);
         self.answer_launcher(snapshot.prepared, snapshot.launched);
         self.answer_draft(snapshot.synced);
+        self.answer_drop(snapshot.dropped);
         self.announce(&snapshot.finished);
         self.reconcile();
     }
@@ -1003,6 +1016,7 @@ impl App {
     pub fn follow(&mut self, link: &Link) {
         self.page = Page::Runs;
         match link {
+            Link::Web { place, route } => self.follow_web(place, route),
             Link::Decision { id } => {
                 self.backend = Backend::Controller;
                 self.page = Page::Decisions;
@@ -1193,6 +1207,17 @@ fn init() -> App {
     let settings = SETTINGS.get().cloned().unwrap_or_else(Settings::load);
     let (keymap, keys_refused) = keymap::Keymap::new(&settings.keys);
     let editor_command = TextEdit::new(&settings.editor_command);
+    let drop_cost = TextEdit::new(format!("{}", settings.drop_max_cost));
+    let drop_time = TextEdit::new(&settings.drop_max_time);
+    let (opened_tx, opened) = std::sync::mpsc::channel();
+    let open_wake: std::sync::Arc<std::sync::Mutex<Option<Waker>>> = Default::default();
+    let woken = open_wake.clone();
+    rune_mac::files::on_open(move |paths| {
+        let _ = opened_tx.send(paths);
+        if let Some(wake) = woken.lock().ok().and_then(|w| w.clone()) {
+            wake();
+        }
+    });
     let (name, chosen) = profile::pick(&settings);
     let target = profile::Target::new(&name, chosen, &settings.keys_dir());
     let keeper = target.start(&repo, profile::supervisor());
@@ -1262,6 +1287,9 @@ fn init() -> App {
         pinned: None,
         tray: None,
         picks: None,
+        opened: Some(opened),
+        open_wake,
+        dropped_seen: 0,
         key_paste: TextEdit::new(""),
         signing_in: false,
         sign_in_error: None,
@@ -1283,6 +1311,10 @@ fn init() -> App {
         scratch: TextEdit::new(""),
         settings,
         editor_command,
+        drop_cost,
+        drop_time,
+        drop_error: None,
+        drop_failed: None,
         login_editor: std::cell::OnceCell::new(),
         pack_md_source: false,
         knobs: rune_knobs::Knobs::default(),
@@ -1305,6 +1337,9 @@ fn setup(app: &mut App, waker: Waker) {
         pick_waker();
     });
     app.picks = Some(picks);
+    if let Ok(mut wake) = app.open_wake.lock() {
+        *wake = Some(waker.clone());
+    }
     app.local.set_waker(waker.clone());
     app.live_client.set_waker(waker.clone());
     app.admin_client.set_waker(waker.clone());
@@ -1344,6 +1379,14 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
     {
         app.follow(&link);
         notify::bring_to_front();
+        changed = true;
+    }
+    while let Some(paths) = app
+        .opened
+        .as_ref()
+        .and_then(|opened| opened.try_recv().ok())
+    {
+        app.open_paths(paths);
         changed = true;
     }
     while let Some(id) = app.picks.as_ref().and_then(|picks| picks.try_recv().ok()) {
@@ -1406,6 +1449,7 @@ fn main() {
     if std::env::args().nth(1).as_deref() == Some(profile::KEEP_FLAG) {
         std::process::exit(profile::keep());
     }
+    rune_mac::files::listen();
     let settings = Settings::load();
     let fonts = settings::fonts(&settings);
     let _ = SETTINGS.set(settings);
@@ -1431,9 +1475,14 @@ fn main() {
             ("page", |app: &mut App| {
                 app.backend = Backend::Controller;
                 let page = std::env::var("CRUCIBLE_PAGE").unwrap_or_default();
-                if let Some(page) = [Page::Schedules, Page::Secrets, Page::Decisions, Page::Approvals]
-                    .into_iter()
-                    .find(|p| p.id() == page)
+                if let Some(page) = [
+                    Page::Schedules,
+                    Page::Secrets,
+                    Page::Decisions,
+                    Page::Approvals,
+                ]
+                .into_iter()
+                .find(|p| p.id() == page)
                 {
                     app.page = page;
                 }
