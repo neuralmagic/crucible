@@ -53,6 +53,11 @@ impl App {
                 Backend::Local => self.launch(),
                 Backend::Controller => self.launch_working(),
             },
+            Command::ZoomIn => self.set_zoom(crate::settings::zoom_step(self.settings.zoom, 1)),
+            Command::ZoomOut => {
+                self.set_zoom(crate::settings::zoom_step(self.settings.zoom, -1));
+            }
+            Command::ZoomReset => self.set_zoom(1.0),
             Command::EditTask => {
                 if let Some(task) = self.expanded.clone() {
                     self.edit_task(&task);

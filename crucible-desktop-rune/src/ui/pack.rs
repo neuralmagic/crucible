@@ -4,7 +4,9 @@ use std::ops::Range;
 
 use rune::{Color, El, ScrollSpec, Span, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::syntax::SyntaxTheme;
-use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, SegmentedControl, Spinner};
+use rune_kit::{
+    Button, ButtonVariant, IconButton, IconButtonVariant, Markdown, SegmentedControl, Spinner,
+};
 use rune_theme_opencode::icons as oc;
 
 use crate::lsp::{self, Problem, Severity};
@@ -342,13 +344,16 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
         );
     };
     let lines = syntax::lines(text_body);
+    let markdown = is_markdown(&file.path);
+    let previewing = markdown && !app.pack_md_source;
     let found = syntax::highlighter().highlight(syntax::language(&file.path), text_body);
     let theme = SyntaxTheme::from_kit(p.k);
     let width = lines.len().max(1).to_string().len();
     let style = p.sized(TextStyle::new(11.5, 400.0).lh(18.0).family(font.family()));
     let marks = marks(text_body, found_problems);
     let mut body = col().gap(0.0).py(10.0);
-    for (n, line) in lines.iter().take(LINES).enumerate() {
+    let shown = if previewing { 0 } else { LINES };
+    for (n, line) in lines.iter().take(shown).enumerate() {
         let mut spans = theme.spans(&syntax::on_line(&found, line.clone()), 0);
         let on_line = marks_on(&marks, line, text_body);
         spans.extend(on_line.iter().map(|(range, severity)| {
@@ -384,7 +389,14 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
             ),
         );
     }
-    if lines.len() > LINES {
+    if previewing {
+        body = body.child(
+            Markdown::new(text_body.clone())
+                .selectable(true)
+                .build(p.k)
+                .key(format!("pack-markdown-{}", file.path)),
+        );
+    } else if lines.len() > LINES {
         body = body.child(
             text(format!("\u{2026} {} more lines", lines.len() - LINES))
                 .font(style)
@@ -417,6 +429,14 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
                         .color(p.c.text_faint),
                 )
                 .child(el().grow(1.0))
+                .children(markdown.then(|| {
+                    SegmentedControl::new(&["Preview", "Source"], Some(app.pack_md_source as usize))
+                        .label("Show")
+                        .fit()
+                        .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.pack_md_source = i == 1)
+                        .build(p.k)
+                        .key("pack-md-mode")
+                }))
                 .children(git_link(app, &file.path, found_problems, p))
                 .children(copy_path(app, &file.path, p))
                 .child(open_button(&file.path, found_problems, p)),
@@ -443,6 +463,11 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
                 .child(body),
         )
         .children(problem_list(&file.path, found_problems, p))
+}
+
+fn is_markdown(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown")
 }
 
 fn severity_icon(severity: Severity, p: &Paint) -> El {

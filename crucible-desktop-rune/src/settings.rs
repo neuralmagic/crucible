@@ -67,6 +67,22 @@ impl Appearance {
     }
 }
 
+/// The zooms the app steps between, smallest first.
+pub const ZOOMS: [f32; 7] = [0.75, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5];
+
+/// The zoom one step in `direction` (+1 in, -1 out) from `zoom`, staying on [`ZOOMS`].
+pub fn zoom_step(zoom: f32, direction: i32) -> f32 {
+    let next = match ZOOMS.iter().position(|z| (z - zoom).abs() < 0.01) {
+        Some(at) => at as i32 + direction,
+        None => {
+            let below = ZOOMS.iter().filter(|z| **z < zoom).count() as i32;
+            if direction > 0 { below } else { below - 1 }
+        }
+    }
+    .clamp(0, ZOOMS.len() as i32 - 1);
+    ZOOMS[next as usize]
+}
+
 /// How large the app sets its text, from the theme's own sizes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -156,6 +172,8 @@ pub struct Settings {
     pub theme: Theme,
     pub appearance: Appearance,
     pub text_size: TextSize,
+    /// Display points per layout point: below 1 fits more on screen.
+    pub zoom: f32,
     /// Draw charts through the CRT pass.
     pub crt: bool,
     /// Announce the signed-in user's runs as they finish.
@@ -187,6 +205,7 @@ struct Config {
     theme: Theme,
     appearance: Appearance,
     text_size: TextSize,
+    zoom: Option<f32>,
     crt: Option<bool>,
     notify: Option<bool>,
     notify_decisions: Option<bool>,
@@ -224,6 +243,10 @@ impl Settings {
             theme: config.theme,
             appearance: config.appearance,
             text_size: config.text_size,
+            zoom: config
+                .zoom
+                .filter(|z| ZOOMS.iter().any(|known| (known - z).abs() < 0.01))
+                .unwrap_or(1.0),
             crt: config.crt.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
             ask: config.notify_decisions.unwrap_or(true),
@@ -301,6 +324,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_zoom(&mut self, zoom: f32) {
+        self.zoom = zoom;
+        self.save();
+    }
+
     pub fn set_text_size(&mut self, size: TextSize) {
         self.text_size = size;
         self.save();
@@ -319,6 +347,7 @@ impl Settings {
             theme: self.theme,
             appearance: self.appearance,
             text_size: self.text_size,
+            zoom: Some(self.zoom),
             crt: Some(self.crt),
             notify: Some(self.notify),
             notify_decisions: Some(self.ask),
@@ -430,6 +459,21 @@ fn scan(dir: &Path, depth: usize) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn zoom_steps_walk_the_known_zooms_and_stop_at_the_ends() {
+        use crate::settings::{ZOOMS, zoom_step};
+        assert_eq!(zoom_step(1.0, -1), 0.9);
+        assert_eq!(zoom_step(1.0, 1), 1.1);
+        assert_eq!(zoom_step(ZOOMS[0], -1), ZOOMS[0]);
+        assert_eq!(zoom_step(1.5, 1), 1.5);
+        assert_eq!(
+            zoom_step(0.95, -1),
+            0.9,
+            "between stops goes to the one below"
+        );
+        assert_eq!(zoom_step(0.95, 1), 1.0);
+    }
+
     use crate::settings::*;
 
     #[test]

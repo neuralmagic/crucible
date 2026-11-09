@@ -1114,7 +1114,7 @@ fn detail(app: &App, p: &Paint) -> El {
     if let Some(problem) = &pane.problem {
         body = body.child(banner(problem, p));
     }
-    if let Some(error) = &app.error {
+    if let (Backend::Local, Some(error)) = (app.backend, &app.local_error) {
         body = body.child(banner(error, p));
     }
     if let Some(note) = &app.handoff_note {
@@ -1521,6 +1521,24 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                     })
                     .build(p.k)
                     .key("mode"),
+                    p,
+                ),
+                rule("zoom-sep", false, p),
+                setting_row(
+                    "Zoom",
+                    SegmentedControl::new(
+                        &crate::settings::ZOOMS.map(|z| format!("{:.0}%", z * 100.0)),
+                        crate::settings::ZOOMS
+                            .iter()
+                            .position(|z| (z - app.settings.zoom).abs() < 0.01),
+                    )
+                    .label("Zoom")
+                    .width(Some(420.0))
+                    .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+                        app.set_zoom(crate::settings::ZOOMS[i]);
+                    })
+                    .build(p.k)
+                    .key("zoom"),
                     p,
                 ),
                 rule("text-size-sep", false, p),

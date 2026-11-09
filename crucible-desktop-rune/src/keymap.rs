@@ -31,10 +31,13 @@ pub enum Command {
     LaunchWorkingCopy,
     /// Open the selected task's definition in the editor.
     EditTask,
+    ZoomIn,
+    ZoomOut,
+    ZoomReset,
 }
 
 impl Command {
-    pub const ALL: [Command; 29] = [
+    pub const ALL: [Command; 32] = [
         Command::Palette,
         Command::Focus(Edge::Left),
         Command::Focus(Edge::Bottom),
@@ -64,6 +67,9 @@ impl Command {
         Command::SaveDraft,
         Command::LaunchWorkingCopy,
         Command::EditTask,
+        Command::ZoomIn,
+        Command::ZoomOut,
+        Command::ZoomReset,
     ];
 
     /// Its name in the config file's `[keys]` table.
@@ -84,6 +90,9 @@ impl Command {
             Command::SaveDraft => "save-draft".into(),
             Command::LaunchWorkingCopy => "launch-working-copy".into(),
             Command::EditTask => "edit-task".into(),
+            Command::ZoomIn => "zoom-in".into(),
+            Command::ZoomOut => "zoom-out".into(),
+            Command::ZoomReset => "zoom-reset".into(),
         }
     }
 
@@ -104,6 +113,9 @@ impl Command {
             Command::SaveDraft => "Save the working copy".into(),
             Command::LaunchWorkingCopy => "Launch the working copy".into(),
             Command::EditTask => "Edit the selected task".into(),
+            Command::ZoomIn => "Zoom in".into(),
+            Command::ZoomOut => "Zoom out".into(),
+            Command::ZoomReset => "Actual size".into(),
         }
     }
 
@@ -137,6 +149,9 @@ impl Command {
             Command::SaveDraft => vec![primary("cmd+s", "ctrl+s")],
             Command::LaunchWorkingCopy => vec![primary("cmd+enter", "ctrl+enter")],
             Command::EditTask => vec![primary("cmd+e", "ctrl+e")],
+            Command::ZoomIn => vec![primary("cmd+=", "ctrl+=")],
+            Command::ZoomOut => vec![primary("cmd+-", "ctrl+-")],
+            Command::ZoomReset => vec![primary("cmd+0", "ctrl+0")],
             _ => Vec::new(),
         }
     }

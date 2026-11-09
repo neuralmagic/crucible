@@ -305,6 +305,8 @@ pub struct App {
     /// Where a text field's edits land once its form has closed.
     pub scratch: TextEdit,
     pub settings: Settings,
+    /// The Pack tab shows a Markdown file's source rather than its rendering.
+    pub pack_md_source: bool,
     /// The editor command field in Settings.
     pub editor_command: TextEdit,
     /// Effect and layout values tuned live; their defaults unless built with `knobs`.
@@ -312,7 +314,8 @@ pub struct App {
     pub page: Page,
     /// The matched id of what the shown run was opened from, which its view flies out of.
     pub flight: Option<String>,
-    pub error: Option<String>,
+    /// Why the local packs could not be read or launched.
+    pub local_error: Option<String>,
 }
 
 impl App {
@@ -563,7 +566,7 @@ impl App {
 
     fn apply_local(&mut self, snapshot: Snapshot) {
         self.packs = snapshot.packs;
-        self.error = snapshot.error;
+        self.local_error = snapshot.error;
         self.reconcile();
     }
 
@@ -1021,6 +1024,12 @@ impl App {
         }
     }
 
+    /// Lay every window out at `zoom` and keep it for next time.
+    pub fn set_zoom(&mut self, zoom: f32) {
+        rune::zoom::set(zoom);
+        self.settings.set_zoom(zoom);
+    }
+
     /// Show `page`, or the runs when it already shows.
     pub fn toggle_page(&mut self, page: Page) {
         self.page = if self.page == page { Page::Runs } else { page };
@@ -1149,14 +1158,16 @@ fn init() -> App {
         scratch: TextEdit::new(""),
         settings,
         editor_command,
+        pack_md_source: false,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,
-        error: None,
+        local_error: None,
     }
 }
 
 fn setup(app: &mut App, waker: Waker) {
+    rune::zoom::set(app.settings.zoom);
     app.waker = Some(waker.clone());
     let (clicked, clicks) = std::sync::mpsc::channel();
     app.notifier = Some(notify::Notifier::start(clicked, waker.clone()));

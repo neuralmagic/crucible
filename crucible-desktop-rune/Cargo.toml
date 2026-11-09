@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 rune = { path = "../vendor/rune/crates/rune" }
-rune-kit = { path = "../vendor/rune/crates/rune-kit", default-features = false, features = ["markdown"] }
+rune-kit = { path = "../vendor/rune/crates/rune-kit", default-features = false, features = ["markdown", "mermaid"] }
 rune-mermaid = { path = "../vendor/rune/crates/rune-mermaid" }
 rune-theme-opencode = { path = "../vendor/rune/themes/opencode" }
 rune-fx = { path = "../vendor/rune/crates/rune-fx" }

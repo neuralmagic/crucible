@@ -699,9 +699,16 @@ pub fn default_repo() -> PathBuf {
     if let Some(dir) = find_repo(std::env::current_dir().unwrap_or_default(), 4) {
         return dir;
     }
-    // A bundled .app launches with cwd /; its executable still lives under the repo.
+    // A bundled .app launches with cwd /; its executable may still live under the repo.
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = find_repo(exe, 8)
+    {
+        return dir;
+    }
+    // An installed copy lives outside it: the checkout it was built from, while that is there.
+    if let Some(dir) = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|dir| find_repo(dir.to_path_buf(), 1))
     {
         return dir;
     }
