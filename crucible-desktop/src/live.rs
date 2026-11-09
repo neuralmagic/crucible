@@ -18,6 +18,7 @@ use tokio::sync::oneshot;
 
 use rune::Waker;
 
+use crate::captured::{Body, Captured, Opened};
 use crate::draft::Working;
 use crate::filter::LaunchFilter;
 use crate::httpcache::{CachedTransport, Store};
@@ -214,6 +215,10 @@ pub struct LiveDetail {
     pub launch: Option<crux::dto::PlaybookLaunch>,
     /// The workflow pack it ran, or why it could not be read.
     pub pack: Result<PackFiles, String>,
+    /// The run shown, the launch's newest.
+    pub run_id: Option<String>,
+    /// The files its tasks captured, or why they could not be listed; `None` until read.
+    pub files: Option<Result<Vec<Captured>, String>>,
 }
 
 /// The launch a run is compared against: its tasks as its stored session left them.
@@ -265,6 +270,8 @@ enum Msg {
     Reconnect,
     /// Which launch to read as the base of a comparison; `None` stops.
     Compare(Option<String>),
+    /// Fetch one file a run captured, by its key.
+    File { run: String, key: String },
 }
 
 /// What a launch form starts: a registered playbook, or a draft's newest save.
@@ -400,6 +407,8 @@ struct Fetcher {
     reran: Option<Reran>,
     synced: Option<Synced>,
     dropped: Option<Dropped>,
+    /// The captured file the Files pane asked for.
+    opened: Option<Opened>,
     replies: u64,
     /// Where draft working copies go.
     drafts: Option<std::path::PathBuf>,
@@ -499,6 +508,9 @@ struct CachedRun {
     /// on screen until that replay's first lines land.
     replaying: bool,
     replaying_log: bool,
+    /// Its captured files, and how many results had settled when they were listed.
+    files: Option<Result<Vec<Captured>, String>>,
+    files_at: usize,
 }
 
 /// A running run's session and pod log, streamed by [`crux::Client::follow_run`] on its own
@@ -609,6 +621,7 @@ impl Fetcher {
             reran: None,
             synced: None,
             dropped: None,
+            opened: None,
             replies: 0,
             drafts: crate::draft::root(),
         }
@@ -916,6 +929,38 @@ impl Fetcher {
         self.finished.drain(..excess);
     }
 
+    /// Read one captured file from its copy on disk, else fetch it and write that copy.
+    fn open_file(&mut self, run: String, key: String) {
+        let disk = crate::captured::cache_path(&run, &key);
+        if let Some(text) = disk.as_ref().and_then(|path| std::fs::read(path).ok()) {
+            self.opened = Some(Opened {
+                body: Ok(Body::from_bytes(text)),
+                run,
+                key,
+                disk,
+            });
+            return;
+        }
+        let bytes = self.connection().and_then(|connection| {
+            connection.call("the file", connection.client.run_file(&run, &key))
+        });
+        let disk = match (&bytes, disk) {
+            (Ok(bytes), Some(path)) => path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, bytes))
+                .ok()
+                .map(|()| path),
+            _ => None,
+        };
+        self.opened = Some(Opened {
+            body: bytes.map(Body::from_bytes),
+            run,
+            key,
+            disk,
+        });
+    }
+
     fn view(&self) -> &LiveView {
         &self.view
     }
@@ -1196,7 +1241,7 @@ impl Fetcher {
             return false;
         }
         let wake = self.wake.clone();
-        let (fold, log, source, error, streaming) = match &run_id {
+        let (fold, log, source, error, streaming, files) = match &run_id {
             Some(run_id) => {
                 let Some(connection) = self.connection.as_ref() else {
                     return false;
@@ -1219,15 +1264,22 @@ impl Fetcher {
                         run.log = log;
                     }
                 }
+                let results = settled_results(&run.fold);
+                let retry = poll && matches!(run.files, Some(Err(_)));
+                if run.files.is_none() || run.files_at != results || retry {
+                    run.files = Some(captured_files(connection, run_id));
+                    run.files_at = results;
+                }
                 (
                     run.fold.clone(),
                     run.log.clone(),
                     run.source,
                     run.error.clone(),
                     run.follow.is_some(),
+                    run.files.clone(),
                 )
             }
-            None => (RunFold::default(), Vec::new(), "", None, false),
+            None => (RunFold::default(), Vec::new(), "", None, false, None),
         };
         let mut next = build_detail(&launch, fold, log);
         next.source = source;
@@ -1235,6 +1287,8 @@ impl Fetcher {
         next.launch = record;
         next.pack = pack;
         next.streaming = streaming;
+        next.run_id = run_id;
+        next.files = files;
         let changed = self.detail.as_ref() != Some(&next);
         self.detail = Some(next);
         changed
@@ -1308,6 +1362,27 @@ fn settle(run: &mut CachedRun, connection: &Connection, run_id: &str) {
             }
         }
     }
+}
+
+/// Results settled so far, tasks and fan-out instances: each can add captured files.
+fn settled_results(fold: &RunFold) -> usize {
+    fold.tasks
+        .iter()
+        .map(|task| {
+            usize::from(task.result.is_some())
+                + task
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.result.is_some())
+                    .count()
+        })
+        .sum()
+}
+
+fn captured_files(connection: &Connection, run_id: &str) -> Result<Vec<Captured>, String> {
+    let listing: crux::dto::RunFiles =
+        connection.call("the captured files", connection.client.run_files(run_id))?;
+    Ok(listing.files.into_iter().map(Captured::from).collect())
 }
 
 /// A run's graph read as the session it was built from: its plan, then each result. The
@@ -1444,6 +1519,8 @@ fn build_detail(launch: &LivePlaybook, fold: RunFold, log: Vec<LogLine>) -> Live
         error: None,
         launch: None,
         pack: Ok(PackFiles::default()),
+        run_id: None,
+        files: None,
     }
 }
 
@@ -1492,6 +1569,8 @@ pub struct Snapshot {
     pub reran: Option<Reran>,
     pub synced: Option<Synced>,
     pub dropped: Option<Dropped>,
+    /// The captured file last fetched for the Files pane.
+    pub file: Option<Opened>,
 }
 
 /// The UI-side handle to the live worker. Dropping it stops the thread.
@@ -1533,6 +1612,7 @@ impl Client {
                     reran: None,
                     synced: None,
                     dropped: None,
+                    file: None,
                 },
             );
         }
@@ -1596,6 +1676,14 @@ impl Client {
 
     pub fn compare(&self, base: Option<&str>) {
         let _ = self.tx.send(Msg::Compare(base.map(ToString::to_string)));
+    }
+
+    /// Fetch the file `run` captured under `key`.
+    pub fn file(&self, run: &str, key: &str) {
+        let _ = self.tx.send(Msg::File {
+            run: run.to_string(),
+            key: key.to_string(),
+        });
     }
 
     pub fn take(&self, seen: u64) -> Option<(u64, Snapshot)> {
@@ -1680,6 +1768,10 @@ fn run_client(
                 compare = base;
                 force = fetcher.refresh_base(compare.as_deref());
             }
+            Ok(Msg::File { run, key }) => {
+                fetcher.open_file(run, key);
+                force = true;
+            }
             Ok(Msg::Reconnect) => {
                 fetcher.connection = None;
                 fetcher.identity = None;
@@ -1736,6 +1828,7 @@ fn run_client(
                     reran: fetcher.reran.clone(),
                     synced: fetcher.synced.clone(),
                     dropped: fetcher.dropped.clone(),
+                    file: fetcher.opened.clone(),
                 },
             );
         }

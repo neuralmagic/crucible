@@ -311,6 +311,50 @@ desktop-check:
     sh crucible-desktop/rune-patches.sh
     cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
 
+# Run a command in the Fedora builder (crucible-desktop/linux/Containerfile) with the repo at /src,
+# for the host's architecture. Cargo's registry and target directory persist in podman volumes.
+[private]
+desktop-fedora *cmd:
+    podman build -q -t crucible-desktop-fedora crucible-desktop/linux
+    podman run --rm -v "$PWD":/src:Z -v crucible-desktop-cargo:/opt/cargo/registry \
+        -v crucible-desktop-target:/target -e CARGO_TARGET_DIR=/target -e SQLX_OFFLINE=true \
+        -e VERSION -w /src crucible-desktop-fedora sh -euc '{{ cmd }}'
+
+# Lint and test the desktop app on Fedora, in a container.
+desktop-linux-check:
+    just desktop-fedora 'sh crucible-desktop/rune-patches.sh && cargo build --locked -p crucible-lsp \
+        && cd crucible-desktop && cargo clippy --all-targets --all-features --locked -- -D warnings \
+        && CRUCIBLE_LSP=/target/debug/crucible-lsp dbus-run-session -- cargo test --locked'
+
+# Install the newest RPM `desktop-linux` built into a Fedora 45 GNOME VM (Lima, crucible-desktop/linux/lima.yaml)
+# and open the app in its window. The first run installs GNOME, which takes a while.
+desktop-linux-vm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="$PWD/crucible-desktop/target/linux"
+    rpm=$(ls -t "$dir"/*.rpm 2>/dev/null | head -1)
+    [ -n "$rpm" ] || { echo "no RPM in $dir: run just desktop-linux first" >&2; exit 1; }
+    if ! limactl list -q | grep -qx crucible-fedora; then
+        limactl create -y --name crucible-fedora --mount-only "$dir" crucible-desktop/linux/lima.yaml
+    fi
+    limactl start -y crucible-fedora 2>/dev/null || true
+    limactl shell crucible-fedora sh -euc "
+        if rpm -q crucible-playbooks >/dev/null; then sudo dnf -y reinstall '$rpm'; else sudo dnf -y install '$rpm'; fi
+        uid=\$(id -u)
+        until [ -S /run/user/\$uid/wayland-0 ]; do sleep 1; done
+        export XDG_RUNTIME_DIR=/run/user/\$uid WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus
+        pkill -x crucible-playbo || true
+        setsid crucible-playbooks >/tmp/crucible-playbooks.log 2>&1 < /dev/null &
+    "
+    echo "running in the crucible-fedora window; log: limactl shell crucible-fedora cat /tmp/crucible-playbooks.log"
+
+# Build the desktop app's Fedora RPM, in a container, into crucible-desktop/target/linux.
+desktop-linux version="0.0.0":
+    VERSION={{ version }} just desktop-fedora 'sh crucible-desktop/rune-patches.sh \
+        && cargo build --release --locked -p crucible-lsp \
+        && (cd crucible-desktop && cargo build --release --locked) \
+        && sh crucible-desktop/linux-bundle.sh'
+
 # Prepare a cluster for the gateway isolation e2e (crucible-controller/tests/kueue_gateway_e2e.rs): the
 # profile's loop and sandbox namespaces, its pull secret copied from `pull_from`, the loop and
 # sandbox service accounts (the sandbox one bound to `scc_role`, the ClusterRole granting the

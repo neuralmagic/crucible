@@ -6,6 +6,7 @@ mod data;
 mod decisions;
 mod desk;
 mod dock;
+mod files;
 mod finder;
 mod graph;
 mod launch;
@@ -342,6 +343,9 @@ struct Pane {
     pack: Result<PackFiles, String>,
     /// The launch record, for the Launch tab; local packs have none.
     launch: Option<crux::dto::PlaybookLaunch>,
+    /// The run shown, and the files its tasks captured; `None` until listed.
+    run_id: Option<String>,
+    files: Option<Result<Vec<crate::captured::Captured>, String>>,
     log_font: LogFont,
     launchable: bool,
     /// The pack as it compiles now: a local pack's, or the run's draft working copy's.
@@ -417,6 +421,10 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
         run_tasks: Vec::new(),
         pack: Ok(pack.pack.clone()),
         launch: None,
+        run_id: None,
+        files: Some(Err(
+            "A local run keeps them in its pack's state/files folder.".to_string(),
+        )),
         empty: (
             "No run recorded here yet.",
             "Run it with the button above, or from a shell with `crucible plan run`.".to_string(),
@@ -488,6 +496,8 @@ fn live_pane(
             |detail| detail.pack.clone(),
         ),
         launch: detail.and_then(|detail| detail.launch.clone()),
+        run_id: detail.and_then(|detail| detail.run_id.clone()),
+        files: detail.and_then(|detail| detail.files.clone()),
     }
 }
 

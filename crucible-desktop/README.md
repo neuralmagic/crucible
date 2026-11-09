@@ -1,9 +1,9 @@
 # Crucible Playbooks
 
-The Crucible desktop app for macOS: a native tracker for Crucible playbooks, drawn with
+The Crucible desktop app for macOS and Fedora: a native tracker for Crucible playbooks, drawn with
 [Rune](https://github.com/anomalyco/rune). It answers one question: what did each playbook do, and
 what is it doing now? It is its own Cargo workspace; `just desktop-check` formats, lints and tests
-it, and the Desktop workflow runs the same on macOS.
+it, and the Desktop workflow runs the same on macOS and in a Fedora container.
 
 ```sh
 just desktop-install   # builds Crucible Playbooks.app, crucible-lsp inside, into ~/Applications
@@ -12,6 +12,30 @@ just desktop-install   # builds Crucible Playbooks.app, crucible-lsp inside, int
 Each release also carries `Crucible-Playbooks-<tag>-aarch64-apple-darwin.zip`. The app is signed ad
 hoc, so macOS blocks a downloaded copy on first launch: allow it from System Settings, Privacy &
 Security, Open Anyway, or run `xattr -d com.apple.quarantine "/Applications/Crucible Playbooks.app"`.
+
+## Fedora
+
+Each release also carries `crucible-playbooks-<version>-1.fc45.<arch>.rpm` for x86_64 and
+aarch64; `sudo dnf install ./crucible-playbooks-*.rpm` installs the app, `crucible-lsp`, its desktop
+entry and the link handler. It draws through Vulkan: a GPU's Mesa driver, or Mesa's software
+renderer in a VM. Settings and profiles live in `~/.config/crucible-playbooks`, caches in
+`~/.cache/crucible-playbooks`, and draft working copies in `~/.local/share/crucible-playbooks`.
+
+```sh
+just desktop-linux-check   # clippy and the tests on Fedora 45, in a podman container
+just desktop-linux 0.6.0   # the RPM for this machine's architecture, into crucible-desktop/target/linux
+just desktop-linux-vm      # installs that RPM in a Fedora 45 GNOME VM (Lima) and opens the app
+```
+
+The builder image is `crucible-desktop/linux/Containerfile`; Cargo's registry and target directory
+persist in the `crucible-desktop-cargo` and `crucible-desktop-target` podman volumes. The VM is
+`crucible-fedora`, from `crucible-desktop/linux/lima.yaml` (`brew install lima`): its first start
+installs GNOME, which takes a while, and logs in on its own. Each `desktop-linux-vm` reinstalls the
+newest RPM and restarts the app; `limactl shell crucible-fedora` gets a shell, `limactl stop
+crucible-fedora` stops it.
+
+On Fedora the Dock badge, menu bar item and folder drops do nothing. Links open through the
+desktop entry: a second launch hands its link to the running app over the session bus.
 
 Coming from the Tauri app (`Crucible.app`): with no profiles of its own, this app takes the ones in
 `~/.config/crucible-desktop/config.toml`, the one it opened by default, and its `[drop]` ceilings.
@@ -47,6 +71,7 @@ resolve = { "crucible-api.wdc.example.com" = "lb.example.net" }   # an IP, ip:po
 url = "https://crucible-api.internal.example.com"
 proxy = "socks5h://127.0.0.1:1080"     # http, https, socks5 or socks5h
 tunnel = "ssh -N -D 1080 jumpbox"      # kept running while the app is
+shell = "/bin/bash"                    # runs it as `<shell> -l -c`; `$SHELL` when unset
 
 [profiles.local]
 url = "http://127.0.0.1:8870"          # starts `just controller-local 8870` in the repo
@@ -122,7 +147,8 @@ on `PATH`.
 
 ## The run workspace
 
-A run's views are panes: Tasks, Timeline, Graph, Pack, Launch and Log. Panes sit as tabs in groups,
+A run's views are panes: Tasks, Timeline, Graph, Data, Files, Transcript, Compare, Pack, Launch
+and Log. Panes sit as tabs in groups,
 groups stack in columns, and the gutters between them resize (double-click evens a pair). Drag a
 tab onto another group's tab bar or middle to join it, or onto an edge to split that group. A pane
 can be closed and reopened from the header.
@@ -131,8 +157,8 @@ Until a pane is moved, resized or closed, each run gets a fitted layout: the gra
 tasks, taller the deeper the graph, beside the log. Once arranged, the layout is saved to the app's
 config and kept across runs; `Reset layout` goes back to the fitted one.
 
-The Timeline draws each task and fan-out instance when it ran, from the `at` stamps on its
-session events, with a strip of how many ran at once and the critical path drawn solid. A log
+The Timeline draws each task and fan-out instance when it ran, and each round of a revise loop
+on its task's own track, from the `at` stamps on its session events, with a strip of how many ran at once and the critical path drawn solid. A log
 from before those stamps is placed from each task's duration, starting when its dependencies
 settle.
 
@@ -151,10 +177,20 @@ the editor's stdin. The copy button copies the file's path, to hand to an agent.
 pack re-reads it and re-checks it. A registered pack's files also link to their lines on the Git
 host, at the commit the playbook is pinned to.
 
+## The Files pane
+
+The Files pane lists the files a controller run's tasks captured (their `emits_files`), by task,
+with sizes, and shows one: markdown rendered (or its source), a patch in a diff view, JSON and
+JSON Lines indented and highlighted, anything else as highlighted text. A shown file is copied to
+`~/Library/Caches/crucible-playbooks/run-files/<run>/<key>`; the copy button copies that path and
+the edit button opens it in the editor. A file over 8 MiB is not fetched; the pane gives the
+`crux run-file` command instead.
+
 ## Fix and rerun
 
 `Edit` on a draft run's pack, or `Draft` on a registered one, pulls the draft into a working copy
-under `~/Library/Application Support/crucible-playbooks/drafts` (`$CRUCIBLE_DRAFTS_DIR`
+under `~/Library/Application Support/crucible-playbooks/drafts` (on Fedora,
+`~/.local/share/crucible-playbooks/drafts`; `$CRUCIBLE_DRAFTS_DIR`
 overrides it). A registered playbook's draft is `<playbook>-<user>`, created from the playbook
 the first time. The Pack tab then switches between the run's pack and the working copy, which
 opens in the editor, is checked by `crucible-lsp`, and is re-read once a second. `Save` sends it
@@ -190,8 +226,8 @@ crucible-playbooks://local/<pack>
 
 A launch link opens that launch pinned, with the task open in the Tasks pane. The copy button in
 the run header copies the link to the run on screen, and an open task card's `Copy link` copies
-one to that task. The bundle `just desktop-install` builds declares the scheme; `open
-'<link>'` or a click anywhere opens the app on it.
+one to that task. The bundle `just desktop-install` builds, and the RPM's desktop entry, declare
+the scheme; `open '<link>'` (`xdg-open` on Fedora) or a click anywhere opens the app on it.
 
 It also opens the controller's web links, as the Tauri app did: `crucible://<profile>/<web path>`,
 and `crucible://open?url=<web url>` for the profile on that URL's origin. The path lands on the
@@ -246,8 +282,11 @@ Rune renders headlessly, so the layout is inspectable:
 
 ```sh
 cargo run -- --scene local --snap /tmp/playbooks.png --size 1120x720
+CRUCIBLE_PICK=<task> CRUCIBLE_TAB=tasks cargo run -- --scene local --snap /tmp/task.png   # that task's card open
 CRUCIBLE_LIVE_SCENE=<playbook id> cargo run -- --scene live --snap /tmp/live.png --at 200
 CRUCIBLE_LIVE_SCENE=<playbook id> CRUCIBLE_TAB=pack cargo run -- --scene live --snap /tmp/pack.png --at 200
+CRUCIBLE_LINK='crucible-playbooks://playbook/<id>/launch/<launch key>' CRUCIBLE_TAB=files \
+  CRUCIBLE_FILE=report/summary.md cargo run -- --scene live --snap /tmp/files.png --at 200
 cargo run -- --scene local --chrome --snap /tmp/chrome.png   # draws the window buttons
 cargo run -- --tree /tmp/playbooks.json --scene local
 cargo test

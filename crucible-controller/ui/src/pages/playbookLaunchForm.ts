@@ -21,6 +21,10 @@ export interface ParamFieldSpec {
   description: string | null;
   /// Typed in a text area: a string that may span lines, such as a pasted log.
   multiline: boolean;
+  /// Picked from a list rather than typed: a declared choice set, or true and false for a bool.
+  choices: string[] | null;
+  /// The bool param that must be true for this one to be supplied; greyed out and omitted otherwise.
+  enabledBy: string | null;
 }
 
 /// A schema outside the closed subset renders nothing rather than a wrong form: the launch
@@ -182,6 +186,22 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     if (multiline.value && valueType !== 'string') {
       return { kind: 'unrenderable', reason: `param ${name} is multiline but not a string` };
     }
+    let choices: string[] | null = valueType === 'boolean' ? ['true', 'false'] : null;
+    if (raw.enum !== undefined) {
+      const spelled = Array.isArray(raw.enum) && valueType !== 'list' ? raw.enum.map((item) => defaultText(item, valueType)) : [];
+      if (spelled.length === 0 || spelled.some((item) => !item.ok || item.value === null)) {
+        return { kind: 'unrenderable', reason: `param ${name} has choices that are not a nonempty list of its type` };
+      }
+      choices = spelled.map((item) => (item.ok ? (item.value ?? '') : ''));
+    }
+    const enabledBy = stringField(raw, 'x-enabled-by');
+    if (!enabledBy.ok) {
+      return { kind: 'unrenderable', reason: `param ${name} has a non-string x-enabled-by` };
+    }
+    const gate = enabledBy.value === null ? undefined : properties[enabledBy.value];
+    if (enabledBy.value !== null && !(isRecord(gate) && gate.type === 'boolean')) {
+      return { kind: 'unrenderable', reason: `param ${name} is enabled by ${enabledBy.value}, which is not a declared bool` };
+    }
     const description = stringField(raw, 'description');
     specs.push({
       name,
@@ -191,6 +211,8 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       pattern: pattern.value,
       description: description.ok ? description.value : null,
       multiline: multiline.value,
+      choices,
+      enabledBy: enabledBy.value,
     });
   }
   if (orderRaw !== undefined) {
@@ -218,13 +240,60 @@ export function initialValues(
 /// Client-side convenience only. An unanchored `new RegExp` matches JSON Schema semantics, and a
 /// pattern the browser cannot compile (Rust-regex syntax the engine accepts) checks nothing here
 /// rather than failing a value the endpoint would have taken.
-export function validateParam(spec: ParamFieldSpec, value: string): string | null {
+/// Whether a gated param's switch is on, so its value is taken; an ungated param always is.
+/// One block of the rendered form: a lone field, or a boolean gate with the fields it enables.
+export type ParamBlock =
+  | { kind: 'field'; spec: ParamFieldSpec }
+  | { kind: 'gated'; gate: ParamFieldSpec; fields: ParamFieldSpec[] };
+
+/// The form's blocks in declaration order. A boolean another field names in enabled_by renders once,
+/// as the head of a group at its first gated field's position, so the gate sits with what it unlocks.
+export function paramBlocks(specs: readonly ParamFieldSpec[]): ParamBlock[] {
+  const gates = new Map(
+    specs
+      .filter((spec) => specs.some((other) => other.enabledBy === spec.name))
+      .map((spec) => [spec.name, spec])
+  );
+  const blocks: ParamBlock[] = [];
+  const groups = new Map<string, ParamFieldSpec[]>();
+  for (const spec of specs) {
+    if (gates.has(spec.name)) continue;
+    const gate = spec.enabledBy === null ? undefined : gates.get(spec.enabledBy);
+    if (gate === undefined) {
+      blocks.push({ kind: 'field', spec });
+      continue;
+    }
+    const fields = groups.get(gate.name);
+    if (fields === undefined) {
+      const group: ParamFieldSpec[] = [spec];
+      groups.set(gate.name, group);
+      blocks.push({ kind: 'gated', gate, fields: group });
+    } else {
+      fields.push(spec);
+    }
+  }
+  return blocks;
+}
+
+export function isEnabled(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): boolean {
+  return spec.enabledBy === null || (values[spec.enabledBy] ?? '').trim().toLowerCase() === 'true';
+}
+
+export function validateParam(
+  spec: ParamFieldSpec,
+  value: string,
+  values?: Readonly<Record<string, string>>
+): string | null {
+  if (values !== undefined && !isEnabled(spec, values)) return null;
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     return spec.required ? `${spec.name} is required` : null;
   }
   if (!readsAs(spec.valueType, trimmed)) {
     return `${spec.name} must be ${spellingOf(spec.valueType) ?? 'text'}`;
+  }
+  if (spec.choices !== null && !spec.choices.includes(spec.valueType === 'boolean' ? trimmed.toLowerCase() : trimmed)) {
+    return `${spec.name} must be one of ${spec.choices.join(', ')}`;
   }
   if (spec.pattern === null) return null;
   let re: RegExp;
@@ -253,7 +322,7 @@ export function trimmedParams(
   const params: Record<string, string> = {};
   for (const spec of specs) {
     const value = (values[spec.name] ?? '').trim();
-    if (value.length === 0 && !spec.required) continue;
+    if (!isEnabled(spec, values) || (value.length === 0 && !spec.required)) continue;
     params[spec.name] = value;
   }
   return params;

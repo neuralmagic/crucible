@@ -61,6 +61,7 @@ changed = [
     "C-PLAYBOOK-PARAMS: a string parameter may take its choices from a task output (choices_from), offered and enforced by the controller from the latest passing run and recorded per launch; allow_other makes any choice list suggestions",
     "C-PLAYBOOK-PARAMS: a choices_from producer and its dependencies must not depend on parameter values; the launch value choices.refresh = true compiles and runs only them, with no parameters",
     "C-PLAYBOOK-PARAMS: choices_from may be keyed_by another string parameter, offering the list for that parameter's value; placeholder_from shows a keyed string in an empty input without submitting it",
+    "C-PLAYBOOK-PARAMS: an optional parameter may be enabled_by a declared boolean; supplying it while the boolean is false is rejected before compilation, and a launch form disables it",
     "C-SETTLED-JOIN: a failing task's own note, from a self-declared failure or a command's nonzero exit, is the note the engine records",
     "C-SETTLED-JOIN: an all-join task gets no entry for an optional dependency that settled not taken (RFC-0001:C-ROUTE)",
     "C-PLAYBOOK-RESUME: a resume reads the manifest variant the interrupted run read",

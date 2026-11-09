@@ -9,7 +9,9 @@ use serde_json::Value;
 use crate::App;
 use crate::gfx;
 use crate::logline::{Activity, LogLine, activity};
-use crate::session::{Instance, InstanceCounts, LinkView, Outcome, TaskState, TaskView};
+use crate::session::{
+    Instance, InstanceCounts, LinkView, Outcome, Round, TaskState, TaskView, sent_back,
+};
 use crate::ui::log;
 use crate::ui::{Paint, Tone, flag, fx, meter, pulsing, tag};
 
@@ -94,7 +96,14 @@ pub(crate) fn task_list(
             editable,
             link,
         };
-        list = list.child(card(task, &activity(log, &task.name), &tail, shown, p));
+        list = list.child(card(
+            task,
+            tasks,
+            &activity(log, &task.name),
+            &tail,
+            shown,
+            p,
+        ));
     }
     list
 }
@@ -109,7 +118,14 @@ struct Shown {
     link: Option<String>,
 }
 
-fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], shown: Shown, p: &Paint) -> El {
+fn card(
+    task: &TaskView,
+    tasks: &[TaskView],
+    activity: &Activity,
+    tail: &[&LogLine],
+    shown: Shown,
+    p: &Paint,
+) -> El {
     let Shown {
         open,
         rerun,
@@ -137,6 +153,9 @@ fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], shown: Shown, p
             p,
         ));
     }
+    if let Some(revised) = &task.revised {
+        title = title.child(tag(&round_of(task, revised.max_rounds), p));
+    }
     if !task.required {
         title = title.child(flag("advisory", Tone::Warning, None, p));
     }
@@ -163,6 +182,9 @@ fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], shown: Shown, p
     if !task.instances.is_empty() {
         body = body.child(fanout_bar(task.instance_counts(), &task.name, p));
     }
+    if let Some(revised) = &task.revised {
+        body = body.child(round_strip(task, revised.max_rounds, p));
+    }
     if !tail.is_empty() {
         body = body.child(live_tail(&task.name, tail, p));
     } else if let Some(line) = headline(task, state, activity, p) {
@@ -173,7 +195,7 @@ fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], shown: Shown, p
         body = body.child(link_chips(&links, p));
     }
     if open {
-        body = body.child(expanded(task, rerun, editable, link, p));
+        body = body.child(expanded(task, tasks, rerun, editable, link, p));
     }
 
     row()
@@ -360,6 +382,8 @@ fn facts(task: &TaskView, activity: &Activity) -> Vec<String> {
         if result.cost_usd > 0.0 {
             facts.push(format!("${:.4}", result.cost_usd));
         }
+    } else if let Some(spent) = Some(round_spend(task)).filter(|spent| *spent > 0.0) {
+        facts.push(format!("${spent:.4}"));
     } else if let Some(attempt) = task.attempt.filter(|a| a.estimate_usd > 0.0) {
         facts.push(format!("est ${:.2}/try", attempt.estimate_usd));
     }
@@ -387,7 +411,11 @@ fn facts(task: &TaskView, activity: &Activity) -> Vec<String> {
 /// What the reader most needs next: what a live task is doing, why a task stopped, or what it
 /// produced.
 fn headline(task: &TaskView, state: TaskState, activity: &Activity, p: &Paint) -> Option<El> {
-    let (line, ink) = match (state, &task.result) {
+    let settled = task
+        .result
+        .as_ref()
+        .or_else(|| task.rounds.last().and_then(|round| round.result.as_ref()));
+    let (line, ink) = match (state, settled) {
         (TaskState::Running(_), _) => (
             activity
                 .last
@@ -574,7 +602,14 @@ fn provider_mark(provider: &str) -> String {
     }
 }
 
-fn expanded(task: &TaskView, rerun: bool, editable: bool, link: Option<String>, p: &Paint) -> El {
+fn expanded(
+    task: &TaskView,
+    tasks: &[TaskView],
+    rerun: bool,
+    editable: bool,
+    link: Option<String>,
+    p: &Paint,
+) -> El {
     let fix =
         rerun && matches!(task.state(), TaskState::Settled(status) if status != TaskStatus::Pass);
     let mut panel = col()
@@ -625,12 +660,12 @@ fn expanded(task: &TaskView, rerun: bool, editable: bool, link: Option<String>, 
             .child(section("Instances", p))
             .child(instances(task, p));
     }
-    let repairs: Vec<_> = task
-        .result
-        .iter()
-        .chain(task.instances.iter().filter_map(|i| i.result.as_ref()))
-        .flat_map(|r| r.repairs.iter())
-        .collect();
+    if !task.rounds.is_empty() {
+        panel = panel
+            .child(section("Rounds", p))
+            .child(rounds(task, tasks, p));
+    }
+    let repairs = task.repairs();
     if !repairs.is_empty() {
         let mut list = col().w_full().gap(4.0);
         for repair in repairs {
@@ -791,13 +826,7 @@ fn instance_row(task: &str, instance: &Instance, p: &Paint) -> El {
         if result.cost_usd > 0.0 {
             detail.push(format!("${:.4}", result.cost_usd));
         }
-        if let Some(why) = stopped_why(result) {
-            detail.push(why);
-        } else if !result.note.is_empty() {
-            detail.push(result.note.clone());
-        } else if let Some(out) = result.output.as_ref().and_then(output_headline) {
-            detail.push(out);
-        }
+        detail.extend(said(result));
     } else if let Some(attempt) = instance.attempt {
         detail.push(format!("try {}", attempt.number));
     }
@@ -834,6 +863,171 @@ fn instance_row(task: &str, instance: &Instance, p: &Paint) -> El {
                 .min_w(0.0)
                 .truncate(),
         )
+}
+
+/// Why a result stopped, else its note, else what it emitted.
+fn said(result: &Outcome) -> Option<String> {
+    stopped_why(result)
+        .or_else(|| (!result.note.is_empty()).then(|| result.note.clone()))
+        .or_else(|| result.output.as_ref().and_then(output_headline))
+}
+
+/// `round 2 of 3` once a round started, `up to 3 rounds` before.
+fn round_of(task: &TaskView, max_rounds: u32) -> String {
+    match task.rounds.last() {
+        Some(round) => format!("round {} of {max_rounds}", round.n),
+        None => format!("up to {max_rounds} rounds"),
+    }
+}
+
+/// What the loop's rounds spent so far.
+fn round_spend(task: &TaskView) -> f64 {
+    task.rounds
+        .iter()
+        .filter_map(|round| round.result.as_ref())
+        .map(|result| result.cost_usd.max(0.0))
+        .sum()
+}
+
+/// The loop's rounds in order, each with its state, then the rounds it may still run.
+fn round_strip(task: &TaskView, max_rounds: u32, p: &Paint) -> El {
+    let mut strip = row()
+        .key(format!("rounds-{}", task.name))
+        .w_full()
+        .gap(4.0)
+        .center_y();
+    let settled = task.result.is_some();
+    for n in 1..=max_rounds.max(task.rounds.last().map_or(0, |r| r.n)) {
+        if n > 1 {
+            strip = strip.child(icon(&oc::CHEVRON_RIGHT, 10.0).color(p.c.icon_faint));
+        }
+        let Some(round) = task.round(n) else {
+            strip = strip.child(
+                text(format!("{n}"))
+                    .font(p.mono(10.5, 400.0))
+                    .color(p.c.text_faint.alpha(if settled { 0.5 } else { 1.0 }))
+                    .px(5.0),
+            );
+            continue;
+        };
+        let state = round.state();
+        let full = round.name(&task.name);
+        strip = strip.child(
+            row()
+                .key(format!("round-chip-{full}"))
+                .role("button")
+                .label(format!("Show {full} in the log"))
+                .help(format!("round {n}: {}", state_label(state)))
+                .h(20.0)
+                .px(5.0)
+                .gap(4.0)
+                .center_y()
+                .radius(p.k.radius.sm)
+                .fill(p.c.layer_02)
+                .border(p.hair, p.c.border_muted)
+                .hover(p.c.hover)
+                .focusable(true)
+                .on_press(move |app: &mut App| app.filter_log(Some(&full)))
+                .child(state_mark(state, p).scale(0.7))
+                .child(
+                    text(format!("{n}"))
+                        .font(p.mono(10.5, 500.0))
+                        .color(label_ink(state, p)),
+                ),
+        );
+    }
+    strip
+}
+
+fn rounds(task: &TaskView, tasks: &[TaskView], p: &Paint) -> El {
+    let mut list = col().w_full().gap(4.0);
+    for round in &task.rounds {
+        list = list.child(round_row(task, tasks, round, p));
+    }
+    list
+}
+
+fn round_row(task: &TaskView, tasks: &[TaskView], round: &Round, p: &Paint) -> El {
+    let state = round.state();
+    let full = round.name(&task.name);
+    let mut detail = Vec::new();
+    if let Some(result) = &round.result {
+        if result.attempts > 1 {
+            detail.push(format!("{} tries", result.attempts));
+        }
+        if result.secs > 0.0 {
+            detail.push(duration(result.secs));
+        }
+        detail.push(format!("${:.4}", result.cost_usd));
+        detail.extend(said(result));
+    } else if let Some(attempt) = round.attempt {
+        detail.push(format!("try {}", attempt.number));
+    }
+    let head = row()
+        .key(format!("round-{full}"))
+        .role("button")
+        .label(format!("Show {full} in the log"))
+        .w_full()
+        .h(22.0)
+        .px(6.0)
+        .gap(7.0)
+        .center_y()
+        .radius(p.k.radius.sm)
+        .hover(p.c.hover)
+        .focusable(true)
+        .on_press(move |app: &mut App| app.filter_log(Some(&full)))
+        .child(state_mark(state, p).scale(0.8))
+        .child(
+            text(format!("round {}", round.n))
+                .font(p.mono(10.5, 500.0))
+                .color(p.c.text_base)
+                .w(64.0),
+        )
+        .child(
+            text(state_label(state))
+                .font(p.mono(10.0, 400.0))
+                .color(label_ink(state, p))
+                .w(70.0),
+        )
+        .child(
+            text(detail.join(" \u{b7} "))
+                .font(p.mono(10.0, 400.0))
+                .color(p.c.text_muted)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    let Some((by, why)) = task.revised.as_ref().zip(sent_back(tasks, task, round.n)) else {
+        return head;
+    };
+    let reason = [
+        stopped_why(why).or_else(|| (!why.note.is_empty()).then(|| why.note.clone())),
+        why.output.as_ref().and_then(output_headline),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" \u{b7} ");
+    col().w_full().gap(1.0).child(head).child(
+        row()
+            .w_full()
+            .gap(6.0)
+            .pl(29.0)
+            .child(
+                text("\u{21a9}")
+                    .font(p.mono(10.0, 400.0))
+                    .color(p.c.icon_faint),
+            )
+            .child(
+                text(format!("sent back by {}: {reason}", by.by))
+                    .font(p.mono(10.0, 400.0))
+                    .color(p.fail.mix(p.c.text_muted, 0.4))
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .max_lines(3)
+                    .wrap(),
+            ),
+    )
 }
 
 pub(crate) fn fact_row(label: &str, value: String, p: &Paint) -> El {
