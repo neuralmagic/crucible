@@ -13,6 +13,7 @@ pub mod history;
 pub mod ir;
 pub mod machine;
 pub mod options;
+pub mod output;
 pub mod param;
 pub mod record;
 pub mod rerun;
