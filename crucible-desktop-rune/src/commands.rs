@@ -14,6 +14,7 @@ impl App {
     pub fn run_command(&mut self, command: Command, tx: &mut Tx) {
         match command {
             Command::Palette => self.toggle_palette(),
+            Command::Search => self.toggle_finder(),
             Command::Focus(edge) => self.move_focus(edge),
             Command::NextTab => self.cycle_tab(1),
             Command::PreviousTab => self.cycle_tab(-1),
@@ -241,6 +242,20 @@ pub fn palette_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         Key::Escape => app.palette = None,
         _ if pressed(tx, ev).is_some_and(|s| app.keymap.command(&s) == Some(Command::Palette)) => {
             app.palette = None;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// The finder field's keys: the arrows move through hits, Escape and the finder's own key close it.
+pub fn finder_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    match ev.key {
+        Key::Up => app.step_finder(-1),
+        Key::Down => app.step_finder(1),
+        Key::Escape => app.finder = None,
+        _ if pressed(tx, ev).is_some_and(|s| app.keymap.command(&s) == Some(Command::Search)) => {
+            app.finder = None;
         }
         _ => return false,
     }

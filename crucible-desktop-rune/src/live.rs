@@ -363,7 +363,7 @@ struct Fetcher {
 
 /// What the controller last answered, on disk, and whether answers are coming from it now.
 pub(crate) struct Cache {
-    store: Arc<Store>,
+    pub(crate) store: Arc<Store>,
     offline: Arc<AtomicBool>,
 }
 

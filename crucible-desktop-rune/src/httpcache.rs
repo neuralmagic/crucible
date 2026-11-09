@@ -24,6 +24,8 @@ use crux::sse::SseEvent;
 use reqwest::{Method, StatusCode};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::search::{self, Hit, Source};
+
 /// The most bytes the cache keeps before it drops what was used longest ago.
 const BUDGET: i64 = 512 * 1024 * 1024;
 
@@ -67,12 +69,64 @@ impl Store {
                  used INTEGER NOT NULL,
                  PRIMARY KEY (base, path)
              );
-             CREATE INDEX IF NOT EXISTS responses_used ON responses (used);",
+             CREATE INDEX IF NOT EXISTS responses_used ON responses (used);
+             CREATE VIRTUAL TABLE IF NOT EXISTS search USING fts5(
+                 text, task UNINDEXED, source UNINDEXED, n UNINDEXED, base UNINDEXED,
+                 path UNINDEXED, run UNINDEXED, launch UNINDEXED, playbook UNINDEXED,
+                 tokenize = 'trigram'
+             );
+             CREATE TABLE IF NOT EXISTS search_runs (
+                 base TEXT NOT NULL,
+                 run TEXT NOT NULL,
+                 launch TEXT NOT NULL,
+                 playbook TEXT NOT NULL,
+                 PRIMARY KEY (base, run)
+             );
+             CREATE TABLE IF NOT EXISTS search_indexed (
+                 base TEXT NOT NULL,
+                 path TEXT NOT NULL,
+                 PRIMARY KEY (base, path)
+             );",
         )?;
+        backfill(&db)?;
         Ok(Store {
             db: Mutex::new(db),
             budget,
         })
+    }
+
+    /// The lines of `playbook`'s runs on `base` that hold `query`, at most `limit`. Only when
+    /// none does are near misses offered: lines holding most of its trigrams, for a typo.
+    pub fn search(&self, base: &str, playbook: &str, query: &str, limit: usize) -> Vec<Hit> {
+        let db = self.db();
+        if let Some(fts) = search::phrase(query) {
+            let exact = query_hits(&db, base, playbook, &fts, limit, true);
+            if !exact.is_empty() {
+                return exact;
+            }
+        }
+        let Some(fts) = search::near(query) else {
+            return Vec::new();
+        };
+        query_hits(&db, base, playbook, &fts, limit * 4, false)
+            .into_iter()
+            .filter(|hit| search::close(query, &hit.text))
+            .take(limit)
+            .collect()
+    }
+
+    /// Whether `path` on `base` has been read into the index.
+    pub fn indexed(&self, base: &str, path: &str) -> bool {
+        self.db()
+            .query_row(
+                "SELECT 1 FROM search_indexed WHERE base = ?1 AND path = ?2",
+                params![base, path],
+                |_| Ok(()),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .is_some()
     }
 
     fn db(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -110,6 +164,7 @@ impl Store {
         if stored.is_err() {
             return;
         }
+        let _ = index(&db, base, path, body);
         loop {
             let total: i64 = db
                 .query_row(
@@ -133,6 +188,103 @@ impl Store {
             }
         }
     }
+}
+
+/// Put the searchable lines of `body`, cached at `path`, in the index in place of what it held.
+fn index(db: &Connection, base: &str, path: &str, body: &[u8]) -> rusqlite::Result<()> {
+    let Some(indexed) = search::docs(path, body) else {
+        return Ok(());
+    };
+    let tx = db.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM search WHERE base = ?1 AND path = ?2",
+        params![base, path],
+    )?;
+    {
+        let mut insert = tx.prepare_cached(
+            "INSERT INTO search (text, task, source, n, base, path, run, launch, playbook)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )?;
+        for doc in &indexed.docs {
+            insert.execute(params![
+                doc.text,
+                doc.task,
+                doc.source.id(),
+                doc.n as i64,
+                base,
+                path,
+                indexed.run,
+                indexed.launch,
+                indexed.playbook,
+            ])?;
+        }
+    }
+    for run in &indexed.runs {
+        tx.execute(
+            "INSERT OR REPLACE INTO search_runs (base, run, launch, playbook)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![base, run, indexed.launch, indexed.playbook],
+        )?;
+    }
+    tx.execute(
+        "INSERT OR IGNORE INTO search_indexed (base, path) VALUES (?1, ?2)",
+        params![base, path],
+    )?;
+    tx.commit()
+}
+
+/// Index what the cache already holds and the index does not.
+fn backfill(db: &Connection) -> rusqlite::Result<()> {
+    let missing: Vec<(String, String, Vec<u8>)> = {
+        let mut rows = db.prepare(
+            "SELECT r.base, r.path, r.body FROM responses r
+             LEFT JOIN search_indexed i ON i.base = r.base AND i.path = r.path
+             WHERE i.path IS NULL",
+        )?;
+        rows.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (base, path, body) in missing {
+        if search::docs(&path, &body).is_some() {
+            index(db, &base, &path, &body)?;
+        }
+    }
+    Ok(())
+}
+
+fn query_hits(
+    db: &Connection,
+    base: &str,
+    playbook: &str,
+    fts: &str,
+    limit: usize,
+    exact: bool,
+) -> Vec<Hit> {
+    let Ok(mut rows) = db.prepare_cached(
+        "SELECT s.text, s.task, s.source, s.n, s.run,
+                COALESCE(NULLIF(s.launch, ''), r.launch, '') AS launch
+         FROM search s
+         LEFT JOIN search_runs r ON r.base = s.base AND r.run = s.run
+         WHERE search MATCH ?1 AND s.base = ?2
+           AND (?3 = '' OR COALESCE(NULLIF(s.playbook, ''), r.playbook, '') = ?3)
+         ORDER BY rank
+         LIMIT ?4",
+    ) else {
+        return Vec::new();
+    };
+    rows.query_map(params![fts, base, playbook, limit as i64], |row| {
+        Ok(Hit {
+            text: row.get(0)?,
+            task: row.get(1)?,
+            source: Source::from_id(&row.get::<_, String>(2)?),
+            n: row.get::<_, i64>(3)? as usize,
+            run: row.get(4)?,
+            launch: row.get(5)?,
+            exact,
+        })
+    })
+    .map(|rows| rows.flatten().collect())
+    .unwrap_or_default()
 }
 
 /// Whether a response at `path` can never change.
@@ -246,6 +398,7 @@ mod tests {
     use crux::config::{Auth, Config};
 
     use crate::httpcache::{CachedTransport, Store, settled};
+    use crate::search::{Hit, Source};
 
     /// A real HTTP server on a loopback port answering every request with `body`, counting them.
     fn serve(body: &'static str) -> (String, Arc<AtomicUsize>) {
@@ -377,5 +530,148 @@ mod tests {
         assert!(settled("/api/playbook-drafts/d/files?version=4", b""));
         assert!(!settled("/api/playbook-drafts/d/files", b""));
         assert!(!settled("/api/runs/r/log", ended));
+    }
+
+    const RUN: &str = "playbook_cve_01a2-1";
+    const LAUNCH: &str = "playbook:cve:01a2";
+
+    fn session() -> Vec<u8> {
+        [
+            r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{"name":"triage","kind":"command","depends_on":[],"required":true}]}"#,
+            r#"{"v":1,"kind":"task_started","task":"triage","attempt":1,"estimate_usd":0.0}"#,
+            r#"{"v":1,"kind":"task_result","task":"triage","status":"pass","attempts":1,"cost_usd":0.0,"output":{"tickets":["XYZ-69","XYZ-70"]},"note":""}"#,
+        ]
+        .join("\n")
+        .into_bytes()
+    }
+
+    fn filled(store: &Store) {
+        store.put(
+            "b",
+            &format!("/api/runs/{RUN}/artifacts/session.jsonl"),
+            &session(),
+            true,
+        );
+        store.put(
+            "b",
+            &format!("/api/runs/{RUN}/log"),
+            br#"{"text":"[triage] fetched XYZ-69 from jira\n[triage] done\n"}"#,
+            false,
+        );
+        store.put(
+            "b",
+            "/api/runs/playbook_other_01b3-1/log",
+            br#"{"text":"[scan] XYZ-69 seen here too\n"}"#,
+            false,
+        );
+    }
+
+    #[test]
+    fn a_ticket_is_found_in_a_runs_output_and_console_and_names_its_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cache.sqlite")).unwrap();
+        filled(&store);
+        let hits: Vec<Hit> = store
+            .search("b", "cve", "xyz-69", 20)
+            .into_iter()
+            .filter(|h| h.exact)
+            .collect();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|h| h.launch == LAUNCH && h.run == RUN));
+        let output = hits
+            .iter()
+            .find(|h| h.source == Source::Output)
+            .expect("output");
+        assert_eq!(output.text, "tickets[0]: XYZ-69");
+        assert_eq!(output.task, "triage");
+        let console = hits
+            .iter()
+            .find(|h| h.source == Source::Console)
+            .expect("console");
+        assert_eq!((console.task.as_str(), console.n), ("triage", 0));
+        let everywhere = store.search("b", "", "XYZ-69", 20);
+        assert_eq!(everywhere.len(), 3, "no playbook searches every one");
+        assert!(
+            everywhere.iter().all(|h| h.exact),
+            "near misses only when nothing holds the query"
+        );
+        assert!(
+            store
+                .search("other-controller", "", "XYZ-69", 20)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_near_miss_ranks_after_exact_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cache.sqlite")).unwrap();
+        filled(&store);
+        let hits = store.search("b", "cve", "XYZ-7O", 5);
+        assert_eq!(
+            hits.len(),
+            1,
+            "a typo finds its line and not ones sharing a prefix: {hits:?}"
+        );
+        assert!(!hits[0].exact);
+        assert_eq!(hits[0].text, "tickets[1]: XYZ-70");
+    }
+
+    #[test]
+    fn storing_a_response_again_replaces_its_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cache.sqlite")).unwrap();
+        let path = format!("/api/runs/{RUN}/log");
+        store.put("b", &path, br#"{"text":"[t] XYZ-69\n"}"#, false);
+        store.put("b", &path, br#"{"text":"[t] ABC-1\n"}"#, false);
+        assert!(store.search("b", "", "XYZ-69", 5).is_empty());
+        assert_eq!(store.search("b", "", "ABC-1", 5).len(), 1);
+    }
+
+    #[test]
+    fn a_launch_record_ties_runs_its_id_does_not_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("cache.sqlite")).unwrap();
+        store.put(
+            "b",
+            "/api/runs/odd-run/log",
+            br#"{"text":"XYZ-69\n"}"#,
+            false,
+        );
+        let record = serde_json::json!({
+            "launch": {"params": {}, "schema_digest": "", "schema_drifted": false,
+                "max_cost": 1.0, "max_time": "5m"},
+            "source_exists": true, "dispatch": {}, "runs": [{"run_id": "odd-run"}]
+        });
+        store.put(
+            "b",
+            "/api/playbook-runs/playbook%3Acve%3A01c4",
+            &serde_json::to_vec(&record).unwrap(),
+            false,
+        );
+        let hits = store.search("b", "cve", "XYZ-69", 5);
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].launch, "playbook:cve:01c4");
+    }
+
+    #[test]
+    fn opening_a_cache_indexes_what_it_already_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.sqlite");
+        {
+            let store = Store::open(&path).unwrap();
+            filled(&store);
+            let db = store.db();
+            db.execute_batch("DELETE FROM search; DELETE FROM search_indexed;")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let exact = store
+            .search("b", "cve", "XYZ-69", 20)
+            .iter()
+            .filter(|h| h.exact)
+            .count();
+        assert_eq!(exact, 2);
+        assert!(store.indexed("b", &format!("/api/runs/{RUN}/log")));
     }
 }

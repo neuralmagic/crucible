@@ -13,6 +13,8 @@ use crate::workspace::{Edge, PaneKind};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Command {
     Palette,
+    /// Search every run of the selected playbook.
+    Search,
     /// Focus the pane on that side of the focused one.
     Focus(Edge),
     NextTab,
@@ -37,8 +39,9 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Command; 32] = [
+    pub const ALL: [Command; 33] = [
         Command::Palette,
+        Command::Search,
         Command::Focus(Edge::Left),
         Command::Focus(Edge::Bottom),
         Command::Focus(Edge::Top),
@@ -76,6 +79,7 @@ impl Command {
     pub fn id(self) -> String {
         match self {
             Command::Palette => "palette".into(),
+            Command::Search => "search-runs".into(),
             Command::Focus(edge) => format!("focus-{}", edge_id(edge)),
             Command::NextTab => "next-tab".into(),
             Command::PreviousTab => "previous-tab".into(),
@@ -99,6 +103,7 @@ impl Command {
     pub fn title(self) -> String {
         match self {
             Command::Palette => "Command palette".into(),
+            Command::Search => "Search runs".into(),
             Command::Focus(edge) => format!("Focus the pane {}", edge_word(edge)),
             Command::NextTab => "Next tab".into(),
             Command::PreviousTab => "Previous tab".into(),
@@ -130,6 +135,7 @@ impl Command {
         };
         match self {
             Command::Palette => vec![primary("cmd+k", "ctrl+k")],
+            Command::Search => vec![primary("cmd+shift+f", "ctrl+shift+f")],
             Command::Focus(Edge::Left) => vec!["h", "left"],
             Command::Focus(Edge::Bottom) => vec!["j", "down"],
             Command::Focus(Edge::Top) => vec!["k", "up"],

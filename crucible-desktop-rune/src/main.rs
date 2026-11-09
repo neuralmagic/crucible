@@ -8,6 +8,7 @@ mod diff;
 mod draft;
 mod editor;
 mod filter;
+mod finder;
 mod form;
 mod gfx;
 mod handoff;
@@ -24,6 +25,7 @@ mod pack;
 mod palette;
 mod preview;
 mod runs;
+mod search;
 mod session;
 mod settings;
 mod signin;
@@ -248,6 +250,10 @@ pub struct App {
     /// Which keys run which commands, and the bindings in the config file it could not use.
     pub keymap: keymap::Keymap,
     pub keys_refused: Vec<keymap::Refused>,
+    /// The run finder, while open.
+    pub finder: Option<finder::Finder>,
+    finder_client: finder::Client,
+    finder_seen: u64,
     /// The command palette, while open.
     pub palette: Option<palette::Palette>,
     /// The pane keyboard navigation starts from.
@@ -1192,6 +1198,9 @@ fn init() -> App {
         keymap,
         keys_refused,
         palette: None,
+        finder: None,
+        finder_client: finder::Client::spawn(),
+        finder_seen: 0,
         pane_focus: None,
         notifier: None,
         clicks: None,
@@ -1250,6 +1259,7 @@ fn setup(app: &mut App, waker: Waker) {
     app.local.set_waker(waker.clone());
     app.live_client.set_waker(waker.clone());
     app.admin_client.set_waker(waker.clone());
+    app.finder_client.set_waker(waker.clone());
     app.lsp.set_waker(waker);
 }
 
@@ -1265,6 +1275,11 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
     if let Some((version, snapshot)) = app.live_client.take(app.live_seen) {
         app.live_seen = version;
         app.apply_live(snapshot);
+        changed = true;
+    }
+    if let Some((version, found)) = app.finder_client.take(app.finder_seen) {
+        app.finder_seen = version;
+        app.apply_found(found);
         changed = true;
     }
     if let Some((version, view)) = app.admin_client.take(app.admin_seen) {

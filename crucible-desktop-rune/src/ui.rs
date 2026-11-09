@@ -5,6 +5,7 @@ mod data;
 mod decisions;
 mod desk;
 mod dock;
+mod finder;
 mod graph;
 mod launch;
 mod launcher;
@@ -307,6 +308,7 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
     let mut layer = Vec::new();
     launcher::sheet(app, &p, &mut layer);
     palette::palette(app, &p, &mut layer);
+    finder::finder(app, &p, &mut layer);
     rune_kit::root(window, layer)
 }
 
