@@ -526,6 +526,88 @@ pub fn keep() -> i32 {
     }
 }
 
+/// What the retired Tauri desktop app's `config.toml` held, as far as this app uses it.
+#[derive(Debug, Default, PartialEq)]
+pub struct Tauri {
+    pub profiles: BTreeMap<String, Profile>,
+    pub default: Option<String>,
+    pub drop: Option<(f64, String)>,
+}
+
+/// The Tauri app's settings in `text`, as profiles of this app. A profile that called crux
+/// (`api = "crux"`) gets `crux_url` and crux's key; the others keep their URL. Its `resolve` named
+/// a domain to reach elsewhere, here the profile's own host when it is in that domain.
+pub fn from_tauri(text: &str, crux_url: &str) -> Tauri {
+    #[derive(Deserialize)]
+    struct File {
+        default_profile: Option<String>,
+        #[serde(default)]
+        profiles: BTreeMap<String, Old>,
+        drop: Option<Drop>,
+    }
+    #[derive(Deserialize)]
+    struct Old {
+        url: String,
+        #[serde(default)]
+        api: Option<String>,
+        proxy: Option<String>,
+        #[serde(default)]
+        resolve: BTreeMap<String, String>,
+    }
+    #[derive(Deserialize)]
+    struct Drop {
+        max_cost: Option<f64>,
+        max_time: Option<String>,
+    }
+    let Ok(file) = toml::from_str::<File>(text) else {
+        return Tauri::default();
+    };
+    let profiles: BTreeMap<String, Profile> = file
+        .profiles
+        .into_iter()
+        .filter_map(|(name, old)| {
+            let crux = old.api.as_deref() == Some("crux");
+            let url = if crux {
+                crux_url.to_string()
+            } else {
+                old.url.trim_end_matches('/').to_string()
+            };
+            let host = Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_default();
+            let resolve = old
+                .resolve
+                .into_iter()
+                .filter_map(|(domain, to)| {
+                    let inside = host == domain || host.ends_with(&format!(".{domain}"));
+                    inside.then(|| (host.clone(), to))
+                })
+                .collect();
+            let profile = Profile {
+                url,
+                auth: if crux { Auth::Crux } else { Auth::Own },
+                proxy: old.proxy,
+                resolve,
+                tunnel: None,
+            };
+            profile.check(&name).ok().map(|()| (name, profile))
+        })
+        .collect();
+    Tauri {
+        default: file
+            .default_profile
+            .filter(|name| profiles.contains_key(name)),
+        drop: file.drop.and_then(|d| Some((d.max_cost?, d.max_time?))),
+        profiles,
+    }
+}
+
+/// The retired Tauri app's settings file, under `config_dir`.
+pub fn tauri_config(config_dir: &Path) -> PathBuf {
+    config_dir.join("crucible-desktop").join("config.toml")
+}
+
 /// The profiles that can be used: the configured ones that read, or the default from crux.
 pub fn usable(settings: &crate::settings::Settings) -> BTreeMap<String, Profile> {
     let good: BTreeMap<String, Profile> = settings
@@ -815,6 +897,64 @@ tunnel = "ssh -N -D 1080 jumpbox"
         assert!(
             toml::from_str::<File>("[profiles.x]\nurl = \"https://a\"\nproxxy = \"x\"").is_err(),
             "a typo is refused"
+        );
+    }
+
+    #[test]
+    fn the_tauri_apps_profiles_carry_over() {
+        let old = crate::profile::from_tauri(
+            r#"
+default_profile = "mpp"
+
+[profiles.local]
+url = "http://127.0.0.1:8870"
+
+[profiles.mpp]
+url = "https://crucible.example.com"
+api = "crux"
+
+[profiles.jump]
+url = "https://crucible.internal.example.com/"
+proxy = "socks5://127.0.0.1:1080"
+
+[drop]
+profile = "local"
+max_cost = 2.5
+max_time = "45m"
+
+[profiles.wdc]
+url = "https://crucible.ext.wdc.example.com"
+
+[profiles.wdc.resolve]
+"ext.wdc.example.com" = "lb.example.net"
+"#,
+            "https://crucible-api.example.com",
+        );
+        assert_eq!(old.default.as_deref(), Some("mpp"));
+        assert_eq!(old.drop, Some((2.5, "45m".to_string())));
+        assert_eq!(old.profiles["mpp"].url, "https://crucible-api.example.com");
+        assert_eq!(old.profiles["mpp"].auth, Auth::Crux);
+        assert_eq!(old.profiles["local"].auth, Auth::Own);
+        assert!(old.profiles["local"].loopback());
+        assert_eq!(
+            old.profiles["jump"].url,
+            "https://crucible.internal.example.com"
+        );
+        assert_eq!(
+            old.profiles["jump"].proxy.as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+        assert_eq!(
+            old.profiles["wdc"].resolve,
+            BTreeMap::from([(
+                "crucible.ext.wdc.example.com".to_string(),
+                "lb.example.net".to_string()
+            )]),
+            "the domain pin becomes a pin on the profile's host"
+        );
+        assert_eq!(
+            crate::profile::from_tauri("not toml [", "x"),
+            crate::profile::Tauri::default()
         );
     }
 

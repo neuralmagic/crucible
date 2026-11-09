@@ -275,52 +275,41 @@ route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
 route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
     kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found
 
-# Build the macOS desktop app and install it as ~/Applications/Crucible.app.
-desktop-install:
-    cd crucible-desktop && bunx @tauri-apps/cli@2.12.1 build --bundles app
-    mkdir -p ~/Applications
-    rm -rf ~/Applications/Crucible.app
-    ditto crucible-desktop/target/release/bundle/macos/Crucible.app ~/Applications/Crucible.app
-
-# Format, lint and test the desktop app, which is its own Cargo workspace.
-desktop-check:
-    cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
-
-# Open the Rune playbook tracker, also its own Cargo workspace.
-playbooks-run:
-    sh crucible-desktop-rune/rune-patches.sh
-    cd crucible-desktop-rune && cargo run
+# Open the desktop app (Crucible Playbooks), its own Cargo workspace on Rune.
+desktop-run:
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo run
 
 # Build the release binary and open it as a bundled .app with the dock icon, crucible-lsp inside.
-playbooks-release *args:
+desktop-release *args:
     cargo build --release -p crucible-lsp
-    sh crucible-desktop-rune/rune-patches.sh
-    cd crucible-desktop-rune && cargo build --release
-    sh crucible-desktop-rune/macos-bundle.sh
-    open "crucible-desktop-rune/target/release/Crucible Playbooks.app" --args {{ args }}
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo build --release
+    sh crucible-desktop/macos-bundle.sh
+    open "crucible-desktop/target/release/Crucible Playbooks.app" --args {{ args }}
 
 # Build and install the release .app, crucible-lsp inside, into ~/Applications.
-playbooks-install:
+desktop-install:
     cargo build --release -p crucible-lsp
-    sh crucible-desktop-rune/rune-patches.sh
-    cd crucible-desktop-rune && cargo build --release
-    sh crucible-desktop-rune/macos-bundle.sh
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo build --release
+    sh crucible-desktop/macos-bundle.sh
     mkdir -p ~/Applications
     rm -rf "$HOME/Applications/Crucible Playbooks.app"
-    ditto "crucible-desktop-rune/target/release/Crucible Playbooks.app" "$HOME/Applications/Crucible Playbooks.app"
+    ditto "crucible-desktop/target/release/Crucible Playbooks.app" "$HOME/Applications/Crucible Playbooks.app"
     open ~/Applications/"Crucible Playbooks.app"
 
 # Hot-reload dev loop: patches src/ui.rs in the open window, rebuilds and relaunches on
 # anything else. Needs Python >= 3.13 (rune-dev uses PurePosixPath.full_match).
-playbooks-hot:
-    sh crucible-desktop-rune/rune-patches.sh
+desktop-hot:
+    sh crucible-desktop/rune-patches.sh
     python3.14 vendor/rune/scripts/rune-dev \
-        --manifest-path crucible-desktop-rune/Cargo.toml --patch 'src/ui/*.rs' --local -- --scene local
+        --manifest-path crucible-desktop/Cargo.toml --patch 'src/ui/*.rs' --local -- --scene local
 
-# Format, lint and test the Rune playbook tracker.
-playbooks-check:
-    sh crucible-desktop-rune/rune-patches.sh
-    cd crucible-desktop-rune && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
+# Format, lint and test the desktop app.
+desktop-check:
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
 
 # Prepare a cluster for the gateway isolation e2e (crucible-controller/tests/kueue_gateway_e2e.rs): the
 # profile's loop and sandbox namespaces, its pull secret copied from `pull_from`, the loop and

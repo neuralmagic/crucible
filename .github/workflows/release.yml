@@ -111,8 +111,8 @@ jobs:
             --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
           gh release upload "$tag" dist/* --clobber
 
-  # The macOS desktop app, signed ad hoc: a downloaded copy needs Open Anyway (or
-  # `xattr -d com.apple.quarantine`) on first launch.
+  # The macOS desktop app (Crucible Playbooks.app, crucible-lsp inside), signed ad hoc: a
+  # downloaded copy needs Open Anyway (or `xattr -d com.apple.quarantine`) on first launch.
   desktop:
     runs-on: macos-latest
     steps:
@@ -123,26 +123,30 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
-          cache-workspaces: crucible-desktop -> target
+          cache-workspaces: |
+            . -> target
+            crucible-desktop -> target
 
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Rune
+        run: sh crucible-desktop/rune-patches.sh
 
-      - name: Build Crucible.app
-        working-directory: crucible-desktop
+      - name: Build Crucible Playbooks.app
+        env:
+          SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
-          version="${tag#v}"
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || version="0.0.0"
-          bunx @tauri-apps/cli@2.12.1 build --bundles app --config "{\"version\":\"$version\"}"
+          cargo build --release --locked -p crucible-lsp
+          ( cd crucible-desktop && cargo build --release --locked )
+          VERSION="${tag#v}" sh crucible-desktop/macos-bundle.sh
 
       - name: Package
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
-          name="Crucible-${tag}-aarch64-apple-darwin"
+          name="Crucible-Playbooks-${tag}-aarch64-apple-darwin"
           mkdir -p dist
-          ditto -c -k --keepParent crucible-desktop/target/release/bundle/macos/Crucible.app "dist/${name}.zip"
+          ditto -c -k --keepParent "crucible-desktop/target/release/Crucible Playbooks.app" "dist/${name}.zip"
           ( cd dist && shasum -a 256 "${name}.zip" > "${name}.zip.sha256" )
           ls -la dist/
 
