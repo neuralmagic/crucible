@@ -1384,6 +1384,19 @@ pub fn validate_params(
             message: format!("the stored params schema is not a usable JSON Schema: {e}"),
         }]
     })?;
+    for name in params.keys() {
+        let gate = schema
+            .pointer(&format!("/properties/{}/x-enabled-by", pointer_token(name)))
+            .and_then(serde_json::Value::as_str);
+        if let Some(gate) = gate
+            && typed.get(gate) != Some(&serde_json::Value::Bool(true))
+        {
+            errors.push(FieldError {
+                field: name.clone(),
+                message: format!("set {gate} to true to supply {name}"),
+            });
+        }
+    }
     let unread: Vec<String> = errors.iter().map(|e| e.field.clone()).collect();
     errors.extend(
         validator
@@ -1588,6 +1601,34 @@ mod tests {
             assert!(
                 validate_params(&typed_schema(), &params(&[(key, spelling)])).is_ok(),
                 "{key}={spelling} is a spelling the engine binds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_gated_param_is_refused_while_its_switch_is_off() {
+        let schema = declared_params(
+            "params = {\"override_branch\": {\"type\": \"bool\", \"default\": False}, \
+             \"branch\": {\"type\": \"string\", \"default\": \"\", \"enabled_by\": \"override_branch\"}}\n\
+             workflow(type = \"playbook\", tasks = [])\n",
+            Path::new("workflow.star"),
+        )
+        .expect("schema");
+        assert!(
+            validate_params(
+                &schema,
+                &params(&[("override_branch", "true"), ("branch", "main")])
+            )
+            .is_ok()
+        );
+        for off in [
+            params(&[("branch", "main")]),
+            params(&[("override_branch", "false"), ("branch", "main")]),
+        ] {
+            let errors = validate_params(&schema, &off).expect_err("refused");
+            assert_eq!(
+                errors.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+                ["branch"]
             );
         }
     }

@@ -23,6 +23,8 @@ export interface ParamFieldSpec {
   multiline: boolean;
   /// Picked from a list rather than typed: a declared choice set, or true and false for a bool.
   choices: string[] | null;
+  /// The bool param that must be true for this one to be supplied; greyed out and omitted otherwise.
+  enabledBy: string | null;
 }
 
 /// A schema outside the closed subset renders nothing rather than a wrong form: the launch
@@ -192,6 +194,14 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       }
       choices = spelled.map((item) => (item.ok ? (item.value ?? '') : ''));
     }
+    const enabledBy = stringField(raw, 'x-enabled-by');
+    if (!enabledBy.ok) {
+      return { kind: 'unrenderable', reason: `param ${name} has a non-string x-enabled-by` };
+    }
+    const gate = enabledBy.value === null ? undefined : properties[enabledBy.value];
+    if (enabledBy.value !== null && !(isRecord(gate) && gate.type === 'boolean')) {
+      return { kind: 'unrenderable', reason: `param ${name} is enabled by ${enabledBy.value}, which is not a declared bool` };
+    }
     const description = stringField(raw, 'description');
     specs.push({
       name,
@@ -202,6 +212,7 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       description: description.ok ? description.value : null,
       multiline: multiline.value,
       choices,
+      enabledBy: enabledBy.value,
     });
   }
   if (orderRaw !== undefined) {
@@ -229,7 +240,17 @@ export function initialValues(
 /// Client-side convenience only. An unanchored `new RegExp` matches JSON Schema semantics, and a
 /// pattern the browser cannot compile (Rust-regex syntax the engine accepts) checks nothing here
 /// rather than failing a value the endpoint would have taken.
-export function validateParam(spec: ParamFieldSpec, value: string): string | null {
+/// Whether a gated param's switch is on, so its value is taken; an ungated param always is.
+export function isEnabled(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): boolean {
+  return spec.enabledBy === null || (values[spec.enabledBy] ?? '').trim().toLowerCase() === 'true';
+}
+
+export function validateParam(
+  spec: ParamFieldSpec,
+  value: string,
+  values?: Readonly<Record<string, string>>
+): string | null {
+  if (values !== undefined && !isEnabled(spec, values)) return null;
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     return spec.required ? `${spec.name} is required` : null;
@@ -267,7 +288,7 @@ export function trimmedParams(
   const params: Record<string, string> = {};
   for (const spec of specs) {
     const value = (values[spec.name] ?? '').trim();
-    if (value.length === 0 && !spec.required) continue;
+    if (!isEnabled(spec, values) || (value.length === 0 && !spec.required)) continue;
     params[spec.name] = value;
   }
   return params;

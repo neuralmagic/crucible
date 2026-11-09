@@ -1,6 +1,6 @@
 import { Mono } from '../ui';
 import { FormGrid, SelectField, TextAreaField, TextField } from './formControls';
-import { spellingOf, type ParamFieldSpec } from './playbookLaunchForm';
+import { isEnabled, spellingOf, type ParamFieldSpec } from './playbookLaunchForm';
 
 export interface PlaybookParamFieldsProps {
   idPrefix: string;
@@ -28,6 +28,7 @@ export function PlaybookParamFields({
           id: `${idPrefix}-param-${spec.name}`,
           label: <Mono size="label">{spec.name}</Mono>,
           required: spec.required,
+          disabled: !isEnabled(spec, values),
           mono: true,
           autoFocus: index === 0,
           value: values[spec.name] ?? '',

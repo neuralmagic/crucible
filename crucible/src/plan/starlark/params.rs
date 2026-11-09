@@ -130,6 +130,9 @@ pub struct ParamSpec {
     /// A string a launch form takes in a text area. The bound value is the same string.
     #[serde(default)]
     pub multiline: bool,
+    /// The boolean parameter that must be true for this one to be supplied.
+    #[serde(default)]
+    pub enabled_by: Option<String>,
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
@@ -143,6 +146,7 @@ pub const FIELDS: &[&str] = &[
     "max",
     "choices",
     "multiline",
+    "enabled_by",
 ];
 
 /// Every parameter a source declares, in source order. Serializes as the bare list, so a launcher
@@ -193,6 +197,27 @@ impl Params {
             }
             specs.push(spec(&name, &value.node)?);
         }
+        for spec in &specs {
+            let Some(gate) = &spec.enabled_by else {
+                continue;
+            };
+            let detail = match specs.iter().find(|other| &other.name == gate) {
+                None => Some("is not declared"),
+                Some(other) if other.ty != ParamType::Bool => Some("is not a bool"),
+                Some(other) if other.enabled_by.is_some() => {
+                    Some("is itself enabled_by another parameter")
+                }
+                Some(_) if spec.required => Some("cannot gate a required parameter"),
+                Some(_) => None,
+            };
+            if let Some(detail) = detail {
+                return Err(CompileError::ParamBadEnabledBy {
+                    param: spec.name.clone(),
+                    gate: gate.clone(),
+                    detail,
+                });
+            }
+        }
         Ok(Params(specs))
     }
 
@@ -231,6 +256,17 @@ impl Params {
             };
             check(spec, &value)?;
             bound.insert(spec.name.clone(), value);
+        }
+        for spec in &self.0 {
+            if let Some(gate) = &spec.enabled_by
+                && supplied.contains_key(&spec.name)
+                && !matches!(bound.get(gate), Some(ParamValue::Bool(true)))
+            {
+                return Err(CompileError::ParamNotEnabled {
+                    name: spec.name.clone(),
+                    gate: gate.clone(),
+                });
+            }
         }
         Ok(bound)
     }
@@ -284,6 +320,9 @@ impl Params {
             }
             if spec.multiline {
                 property.insert("x-multiline".into(), serde_json::json!(true));
+            }
+            if let Some(gate) = &spec.enabled_by {
+                property.insert("x-enabled-by".into(), serde_json::json!(gate));
             }
             if spec.required {
                 required.push(spec.name.clone());
@@ -417,6 +456,13 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         max,
         choices,
         multiline,
+        enabled_by: field(
+            &declared,
+            name,
+            "enabled_by",
+            "a string literal",
+            literal_string,
+        )?,
     })
 }
 

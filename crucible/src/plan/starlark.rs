@@ -5962,6 +5962,85 @@ fail("evaluating this source is a bug")
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    /// A gated parameter is only for when its switch is on: the form greys it out, and a value
+    /// supplied while the switch is off is refused rather than silently used or dropped.
+    #[test]
+    fn a_gated_param_binds_only_while_its_switch_is_on() {
+        let source = r#"
+params = {
+    "override_branch": {"type": "bool", "default": False},
+    "branch": {"type": "string", "default": "", "enabled_by": "override_branch"},
+}
+"#;
+        let params = read_params(source, Path::new("workflow.star"))
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            params.json_schema()["properties"]["branch"]["x-enabled-by"],
+            "override_branch"
+        );
+        let supplied = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(
+            params
+                .bind(&supplied(&[
+                    ("override_branch", "true"),
+                    ("branch", "main")
+                ]))
+                .is_ok()
+        );
+        assert!(params.bind(&supplied(&[])).is_ok());
+        for off in [
+            supplied(&[("branch", "main")]),
+            supplied(&[("override_branch", "false"), ("branch", "main")]),
+        ] {
+            let error = params.bind(&off).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ParamNotEnabled { name, gate } if name == "branch" && gate == "override_branch"),
+                "{}",
+                crate::errors::report(&error)
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_by_must_name_an_ungated_bool_and_gate_an_optional_param() {
+        for (gate_decl, gated_extra, detail) in [
+            ("", "", "is not declared"),
+            (
+                r#""switch": {"type": "string", "default": ""},"#,
+                "",
+                "is not a bool",
+            ),
+            (
+                r#""other": {"type": "bool", "default": False}, "switch": {"type": "bool", "default": False, "enabled_by": "other"},"#,
+                "",
+                "is itself enabled_by another parameter",
+            ),
+            (
+                r#""switch": {"type": "bool", "default": False},"#,
+                "required",
+                "cannot gate a required parameter",
+            ),
+        ] {
+            let gated = if gated_extra == "required" {
+                r#""gated": {"type": "string", "required": True, "enabled_by": "switch"}"#
+            } else {
+                r#""gated": {"type": "string", "default": "", "enabled_by": "switch"}"#
+            };
+            let source = format!("params = {{{gate_decl} {gated}}}\n");
+            let error = read_params(&source, Path::new("workflow.star")).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ParamBadEnabledBy { detail: d, .. } if *d == detail),
+                "{detail}: {}",
+                crate::errors::report(&error)
+            );
+        }
+    }
+
     /// Values bind before evaluation, so the compiled graph is what they produced rather than a
     /// template of them: nothing downstream has a parameter left to resolve.
     #[test]
