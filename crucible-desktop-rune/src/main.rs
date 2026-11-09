@@ -305,6 +305,8 @@ pub struct App {
     /// Where a text field's edits land once its form has closed.
     pub scratch: TextEdit,
     pub settings: Settings,
+    /// The editor command field in Settings.
+    pub editor_command: TextEdit,
     /// Effect and layout values tuned live; their defaults unless built with `knobs`.
     pub knobs: rune_knobs::Knobs,
     pub page: Page,
@@ -494,33 +496,66 @@ impl App {
         }
     }
 
+    /// The command the user set, or the editor app to open files in.
+    fn editor(&self) -> Result<Result<Editor, String>, String> {
+        let command = self.settings.editor_command.trim();
+        if self.settings.editor_custom && !command.is_empty() {
+            return Ok(Err(command.to_string()));
+        }
+        if self.settings.editor_custom {
+            return Err(format!(
+                "Set the editor command in Settings, like `{}`",
+                editor::EXAMPLE
+            ));
+        }
+        self.settings.editor.map_or_else(Editor::detect, Ok).map(Ok)
+    }
+
     /// Open line `line` (1-based) of the file at `path` in the user's editor.
     pub fn open_path_in_editor(&mut self, path: &std::path::Path, line: usize) {
-        let Some(editor) = self.settings.editor.or_else(Editor::detect) else {
-            self.editor_error = Some("No editor found. Pick one in Settings.".to_string());
-            return;
-        };
-        self.editor_error = editor::open_file(editor, path, line).err();
+        self.editor_error = match self.editor() {
+            Ok(Ok(app)) => editor::open_file(app, path, line),
+            Ok(Err(command)) => editor::run_command(&command, path, line),
+            Err(why) => Err(why),
+        }
+        .err();
     }
 
     /// Open line `line` (1-based) of pack file `file` in the user's editor: the file itself from
     /// a checkout, or its text as a scratch buffer from a controller's copy.
     pub fn open_in_editor(&mut self, file: &str, line: usize) {
-        let Some(editor) = self.settings.editor.or_else(Editor::detect) else {
-            self.editor_error = Some("No editor found. Pick one in Settings.".to_string());
-            return;
+        let editor = match self.editor() {
+            Ok(editor) => editor,
+            Err(why) => {
+                self.editor_error = Some(why);
+                return;
+            }
         };
         let Some(pack) = self.shown_pack() else {
             return;
         };
-        let result = match (&pack.disk, pack.file(file)) {
-            (Some(Disk::Checkout(dir)), _) => editor::open_file(editor, &dir.join(file), line),
+        let result = match (&pack.disk, pack.file(file), editor) {
+            (Some(Disk::Checkout(dir)), _, Ok(app)) => {
+                editor::open_file(app, &dir.join(file), line)
+            }
+            (Some(Disk::Checkout(dir)), _, Err(command)) => {
+                editor::run_command(&command, &dir.join(file), line)
+            }
             (
                 _,
                 Some(PackFile {
                     text: Some(text), ..
                 }),
-            ) => editor::open_text(editor, text),
+                Ok(app),
+            ) => editor::open_text(app, text),
+            (
+                _,
+                Some(PackFile {
+                    text: Some(text), ..
+                }),
+                Err(command),
+            ) => editor::scratch(file, text)
+                .and_then(|path| editor::run_command(&command, &path, line)),
             _ => Err(format!("{file} has no text to open")),
         };
         self.editor_error = result.err();
@@ -1031,6 +1066,7 @@ fn init() -> App {
     let repo = repo_from_args().unwrap_or_else(model::default_repo);
     let settings = SETTINGS.get().cloned().unwrap_or_else(Settings::load);
     let (keymap, keys_refused) = keymap::Keymap::new(&settings.keys);
+    let editor_command = TextEdit::new(&settings.editor_command);
     App {
         repo: repo.display().to_string(),
         local: Client::spawn(repo),
@@ -1112,6 +1148,7 @@ fn init() -> App {
         replies: 0,
         scratch: TextEdit::new(""),
         settings,
+        editor_command,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,
@@ -1181,6 +1218,13 @@ fn scene_tab(app: &mut App) {
         .find(|t| t.label().eq_ignore_ascii_case(&theme))
     {
         app.settings.theme = theme;
+    }
+    let size = std::env::var("CRUCIBLE_TEXT").unwrap_or_default();
+    if let Some(size) = settings::TextSize::ALL
+        .into_iter()
+        .find(|s| s.label().eq_ignore_ascii_case(&size))
+    {
+        app.settings.text_size = size;
     }
     let tab = std::env::var("CRUCIBLE_TAB").unwrap_or_default();
     if let Some(kind) = PaneKind::ALL

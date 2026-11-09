@@ -5,7 +5,7 @@ use rune_kit::Switch;
 
 use crate::admin::{Action, relative};
 use crate::ui::desk::{card, frame, landed, none, now, scrolled, stacked};
-use crate::ui::{Paint, Tone, flag, mono, tag};
+use crate::ui::{Paint, Tone, flag, tag};
 use crate::{App, Selection};
 
 pub(crate) fn page(app: &App, p: &Paint) -> El {
@@ -124,7 +124,7 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
         .child(
             col().grow(1.0).min_w(0.0).gap(4.0).child(title).child(
                 text(when.join(" \u{b7} "))
-                    .font(mono(12.0, 420.0))
+                    .font(p.mono(12.0, 420.0))
                     .color(p.c.text_muted)
                     .truncate(),
             ),

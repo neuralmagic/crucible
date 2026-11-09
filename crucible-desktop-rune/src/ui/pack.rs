@@ -11,7 +11,7 @@ use crate::lsp::{self, Problem, Severity};
 use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
 use crate::syntax;
-use crate::ui::{Paint, mono};
+use crate::ui::Paint;
 use crate::{App, PackSource};
 
 /// Lines drawn per file; a longer file says how much it left out.
@@ -120,7 +120,7 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
     }
     bar = bar.child(
         text(pack.origin.clone())
-            .font(mono(11.0, 400.0))
+            .font(p.mono(11.0, 400.0))
             .color(p.c.text_faint)
             .selectable(true)
             .selection_color(p.k.selection())
@@ -308,11 +308,11 @@ fn file_row(file: &PackFile, selected: bool, worst: Option<Severity>, p: &Paint)
                 .min_w(0.0)
                 .children(
                     (!dir.is_empty())
-                        .then(|| text(dir).font(mono(11.0, 400.0)).color(p.c.text_faint)),
+                        .then(|| text(dir).font(p.mono(11.0, 400.0)).color(p.c.text_faint)),
                 )
                 .child(
                     text(name)
-                        .font(mono(11.0, if selected { 500.0 } else { 400.0 }))
+                        .font(p.mono(11.0, if selected { 500.0 } else { 400.0 }))
                         .color(if selected {
                             p.c.text_base
                         } else {
@@ -345,7 +345,7 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
     let found = syntax::highlighter().highlight(syntax::language(&file.path), text_body);
     let theme = SyntaxTheme::from_kit(p.k);
     let width = lines.len().max(1).to_string().len();
-    let style = TextStyle::new(11.5, 400.0).lh(18.0).family(font.family());
+    let style = p.sized(TextStyle::new(11.5, 400.0).lh(18.0).family(font.family()));
     let marks = marks(text_body, found_problems);
     let mut body = col().gap(0.0).py(10.0);
     for (n, line) in lines.iter().take(LINES).enumerate() {
@@ -406,7 +406,7 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
                 .center_y()
                 .child(
                     text(file.path.clone())
-                        .font(mono(11.5, 500.0))
+                        .font(p.mono(11.5, 500.0))
                         .color(p.c.text_base)
                         .selectable(true)
                         .selection_color(p.k.selection()),
@@ -496,7 +496,7 @@ fn problem_list(file: &str, found: &[Problem], p: &Paint) -> Option<El> {
                 .child(severity_icon(problem.severity, p))
                 .child(
                     text(format!("{line}"))
-                        .font(mono(11.0, 500.0))
+                        .font(p.mono(11.0, 500.0))
                         .color(p.c.text_faint)
                         .min_w(28.0),
                 )
@@ -585,7 +585,7 @@ fn note(headline: &str, detail: &str, p: &Paint) -> El {
     if !detail.is_empty() {
         card = card.child(
             text(detail.to_string())
-                .font(mono(11.0, 400.0))
+                .font(p.mono(11.0, 400.0))
                 .color(p.c.text_muted)
                 .selectable(true)
                 .selection_color(p.k.selection())

@@ -7,8 +7,8 @@ use rune_theme_opencode::icons as oc;
 use crate::logline::{Body, Level, LogLine, LogView};
 use crate::session::{TaskState, TaskView};
 use crate::settings::LogFont;
+use crate::ui::Paint;
 use crate::ui::tasks::{count, state_mark, status_color};
-use crate::ui::{Paint, mono};
 use crate::unfurl::{self, Block, LogMode};
 use crate::{App, LogSource};
 use crucible_contract::session::TaskStatus;
@@ -50,7 +50,7 @@ pub(crate) fn log_pane(
         .filter(|line| app.log_view.keeps(line, app.log_chatter))
         .collect();
 
-    let style = TextStyle::new(11.5, 400.0).lh(17.0).family(font.family());
+    let style = p.sized(TextStyle::new(11.5, 400.0).lh(17.0).family(font.family()));
     let mode = app
         .log_mode
         .unwrap_or_else(|| unfurl::default_mode(&matched));
@@ -266,20 +266,20 @@ impl Blocks<'_> {
         head = head
             .child(
                 text(label)
-                    .font(mono(11.0, 600.0))
+                    .font(p.mono(11.0, 600.0))
                     .color(p.c.text_base)
                     .max_w(260.0)
                     .truncate(),
             )
             .child(
                 text(count(block.all.len() as u64))
-                    .font(mono(10.5, 400.0))
+                    .font(p.mono(10.5, 400.0))
                     .color(p.c.text_faint),
             );
         if problems > 0 {
             head = head.child(
                 text(format!("{problems} problems"))
-                    .font(mono(10.5, 500.0))
+                    .font(p.mono(10.5, 500.0))
                     .color(p.c.danger.fg),
             );
         }
@@ -289,7 +289,7 @@ impl Blocks<'_> {
             } else {
                 String::new()
             })
-            .font(mono(10.5, 400.0))
+            .font(p.mono(10.5, 400.0))
             .color(p.c.text_faint)
             .grow(1.0)
             .min_w(0.0)
@@ -371,7 +371,7 @@ fn scope_row(app: &App, p: &Paint) -> El {
                 .on_press(|app: &mut App| app.filter_log(None))
                 .child(
                     text(task.clone())
-                        .font(mono(11.0, 500.0))
+                        .font(p.mono(11.0, 500.0))
                         .color(p.c.text_base),
                 )
                 .child(icon(&oc::XMARK_SMALL, 16.0).color(p.c.icon_muted)),
@@ -420,7 +420,7 @@ fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {
     if let Some(at) = &line.at {
         lead = lead.child(
             text(at.clone())
-                .font(mono(10.5, 400.0))
+                .font(p.mono(10.5, 400.0))
                 .color(p.c.text_faint),
         );
     }
@@ -438,7 +438,7 @@ fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {
                 .on_press(move |app: &mut App| app.filter_log(Some(&name)))
                 .child(
                     text(short(task, 18))
-                        .font(mono(10.5, 500.0))
+                        .font(p.mono(10.5, 500.0))
                         .color(p.c.text_muted),
                 ),
         );

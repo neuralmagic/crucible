@@ -8,7 +8,7 @@ use rune::{Color, El, Tx, col, row, text};
 use rune_kit::{Button, ButtonVariant, ControlSize, SegmentedControl};
 
 use crate::session::{TaskState, TaskView};
-use crate::ui::{Paint, Pane, empty_run, mono};
+use crate::ui::{Paint, Pane, empty_run};
 use crate::{App, GraphSource};
 
 pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
@@ -34,7 +34,7 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
     };
     let source = mermaid_source(&pane.tasks, &shown, &Ink::of(p));
     let mut style = rune_mermaid::DiagramStyle::neutral(p.dark);
-    style.font = mono(11.5, 400.0);
+    style.font = p.mono(11.5, 400.0);
     style.max_width = 1160.0;
     style.surface = Color::TRANSPARENT;
     style.surface_border = Color::TRANSPARENT;
@@ -205,7 +205,7 @@ fn preview_head(pane: &Pane, p: &Paint) -> Option<El> {
         }
         bar = bar.child(
             text(said.join(" \u{b7} "))
-                .font(mono(10.5, 400.0))
+                .font(p.mono(10.5, 400.0))
                 .color(p.c.text_muted)
                 .grow(1.0)
                 .min_w(0.0)
@@ -220,7 +220,7 @@ fn preview_head(pane: &Pane, p: &Paint) -> Option<El> {
             .gap(8.0)
             .child(
                 text(problem.message.clone())
-                    .font(mono(10.5, 400.0))
+                    .font(p.mono(10.5, 400.0))
                     .color(p.fail)
                     .grow(1.0)
                     .min_w(0.0)

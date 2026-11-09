@@ -9,7 +9,7 @@ use crate::inspect::Pick;
 use crate::transcript::{Step, Turn, turns, turns_from_log};
 use crate::ui::data::{DATA_OPEN, faint, json_box, tree};
 use crate::ui::tasks::count;
-use crate::ui::{Paint, Pane, mono};
+use crate::ui::{Paint, Pane};
 
 /// Steps one turn draws; its last are kept.
 const STEPS: usize = 400;
@@ -86,7 +86,7 @@ fn instance_chips(task: &str, speakers: &[&str], picked: &str, p: &Paint) -> El 
                 .on_press(move |app: &mut App| {
                     app.inspect.pick = key.clone().map(Pick::Instance);
                 })
-                .child(text(label).font(mono(10.0, 500.0)).color(if on {
+                .child(text(label).font(p.mono(10.0, 500.0)).color(if on {
                     p.c.text_base
                 } else {
                     p.c.text_muted
@@ -111,7 +111,7 @@ fn turn_view(turn: &Turn, app: &App, p: &Paint) -> El {
     }
     let mut head = row().w_full().gap(8.0).center_y().child(
         text(facts.join(" \u{b7} "))
-            .font(mono(11.0, 600.0))
+            .font(p.mono(11.0, 600.0))
             .color(p.c.text_base)
             .grow(1.0)
             .min_w(0.0)
@@ -122,11 +122,11 @@ fn turn_view(turn: &Turn, app: &App, p: &Paint) -> El {
         if let Some(error) = ending.error.as_ref().filter(|_| ending.failed) {
             said.push_str(&format!(" \u{b7} {error}"));
         }
-        head = head.child(text(said).font(mono(10.5, 500.0)).color(if ending.failed {
-            p.fail
-        } else {
-            p.pass
-        }));
+        head = head.child(
+            text(said)
+                .font(p.mono(10.5, 500.0))
+                .color(if ending.failed { p.fail } else { p.pass }),
+        );
     }
     let mut card = col()
         .key(format!("turn-{}-{}", turn.task, turn.attempt))
@@ -196,12 +196,12 @@ fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
             let head = toggle(line(), path)
                 .child(
                     text("thinking".to_string())
-                        .font(mono(10.5, 500.0))
+                        .font(p.mono(10.5, 500.0))
                         .color(p.c.text_faint),
                 )
                 .child(
                     text(preview)
-                        .font(mono(10.5, 400.0))
+                        .font(p.mono(10.5, 400.0))
                         .color(p.c.text_faint)
                         .grow(1.0)
                         .min_w(0.0)
@@ -231,7 +231,7 @@ fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
             let mut head = toggle(line(), path)
                 .child(
                     text(name.to_string())
-                        .font(mono(10.5, 600.0))
+                        .font(p.mono(10.5, 600.0))
                         .color(if *subagent {
                             p.c.text_accent
                         } else {
@@ -240,7 +240,7 @@ fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
                 )
                 .child(
                     text(first_line(summary))
-                        .font(mono(10.5, 400.0))
+                        .font(p.mono(10.5, 400.0))
                         .color(p.c.text_muted)
                         .grow(1.0)
                         .min_w(0.0)
@@ -249,7 +249,7 @@ fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
             if *failed {
                 head = head.child(
                     text("failed".to_string())
-                        .font(mono(10.5, 500.0))
+                        .font(p.mono(10.5, 500.0))
                         .color(p.fail),
                 );
             }
@@ -259,7 +259,7 @@ fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
                 if summary.contains('\n') {
                     detail = detail.child(
                         text(summary.to_string())
-                            .font(mono(10.5, 400.0))
+                            .font(p.mono(10.5, 400.0))
                             .color(p.c.text_muted)
                             .wrap()
                             .selectable(true),
@@ -282,12 +282,12 @@ fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
             block
         }
         Step::Retry(said) | Step::Error(said) => text(said.clone())
-            .font(mono(10.5, 400.0))
+            .font(p.mono(10.5, 400.0))
             .color(p.fail)
             .wrap()
             .py(2.0),
         Step::Note(said) => text(said.clone())
-            .font(mono(10.0, 400.0))
+            .font(p.mono(10.0, 400.0))
             .color(p.c.text_faint)
             .truncate()
             .py(1.0),
@@ -312,7 +312,7 @@ fn result_box(result: &str, p: &Paint) -> El {
         .scroll_xy()
         .child(
             text(shown)
-                .font(mono(10.5, 400.0))
+                .font(p.mono(10.5, 400.0))
                 .color(p.c.text_base)
                 .selectable(true)
                 .selection_color(p.k.selection()),

@@ -45,7 +45,7 @@ impl OriginFilter {
     pub fn label(self) -> &'static str {
         match self {
             OriginFilter::All => "All",
-            OriginFilter::Schedules => "Schedules",
+            OriginFilter::Schedules => "Cron",
             OriginFilter::Drafts => "Drafts",
         }
     }

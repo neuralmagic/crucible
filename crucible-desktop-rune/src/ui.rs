@@ -36,7 +36,7 @@ use crate::logline::{LogLine, activity};
 use crate::model::{PackView, Verdict};
 use crate::pack::PackFiles;
 use crate::session::{TaskState, TaskView};
-use crate::settings::{Appearance, LogFont, Theme};
+use crate::settings::{Appearance, LogFont, TextSize, Theme};
 use crate::{App, Backend, MAX_TIME, Selection, gfx};
 use crucible_contract::session::TaskStatus;
 
@@ -45,13 +45,15 @@ const TITLE_BAND: f32 = 52.0;
 /// The close button's top-left, centring the buttons in the title band.
 #[cfg(not(feature = "hot"))]
 pub const TRAFFIC_LIGHTS: (f32, f32) = (18.0, 19.0);
-const SIDEBAR_PAD: f32 = 16.0;
-const ROW: f32 = 46.0;
+const SIDEBAR_PAD: f32 = 12.0;
+const ROW: f32 = 40.0;
+/// The width of a sidebar filter's label beside its control.
+const FILTER_LABEL: f32 = 40.0;
 
 const TITLE: TextStyle = TextStyle::new(20.0, 640.0).lh(26.0).tracking(-0.2);
 const BRAND: TextStyle = TextStyle::new(15.0, 640.0).lh(20.0);
 const SECTION: TextStyle = TextStyle::new(13.0, 560.0).lh(16.0);
-const VALUE: TextStyle = TextStyle::new(18.0, 600.0).lh(24.0).features("'tnum' 1");
+const VALUE: TextStyle = TextStyle::new(15.0, 600.0).lh(20.0).features("'tnum' 1");
 
 struct Paint {
     k: &'static Kit,
@@ -65,6 +67,20 @@ struct Paint {
     /// Points the window buttons take at the leading edge; 0 in full screen.
     inset: f32,
     tune: crate::tune::Tune,
+    /// What app-set text sizes are multiplied by.
+    text: f32,
+}
+
+impl Paint {
+    /// `style` at the text size the user picked.
+    fn sized(&self, style: TextStyle) -> TextStyle {
+        theme::scaled(style, self.text)
+    }
+
+    /// A monospaced style at `size` points, scaled to the picked text size.
+    fn mono(&self, size: f32, weight: f32) -> TextStyle {
+        self.sized(TextStyle::new(size, weight).mono())
+    }
 }
 
 /// A status role with its own fill, ink and border: passing, needing attention, or failing.
@@ -87,7 +103,7 @@ impl Paint {
 
 fn palette(app: &App, cx: &Cx<App>) -> Paint {
     let dark = app.settings.appearance.dark(cx.system_dark());
-    let k = theme::kit(app.settings.theme, dark);
+    let k = theme::kit(app.settings.theme, dark, app.settings.text_size);
     let c = &k.c;
     Paint {
         k,
@@ -100,11 +116,8 @@ fn palette(app: &App, cx: &Cx<App>) -> Paint {
         hair: 1.0 / cx.env().scale,
         inset: cx.titlebar_inset(),
         tune: crate::tune::Tune::read(&app.knobs),
+        text: app.settings.text_size.factor(),
     }
-}
-
-fn mono(size: f32, weight: f32) -> TextStyle {
-    TextStyle::new(size, weight).mono()
 }
 
 /// An effect slot covering its parent, painted by `crate::gfx` as effect `kind`.
@@ -510,7 +523,7 @@ fn sidebar(app: &App, p: &Paint) -> El {
         .center_y()
         .gap(6.0)
         .child(logo(app, p))
-        .child(text("Playbooks").font(BRAND).color(p.c.text_base));
+        .child(text("Playbooks").font(p.sized(BRAND)).color(p.c.text_base));
 
     let band = row()
         .key("title-band")
@@ -528,8 +541,8 @@ fn sidebar(app: &App, p: &Paint) -> El {
         .key("sidebar-head")
         .w_full()
         .px(SIDEBAR_PAD)
-        .pb(14.0)
-        .gap(12.0)
+        .pb(10.0)
+        .gap(8.0)
         .child(backend_switch(app, p))
         .child(search(app, p));
     if let (
@@ -572,7 +585,7 @@ fn pages_nav(app: &App, p: &Paint) -> El {
     let entry = |page: crate::Page, glyph: &'static Icon, badge: Option<String>| {
         let mut entry = SidebarRow::new(page.title())
             .icon(glyph)
-            .height(32.0)
+            .height(28.0)
             .selected(app.page == page)
             .on_select(move |app: &mut App, _: &mut Tx| app.toggle_page(page));
         if let Some(badge) = badge {
@@ -684,7 +697,7 @@ fn filters(app: &App, p: &Paint) -> El {
     col()
         .key("filters")
         .w_full()
-        .gap(8.0)
+        .gap(6.0)
         .child(filter_row(
             "Owner",
             &OwnerFilter::ALL.map(|choice| choice.label()),
@@ -721,15 +734,23 @@ fn filter_row(
     pick: impl Fn(&mut App, usize, &mut Tx) + Clone + 'static,
     p: &Paint,
 ) -> El {
-    col()
+    row()
         .key(format!("filter-{}", slug(label)))
         .w_full()
-        .gap(4.0)
-        .child(text(label).font(p.k.ty.small).color(p.c.text_faint))
+        .gap(8.0)
+        .center_y()
+        .child(
+            text(label)
+                .font(p.k.ty.small)
+                .color(p.c.text_faint)
+                .w(FILTER_LABEL),
+        )
         .child(
             SegmentedControl::new(choices, selected)
                 .label(label)
-                .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD))
+                .width(Some(
+                    p.tune.sidebar - 2.0 * SIDEBAR_PAD - FILTER_LABEL - 8.0,
+                ))
                 .on_pick(pick)
                 .build(p.k),
         )
@@ -870,7 +891,7 @@ fn unavailable(error: &str, app: &App, p: &Paint) -> El {
         )
         .child(
             text(error.to_string())
-                .font(mono(11.0, 400.0))
+                .font(p.mono(11.0, 400.0))
                 .color(s.fg)
                 .max_lines(4)
                 .wrap(),
@@ -961,7 +982,7 @@ fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec
             let id = playbook.id.clone();
             let mut item = SidebarRow::new(playbook.id.clone())
                 .subtitle(row_meta(playbook))
-                .height(ROW)
+                .height(ROW * p.text)
                 .status(verdict_status(playbook.verdict(), p))
                 .selected(current == Some(playbook.id.as_str()))
                 .on_select(move |app: &mut App, _: &mut Tx| app.select(Selection::playbook(&id)));
@@ -995,7 +1016,7 @@ fn pack_row(app: &App, pack: &PackView, p: &Paint) -> El {
     };
     SidebarRow::new(pack.name.clone())
         .subtitle(subtitle)
-        .height(ROW)
+        .height(ROW * p.text)
         .status(verdict_status(pack.verdict, p))
         .selected(selected)
         .on_select(move |app: &mut App, _: &mut Tx| app.select(Selection::Local(name.clone())))
@@ -1069,7 +1090,7 @@ fn detail(app: &App, p: &Paint) -> El {
             .child(icon(&oc::CHECKLIST, 28.0).color(p.c.icon_faint))
             .child(
                 text("No playbook selected")
-                    .font(SECTION)
+                    .font(p.sized(SECTION))
                     .color(p.c.text_base),
             )
             .child(
@@ -1162,7 +1183,7 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                 .children(breadcrumb(app, p))
                 .child(
                     text(pane.title.clone())
-                        .font(TITLE)
+                        .font(p.sized(TITLE))
                         .color(p.c.text_base)
                         .selectable(true)
                         .selection_color(p.k.selection())
@@ -1281,8 +1302,8 @@ fn stat_card(key: &str, p: &Paint) -> El {
         .grow(1.0)
         .min_w(0.0)
         .gap(4.0)
-        .px(14.0)
-        .py(12.0)
+        .px(12.0)
+        .py(8.0)
         .radius(p.k.radius.lg)
         .fill(p.c.layer_01)
         .border(p.hair, p.c.border_muted)
@@ -1304,17 +1325,19 @@ fn stat_sub(sub: &str, p: &Paint) -> El {
 fn status_stat(pane: &Pane, p: &Paint) -> El {
     let ink = verdict_color(pane.verdict, p);
     let glyph = verdict_tone(pane.verdict).map(|(_, glyph)| glyph);
-    stat_card("status", p).child(stat_label("Status", p)).child(
+    stat_card("status", p).child(
         row()
+            .w_full()
             .gap(6.0)
             .center_y()
+            .child(stat_label("Status", p).grow(1.0))
             .children(match pane.verdict {
-                Verdict::Running => Some(Spinner::new().size(16.0).color(ink).build(p.k)),
-                _ => glyph.map(|glyph| icon(glyph, 16.0).color(ink)),
+                Verdict::Running => Some(Spinner::new().size(14.0).color(ink).build(p.k)),
+                _ => glyph.map(|glyph| icon(glyph, 14.0).color(ink)),
             })
             .child(
                 text(pane.verdict.label())
-                    .font(VALUE)
+                    .font(p.sized(VALUE))
                     .color(if glyph.is_some() { ink } else { p.c.text_muted })
                     .truncate(),
             ),
@@ -1330,19 +1353,29 @@ fn stat(
     sub: &str,
     p: &Paint,
 ) -> El {
-    let mut line = row().w_full().center_y().gap(8.0);
-    if let Some(bar) = bar {
-        line = line.child(bar);
-    }
+    let detail = (bar.is_some() || !sub.is_empty()).then(|| {
+        row()
+            .w_full()
+            .center_y()
+            .gap(8.0)
+            .children(bar)
+            .children((!sub.is_empty()).then(|| stat_sub(sub, p)))
+    });
     stat_card(key, p)
-        .child(stat_label(label, p))
         .child(
-            RollingText::new(format!("stat-{key}-value"), value)
-                .font(VALUE)
-                .color(ink)
-                .build(p.k),
+            row()
+                .w_full()
+                .gap(8.0)
+                .center_y()
+                .child(stat_label(label, p).grow(1.0).min_w(0.0))
+                .child(
+                    RollingText::new(format!("stat-{key}-value"), value)
+                        .font(p.sized(VALUE))
+                        .color(ink)
+                        .build(p.k),
+                ),
         )
-        .child(line.child(stat_sub(sub, p)))
+        .children(detail)
 }
 
 /// Passed over planned, with a bar split by where each task stands.
@@ -1437,7 +1470,12 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                 .w_full()
                 .center_y()
                 .gap(10.0)
-                .child(text("Settings").font(TITLE).color(p.c.text_base).grow(1.0))
+                .child(
+                    text("Settings")
+                        .font(p.sized(TITLE))
+                        .color(p.c.text_base)
+                        .grow(1.0),
+                )
                 .child(
                     Button::new("Done")
                         .variant(ButtonVariant::Neutral)
@@ -1483,6 +1521,24 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                     })
                     .build(p.k)
                     .key("mode"),
+                    p,
+                ),
+                rule("text-size-sep", false, p),
+                setting_row(
+                    "Text size",
+                    SegmentedControl::new(
+                        &TextSize::ALL.map(|s| s.label()),
+                        TextSize::ALL
+                            .iter()
+                            .position(|s| *s == app.settings.text_size),
+                    )
+                    .label("Text size")
+                    .width(Some(360.0))
+                    .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+                        app.settings.set_text_size(TextSize::ALL[i]);
+                    })
+                    .build(p.k)
+                    .key("text-size"),
                     p,
                 ),
             ],
@@ -1558,32 +1614,7 @@ fn settings_pane(app: &App, p: &Paint) -> El {
             ],
             p,
         ))
-        .child(settings_section(
-            "packs",
-            "Packs",
-            vec![setting_row(
-                "Editor",
-                SegmentedControl::new(
-                    &["Auto", "VS Code", "Cursor", "Zed"],
-                    Some(
-                        app.settings
-                            .editor
-                            .and_then(|e| Editor::ALL.iter().position(|x| *x == e))
-                            .map_or(0, |i| i + 1),
-                    ),
-                )
-                .label("Editor")
-                .width(Some(320.0))
-                .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
-                    app.settings
-                        .set_editor(i.checked_sub(1).and_then(|i| Editor::ALL.get(i).copied()));
-                })
-                .build(p.k)
-                .key("editor"),
-                p,
-            )],
-            p,
-        ))
+        .child(settings_section("packs", "Packs", editor_rows(app, p), p))
         .child(settings_section("log-viewer", "Log font", rows, p))
         .child(settings_section("keys", "Keys", key_rows(app, p), p))
 }
@@ -1632,7 +1663,7 @@ fn key_rows(app: &App, p: &Paint) -> Vec<El> {
         if !others.is_empty() {
             control = control.child(
                 text(others.join("  "))
-                    .font(mono(11.0, 400.0))
+                    .font(p.mono(11.0, 400.0))
                     .color(p.c.text_faint),
             );
         }
@@ -1652,6 +1683,61 @@ fn key_rows(app: &App, p: &Paint) -> Vec<El> {
     rows
 }
 
+/// The editor pick, and the command field while a command is picked.
+fn editor_rows(app: &App, p: &Paint) -> Vec<El> {
+    let picked = if app.settings.editor_custom {
+        Editor::ALL.len() + 1
+    } else {
+        app.settings
+            .editor
+            .and_then(|e| Editor::ALL.iter().position(|x| *x == e))
+            .map_or(0, |i| i + 1)
+    };
+    let mut rows = vec![setting_row(
+        "Editor",
+        SegmentedControl::new(
+            &["Auto", "VS Code", "Cursor", "Zed", "Command"],
+            Some(picked),
+        )
+        .label("Editor")
+        .width(Some(400.0))
+        .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+            if i == Editor::ALL.len() + 1 {
+                let command = app.editor_command.text.clone();
+                app.settings.set_editor_command(true, &command);
+            } else {
+                app.settings
+                    .set_editor(i.checked_sub(1).and_then(|i| Editor::ALL.get(i).copied()));
+            }
+        })
+        .build(p.k)
+        .key("editor"),
+        p,
+    )];
+    if app.settings.editor_custom {
+        rows.push(rule("editor-sep", false, p));
+        rows.push(setting_row(
+            "Command",
+            TextInput::new(&app.editor_command)
+                .placeholder(crate::editor::EXAMPLE)
+                .width(Some(400.0))
+                .invalid(
+                    !app.editor_command.text.trim().is_empty()
+                        && !app.editor_command.text.contains("{file}"),
+                )
+                .on_edit(|app: &mut App| &mut app.editor_command)
+                .on_change(|app: &mut App, _: &mut Tx| {
+                    let command = app.editor_command.text.clone();
+                    app.settings.set_editor_command(true, &command);
+                })
+                .build(p.k)
+                .key("editor-command"),
+            p,
+        ));
+    }
+    rows
+}
+
 /// A titled card of rows, as a settings page lays them out.
 fn settings_section(key: &str, title: &str, rows: Vec<El>, p: &Paint) -> El {
     col()
@@ -1659,7 +1745,11 @@ fn settings_section(key: &str, title: &str, rows: Vec<El>, p: &Paint) -> El {
         .w_full()
         .max_w(720.0)
         .gap(10.0)
-        .child(text(title.to_string()).font(SECTION).color(p.c.text_base))
+        .child(
+            text(title.to_string())
+                .font(p.sized(SECTION))
+                .color(p.c.text_base),
+        )
         .child(
             col()
                 .key(format!("{key}-card"))

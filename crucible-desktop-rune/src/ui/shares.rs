@@ -6,7 +6,7 @@ use rune_kit::{Button, ButtonVariant, SegmentedControl, TextInput};
 use crate::App;
 use crate::admin::{Action, ROLES, not_after, valid_grantee};
 use crate::ui::desk::{heading, landed, none};
-use crate::ui::{Paint, mono, tag};
+use crate::ui::{Paint, tag};
 
 const WIDTH: f32 = 268.0;
 
@@ -57,7 +57,7 @@ fn share_row(share: &crux::dto::Share, of: &crux::client::Shared, app: &App, p: 
                 .gap(2.0)
                 .child(
                     text(share.grantee.clone())
-                        .font(mono(12.0, 520.0))
+                        .font(p.mono(12.0, 520.0))
                         .color(if share.expired {
                             p.c.text_faint
                         } else {

@@ -10,7 +10,7 @@ use crate::App;
 use crate::inspect::{self, Check, Flow, Inspect, Pick, Via};
 use crate::session::TaskView;
 use crate::ui::tasks::{label_ink, section, state_label, state_mark};
-use crate::ui::{Paint, Pane, mono, tag};
+use crate::ui::{Paint, Pane, tag};
 
 /// Rows one JSON tree draws before it stops.
 const TREE_ROWS: usize = 1500;
@@ -97,7 +97,7 @@ fn header(task: &TaskView, p: &Paint) -> El {
         .child(state_mark(state, p))
         .child(
             text(task.name.clone())
-                .font(mono(13.0, 600.0))
+                .font(p.mono(13.0, 600.0))
                 .color(p.c.text_base)
                 .min_w(0.0)
                 .truncate(),
@@ -105,7 +105,7 @@ fn header(task: &TaskView, p: &Paint) -> El {
         .child(tag(&task.kind, p))
         .child(
             text(state_label(state))
-                .font(mono(10.5, 400.0))
+                .font(p.mono(10.5, 400.0))
                 .color(label_ink(state, p)),
         )
 }
@@ -124,13 +124,13 @@ fn flow_card(flow: &Flow, inspect: &Inspect, p: &Paint) -> El {
             .center_y()
             .child(
                 text(flow.from.to_string())
-                    .font(mono(11.0, 600.0))
+                    .font(p.mono(11.0, 600.0))
                     .color(p.c.text_base),
             )
             .child(icon(&oc::CHEVRON_RIGHT, 12.0).color(p.c.icon_faint))
             .child(
                 text(via)
-                    .font(mono(10.5, 400.0))
+                    .font(p.mono(10.5, 400.0))
                     .color(p.c.text_muted)
                     .grow(1.0)
                     .min_w(0.0)
@@ -188,20 +188,20 @@ fn declared(task: &TaskView, output: Option<&Value>, inspect: &Inspect, p: &Pain
                 .gap(8.0)
                 .child(
                     text(emit.field.clone())
-                        .font(mono(10.5, 500.0))
+                        .font(p.mono(10.5, 500.0))
                         .color(p.c.text_base)
                         .w(160.0)
                         .truncate(),
                 )
                 .child(
                     text(ty)
-                        .font(mono(10.5, 400.0))
+                        .font(p.mono(10.5, 400.0))
                         .color(p.c.text_muted)
                         .grow(1.0)
                         .min_w(0.0)
                         .truncate(),
                 )
-                .child(text(mark).font(mono(10.5, 500.0)).color(ink)),
+                .child(text(mark).font(p.mono(10.5, 500.0)).color(ink)),
         );
     }
     for file in &task.files {
@@ -213,7 +213,7 @@ fn declared(task: &TaskView, output: Option<&Value>, inspect: &Inspect, p: &Pain
                 .gap(8.0)
                 .child(
                     text(file.path.clone())
-                        .font(mono(10.5, 500.0))
+                        .font(p.mono(10.5, 500.0))
                         .color(p.c.text_base)
                         .w(160.0)
                         .truncate(),
@@ -224,7 +224,7 @@ fn declared(task: &TaskView, output: Option<&Value>, inspect: &Inspect, p: &Pain
                             .coarse()
                             .map_or("schema".to_string(), |ty| format!("schema, {ty}"))
                     }))
-                    .font(mono(10.5, 400.0))
+                    .font(p.mono(10.5, 400.0))
                     .color(p.c.text_muted)
                     .grow(1.0)
                     .min_w(0.0)
@@ -256,11 +256,11 @@ fn pick_chips(task: &TaskView, shown: Option<&Pick>, p: &Paint) -> El {
             .hover(p.c.hover)
             .focusable(true)
             .on_press(move |app: &mut App| app.inspect.pick = Some(pick.clone()))
-            .child(
-                text(label)
-                    .font(mono(10.0, 500.0))
-                    .color(if on { p.c.text_base } else { ink }),
-            )
+            .child(text(label).font(p.mono(10.0, 500.0)).color(if on {
+                p.c.text_base
+            } else {
+                ink
+            }))
     };
     let mut chips = row().w_full().gap(4.0).wrap();
     if task.result.as_ref().is_some_and(|r| r.output.is_some()) {
@@ -303,7 +303,7 @@ fn copy_button(label: &str, value: &Value, key: &str, p: &Paint) -> El {
 
 pub(crate) fn faint(label: &str, p: &Paint) -> El {
     text(label.to_string())
-        .font(mono(10.5, 400.0))
+        .font(p.mono(10.5, 400.0))
         .color(p.c.text_faint)
 }
 
@@ -343,7 +343,7 @@ impl Walk<'_> {
         let p = self.p;
         let key = label.map(|label| {
             text(format!("{label}:"))
-                .font(mono(10.5, 400.0))
+                .font(p.mono(10.5, 400.0))
                 .color(p.c.text_muted)
         });
         let line = |depth: usize| {
@@ -393,7 +393,11 @@ impl Walk<'_> {
                     .color(p.c.icon_faint),
                 )
                 .children(key)
-                .child(text(summary).font(mono(10.5, 400.0)).color(p.c.text_faint)),
+                .child(
+                    text(summary)
+                        .font(p.mono(10.5, 400.0))
+                        .color(p.c.text_faint),
+                ),
         );
         if !open {
             return;
@@ -423,7 +427,7 @@ fn scalar_text(value: &Value, p: &Paint) -> El {
         other => (other.to_string(), p.c.text_muted),
     };
     text(shown)
-        .font(mono(10.5, 400.0))
+        .font(p.mono(10.5, 400.0))
         .color(ink)
         .grow(1.0)
         .min_w(0.0)

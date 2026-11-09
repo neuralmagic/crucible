@@ -7,7 +7,7 @@ use rune_kit::{Button, ButtonVariant, Markdown, SidebarRow, TextInput};
 
 use crate::admin::{Action, relative};
 use crate::ui::desk::{card, frame, heading, landed, list, none, now, reading};
-use crate::ui::{Paint, Tone, flag, mono, tag};
+use crate::ui::{Paint, Tone, flag, tag};
 use crate::{App, Selection};
 
 const LIST: f32 = 300.0;
@@ -193,7 +193,7 @@ fn gated(decision: &crux::dto::Decision, p: &Paint) -> El {
                 .center_y()
                 .child(
                     text(gate.name.clone())
-                        .font(mono(12.0, 520.0))
+                        .font(p.mono(12.0, 520.0))
                         .color(p.c.text_base),
                 )
                 .children((!gate.kind.is_empty()).then(|| tag(&gate.kind, p)))
@@ -234,7 +234,7 @@ fn upstream(input: &crux::dto::DecisionInput, p: &Paint) -> El {
         )
         .children((!shown.is_empty()).then(|| {
             text(shown)
-                .font(mono(12.0, 420.0))
+                .font(p.mono(12.0, 420.0))
                 .color(p.c.text_muted)
                 .wrap()
                 .selectable(true)
@@ -372,7 +372,7 @@ fn question_row(question: &crux::dto::DecisionQuestion, open: bool, app: &App, p
                 .center_y()
                 .child(
                     text(question.id.clone())
-                        .font(mono(12.0, 560.0))
+                        .font(p.mono(12.0, 560.0))
                         .color(p.c.text_base),
                 )
                 .children(question.multiple.then(|| tag("any number", p))),

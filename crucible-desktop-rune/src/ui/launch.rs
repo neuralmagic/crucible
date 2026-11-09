@@ -4,7 +4,7 @@ use crux::dto::{LaunchRun, PlaybookLaunch};
 use rune::{El, ScrollSpec, col, row, text};
 use serde_json::Value;
 
-use crate::ui::{Paint, SECTION, Tone, flag, mono};
+use crate::ui::{Paint, SECTION, Tone, flag};
 
 pub(crate) fn launch_view(launch: Option<&PlaybookLaunch>, p: &Paint) -> El {
     let Some(detail) = launch else {
@@ -124,7 +124,7 @@ pub(crate) fn launch_view(launch: Option<&PlaybookLaunch>, p: &Paint) -> El {
     if let Some(failure) = &dispatch.failure {
         engine = engine.child(
             text(failure.clone())
-                .font(mono(11.5, 400.0))
+                .font(p.mono(11.5, 400.0))
                 .color(p.c.danger.fg)
                 .selectable(true)
                 .selection_color(p.k.selection())
@@ -194,7 +194,7 @@ fn run_row(run: &LaunchRun, p: &Paint) -> El {
                 .center_y()
                 .child(
                     text(name)
-                        .font(mono(12.0, 500.0))
+                        .font(p.mono(12.0, 500.0))
                         .color(p.c.text_base)
                         .selectable(true)
                         .selection_color(p.k.selection()),
@@ -207,7 +207,7 @@ fn run_row(run: &LaunchRun, p: &Paint) -> El {
         )
         .child(
             text(format!("{place}  ({})", run.run_id))
-                .font(mono(11.0, 400.0))
+                .font(p.mono(11.0, 400.0))
                 .color(p.c.text_faint)
                 .selectable(true)
                 .selection_color(p.k.selection())
@@ -227,7 +227,7 @@ fn field(label: &str, value: String, p: &Paint) -> El {
         )
         .child(
             text(value)
-                .font(mono(12.0, 400.0))
+                .font(p.mono(12.0, 400.0))
                 .color(p.c.text_base)
                 .grow(1.0)
                 .min_w(0.0)
@@ -241,7 +241,11 @@ fn section_card(label: &str, body: El, p: &Paint) -> El {
     col()
         .w_full()
         .gap(8.0)
-        .child(text(label.to_string()).font(SECTION).color(p.c.text_base))
+        .child(
+            text(label.to_string())
+                .font(p.sized(SECTION))
+                .color(p.c.text_base),
+        )
         .child(
             col()
                 .w_full()

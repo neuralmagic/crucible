@@ -12,7 +12,7 @@ pub const BAR_SHIMMER: Knob =
     Knob::new("Bar shimmer", 0.0, 1.0, 0.35).about("The sweep over a running timeline bar");
 pub const GLOW: Knob = Knob::new("Drop glow", 0.0, 1.5, 0.6).about("Where a dragged pane lands");
 pub const GLOW_BLEED: Knob = Knob::new("Drop glow reach", 0.0, 40.0, 16.0).step(1.0);
-pub const SIDEBAR: Knob = Knob::new("Sidebar width", 220.0, 420.0, 300.0).step(1.0);
+pub const SIDEBAR: Knob = Knob::new("Sidebar width", 220.0, 420.0, 288.0).step(1.0);
 pub const TIMELINE_ROW: Knob = Knob::new("Timeline row", 18.0, 40.0, 26.0).step(1.0);
 pub const TIMELINE_LABEL: Knob = Knob::new("Timeline labels", 90.0, 260.0, 150.0).step(1.0);
 
@@ -74,7 +74,7 @@ mod tests {
     fn untouched_knobs_read_the_shipped_constants() {
         let tune = Tune::read(&Knobs::default());
         assert_eq!(tune.grain, 0.035);
-        assert_eq!(tune.sidebar, 300.0);
+        assert_eq!(tune.sidebar, 288.0);
         assert_eq!(tune.timeline_row, 26.0);
         assert_eq!(tune.timeline_label, 150.0);
     }

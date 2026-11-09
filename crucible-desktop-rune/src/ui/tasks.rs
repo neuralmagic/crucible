@@ -11,7 +11,7 @@ use crate::gfx;
 use crate::logline::{Activity, LogLine, activity};
 use crate::session::{Instance, InstanceCounts, LinkView, Outcome, TaskState, TaskView};
 use crate::ui::log;
-use crate::ui::{Paint, Tone, flag, fx, meter, mono, pulsing, tag};
+use crate::ui::{Paint, Tone, flag, fx, meter, pulsing, tag};
 
 const LINK_CHIPS: usize = 4;
 /// Agent lines a running task's card streams.
@@ -121,7 +121,7 @@ fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], shown: Shown, p
 
     let mut title = row().w_full().gap(8.0).center_y().child(
         text(task.name.clone())
-            .font(mono(12.5, 500.0))
+            .font(p.mono(12.5, 500.0))
             .color(p.c.text_base)
             .shrink()
             .truncate(),
@@ -271,7 +271,7 @@ fn streamed_card(name: &str, tail: &[&LogLine], p: &Paint) -> El {
                 .gap(6.0)
                 .child(
                     text(name.to_string())
-                        .font(mono(12.5, 500.0))
+                        .font(p.mono(12.5, 500.0))
                         .color(p.c.text_base)
                         .truncate(),
                 )
@@ -307,7 +307,7 @@ fn live_tail(task: &str, tail: &[&LogLine], p: &Paint) -> El {
                 }))
                 .child(
                     text(content)
-                        .font(mono(11.0, 400.0).lh(15.0))
+                        .font(p.mono(11.0, 400.0).lh(15.0))
                         .color(ink.alpha(fade))
                         .grow(1.0)
                         .min_w(0.0)
@@ -410,7 +410,7 @@ fn headline(task: &TaskView, state: TaskState, activity: &Activity, p: &Paint) -
     };
     Some(
         text(line)
-            .font(mono(11.5, 400.0))
+            .font(p.mono(11.5, 400.0))
             .color(ink)
             .w_full()
             .max_lines(2)
@@ -529,7 +529,7 @@ fn link_chips(links: &[&LinkView], p: &Paint) -> El {
     if links.len() > LINK_CHIPS {
         chips = chips.child(
             text(format!("+{} more", links.len() - LINK_CHIPS))
-                .font(mono(10.0, 400.0))
+                .font(p.mono(10.0, 400.0))
                 .color(p.c.text_muted),
         );
     }
@@ -560,7 +560,7 @@ fn link_chip(link: &LinkView, p: &Paint) -> El {
         )
         .child(
             text(link.label.clone())
-                .font(mono(11.0, 500.0))
+                .font(p.mono(11.0, 500.0))
                 .color(p.c.text_accent),
         )
 }
@@ -636,13 +636,13 @@ fn expanded(task: &TaskView, rerun: bool, editable: bool, link: Option<String>, 
         for repair in repairs {
             let mut item = col().w_full().gap(2.0).child(
                 text(format!("{} \u{b7} ${:.4}", repair.label, repair.cost_usd))
-                    .font(mono(10.5, 500.0))
+                    .font(p.mono(10.5, 500.0))
                     .color(p.c.text_base),
             );
             for note in &repair.notes {
                 item = item.child(
                     text(format!("\u{2022} {note}"))
-                        .font(mono(10.0, 400.0))
+                        .font(p.mono(10.0, 400.0))
                         .color(p.c.text_muted)
                         .wrap(),
                 );
@@ -663,12 +663,12 @@ fn expanded(task: &TaskView, rerun: bool, editable: bool, link: Option<String>, 
                     .child(link_chip(link, p))
                     .child(
                         text(link.kind.replace('_', " "))
-                            .font(mono(10.0, 400.0))
+                            .font(p.mono(10.0, 400.0))
                             .color(p.c.text_muted),
                     )
                     .child(
                         text(link.url.clone())
-                            .font(mono(10.0, 400.0))
+                            .font(p.mono(10.0, 400.0))
                             .color(p.c.text_muted)
                             .grow(1.0)
                             .min_w(0.0)
@@ -704,7 +704,7 @@ fn expanded(task: &TaskView, rerun: bool, editable: bool, link: Option<String>, 
                 .scroll_xy()
                 .child(
                     text(pretty)
-                        .font(mono(10.0, 400.0))
+                        .font(p.mono(10.0, 400.0))
                         .color(p.c.text_base)
                         .selectable(true)
                         .selection_color(p.k.selection()),
@@ -773,7 +773,7 @@ fn instances(task: &TaskView, p: &Paint) -> El {
     if task.instances.len() > INSTANCE_CHIPS {
         list = list.child(
             text(format!("+{} more", task.instances.len() - INSTANCE_CHIPS))
-                .font(mono(10.0, 400.0))
+                .font(p.mono(10.0, 400.0))
                 .color(p.c.text_muted),
         );
     }
@@ -815,20 +815,20 @@ fn instance_row(task: &str, instance: &Instance, p: &Paint) -> El {
         .on_press(move |app: &mut App| app.filter_log(Some(&full)))
         .child(
             text(instance.key.clone())
-                .font(mono(10.5, 500.0))
+                .font(p.mono(10.5, 500.0))
                 .color(p.c.text_base)
                 .w(150.0)
                 .truncate(),
         )
         .child(
             text(state_label(state))
-                .font(mono(10.0, 400.0))
+                .font(p.mono(10.0, 400.0))
                 .color(label_ink(state, p))
                 .w(70.0),
         )
         .child(
             text(detail.join(" \u{b7} "))
-                .font(mono(10.0, 400.0))
+                .font(p.mono(10.0, 400.0))
                 .color(p.c.text_muted)
                 .grow(1.0)
                 .min_w(0.0)
@@ -849,7 +849,7 @@ pub(crate) fn fact_row(label: &str, value: String, p: &Paint) -> El {
         )
         .child(
             text(value)
-                .font(mono(10.5, 400.0))
+                .font(p.mono(10.5, 400.0))
                 .color(p.c.text_base)
                 .grow(1.0)
                 .min_w(0.0)

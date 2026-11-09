@@ -7,7 +7,7 @@ use serde_json::Value;
 use crate::App;
 use crate::diff::{self, FieldChange, InstanceDiff, Presence, TaskDiff};
 use crate::ui::tasks::section;
-use crate::ui::{Paint, Pane, mono};
+use crate::ui::{Paint, Pane};
 
 /// Launches the picker offers.
 const CANDIDATES: usize = 12;
@@ -50,7 +50,7 @@ pub(crate) fn compare_view(pane: &Pane, app: &App, p: &Paint) -> El {
         return shell(
             body.child(
                 text(error.clone())
-                    .font(mono(10.5, 400.0))
+                    .font(p.mono(10.5, 400.0))
                     .color(p.fail)
                     .wrap(),
             ),
@@ -92,7 +92,7 @@ fn picker(candidates: &[&crate::live::LivePlaybook], base: &str, p: &Paint) -> E
                 .on_press(move |app: &mut App| app.compare_to = Some(key.clone()))
                 .child(
                     text(launch.landed_at.clone())
-                        .font(mono(10.0, 500.0))
+                        .font(p.mono(10.0, 500.0))
                         .color(if on { p.c.text_base } else { p.c.text_muted }),
                 ),
         );
@@ -119,7 +119,7 @@ fn summary(changed: &[&TaskDiff], same: usize, p: &Paint) -> El {
         parts.push(format!("instances +{added} \u{2212}{removed} ~{moved}"));
     }
     text(parts.join(" \u{b7} "))
-        .font(mono(11.0, 500.0))
+        .font(p.mono(11.0, 500.0))
         .color(p.c.text_muted)
 }
 
@@ -132,7 +132,7 @@ fn task_card(task: &TaskDiff, p: &Paint) -> El {
         .child(mark(task.presence, p))
         .child(
             text(task.name.clone())
-                .font(mono(11.5, 600.0))
+                .font(p.mono(11.5, 600.0))
                 .color(p.c.text_base)
                 .role("button")
                 .label(format!("Open {}", task.name))
@@ -176,7 +176,7 @@ fn instance_rows(instance: &InstanceDiff, p: &Paint) -> El {
         .child(mark(instance.presence, p))
         .child(
             text(instance.key.clone())
-                .font(mono(10.5, 500.0))
+                .font(p.mono(10.5, 500.0))
                 .color(p.c.text_base)
                 .min_w(0.0)
                 .truncate(),
@@ -200,7 +200,7 @@ fn field_rows(fields: &[FieldChange], indent: f32, p: &Paint) -> El {
                 .gap(6.0)
                 .child(
                     text(field.path.clone())
-                        .font(mono(10.5, 400.0))
+                        .font(p.mono(10.5, 400.0))
                         .color(p.c.text_muted)
                         .w(170.0)
                         .truncate(),
@@ -208,7 +208,7 @@ fn field_rows(fields: &[FieldChange], indent: f32, p: &Paint) -> El {
                 .child(value(field.before.as_ref(), p.fail, p))
                 .child(
                     text("\u{2192}".to_string())
-                        .font(mono(10.5, 400.0))
+                        .font(p.mono(10.5, 400.0))
                         .color(p.c.text_faint),
                 )
                 .child(value(field.after.as_ref(), p.pass, p)),
@@ -232,7 +232,7 @@ fn value(value: Option<&Value>, ink: Color, p: &Paint) -> El {
         }
     };
     text(shown)
-        .font(mono(10.5, 400.0))
+        .font(p.mono(10.5, 400.0))
         .color(if value.is_some() { ink } else { p.c.text_faint })
         .grow(1.0)
         .min_w(0.0)
@@ -247,7 +247,7 @@ fn state_change(before: &str, after: &str, p: &Paint) -> El {
         before.replace('_', " "),
         after.replace('_', " ")
     ))
-    .font(mono(10.5, 400.0))
+    .font(p.mono(10.5, 400.0))
     .color(p.c.text_muted)
 }
 
@@ -258,13 +258,13 @@ fn mark(presence: Presence, p: &Paint) -> El {
         Presence::Both => ("~", p.c.text_faint),
     };
     text(glyph.to_string())
-        .font(mono(11.0, 600.0))
+        .font(p.mono(11.0, 600.0))
         .color(ink)
         .w(10.0)
 }
 
 fn faint(label: &str, p: &Paint) -> El {
     text(label.to_string())
-        .font(mono(10.5, 400.0))
+        .font(p.mono(10.5, 400.0))
         .color(p.c.text_faint)
 }

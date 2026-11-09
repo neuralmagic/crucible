@@ -7,7 +7,7 @@ use rune_kit::{Button, ButtonVariant, SidebarRow, TextInput};
 use crate::App;
 use crate::admin::{Action, SecretView, relative};
 use crate::ui::desk::{card, frame, heading, landed, list, none, now, reading};
-use crate::ui::{Paint, mono, tag};
+use crate::ui::{Paint, tag};
 
 const LIST: f32 = 300.0;
 
@@ -209,12 +209,12 @@ fn bindings(view: &SecretView, app: &App, p: &Paint) -> El {
                 .center_y()
                 .child(
                     text(format!("{}:{}", binding.scope_kind, binding.scope_id))
-                        .font(mono(12.0, 520.0))
+                        .font(p.mono(12.0, 520.0))
                         .color(p.c.text_base),
                 )
                 .child(
                     text(projected)
-                        .font(mono(12.0, 420.0))
+                        .font(p.mono(12.0, 420.0))
                         .color(p.c.text_muted)
                         .grow(1.0)
                         .min_w(0.0)

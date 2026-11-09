@@ -7,7 +7,7 @@ use rune_theme_opencode::icons as oc;
 
 use crate::App;
 use crate::palette::{Item, rank};
-use crate::ui::{Paint, mono};
+use crate::ui::Paint;
 
 const WIDTH: f32 = 600.0;
 const ROW: f32 = 30.0;
@@ -89,7 +89,7 @@ pub(crate) fn palette(app: &App, p: &Paint, layer: &mut Vec<El>) {
                 }))
                 .child(
                     text(entry.kind.to_string())
-                        .font(mono(10.5, 400.0))
+                        .font(p.mono(10.5, 400.0))
                         .color(p.c.text_faint)
                         .w(64.0),
                 ),

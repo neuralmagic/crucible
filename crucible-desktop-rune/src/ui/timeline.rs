@@ -7,7 +7,7 @@ use crate::gfx;
 use crate::session::TaskState;
 use crate::timeline::{Bar, Schedule, concurrency, schedule, tick};
 use crate::ui::tasks::{duration, status_color};
-use crate::ui::{Paint, Pane, fx, mono};
+use crate::ui::{Paint, Pane, fx};
 
 const LANE: f32 = 5.0;
 const STRIP: f32 = 30.0;
@@ -162,7 +162,7 @@ fn axis(span: f64, p: &Paint) -> El {
                 .child(el().w(1.0).h(6.0).fill(p.c.border_strong))
                 .child(
                     text(duration(t))
-                        .font(mono(10.5, 400.0))
+                        .font(p.mono(10.5, 400.0))
                         .color(p.c.text_faint)
                         .pl(4.0)
                         .truncate(),
@@ -215,7 +215,7 @@ fn bar_row(i: usize, bar: &Bar, span: f64, p: &Paint) -> El {
         .w_full()
         .child(
             text(bar.name.clone())
-                .font(mono(11.5, if bar.critical { 500.0 } else { 400.0 }))
+                .font(p.mono(11.5, if bar.critical { 500.0 } else { 400.0 }))
                 .color(if bar.critical {
                     p.c.text_base
                 } else {

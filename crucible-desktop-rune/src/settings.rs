@@ -67,6 +67,45 @@ impl Appearance {
     }
 }
 
+/// How large the app sets its text, from the theme's own sizes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TextSize {
+    Small,
+    #[default]
+    Default,
+    Large,
+    Larger,
+}
+
+impl TextSize {
+    pub const ALL: [TextSize; 4] = [
+        TextSize::Small,
+        TextSize::Default,
+        TextSize::Large,
+        TextSize::Larger,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TextSize::Small => "Small",
+            TextSize::Default => "Default",
+            TextSize::Large => "Large",
+            TextSize::Larger => "Larger",
+        }
+    }
+
+    /// What every text size and line height is multiplied by.
+    pub fn factor(self) -> f32 {
+        match self {
+            TextSize::Small => 0.9,
+            TextSize::Default => 1.0,
+            TextSize::Large => 1.12,
+            TextSize::Larger => 1.25,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LogFont {
@@ -116,6 +155,7 @@ pub struct Settings {
     pub layout: Option<Workspace>,
     pub theme: Theme,
     pub appearance: Appearance,
+    pub text_size: TextSize,
     /// Draw charts through the CRT pass.
     pub crt: bool,
     /// Announce the signed-in user's runs as they finish.
@@ -124,6 +164,10 @@ pub struct Settings {
     pub ask: bool,
     /// The editor pack files open in; `None` finds one.
     pub editor: Option<Editor>,
+    /// Open files with `editor_command` instead of an editor app.
+    pub editor_custom: bool,
+    /// A shell command with `{file}` and `{line}`, for editors that are not apps.
+    pub editor_command: String,
     /// Keys bound by hand, by command id; a command left out keeps its defaults.
     pub keys: BTreeMap<String, Vec<String>>,
     /// Check the shown pack file with crucible-lsp.
@@ -142,11 +186,15 @@ struct Config {
     layout: Option<Workspace>,
     theme: Theme,
     appearance: Appearance,
+    text_size: TextSize,
     crt: Option<bool>,
     notify: Option<bool>,
     notify_decisions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     editor: Option<Editor>,
+    editor_custom: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    editor_command: Option<String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     keys: BTreeMap<String, Vec<String>>,
     checks: Option<bool>,
@@ -175,10 +223,13 @@ impl Settings {
             layout: config.layout.and_then(Workspace::repaired),
             theme: config.theme,
             appearance: config.appearance,
+            text_size: config.text_size,
             crt: config.crt.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
             ask: config.notify_decisions.unwrap_or(true),
             editor: config.editor,
+            editor_custom: config.editor_custom.unwrap_or(false),
+            editor_command: config.editor_command.unwrap_or_default(),
             keys: config.keys,
             checks: config.checks.unwrap_or(true),
             path,
@@ -229,7 +280,14 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_editor_command(&mut self, custom: bool, command: &str) {
+        self.editor_custom = custom;
+        self.editor_command = command.to_string();
+        self.save();
+    }
+
     pub fn set_editor(&mut self, editor: Option<Editor>) {
+        self.editor_custom = false;
         self.editor = editor;
         self.save();
     }
@@ -240,6 +298,11 @@ impl Settings {
             Some(keys) => self.keys.insert(command.to_string(), keys),
             None => self.keys.remove(command),
         };
+        self.save();
+    }
+
+    pub fn set_text_size(&mut self, size: TextSize) {
+        self.text_size = size;
         self.save();
     }
 
@@ -255,10 +318,13 @@ impl Settings {
             layout: self.layout.clone(),
             theme: self.theme,
             appearance: self.appearance,
+            text_size: self.text_size,
             crt: Some(self.crt),
             notify: Some(self.notify),
             notify_decisions: Some(self.ask),
             editor: self.editor,
+            editor_custom: Some(self.editor_custom),
+            editor_command: (!self.editor_command.is_empty()).then(|| self.editor_command.clone()),
             keys: self.keys.clone(),
             checks: Some(self.checks),
         };

@@ -53,18 +53,92 @@ impl Editor {
         }
     }
 
-    /// The editor `$VISUAL` or `$EDITOR` names, else the first one installed.
-    pub fn detect() -> Option<Editor> {
+    /// The editor `$VISUAL` or `$EDITOR` names, else the first one installed. One they name that
+    /// is not an app this knows, a terminal editor such as `nvim`, is refused rather than passed
+    /// over for an app the user did not pick.
+    pub fn detect() -> Result<Editor, String> {
         let named = ["VISUAL", "EDITOR"]
             .into_iter()
-            .filter_map(|var| std::env::var(var).ok())
-            .find_map(|value| from_command(&value));
-        named.or_else(|| {
-            [Editor::Cursor, Editor::Zed, Editor::VsCode]
-                .into_iter()
-                .find(|editor| bundle(*editor).is_some())
-        })
+            .find_map(|var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()));
+        if let Some(named) = named {
+            return from_command(&named).ok_or_else(|| {
+                format!(
+                    "$EDITOR is {}, which needs a terminal. Set an editor command in Settings, \
+                     like `{EXAMPLE}`.",
+                    named.trim()
+                )
+            });
+        }
+        [Editor::Cursor, Editor::Zed, Editor::VsCode]
+            .into_iter()
+            .find(|editor| bundle(*editor).is_some())
+            .ok_or_else(|| "No editor found. Pick one in Settings.".to_string())
     }
+}
+
+/// An editor command a terminal editor fits.
+pub const EXAMPLE: &str = "ghostty -e nvim +{line} {file}";
+
+/// `template` with `{file}` and `{line}` filled in, the path quoted for `sh`.
+pub fn command_line(template: &str, path: &Path, line: usize) -> String {
+    template
+        .replace("{file}", &shell_quote(&path.to_string_lossy()))
+        .replace("{line}", &line.to_string())
+}
+
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
+/// Run an editor command for `path` at `line` through `sh`, with the usual tool directories on
+/// `PATH`: an app opened from Finder starts with only the system ones.
+pub fn run_command(template: &str, path: &Path, line: usize) -> Result<(), String> {
+    if !template.contains("{file}") {
+        return Err("The editor command needs {file} where the path goes".to_string());
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dirs: Vec<PathBuf> = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/Applications/Ghostty.app/Contents/MacOS",
+        "/Applications/kitty.app/Contents/MacOS",
+        "/Applications/WezTerm.app/Contents/MacOS",
+        "/Applications/Alacritty.app/Contents/MacOS",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(home) = home {
+        dirs.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&path));
+    }
+    let search = std::env::join_paths(dirs).map_err(|e| format!("building PATH: {e}"))?;
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(command_line(template, path, line))
+        .env("PATH", search)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(drop)
+        .map_err(|e| format!("running the editor command: {e}"))
+}
+
+/// Write `text` to a scratch file named `name`, for an editor that opens files only.
+pub fn scratch(name: &str, text: &str) -> Result<PathBuf, String> {
+    let dir = crate::httpcache::cache_root()
+        .ok_or("no cache directory for a scratch copy")?
+        .join("scratch");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    let file = Path::new(name)
+        .file_name()
+        .map_or_else(|| "pack-file".into(), |n| n.to_owned());
+    let path = dir.join(file);
+    std::fs::write(&path, text).map_err(|e| format!("writing {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// The editor a command like `code --wait` or `/usr/local/bin/zed` runs.
@@ -152,7 +226,7 @@ pub fn open_text(editor: Editor, text: &str) -> Result<(), String> {
 mod tests {
     use std::path::Path;
 
-    use crate::editor::{Editor, from_command};
+    use crate::editor::{Editor, command_line, from_command};
 
     #[test]
     fn links_name_the_file_and_line() {
@@ -178,5 +252,27 @@ mod tests {
         assert_eq!(from_command("cursor"), Some(Editor::Cursor));
         assert_eq!(from_command("nvim"), None);
         assert_eq!(from_command(""), None);
+    }
+
+    #[test]
+    fn an_editor_command_gets_the_path_quoted_and_the_line() {
+        assert_eq!(
+            command_line(
+                "ghostty -e nvim +{line} {file}",
+                Path::new("/Users/me/my packs/it's.star"),
+                12
+            ),
+            "ghostty -e nvim +12 '/Users/me/my packs/it'\\''s.star'"
+        );
+        assert_eq!(
+            command_line("nvim --remote {file}", Path::new("/a/$(rm -rf ~)"), 1),
+            "nvim --remote '/a/$(rm -rf ~)'",
+            "nothing in the path reaches the shell unquoted"
+        );
+    }
+
+    #[test]
+    fn a_command_without_a_file_slot_is_refused() {
+        assert!(crate::editor::run_command("nvim", Path::new("/a"), 1).is_err());
     }
 }

@@ -26,7 +26,11 @@ pub(crate) fn frame(key: &str, title: &str, note: String, app: &App, p: &Paint) 
                 .gap(10.0)
                 .center_y()
                 .window_drag()
-                .child(text(title.to_string()).font(TITLE).color(p.c.text_base))
+                .child(
+                    text(title.to_string())
+                        .font(p.sized(TITLE))
+                        .color(p.c.text_base),
+                )
                 .child(
                     text(note)
                         .font(p.k.ty.ui)

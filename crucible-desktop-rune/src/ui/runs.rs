@@ -8,7 +8,7 @@ use crate::model::Verdict;
 use crate::runs::{DAY, Day, Summary, calendar, date, day_label, lanes, month_labels};
 use crate::ui::Flight;
 use crate::ui::{
-    Paint, SECTION, TITLE, age, meter, mono, pulsing, runs_note, stat, verdict_color, verdict_tone,
+    Paint, SECTION, TITLE, age, meter, pulsing, runs_note, stat, verdict_color, verdict_tone,
 };
 use crate::{App, Selection};
 use rune_kit::Spinner;
@@ -63,7 +63,7 @@ pub(crate) fn runs_page(
                         .window_drag()
                         .child(
                             text(playbook.to_string())
-                                .font(TITLE)
+                                .font(p.sized(TITLE))
                                 .color(p.c.text_base)
                                 .matched(crate::ui::title_flight(playbook)),
                         )
@@ -181,7 +181,11 @@ fn card(title: &str, body: El, p: &Paint) -> El {
         .radius(p.k.radius.lg)
         .fill(p.c.layer_01)
         .border(p.hair, p.c.border_muted)
-        .child(text(title.to_string()).font(SECTION).color(p.c.text_base))
+        .child(
+            text(title.to_string())
+                .font(p.sized(SECTION))
+                .color(p.c.text_base),
+        )
         .child(body)
 }
 
@@ -484,7 +488,7 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
         )
         .child(
             text(launch.cost.map_or("—".to_string(), |c| format!("${c:.2}")))
-                .font(mono(12.0, 400.0).features("'tnum' 1"))
+                .font(p.mono(12.0, 400.0).features("'tnum' 1"))
                 .color(p.c.text_muted)
                 .w(64.0),
         )
