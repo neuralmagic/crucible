@@ -34,7 +34,7 @@ report = command(
     name = "report",
     run = "python3 report.py inputs/climb",
     depends_on = [seed, climb],
-    emits = ["speedup", "best", "builds", "layer_builds", "median_iteration_s", "median_queue_run_s"],
+    emits = ["speedup", "best", "builds", "layer_builds", "failed_builds", "median_iteration_s", "median_queue_run_s"],
     emits_files = ["summary.md"],
 )
 

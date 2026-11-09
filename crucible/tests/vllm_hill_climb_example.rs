@@ -265,6 +265,7 @@ fn climb_inputs(dir: &Path, best: &str) {
                 {"label": "config", "round": 1, "recipe": "layer", "change": "an A100 config"},
                 {"label": "wrong", "round": 1, "recipe": "layer", "change": "skips a block"},
                 {"label": "topk", "round": 1, "recipe": "dockerfile", "change": "warp topk"},
+                {"label": "broken", "round": 1, "recipe": "layer", "change": "never built"},
             ],
             "summary": "The config helped.",
         })
@@ -277,13 +278,17 @@ fn climb_inputs(dir: &Path, best: &str) {
         ("config", 200.0, 230.0, 240.0, 330.0),
         ("wrong", 210.0, 250.0, 255.0, 345.0),
         ("topk", 220.0, 620.0, 630.0, 750.0),
+        ("broken", 230.0, -1.0, -1.0, -1.0),
     ] {
         for (event, t) in [
             ("staged", staged),
             ("pushed", pushed),
             ("submitted", submitted),
             ("measured", measured),
-        ] {
+        ]
+        .into_iter()
+        .filter(|(_, t)| *t >= 0.0)
+        {
             timeline.push_str(
                 &serde_json::json!({"label": label, "event": event, "t": t}).to_string(),
             );
@@ -347,8 +352,9 @@ fn the_report_computes_the_speedup_iteration_times_and_build_reuse() {
         serde_json::from_str(stdout.lines().last().unwrap_or_default()).unwrap();
     assert_eq!(emitted["best"], "config");
     assert_eq!(emitted["speedup"], 1.25);
-    assert_eq!(emitted["builds"], 3);
+    assert_eq!(emitted["builds"], 3, "a build that never pushed is not counted");
     assert_eq!(emitted["layer_builds"], 2);
+    assert_eq!(emitted["failed_builds"], 1);
     assert_eq!(
         emitted["median_iteration_s"],
         serde_json::json!({"layer": 132.5, "dockerfile": 530.0})
@@ -360,6 +366,11 @@ fn the_report_computes_the_speedup_iteration_times_and_build_reuse() {
     assert!(summary.contains("| 1 | wrong | layer | no | 90.0 |  |"), "{summary}");
     assert!(summary.contains("| output_throughput | 1000.0 | 1100.0 |"), "{summary}");
     assert!(summary.contains("'remote_hit': 570"), "{summary}");
+    assert!(
+        summary.contains("| 0 | baseline | seed | yes | 200.0 | 1.0 | 0.0 | 120.0 | None |"),
+        "the seed's row times no iteration: {summary}"
+    );
+    assert!(summary.contains("Builds: 3 succeeded, 2 of them layers"), "{summary}");
 }
 
 #[test]

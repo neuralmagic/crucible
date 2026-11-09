@@ -73,7 +73,8 @@ def summarize(root: Path, seed: dict[str, Any]) -> dict[str, Any]:
                 "geomean_us": result.get("geomean_us") if result else None,
                 "build_push_s": span(t, "staged", "pushed"),
                 "queue_run_s": span(t, "submitted", "measured"),
-                "iteration_s": span(t, "staged", "measured"),
+                "built": "pushed" in t,
+                "iteration_s": None if cand.get("recipe") == "seed" else span(t, "staged", "measured"),
             }
         )
     by_label = {r["label"]: r for r in rows}
@@ -86,7 +87,8 @@ def summarize(root: Path, seed: dict[str, Any]) -> dict[str, Any]:
     for r in rows:
         if r["ok"]:
             r["speedup"] = round(base["geomean_us"] / r["geomean_us"], 4)
-    built = [r for r in rows if r["recipe"] in ("layer", "dockerfile")]
+    tried = [r for r in rows if r["recipe"] in ("layer", "dockerfile")]
+    built = [r for r in tried if r["built"]]
     layered = [r for r in built if r["recipe"] == "layer"]
     return {
         "best": best["label"],
@@ -95,6 +97,7 @@ def summarize(root: Path, seed: dict[str, Any]) -> dict[str, Any]:
         "best_us": best["geomean_us"],
         "candidates": rows,
         "builds": len(built),
+        "failed_builds": len(tried) - len(built),
         "layer_builds": len(layered),
         "median_iteration_s": {
             "layer": median([r["iteration_s"] for r in layered]),
@@ -135,7 +138,8 @@ def markdown(s: dict[str, Any]) -> str:
     seed = s["seed"]
     out += [
         "",
-        f"Builds: {s['builds']}, of which {s['layer_builds']} were layers that compiled nothing.",
+        f"Builds: {s['builds']} succeeded, {s['layer_builds']} of them layers that compiled"
+        f" nothing; {s['failed_builds']} failed.",
         f"Median iteration: {s['median_iteration_s']}; build and push: {s['median_build_push_s']};"
         f" queue and run: {s['median_queue_run_s']} s.",
         f"Seed: {seed.get('seed_build_seconds')} s to build, {seed.get('seed_push_seconds')} s to"
@@ -156,7 +160,7 @@ def main() -> None:
     climb = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(".")
     s = summarize(climb, seed)
     Path("summary.md").write_text(markdown(s))
-    print(json.dumps({k: s[k] for k in ("speedup", "best", "builds", "layer_builds",
+    print(json.dumps({k: s[k] for k in ("speedup", "best", "builds", "layer_builds", "failed_builds",
                                         "median_iteration_s", "median_queue_run_s")}))
 
 
