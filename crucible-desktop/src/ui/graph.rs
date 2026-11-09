@@ -82,9 +82,16 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
                 if from.name == task.name {
                     return spot;
                 }
-                let (name, from) = (task.name.clone(), from.name.clone());
-                pointer(spot, format!("What {from} hands {name}"))
-                    .on_press(move |app: &mut App| app.pick_task(&name, Some(&from)))
+                let (name, by) = (task.name.clone(), from.name.clone());
+                if task.depends_on.contains(&from.name) {
+                    pointer(spot, format!("What {by} hands {name}"))
+                        .on_press(move |app: &mut App| app.pick_task(&name, Some(&by)))
+                } else if from.revise.contains(&task.name) {
+                    pointer(spot, format!("{name}'s rounds, each sent back by {by}"))
+                        .on_press(move |app: &mut App| app.pick_task(&name, None))
+                } else {
+                    spot
+                }
             }
         }
     };
@@ -279,6 +286,8 @@ struct Ink {
     /// Outlines of tasks a preview adds and redefines.
     added: Color,
     changed: Color,
+    /// Edges from a reviser back to the tasks it revises.
+    revise: Color,
 }
 
 impl Ink {
@@ -302,6 +311,7 @@ impl Ink {
             critical: p.c.text_muted,
             added: p.pass,
             changed: p.c.warning.icon,
+            revise: p.c.text_accent,
         }
     }
 }
@@ -390,6 +400,7 @@ struct Shown<'a> {
 ///   a -->|.k| b         b gets its own entry of a.k
 ///   a -->|yes / no| b   b runs on those answers of route a
 ///   a -.-> b            b was not taken, faded
+///   r -.->|revise 2/3| a  r failing sends a back for another round, of at most 3
 /// ```
 ///
 /// Node colour carries each task's state, the open task has an accent outline, and the edges
@@ -431,6 +442,9 @@ fn mermaid_source(tasks: &[TaskView], shown: &Shown, ink: &Ink) -> String {
                 task.instances.len(),
                 task.instance_counts().passed
             ));
+        }
+        if let (Some(revised), Some(round)) = (&task.revised, task.rounds.last()) {
+            label.push_str(&format!(" r{}/{}", round.n, revised.max_rounds));
         }
         let (open, close) = if task.kind == "route" {
             ("{{", "}}")
@@ -520,6 +534,26 @@ fn mermaid_source(tasks: &[TaskView], shown: &Shown, ink: &Ink) -> String {
             }
             edge += 1;
         }
+    }
+    let mut revise = Vec::new();
+    for (from, task) in tasks.iter().enumerate() {
+        let rounds = task.rounds.last().map_or(0, |round| round.n);
+        for target in &task.revise {
+            let label = match rounds {
+                0 => format!("revise \u{2264}{}", task.max_rounds),
+                n => format!("revise {n}/{}", task.max_rounds),
+            };
+            source.push_str(&format!("  t{from} -.->|{label}| {}\n", id(target)));
+            revise.push(edge.to_string());
+            edge += 1;
+        }
+    }
+    if !revise.is_empty() {
+        source.push_str(&format!(
+            "  linkStyle {} stroke:{},stroke-width:1.5\n",
+            revise.join(","),
+            ink.revise.hex()
+        ));
     }
     if !faded.is_empty() {
         source.push_str(&format!(
@@ -635,6 +669,7 @@ mod tests {
             critical: Color::WHITE,
             added: Color::WHITE,
             changed: Color::BLACK,
+            revise: Color::TRANSPARENT,
         }
     }
 
@@ -767,6 +802,36 @@ mod tests {
         assert!(
             source.contains(&format!("style t{b} stroke:#000000ff")),
             "{source}"
+        );
+    }
+
+    #[test]
+    fn a_reviser_draws_its_revise_edge_back_to_its_target() {
+        let all = include_str!("../../fixtures/revise-session.jsonl");
+        let plan = all.lines().next().unwrap();
+        contains_all(
+            &source(&fold(plan), None, &[]),
+            &[
+                "t1 -.->|revise \u{2264}3| t0",
+                "t0[\"\u{203a} author\"]",
+                "linkStyle 2 stroke:#00000000,stroke-width:1.5",
+            ],
+        );
+        let ran = source(&fold(all), None, &[]);
+        contains_all(
+            &ran,
+            &[
+                "t0[\"\u{203a} author r2/3\"]",
+                "t1[\"\u{203a} review r2/3\"]",
+                "t0 --> t1",
+                "t1 -.->|revise 2/3| t0",
+                "t1 --> t2",
+                "class t0 pass",
+            ],
+        );
+        assert!(
+            !ran.contains("t0 -.-> t1"),
+            "a revise loop is not a passed-over edge"
         );
     }
 
