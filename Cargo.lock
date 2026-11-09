@@ -2007,7 +2007,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crucible"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "allocative",
  "anyhow",
@@ -2067,7 +2067,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-broker"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2096,7 +2096,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-capability"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "semver",
  "serde",
@@ -2106,7 +2106,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-contract"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -2123,7 +2123,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-controller"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2207,7 +2207,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-git"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -2238,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-harness"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "crucible-contract",
@@ -2251,7 +2251,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-lsp"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "crucible",
  "crucible-contract",
@@ -2295,7 +2295,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-mcp-auth"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-vcs"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "git2",
@@ -2338,7 +2338,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3383,7 +3383,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -11830,7 +11830,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "clap",
