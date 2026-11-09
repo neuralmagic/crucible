@@ -102,11 +102,16 @@ def main() -> None:
     build_seconds = round(time.monotonic() - started)
     pushed = buildit("push", build_id)
     push_seconds = round(time.monotonic() - started) - build_seconds
-    buildit(
+    ran = buildit(
         "run", build_id, "--fetch", "/trace", "--",
         "sh", "-c", "mkdir -p /trace && cp /buildit/ccache-stats.log /trace/",
     )
-    ccache = ccache_counts(Path(".buildit") / build_id / "trace" / "ccache-stats.log")
+    stats = Path(".buildit") / build_id / "trace" / "ccache-stats.log"
+    if stats.is_file():
+        ccache: dict[str, int] | None = ccache_counts(stats)
+    else:
+        print(f"no ccache log came back from the run: {json.dumps(ran)[:2000]}", flush=True)
+        ccache = None
     print(
         json.dumps(
             {
