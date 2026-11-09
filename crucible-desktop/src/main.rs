@@ -3,6 +3,7 @@
 //! (through each pack's `state/session.jsonl`).
 
 mod admin;
+mod captured;
 mod commands;
 mod diff;
 mod draft;
@@ -279,6 +280,15 @@ pub struct App {
     pub provider_scratch: rune_kit::ComboboxState,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
+    /// The captured file the Files tab shows, by key; the first listed when none is picked.
+    pub run_file: Option<String>,
+    /// The captured file last asked of the live worker, by run and key.
+    file_sent: Option<(String, String)>,
+    /// The captured file the live worker last fetched.
+    pub opened_file: Option<captured::Opened>,
+    /// The fetched file read as a patch, when it is one.
+    pub file_diff: rune_kit::diff::DiffState,
+    pub files_md_source: bool,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
     /// Panes picked from a tab bar while the layout follows the run, oldest first.
@@ -881,6 +891,7 @@ impl App {
         self.answer_launcher(snapshot.prepared, snapshot.launched);
         self.answer_draft(snapshot.synced);
         self.answer_drop(snapshot.dropped);
+        self.answer_file(snapshot.file);
         self.announce(&snapshot.finished);
         self.reconcile();
     }
@@ -947,6 +958,71 @@ impl App {
             self.live_client.compare(base.as_deref());
             self.compare_sent = base;
         }
+        let file = self.wanted_file();
+        if file != self.file_sent {
+            if let Some((run, key)) = &file {
+                self.live_client.file(run, key);
+            }
+            self.file_sent = file;
+        }
+    }
+
+    /// The run and key of the captured file the Files tab shows, while it is open and the file
+    /// is small enough to draw.
+    fn wanted_file(&self) -> Option<(String, String)> {
+        if !self.workspace().showing(PaneKind::Files) {
+            return None;
+        }
+        let detail = self.selected_detail()?;
+        let run = detail.run_id.clone()?;
+        let files = detail.files.as_ref()?.as_ref().ok()?;
+        let file = captured::pick(files, self.run_file.as_deref())?;
+        file.shown().then(|| (run, file.key.clone()))
+    }
+
+    /// Show the captured file under `key`, fetching it again if it is the one already asked for.
+    pub fn pick_file(&mut self, key: &str) {
+        self.run_file = Some(key.to_string());
+        self.file_sent = None;
+    }
+
+    fn answer_file(&mut self, file: Option<captured::Opened>) {
+        if file == self.opened_file {
+            return;
+        }
+        if let Some(captured::Opened {
+            key,
+            body: Ok(captured::Body::Text(text)),
+            ..
+        }) = &file
+            && captured::Kind::of(key) == captured::Kind::Patch
+        {
+            self.file_diff.set_files(rune_kit::diff::parse(text));
+        }
+        self.opened_file = file;
+    }
+
+    /// Open the fetched captured file's copy on disk in the user's editor.
+    pub fn open_captured(&mut self) {
+        let editor = match self.editor() {
+            Ok(editor) => editor,
+            Err(why) => {
+                self.editor_error = Some(why);
+                return;
+            }
+        };
+        let Some(path) = self.opened_file.as_ref().and_then(|file| file.disk.clone()) else {
+            self.editor_error = Some("The file has no copy on disk to open".to_string());
+            return;
+        };
+        let result = match editor {
+            Ok(app) => editor::open_file(app, &path, 1),
+            Err(command) => {
+                let dir = path.parent().unwrap_or(std::path::Path::new("/"));
+                editor::run_command(&command, &path, 1, dir)
+            }
+        };
+        self.editor_error = result.err();
     }
 
     /// Earlier launches of the selected one's playbook that ran, newest first.
@@ -1353,6 +1429,11 @@ fn init() -> App {
         drop_failed: None,
         login_editor: std::cell::OnceCell::new(),
         pack_md_source: false,
+        run_file: None,
+        file_sent: None,
+        opened_file: None,
+        file_diff: rune_kit::diff::DiffState::default(),
+        files_md_source: false,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         flight: None,
@@ -1469,6 +1550,7 @@ fn scene_tab(app: &mut App) {
     {
         app.settings.text_size = size;
     }
+    app.run_file = std::env::var("CRUCIBLE_FILE").ok();
     let tab = std::env::var("CRUCIBLE_TAB").unwrap_or_default();
     if let Some(kind) = PaneKind::ALL
         .into_iter()
@@ -1505,8 +1587,9 @@ fn main() {
         poll: Some(poll),
         on_key: Some(commands::on_key),
         scenes: &[
-            // `CRUCIBLE_TAB` shows that pane (tasks, timeline, graph, pack, launch or log).
-            // `CRUCIBLE_PICK` opens that task's card.
+            // `CRUCIBLE_TAB` shows that pane (tasks, timeline, graph, pack, files, launch or log),
+            // `CRUCIBLE_FILE` the captured file the Files pane shows, by key, and `CRUCIBLE_PICK`
+            // opens that task's card.
             ("local", |app: &mut App| {
                 app.backend = Backend::Local;
                 app.select(Selection::Local("playbook".into()));

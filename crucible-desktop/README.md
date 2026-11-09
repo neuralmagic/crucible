@@ -122,7 +122,8 @@ on `PATH`.
 
 ## The run workspace
 
-A run's views are panes: Tasks, Timeline, Graph, Pack, Launch and Log. Panes sit as tabs in groups,
+A run's views are panes: Tasks, Timeline, Graph, Data, Files, Transcript, Compare, Pack, Launch
+and Log. Panes sit as tabs in groups,
 groups stack in columns, and the gutters between them resize (double-click evens a pair). Drag a
 tab onto another group's tab bar or middle to join it, or onto an edge to split that group. A pane
 can be closed and reopened from the header.
@@ -150,6 +151,15 @@ installed). A local pack opens by deep link; a controller's file opens as an uns
 the editor's stdin. The copy button copies the file's path, to hand to an agent. Saving a local
 pack re-reads it and re-checks it. A registered pack's files also link to their lines on the Git
 host, at the commit the playbook is pinned to.
+
+## The Files pane
+
+The Files pane lists the files a controller run's tasks captured (their `emits_files`), by task,
+with sizes, and shows one: markdown rendered (or its source), a patch in a diff view, JSON and
+JSON Lines indented and highlighted, anything else as highlighted text. A shown file is copied to
+`~/Library/Caches/crucible-playbooks/run-files/<run>/<key>`; the copy button copies that path and
+the edit button opens it in the editor. A file over 8 MiB is not fetched; the pane gives the
+`crux run-file` command instead.
 
 ## Fix and rerun
 
@@ -249,6 +259,8 @@ cargo run -- --scene local --snap /tmp/playbooks.png --size 1120x720
 CRUCIBLE_PICK=<task> CRUCIBLE_TAB=tasks cargo run -- --scene local --snap /tmp/task.png   # that task's card open
 CRUCIBLE_LIVE_SCENE=<playbook id> cargo run -- --scene live --snap /tmp/live.png --at 200
 CRUCIBLE_LIVE_SCENE=<playbook id> CRUCIBLE_TAB=pack cargo run -- --scene live --snap /tmp/pack.png --at 200
+CRUCIBLE_LINK='crucible-playbooks://playbook/<id>/launch/<launch key>' CRUCIBLE_TAB=files \
+  CRUCIBLE_FILE=report/summary.md cargo run -- --scene live --snap /tmp/files.png --at 200
 cargo run -- --scene local --chrome --snap /tmp/chrome.png   # draws the window buttons
 cargo run -- --tree /tmp/playbooks.json --scene local
 cargo test

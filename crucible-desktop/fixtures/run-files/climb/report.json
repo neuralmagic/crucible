@@ -1,0 +1,96 @@
+{
+  "best": "kern1",
+  "candidates": [
+    {
+      "label": "baseline",
+      "round": 0,
+      "recipe": "seed",
+      "build_id": "buildit-e962a90583f9b121",
+      "image": "quay.io/wseaton/crucible-smoke@sha256:3e5a6afd35f762cf3301355f4aacabc1d0999a93f8343a6e1e304a1be65dcc8e",
+      "job": "hc-1a75fe-baseline",
+      "change": "none: the seed image measured as-is"
+    },
+    {
+      "label": "cfgsmall-layer",
+      "round": 1,
+      "recipe": "layer",
+      "build_id": "buildit-c7fca3e6d81891ba",
+      "image": null,
+      "job": null,
+      "change": "failed layer-recipe attempt for cfgsmall: no Dockerfile in the layer context (exit 125)"
+    },
+    {
+      "label": "cfgwide-layer",
+      "round": 1,
+      "recipe": "layer",
+      "build_id": "buildit-c7fca3e6d81891ba-51e874bb",
+      "image": null,
+      "job": null,
+      "change": "failed layer-recipe attempt for cfgwide: no Dockerfile in the layer context (exit 125)"
+    },
+    {
+      "label": "cfgsmall-fromseed",
+      "round": 1,
+      "recipe": "dockerfile",
+      "build_id": "buildit-c7fca3e6d81891ba-60df0fb7",
+      "image": null,
+      "job": null,
+      "change": "failed build: Dockerfile based FROM the seed image, which the builder may not pull (exit 125)"
+    },
+    {
+      "label": "cfgsmall",
+      "round": 1,
+      "recipe": "dockerfile",
+      "build_id": "buildit-c7fca3e6d81891ba-ea298365",
+      "image": "quay.io/wseaton/crucible-smoke@sha256:e2b0743d00a876eba282a45b4b6a6b3cd609a3aa5cea4e2618c39df73b8a5add",
+      "job": "hc-1a75fe-cfgsmall",
+      "change": "A100 config table: BM16 for the small token counts, BM64/BN128 at 2048; targets 1,8,32,128,512 and 2048"
+    },
+    {
+      "label": "cfgwide",
+      "round": 1,
+      "recipe": "dockerfile",
+      "build_id": "buildit-d3be01badefccf3c",
+      "image": "quay.io/wseaton/crucible-smoke@sha256:66e305e4daa79cd5218af7f40e0db297915c919172a789edf681e5e93a31ec59",
+      "job": "hc-1a75fe-cfgwide",
+      "change": "config table with BN=256/BM=128/G16 for 2048 and 8192; targets the two large token counts"
+    },
+    {
+      "label": "cfgh200",
+      "round": 1,
+      "recipe": "dockerfile",
+      "build_id": "buildit-1255c6a5b6738588",
+      "image": "quay.io/wseaton/crucible-smoke@sha256:951a0652f9e65877d4dab03457730af2a505f066bb088f0785319726ec664dc1",
+      "job": "hc-1a75fe-cfgh200",
+      "change": "per-token-count table taken from the H200 tuning of the same shape; targets all counts"
+    },
+    {
+      "label": "merge1",
+      "round": 2,
+      "recipe": "dockerfile",
+      "build_id": "buildit-1255c6a5b6738588-4d88daad",
+      "image": "quay.io/wseaton/crucible-smoke@sha256:577d6a100fe39f336ebe738c2a454ce4781f1e50cf1fa7512a5ca94fbdf7db9a",
+      "job": "hc-1a75fe-merge1",
+      "change": "best-of merge of the round-1 per-count winners; targets every count"
+    },
+    {
+      "label": "cfgmid",
+      "round": 2,
+      "recipe": "dockerfile",
+      "build_id": "buildit-d3be01badefccf3c-2eb9961a",
+      "image": "quay.io/wseaton/crucible-smoke@sha256:dd16f5bb256bf94edb04172fc76bded88eed860f510afd46b0efc703ea0a7500",
+      "job": "hc-1a75fe-cfgmid",
+      "change": "merge table with BN=32 at M=1 and G=1 at 2048/8192; targets 1, 2048 and 8192"
+    },
+    {
+      "label": "kern1",
+      "round": 2,
+      "recipe": "dockerfile",
+      "build_id": "buildit-c7fca3e6d81891ba-e221ecfd",
+      "image": "quay.io/wseaton/crucible-smoke@sha256:55fcc870bff4f48f26f8ecb0b49e3d220d290443cd3a1e059c50972f7e479af5",
+      "job": "hc-1a75fe-kern1",
+      "change": "merge1 table plus Triton fast paths that drop provably-true K-loop and N-offset masks (K_DIVISIBLE, EVEN_N); targets every count"
+    }
+  ],
+  "summary": "A per-token-count Triton config table tuned for the A100-SXM4-80GB plus mask-elision fast paths in fused_moe_kernel cut the fused MoE geomean from 680.657 us to 633.49 us (1.074x, 7.4% faster), with every token count improving and all outputs still within 2e-2 of the fp32 reference. Six buildable candidates were measured over three rounds; kern1 was the only one to clear the 1% bar over the best so far. The serving check could not run: both the seed and kern1 images fail identically at `vllm bench serve` startup with ModuleNotFoundError: No module named 'vllm.benchmarks.lib' (the vLLM repo's own .dockerignore excludes vllm/benchmarks/lib/ from the image), so no serving numbers were produced for either side."
+}
