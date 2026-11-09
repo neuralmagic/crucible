@@ -72,6 +72,7 @@ import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
 import { RunTaskGraph, type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
 import { RunTaskGrid } from './RunTaskGrid';
+import { logBody, logPath, logSectionNote } from './taskEvidenceView';
 import { planOrder } from './runGrid';
 import { absoluteTime, relativeTime } from './journeyView';
 import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView';
@@ -293,6 +294,8 @@ export function RunDetailPage() {
       <RunTaskGraph runId={runId} />
 
       <RunTaskGrid runId={runId} />
+
+      <EngineLogSection runId={runId} live={isLiveRun} />
 
       {!isPlaybook && !isLiveRun && <FlowSection runId={runId} />}
 
@@ -1241,6 +1244,50 @@ function CopyLinkButton({ route, className }: { route: RunFileRoute; className?:
     >
       {copied ? 'copied' : 'copy link'}
     </Button>
+  );
+}
+
+/// The run's engine output on the run page itself, refreshed while the run is still working: the
+/// supervised subprocess for a local run, the work pod's output for a pod run. A run whose output
+/// this deployment cannot reach says where it lives instead.
+function EngineLogSection({ runId, live }: { runId: string; live: boolean }) {
+  const log = $api.useQuery(
+    'get',
+    '/api/runs/{run_id}/log',
+    { params: { path: { run_id: runId } } },
+    { retry: false, refetchInterval: live ? 5_000 : false },
+  );
+  if (log.isPending) {
+    return (
+      <Section>
+        <SectionHeader title="Engine log" />
+        <SectionBody>
+          <Spinner label="Loading the engine log" />
+        </SectionBody>
+      </Section>
+    );
+  }
+  if (log.isError) {
+    return (
+      <Section>
+        <SectionHeader title="Engine log" />
+        <SectionBody>
+          <Mono tone="ink-3">The engine log could not be loaded: {formatError(log.error)}</Mono>
+        </SectionBody>
+      </Section>
+    );
+  }
+  return (
+    <Section>
+      <SectionHeader title="Engine log" note={logSectionNote(log.data)} />
+      <SectionBody className="flex h-[24rem] flex-col overflow-hidden">
+        {logPath(log.data) === null ? (
+          <Mono tone="ink-3">{logBody(log.data)}</Mono>
+        ) : (
+          <LogView text={logBody(log.data)} testId="run-engine-log" />
+        )}
+      </SectionBody>
+    </Section>
   );
 }
 
