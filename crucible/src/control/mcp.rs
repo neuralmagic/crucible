@@ -3,12 +3,12 @@
 //! [`crucible_contract::mcp`]).
 
 use crate::control::broker::{mint_token, port_open};
-use crate::manifest::McpCfg;
+use crate::manifest::{McpCfg, McpLog};
 use anyhow::{Context, Result};
 use crucible_contract::mcp::{self as wire, TokenHolder, TokenMap};
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -70,42 +70,67 @@ impl std::fmt::Display for StderrShown {
     }
 }
 
-/// A server's last [`STDERR_TAIL`] stderr lines, redacted. Its raw stderr is copied to crucible's
-/// stderr as it arrives.
+/// A server's last [`STDERR_TAIL`] stderr lines, redacted. Each line `log` passes is copied to
+/// `out` (crucible's stderr) as it arrives.
 #[derive(Clone, Default)]
 struct StderrTail(Arc<Mutex<VecDeque<String>>>);
 
 impl StderrTail {
-    fn follow(stderr: Option<ChildStderr>) -> (Self, JoinHandle<()>) {
+    fn follow(
+        stderr: Option<impl std::io::Read + Send + 'static>,
+        log: McpLog,
+        mut out: impl std::io::Write + Send + 'static,
+    ) -> (Self, JoinHandle<()>) {
         let tail = Self::default();
         let lines = tail.clone();
         let reader = std::thread::spawn(move || {
-            use std::io::{Read, Write};
             let Some(mut stderr) = stderr else { return };
+            let passes = |line: &[u8]| log.passes(&String::from_utf8_lossy(line));
             let mut chunk = [0u8; 8192];
             let mut line = Vec::new();
             let mut capped = false;
+            let mut passing = false;
             while let Ok(n @ 1..) = stderr.read(&mut chunk) {
-                let _ = std::io::stderr().write_all(&chunk[..n]);
+                let mut shown = Vec::new();
                 for &byte in &chunk[..n] {
                     if byte == b'\n' {
                         if !capped {
                             lines.push(&line);
+                            passing = passes(&line);
+                            if passing {
+                                shown.extend_from_slice(&line);
+                            }
+                        }
+                        if passing {
+                            shown.push(b'\n');
                         }
                         line.clear();
                         capped = false;
-                    } else if !capped {
+                    } else if capped {
+                        if passing {
+                            shown.push(byte);
+                        }
+                    } else {
                         line.push(byte);
                         if line.len() == STDERR_LINE_CHARS * 4 {
                             lines.push(&line);
+                            passing = passes(&line);
+                            if passing {
+                                shown.extend_from_slice(&line);
+                            }
                             line.clear();
                             capped = true;
                         }
                     }
                 }
+                let _ = out.write_all(&shown);
             }
             if !line.is_empty() {
                 lines.push(&line);
+                if !capped && passes(&line) {
+                    line.push(b'\n');
+                    let _ = out.write_all(&line);
+                }
             }
         });
         (tail, reader)
@@ -155,8 +180,8 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// Start every server in `table`. A server gets only `PATH`, `HOME`, the names it inherits from
-/// `vars` (the loop pod's env), its pack `env`, and the `MCP_*` names.
+/// Start every server in `table`. A server gets only `PATH`, `HOME`, `NO_COLOR=1`, the names it
+/// inherits from `vars` (the loop pod's env), its pack `env`, and the `MCP_*` names.
 pub(crate) fn start(
     table: &BTreeMap<String, McpCfg>,
     vars: &[(String, String)],
@@ -170,7 +195,7 @@ pub(crate) fn start(
         }
         let tokens = TokenFile::create()?;
         let mut cmd = Command::new(&cfg.bin);
-        cmd.args(&cfg.args).env_clear();
+        cmd.args(&cfg.args).env_clear().env("NO_COLOR", "1");
         for (name, value) in vars {
             if matches!(name.as_str(), "PATH" | "HOME") || cfg.inherit.contains(name) {
                 cmd.env(name, value);
@@ -194,7 +219,7 @@ pub(crate) fn start(
                 source,
             })?;
         let mut child = KillOnDrop(child);
-        let (tail, reader) = StderrTail::follow(child.0.stderr.take());
+        let (tail, reader) = StderrTail::follow(child.0.stderr.take(), cfg.log, std::io::stderr());
         let deadline = Instant::now() + BOOT_TIMEOUT;
         while !port_open(&probe) {
             if let Some(status) = child
@@ -301,8 +326,64 @@ pub(crate) fn grant_all<'a>(
 #[cfg(test)]
 mod tests {
     use crate::control::broker::port_open;
-    use crate::control::mcp::{STDERR_LINE_CHARS, STDERR_TAIL, StartError, grant_all, start};
-    use crate::manifest::McpCfg;
+    use crate::control::mcp::{
+        STDERR_LINE_CHARS, STDERR_TAIL, StartError, StderrTail, grant_all, start,
+    };
+    use crate::manifest::{McpCfg, McpLog};
+    use std::sync::{Arc, Mutex};
+
+    /// What a server's stderr copy wrote, for a test to read.
+    #[derive(Clone, Default)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn copied(stderr: &str, log: McpLog) -> (String, Vec<String>) {
+        let sink = Sink::default();
+        let input = std::io::Cursor::new(stderr.as_bytes().to_vec());
+        let (tail, reader) = StderrTail::follow(Some(input), log, sink.clone());
+        reader.join().unwrap();
+        let shown = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        (shown, tail.shown().0)
+    }
+
+    #[test]
+    fn crucibles_copy_of_a_servers_stderr_keeps_its_level_while_the_tail_keeps_everything() {
+        let stderr = "\u{1b}[2m2026-11-09T18:02:41.069974Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m cve_triage::tickets: [llm-d] Jira search returned 176 ticket(s)\n\
+                      2026-11-09T18:02:42Z  WARN cve_triage::tickets: rate limited\n\
+                      listening on 0.0.0.0:8850\n\
+                      2026-11-09T18:02:43Z DEBUG hyper: connect";
+        let (shown, tail) = copied(stderr, McpLog::Warn);
+        assert_eq!(
+            shown,
+            "2026-11-09T18:02:42Z  WARN cve_triage::tickets: rate limited\nlistening on 0.0.0.0:8850\n"
+        );
+        assert_eq!(tail.len(), 4, "a start failure still quotes every line");
+
+        let (shown, _) = copied(stderr, McpLog::Debug);
+        assert_eq!(shown.lines().count(), 4);
+        assert!(shown.ends_with("DEBUG hyper: connect\n"), "{shown}");
+        assert_eq!(copied(stderr, McpLog::Off).0, "");
+
+        let long = format!(
+            "2026-11-09T18:02:44Z ERROR x: {}\nINFO y: z\n",
+            "e".repeat(5000)
+        );
+        let (shown, _) = copied(&long, McpLog::Warn);
+        assert_eq!(
+            shown.len(),
+            long.len() - "INFO y: z\n".len(),
+            "a long line passes whole"
+        );
+    }
     use crucible_contract::mcp::TokenHolder;
     use std::collections::BTreeMap;
 
@@ -359,6 +440,7 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
             env: BTreeMap::from([("PACK_SETTING".into(), "on".into())]),
             inherit: inherit.iter().map(|s| s.to_string()).collect(),
             tools: vec!["build".into()],
+            ..McpCfg::default()
         };
         let table = BTreeMap::from([
             ("alpha".into(), cfg(&["KUBE_HOST"])),
@@ -404,6 +486,7 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
             "MCP_NAME",
             "MCP_TOKENS_FILE",
             "MCP_TOOLS",
+            "NO_COLOR",
             "PACK_SETTING",
         ];
         expected.extend(
@@ -448,6 +531,7 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
                 env: BTreeMap::new(),
                 inherit: Vec::new(),
                 tools: Vec::new(),
+                ..McpCfg::default()
             },
         )]);
         let vars: Vec<(String, String)> = std::env::vars().collect();

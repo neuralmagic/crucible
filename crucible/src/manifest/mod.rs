@@ -35,7 +35,7 @@ pub use deploy::DeployCfg;
 pub use dispatch::{ClusterName, ClusterNameError, DispatchCfg};
 pub use git_ref::{GitRef, GitRefError, RepoOverridesCfg};
 pub use judge::JudgeCfg;
-pub use mcp::McpCfg;
+pub use mcp::{McpCfg, McpLog};
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
