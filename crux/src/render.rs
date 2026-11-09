@@ -715,7 +715,11 @@ pub fn approvals(d: &dto::Approvals) -> String {
                     format!("{}/{}", i.repo, i.path),
                     i.rev.chars().take(12).collect(),
                     i.proposed_by.clone().unwrap_or_else(|| "-".into()),
-                    if i.compiles { "yes".into() } else { "no".into() },
+                    if i.compiles {
+                        "yes".into()
+                    } else {
+                        "no".into()
+                    },
                 ]
             })
             .collect();
