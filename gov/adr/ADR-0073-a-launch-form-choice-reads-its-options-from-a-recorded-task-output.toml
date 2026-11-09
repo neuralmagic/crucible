@@ -1,0 +1,37 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0073"
+title = "A launch-form choice reads its options from a recorded task output"
+status = "proposed"
+date = "2026-11-09"
+refs = [
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "ADR-0027",
+    "ADR-0037",
+    "ADR-0070",
+]
+
+[content]
+context = """
+A parameter's choices are written in the params block ([[RFC-0002:C-PLAYBOOK-PARAMS]]), which must be a literal the engine reads without evaluating the source. The launch form renders the stored schema ([[ADR-0027]]), which rejected a controller-side copy of the form definition so the pack stays its single source.
+
+Some choices are data rather than authorship. The backport playbook's target release and component must name a column and a row of the release component spreadsheet, which only a credentialed task can read, and only releases the operator has configured can run. Written into the params block, the list goes stale on every release and costs a draft save and re-pin each time. Left free text, the launcher guesses a spelling and learns at the resolve task, minutes and dollars later, that the release does not exist.
+
+[[ADR-0070]] solved the same shape for routes: a choice names a dependency's field, the engine resolves it with bounds, and the record keeps what was offered."""
+decision = """
+A declared parameter MAY carry choices_from = {"task": "<name>", "field": "<field>"} in place of choices. The block stays a literal, so introspection without evaluation still holds.
+
+- **Producer.** The task must be declared in the same workflow and emit the field as a list of strings. The compiler checks the reference against the producer's emits, as keyed does. The producer and its dependency closure must not read params, so they compile and run without any launch values.
+- **Snapshot.** The controller keeps, per playbook (registered version or draft head), the field's value from the most recent run in which the producer passed: the choice snapshot, with its run key, capture time, and digest. Any run that includes the producer refreshes it.
+- **Refresh.** A choices refresh is a launch that compiles only the producer closure. It needs no parameters, so it can run as a standing launch ([[ADR-0037]]) on a schedule or on demand from the playbook page.
+- **Bounds.** At most 256 entries of at most 256 characters each. Duplicates collapse to the first. A snapshot outside the bounds is not stored, and the previous one stays.
+- **Form and validation.** The schema emits x-choices-from. The form renders the snapshot as a select and shows its age. Launch validation refuses a value outside the snapshot. With no snapshot yet, the field is free text with a notice, and the pack's own checks decide.
+- **Record.** A launch records the snapshot's run key and digest beside its params, so a reader sees what was offered without re-running the producer.
+- **Other surfaces.** The CLI and ask validation have no snapshot. They validate the declared type only, so the producer's checks remain the authority."""
+consequences = """
+- Data-shaped choices stay current without editing the pack, and a wrong value is refused at the form instead of at the first task.
+- Choices are as fresh as the last refresh. A release added to the sheet appears after the next refresh, not the instant it is typed.
+- The controller stores one small list per declaring parameter per playbook and serves it with the schema. It does not contact external services or execute pack code when the form opens.
+- A producer that reads params is a compile error. A pack that wants choices depending on another launch value (component choices per release) must emit an object keyed by the other value; that cascading form is not part of this decision.
+- Packs pinned before this change see no difference. A reader that predates x-choices-from renders the field as plain text."""
