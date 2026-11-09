@@ -804,6 +804,7 @@ pub fn run(
                         env: crucible::host_env::HostEnv::inherited(),
                         buildit_socket: None,
                         github: false,
+                        broker: None,
                     }),
                     None,
                 )

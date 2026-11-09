@@ -41,6 +41,9 @@ pub enum Capability {
     McpServer { name: String, bin: String },
     /// Whether the pack runs commands outside the sandbox, which hold their executor's reach.
     ExternalCommands { present: bool },
+    /// The broker the workflow's `command` and `evaluate` tasks reach, and so every agent that can
+    /// edit a script they run.
+    TaskBroker { url: String },
     /// What of the engine's environment a manifest table's commands outside the sandbox hold.
     HostEnv {
         table: String,
@@ -140,6 +143,11 @@ pub fn capabilities(m: &Manifest) -> Vec<Capability> {
     out.extend(mcp_servers(&m.mcp));
     if runs_external_commands(m) {
         out.push(Capability::ExternalCommands { present: true });
+    }
+    if m.agent.broker.enabled && m.agent.broker.tasks {
+        out.push(Capability::TaskBroker {
+            url: crate::manifest::resolve_broker_url(&m.agent.broker, "127.0.0.1"),
+        });
     }
     out.extend(host_env(m));
     out.extend(sandboxes(&m.agent));
@@ -529,6 +537,10 @@ fn render_capability(cap: &Capability) -> String {
         Capability::ExternalCommands { present: false } => {
             "external    no commands run outside the sandbox".to_string()
         }
+        Capability::TaskBroker { url } => format!(
+            "task-broker [workflow] command and evaluate tasks reach the broker at {url} with its \
+             token, so every agent in the run can through a script they run"
+        ),
         Capability::HostEnv {
             table,
             reach: HostReach::Inherited,
@@ -774,6 +786,33 @@ mod tests {
                 |c| matches!(c, Capability::Egress { host, .. } if host.contains("openshell.internal"))
             ),
             "an enabled broker's endpoint is disclosed reach"
+        );
+    }
+
+    #[test]
+    fn broker_reach_for_workflow_tasks_is_disclosed_only_when_granted() {
+        let broker = |tasks: bool| {
+            manifest(&format!(
+                "{OPENSHELL}
+                [agent.broker]
+                enabled = true
+                bin = \"my-broker\"
+                tasks = {tasks}
+                "
+            ))
+        };
+        let task_broker = |m: &Manifest| {
+            capabilities(m)
+                .into_iter()
+                .filter(|c| matches!(c, Capability::TaskBroker { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert!(task_broker(&broker(false)).is_empty());
+        assert_eq!(
+            task_broker(&broker(true)),
+            [Capability::TaskBroker {
+                url: "http://127.0.0.1:8849/mcp".into()
+            }]
         );
     }
 

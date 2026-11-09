@@ -288,6 +288,13 @@ from upstream tasks. If a task had a secret, its output, files, and workspace ch
 go to the tasks after it. The capability disclosure lists each sandbox. At launch, the
 controller checks each sandbox image against the catalog.
 
+`command` and `evaluate` tasks run in the loop pod, not in a sandbox. With `tasks = true` in
+`[agent.broker]`, they reach the run's broker at `$CRUCIBLE_BROKER_URL`, with its bearer token
+in `$BROKER_TOKEN`. The broker's output bounds apply to them as to any turn. Such a task can
+run a script an agent edited, so this grants the broker to every agent in the run, whatever
+its sandbox says. Agent turns never get these variables; they reach the broker through their
+`.mcp.json`.
+
 ## MCP servers
 
 With `openshell`, a pack can start MCP servers on the loop pod. Use them for tools that need

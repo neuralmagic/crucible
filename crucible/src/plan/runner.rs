@@ -34,6 +34,17 @@ const INPUTS_ENV_MAX: usize = 64 * 1024;
 /// The run's buildit socket, set for command and evaluate tasks alone; `buildit` calls the server
 /// there.
 pub const BUILDIT_SOCKET_ENV: &str = "CRUCIBLE_BUILDIT_SOCKET";
+/// The run's broker MCP endpoint, set for command and evaluate tasks when the run has a broker.
+pub const BROKER_URL_ENV: &str = "CRUCIBLE_BROKER_URL";
+/// The bearer token the broker checks, set beside [`BROKER_URL_ENV`].
+pub const BROKER_TOKEN_ENV: &str = "BROKER_TOKEN";
+
+/// How a command or evaluate task reaches the run's broker.
+#[derive(Clone, Debug, Default)]
+pub struct TaskBroker {
+    pub url: String,
+    pub token: String,
+}
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
@@ -49,6 +60,9 @@ pub struct ShellRunner {
     /// get [`crucible_contract::git::task_env`], each variable as the loop container holds it when
     /// it does, so an edition-2 task sees what an edition-1 task inherits.
     pub github: bool,
+    /// The run's broker, exported to command and evaluate tasks as [`BROKER_URL_ENV`] and
+    /// [`BROKER_TOKEN_ENV`].
+    pub broker: Option<TaskBroker>,
 }
 
 impl TaskRunner for ShellRunner {
@@ -111,6 +125,8 @@ impl ShellRunner {
         }
         crate::inference::withhold_from_task(&mut cmd);
         cmd.env_remove(BUILDIT_SOCKET_ENV);
+        cmd.env_remove(BROKER_URL_ENV);
+        cmd.env_remove(BROKER_TOKEN_ENV);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -143,6 +159,10 @@ impl ShellRunner {
                 cmd.arg(command);
                 if let Some(socket) = &self.buildit_socket {
                     cmd.env(BUILDIT_SOCKET_ENV, socket);
+                }
+                if let Some(broker) = &self.broker {
+                    cmd.env(BROKER_URL_ENV, &broker.url);
+                    cmd.env(BROKER_TOKEN_ENV, &broker.token);
                 }
                 if self.github {
                     for (name, value) in crucible_contract::git::task_env() {
@@ -496,6 +516,7 @@ mod tests {
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
             github: false,
+            broker: None,
         }
     }
 
@@ -1382,6 +1403,7 @@ mod tests {
             env: crate::host_env::HostEnv::default(),
             buildit_socket: None,
             github: false,
+            broker: None,
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
@@ -1442,6 +1464,7 @@ mod tests {
             agent_cmd: Some(show.into()),
             buildit_socket: Some("/runs/r1/pack/state/buildit.sock".into()),
             github: false,
+            broker: None,
             ..runner()
         };
         let seen =
@@ -1456,6 +1479,43 @@ mod tests {
         assert_eq!(seen(&mut r, &agent), "unset");
         r.buildit_socket = None;
         assert_eq!(seen(&mut r, &command("c", show, &[])), "unset");
+    }
+
+    #[test]
+    fn the_broker_reaches_command_and_evaluate_tasks_and_never_an_agent() {
+        let show = r#"printf '{"url":"%s","token":"%s","pass":true}\n' "${CRUCIBLE_BROKER_URL-unset}" "${BROKER_TOKEN-unset}""#;
+        let mut agent = command("a", "unused", &[]);
+        agent.task = TaskKind::Agent {
+            prompt: "probe it".into(),
+            harness: None,
+            model: None,
+            effort: None,
+            sandbox: None,
+        };
+        let mut r = ShellRunner {
+            agent_cmd: Some(show.into()),
+            broker: Some(TaskBroker {
+                url: "http://127.0.0.1:8849/mcp".into(),
+                token: "t0k".into(),
+            }),
+            ..runner()
+        };
+        let seen =
+            |r: &mut ShellRunner, task: &Task| match r.run(task, 1, &BTreeMap::new(), None).outcome
+            {
+                AttemptOutcome::Pass(v) => (v["url"].clone(), v["token"].clone()),
+                other => panic!("{}: {other:?}", task.name),
+            };
+        let reached = (
+            serde_json::json!("http://127.0.0.1:8849/mcp"),
+            serde_json::json!("t0k"),
+        );
+        let unset = (serde_json::json!("unset"), serde_json::json!("unset"));
+        assert_eq!(seen(&mut r, &command("c", show, &[])), reached);
+        assert_eq!(seen(&mut r, &evaluate("e", show, None)), reached);
+        assert_eq!(seen(&mut r, &agent), unset);
+        r.broker = None;
+        assert_eq!(seen(&mut r, &command("c", show, &[])), unset);
     }
 
     #[test]

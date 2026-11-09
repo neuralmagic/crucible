@@ -179,6 +179,10 @@ pub struct CodegenBuildArgs {
     /// or `full` (slow kernel-compile path). Only modes the scenario declares are accepted. Default `derive`.
     #[serde(default = "default_build_mode")]
     mode: String,
+    /// The digest-pinned image to derive from, in place of the scenario's base image. Only images
+    /// the scenario allows are accepted. Default: the scenario's base image.
+    #[serde(default)]
+    base: Option<String>,
 }
 
 fn default_build_mode() -> String {
@@ -209,6 +213,16 @@ pub struct CodegenLmEvalArgs {
     /// declared bounds.
     #[serde(default)]
     limit: Option<u32>,
+}
+
+/// Args for `codegen_probe`: run a probe document against a built candidate on the GPU.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodegenProbeArgs {
+    /// The digest-pinned image from a `codegen_build` `built` result.
+    digest: String,
+    /// The probe document: a JSON object of at most 64 KiB, handed to the scenario's frozen probe
+    /// command as `$CRUCIBLE_PROBE`.
+    probe: serde_json::Value,
 }
 
 /// Args for `codegen_profile`: capture a GPU trace of a built candidate.
@@ -606,9 +620,11 @@ impl McpServer {
             return refused(&detail);
         }
         let state = self.codegen.clone();
-        crate::telemetry::spawn_blocking(move || crate::codegen::build(&state, &args.mode))
-            .await
-            .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"build task failed: {e}"}}"#))
+        crate::telemetry::spawn_blocking(move || {
+            crate::codegen::build(&state, &args.mode, args.base.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"build task failed: {e}"}}"#))
     }
 
     #[tool(
@@ -670,6 +686,33 @@ impl McpServer {
         })
         .await
         .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"lm_eval task failed: {e}"}}"#))
+    }
+
+    #[tool(
+        description = "Run a probe document against a built candidate on the GPU through the \
+        scenario's FROZEN probe command: the command is server-side, the document is the data it \
+        reads (`$CRUCIBLE_PROBE`). Pass `digest` from codegen_build and `probe`, a JSON object of at \
+        most 64 KiB. Returns JSON: probed{result, logs, cached} — `result` is the JSON object the \
+        command wrote. Memoized per digest+document (a re-issue after the job finished is a free \
+        cache hit, never a resubmission). Also: unconfigured{reason} (the scenario declares no \
+        probe) | pending{job, log, hint} (wait budget ran out, job still queued/running — re-issue \
+        this exact call to re-attach) | job_failed{reason, logs} | rejected_kwarg | \
+        budget_exhausted | disabled | error. The call BLOCKS until the job resolves or the server \
+        wait budget (default 20 min) runs out."
+    )]
+    async fn codegen_probe(&self, Parameters(args): Parameters<CodegenProbeArgs>) -> String {
+        if let Err(detail) = self
+            .bounds
+            .admit("codegen_probe", OutputKind::GpuCapture, None)
+        {
+            return refused(&detail);
+        }
+        let state = self.codegen.clone();
+        crate::telemetry::spawn_blocking(move || {
+            crate::codegen::probe(&state, &args.digest, &args.probe)
+        })
+        .await
+        .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"probe task failed: {e}"}}"#))
     }
 
     #[tool(

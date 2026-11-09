@@ -809,6 +809,18 @@ pub(crate) fn resolved_agent(
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
 /// tasks run through the real [`crate::agent::run_turn`] with the task's knob overrides.
+/// The run's broker as a command or evaluate task reaches it when `[agent.broker].tasks` grants
+/// it: over loopback, since the task runs in the loop pod beside the broker, unless the pack names
+/// the broker's URL outright.
+fn task_broker(args: &Args, kind: &TaskKind) -> Option<crate::plan::runner::TaskBroker> {
+    let reaches = matches!(kind, TaskKind::Command { .. } | TaskKind::Evaluate { .. });
+    let token = args.broker_token.as_ref()?;
+    (reaches && args.broker.enabled && args.broker.tasks).then(|| crate::plan::runner::TaskBroker {
+        url: crate::manifest::resolve_broker_url(&args.broker, "127.0.0.1"),
+        token: token.clone(),
+    })
+}
+
 fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     let Job {
         attempt,
@@ -858,6 +870,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
                 env: args.workflow_env.clone(),
                 buildit_socket,
                 github,
+                broker: task_broker(args, &task.task),
             };
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs, deadline, lane)

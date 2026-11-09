@@ -48,6 +48,11 @@ pub struct BrokerCfg {
     /// The build *target* (`FORGE_*`: registry, push authfile, deploy name) is the loop pod's env.
     #[serde(default)]
     pub build: bool,
+    /// Hand the broker's URL and token to the workflow's `command` and `evaluate` tasks. Off by
+    /// default: such a task can run a script an agent edited, so this reaches agents whose
+    /// sandbox withholds the broker.
+    #[serde(default)]
+    pub tasks: bool,
 }
 
 impl Default for BrokerCfg {
@@ -59,6 +64,7 @@ impl Default for BrokerCfg {
             name: default_broker_name(),
             bin: String::new(),
             build: false,
+            tasks: false,
         }
     }
 }

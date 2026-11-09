@@ -74,6 +74,9 @@ pub struct ToolsConfig {
     /// Optional: only deployments whose scenario declares `[tools.profile]` get the `codegen_profile` tool.
     /// `None` = the tool answers with a readable rejection instead of failing config load.
     pub(crate) profile: Option<ProfileCfg>,
+    /// Optional: the frozen command `codegen_probe` runs with a caller's probe document. `None` =
+    /// the tool answers `unconfigured`.
+    pub(crate) probe: Option<ProbeCfg>,
 }
 
 /// `Hash` participates in the build memo key: every field that shapes the produced image (or could)
@@ -93,6 +96,9 @@ pub struct BuildCfg {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BuildMutableKwargs {
     pub mode: Vec<BuildMode>,
+    /// Digest-pinned images a build may name as `base` in place of `base_image`. Empty = only
+    /// `base_image`.
+    pub base: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,6 +130,16 @@ pub struct LmEvalMutableKwargs {
     pub limit: Option<IntDomain>,
 }
 
+/// A GPU run of a caller-supplied probe document: the frozen command reads the document from
+/// `$CRUCIBLE_PROBE` (and the pack's script from `$CRUCIBLE_PROBE_SCRIPT`) and writes its JSON
+/// result to `$OUT`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProbeCfg {
+    pub(crate) command: String,
+    /// The pack's probe script, handed to the job as `$CRUCIBLE_PROBE_SCRIPT`.
+    pub(crate) script: Option<String>,
+}
+
 /// A GPU capture run: the frozen command writes its trace artifact to `$OUT`; `trace_ext` is the
 /// artifact's extension, preserved in the returned handle name so a downstream analyzer keys on it.
 #[derive(Debug, Clone, PartialEq)]
@@ -148,6 +164,23 @@ impl BuildCfg {
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
+        }
+    }
+
+    /// The image a build derives from: `base_image`, or a `base` the scenario allows.
+    pub fn resolve_base(&self, base: Option<&str>) -> Result<String, String> {
+        match base.map(str::trim).filter(|b| !b.is_empty()) {
+            None => Ok(self.base_image.clone()),
+            Some(b) if b == self.base_image || self.mutable_kwargs.base.iter().any(|a| a == b) => {
+                Ok(b.to_string())
+            }
+            Some(b) => Err(format!(
+                "base {b:?} is not allowed for this scenario (allowed: {})",
+                std::iter::once(self.base_image.as_str())
+                    .chain(self.mutable_kwargs.base.iter().map(String::as_str))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
         }
     }
 
@@ -235,6 +268,16 @@ pub struct ToolsOverlay {
     /// `Option` (not a plain default struct) so an ABSENT section stays distinguishable from a
     /// present-but-empty one: absent ⇒ the tool is unconfigured, present ⇒ `command` is required.
     profile: Option<ProfileOverlay>,
+    /// `Option` for the same reason as `profile`.
+    probe: Option<ProbeOverlay>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProbeOverlay {
+    pub command: Option<String>,
+    /// The engine fills this from `[measure.probe].script`.
+    pub script_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -252,6 +295,7 @@ pub struct BuildOverlay {
 #[serde(default, deny_unknown_fields)]
 pub struct BuildMutableKwargsOverlay {
     pub mode: Option<Vec<BuildMode>>,
+    pub base: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -359,6 +403,11 @@ impl ToolsOverlay {
                         .mutable_kwargs
                         .mode
                         .or(base.build.mutable_kwargs.mode),
+                    base: self
+                        .build
+                        .mutable_kwargs
+                        .base
+                        .or(base.build.mutable_kwargs.base),
                 },
             },
             benchmark: BenchOverlay {
@@ -392,6 +441,13 @@ impl ToolsOverlay {
                 (Some(o), Some(b)) => Some(o.merge(b)),
                 (Some(o), None) => Some(o),
                 (None, b) => b,
+            },
+            probe: match (self.probe, base.probe) {
+                (Some(o), Some(b)) => Some(ProbeOverlay {
+                    command: o.command.or(b.command),
+                    script_text: o.script_text.or(b.script_text),
+                }),
+                (o, b) => o.or(b),
             },
         }
     }
@@ -435,6 +491,7 @@ impl ToolsOverlay {
                     .mutable_kwargs
                     .mode
                     .unwrap_or_else(|| vec![BuildMode::Derive]),
+                base: pinned_bases(self.build.mutable_kwargs.base.unwrap_or_default())?,
             },
         };
         let benchmark = BenchCfg {
@@ -471,12 +528,30 @@ impl ToolsOverlay {
             },
         };
         let profile = self.profile.map(finalize_profile).transpose()?;
+        let probe = self
+            .probe
+            .map(|o| {
+                if o.script_text
+                    .as_ref()
+                    .is_some_and(|t| t.len() > MAX_PROBE_SCRIPT_BYTES)
+                {
+                    return Err(format!(
+                        "probe script is over the {MAX_PROBE_SCRIPT_BYTES}-byte limit"
+                    ));
+                }
+                Ok(ProbeCfg {
+                    command: require_cmd(o.command, "probe.command")?,
+                    script: o.script_text,
+                })
+            })
+            .transpose()?;
         Ok(ToolsConfig {
             gpus,
             build,
             benchmark,
             lm_eval,
             profile,
+            probe,
         })
     }
 }
@@ -501,6 +576,28 @@ fn finalize_profile(o: ProfileOverlay) -> Result<ProfileCfg, String> {
         command: require_cmd(o.command, "profile.command")?,
         trace_ext,
     })
+}
+
+/// A script rides one environment variable, and Linux refuses any one over 128 KiB.
+const MAX_PROBE_SCRIPT_BYTES: usize = 96 * 1024;
+
+/// Each allowed `base` must name exactly one image: `<repository>@sha256:<64 hex>`.
+fn pinned_bases(bases: Vec<String>) -> Result<Vec<String>, String> {
+    for base in &bases {
+        let pinned = base.rsplit_once("@sha256:").is_some_and(|(repo, hex)| {
+            !repo.is_empty()
+                && hex.len() == 64
+                && hex
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+        });
+        if !pinned {
+            return Err(format!(
+                "build.mutable_kwargs.base entry {base:?} must be digest-pinned (<repository>@sha256:<64 hex>)"
+            ));
+        }
+    }
+    Ok(bases)
 }
 
 fn require_cmd(v: Option<String>, field: &str) -> Result<String, String> {
@@ -534,6 +631,37 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// An allowed build base must be digest-pinned, and a declared probe needs its command.
+    #[test]
+    fn bases_are_pinned_and_a_probe_needs_its_command() {
+        let pinned = format!("quay.io/rh/vllm@sha256:{}", "a".repeat(64));
+        let cfg = minimal(serde_json::json!({
+            "build": {"mutable_kwargs": {"base": [pinned.clone()]}},
+            "probe": {"command": "python3 /probe.py"}
+        }))
+        .finalize(2)
+        .unwrap();
+        assert_eq!(cfg.build.mutable_kwargs.base, [pinned]);
+        assert_eq!(cfg.probe.unwrap().command, "python3 /probe.py");
+        assert!(
+            minimal(serde_json::json!({}))
+                .finalize(2)
+                .unwrap()
+                .probe
+                .is_none()
+        );
+        for bad in ["quay.io/rh/vllm:latest", "quay.io/rh/vllm@sha256:abc"] {
+            let err = minimal(serde_json::json!({"build": {"mutable_kwargs": {"base": [bad]}}}))
+                .finalize(2)
+                .unwrap_err();
+            assert!(err.contains("digest-pinned"), "{bad}: {err}");
+        }
+        let err = minimal(serde_json::json!({"probe": {}}))
+            .finalize(2)
+            .unwrap_err();
+        assert!(err.contains("probe.command"), "{err}");
     }
 
     #[test]

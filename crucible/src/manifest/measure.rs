@@ -6,7 +6,7 @@ use serde::Deserialize;
 /// in a per-cluster deploy profile. Captured as a raw table and serialized verbatim: the broker
 /// (crucible-broker codegen::config::ToolsOverlay) is the single validator, it finalize()s this at
 /// startup, so we don't re-declare its schema here. The [measure] table is exactly the
-/// BROKER_CODEGEN_TOOLS_DEFAULTS JSON shape: { gpus, build, benchmark, lm_eval, profile? }.
+/// BROKER_CODEGEN_TOOLS_DEFAULTS JSON shape: { gpus, build, benchmark, lm_eval, profile?, probe? }.
 #[derive(Deserialize, Clone, Default)]
 #[serde(transparent)]
 pub struct MeasureCfg {
@@ -32,8 +32,26 @@ impl MeasureCfg {
 
     /// The broker-child env this contract projects: the enable flag + the tools-defaults JSON. The
     /// per-cluster substrate facts (namespace/queue/PVCs/max_gpus) come from the deploy profile, not here.
-    pub fn broker_env(&self) -> Result<Vec<(String, String)>, String> {
-        let json = serde_json::to_string(&self.tools).map_err(|e| {
+    /// `[measure.probe].script` names a pack file; its text rides the JSON as `script_text`.
+    pub fn broker_env(&self, pack_dir: &std::path::Path) -> Result<Vec<(String, String)>, String> {
+        let mut tools = self.tools.clone();
+        if let Some(probe) = tools.get_mut("probe").and_then(toml::Value::as_table_mut)
+            && let Some(script) = probe.remove("script")
+        {
+            const RELATIVE: &str = "[measure.probe].script must be a path inside the pack";
+            let rel = std::path::Path::new(script.as_str().ok_or(RELATIVE)?);
+            if !rel
+                .components()
+                .all(|c| matches!(c, std::path::Component::Normal(_)))
+            {
+                return Err(format!("{RELATIVE}, got {}", rel.display()));
+            }
+            let path = pack_dir.join(rel);
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("reading [measure.probe].script {}: {e}", path.display()))?;
+            probe.insert("script_text".to_string(), toml::Value::String(text));
+        }
+        let json = serde_json::to_string(&tools).map_err(|e| {
             format!("serializing [measure] to BROKER_CODEGEN_TOOLS_DEFAULTS json: {e}")
         })?;
         Ok(vec![
@@ -62,7 +80,9 @@ mod tests {
         )
         .expect("measure table parses");
 
-        let env = cfg.broker_env().expect("projects env");
+        let env = cfg
+            .broker_env(std::path::Path::new("."))
+            .expect("projects env");
         let get = |k: &str| {
             env.iter()
                 .find(|(name, _)| name == k)
@@ -79,5 +99,27 @@ mod tests {
             "nested build.base_image survives"
         );
         assert_eq!(parsed["benchmark"]["command"], "./bench.sh");
+    }
+
+    #[test]
+    fn a_probe_script_is_read_from_inside_the_pack_and_rides_as_text() {
+        let dir = std::env::temp_dir().join(format!("measure-probe-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("tools")).unwrap();
+        std::fs::write(dir.join("tools/probe.py"), "print('probe')\n").unwrap();
+        let cfg = |script: &str| -> MeasureCfg {
+            toml::from_str(&format!(
+                "gpus = 1\n[probe]\ncommand = \"python3 -c \\\"$CRUCIBLE_PROBE_SCRIPT\\\"\"\nscript = {script:?}\n"
+            ))
+            .unwrap()
+        };
+        let env = cfg("tools/probe.py").broker_env(&dir).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&env[1].1).unwrap();
+        assert_eq!(json["probe"]["script_text"], "print('probe')\n");
+        assert!(json["probe"].get("script").is_none());
+        for escape in ["../outside.py", "/etc/passwd"] {
+            let err = cfg(escape).broker_env(&dir).unwrap_err();
+            assert!(err.contains("inside the pack"), "{escape}: {err}");
+        }
+        let _ = std::fs::remove_file(dir.join("tools/probe.py"));
     }
 }
