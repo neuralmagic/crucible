@@ -207,6 +207,7 @@ fn form_rows(form: &Form, p: &Paint) -> Vec<El> {
             |f| &mut f.tunnel,
             p,
         ),
+        field("Shell", "shell", &form.shell, "$SHELL", |f| &mut f.shell, p),
         field(
             "Resolve",
             "resolve",

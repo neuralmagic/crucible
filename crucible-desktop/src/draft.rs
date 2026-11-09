@@ -29,13 +29,21 @@ struct Sidecar {
     tree_digest: String,
 }
 
-/// Where working copies live: `$CRUCIBLE_DRAFTS_DIR`, else the app's support directory.
+/// Where working copies live: `$CRUCIBLE_DRAFTS_DIR`, else the app's data directory:
+/// `~/Library/Application Support` on macOS, else `$XDG_DATA_HOME` or `~/.local/share`.
 pub fn root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CRUCIBLE_DRAFTS_DIR") {
         return Some(PathBuf::from(dir));
     }
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/Application Support/crucible-playbooks/drafts"))
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let base = if cfg!(target_os = "macos") {
+        home?.join("Library/Application Support")
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|h| h.join(".local/share")))?
+    };
+    Some(base.join("crucible-playbooks/drafts"))
 }
 
 /// A draft id as one file name.

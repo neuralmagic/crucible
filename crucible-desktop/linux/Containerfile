@@ -1,0 +1,5 @@
+FROM registry.fedoraproject.org/fedora:45
+COPY deps.sh /tmp/deps.sh
+RUN sh /tmp/deps.sh
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.1 -c clippy -c rustfmt
