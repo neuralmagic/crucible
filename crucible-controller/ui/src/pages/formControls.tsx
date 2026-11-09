@@ -258,6 +258,8 @@ export interface SelectFieldProps {
   options: readonly SelectOption[];
   hint?: ReactNode;
   required?: boolean;
+  error?: string | null;
+  onBlur?: () => void;
 }
 
 export function SelectField({
@@ -268,15 +270,18 @@ export function SelectField({
   options,
   hint,
   required,
+  error,
+  onBlur,
 }: SelectFieldProps) {
   return (
-    <FieldShell label={label} htmlFor={id} required={required} hint={hint}>
+    <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
       <select
         id={id}
         value={value}
         onChange={(event) => {
           onChange(event.target.value);
         }}
+        onBlur={onBlur}
         className={cn(CONTROL, MONO_CONTROL, 'cursor-pointer')}
       >
         {options.map((option) => (

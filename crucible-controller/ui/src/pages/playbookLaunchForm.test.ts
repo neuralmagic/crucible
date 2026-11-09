@@ -46,8 +46,9 @@ describe('parseParamsSchema', () => {
         pattern: '^[a-z ]+$',
         description: 'What the survey covers.',
         multiline: false,
+        choices: null,
       },
-      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null },
       {
         name: 'since',
         valueType: 'string',
@@ -56,8 +57,9 @@ describe('parseParamsSchema', () => {
         pattern: '^\\d{4}-\\d{2}-\\d{2}$',
         description: null,
         multiline: false,
+        choices: null,
       },
-      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null },
     ]);
   });
 
@@ -69,7 +71,7 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null },
     ]);
   });
 
@@ -107,6 +109,28 @@ describe('parseParamsSchema', () => {
 
   it('refuses an x-order that is not a list of names', () => {
     expect(parseParamsSchema({ type: 'object', properties: {}, 'x-order': 'pr' }).kind).toBe('unrenderable');
+  });
+
+  it('offers a declared choice set, and true or false for a bool, as picks', () => {
+    const [release, accept, note] = specsOf({
+      type: 'object',
+      properties: {
+        release: { type: 'string', enum: ['3.6.0 GA', '3.7 Fast-1'] },
+        accept: { type: 'boolean', default: false },
+        note: { type: 'string' },
+      },
+      required: ['release'],
+    });
+    if (!release || !accept || !note) throw new Error('three specs');
+    expect([release.choices, accept.choices, note.choices]).toEqual([['3.6.0 GA', '3.7 Fast-1'], ['true', 'false'], null]);
+    expect(validateParam(release, '3.7 Fast-1')).toBeNull();
+    expect(validateParam(release, '3.7 EA')).toBe('release must be one of 3.6.0 GA, 3.7 Fast-1');
+  });
+
+  it('refuses choices that are not a nonempty list of the param type', () => {
+    for (const choices of [[], [1, 2], 'a', ['a', null]]) {
+      expect(parseParamsSchema({ type: 'object', properties: { p: { type: 'string', enum: choices } } }).kind).toBe('unrenderable');
+    }
   });
 
   it('renders an empty form for a pack that declares no params', () => {
@@ -217,6 +241,7 @@ describe('validateParam', () => {
       pattern: '(?P<year>\\d{4})',
       description: null,
       multiline: false,
+      choices: null,
     };
     expect(validateParam(rustOnly, 'whatever')).toBeNull();
   });

@@ -21,6 +21,8 @@ export interface ParamFieldSpec {
   description: string | null;
   /// Typed in a text area: a string that may span lines, such as a pasted log.
   multiline: boolean;
+  /// Picked from a list rather than typed: a declared choice set, or true and false for a bool.
+  choices: string[] | null;
 }
 
 /// A schema outside the closed subset renders nothing rather than a wrong form: the launch
@@ -182,6 +184,14 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     if (multiline.value && valueType !== 'string') {
       return { kind: 'unrenderable', reason: `param ${name} is multiline but not a string` };
     }
+    let choices: string[] | null = valueType === 'boolean' ? ['true', 'false'] : null;
+    if (raw.enum !== undefined) {
+      const spelled = Array.isArray(raw.enum) && valueType !== 'list' ? raw.enum.map((item) => defaultText(item, valueType)) : [];
+      if (spelled.length === 0 || spelled.some((item) => !item.ok || item.value === null)) {
+        return { kind: 'unrenderable', reason: `param ${name} has choices that are not a nonempty list of its type` };
+      }
+      choices = spelled.map((item) => (item.ok ? (item.value ?? '') : ''));
+    }
     const description = stringField(raw, 'description');
     specs.push({
       name,
@@ -191,6 +201,7 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       pattern: pattern.value,
       description: description.ok ? description.value : null,
       multiline: multiline.value,
+      choices,
     });
   }
   if (orderRaw !== undefined) {
@@ -225,6 +236,9 @@ export function validateParam(spec: ParamFieldSpec, value: string): string | nul
   }
   if (!readsAs(spec.valueType, trimmed)) {
     return `${spec.name} must be ${spellingOf(spec.valueType) ?? 'text'}`;
+  }
+  if (spec.choices !== null && !spec.choices.includes(spec.valueType === 'boolean' ? trimmed.toLowerCase() : trimmed)) {
+    return `${spec.name} must be one of ${spec.choices.join(', ')}`;
   }
   if (spec.pattern === null) return null;
   let re: RegExp;
