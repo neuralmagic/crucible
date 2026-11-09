@@ -65,7 +65,7 @@ mod openshell {
 mod plan {
     pub use crucible::plan::{
         STAGED_INPUTS, TASK_NAME_ENV, admission, attempt, exec, files, history, ir, machine,
-        record, rerun, resume, runner, starlark, term_img, workflow, worktree,
+        output, record, rerun, resume, runner, starlark, term_img, workflow, worktree,
     };
 
     pub mod cli;

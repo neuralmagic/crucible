@@ -15,7 +15,7 @@ use anyhow::Result;
 use serde_json::Value;
 
 use crate::manifest::{MODE_PLACEHOLDER, PreflightCfg};
-use crate::plan::runner::{Finished, json_line, run_echoed};
+use crate::plan::output::{Finished, json_line, run_echoed};
 use crate::process::STOP;
 use crate::report::reporter::Reporter;
 
