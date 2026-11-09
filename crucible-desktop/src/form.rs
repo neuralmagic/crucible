@@ -257,11 +257,61 @@ pub fn ceilings(
     Ok((cost, time.trim().to_string()))
 }
 
+/// What the controller said when it refused a launch: each field's message, else its `error`,
+/// else the error as it came.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal(pub String);
+
+impl From<&str> for Refusal {
+    fn from(error: &str) -> Self {
+        let body = error
+            .find('{')
+            .and_then(|at| serde_json::from_str::<Value>(error[at..].trim()).ok());
+        let Some(body) = body else {
+            return Refusal(error.to_string());
+        };
+        let fields: Vec<&str> = body
+            .get("fields")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f.get("message").and_then(Value::as_str))
+            .collect();
+        if !fields.is_empty() {
+            return Refusal(fields.join("\n"));
+        }
+        Refusal(
+            body.get("error")
+                .and_then(Value::as_str)
+                .unwrap_or(error)
+                .to_string(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use crate::form::{Kind, Scale, ceilings, duration, fields, minutes, params};
+    use crate::form::{Kind, Refusal, Scale, ceilings, duration, fields, minutes, params};
+
+    #[test]
+    fn a_refusal_says_what_the_controller_said_about_each_field() {
+        let raw = r#"/api/playbook-drafts/x/launch -> HTTP 422 Unprocessable Entity: {"error":"the supplied parameters do not satisfy the playbook's schema","fields":[{"field":"max_time","message":"task \"climb\" declares timeout 4h, longer than this run's --max-time 3h"}]}"#;
+        let said = |raw: &str| Refusal::from(raw).0;
+        assert_eq!(
+            said(raw),
+            "task \"climb\" declares timeout 4h, longer than this run's --max-time 3h"
+        );
+        assert_eq!(
+            said(r#"/x -> HTTP 409 Conflict: {"error":"a newer save landed"}"#),
+            "a newer save landed"
+        );
+        assert_eq!(
+            said("the launch timed out after 20s"),
+            "the launch timed out after 20s"
+        );
+    }
 
     fn triage() -> serde_json::Value {
         json!({

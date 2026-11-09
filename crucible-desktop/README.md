@@ -90,6 +90,9 @@ A registered playbook has a Launch button on its runs page and run header. It op
 from the playbook's params schema (`crux playbook-schema`), prefilled from the launch on screen,
 with cost and time ceilings held under the admin caps (`crux playbook-caps`). The controller
 validates the params; a refusal shows in the form. A launch that lands opens, pinned, and streams.
+The form also picks the dispatch target (from the ones the controller offers you, default first),
+the agent's provider and its model, starting from where the launch on screen ran. A rerun carries
+them too, so it runs where the run it repeats did.
 
 It is its own Cargo workspace, like `crucible-desktop`, because Rune is pre-release and pinned to a
 dev rev the engine workspace must not inherit.
@@ -196,7 +199,9 @@ matching view: a launch, a playbook, a decision, Approvals, Schedules or Secrets
 
 Dropping a pack folder on the Dock icon, or opening one with the app from Finder, pushes it as the
 next version of the draft named after the folder (created on first drop), test-fires it on the
-profile in use under the ceilings in Settings ($1 and 30m unless set), and opens the launch.
+profile in use under the ceilings in Settings ($1 and 30m unless set), and opens the launch. The
+test-fire goes to the cluster the draft's newest run went to, with the same provider and model. A
+draft that has never run opens its launch form instead.
 
 ## The Dock and the menu bar
 
