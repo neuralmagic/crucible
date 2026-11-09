@@ -57,6 +57,68 @@ fn app(db: Db) -> Router {
     router(ApiState::test(db))
 }
 
+/// A client that asks for zstd gets a zstd body that decodes to what an uncompressed request
+/// gets; one that does not ask gets plain JSON.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn responses_are_zstd_for_clients_that_ask(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app(db);
+    let get = |zstd: bool| {
+        let mut req = HttpRequest::get("/api/openapi.json");
+        if zstd {
+            req = req.header(header::ACCEPT_ENCODING, "zstd");
+        }
+        req.body(Body::empty())
+    };
+
+    let plain = app.clone().oneshot(get(false)?).await?;
+    assert_eq!(plain.status(), StatusCode::OK);
+    assert!(plain.headers().get(header::CONTENT_ENCODING).is_none());
+    let plain = axum::body::to_bytes(plain.into_body(), usize::MAX).await?;
+
+    let packed = app.oneshot(get(true)?).await?;
+    assert_eq!(packed.status(), StatusCode::OK);
+    assert_eq!(
+        packed
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .map(|v| v.as_bytes()),
+        Some(&b"zstd"[..])
+    );
+    let packed = axum::body::to_bytes(packed.into_body(), usize::MAX).await?;
+    assert!(
+        packed.len() * 3 < plain.len(),
+        "{} vs {}",
+        packed.len(),
+        plain.len()
+    );
+    assert_eq!(zstd::decode_all(&packed[..])?, plain.to_vec());
+    Ok(())
+}
+
+/// crux asks for zstd and reads the compressed body as the JSON it is, over a real socket.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn crux_reads_a_zstd_response_whole(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let served = app(db.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    tokio::spawn(async move { axum::serve(listener, served).await });
+
+    let client = crux::Client::connect(&crux::config::Config {
+        url: format!("http://{addr}"),
+        auth: crux::config::Auth::None,
+    })?;
+    let spec: serde_json::Value = client.get("/api/openapi.json").await?;
+
+    let plain = app(db)
+        .oneshot(HttpRequest::get("/api/openapi.json").body(Body::empty())?)
+        .await?;
+    let plain = axum::body::to_bytes(plain.into_body(), usize::MAX).await?;
+    assert_eq!(spec, serde_json::from_slice::<serde_json::Value>(&plain)?);
+    Ok(())
+}
+
 fn app_with_caps(db: Db, caps: Option<Caps>) -> Router {
     router(ApiState {
         caps,

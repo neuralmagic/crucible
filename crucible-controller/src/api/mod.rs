@@ -762,6 +762,7 @@ pub fn router(state: ApiState) -> Router {
             crate::authz::bindings::enforce,
         ))
         .layer(axum::middleware::from_fn(trace_requests))
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
 }
 
