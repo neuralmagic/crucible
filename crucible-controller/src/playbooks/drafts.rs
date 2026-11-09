@@ -3821,4 +3821,55 @@ mod tests {
             );
         }
     }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_version_saved_before_routes_still_previews(pool: PgPool) {
+        create(
+            &pool,
+            "aged",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("the skeleton compiles");
+        let old_graph = serde_json::json!({
+            "workflow_type": "playbook",
+            "result": null,
+            "nodes": [
+                {"name": "a", "kind": "command", "required": true, "needs": "any", "join": "all",
+                 "isolation": null, "emits": [], "emits_files": [], "fanout": null,
+                 "session": null, "harness": null, "model": null, "effort": null,
+                 "prompt": null, "command": "true"},
+                {"name": "b", "kind": "command", "required": true, "needs": "any", "join": "all",
+                 "isolation": null, "emits": [], "emits_files": [], "fanout": null,
+                 "session": null, "harness": null, "model": null, "effort": null,
+                 "prompt": null, "command": "true"}
+            ],
+            "edges": [{"from": "a", "to": "b", "join": "all", "required": true}]
+        });
+        sqlx::query("UPDATE playbook_draft_versions SET graph = $1 WHERE draft_id = $2")
+            .bind(&old_graph)
+            .bind("aged")
+            .execute(&pool)
+            .await
+            .expect("age the stored graph");
+
+        let stored = preview(&pool, "aged", None)
+            .await
+            .expect("an old graph decodes")
+            .expect("head version");
+        let graph = stored.graph.expect("graph");
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.edges.len(), 1);
+        assert!(!graph.edges[0].aligned);
+        assert!(graph.edges[0].keyed.is_empty());
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|n| n.questions.is_empty() && n.keyed.is_empty())
+        );
+    }
 }
