@@ -121,8 +121,11 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
 
+      # rustflags off: the action's default `-D warnings` reaches the vendored Rune, whose release
+      # build warns about debug-only tooling.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
+          rustflags: ""
           cache-workspaces: |
             . -> target
             crucible-desktop -> target

@@ -759,6 +759,23 @@ mod tests {
         dir.to_path_buf()
     }
 
+    /// `from`'s files into `to`, but its run state.
+    fn copy_dir(from: &Path, to: &Path) {
+        fs::create_dir_all(to).unwrap();
+        for entry in fs::read_dir(from).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name == "state" {
+                continue;
+            }
+            if entry.file_type().unwrap().is_dir() {
+                copy_dir(&entry.path(), &to.join(&name));
+            } else {
+                fs::copy(entry.path(), to.join(&name)).unwrap();
+            }
+        }
+    }
+
     fn append(pack: &Path, lines: &[&str]) {
         let mut file = fs::OpenOptions::new()
             .create(true)
@@ -786,6 +803,21 @@ mod tests {
             packs.iter().all(|pack| pack.workflow == "playbook"),
             "the local backend lists playbooks and nothing else"
         );
+
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("examples/playbook");
+        copy_dir(&repo.join("examples/playbook"), &copy);
+        fs::create_dir_all(copy.join("state")).unwrap();
+        fs::write(
+            copy.join("state/session.jsonl"),
+            include_str!("../fixtures/playbook-session.jsonl"),
+        )
+        .unwrap();
+        let packs: Vec<PackView> = load_packs(dir.path())
+            .unwrap()
+            .iter()
+            .map(Pack::view)
+            .collect();
         let playbook = packs
             .iter()
             .find(|pack| pack.name == "playbook")

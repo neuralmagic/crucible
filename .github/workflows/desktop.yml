@@ -63,9 +63,15 @@ jobs:
         working-directory: crucible-desktop
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      # The language-server test drives the real crucible-lsp.
+      - name: crucible-lsp
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --locked -p crucible-lsp
+
       - name: test
         working-directory: crucible-desktop
-        run: cargo test --locked
+        run: CRUCIBLE_LSP="$GITHUB_WORKSPACE/target/debug/crucible-lsp" cargo test --locked
 
   # The release bundle, built the way the release workflow builds it, so a change that breaks the
   # bundle fails here rather than on a tag.
@@ -76,8 +82,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # rustflags off: the action's default `-D warnings` reaches the vendored Rune, whose release
+      # build warns about debug-only tooling. The check job holds the app itself to clippy.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
+          rustflags: ""
           cache-workspaces: |
             . -> target
             crucible-desktop -> target
