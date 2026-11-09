@@ -35,3 +35,40 @@ consequences = """
 - The controller stores one small list per declaring parameter per playbook and serves it with the schema. It does not contact external services or execute pack code when the form opens.
 - A producer that reads params is a compile error. A pack that wants choices depending on another launch value (component choices per release) must emit an object keyed by the other value; that cascading form is not part of this decision.
 - Packs pinned before this change see no difference. A reader that predates x-choices-from renders the field as plain text."""
+
+[[content.alternatives]]
+text = "choices_from names a producer task in the same workflow; the controller keeps its latest passing output as the choice snapshot"
+status = "accepted"
+pros = [
+    "The params block stays the single, literal source of the form, as [[ADR-0027]] requires.",
+    "The controller neither contacts external services nor executes pack code when a form opens.",
+    "The same resolve-bound-record shape as [[ADR-0070]]'s dynamic route choices.",
+]
+cons = ["Choices are as fresh as the last refresh."]
+
+[[content.alternatives]]
+text = "A pack script regenerates the literal choices list and saves a new draft or version"
+status = "rejected"
+pros = ["No engine or controller change."]
+cons = [
+    "Every release costs a draft save, and for a registered pack a re-pin and re-approval.",
+    "The list in source is stale between regenerations, with nothing showing its age.",
+]
+rejection_reason = "It turns data churn into source churn on the path that is meant to change only on review."
+
+[[content.alternatives]]
+text = "The controller fetches choices itself when the form opens, from a URL or connector the param names"
+status = "rejected"
+pros = ["Always current."]
+cons = [
+    "The controller would hold the source's credentials and reach external services on page load.",
+    "A second definition of the form's data outside the pack, which [[ADR-0027]] rejected.",
+]
+rejection_reason = "It moves credentials and pack-specific logic into the controller."
+
+[[content.alternatives]]
+text = "choices_from names another playbook's task output"
+status = "rejected"
+pros = ["A small dedicated refresh playbook keeps the main graph untouched."]
+cons = ["Couples two playbooks' versions and permissions; a producer and its consumer can drift apart."]
+rejection_reason = "The producer-closure refresh gives the same small run without a cross-playbook reference."
