@@ -9,6 +9,7 @@ mod draft;
 mod editor;
 mod filter;
 mod finder;
+mod fleet;
 mod form;
 mod gfx;
 mod handoff;
@@ -315,6 +316,13 @@ pub struct App {
     pub pinned: Option<String>,
     /// What the Dock and the menu bar were last told to show.
     tray: Option<tray::Shown>,
+    /// The profiles not in use, as the background worker last read them, and which it reads.
+    pub fleet: Vec<fleet::Status>,
+    fleet_client: fleet::Client,
+    fleet_seen: u64,
+    fleet_sent: Vec<(String, profile::Profile)>,
+    /// The approvals each profile was last seen waiting on, to say when they grow.
+    approvals_known: HashMap<String, usize>,
     /// Ids of the menu bar lines picked, to act on.
     picks: Option<std::sync::mpsc::Receiver<String>>,
     /// Folders the system opened with the app, to launch, and the loop's waker once it runs.
@@ -1286,6 +1294,11 @@ fn init() -> App {
         source_menu: false,
         pinned: None,
         tray: None,
+        fleet: Vec::new(),
+        fleet_client: fleet::Client::spawn(),
+        fleet_seen: 0,
+        fleet_sent: Vec::new(),
+        approvals_known: HashMap::new(),
         picks: None,
         opened: Some(opened),
         open_wake,
@@ -1344,6 +1357,7 @@ fn setup(app: &mut App, waker: Waker) {
     app.live_client.set_waker(waker.clone());
     app.admin_client.set_waker(waker.clone());
     app.finder_client.set_waker(waker.clone());
+    app.fleet_client.set_waker(waker.clone());
     app.lsp.set_waker(waker);
 }
 
@@ -1393,8 +1407,14 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         app.picked(&id);
         changed = true;
     }
+    if let Some((version, statuses)) = app.fleet_client.take(app.fleet_seen) {
+        app.fleet_seen = version;
+        app.fleet = statuses;
+        changed = true;
+    }
     app.sync_live();
     app.sync_admin();
+    app.sync_fleet();
     app.sync_tray();
     changed |= app.refresh_working();
     changed |= app.finish_sign_in();
