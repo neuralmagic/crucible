@@ -304,6 +304,8 @@ pub struct App {
     targets: HashMap<String, (profile::Target, Option<profile::Keeper>)>,
     /// The profile being added or edited in Settings.
     pub profile_form: Option<profile::Form>,
+    /// The account row's menu of profiles and local packs, while open.
+    pub source_menu: bool,
     /// A key pasted for the profile in use, for one the browser cannot reach.
     pub key_paste: TextEdit,
     /// How the last browser sign-in went.
@@ -1246,6 +1248,7 @@ fn init() -> App {
         targets: HashMap::from([(name, (target.clone(), keeper))]),
         target,
         profile_form: None,
+        source_menu: false,
         key_paste: TextEdit::new(""),
         signing_in: false,
         sign_in_error: None,

@@ -284,12 +284,13 @@ fn meter(key: &str, parts: &[(f32, Color)], p: &Paint) -> El {
 
 pub fn view(app: &App, cx: &mut Cx<App>) -> El {
     let p = palette(app, cx);
+    let mut layer = Vec::new();
     let window = row()
         .key("window")
         .w_full()
         .h_full()
         .fill(p.c.bg_base)
-        .child(sidebar(app, &p))
+        .child(sidebar(app, &p, &mut layer))
         .child(rule("sidebar-edge", true, &p));
     let window = window
         .child(detail(app, &p))
@@ -306,7 +307,6 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
         },
         |app: &mut App| &mut app.knobs,
     );
-    let mut layer = Vec::new();
     launcher::sheet(app, &p, &mut layer);
     palette::palette(app, &p, &mut layer);
     finder::finder(app, &p, &mut layer);
@@ -511,7 +511,7 @@ fn live_empty(launch: &LivePlaybook, detail: Option<&LiveDetail>) -> (&'static s
     )
 }
 
-fn sidebar(app: &App, p: &Paint) -> El {
+fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let source = match app.backend {
         Backend::Controller => match &app.live {
             LiveView::Ready { endpoint, .. } => format!("{} \u{b7} {endpoint}", app.target.name),
@@ -546,7 +546,6 @@ fn sidebar(app: &App, p: &Paint) -> El {
         .px(SIDEBAR_PAD)
         .pb(10.0)
         .gap(8.0)
-        .child(backend_switch(app, p))
         .child(search(app, p));
     if let (
         Backend::Controller,
@@ -579,7 +578,7 @@ fn sidebar(app: &App, p: &Paint) -> El {
         .child(pack_list(app, p))
         .children((app.backend == Backend::Controller).then(|| pages_nav(app, p)))
         .child(rule("sidebar-foot-rule", false, p))
-        .child(account(app, source, p))
+        .child(account(app, source, p, layer))
 }
 
 /// The controller's management pages, under the playbooks.
@@ -612,8 +611,9 @@ fn pages_nav(app: &App, p: &Paint) -> El {
         .child(entry(crate::Page::Secrets, &rune_kit::glyphs::LOCK, None))
 }
 
-/// Who is signed in, bottom left, with the settings button beside it.
-fn account(app: &App, source: String, p: &Paint) -> El {
+/// Who is signed in, bottom left, with the settings button beside it. Pressing it opens a menu of
+/// the profiles and the local packs, to switch between them.
+fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
     let (name, about) = match (app.backend, &app.live) {
         (Backend::Local, _) => ("Local packs".to_string(), source),
         (Backend::Controller, LiveView::Ready { identity, .. }) if !identity.user.is_empty() => {
@@ -634,38 +634,102 @@ fn account(app: &App, source: String, p: &Paint) -> El {
         .chars()
         .find(|c| c.is_alphanumeric())
         .map_or("?".to_string(), |c| c.to_uppercase().to_string());
-    row()
-        .key("account")
-        .w_full()
-        .h(52.0)
-        .px(12.0)
+    let place = match app.backend {
+        Backend::Local => "Local".to_string(),
+        Backend::Controller => app.target.name.clone(),
+    };
+    let trigger = row()
+        .key("source-menu-button")
+        .role("button")
+        .label("Switch profile")
+        .w(p.tune.sidebar - 76.0)
+        .min_w(0.0)
         .gap(10.0)
+        .px(6.0)
+        .py(5.0)
+        .radius(p.k.radius.md)
         .center_y()
+        .hover(p.c.hover)
+        .on_press(|app: &mut App| app.source_menu = !app.source_menu)
+        .help(about)
         .child(
             row()
+                .size(26.0, 26.0)
+                .radius(13.0)
+                .fill(p.c.layer_03)
+                .border(p.hair, p.c.border_base)
+                .center()
+                .child(text(initial).font(p.k.ty.small_medium).color(p.c.text_base)),
+        )
+        .child(
+            col()
                 .grow(1.0)
                 .min_w(0.0)
-                .gap(10.0)
-                .center_y()
-                .help(about)
-                .child(
-                    row()
-                        .size(26.0, 26.0)
-                        .radius(13.0)
-                        .fill(p.c.layer_03)
-                        .border(p.hair, p.c.border_base)
-                        .center()
-                        .child(text(initial).font(p.k.ty.small_medium).color(p.c.text_base)),
-                )
                 .child(
                     text(name)
                         .font(p.k.ty.ui_medium)
                         .color(p.c.text_base)
-                        .grow(1.0)
-                        .min_w(0.0)
+                        .truncate(),
+                )
+                .child(
+                    text(place)
+                        .font(p.k.ty.small)
+                        .color(p.c.text_muted)
                         .truncate(),
                 ),
         )
+        .child(icon(&rune_kit::glyphs::CHEVRON_UP, 12.0).color(p.c.text_faint));
+
+    let mut menu = rune_kit::Menu::new("source-menu")
+        .trigger(trigger)
+        .placement(rune_kit::Placement::TopStart)
+        .min_width(240.0)
+        .group_label("Controllers");
+    for (i, name) in crate::profile::usable(&app.settings)
+        .into_keys()
+        .enumerate()
+    {
+        let current = app.backend == Backend::Controller && app.target.name == name;
+        let mut item = rune_kit::MenuItem::new(name.clone()).checked(current);
+        if i < 9 {
+            item = item.shortcut(format!("\u{2318}\u{2325}{}", i + 1));
+        }
+        menu = menu.item(item.on_select(move |app: &mut App| {
+            app.source_menu = false;
+            app.switch(Backend::Controller);
+            app.use_profile(&name);
+        }));
+    }
+    let menu = menu
+        .separator()
+        .item(
+            rune_kit::MenuItem::new("Local packs")
+                .checked(app.backend == Backend::Local)
+                .on_select(|app: &mut App| {
+                    app.source_menu = false;
+                    app.switch(Backend::Local);
+                }),
+        )
+        .separator()
+        .item(
+            rune_kit::MenuItem::new("Edit profiles\u{2026}").on_select(|app: &mut App| {
+                app.source_menu = false;
+                app.page = crate::Page::Settings;
+            }),
+        )
+        .open(app.source_menu)
+        .on_close(|app: &mut App| app.source_menu = false)
+        .build(p.k, layer);
+
+    row()
+        .key("account")
+        .w_full()
+        .h(52.0)
+        .px(6.0)
+        .gap(4.0)
+        .center_y()
+        .child(menu)
+        .child(el().grow(1.0))
         .child(
             IconButton::new(&oc::SETTINGS_GEAR)
                 .variant(if app.page == crate::Page::Settings {
@@ -761,19 +825,6 @@ fn filter_row(
 
 fn slug(label: &str) -> String {
     label.to_ascii_lowercase().replace(' ', "-")
-}
-
-fn backend_switch(app: &App, p: &Paint) -> El {
-    const BACKENDS: [Backend; 2] = [Backend::Controller, Backend::Local];
-    SegmentedControl::new(
-        &BACKENDS.map(|backend| backend.label()),
-        BACKENDS.iter().position(|backend| *backend == app.backend),
-    )
-    .label("Source")
-    .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD))
-    .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.switch(BACKENDS[i]))
-    .build(p.k)
-    .key("backend")
 }
 
 fn pack_list(app: &App, p: &Paint) -> El {
