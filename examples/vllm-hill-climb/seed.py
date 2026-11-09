@@ -15,6 +15,9 @@ REMOTE_HITS = {"remote_storage_hit", "remote_storage_read_hit", "secondary_stora
 LOCAL_HITS = {"direct_cache_hit", "preprocessed_cache_hit"}
 
 
+POLL_SECONDS = 20
+
+
 def buildit(*args: str) -> dict[str, object]:
     done = subprocess.run(["buildit", *args], stdout=subprocess.PIPE, text=True)
     lines = done.stdout.strip().splitlines()
@@ -22,6 +25,28 @@ def buildit(*args: str) -> dict[str, object]:
     if done.returncode != 0:
         sys.exit(f"buildit {args[0]} failed: {json.dumps(reply)}")
     return reply
+
+
+def build(*args: str) -> str:
+    """Start a build and print its status and newest log line until it ends, so the task shows
+    progress while it compiles. Returns the build id of a build that succeeded."""
+    build_id = str(buildit("build", *args, "--no-wait")["build_id"])
+    started = time.monotonic()
+    last = ""
+    while True:
+        reply = buildit("status", build_id)
+        tail = [line for line in str(reply.get("log_tail", "")).splitlines() if line.strip()]
+        newest = tail[-1].strip() if tail else ""
+        if newest and newest != last:
+            print(f"[{round(time.monotonic() - started):>5}s] {newest[:200]}", flush=True)
+            last = newest
+        if reply.get("status") != "running":
+            break
+        time.sleep(POLL_SECONDS)
+    if reply.get("status") != "succeeded":
+        print("\n".join(tail[-40:]), flush=True)
+        sys.exit(f"build {build_id} ended {reply.get('status')}: exit {reply.get('exit')}")
+    return build_id
 
 
 def ccache_counts(log: Path) -> dict[str, int]:
@@ -60,8 +85,7 @@ def main() -> None:
     subprocess.run([*git, "checkout", "-q", "--detach", "FETCH_HEAD"], check=True)
 
     started = time.monotonic()
-    built = buildit(
-        "build",
+    build_id = build(
         "-c", "build",
         "-f", "Dockerfile",
         "--ccache",
@@ -76,7 +100,6 @@ def main() -> None:
         "--timeout", "3600",
     )
     build_seconds = round(time.monotonic() - started)
-    build_id = str(built["build_id"])
     pushed = buildit("push", build_id)
     push_seconds = round(time.monotonic() - started) - build_seconds
     buildit(
