@@ -431,6 +431,15 @@ pub struct KeptPr {
     pub pr_url: String,
 }
 
+/// `POST /api/playbook-runs/{key}/cancel`: the launch, who asked, and the reason it is parked under.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct CancelAck {
+    pub key: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+    pub reason: String,
+}
+
 /// A pack import waiting for an operator to register or discard it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PendingImport {

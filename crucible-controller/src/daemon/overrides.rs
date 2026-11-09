@@ -87,20 +87,32 @@ impl QueueOverrideSink {
 /// Drain and apply any pending override for `key` before reconcile runs (called by the daemon's
 /// reconcile step). A no-op when nothing is pending, so it's cheap on every dequeue. With
 /// `records_dispatchers`, an override that dispatches records its actor as who the dispatch acts
-/// for.
+/// for. Returns the override it applied.
 pub async fn apply_pending(
     db: &Db,
     store: &OverrideStore,
     key: &str,
     records_dispatchers: bool,
-) -> Result<()> {
+) -> Result<Option<Override>> {
     let Some(ov) = store.take(key) else {
-        return Ok(());
+        return Ok(None);
     };
+    apply(db, key, &ov, records_dispatchers).await?;
+    Ok(Some(ov))
+}
+
+async fn apply(db: &Db, key: &str, ov: &Override, records_dispatchers: bool) -> Result<()> {
     let actor = ov.actor.as_deref();
     let requester = actor.filter(|_| records_dispatchers);
     match ov.kind {
         OverrideKind::Park => apply_park(db, key, ov.reason.as_deref(), actor).await,
+        OverrideKind::Cancel => {
+            let reason = ov
+                .reason
+                .clone()
+                .unwrap_or_else(|| format!("cancelled by {}", actor.unwrap_or("an operator")));
+            apply_park(db, key, Some(&reason), actor).await
+        }
         OverrideKind::Unpark => {
             let unparked = crate::issues::transitions::unpark(
                 db.pool(),

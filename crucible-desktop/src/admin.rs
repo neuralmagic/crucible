@@ -84,6 +84,10 @@ pub enum Action {
     DiscardImport {
         import: String,
     },
+    /// Stop playbook launch `key`: park it and delete its running pods.
+    CancelLaunch {
+        key: String,
+    },
 }
 
 /// Which kind of action an outcome answers.
@@ -100,6 +104,7 @@ pub enum Did {
     SaveSchedule,
     RegisterImport,
     DiscardImport,
+    CancelLaunch,
 }
 
 impl Action {
@@ -116,6 +121,7 @@ impl Action {
             Action::SaveSchedule { .. } => Did::SaveSchedule,
             Action::RegisterImport { .. } => Did::RegisterImport,
             Action::DiscardImport { .. } => Did::DiscardImport,
+            Action::CancelLaunch { .. } => Did::CancelLaunch,
         }
     }
 
@@ -139,6 +145,7 @@ impl Action {
             Action::SaveSchedule { id: Some(_), .. } => "Saved the schedule".to_string(),
             Action::RegisterImport { id, .. } => format!("Registered {id}"),
             Action::DiscardImport { .. } => "Discarded the import".to_string(),
+            Action::CancelLaunch { .. } => "Cancelling the launch".to_string(),
         }
     }
 }
@@ -424,6 +431,7 @@ fn act(c: &Connection, action: &Action) -> Result<(), String> {
         Action::DiscardImport { import } => c
             .call("the discard", client.discard_import(import))
             .map(drop),
+        Action::CancelLaunch { key } => c.call("the cancel", client.cancel_launch(key)).map(drop),
     }
 }
 
@@ -901,7 +909,8 @@ impl crate::App {
                     | Did::Revoke
                     | Did::Unbind
                     | Did::RegisterImport
-                    | Did::DiscardImport => {}
+                    | Did::DiscardImport
+                    | Did::CancelLaunch => {}
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =

@@ -124,6 +124,8 @@ enum Command {
     /// Adopt a scenario: a controller issue with no upstream.
     Adopt(AdoptArgs),
 
+    /// Cancel a playbook launch: park it and delete its running pods.
+    Cancel(ops::playbooks::Cancel),
     /// Park an issue: stop working it, and record why.
     Park(ops::issues::Park),
 
@@ -454,6 +456,7 @@ pub async fn run() -> Result<()> {
         Command::Issues(op) => op.run(&c).await?,
         Command::Issue(op) => op.run(&c).await?,
         Command::Adopt(args) => args.into_op()?.run(&c).await?,
+        Command::Cancel(op) => op.run(&c).await?,
         Command::Park(op) => op.run(&c).await?,
         Command::Unpark(op) => op.run(&c).await?,
         Command::Bump(op) => op.run(&c).await?,

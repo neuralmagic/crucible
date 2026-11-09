@@ -112,6 +112,7 @@ pub(crate) mod tests;
         crate::playbooks::api::registry::launch_playbook,
         crate::launches::api::playbook_runs::list_playbook_runs,
         crate::launches::api::playbook_runs::get_playbook_run,
+        crate::launches::api::playbook_runs::cancel_playbook_run,
         crate::launches::api::playbook_runs::create_one_shot,
         crate::launches::api::playbook_runs::list_one_shots,
         crate::launches::api::playbook_runs::cancel_one_shot,
@@ -559,6 +560,9 @@ pub fn router(state: ApiState) -> Router {
         ))
         .routes(routes!(
             crate::launches::api::playbook_runs::get_playbook_run
+        ))
+        .routes(routes!(
+            crate::launches::api::playbook_runs::cancel_playbook_run
         ))
         .routes(routes!(
             crate::launches::api::playbook_runs::create_one_shot

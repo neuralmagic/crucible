@@ -1225,6 +1225,9 @@ fn detail(app: &App, p: &Paint) -> El {
     if let (Backend::Local, Some(error)) = (app.backend, &app.local_error) {
         body = body.child(banner(error, p));
     }
+    if let Some(note) = cancel_note(app, p) {
+        body = body.child(note);
+    }
     if let Some(note) = &app.handoff_note {
         let (line, color) = match note {
             Ok(path) => (
@@ -1256,6 +1259,57 @@ fn detail(app: &App, p: &Paint) -> El {
         None => stats(&pane, p),
     };
     body.child(stats).child(dock::workspace(&pane, app, p))
+}
+
+/// Stops the launch on screen while it runs, after a confirming second press.
+fn cancel_button(app: &App, p: &Paint) -> Option<El> {
+    let launch = app
+        .selected_live()
+        .filter(|l| l.verdict() == crate::model::Verdict::Running)?;
+    let key = launch.key.clone();
+    let armed_key = format!("cancel:{key}");
+    let armed = app.desk.armed.as_deref() == Some(armed_key.as_str());
+    Some(
+        Button::new(if armed { "Confirm cancel" } else { "Cancel" })
+            .variant(if armed {
+                ButtonVariant::Danger
+            } else {
+                ButtonVariant::Ghost
+            })
+            .disabled(app.desk.busy())
+            .on_press(move |app: &mut App| {
+                if app.desk.armed.as_deref() == Some(armed_key.as_str()) {
+                    app.act(crate::admin::Action::CancelLaunch { key: key.clone() });
+                } else {
+                    app.desk.armed = Some(armed_key.clone());
+                }
+            })
+            .build(p.k)
+            .key("cancel-launch"),
+    )
+}
+
+/// What the last cancel came to, under the run header.
+fn cancel_note(app: &App, p: &Paint) -> Option<El> {
+    let acted = app.admin.acted.as_ref()?;
+    if acted.did != crate::admin::Did::CancelLaunch {
+        return None;
+    }
+    let (line, color) = match (&acted.result, app.desk.busy()) {
+        (_, true) => ("Cancelling\u{2026}".to_string(), p.c.text_muted),
+        (Ok(_), false) => (
+            "Cancel queued: the launch is parked and its pods are being deleted".to_string(),
+            p.c.text_muted,
+        ),
+        (Err(why), false) => (why.clone(), p.fail),
+    };
+    Some(
+        text(line)
+            .font(p.k.ty.small)
+            .color(color)
+            .truncate()
+            .key("cancel-note"),
+    )
 }
 
 /// Copies the `crucible-playbooks://` link to the run on screen.
@@ -1309,6 +1363,7 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                 .child(el().grow(1.0))
                 .children(dock::tools(app, p))
                 .children(link_button(app, p))
+                .children(cancel_button(app, p))
                 .children(
                     (!pane.launchable)
                         .then(|| launcher::fix_button(app, p))
