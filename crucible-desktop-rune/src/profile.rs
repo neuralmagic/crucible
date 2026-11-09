@@ -675,6 +675,7 @@ impl crate::App {
         self.registered.clear();
         self.launcher = None;
         self.notified = 0;
+        self.pinned = None;
         self.working = None;
         self.working_pack = None;
         self.working_preview = None;

@@ -34,6 +34,7 @@ mod studio;
 mod syntax;
 mod timeline;
 mod transcript;
+mod tray;
 mod tune;
 mod ui;
 mod unfurl;
@@ -306,6 +307,12 @@ pub struct App {
     pub profile_form: Option<profile::Form>,
     /// The account row's menu of profiles and local packs, while open.
     pub source_menu: bool,
+    /// The launch whose budget the Dock icon shows.
+    pub pinned: Option<String>,
+    /// What the Dock and the menu bar were last told to show.
+    tray: Option<tray::Shown>,
+    /// Ids of the menu bar lines picked, to act on.
+    picks: Option<std::sync::mpsc::Receiver<String>>,
     /// A key pasted for the profile in use, for one the browser cannot reach.
     pub key_paste: TextEdit,
     /// How the last browser sign-in went.
@@ -616,9 +623,9 @@ impl App {
                 && self
                     .selected_live()
                     .is_some_and(|live| live.key == done.key);
+            let pinned = self.pinned.as_deref() == Some(done.key.as_str());
             if self.settings.notify
-                && !me.is_empty()
-                && done.by == me
+                && ((!me.is_empty() && done.by == me) || pinned)
                 && !looking
                 && let Some(notifier) = &self.notifier
             {
@@ -1249,6 +1256,9 @@ fn init() -> App {
         target,
         profile_form: None,
         source_menu: false,
+        pinned: None,
+        tray: None,
+        picks: None,
         key_paste: TextEdit::new(""),
         signing_in: false,
         sign_in_error: None,
@@ -1285,6 +1295,13 @@ fn setup(app: &mut App, waker: Waker) {
     let (clicked, clicks) = std::sync::mpsc::channel();
     app.notifier = Some(notify::Notifier::start(clicked, waker.clone()));
     app.clicks = Some(clicks);
+    let (picked, picks) = std::sync::mpsc::channel();
+    let pick_waker = waker.clone();
+    rune_mac::status::on_pick(move |id| {
+        let _ = picked.send(id);
+        pick_waker();
+    });
+    app.picks = Some(picks);
     app.local.set_waker(waker.clone());
     app.live_client.set_waker(waker.clone());
     app.admin_client.set_waker(waker.clone());
@@ -1326,8 +1343,13 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         notify::bring_to_front();
         changed = true;
     }
+    while let Some(id) = app.picks.as_ref().and_then(|picks| picks.try_recv().ok()) {
+        app.picked(&id);
+        changed = true;
+    }
     app.sync_live();
     app.sync_admin();
+    app.sync_tray();
     changed |= app.refresh_working();
     changed |= app.finish_sign_in();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
