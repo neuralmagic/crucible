@@ -13,6 +13,7 @@ mod fleet;
 mod form;
 mod gfx;
 mod handoff;
+mod history;
 mod httpcache;
 mod inspect;
 mod keymap;
@@ -71,7 +72,7 @@ pub enum GraphSource {
     Preview,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Backend {
     Controller,
     Local,
@@ -93,7 +94,7 @@ pub enum LogSource {
     Console,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selection {
     /// A live playbook. With no `launch` it follows the newest launch the filters keep.
     Live {
@@ -330,6 +331,8 @@ pub struct App {
     open_wake: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
     /// The newest drop reply taken.
     dropped_seen: u64,
+    /// The places the window showed, to go back and forward through.
+    history: history::History,
     /// A key pasted for the profile in use, for one the browser cannot reach.
     pub key_paste: TextEdit,
     /// How the last browser sign-in went.
@@ -1303,6 +1306,7 @@ fn init() -> App {
         opened: Some(opened),
         open_wake,
         dropped_seen: 0,
+        history: history::History::default(),
         key_paste: TextEdit::new(""),
         signing_in: false,
         sign_in_error: None,
@@ -1416,6 +1420,8 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
     app.sync_admin();
     app.sync_fleet();
     app.sync_tray();
+    let place = app.place();
+    app.history.saw(place);
     changed |= app.refresh_working();
     changed |= app.finish_sign_in();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {

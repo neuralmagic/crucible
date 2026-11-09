@@ -59,6 +59,12 @@ impl App {
                 self.set_zoom(crate::settings::zoom_step(self.settings.zoom, -1));
             }
             Command::ZoomReset => self.set_zoom(1.0),
+            Command::Back => self.go(-1),
+            Command::Forward => self.go(1),
+            Command::Reload => {
+                self.live_client.reconnect();
+                self.admin_client.reconnect();
+            }
             Command::Profile(n) => {
                 self.switch(Backend::Controller);
                 self.use_profile_at(n as usize);

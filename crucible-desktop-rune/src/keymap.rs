@@ -38,10 +38,14 @@ pub enum Command {
     ZoomReset,
     /// Use the profile at this place in the list, from 0.
     Profile(u8),
+    Back,
+    Forward,
+    /// Read everything from the controller again.
+    Reload,
 }
 
 impl Command {
-    pub const ALL: [Command; 43] = [
+    pub const ALL: [Command; 46] = [
         Command::Palette,
         Command::Search,
         Command::Focus(Edge::Left),
@@ -76,6 +80,9 @@ impl Command {
         Command::ZoomIn,
         Command::ZoomOut,
         Command::ZoomReset,
+        Command::Back,
+        Command::Forward,
+        Command::Reload,
         Command::Profile(0),
         Command::Profile(1),
         Command::Profile(2),
@@ -110,6 +117,9 @@ impl Command {
             Command::ZoomOut => "zoom-out".into(),
             Command::ZoomReset => "zoom-reset".into(),
             Command::Profile(n) => format!("profile-{}", n + 1),
+            Command::Back => "back".into(),
+            Command::Forward => "forward".into(),
+            Command::Reload => "reload".into(),
         }
     }
 
@@ -135,6 +145,9 @@ impl Command {
             Command::ZoomOut => "Zoom out".into(),
             Command::ZoomReset => "Actual size".into(),
             Command::Profile(n) => format!("Use profile {}", n + 1),
+            Command::Back => "Back".into(),
+            Command::Forward => "Forward".into(),
+            Command::Reload => "Reload from the controller".into(),
         }
     }
 
@@ -172,6 +185,9 @@ impl Command {
             Command::ZoomIn => vec![primary("cmd+=", "ctrl+=")],
             Command::ZoomOut => vec![primary("cmd+-", "ctrl+-")],
             Command::ZoomReset => vec![primary("cmd+0", "ctrl+0")],
+            Command::Back => vec![primary("cmd+[", "alt+left")],
+            Command::Forward => vec![primary("cmd+]", "alt+right")],
+            Command::Reload => vec![primary("cmd+r", "ctrl+r")],
             Command::Profile(n) => {
                 let (mac, other) = PROFILE_KEYS[n as usize % PROFILE_KEYS.len()];
                 vec![primary(mac, other)]
