@@ -29,6 +29,7 @@ mod palette;
 mod preview;
 mod profile;
 mod runs;
+mod runs_on;
 mod search;
 mod session;
 mod settings;
@@ -141,17 +142,8 @@ pub struct Launcher {
     pub answers: Vec<TextEdit>,
     pub cost: TextEdit,
     pub time: TextEdit,
-    /// The dispatch target picked, by name; `None` until the targets are read.
-    pub dispatch: Option<String>,
-    /// The provider picked, by id; `None` leaves the controller's default.
-    pub provider: Option<String>,
-    /// The model asked of that provider; empty takes its default.
-    pub model: TextEdit,
-    /// What the target and provider pickers offer, as (value, label).
-    pub targets: Vec<(String, String)>,
-    pub providers: Vec<(String, String)>,
-    /// Each offered provider's default model, shown while `model` is empty.
-    pub default_models: Vec<(String, String)>,
+    /// Where it runs: the dispatch target, and the agent's provider and model.
+    pub runs_on: runs_on::RunsOnForm,
     /// The admin caps: dollars and a duration.
     pub caps: (f64, String),
     pub problems: form::Problems,
@@ -283,6 +275,8 @@ pub struct App {
     clicks: Option<std::sync::mpsc::Receiver<String>>,
     /// Each command's key recorder in Settings, once touched.
     pub recorders: HashMap<keymap::Command, rune_kit::ShortcutRecorderState>,
+    /// Where the provider picker's state goes once the launch sheet has closed.
+    pub provider_scratch: rune_kit::ComboboxState,
     /// The pack file the Pack tab shows; the manifest when none is picked.
     pub pack_file: Option<String>,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
@@ -680,12 +674,7 @@ impl App {
             answers: Vec::new(),
             cost: TextEdit::new(""),
             time: TextEdit::new(""),
-            dispatch: None,
-            provider: None,
-            model: TextEdit::new(""),
-            targets: Vec::new(),
-            providers: Vec::new(),
-            default_models: Vec::new(),
+            runs_on: runs_on::RunsOnForm::default(),
             caps: (0.0, String::new()),
             problems: Vec::new(),
             refusal: None,
@@ -736,11 +725,7 @@ impl App {
             launcher.refusal = Some(why);
             return;
         }
-        let runs_on = form::RunsOn {
-            target: launcher.dispatch.clone(),
-            provider: launcher.provider.clone(),
-            model: launcher.model.text.clone(),
-        };
+        let runs_on = launcher.runs_on.runs_on();
         if let Some(schedule) = &launcher.schedule {
             match schedule.body(
                 &launcher.target,
@@ -750,7 +735,7 @@ impl App {
                 launcher.digest.as_deref(),
             ) {
                 Ok(mut body) => {
-                    runs_on.apply(&mut body);
+                    runs_on.pin(&mut body);
                     let id = schedule.stored.as_ref().map(|s| s.id.clone());
                     launcher.stage = Stage::Sending;
                     self.act(admin::Action::SaveSchedule { id, body });
@@ -767,7 +752,7 @@ impl App {
             launcher.digest.as_deref(),
             launcher.rerun.as_ref(),
         );
-        runs_on.apply(&mut body);
+        runs_on.pin(&mut body);
         launcher.stage = Stage::Sending;
         launcher.after = self.replies;
         self.live_client.launch(launcher.target.clone(), body);
@@ -803,7 +788,7 @@ impl App {
                 Err(error) => {
                     if let Some(launcher) = &mut self.launcher {
                         launcher.stage = Stage::Ready;
-                        launcher.refusal = Some(form::refusal(&error));
+                        launcher.refusal = Some(form::Refusal::from(error.as_str()).0);
                     }
                 }
             }
@@ -831,12 +816,10 @@ impl App {
             None => shown.map(|record| record.launch.params.clone()),
         };
         let before = match &stored {
-            Some(stored) => form::RunsOn {
-                target: stored.dispatch_target.clone(),
-                provider: stored.agent_provider.clone(),
-                model: stored.agent_model.clone().unwrap_or_default(),
-            },
-            None => shown.and_then(form::RunsOn::of).unwrap_or_default(),
+            Some(stored) => runs_on::RunsOn::from(stored),
+            None => shown
+                .and_then(|record| runs_on::RunsOn::try_from(record).ok())
+                .unwrap_or_default(),
         };
         let Some(launcher) = &mut self.launcher else {
             return;
@@ -852,17 +835,7 @@ impl App {
                 targets,
                 providers,
             }) => {
-                launcher.dispatch = form::starting_target(before.target.as_deref(), &targets);
-                launcher.targets = form::targets(&targets);
-                launcher.providers = form::providers(&providers);
-                launcher.provider = before
-                    .provider
-                    .filter(|id| launcher.providers.iter().any(|(value, _)| value == id));
-                launcher.model = TextEdit::new(&before.model);
-                launcher.default_models = providers
-                    .iter()
-                    .map(|p| (p.id.clone(), p.default_model.clone()))
-                    .collect();
+                launcher.runs_on = runs_on::RunsOnForm::new(&targets, &providers, before);
                 launcher.digest = digest;
                 launcher.fields = form::fields(&schema);
                 launcher.answers = launcher
@@ -1326,6 +1299,7 @@ fn init() -> App {
         notifier: None,
         clicks: None,
         recorders: HashMap::new(),
+        provider_scratch: rune_kit::ComboboxState::default(),
         pack_file: None,
         layout: settings.layout.clone(),
         shown: Vec::new(),

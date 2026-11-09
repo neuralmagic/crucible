@@ -817,14 +817,14 @@ impl Fetcher {
                 "the draft's launches",
                 connection.client.playbook_runs(None, Some(&draft)),
             )?;
-            let Some(newest) = crate::form::newest_dispatched(&launches) else {
+            let Some(newest) = crate::runs_on::newest_dispatched(&launches) else {
                 return Ok(DropOutcome::Saved);
             };
             let newest: crux::dto::PlaybookLaunch = connection.call(
                 "the draft's newest launch",
-                connection.client.playbook_run(&newest),
+                connection.client.playbook_run(newest),
             )?;
-            let Some(runs_on) = crate::form::RunsOn::of(&newest) else {
+            let Ok(runs_on) = crate::runs_on::RunsOn::try_from(&newest) else {
                 return Ok(DropOutcome::Saved);
             };
             let mut body = serde_json::json!({
@@ -832,7 +832,7 @@ impl Fetcher {
                 "max_cost": max_cost,
                 "max_time": max_time,
             });
-            runs_on.apply(&mut body);
+            runs_on.pin(&mut body);
             let ack: crux::dto::LaunchAck =
                 connection.call("the launch", connection.client.launch_draft(&draft, &body))?;
             Ok(DropOutcome::Launched(ack.key))
@@ -2194,7 +2194,10 @@ mod tests {
             form.targets
         );
         assert!(
-            crate::form::providers(&form.providers).len() > 1,
+            crate::runs_on::RunsOnForm::new(&form.targets, &form.providers, Default::default())
+                .providers
+                .len()
+                > 1,
             "an enabled agent provider is offered besides the default"
         );
 

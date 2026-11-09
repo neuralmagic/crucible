@@ -37,7 +37,7 @@ fn edit(app: &mut App, slot: Slot) -> &mut TextEdit {
             Slot::Answer(i) => launcher.answers.get_mut(i),
             Slot::Cost => Some(&mut launcher.cost),
             Slot::Time => Some(&mut launcher.time),
-            Slot::Model => Some(&mut launcher.model),
+            Slot::Model => Some(&mut launcher.runs_on.model),
         };
         if let Some(edit) = found {
             return edit;
@@ -113,7 +113,7 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
                     .color(p.c.text_muted),
             ),
         Stage::Failed(error) => problem(error, p),
-        Stage::Ready | Stage::Sending => form(app, p),
+        Stage::Ready | Stage::Sending => form(app, p, layer),
     };
     let blocked = launcher.rerun.as_ref().and_then(|r| r.blocked()).is_some();
     let (verb, going) = if launcher.rerun.is_some() {
@@ -325,7 +325,7 @@ fn fact(name: &str, value: String, p: &Paint) -> El {
         )
 }
 
-fn form(app: &App, p: &Paint) -> El {
+fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let Some(launcher) = &app.launcher else {
         return el();
     };
@@ -336,7 +336,7 @@ fn form(app: &App, p: &Paint) -> El {
             .pt(4.0)
             .child(rerun_summary(rerun, p))
             .child(el().h(p.hair).w_full().fill(p.c.border_muted))
-            .child(runs_on(app, p))
+            .child(runs_on(app, p, layer))
             .child(ceilings(app, p));
     }
     let mut fields = col().w_full().gap(14.0);
@@ -407,7 +407,7 @@ fn form(app: &App, p: &Paint) -> El {
         .children((!editing).then(|| when(app, p)))
         .child(fields)
         .child(el().h(p.hair).w_full().fill(p.c.border_muted))
-        .child(runs_on(app, p))
+        .child(runs_on(app, p, layer))
         .child(ceilings(app, p))
         .children(
             launcher
@@ -497,64 +497,110 @@ fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> E
         ))
 }
 
-/// The cluster the launch dispatches onto, and the provider and model its agent runs against.
-fn runs_on(app: &App, p: &Paint) -> El {
+/// Where the launch runs: one line naming the target, provider and model, or, opened, the
+/// pickers for each.
+fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let Some(launcher) = &app.launcher else {
         return el();
     };
-    let provider = launcher.provider.clone().unwrap_or_default();
-    let placeholder = launcher
-        .default_models
-        .iter()
-        .find(|(id, _)| *id == provider)
-        .map(|(_, model)| model.clone())
-        .unwrap_or_else(|| "the provider's default".to_string());
-    col()
-        .key("runs-on")
+    let form = &launcher.runs_on;
+    let header = row()
         .w_full()
-        .gap(12.0)
-        .children((!launcher.targets.is_empty()).then(|| {
-            field(
-                "Target",
-                pills(
-                    "launch-target",
-                    &launcher.targets,
-                    launcher.dispatch.as_deref(),
-                    |app: &mut App, name: &str| {
-                        if let Some(launcher) = app.launcher.as_mut() {
-                            launcher.dispatch = Some(name.to_string());
-                        }
-                    },
-                    p,
-                ),
-                p,
-            )
-        }))
-        .child(field(
-            "Agent",
-            pills(
-                "launch-provider",
-                &launcher.providers,
-                Some(provider.as_str()),
-                |app: &mut App, id: &str| {
+        .gap(8.0)
+        .center_y()
+        .child(label("Runs on", "", false, p))
+        .child(
+            text(form.summary())
+                .font(p.k.ty.ui)
+                .color(p.c.text_muted)
+                .grow(1.0)
+                .min_w(0.0),
+        )
+        .child(
+            Button::new(if form.open { "Done" } else { "Change" })
+                .variant(ButtonVariant::Neutral)
+                .on_press(|app: &mut App| {
                     if let Some(launcher) = app.launcher.as_mut() {
-                        launcher.provider = (!id.is_empty()).then(|| id.to_string());
+                        launcher.runs_on.open = !launcher.runs_on.open;
                     }
-                },
-                p,
-            ),
-            p,
-        ))
-        .child(field(
-            "Model",
-            TextInput::new(&launcher.model)
-                .placeholder(placeholder)
-                .width(Some(INNER))
-                .on_edit(|app: &mut App| edit(app, Slot::Model))
+                })
                 .build(p.k)
-                .key("launch-model"),
-            p,
-        ))
+                .key("runs-on-toggle"),
+        );
+    let mut out = col().key("runs-on").w_full().gap(12.0).child(header);
+    if !form.open {
+        return out;
+    }
+    if !form.targets.is_empty() {
+        let mut pills = row().key("launch-target").gap(6.0).flex_wrap();
+        for choice in &form.targets {
+            let on = form.target.as_deref() == Some(choice.value.as_str());
+            let value = choice.value.clone();
+            pills = pills.child(
+                Button::new(choice.label.clone())
+                    .variant(if on {
+                        ButtonVariant::Submit
+                    } else {
+                        ButtonVariant::Outline
+                    })
+                    .on_press(move |app: &mut App| {
+                        if let Some(launcher) = app.launcher.as_mut() {
+                            launcher.runs_on.target = Some(value.clone());
+                        }
+                    })
+                    .build(p.k)
+                    .help(choice.detail.clone())
+                    .key(format!("launch-target-{}", choice.value)),
+            );
+        }
+        out = out.child(field("Target", pills, p));
+    }
+    let options: Vec<rune_kit::ComboboxOption> = form
+        .providers
+        .iter()
+        .map(|c| rune_kit::ComboboxOption {
+            id: c.value.clone(),
+            label: c.label.clone(),
+            detail: c.detail.clone(),
+            disabled: false,
+        })
+        .collect();
+    let picker = rune_kit::Combobox::new(
+        "launch-provider",
+        &form.search,
+        &options,
+        |app: &mut App| match app.launcher.as_mut() {
+            Some(launcher) => &mut launcher.runs_on.search,
+            None => &mut app.provider_scratch,
+        },
+    )
+    .label("Agent")
+    .current(Some(form.provider.as_str()))
+    .search_placeholder("Filter providers")
+    .width(INNER)
+    .max_height(240.0)
+    .on_choose(|app: &mut App, id: &str, _: &mut Tx| {
+        if let Some(launcher) = app.launcher.as_mut() {
+            launcher.runs_on.provider = id.to_string();
+            launcher.runs_on.search.close();
+        }
+    })
+    .build(p.k, layer);
+    let default_model = form.default_model();
+    out.child(field("Agent", picker, p)).child(field(
+        "Model",
+        TextInput::new(&form.model)
+            .placeholder(if default_model.is_empty() {
+                "the provider's default"
+            } else {
+                default_model
+            })
+            .width(Some(INNER))
+            .on_edit(|app: &mut App| edit(app, Slot::Model))
+            .build(p.k)
+            .key("launch-model"),
+        p,
+    ))
 }
 
 fn ceilings(app: &App, p: &Paint) -> El {
