@@ -5,8 +5,9 @@ use rune::{El, TextEdit, Tx, col, el, icon, row, text};
 use rune_kit::{Button, ButtonVariant, Dialog, SegmentedControl, Spinner, Switch, TextInput};
 use rune_theme_opencode::icons as oc;
 
-use crate::form::Kind;
+use crate::form::{Kind, Scale, duration, minutes};
 use crate::live::Target;
+use crate::ui::slider::Slider;
 use crate::ui::{Paint, Tone};
 use crate::{App, Stage};
 
@@ -387,7 +388,25 @@ fn ceilings(app: &App, p: &Paint) -> El {
                         .width(Some((INNER - 12.0) / 2.0))
                         .on_edit(|app: &mut App| edit(app, Slot::Cost))
                         .build(p.k),
-                ),
+                )
+                .children((*cap_cost > 0.0).then(|| {
+                    let scale = Scale::dollars(*cap_cost);
+                    let asked = launcher
+                        .cost
+                        .text
+                        .trim()
+                        .trim_start_matches('$')
+                        .parse()
+                        .unwrap_or(0.0);
+                    Slider {
+                        key: "launch-cost-slider".into(),
+                        label: "Max cost".into(),
+                        frac: scale.frac(asked),
+                        steps: scale.steps(),
+                        set: set_cost,
+                    }
+                    .build(p)
+                })),
         )
         .child(
             col()
@@ -400,6 +419,34 @@ fn ceilings(app: &App, p: &Paint) -> El {
                         .width(Some((INNER - 12.0) / 2.0))
                         .on_edit(|app: &mut App| edit(app, Slot::Time))
                         .build(p.k),
-                ),
+                )
+                .children(minutes(cap_time).map(|cap| {
+                    let scale = Scale::minutes(cap);
+                    let asked = minutes(&launcher.time.text).unwrap_or(0) as f64;
+                    Slider {
+                        key: "launch-time-slider".into(),
+                        label: "Max time".into(),
+                        frac: scale.frac(asked),
+                        steps: scale.steps(),
+                        set: set_time,
+                    }
+                    .build(p)
+                })),
         )
+}
+
+fn set_cost(app: &mut App, frac: f32) {
+    if let Some(launcher) = app.launcher.as_mut() {
+        let cost = Scale::dollars(launcher.caps.0).at(frac);
+        launcher.cost = TextEdit::new(format!("{cost:.2}"));
+    }
+}
+
+fn set_time(app: &mut App, frac: f32) {
+    if let Some(launcher) = app.launcher.as_mut()
+        && let Some(cap) = minutes(&launcher.caps.1)
+    {
+        let time = Scale::minutes(cap).at(frac).round() as u64;
+        launcher.time = TextEdit::new(duration(time));
+    }
 }

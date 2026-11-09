@@ -349,7 +349,14 @@ fn drop_preview(at: At, group: &Group, app: &App, p: &Paint) -> Option<El> {
             .radius(p.k.radius.md)
             .fill(p.c.bg_accent.alpha(0.12))
             .border(1.5, p.c.bg_accent.alpha(0.7))
-            .child(fx(gfx::GLOW, gfx::data(p.c.bg_accent, 0.6), 16.0).radius(p.k.radius.md)),
+            .child(
+                fx(
+                    gfx::GLOW,
+                    gfx::data(p.c.bg_accent, p.tune.glow),
+                    p.tune.glow_bleed,
+                )
+                .radius(p.k.radius.md),
+            ),
     )
 }
 

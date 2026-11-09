@@ -15,6 +15,7 @@ mod runs;
 mod schedules;
 mod secrets;
 mod shares;
+mod slider;
 mod tasks;
 mod theme;
 mod timeline;
@@ -23,8 +24,8 @@ mod transcript;
 use rune::{Color, Cx, El, Icon, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::RowStatus;
 use rune_kit::{
-    Badge, Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Palette, SegmentedControl,
-    SidebarRow, Spinner, StateColors, Switch, TextInput,
+    Badge, Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Palette, RollingText,
+    SegmentedControl, SidebarRow, Spinner, StateColors, Switch, TextInput,
 };
 use rune_theme_opencode::icons as oc;
 
@@ -39,7 +40,6 @@ use crate::settings::{Appearance, LogFont, Theme};
 use crate::{App, Backend, MAX_TIME, Selection, gfx};
 use crucible_contract::session::TaskStatus;
 
-const SIDEBAR: f32 = 300.0;
 /// The band across the top that holds the window buttons and drags the window.
 const TITLE_BAND: f32 = 52.0;
 /// The close button's top-left, centring the buttons in the title band.
@@ -64,6 +64,7 @@ struct Paint {
     hair: f32,
     /// Points the window buttons take at the leading edge; 0 in full screen.
     inset: f32,
+    tune: crate::tune::Tune,
 }
 
 /// A status role with its own fill, ink and border: passing, needing attention, or failing.
@@ -98,6 +99,7 @@ fn palette(app: &App, cx: &Cx<App>) -> Paint {
         live: c.warning.fg,
         hair: 1.0 / cx.env().scale,
         inset: cx.titlebar_inset(),
+        tune: crate::tune::Tune::read(&app.knobs),
     }
 }
 
@@ -116,12 +118,19 @@ fn fx(kind: u32, data: [f32; 4], bleed: f32) -> El {
 }
 
 /// A breathing ring behind `mark`, in `color`.
-fn pulsing(mark: El, color: Color, size: f32) -> El {
+fn pulsing(p: &Paint, mark: El, color: Color, size: f32) -> El {
     row()
         .size(size, size)
         .center()
         .radius(size / 2.0)
-        .child(fx(gfx::PULSE, gfx::data(color, 0.6), 14.0).radius(size / 2.0))
+        .child(
+            fx(
+                gfx::PULSE,
+                gfx::data(color, p.tune.pulse),
+                p.tune.pulse_bleed,
+            )
+            .radius(size / 2.0),
+        )
         .child(mark)
 }
 
@@ -246,7 +255,18 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
     let window = window
         .child(detail(app, &p))
         .children(dock::ghost(app, &p))
-        .child(fx(gfx::GRAIN, gfx::data(Color::WHITE, 0.035), 0.0));
+        .child(fx(gfx::GRAIN, gfx::data(Color::WHITE, p.tune.grain), 0.0));
+    let window = rune_knobs::side(
+        window,
+        &app.knobs,
+        crate::tune::GROUPS,
+        if p.dark {
+            rune_knobs::Style::dark()
+        } else {
+            rune_knobs::Style::light()
+        },
+        |app: &mut App| &mut app.knobs,
+    );
     let mut layer = Vec::new();
     launcher::sheet(app, &p, &mut layer);
     palette::palette(app, &p, &mut layer);
@@ -509,7 +529,7 @@ fn sidebar(app: &App, p: &Paint) -> El {
 
     col()
         .key("sidebar")
-        .w(SIDEBAR)
+        .w(p.tune.sidebar)
         .h_full()
         .min_h(0.0)
         .fill(p.c.page)
@@ -628,7 +648,7 @@ fn search(app: &App, p: &Paint) -> El {
     let mut input = TextInput::new(&app.playbook_search)
         .placeholder(placeholder)
         .leading_icon(&oc::MAGNIFYING_GLASS)
-        .width(Some(SIDEBAR - 2.0 * SIDEBAR_PAD))
+        .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD))
         .on_edit(|app: &mut App| &mut app.playbook_search);
     if !app.playbook_search.text.is_empty() {
         input = input.clear_button();
@@ -685,7 +705,7 @@ fn filter_row(
         .child(
             SegmentedControl::new(choices, selected)
                 .label(label)
-                .width(Some(SIDEBAR - 2.0 * SIDEBAR_PAD))
+                .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD))
                 .on_pick(pick)
                 .build(p.k),
         )
@@ -702,7 +722,7 @@ fn backend_switch(app: &App, p: &Paint) -> El {
         BACKENDS.iter().position(|backend| *backend == app.backend),
     )
     .label("Source")
-    .width(Some(SIDEBAR - 2.0 * SIDEBAR_PAD))
+    .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD))
     .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.switch(BACKENDS[i]))
     .build(p.k)
     .key("backend")
@@ -834,7 +854,7 @@ fn unavailable(error: &str, app: &App, p: &Paint) -> El {
         .child(
             TextInput::new(&app.sign_in_url)
                 .placeholder("https://crucible.example.com")
-                .width(Some(SIDEBAR - 2.0 * SIDEBAR_PAD - 20.0))
+                .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD - 20.0))
                 .disabled(app.signing_in)
                 .on_edit(|app: &mut App| &mut app.sign_in_url)
                 .build(p.k)
@@ -893,6 +913,7 @@ fn age(landed: i64, now: i64) -> String {
 fn verdict_status(verdict: Verdict, p: &Paint) -> RowStatus {
     match verdict {
         Verdict::Running => RowStatus::Other(pulsing(
+            p,
             Spinner::new().size(12.0).color(p.live).build(p.k),
             p.live,
             12.0,
@@ -1114,8 +1135,13 @@ fn header(pane: &Pane, app: &App, p: &Paint) -> El {
                         .help(about),
                 )
                 .children(pane.streaming.then(|| {
-                    pulsing(el().size(7.0, 7.0).radius(3.5).fill(p.live), p.live, 12.0)
-                        .help("Streaming")
+                    pulsing(
+                        p,
+                        el().size(7.0, 7.0).radius(3.5).fill(p.live),
+                        p.live,
+                        12.0,
+                    )
+                    .help("Streaming")
                 }))
                 .child(el().grow(1.0))
                 .children(dock::tools(app, p))
@@ -1275,7 +1301,12 @@ fn stat(
     }
     stat_card(key, p)
         .child(stat_label(label, p))
-        .child(text(value.to_string()).font(VALUE).color(ink).truncate())
+        .child(
+            RollingText::new(format!("stat-{key}-value"), value)
+                .font(VALUE)
+                .color(ink)
+                .build(p.k),
+        )
         .child(line.child(stat_sub(sub, p)))
 }
 

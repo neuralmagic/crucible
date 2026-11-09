@@ -31,6 +31,7 @@ mod studio;
 mod syntax;
 mod timeline;
 mod transcript;
+mod tune;
 mod ui;
 mod unfurl;
 mod workspace;
@@ -304,6 +305,8 @@ pub struct App {
     /// Where a text field's edits land once its form has closed.
     pub scratch: TextEdit,
     pub settings: Settings,
+    /// Effect and layout values tuned live; their defaults unless built with `knobs`.
+    pub knobs: rune_knobs::Knobs,
     pub page: Page,
     pub error: Option<String>,
 }
@@ -1107,6 +1110,7 @@ fn init() -> App {
         replies: 0,
         scratch: TextEdit::new(""),
         settings,
+        knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
         error: None,
     }

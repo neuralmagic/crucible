@@ -193,7 +193,7 @@ fn dot(launch: &LivePlaybook, p: &Paint) -> El {
         .fill(ink)
         .border(p.hair, p.c.bg_base);
     let mark = if verdict == Verdict::Running {
-        pulsing(mark, p.live, DOT)
+        pulsing(p, mark, p.live, DOT)
     } else {
         mark
     };
@@ -401,7 +401,7 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, p: &Paint) -> El {
             .border(1.0, p.c.text_faint),
     };
     let glyph = if verdict == Verdict::Running {
-        pulsing(glyph, p.live, 14.0)
+        pulsing(p, glyph, p.live, 14.0)
     } else {
         glyph
     };

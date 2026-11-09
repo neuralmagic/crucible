@@ -16,6 +16,7 @@ rune-kit = { path = "../vendor/rune/crates/rune-kit", default-features = false, 
 rune-mermaid = { path = "../vendor/rune/crates/rune-mermaid" }
 rune-theme-opencode = { path = "../vendor/rune/themes/opencode" }
 rune-fx = { path = "../vendor/rune/crates/rune-fx" }
+rune-knobs = { path = "../vendor/rune/crates/rune-knobs" }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
 crucible-contract = { path = "../crucible-contract" }
 crux = { path = "../crux", default-features = false }
@@ -42,3 +43,5 @@ tempfile = "3"
 
 [features]
 hot = ["rune/hot"]
+# The ⌘⇧K panel that tunes effects and layout live. Off, every knob reads its default.
+knobs = ["rune-knobs/panel"]

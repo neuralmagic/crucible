@@ -1476,6 +1476,7 @@ dependencies = [
  "rune",
  "rune-fx",
  "rune-kit",
+ "rune-knobs",
  "rune-mac",
  "rune-mermaid",
  "rune-theme-opencode",
@@ -6594,6 +6595,13 @@ dependencies = [
  "rune",
  "rune-motion",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "rune-knobs"
+version = "0.0.1"
+dependencies = [
+ "rune",
 ]
 
 [[package]]

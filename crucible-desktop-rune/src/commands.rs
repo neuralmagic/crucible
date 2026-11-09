@@ -244,6 +244,10 @@ pub fn palette_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
 
 /// The window's keys: whichever command the key is bound to, unless a key is being recorded.
 pub fn on_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if rune_knobs::key(&mut app.knobs, ev) {
+        tx.motion(app.knobs.slide());
+        return true;
+    }
     if app
         .recorders
         .values()

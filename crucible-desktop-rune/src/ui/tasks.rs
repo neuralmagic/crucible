@@ -198,11 +198,9 @@ fn card(task: &TaskView, activity: &Activity, tail: &[&LogLine], shown: Shown, p
         .press(p.c.pressed)
         .focusable(true)
         .on_press(move |app: &mut App| app.toggle_task(&name))
-        .children(
-            state
-                .is_running()
-                .then(|| fx(gfx::SHIMMER, gfx::data(p.live, 0.08), 0.0).radius(p.k.radius.lg)),
-        )
+        .children(state.is_running().then(|| {
+            fx(gfx::SHIMMER, gfx::data(p.live, p.tune.shimmer), 0.0).radius(p.k.radius.lg)
+        }))
         .child(row().size(16.0, 18.0).center().child(state_mark(state, p)))
         .child(body.grow(1.0).min_w(0.0))
 }
@@ -217,6 +215,7 @@ pub(crate) fn state_mark(state: TaskState, p: &Paint) -> El {
             .radius(6.0)
             .border(1.0, p.c.text_faint),
         TaskState::Running(_) => pulsing(
+            p,
             Spinner::new().size(14.0).color(p.live).build(p.k),
             p.live,
             16.0,
@@ -258,7 +257,7 @@ fn streamed_card(name: &str, tail: &[&LogLine], p: &Paint) -> El {
         .radius(p.k.radius.lg)
         .fill(p.c.layer_01)
         .border(p.hair, p.c.border_muted)
-        .child(fx(gfx::SHIMMER, gfx::data(p.live, 0.08), 0.0).radius(p.k.radius.lg))
+        .child(fx(gfx::SHIMMER, gfx::data(p.live, p.tune.shimmer), 0.0).radius(p.k.radius.lg))
         .child(
             row()
                 .size(16.0, 18.0)

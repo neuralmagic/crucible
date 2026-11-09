@@ -9,8 +9,6 @@ use crate::timeline::{Bar, Schedule, concurrency, schedule, tick};
 use crate::ui::tasks::{duration, status_color};
 use crate::ui::{Paint, Pane, fx, mono};
 
-const LABEL: f32 = 150.0;
-const ROW: f32 = 26.0;
 const LANE: f32 = 5.0;
 const STRIP: f32 = 30.0;
 
@@ -71,18 +69,19 @@ pub(crate) fn timeline_view(pane: &Pane, p: &Paint) -> El {
             "strip",
             text("At once").font(p.k.ty.small).color(p.c.text_faint),
             strip(&steps, plan.span, peak, p),
+            p,
         ))
-        .child(lane("axis", el(), axis(plan.span, p)))
+        .child(lane("axis", el(), axis(plan.span, p), p))
         .child(p.k.scroll_bar(rows).w_full().grow(1.0).min_h(0.0))
 }
 
 /// The label column, then the track.
-fn lane(key: &str, label: El, track: El) -> El {
+fn lane(key: &str, label: El, track: El, p: &Paint) -> El {
     row()
         .key(format!("lane-{key}"))
         .w_full()
         .center_y()
-        .child(row().w(LABEL).pr(10.0).child(label))
+        .child(row().w(p.tune.timeline_label).pr(10.0).child(label))
         .child(track.grow(1.0).min_w(0.0))
 }
 
@@ -238,7 +237,7 @@ fn bar_row(i: usize, bar: &Bar, span: f64, p: &Paint) -> El {
     row()
         .key(format!("bar-{}", bar.name))
         .w_full()
-        .min_h(ROW)
+        .min_h(p.tune.timeline_row)
         .py(4.0)
         .radius(p.k.radius.sm)
         .fill(if i % 2 == 1 {
@@ -248,7 +247,7 @@ fn bar_row(i: usize, bar: &Bar, span: f64, p: &Paint) -> El {
         })
         .hover(p.c.hover)
         .center_y()
-        .child(row().w(LABEL).px(8.0).child(label))
+        .child(row().w(p.tune.timeline_label).px(8.0).child(label))
         .child(track.grow(1.0).min_w(0.0).pr(8.0))
 }
 
@@ -271,9 +270,14 @@ fn span_bar(
         bar = bar.border(1.0, p.c.text_base.alpha(0.35));
     }
     if running {
-        bar = bar
-            .clip_rounded(3.0)
-            .child(fx(gfx::SHIMMER, gfx::data(Color::WHITE, 0.35), 0.0).radius(3.0));
+        bar = bar.clip_rounded(3.0).child(
+            fx(
+                gfx::SHIMMER,
+                gfx::data(Color::WHITE, p.tune.bar_shimmer),
+                0.0,
+            )
+            .radius(3.0),
+        );
     }
     row()
         .w_full()

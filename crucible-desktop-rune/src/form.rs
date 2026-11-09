@@ -170,6 +170,67 @@ pub fn minutes(duration: &str) -> Option<u64> {
     (any && digits.is_empty() && total > 0).then_some(total)
 }
 
+/// `90` minutes as `1h30m`, `120` as `2h`, `45` as `45m`.
+pub fn duration(minutes: u64) -> String {
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m}m"),
+    }
+}
+
+/// A slider's range: whole steps of `step` up to `max`, never below one step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Scale {
+    pub step: f64,
+    pub max: f64,
+}
+
+impl Scale {
+    /// Dollars up to `cap`, in steps that keep the slider to a few hundred stops.
+    pub fn dollars(cap: f64) -> Scale {
+        let step = match cap {
+            c if c <= 10.0 => 0.25,
+            c if c <= 100.0 => 1.0,
+            _ => 5.0,
+        };
+        Scale { step, max: cap }
+    }
+
+    /// Minutes up to `cap`.
+    pub fn minutes(cap: u64) -> Scale {
+        let step = match cap {
+            0..=60 => 5,
+            61..=360 => 15,
+            _ => 30,
+        };
+        Scale {
+            step: step as f64,
+            max: cap as f64,
+        }
+    }
+
+    /// The value at `frac` of the way along, on a step.
+    pub fn at(self, frac: f32) -> f64 {
+        let raw = f64::from(frac.clamp(0.0, 1.0)) * self.max;
+        let stepped = (raw / self.step).round() * self.step;
+        stepped.clamp(self.step.min(self.max), self.max)
+    }
+
+    /// How far along `value` sits.
+    pub fn frac(self, value: f64) -> f32 {
+        if self.max <= 0.0 {
+            return 0.0;
+        }
+        (value / self.max).clamp(0.0, 1.0) as f32
+    }
+
+    /// Stops between the ends, for the arrow keys.
+    pub fn steps(self) -> u32 {
+        (self.max / self.step).round().max(1.0) as u32
+    }
+}
+
 /// The ceilings a launch asks for, checked against the admin caps.
 pub fn ceilings(
     cost: &str,
@@ -200,7 +261,7 @@ pub fn ceilings(
 mod tests {
     use serde_json::json;
 
-    use crate::form::{Kind, ceilings, fields, minutes, params};
+    use crate::form::{Kind, Scale, ceilings, duration, fields, minutes, params};
 
     fn triage() -> serde_json::Value {
         json!({
@@ -279,6 +340,44 @@ mod tests {
         for bad in ["", "30", "m", "0m", "1d", "1.5h", "h30"] {
             assert_eq!(minutes(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn durations_write_back_the_way_they_read() {
+        for m in [5, 45, 60, 90, 120, 185] {
+            assert_eq!(minutes(&duration(m)), Some(m), "{m}");
+        }
+        assert_eq!(duration(90), "1h30m");
+        assert_eq!(duration(120), "2h");
+        assert_eq!(duration(45), "45m");
+    }
+
+    #[test]
+    fn a_dollar_scale_lands_on_steps_inside_its_cap() {
+        let small = Scale::dollars(5.0);
+        assert_eq!(small.at(0.0), 0.25, "never below one step");
+        assert_eq!(small.at(0.5), 2.5);
+        assert_eq!(small.at(0.51), 2.5);
+        assert_eq!(small.at(1.0), 5.0);
+        assert_eq!(small.at(7.0), 5.0, "past the end clamps");
+        assert_eq!(small.steps(), 20);
+        let big = Scale::dollars(50.0);
+        assert_eq!(big.at(0.333), 17.0);
+        assert_eq!(big.frac(25.0), 0.5);
+        assert_eq!(big.frac(80.0), 1.0);
+        let tiny = Scale::dollars(0.1);
+        assert_eq!(tiny.at(0.0), 0.1, "a cap under one step is the only stop");
+    }
+
+    #[test]
+    fn a_minute_scale_steps_by_the_size_of_its_cap() {
+        let hours = Scale::minutes(180);
+        assert_eq!(hours.step, 15.0);
+        assert_eq!(hours.at(0.5), 90.0);
+        assert_eq!(hours.at(0.0), 15.0);
+        assert_eq!(Scale::minutes(30).at(0.5), 15.0);
+        assert_eq!(Scale::minutes(600).step, 30.0);
+        assert_eq!(Scale::dollars(0.0).frac(1.0), 0.0);
     }
 
     #[test]
