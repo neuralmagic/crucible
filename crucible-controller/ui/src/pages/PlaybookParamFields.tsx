@@ -1,6 +1,32 @@
+import { useState } from 'react';
 import { Mono } from '../ui';
 import { CheckField, FormGrid, SelectField, TextAreaField, TextField } from './formControls';
-import { isEnabled, paramBlocks, spellingOf, type ParamFieldSpec } from './playbookLaunchForm';
+import {
+  isEnabled,
+  offeredChoices,
+  paramBlocks,
+  placeholderFor,
+  snapshotAge,
+  spellingOf,
+  type ParamFieldSpec,
+} from './playbookLaunchForm';
+
+/// The select entry that switches an open choice to a typed value. Not a value any choice can
+/// take: the form never submits it.
+const OTHER = '\u0000other';
+
+/// Where a param's options came from and how old they are, for its hint.
+function sourceHint(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): string | null {
+  const from = spec.choicesFrom;
+  if (from === null) return null;
+  if (spec.choicesSnapshot === null) return `Options appear once ${from.task} has passed; refresh to compute them`;
+  const key = from.keyedBy;
+  const keyValue = key === null ? '' : (values[key] ?? '').trim();
+  if (key !== null && keyValue === '') return `Pick ${key} to see options`;
+  const age = snapshotAge(spec.choicesSnapshot.capturedAt);
+  const scope = key === null ? '' : ` for ${key} ${keyValue}`;
+  return `Options${scope} from ${from.task}${age === null ? '' : `, ${age}`}`;
+}
 
 export interface PlaybookParamFieldsProps {
   idPrefix: string;
@@ -23,6 +49,15 @@ export function PlaybookParamFields({
   onBlur,
 }: PlaybookParamFieldsProps) {
   const first = specs[0]?.name;
+  const [typing, setTyping] = useState<ReadonlySet<string>>(new Set());
+  const setTypingFor = (name: string, on: boolean) => {
+    setTyping((current) => {
+      const next = new Set(current);
+      if (on) next.add(name);
+      else next.delete(name);
+      return next;
+    });
+  };
   const input = (spec: ParamFieldSpec) => {
     const field = {
       id: `${idPrefix}-param-${spec.name}`,
@@ -40,23 +75,51 @@ export function PlaybookParamFields({
       },
       error: errors.get(spec.name) ?? null,
       hint:
-        spec.description ??
+        [spec.description, sourceHint(spec, values)].filter((part) => part !== null).join(' · ') ||
         (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined)),
     };
-    if (spec.choices !== null) {
-      const blank = spec.required && spec.defaultValue !== null ? [] : [{ value: '', label: spec.required ? 'Select…' : '—' }];
+    const offered = offeredChoices(spec, values);
+    const placeholder = placeholderFor(spec, values) ?? undefined;
+    if (offered !== null) {
+      const value = field.value;
+      const listed = offered.includes(value);
+      const other = spec.allowOther && (typing.has(spec.name) || (value !== '' && !listed));
+      const blank = spec.required && spec.defaultValue !== null && listed ? [] : [{ value: '', label: spec.required ? 'Select…' : '—' }];
+      const stale = !listed && value !== '' && !spec.allowOther ? [{ value, label: `${value} (not offered)` }] : [];
+      const options = [
+        ...blank,
+        ...offered.map((choice) => ({ value: choice, label: choice })),
+        ...stale,
+        ...(spec.allowOther ? [{ value: OTHER, label: 'Other…' }] : []),
+      ];
       return (
-        <SelectField
-          key={spec.name}
-          {...field}
-          options={[...blank, ...spec.choices.map((choice) => ({ value: choice, label: choice }))]}
-        />
+        <div key={spec.name} className="grid gap-2">
+          <SelectField
+            {...field}
+            value={other ? OTHER : value}
+            options={options}
+            onChange={(picked) => {
+              setTypingFor(spec.name, picked === OTHER);
+              onChange(spec.name, picked === OTHER ? '' : picked);
+            }}
+          />
+          {other ? (
+            <TextField
+              {...field}
+              id={`${field.id}-other`}
+              label={<Mono size="label">{spec.name} (other)</Mono>}
+              autoFocus={typing.has(spec.name)}
+              placeholder={placeholder}
+              hint={undefined}
+            />
+          ) : null}
+        </div>
       );
     }
     return spec.multiline ? (
       <TextAreaField key={spec.name} rows={8} {...field} />
     ) : (
-      <TextField key={spec.name} {...field} />
+      <TextField key={spec.name} {...field} placeholder={placeholder} />
     );
   };
   return (

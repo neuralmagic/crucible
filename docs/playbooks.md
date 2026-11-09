@@ -368,9 +368,13 @@ show a value greyed out in its empty input, the one the pack would choose itself
 
 The field is an object from each release to one string. It is only shown, never submitted.
 
+The launch form offers the list as a select and says how old it is. With `allow_other`, the
+select ends in "Other…", which opens a text input.
+
 The task and everything it depends on must not depend on parameters, so they can run alone.
 The compiler checks this and names the task that does. Launch with `choices.refresh=true` and
-nothing else to run just those tasks and refresh the list:
+nothing else to run just those tasks and refresh the list. The launch form's "Refresh options"
+button does this; from the command line:
 
 ```sh
 crucible plan run --manifest crucible.toml --param choices.refresh=true --max-cost 1 --max-time 10m

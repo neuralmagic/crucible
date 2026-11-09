@@ -37,6 +37,8 @@ import {
   mapServerRejection,
   parseParamsSchema,
   previewMatches,
+  refreshBody,
+  refreshable,
   runSnapshot,
   scheduleBody,
   validateCronExpr,
@@ -287,6 +289,26 @@ export function PlaybookLaunchPage() {
     }
   };
 
+  /// Launch only the tasks the form's options come from, with no params, so the next visit offers
+  /// fresh lists. The ceilings in the form bound it like any launch.
+  const handleRefresh = async () => {
+    setSubmitError(null);
+    const time = validateMaxTime(maxTime, timeCap);
+    if (time !== null) {
+      setCeilingErrors(new Map([['max_time', time]]));
+      return;
+    }
+    try {
+      const ack = await launch.mutateAsync({
+        params: { path: { id } },
+        body: refreshBody({ maxCost, maxTime, schemaDigest: pack?.schema_digest ?? '', dispatchTarget }),
+      });
+      void navigate(`/issues/${encodeURIComponent(ack.key)}`);
+    } catch (err: unknown) {
+      applyRejection(err);
+    }
+  };
+
   const handleSchedule = async () => {
     setSubmitError(null);
     setScheduled(null);
@@ -351,9 +373,20 @@ export function PlaybookLaunchPage() {
           title="Parameters"
           actions={
             pack === undefined ? undefined : (
-              <Mono size="data" tone="ink-3">
-                {pack.schema_digest}
-              </Mono>
+              <span className="flex items-center gap-3">
+                {refreshable(specs) ? (
+                  <Button
+                    className="border border-rule-hard uppercase"
+                    onClick={() => void handleRefresh()}
+                    disabled={launch.isPending}
+                  >
+                    Refresh options
+                  </Button>
+                ) : null}
+                <Mono size="data" tone="ink-3">
+                  {pack.schema_digest}
+                </Mono>
+              </span>
             )
           }
         />

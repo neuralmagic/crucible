@@ -137,6 +137,63 @@ test.describe('playbook launch form', () => {
     await expect(page.getByText('Cannot dispatch')).toHaveCount(0);
   });
 
+  /// Options a task computed: a list from the latest run with its age, a keyed list that follows
+  /// another field and takes other values, a greyed-out pick, and a refresh that recomputes them.
+  test('offers task-computed options and refreshes them', async ({ page }) => {
+    await stubApi(page);
+    await page.route('**/api/playbooks/survey/schema', (route: Route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          type: 'object',
+          properties: {
+            release: {
+              type: 'string',
+              'x-choices-from': { task: 'release_options', field: 'releases' },
+              'x-choices-snapshot': { value: ['3.6.0 GA', '3.7 Fast-1'], run_id: 'r1', digest: 'd', captured_at: new Date().toISOString() },
+            },
+            component: {
+              type: 'string',
+              'x-allow-other': true,
+              'x-choices-from': { task: 'release_options', field: 'components', keyed_by: 'release' },
+              'x-choices-snapshot': { value: { '3.7 Fast-1': ['vllm', 'flashinfer'] }, run_id: 'r1', digest: 'd', captured_at: null },
+            },
+            target_branch: {
+              type: 'string',
+              default: '',
+              'x-placeholder-from': { task: 'release_options', field: 'branches', keyed_by: 'release' },
+              'x-placeholder-snapshot': { value: { '3.7 Fast-1': 'sync-v0.33.0' }, run_id: 'r1', digest: 'd', captured_at: null },
+            },
+          },
+          required: ['release'],
+        }),
+      }),
+    );
+    let sent: unknown = null;
+    await page.route('**/api/playbooks/survey/launch', (route: Route) => {
+      sent = JSON.parse(route.request().postData() ?? '{}');
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ key: 'RUN-0001' }) });
+    });
+    await ready(page, LAUNCH);
+
+    const release = page.locator('#launch-param-release');
+    await expect(release.locator('option')).toHaveText(['Select…', '3.6.0 GA', '3.7 Fast-1']);
+    await expect(page.getByText('Options from release_options, just now')).toBeVisible();
+    await release.selectOption('3.7 Fast-1');
+
+    const component = page.locator('#launch-param-component');
+    await expect(component.locator('option')).toHaveText(['—', 'vllm', 'flashinfer', 'Other…']);
+    await component.selectOption({ label: 'Other…' });
+    await page.locator('#launch-param-component-other').fill('triton');
+    await expect(component).toHaveValue('\u0000other');
+
+    await expect(page.locator('#launch-param-target_branch')).toHaveAttribute('placeholder', 'sync-v0.33.0');
+
+    await page.getByRole('button', { name: 'Refresh options' }).click();
+    await expect.poll(() => sent).toMatchObject({ params: { 'choices.refresh': 'true' } });
+  });
+
   test('the registry and the form are accessible', async ({ page }) => {
     await stubApi(page);
     for (const path of ['/playbooks', LAUNCH]) {
