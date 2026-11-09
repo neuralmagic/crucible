@@ -143,6 +143,8 @@ pub struct Launcher {
     digest: Option<String>,
     /// Set when this form reruns a finished run instead of starting afresh.
     pub rerun: Option<studio::Rerun>,
+    /// Set when this form saves a schedule rather than launching now.
+    pub schedule: Option<admin::ScheduleForm>,
     /// Only replies newer than this one answer this form.
     after: u64,
     /// The newest schema reply this form took, so a repeated snapshot does not refill it.
@@ -518,7 +520,12 @@ impl App {
     pub fn open_path_in_editor(&mut self, path: &std::path::Path, line: usize) {
         self.editor_error = match self.editor() {
             Ok(Ok(app)) => editor::open_file(app, path, line),
-            Ok(Err(command)) => editor::run_command(&command, path, line),
+            Ok(Err(command)) => editor::run_command(
+                &command,
+                path,
+                line,
+                path.parent().unwrap_or(std::path::Path::new("/")),
+            ),
             Err(why) => Err(why),
         }
         .err();
@@ -542,7 +549,7 @@ impl App {
                 editor::open_file(app, &dir.join(file), line)
             }
             (Some(Disk::Checkout(dir)), _, Err(command)) => {
-                editor::run_command(&command, &dir.join(file), line)
+                editor::run_command(&command, &dir.join(file), line, dir)
             }
             (
                 _,
@@ -557,8 +564,10 @@ impl App {
                     text: Some(text), ..
                 }),
                 Err(command),
-            ) => editor::scratch(file, text)
-                .and_then(|path| editor::run_command(&command, &path, line)),
+            ) => editor::scratch(file, text).and_then(|path| {
+                let dir = path.parent().unwrap_or(std::path::Path::new("/"));
+                editor::run_command(&command, &path, line, dir)
+            }),
             _ => Err(format!("{file} has no text to open")),
         };
         self.editor_error = result.err();
@@ -608,10 +617,24 @@ impl App {
             refusal: None,
             digest: None,
             rerun: None,
+            schedule: None,
             after: self.replies,
             filled: 0,
         });
         self.live_client.prepare(target);
+    }
+
+    /// Opens the launch sheet on `schedule`'s playbook, to edit when and how it fires.
+    pub fn edit_schedule(&mut self, schedule: &crux::dto::Schedule) {
+        let target = if schedule.target_kind == "draft_head" {
+            Target::Draft(schedule.playbook.clone())
+        } else {
+            Target::Playbook(schedule.playbook.clone())
+        };
+        self.open_launcher(target);
+        if let Some(launcher) = &mut self.launcher {
+            launcher.schedule = Some(admin::ScheduleForm::editing(schedule));
+        }
     }
 
     /// Sends the form, or marks what has to change first.
@@ -637,6 +660,23 @@ impl App {
         };
         if let Some(why) = launcher.rerun.as_ref().and_then(studio::Rerun::blocked) {
             launcher.refusal = Some(why);
+            return;
+        }
+        if let Some(schedule) = &launcher.schedule {
+            match schedule.body(
+                &launcher.target,
+                &params,
+                max_cost,
+                &max_time,
+                launcher.digest.as_deref(),
+            ) {
+                Ok(body) => {
+                    let id = schedule.stored.as_ref().map(|s| s.id.clone());
+                    launcher.stage = Stage::Sending;
+                    self.act(admin::Action::SaveSchedule { id, body });
+                }
+                Err(why) => launcher.refusal = Some(why),
+            }
             return;
         }
         let body = studio::launch_body(
@@ -694,12 +734,21 @@ impl App {
         };
         self.replies = self.replies.max(prepared.seq);
         let newest = self.newest_launch(prepared.target.id()).cloned();
-        let previous = self
-            .selected_live()
-            .filter(|live| live.id == prepared.target.id())
-            .and(self.selected_detail())
-            .and_then(|detail| detail.launch.as_ref())
-            .map(|record| record.launch.params.clone());
+        let stored = self
+            .launcher
+            .as_ref()
+            .and_then(|l| l.schedule.as_ref())
+            .and_then(|s| s.stored.as_deref())
+            .cloned();
+        let previous = match &stored {
+            Some(stored) => Some(serde_json::Value::Object(stored.params.clone())),
+            None => self
+                .selected_live()
+                .filter(|live| live.id == prepared.target.id())
+                .and(self.selected_detail())
+                .and_then(|detail| detail.launch.as_ref())
+                .map(|record| record.launch.params.clone()),
+        };
         let Some(launcher) = &mut self.launcher else {
             return;
         };
@@ -728,10 +777,16 @@ impl App {
                         TextEdit::new(before.unwrap_or_else(|| field.default.clone()))
                     })
                     .collect();
-                let cost = newest.as_ref().map_or(5.0, |n| n.cap).min(max_cost);
-                let time = newest
+                let cost = stored
                     .as_ref()
-                    .map(|n| n.max_time.clone())
+                    .map(|s| s.max_cost)
+                    .or(newest.as_ref().map(|n| n.cap))
+                    .unwrap_or(5.0)
+                    .min(max_cost);
+                let time = stored
+                    .as_ref()
+                    .map(|s| s.max_time.clone())
+                    .or(newest.as_ref().map(|n| n.max_time.clone()))
                     .filter(|t| form::minutes(t).is_some())
                     .unwrap_or_else(|| "30m".to_string());
                 launcher.cost = TextEdit::new(format!("{cost:.2}"));
@@ -1021,6 +1076,16 @@ impl App {
         if !on {
             self.lsp.stop();
             self.lsp_sent = None;
+        }
+    }
+
+    /// What the signed-in user may own things as, themself first.
+    pub fn owners(&self) -> Vec<String> {
+        match &self.live {
+            LiveView::Ready { identity, .. } if !identity.owners.is_empty() => {
+                identity.owners.clone()
+            }
+            _ => vec!["user:self".to_string()],
         }
     }
 

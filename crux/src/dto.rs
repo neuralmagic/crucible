@@ -536,6 +536,32 @@ pub struct Whoami {
     pub groups: Vec<String>,
     #[serde(default)]
     pub mode: Option<ControllerAuthMode>,
+    /// The teams the caller belongs to, which it may act and own things as.
+    #[serde(default)]
+    pub teams: Vec<WhoamiTeam>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhoamiTeam {
+    pub team: String,
+    #[serde(default)]
+    pub role: String,
+}
+
+/// Param values as a schedule stores them: every one a string.
+pub fn string_params(
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    params
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            (name.clone(), serde_json::Value::String(text))
+        })
+        .collect()
 }
 
 /// `POST /api/playbooks/imports`: a proposal frozen at the commit the fetch resolved to.
@@ -1257,17 +1283,7 @@ impl Schedule {
     /// The body that saves this schedule back as it stands, but `enabled`. The controller's PUT
     /// replaces a schedule whole, so every field it stored goes back with it.
     pub fn body(&self, enabled: bool) -> serde_json::Value {
-        let params: serde_json::Map<String, serde_json::Value> = self
-            .params
-            .iter()
-            .map(|(name, value)| {
-                let text = match value {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                };
-                (name.clone(), serde_json::Value::String(text))
-            })
-            .collect();
+        let params = string_params(&self.params);
         serde_json::json!({
             "owner": self.owner_principal,
             "playbook": self.playbook,

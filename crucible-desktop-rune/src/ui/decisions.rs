@@ -21,7 +21,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
     } else {
         String::new()
     };
-    let page = frame("decisions", "Decisions", note, app, p);
+    let page = frame("decisions", "Decisions", note, None, app, p);
     let open = match landed(&app.admin.decisions, "the decision queue", p) {
         Err(standin) => return page.child(*standin),
         Ok(open) => open,

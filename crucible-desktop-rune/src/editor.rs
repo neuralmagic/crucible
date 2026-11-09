@@ -77,12 +77,14 @@ impl Editor {
 }
 
 /// An editor command a terminal editor fits.
-pub const EXAMPLE: &str = "ghostty -e nvim +{line} {file}";
+pub const EXAMPLE: &str =
+    "open -na Ghostty.app --args --working-directory={dir} -e nvim +{line} {file}";
 
-/// `template` with `{file}` and `{line}` filled in, the path quoted for `sh`.
-pub fn command_line(template: &str, path: &Path, line: usize) -> String {
+/// `template` with `{file}`, `{line}` and `{dir}` filled in, the paths quoted for `sh`.
+pub fn command_line(template: &str, path: &Path, line: usize, dir: &Path) -> String {
     template
         .replace("{file}", &shell_quote(&path.to_string_lossy()))
+        .replace("{dir}", &shell_quote(&dir.to_string_lossy()))
         .replace("{line}", &line.to_string())
 }
 
@@ -90,9 +92,10 @@ fn shell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "'\\''"))
 }
 
-/// Run an editor command for `path` at `line` through `sh`, with the usual tool directories on
-/// `PATH`: an app opened from Finder starts with only the system ones.
-pub fn run_command(template: &str, path: &Path, line: usize) -> Result<(), String> {
+/// Run an editor command for `path` at `line` through `sh` in `dir`, the pack's directory, with
+/// the usual tool directories on `PATH`: an app opened from Finder starts with only the system
+/// ones.
+pub fn run_command(template: &str, path: &Path, line: usize, dir: &Path) -> Result<(), String> {
     if !template.contains("{file}") {
         return Err("The editor command needs {file} where the path goes".to_string());
     }
@@ -117,7 +120,8 @@ pub fn run_command(template: &str, path: &Path, line: usize) -> Result<(), Strin
     let search = std::env::join_paths(dirs).map_err(|e| format!("building PATH: {e}"))?;
     Command::new("/bin/sh")
         .arg("-c")
-        .arg(command_line(template, path, line))
+        .arg(command_line(template, path, line, dir))
+        .current_dir(dir)
         .env("PATH", search)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -258,14 +262,21 @@ mod tests {
     fn an_editor_command_gets_the_path_quoted_and_the_line() {
         assert_eq!(
             command_line(
-                "ghostty -e nvim +{line} {file}",
+                "ghostty --working-directory={dir} -e nvim +{line} {file}",
                 Path::new("/Users/me/my packs/it's.star"),
-                12
+                12,
+                Path::new("/Users/me/my packs"),
             ),
-            "ghostty -e nvim +12 '/Users/me/my packs/it'\\''s.star'"
+            "ghostty --working-directory='/Users/me/my packs' -e nvim +12 \
+             '/Users/me/my packs/it'\\''s.star'"
         );
         assert_eq!(
-            command_line("nvim --remote {file}", Path::new("/a/$(rm -rf ~)"), 1),
+            command_line(
+                "nvim --remote {file}",
+                Path::new("/a/$(rm -rf ~)"),
+                1,
+                Path::new("/a")
+            ),
             "nvim --remote '/a/$(rm -rf ~)'",
             "nothing in the path reaches the shell unquoted"
         );
@@ -273,6 +284,6 @@ mod tests {
 
     #[test]
     fn a_command_without_a_file_slot_is_refused() {
-        assert!(crate::editor::run_command("nvim", Path::new("/a"), 1).is_err());
+        assert!(crate::editor::run_command("nvim", Path::new("/a"), 1, Path::new("/")).is_err());
     }
 }

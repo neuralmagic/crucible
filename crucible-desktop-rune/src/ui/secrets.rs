@@ -2,11 +2,11 @@
 //! form and its audit trail. Values never reach the app except as typed into the rotate field.
 
 use rune::{El, Tx, col, row, text};
-use rune_kit::{Button, ButtonVariant, SidebarRow, TextInput};
+use rune_kit::{Button, ButtonVariant, SidebarRow, Switch, TextArea, TextInput};
 
 use crate::App;
-use crate::admin::{Action, SecretView, relative};
-use crate::ui::desk::{card, frame, heading, landed, list, none, now, reading};
+use crate::admin::{Action, SECRET_KINDS, SecretForm, SecretView, relative};
+use crate::ui::desk::{card, field, frame, heading, landed, list, none, now, pills, reading};
 use crate::ui::{Paint, tag};
 
 const LIST: f32 = 300.0;
@@ -16,14 +16,20 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         Some(Ok(secrets)) => secrets.len().to_string(),
         _ => String::new(),
     };
-    let page = frame("secrets", "Secrets", note, app, p);
+    let create = Button::new("New secret")
+        .variant(ButtonVariant::Neutral)
+        .disabled(app.desk.new_secret.is_some())
+        .on_press(|app: &mut App| {
+            let owner = app.owners().into_iter().next().unwrap_or_default();
+            app.desk.new_secret = Some(SecretForm::new(&owner));
+        })
+        .build(p.k)
+        .key("secret-new");
+    let page = frame("secrets", "Secrets", note, Some(create), app, p);
     let secrets = match landed(&app.admin.secrets, "the secrets", p) {
         Err(standin) => return page.child(*standin),
         Ok(secrets) => secrets,
     };
-    if secrets.is_empty() {
-        return page.child(none("secrets-none", "No secrets", p));
-    }
     let mut sorted: Vec<&crux::dto::Secret> = secrets.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.owner.cmp(&b.owner)));
     let rows = sorted
@@ -40,11 +46,13 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         })
         .collect();
     let picked = match (&app.desk.secret, &app.admin.secret) {
+        _ if app.desk.new_secret.is_some() => new_secret(app, p),
         (Some(id), Some((read, loaded))) if id == read => match landed(loaded, "the secret", p) {
             Ok(view) => detail(view, app, p),
             Err(standin) => *standin,
         },
         (Some(_), _) => reading("the secret", p),
+        (None, _) if secrets.is_empty() => none("secrets-none", "No secrets", p),
         (None, _) => none("secret-unpicked", "Pick a secret", p),
     };
     page.child(
@@ -118,7 +126,11 @@ fn detail(view: &SecretView, app: &App, p: &Paint) -> El {
                 .key("secret-rotate"),
         );
     }
-    let mut body = col().w_full().gap(14.0).child(head);
+    let mut body = col()
+        .w_full()
+        .gap(14.0)
+        .child(head)
+        .child(owner_row(secret, app, p));
     if let Some(value) = &app.desk.rotate {
         body = body.child(rotate_form(&secret.id, value, app, p));
     }
@@ -130,6 +142,214 @@ fn detail(view: &SecretView, app: &App, p: &Paint) -> El {
         .gap(16.0)
         .child(card("secret-card", body, p))
         .child(card("secret-audit-card", audit(view, p), p).grow(1.0))
+}
+
+/// Who owns the secret, and moving it to another of the user's owners.
+fn owner_row(secret: &crux::dto::Secret, app: &App, p: &Paint) -> El {
+    let mut owners = app.owners();
+    if !owners.contains(&secret.owner) {
+        owners.insert(0, secret.owner.clone());
+    }
+    let options: Vec<(String, String)> = owners.iter().map(|o| (o.clone(), o.clone())).collect();
+    let target = app
+        .desk
+        .move_to
+        .clone()
+        .unwrap_or_else(|| secret.owner.clone());
+    let moving = target != secret.owner;
+    let id = secret.id.clone();
+    let mut column = col()
+        .w_full()
+        .gap(6.0)
+        .child(heading("Owner", p))
+        .child(pills(
+            "secret-owner",
+            &options,
+            Some(&target),
+            |app: &mut App, owner: &str| app.desk.move_to = Some(owner.to_string()),
+            p,
+        ));
+    if moving {
+        column = column.child(
+            row()
+                .gap(8.0)
+                .child(
+                    Button::new(format!("Move to {target}"))
+                        .variant(ButtonVariant::Submit)
+                        .disabled(app.desk.busy())
+                        .on_press(move |app: &mut App| {
+                            if let Some(owner) = app.desk.move_to.clone() {
+                                app.act(Action::MoveSecret {
+                                    secret: id.clone(),
+                                    owner,
+                                });
+                            }
+                        })
+                        .build(p.k)
+                        .key("secret-move"),
+                )
+                .child(
+                    Button::new("Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|app: &mut App| app.desk.move_to = None)
+                        .build(p.k)
+                        .key("secret-move-cancel"),
+                ),
+        );
+    }
+    column
+}
+
+/// The form that registers a secret from a typed value.
+fn new_secret(app: &App, p: &Paint) -> El {
+    let Some(form) = &app.desk.new_secret else {
+        return none("secret-unpicked", "Pick a secret", p);
+    };
+    let owners: Vec<(String, String)> = app.owners().into_iter().map(|o| (o.clone(), o)).collect();
+    let kinds: Vec<(String, String)> = SECRET_KINDS
+        .iter()
+        .map(|(kind, label)| (kind.to_string(), label.to_string()))
+        .collect();
+    let checked = form.body();
+    let mut body = col()
+        .key("secret-form")
+        .w_full()
+        .gap(14.0)
+        .child(
+            text("New secret")
+                .font(p.k.ty.ui_medium)
+                .color(p.c.text_base),
+        )
+        .child(field(
+            "Name",
+            TextInput::new(&form.name)
+                .placeholder("lowercase-name")
+                .width(Some(320.0))
+                .on_edit(|app: &mut App| match &mut app.desk.new_secret {
+                    Some(form) => &mut form.name,
+                    None => &mut app.scratch,
+                })
+                .build(p.k)
+                .key("secret-name"),
+            p,
+        ))
+        .child(field(
+            "Owner",
+            pills(
+                "secret-new-owner",
+                &owners,
+                Some(&form.owner),
+                |app: &mut App, owner: &str| {
+                    if let Some(form) = &mut app.desk.new_secret {
+                        form.owner = owner.to_string();
+                    }
+                },
+                p,
+            ),
+            p,
+        ))
+        .child(field(
+            "Kind",
+            pills(
+                "secret-kind",
+                &kinds,
+                Some(form.kind()),
+                |app: &mut App, kind: &str| {
+                    if let Some(form) = &mut app.desk.new_secret {
+                        form.kind = SECRET_KINDS
+                            .iter()
+                            .position(|(k, _)| *k == kind)
+                            .unwrap_or(0);
+                    }
+                },
+                p,
+            ),
+            p,
+        ));
+    if form.kind() == "opaque" {
+        body = body.child(
+            Switch::new(form.agent_visible)
+                .label("The agent can read it")
+                .on_toggle(|app: &mut App| {
+                    if let Some(form) = &mut app.desk.new_secret {
+                        form.agent_visible = !form.agent_visible;
+                    }
+                })
+                .build(p.k)
+                .key("secret-visible"),
+        );
+    }
+    if form.kind() == "inference_api_key" {
+        body = body.child(field(
+            "Variable",
+            TextInput::new(&form.variable)
+                .width(Some(320.0))
+                .on_edit(|app: &mut App| match &mut app.desk.new_secret {
+                    Some(form) => &mut form.variable,
+                    None => &mut app.scratch,
+                })
+                .build(p.k)
+                .key("secret-variable"),
+            p,
+        ));
+    }
+    let value = if form.multiline() {
+        TextArea::new(&form.value)
+            .secure()
+            .rows(6)
+            .width(Some(480.0))
+            .on_edit(|app: &mut App| match &mut app.desk.new_secret {
+                Some(form) => &mut form.value,
+                None => &mut app.scratch,
+            })
+            .build(p.k)
+    } else {
+        TextInput::new(&form.value)
+            .secure()
+            .width(Some(480.0))
+            .on_edit(|app: &mut App| match &mut app.desk.new_secret {
+                Some(form) => &mut form.value,
+                None => &mut app.scratch,
+            })
+            .build(p.k)
+    };
+    body = body.child(field("Value", value.key("secret-value"), p));
+    let problem = match (
+        &checked,
+        form.name.text.is_empty() && form.value.text.is_empty(),
+    ) {
+        (Err(why), false) => Some(why.clone()),
+        _ => None,
+    };
+    let ready = checked.is_ok() && !app.desk.busy();
+    body = body
+        .children(problem.map(|why| text(why).font(p.k.ty.small).color(p.fail)))
+        .child(
+            row()
+                .gap(8.0)
+                .child(
+                    Button::new("Create")
+                        .variant(ButtonVariant::Submit)
+                        .disabled(!ready)
+                        .on_press(|app: &mut App| {
+                            if let Some(Ok(body)) =
+                                app.desk.new_secret.as_ref().map(SecretForm::body)
+                            {
+                                app.act(Action::CreateSecret { body });
+                            }
+                        })
+                        .build(p.k)
+                        .key("secret-create"),
+                )
+                .child(
+                    Button::new("Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|app: &mut App| app.desk.new_secret = None)
+                        .build(p.k)
+                        .key("secret-create-cancel"),
+                ),
+        );
+    card("secret-form-card", body, p)
 }
 
 fn rotate_form(id: &str, value: &rune::TextEdit, app: &App, p: &Paint) -> El {

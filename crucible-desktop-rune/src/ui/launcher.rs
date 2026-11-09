@@ -7,6 +7,7 @@ use rune_theme_opencode::icons as oc;
 
 use crate::form::{Kind, Scale, duration, minutes};
 use crate::live::Target;
+use crate::ui::desk::{field, pills};
 use crate::ui::slider::Slider;
 use crate::ui::{Paint, Tone};
 use crate::{App, Stage};
@@ -113,6 +114,8 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
     let blocked = launcher.rerun.as_ref().and_then(|r| r.blocked()).is_some();
     let (verb, going) = if launcher.rerun.is_some() {
         ("Rerun", "Rerunning\u{2026}")
+    } else if launcher.schedule.is_some() {
+        ("Save schedule", "Saving\u{2026}")
     } else {
         ("Launch", "Launching\u{2026}")
     };
@@ -128,8 +131,13 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
             .disabled(!ready || blocked)
             .on_press(|app: &mut App| app.submit_launch())
     };
+    let editing = launcher
+        .schedule
+        .as_ref()
+        .is_some_and(|s| s.stored.is_some());
     let title = match (&launcher.target, &launcher.rerun) {
         (target, Some(_)) => format!("Rerun {}", target.id()),
+        (target, None) if editing => format!("Edit schedule of {}", target.id()),
         (Target::Draft(id), None) => format!("Launch draft {id}"),
         (Target::Playbook(id), None) => format!("Launch {id}"),
     };
@@ -368,14 +376,105 @@ fn form(app: &App, p: &Paint) -> El {
                 .color(p.c.text_muted),
         );
     }
+    let editing = launcher
+        .schedule
+        .as_ref()
+        .is_some_and(|s| s.stored.is_some());
     col()
         .w_full()
         .gap(16.0)
         .pt(4.0)
+        .children((!editing).then(|| when(app, p)))
         .child(fields)
         .child(el().h(p.hair).w_full().fill(p.c.border_muted))
         .child(ceilings(app, p))
+        .children(
+            launcher
+                .schedule
+                .as_ref()
+                .map(|s| schedule_fields(s, app, p)),
+        )
         .children(launcher.refusal.as_ref().map(|why| problem(why, p)))
+}
+
+/// Launch now, or save a schedule that launches on a cron.
+fn when(app: &App, p: &Paint) -> El {
+    let scheduled = app.launcher.as_ref().is_some_and(|l| l.schedule.is_some());
+    SegmentedControl::new(&["Run now", "On a schedule"], Some(scheduled as usize))
+        .label("When")
+        .width(Some(INNER))
+        .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+            let owner = app.owners().into_iter().next().unwrap_or_default();
+            if let Some(launcher) = &mut app.launcher {
+                launcher.schedule = (i == 1).then(|| crate::admin::ScheduleForm::new(&owner));
+                launcher.refusal = None;
+            }
+        })
+        .build(p.k)
+        .key("launch-when")
+}
+
+/// The cron, its zone and the owner of a schedule.
+fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> El {
+    let mut owners = app.owners();
+    if !form.owner.is_empty() && !owners.contains(&form.owner) {
+        owners.insert(0, form.owner.clone());
+    }
+    let owners: Vec<(String, String)> = owners.into_iter().map(|o| (o.clone(), o)).collect();
+    col()
+        .key("schedule-fields")
+        .w_full()
+        .gap(12.0)
+        .child(
+            row()
+                .w_full()
+                .gap(12.0)
+                .child(field(
+                    "Cron",
+                    TextInput::new(&form.cron)
+                        .placeholder("0 9 * * MON-FRI")
+                        .width(Some((INNER - 12.0) / 2.0))
+                        .on_edit(|app: &mut App| {
+                            match app.launcher.as_mut().and_then(|l| l.schedule.as_mut()) {
+                                Some(form) => &mut form.cron,
+                                None => &mut app.scratch,
+                            }
+                        })
+                        .build(p.k)
+                        .key("schedule-cron"),
+                    p,
+                ))
+                .child(field(
+                    "Time zone",
+                    TextInput::new(&form.tz)
+                        .placeholder("UTC")
+                        .width(Some((INNER - 12.0) / 2.0))
+                        .on_edit(|app: &mut App| {
+                            match app.launcher.as_mut().and_then(|l| l.schedule.as_mut()) {
+                                Some(form) => &mut form.tz,
+                                None => &mut app.scratch,
+                            }
+                        })
+                        .build(p.k)
+                        .key("schedule-tz"),
+                    p,
+                )),
+        )
+        .child(field(
+            "Owner",
+            pills(
+                "schedule-owner",
+                &owners,
+                Some(&form.owner),
+                |app: &mut App, owner: &str| {
+                    if let Some(form) = app.launcher.as_mut().and_then(|l| l.schedule.as_mut()) {
+                        form.owner = owner.to_string();
+                    }
+                },
+                p,
+            ),
+            p,
+        ))
 }
 
 fn ceilings(app: &App, p: &Paint) -> El {

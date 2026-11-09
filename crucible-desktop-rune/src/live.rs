@@ -136,6 +136,8 @@ impl LiveView {
 pub struct Identity {
     pub user: String,
     pub role: String,
+    /// What the user may own things as: themself, then each of their teams.
+    pub owners: Vec<String>,
 }
 
 impl Identity {
@@ -1242,9 +1244,16 @@ fn pin_label(playbook: &crux::dto::Playbook) -> String {
 }
 
 fn identity(whoami: crux::dto::Whoami) -> Identity {
+    let user = whoami.user.unwrap_or_default();
+    let owners = (!user.is_empty())
+        .then(|| format!("user:{user}"))
+        .into_iter()
+        .chain(whoami.teams.iter().map(|t| format!("team:{}", t.team)))
+        .collect();
     Identity {
-        user: whoami.user.unwrap_or_default(),
+        user,
         role: whoami.role,
+        owners,
     }
 }
 
@@ -1618,6 +1627,7 @@ mod tests {
             identity: Identity {
                 user: "wren".into(),
                 role: String::new(),
+                owners: vec!["user:wren".into()],
             },
             now: NOW,
             launches,

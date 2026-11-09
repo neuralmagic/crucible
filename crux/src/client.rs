@@ -509,6 +509,15 @@ impl Client {
         .await
     }
 
+    /// Hand secret `id` to `owner` (`user:<login>` or `team:<slug>`).
+    pub async fn transfer_secret(&self, id: &str, owner: &str) -> Result<dto::Secret> {
+        self.put(
+            &format!("/api/secrets/{}/owner", encode(id)),
+            &serde_json::json!({ "owner": owner }),
+        )
+        .await
+    }
+
     /// A secret and its bindings.
     pub async fn secret(&self, id: &str) -> Result<dto::SecretDetail> {
         self.get(&format!("/api/secrets/{}", encode(id))).await
@@ -658,6 +667,13 @@ impl Client {
 
     pub async fn schedules<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/schedules").await
+    }
+
+    pub async fn create_schedule<T: DeserializeOwned>(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        self.post("/api/schedules", Some(body)).await
     }
 
     /// Replace schedule `id` whole with `body`; [`dto::Schedule::body`] builds one from a stored

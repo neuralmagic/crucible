@@ -63,6 +63,18 @@ pub enum Action {
         digest: String,
         note: Option<String>,
     },
+    CreateSecret {
+        body: serde_json::Value,
+    },
+    MoveSecret {
+        secret: String,
+        owner: String,
+    },
+    /// Create a schedule, or replace schedule `id` whole.
+    SaveSchedule {
+        id: Option<String>,
+        body: serde_json::Value,
+    },
 }
 
 /// Which kind of action an outcome answers.
@@ -74,6 +86,9 @@ pub enum Did {
     Rotate,
     Unbind,
     Answer,
+    CreateSecret,
+    MoveSecret,
+    SaveSchedule,
 }
 
 impl Action {
@@ -85,6 +100,9 @@ impl Action {
             Action::Rotate { .. } => Did::Rotate,
             Action::Unbind { .. } => Did::Unbind,
             Action::Answer { .. } => Did::Answer,
+            Action::CreateSecret { .. } => Did::CreateSecret,
+            Action::MoveSecret { .. } => Did::MoveSecret,
+            Action::SaveSchedule { .. } => Did::SaveSchedule,
         }
     }
 
@@ -97,6 +115,15 @@ impl Action {
             Action::Rotate { .. } => "Rotated".to_string(),
             Action::Unbind { .. } => "Unbound".to_string(),
             Action::Answer { .. } => "Answered".to_string(),
+            Action::CreateSecret { body } => format!(
+                "Created {}",
+                body.get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("the secret")
+            ),
+            Action::MoveSecret { owner, .. } => format!("Moved to {owner}"),
+            Action::SaveSchedule { id: None, .. } => "Scheduled".to_string(),
+            Action::SaveSchedule { id: Some(_), .. } => "Saved the schedule".to_string(),
         }
     }
 }
@@ -341,6 +368,27 @@ fn act(c: &Connection, action: &Action) -> Result<(), String> {
                 client.answer_decision(id, labels, digest, note.as_deref()),
             )
             .map(drop),
+        Action::CreateSecret { body } => c
+            .call(
+                "the new secret",
+                client.create_secret::<serde_json::Value>(body),
+            )
+            .map(drop),
+        Action::MoveSecret { secret, owner } => c
+            .call("the owner change", client.transfer_secret(secret, owner))
+            .map(drop),
+        Action::SaveSchedule { id: None, body } => c
+            .call(
+                "the new schedule",
+                client.create_schedule::<serde_json::Value>(body),
+            )
+            .map(drop),
+        Action::SaveSchedule { id: Some(id), body } => c
+            .call(
+                "the schedule",
+                client.update_schedule::<serde_json::Value>(id, body),
+            )
+            .map(drop),
     }
 }
 
@@ -421,6 +469,10 @@ pub struct Desk {
     pub outcome: Option<Result<String, String>>,
     /// The removal armed by a first click, which a second click on it carries out.
     pub armed: Option<String>,
+    /// The new-secret form, while open.
+    pub new_secret: Option<SecretForm>,
+    /// The owner picked to move the shown secret to.
+    pub move_to: Option<String>,
     /// The decision requests already announced; `None` until the first queue lands.
     seen: Option<HashSet<String>>,
 }
@@ -439,6 +491,8 @@ impl Default for Desk {
             sent: None,
             outcome: None,
             armed: None,
+            new_secret: None,
+            move_to: None,
             seen: None,
         }
     }
@@ -496,6 +550,178 @@ impl Desk {
         };
         self.seen = Some(ids);
         new
+    }
+}
+
+/// The launch sheet's schedule half: when it fires, in which zone, owned by whom, and the
+/// schedule it edits.
+pub struct ScheduleForm {
+    pub stored: Option<Box<dto::Schedule>>,
+    pub cron: TextEdit,
+    pub tz: TextEdit,
+    pub owner: String,
+}
+
+impl ScheduleForm {
+    pub fn new(owner: &str) -> ScheduleForm {
+        let tz = jiff::tz::TimeZone::system()
+            .iana_name()
+            .unwrap_or("UTC")
+            .to_string();
+        ScheduleForm {
+            stored: None,
+            cron: TextEdit::new("0 9 * * MON-FRI"),
+            tz: TextEdit::new(tz),
+            owner: owner.to_string(),
+        }
+    }
+
+    pub fn editing(schedule: &dto::Schedule) -> ScheduleForm {
+        ScheduleForm {
+            cron: TextEdit::new(&schedule.cron_expr),
+            tz: TextEdit::new(if schedule.tz.is_empty() {
+                "UTC"
+            } else {
+                &schedule.tz
+            }),
+            owner: schedule.owner_principal.clone().unwrap_or_default(),
+            stored: Some(Box::new(schedule.clone())),
+        }
+    }
+
+    /// The body that creates the schedule, or replaces the stored one keeping what the form
+    /// does not show.
+    pub fn body(
+        &self,
+        target: &crate::live::Target,
+        params: &serde_json::Value,
+        max_cost: f64,
+        max_time: &str,
+        digest: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
+        let cron = self.cron.text.split_whitespace().collect::<Vec<_>>();
+        if cron.len() != 5 {
+            return Err("A cron expression has five fields, like 0 9 * * MON-FRI".to_string());
+        }
+        let tz = self.tz.text.trim();
+        if tz.is_empty() {
+            return Err("A time zone, like UTC or America/New_York".to_string());
+        }
+        let params = params
+            .as_object()
+            .map(dto::string_params)
+            .unwrap_or_default();
+        let mut body = match &self.stored {
+            Some(stored) => stored.body(stored.enabled),
+            None => serde_json::json!({"advance_dedupe": true, "enabled": true}),
+        };
+        let target_kind = match target {
+            crate::live::Target::Playbook(_) => "adopted",
+            crate::live::Target::Draft(_) => "draft_head",
+        };
+        let fields = [
+            ("owner", serde_json::json!(self.owner)),
+            ("playbook", serde_json::json!(target.id())),
+            ("target_kind", serde_json::json!(target_kind)),
+            ("params", serde_json::Value::Object(params)),
+            ("max_cost", serde_json::json!(max_cost)),
+            ("max_time", serde_json::json!(max_time)),
+            ("cron_expr", serde_json::json!(cron.join(" "))),
+            ("tz", serde_json::json!(tz)),
+        ];
+        for (name, value) in fields {
+            body[name] = value;
+        }
+        if let Some(digest) = digest {
+            body["schema_digest"] = serde_json::json!(digest);
+        }
+        Ok(body)
+    }
+}
+
+/// The secret kinds a value can be typed in for, with what the form calls them.
+pub const SECRET_KINDS: [(&str, &str); 6] = [
+    ("opaque", "Token"),
+    ("github_token", "GitHub token"),
+    ("inference_api_key", "Model API key"),
+    ("file", "File"),
+    ("registry_authfile", "Registry auth"),
+    ("kubeconfig", "Kubeconfig"),
+];
+
+/// A secret being registered from a typed value.
+pub struct SecretForm {
+    pub name: TextEdit,
+    pub owner: String,
+    pub kind: usize,
+    pub agent_visible: bool,
+    pub value: TextEdit,
+    /// The environment variable a model API key lands in.
+    pub variable: TextEdit,
+}
+
+impl SecretForm {
+    pub fn new(owner: &str) -> SecretForm {
+        SecretForm {
+            name: TextEdit::new(""),
+            owner: owner.to_string(),
+            kind: 0,
+            agent_visible: false,
+            value: TextEdit::new(""),
+            variable: TextEdit::new("OPENAI_API_KEY"),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        SECRET_KINDS[self.kind.min(SECRET_KINDS.len() - 1)].0
+    }
+
+    /// Whether the value is a document rather than one line.
+    pub fn multiline(&self) -> bool {
+        matches!(self.kind(), "file" | "registry_authfile" | "kubeconfig")
+    }
+
+    /// The registration body, or what is wrong with the form.
+    pub fn body(&self) -> Result<serde_json::Value, String> {
+        let name = self.name.text.trim();
+        if name.is_empty() || name.len() > 96 {
+            return Err("A name of 1 to 96 characters".to_string());
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'))
+        {
+            return Err("Names are lowercase letters, digits, '.', '_' and '-'".to_string());
+        }
+        if self.value.text.is_empty() {
+            return Err("No value".to_string());
+        }
+        let value = match self.kind() {
+            "inference_api_key" => {
+                let variable = self.variable.text.trim();
+                let valid = variable
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_uppercase() || c == '_')
+                    && variable
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                if !valid {
+                    return Err(format!("{variable:?} is not an environment variable name"));
+                }
+                serde_json::json!({ variable: self.value.text.trim() }).to_string()
+            }
+            "opaque" | "github_token" => self.value.text.trim().to_string(),
+            _ => self.value.text.clone(),
+        };
+        let visible = self.agent_visible && self.kind() == "opaque";
+        Ok(serde_json::json!({
+            "name": name,
+            "owner": self.owner,
+            "kind": self.kind(),
+            "visibility": if visible { "agent_visible" } else { "broker_only" },
+            "value": value,
+        }))
     }
 }
 
@@ -626,8 +852,20 @@ impl crate::App {
                         self.desk.grantee = TextEdit::new("");
                         self.desk.until = TextEdit::new("");
                     }
+                    Did::CreateSecret => self.desk.new_secret = None,
+                    Did::MoveSecret => self.desk.move_to = None,
+                    Did::SaveSchedule => {
+                        self.launcher = None;
+                        self.page = crate::Page::Schedules;
+                    }
                     Did::Enable | Did::Revoke | Did::Unbind => {}
                 }
+            }
+            if let (Did::SaveSchedule, Err(why), Some(launcher)) =
+                (acted.did, &acted.result, self.launcher.as_mut())
+            {
+                launcher.stage = crate::Stage::Ready;
+                launcher.refusal = Some(why.clone());
             }
             self.desk.outcome = Some(acted.result.clone());
         }
@@ -755,6 +993,127 @@ mod tests {
         assert_eq!(desk.picks.len(), 1, "the same request keeps them");
         desk.pick_decision("b");
         assert!(desk.picks.is_empty());
+    }
+
+    fn form(kind: &str, name: &str, value: &str) -> SecretForm {
+        let mut form = SecretForm::new("team:infra");
+        form.kind = SECRET_KINDS
+            .iter()
+            .position(|(k, _)| *k == kind)
+            .expect("kind");
+        form.name = TextEdit::new(name);
+        form.value = TextEdit::new(value);
+        form
+    }
+
+    #[test]
+    fn a_secret_form_sends_the_registration_the_controller_takes() {
+        let body = form("opaque", "gh-token", " ghp_x \n")
+            .body()
+            .expect("valid");
+        assert_eq!(
+            body,
+            serde_json::json!({"name": "gh-token", "owner": "team:infra", "kind": "opaque",
+                "visibility": "broker_only", "value": "ghp_x"})
+        );
+        let mut visible = form("opaque", "t", "v");
+        visible.agent_visible = true;
+        assert_eq!(
+            visible.body().expect("valid")["visibility"],
+            "agent_visible"
+        );
+        let mut file = form("file", "conf", "a\nb\n");
+        file.agent_visible = true;
+        let body = file.body().expect("valid");
+        assert_eq!(body["value"], "a\nb\n", "a document keeps its bytes");
+        assert_eq!(
+            body["visibility"], "broker_only",
+            "only a token can be agent visible"
+        );
+        let key = form("inference_api_key", "openai", "sk-1")
+            .body()
+            .expect("valid");
+        assert_eq!(key["value"], r#"{"OPENAI_API_KEY":"sk-1"}"#);
+    }
+
+    #[test]
+    fn a_secret_form_refuses_what_the_controller_would() {
+        assert!(form("opaque", "", "v").body().is_err());
+        assert!(form("opaque", "Upper", "v").body().is_err());
+        assert!(form("opaque", "has space", "v").body().is_err());
+        assert!(form("opaque", &"a".repeat(97), "v").body().is_err());
+        assert!(form("opaque", "ok", "").body().is_err());
+        let mut key = form("inference_api_key", "k", "sk");
+        key.variable = TextEdit::new("openai key");
+        assert!(key.body().is_err());
+    }
+
+    #[test]
+    fn a_new_schedule_body_carries_the_form_and_defaults() {
+        let mut form = ScheduleForm::new("team:infra");
+        form.cron = TextEdit::new(" 0  6 * * 1 ");
+        form.tz = TextEdit::new("America/New_York");
+        let body = form
+            .body(
+                &crate::live::Target::Draft("cve".into()),
+                &serde_json::json!({"limit": 5, "repo": "a/b"}),
+                3.0,
+                "45m",
+                Some("sha256:d"),
+            )
+            .expect("valid");
+        assert_eq!(
+            body,
+            serde_json::json!({"advance_dedupe": true, "enabled": true, "owner": "team:infra",
+                "playbook": "cve", "target_kind": "draft_head",
+                "params": {"limit": "5", "repo": "a/b"}, "max_cost": 3.0, "max_time": "45m",
+                "cron_expr": "0 6 * * 1", "tz": "America/New_York",
+                "schema_digest": "sha256:d"})
+        );
+    }
+
+    #[test]
+    fn an_edited_schedule_keeps_what_the_form_does_not_show() {
+        let stored: dto::Schedule = serde_json::from_str(
+            r#"{"id":"s1","playbook":"report","cron_expr":"0 9 * * *","enabled":false,
+                "next_due_at":null,"last_fired_at":null,"consecutive_failures":0,
+                "owner_principal":"user:wren","target_kind":"adopted","params":{"a":"1"},
+                "max_cost":1.0,"max_time":"10m","advance_dedupe":false,"tz":"UTC",
+                "dispatch_target":"wharf","agent_provider":"vertex","agent_model":"m",
+                "cursor":{"from":"result","param":"since","path":null}}"#,
+        )
+        .expect("wire shape");
+        let mut form = ScheduleForm::editing(&stored);
+        form.owner = "team:infra".into();
+        let body = form
+            .body(
+                &crate::live::Target::Playbook("report".into()),
+                &serde_json::json!({"a": "2"}),
+                2.0,
+                "20m",
+                None,
+            )
+            .expect("valid");
+        assert_eq!(body["owner"], "team:infra");
+        assert_eq!(body["params"], serde_json::json!({"a": "2"}));
+        assert_eq!(body["enabled"], false, "editing does not resume it");
+        assert_eq!(body["advance_dedupe"], false);
+        assert_eq!(body["dispatch_target"], "wharf");
+        assert_eq!(body["provider"], "vertex");
+        assert_eq!(body["cursor"]["param"], "since");
+        assert_eq!(body["target_kind"], "adopted");
+    }
+
+    #[test]
+    fn a_schedule_form_refuses_a_bad_cron_or_no_zone() {
+        let target = crate::live::Target::Playbook("p".into());
+        let params = serde_json::json!({});
+        let mut form = ScheduleForm::new("user:me");
+        form.cron = TextEdit::new("0 9 * *");
+        assert!(form.body(&target, &params, 1.0, "5m", None).is_err());
+        form.cron = TextEdit::new("0 9 * * *");
+        form.tz = TextEdit::new(" ");
+        assert!(form.body(&target, &params, 1.0, "5m", None).is_err());
     }
 
     #[test]

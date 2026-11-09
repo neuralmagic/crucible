@@ -1,7 +1,7 @@
 //! The Schedules page: every schedule the caller may see, with a switch to pause or resume each.
 
 use rune::{El, col, row, text};
-use rune_kit::Switch;
+use rune_kit::{Button, ButtonVariant, Switch};
 
 use crate::admin::{Action, relative};
 use crate::ui::desk::{card, frame, landed, none, now, scrolled, stacked};
@@ -16,7 +16,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         }
         _ => String::new(),
     };
-    let page = frame("schedules", "Schedules", note, app, p);
+    let page = frame("schedules", "Schedules", note, None, app, p);
     let schedules = match landed(&app.admin.schedules, "the schedules", p) {
         Err(standin) => return page.child(*standin),
         Ok(schedules) => schedules,
@@ -114,6 +114,13 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
             format!("fired {}", relative(at, now))
         });
 
+    let editing = schedule.clone();
+    let edit = Button::new("Edit")
+        .variant(ButtonVariant::GhostMuted)
+        .disabled(app.desk.busy())
+        .on_press(move |app: &mut App| app.edit_schedule(&editing))
+        .build(p.k)
+        .key(format!("schedule-edit-{}", schedule.id));
     row()
         .key(format!("schedule-{}", schedule.id))
         .w_full()
@@ -140,4 +147,5 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
                 }))
                 .child(text(last).font(p.k.ty.small).color(p.c.text_muted)),
         )
+        .child(edit)
 }

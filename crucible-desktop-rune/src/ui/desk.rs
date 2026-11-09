@@ -1,14 +1,21 @@
 //! What the management pages share: their frame, read states, and the last action's outcome.
 
 use rune::{El, ScrollSpec, col, el, row, text};
-use rune_kit::Spinner;
+use rune_kit::{Button, ButtonVariant, Spinner};
 
 use crate::App;
 use crate::admin::Loaded;
 use crate::ui::{Paint, TITLE, banner};
 
 /// A management page: its title and a note beside it, then `body`.
-pub(crate) fn frame(key: &str, title: &str, note: String, app: &App, p: &Paint) -> El {
+pub(crate) fn frame(
+    key: &str,
+    title: &str,
+    note: String,
+    action: Option<El>,
+    app: &App,
+    p: &Paint,
+) -> El {
     col()
         .key("detail")
         .grow(1.0)
@@ -37,7 +44,8 @@ pub(crate) fn frame(key: &str, title: &str, note: String, app: &App, p: &Paint) 
                         .color(p.c.text_muted)
                         .grow(1.0)
                         .truncate(),
-                ),
+                )
+                .children(action),
         )
         .children(outcome(app, p))
 }
@@ -163,6 +171,49 @@ pub(crate) fn scrolled(key: &str, body: El, p: &Paint) -> El {
         .scroll_edge_fade(8.0)
         .child(body);
     p.k.scroll_bar(area).w_full().grow(1.0).min_h(0.0)
+}
+
+/// One choice of several as a wrapping row of buttons, the picked one filled.
+pub(crate) fn pills(
+    key: &str,
+    options: &[(String, String)],
+    picked: Option<&str>,
+    pick: impl Fn(&mut App, &str) + Clone + 'static,
+    p: &Paint,
+) -> El {
+    let mut row_ = row().key(key.to_string()).gap(6.0).flex_wrap();
+    for (value, label) in options {
+        let on = picked == Some(value.as_str());
+        let (pick, value) = (pick.clone(), value.clone());
+        row_ = row_.child(
+            Button::new(label.clone())
+                .variant(if on {
+                    ButtonVariant::Submit
+                } else {
+                    ButtonVariant::Outline
+                })
+                .on_press(move |app: &mut App| pick(app, &value))
+                .build(p.k)
+                .key(format!(
+                    "{key}-{}",
+                    label.to_ascii_lowercase().replace(' ', "-")
+                )),
+        );
+    }
+    row_
+}
+
+/// A labelled field in a form.
+pub(crate) fn field(label: &str, control: El, p: &Paint) -> El {
+    col()
+        .w_full()
+        .gap(6.0)
+        .child(
+            text(label.to_string())
+                .font(p.k.ty.small_medium)
+                .color(p.c.text_muted),
+        )
+        .child(control)
 }
 
 /// A small muted heading over a group of rows.
