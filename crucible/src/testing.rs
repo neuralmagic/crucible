@@ -86,8 +86,10 @@ pub(crate) fn answer_one_request(
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
     let (line, headers) = head.split_once("\r\n").unwrap_or((head.as_str(), ""));
     let body = buf[head_end + 4..head_end + 4 + len].to_vec();
-    s.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
-        .expect("respond");
+    s.write_all(
+        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+    )
+    .expect("respond");
     let _ = s.flush();
     (line.to_string(), headers.to_ascii_lowercase(), body)
 }
