@@ -326,8 +326,16 @@ fn dispatch<'v>(
         .then(|| kwargs.get("name")?.unpack_str())
         .flatten()
         .and_then(|name| TaskName::declared(name).ok());
+    let written: Vec<TaskName> = kwargs
+        .get("depends_on")
+        .and_then(|listed| ListRef::from_value(*listed))
+        .map(|listed| listed.iter().filter_map(task_named).collect())
+        .unwrap_or_default();
     let failed = |heap: Heap<'v>| match broken.clone() {
-        Some(name) => heap.alloc(BrokenTask(name)),
+        Some(name) => {
+            state.sketch_broken(&name, written.clone());
+            heap.alloc(BrokenTask(name))
+        }
         None => heap.alloc(PoisonValue),
     };
     let follows_an_error = args
@@ -346,6 +354,17 @@ fn dispatch<'v>(
             Ok(failed(heap))
         }
     }
+}
+
+/// The task a `depends_on` entry names, when it names one by value.
+fn task_named(entry: Value<'_>) -> Option<TaskName> {
+    if let Some(task) = TaskValue::from_value(entry) {
+        return Some(task.0.name.clone());
+    }
+    if let Some(broken) = BrokenTask::from_value(entry) {
+        return Some(broken.0.clone());
+    }
+    OptionalValue::from_value(entry).map(|optional| optional.0.clone())
 }
 
 /// The constructors that build a task, which a failure leaves standing by name.

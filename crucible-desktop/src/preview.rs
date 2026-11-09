@@ -1,12 +1,13 @@
 //! A pack compiled the way a run would admit it, before anything runs: the linked engine
 //! compiles its workflow source with the params' defaults (or stand-ins for required ones), and
 //! the admitted plan folds like the first line of a run's session, so the graph, tasks and
-//! declared fields show what a launch would start.
+//! declared fields show what a launch would start. A pack that does not compile folds the tasks
+//! the engine got to, with the ones it could not build named in `broken`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crucible::plan::starlark::{compile_file_with, declared_params, parent_or_cwd, placeholder};
+use crucible::plan::starlark::{check_file_with, declared_params, parent_or_cwd, placeholder};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -20,6 +21,8 @@ pub struct Preview {
     pub params_schema: Option<Value>,
     /// The engine's refusals, verbatim, each with the first `file:line` it names.
     pub problems: Vec<Problem>,
+    /// Tasks in `fold` standing in for ones the engine could not build.
+    pub broken: Vec<String>,
     /// The workflow source the pack names, when it names one.
     pub source: Option<PathBuf>,
 }
@@ -124,10 +127,19 @@ pub fn compile(pack: &Path) -> Preview {
     };
     let params = defaults(&schema);
     preview.params_schema = Some(schema);
-    let compiled = match compile_file_with(&source, parent_or_cwd(&source), &params) {
+    let checked = check_file_with(&source, parent_or_cwd(&source), &params);
+    let compiled = match checked.outcome {
         Ok(compiled) => compiled,
         Err(e) => {
-            refuse(&mut preview, crucible::errors::report(&e));
+            for error in e.each() {
+                refuse(&mut preview, crucible::errors::report(error));
+            }
+            if let Some(sketch) = checked.sketch {
+                preview
+                    .fold
+                    .apply(crucible::plan::admitted::plan_sketched(&sketch.tasks));
+                preview.broken = sketch.broken.into_iter().map(|name| name.0).collect();
+            }
             return preview;
         }
     };
@@ -275,5 +287,48 @@ mod tests {
             "{problem:?}"
         );
         assert!(!compile(&dir.path().join("nope")).problems.is_empty());
+    }
+
+    #[test]
+    fn a_pack_that_does_not_compile_still_shows_its_graph_and_every_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        pack(
+            dir.path(),
+            concat!(
+                "scan = command(name = \"scan\", run = \"true\", emits = {\"cves\": \"list\"})\n",
+                "fix = agent(name = \"fix\", prompt = \"p\", over = each(scan.cves, max = 4), effort = \"hgih\")\n",
+                "sum = command(name = \"sum\", run = \"true\", depends_on = [fix], join = \"some\")\n",
+                "done = command(name = \"done\", run = \"true\", depends_on = [sum])\n",
+                "workflow(type = \"playbook\", tasks = [scan, fix, sum, done])\n",
+            ),
+        );
+        let preview = compile(dir.path());
+        let said: Vec<(Option<u32>, bool)> = preview
+            .problems
+            .iter()
+            .map(|problem| {
+                (
+                    problem.at.as_ref().map(|(_, line)| *line),
+                    problem.message.contains("hgih") || problem.message.contains("some"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            said,
+            [(Some(2), true), (Some(3), true)],
+            "{:?}",
+            preview.problems
+        );
+        let drawn: Vec<(&str, &[String])> = preview
+            .fold
+            .tasks
+            .iter()
+            .map(|task| (task.name.as_str(), task.depends_on.as_slice()))
+            .collect();
+        assert_eq!(drawn.len(), 4, "{drawn:?}");
+        assert_eq!(drawn[0], ("scan", [].as_slice()));
+        assert_eq!(drawn[2], ("sum", ["fix".to_owned()].as_slice()));
+        assert_eq!(drawn[3], ("done", ["sum".to_owned()].as_slice()));
+        assert_eq!(preview.broken, ["fix", "sum"]);
     }
 }

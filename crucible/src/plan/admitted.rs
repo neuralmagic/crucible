@@ -1,7 +1,7 @@
 //! The session event a plan run opens with: the admitted graph, task by task. A viewer that folds
 //! a run's session can fold this to show a plan before anything runs.
 
-use crate::plan::ir::{TaskName, ValidPlan};
+use crate::plan::ir::{Task, TaskName, ValidPlan};
 
 /// `history_record` is the playbook's record task, which lives on the workflow rather than the
 /// plan; a scored loop has none.
@@ -17,49 +17,65 @@ pub fn plan_admitted(
         budget_usd: p.budget.usd,
         tasks: plan
             .tasks_topo()
-            .map(|t| crucible_contract::session::PlanTaskWire {
-                name: t.name.0.clone(),
-                kind: t.task.label().to_string(),
-                depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
-                optional: t.optional.iter().map(|d| d.0.clone()).collect(),
-                session: t.session.clone().unwrap_or_default(),
-                needs: t.needs.clone(),
-                required: t.required,
-                join: t.join.as_str().to_string(),
-                stage: t.stage.as_str().to_string(),
-                over: t
-                    .over
-                    .as_ref()
-                    .map(crate::plan::ir::OutputRef::to_string)
-                    .unwrap_or_default(),
-                max_fanout: t.max_fanout.unwrap_or_default(),
-                when: t.when.as_ref().map(ToString::to_string).unwrap_or_default(),
-                keyed: t.keyed.iter().map(ToString::to_string).collect(),
-                revise: t
-                    .revise
-                    .as_ref()
-                    .map(|r| r.tasks.iter().map(|task| task.0.clone()).collect())
-                    .unwrap_or_default(),
-                max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
-                emits: t
-                    .emits
-                    .fields()
-                    .into_iter()
-                    .map(|(field, ty)| crucible_contract::emits::EmitWire {
-                        field: field.0.clone(),
-                        ty: ty.cloned(),
-                    })
-                    .collect(),
-                emits_files: t.emits_files.clone(),
-                timeout: t
-                    .timeout
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                history_depth: t.history.unwrap_or_default(),
-                definition: definitions.get(&t.name).cloned().unwrap_or_default(),
-            })
+            .map(|t| wire(t, definitions.get(&t.name).cloned().unwrap_or_default()))
             .collect(),
         history_record: history_record.map(|t| t.0.clone()).unwrap_or_default(),
+    }
+}
+
+/// The same event for a graph that was never admitted: the tasks of a pack that does not
+/// compile, in the order written, so a viewer can draw where the pack stands.
+pub fn plan_sketched(tasks: &[Task]) -> crucible_contract::session::SessionEvent {
+    crucible_contract::session::SessionEvent::PlanAdmitted {
+        plan_version: 1,
+        reason: String::new(),
+        budget_usd: 0.0,
+        tasks: tasks.iter().map(|t| wire(t, String::new())).collect(),
+        history_record: String::new(),
+    }
+}
+
+fn wire(t: &Task, definition: String) -> crucible_contract::session::PlanTaskWire {
+    crucible_contract::session::PlanTaskWire {
+        name: t.name.0.clone(),
+        kind: t.task.label().to_string(),
+        depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
+        optional: t.optional.iter().map(|d| d.0.clone()).collect(),
+        session: t.session.clone().unwrap_or_default(),
+        needs: t.needs.clone(),
+        required: t.required,
+        join: t.join.as_str().to_string(),
+        stage: t.stage.as_str().to_string(),
+        over: t
+            .over
+            .as_ref()
+            .map(crate::plan::ir::OutputRef::to_string)
+            .unwrap_or_default(),
+        max_fanout: t.max_fanout.unwrap_or_default(),
+        when: t.when.as_ref().map(ToString::to_string).unwrap_or_default(),
+        keyed: t.keyed.iter().map(ToString::to_string).collect(),
+        revise: t
+            .revise
+            .as_ref()
+            .map(|r| r.tasks.iter().map(|task| task.0.clone()).collect())
+            .unwrap_or_default(),
+        max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
+        emits: t
+            .emits
+            .fields()
+            .into_iter()
+            .map(|(field, ty)| crucible_contract::emits::EmitWire {
+                field: field.0.clone(),
+                ty: ty.cloned(),
+            })
+            .collect(),
+        emits_files: t.emits_files.clone(),
+        timeout: t
+            .timeout
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        history_depth: t.history.unwrap_or_default(),
+        definition,
     }
 }

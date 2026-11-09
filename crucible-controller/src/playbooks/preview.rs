@@ -159,7 +159,11 @@ pub(crate) fn preview_pack_for(
     let compiled = match compile_file_with(&source, parent_or_cwd(&source), &params) {
         Ok(compiled) => compiled,
         Err(e) => {
-            preview.diagnostics.push(crucible::errors::report(&e));
+            preview.diagnostics.extend(
+                e.each()
+                    .into_iter()
+                    .map(|error| crucible::errors::report(error)),
+            );
             return Ok(preview);
         }
     };
@@ -260,6 +264,32 @@ mod tests {
         };
         assert_eq!(emits("scan"), ["targets", "tier"]);
         assert_eq!(emits("audit"), ["note"]);
+    }
+
+    #[test]
+    fn every_error_of_a_refused_compile_is_its_own_diagnostic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = write_playbook_pack(
+            dir.path(),
+            "a = agent(name = \"a\", prompt = \"p\", effort = \"hgih\")\n\
+             b = command(name = \"b\", run = \"true\", depends_on = [a], join = \"some\")\n\
+             workflow(type = \"playbook\", tasks = [a, b])\n",
+        );
+        let preview =
+            preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse, None).expect("previews");
+        assert_eq!(preview.diagnostics.len(), 2, "{:?}", preview.diagnostics);
+        assert!(
+            preview.diagnostics[0].contains("workflow.star:1:")
+                && preview.diagnostics[0].contains("hgih"),
+            "{:?}",
+            preview.diagnostics
+        );
+        assert!(
+            preview.diagnostics[1].contains("workflow.star:2:")
+                && preview.diagnostics[1].contains("\"some\""),
+            "{:?}",
+            preview.diagnostics
+        );
     }
 
     #[test]
