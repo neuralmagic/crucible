@@ -276,6 +276,11 @@ fn run_turn_with(
     deadline: Option<Deadline>,
     mut sink: impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> TurnOutcome {
+    let redactor = crucible_harness::redact::Redactor::with_rules(args.secret_rules.clone());
+    let mut sink = |line: &str, stream: RawStream, ev: Option<&AgentEvent>| {
+        let ev = ev.map(|ev| redactor.event(ev));
+        sink(&redactor.text(line), stream, ev.as_deref());
+    };
     // Start the in-process OTLP collector for a local claude turn when telemetry is opted in
     // . A bind failure degrades to telemetry-off: no collector, no otel_summary, the
     // pricing-table estimate stays the cost fallback. The `otel.jsonl` lands next to the session
@@ -289,7 +294,7 @@ fn run_turn_with(
             "127.0.0.1",
             0,
             otel_forward(&args.env),
-            crucible_harness::redact::Redactor::default(),
+            redactor.clone(),
         ) {
             Ok(c) => Some(c),
             Err(e) => {
@@ -484,7 +489,9 @@ mod tests {
     fn args(extra: &[&str]) -> Args {
         let mut argv = vec!["crucible"];
         argv.extend_from_slice(extra);
-        crate::cli::Cli::parse_from(argv).run
+        let mut args = crate::cli::Cli::parse_from(argv).run;
+        args.secret_rules = crate::testing::secret_rules();
+        args
     }
 
     #[test]
@@ -499,17 +506,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_io_defaults_compact_and_manifest_env_opts_in() {
+    fn tool_io_defaults_full_and_manifest_env_opts_out_with_compact() {
         let mut a = args(&[]);
-        assert!(!tool_io_full(&a.env), "compact by default");
-        a.env
-            .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "full".to_string()));
-        assert!(tool_io_full(&a.env));
-        // Any value other than "full" stays compact.
-        a.env.pop();
-        a.env
-            .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), "yes".to_string()));
-        assert!(!tool_io_full(&a.env));
+        assert!(tool_io_full(&a.env), "full by default");
+        for (value, full) in [
+            ("full", true),
+            ("yes", true),
+            ("compact", false),
+            (" Compact\n", false),
+        ] {
+            a.env
+                .push(("CRUCIBLE_SESSION_TOOL_IO".to_string(), value.to_string()));
+            assert_eq!(tool_io_full(&a.env), full, "{value:?}");
+            a.env.pop();
+        }
     }
 
     /// A temp workspace for a real turn (the `command` backend shells out for real).

@@ -220,6 +220,10 @@ fn tree_bytes(dir: &Path) -> u64 {
 }
 
 impl TaskRunner for HarnessRunner {
+    fn prepare(&mut self) {
+        self.args.compile_secret_rules();
+    }
+
     fn run(
         &mut self,
         task: &Task,
@@ -1879,6 +1883,7 @@ mod tests {
         let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
+        runner.args.secret_rules = crate::testing::secret_rules();
         let out = execute(
             &plan,
             &Substrate::default(),
@@ -4586,6 +4591,7 @@ workflow(type = "playbook", tasks = [discover, audit])
                 {"result": {"lanes": ["a"]}, "writes": {"RESULT.json": "{\"ok\": true}"}, "sleep_ms": 6000}
             ]}}),
         );
+        crate::testing::secret_rules();
         let started = std::time::Instant::now();
         let out = run_playbook(&dir);
         let plan = &out.results[&"plan".into()];
