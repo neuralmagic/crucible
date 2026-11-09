@@ -294,6 +294,60 @@ mod tests {
         assert_eq!(record, serde_json::json!({}));
     }
 
+    /// A refresh skips the declared params' schema, so a required param need not be supplied,
+    /// but it must be the only value and the playbook must declare something to refresh. Its
+    /// admission compiles the producer closure alone.
+    #[test]
+    fn a_refresh_launch_is_its_switch_alone_and_compiles_the_producer_closure() {
+        use crate::playbooks::registry::{compiled_plan, validate_params};
+        let schema = serde_json::json!({
+            "type": "object", "additionalProperties": false, "required": ["pr"],
+            "properties": {
+                "pr": {"type": "integer"},
+                "release": {"type": "string", "x-choices-from": {"task": "options", "field": "releases"}},
+            },
+        });
+        let params = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<std::collections::BTreeMap<String, String>>()
+        };
+        let refresh = params(&[("choices.refresh", "true")]);
+        assert_eq!(
+            validate_params(&schema, &refresh).unwrap(),
+            serde_json::json!({"choices.refresh": "true"})
+        );
+        for refused in [
+            params(&[("choices.refresh", "true"), ("pr", "1")]),
+            params(&[("choices.refresh", "yes")]),
+        ] {
+            assert!(validate_params(&schema, &refused).is_err(), "{refused:?}");
+        }
+        let mut plain = schema.clone();
+        plain["properties"]["release"]
+            .as_object_mut()
+            .unwrap()
+            .remove("x-choices-from");
+        assert!(validate_params(&plain, &refresh).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::testing::fixtures::write_playbook_pack(
+            dir.path(),
+            r#"params = {
+    "pr": {"type": "int", "required": True},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}
+options = command(name = "options", run = "./o.sh", emits = {"releases": "list"})
+work = agent(name = "work", prompt = "Backport " + str(param("pr")), depends_on = [options])
+workflow(type = "playbook", tasks = [options, work])
+"#,
+        );
+        let plan = compiled_plan(&root, &refresh, None).unwrap();
+        let names: Vec<&str> = plan.tasks_topo().map(|t| t.name.0.as_str()).collect();
+        assert_eq!(names, ["options"]);
+    }
+
     #[test]
     fn only_a_closed_snapshot_refuses_a_value() {
         let closed = serde_json::json!({"x-choices-snapshot": {"choices": ["a", "b"]}});

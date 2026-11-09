@@ -217,6 +217,16 @@ pub enum CompileError {
         detail: &'static str,
     },
     #[error(
+        "task {task:?} produces or feeds the choices of parameter {param:?}, but it changes with \
+         the launch values; a choices refresh runs without them, so build {task:?} from nothing \
+         param() returns"
+    )]
+    ChoiceProducerReadsParams { param: String, task: String },
+    #[error(
+        "a choices refresh needs a parameter that declares choices_from, and this source has none"
+    )]
+    RefreshWithoutProducers,
+    #[error(
         "no value for required parameter {name:?}{}",
         if doc.is_empty() { String::new() } else { format!(" ({doc})") }
     )]

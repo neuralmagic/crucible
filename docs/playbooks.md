@@ -342,6 +342,28 @@ crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max
 A string parameter that sets `"multiline": True` takes its value in a text area on the control
 plane's launch, schedule and ask forms. The value is still one string.
 
+A string parameter can take its choices from a task's output instead of a written list:
+
+```python
+params = {
+    "release": {"type": "string", "required": True,
+                "choices_from": {"task": "release_options", "field": "releases"}},
+}
+```
+
+The task must be in the same workflow, unmapped, and promise the field in `emits` as a list.
+The control plane offers the list from the latest passing run of that task, and refuses a
+launch value outside it. Add `"allow_other": True` to accept other values too. Before the task
+has passed once, the field takes any value.
+
+The task and everything it depends on must not depend on parameters, so they can run alone.
+The compiler checks this and names the task that does. Launch with `choices.refresh=true` and
+nothing else to run just those tasks and refresh the list:
+
+```sh
+crucible plan run --manifest crucible.toml --param choices.refresh=true --max-cost 1 --max-time 10m
+```
+
 Parameters go into prompts and skill arguments. They do not go into a command line. If you
 put a parameter into `run`, the compiler rejects the pack:
 

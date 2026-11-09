@@ -681,11 +681,12 @@ pub(crate) fn compiled_plan(
     variant: Option<&VariantName>,
 ) -> Result<crucible::plan::ir::ValidPlan, String> {
     let source = workflow_source(root, variant).map_err(|e| e.to_string())?;
-    let compiled = crucible::plan::starlark::compile_file_with(
-        &source,
-        crucible::plan::starlark::parent_or_cwd(&source),
-        params,
-    )
+    let pack_dir = crucible::plan::starlark::parent_or_cwd(&source);
+    let compiled = if is_refresh(params) {
+        crucible::plan::starlark::compile_refresh_file(&source, pack_dir)
+    } else {
+        crucible::plan::starlark::compile_file_with(&source, pack_dir, params)
+    }
     .map_err(|e| crucible::errors::report(&e))?;
     compiled
         .workflow
@@ -1356,6 +1357,9 @@ pub fn validate_params(
     schema: &serde_json::Value,
     params: &std::collections::BTreeMap<String, String>,
 ) -> Result<serde_json::Value, Vec<FieldError>> {
+    if params.contains_key(CHOICES_REFRESH) {
+        return validate_refresh(schema, params);
+    }
     let mut errors = Vec::new();
     let typed = serde_json::Value::Object(
         params
@@ -1414,6 +1418,50 @@ pub fn validate_params(
     } else {
         Err(errors)
     }
+}
+
+use crucible::manifest::launch::CHOICES_REFRESH;
+
+/// Whether `params` launch a choices refresh ([ADR-0074]) rather than the playbook's graph.
+///
+/// [ADR-0074]: ../../../docs/adr/ADR-0074.md
+pub(crate) fn is_refresh(params: &std::collections::BTreeMap<String, String>) -> bool {
+    params.get(CHOICES_REFRESH).map(String::as_str) == Some("true")
+}
+
+/// A choices refresh carries `choices.refresh = true` alone, and only a playbook that declares
+/// choices_from has anything to refresh. The declared params' schema does not apply: a refresh
+/// compiles without them.
+fn validate_refresh(
+    schema: &serde_json::Value,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<serde_json::Value, Vec<FieldError>> {
+    let refuse = |field: &str, message: &str| {
+        Err(vec![FieldError {
+            field: field.to_owned(),
+            message: message.to_owned(),
+        }])
+    };
+    if let Some(other) = params.keys().find(|k| *k != CHOICES_REFRESH) {
+        return refuse(other, "a choices refresh takes no other values");
+    }
+    if !is_refresh(params) {
+        return refuse(
+            CHOICES_REFRESH,
+            "a choices refresh is launched with the value true",
+        );
+    }
+    let declares = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|p| p.values().any(|v| v.get("x-choices-from").is_some()));
+    if !declares {
+        return refuse(
+            CHOICES_REFRESH,
+            "this playbook declares no choices_from parameter, so there is nothing to refresh",
+        );
+    }
+    Ok(serde_json::json!({ CHOICES_REFRESH: "true" }))
 }
 
 /// A param name as one JSON Pointer reference token.

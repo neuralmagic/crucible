@@ -133,6 +133,13 @@ pub enum ManifestError {
         declared: WorkflowType,
         compiled: WorkflowType,
     },
+    #[error(
+        "a choices refresh takes no parameters, but {} supplied",
+        names.join(", ")
+    )]
+    RefreshWithParams { names: Vec<String> },
+    #[error("a choices refresh needs a compiled workflow source, and this manifest has none")]
+    RefreshWithoutSource,
     #[error("a composite needs at least two [[component]] entries")]
     CompositeTooSmall,
     #[error("duplicate component domain `{domain}`")]
@@ -1253,6 +1260,17 @@ impl Manifest {
             }
             self.repo.git_ref = Some(r.clone());
         }
+        if launch.refresh() {
+            if !declared_params.is_empty() {
+                return Err(ManifestError::RefreshWithParams {
+                    names: declared_params.keys().cloned().collect(),
+                }
+                .into());
+            }
+            if !workflow.is_unresolved() {
+                return Err(ManifestError::RefreshWithoutSource.into());
+            }
+        }
         if !workflow.is_unresolved() {
             refuse_unconsumable(&declared_params)?;
             if !launch.is_empty() {
@@ -1264,9 +1282,12 @@ impl Manifest {
         let declared = workflow.workflow_type;
         let file = workflow.file.clone().unwrap_or_default();
         let source = manifest_dir.join(&file);
-        let compiled =
+        let compiled = if launch.refresh() {
+            crate::plan::starlark::compile_refresh_file(&source, manifest_dir)
+        } else {
             crate::plan::starlark::compile_file_with(&source, manifest_dir, &declared_params)
-                .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
+        }
+        .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
         if compiled.workflow.workflow_type != declared {
             return Err(ManifestError::WorkflowTypeMismatch {
                 declared,
@@ -2075,6 +2096,60 @@ mod tests {
             .expect("parses")
             .resolve_workflow_with(&dir, &std::collections::BTreeMap::new())
             .expect("nothing supplied, nothing to refuse");
+    }
+
+    /// `choices.refresh` compiles the producer closure in place of the graph, refuses declared
+    /// parameters beside it, and needs a source to compile.
+    #[test]
+    fn a_choices_refresh_compiles_the_producer_closure_and_takes_no_parameters() {
+        let dir = std::env::temp_dir().join(format!("crucible-wf-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("graph.star"),
+            r#"params = {
+    "pr": {"type": "int", "required": True},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}
+options = command(name = "options", run = "./o.sh", emits = {"releases": "list"})
+work = agent(name = "work", prompt = "Backport " + str(param("pr")), depends_on = [options])
+workflow(type = "playbook", tasks = [options, work])
+"#,
+        )
+        .unwrap();
+        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
+        let refresh = |pairs: &[(&str, &str)]| {
+            let supplied: std::collections::BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            let mut m = toml::from_str::<Manifest>(&task_manifest(table)).expect("parses");
+            m.resolve_workflow_with(&dir, &supplied).map(|()| m)
+        };
+        let m = refresh(&[("choices.refresh", "true")]).expect("refresh compiles");
+        let workflow = m.workflow.as_ref().unwrap();
+        assert_eq!(workflow.tasks.len(), 1);
+        assert_eq!(workflow.tasks[0].name.0, "options");
+        let Err(err) = refresh(&[("choices.refresh", "true"), ("pr", "7")]) else {
+            panic!("a refresh beside a parameter compiled");
+        };
+        assert!(err.to_string().contains("takes no parameters"), "{err:#}");
+        let inline = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .resolve_workflow_with(
+                &dir,
+                &std::collections::BTreeMap::from([(
+                    "choices.refresh".to_owned(),
+                    "true".to_owned(),
+                )]),
+            )
+            .expect_err("nothing to compile");
+        assert!(
+            err.to_string().contains("needs a compiled workflow source"),
+            "{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
