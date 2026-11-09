@@ -45,6 +45,13 @@ export function logPath(log: RunLog): string | null {
   return (log.text ?? '') === '' ? null : 'run.log';
 }
 
+/// The run page's engine log heading: where the output came from, and whether its head was
+/// dropped to fit the cap.
+export function logSectionNote(log: RunLog): string {
+  const source = log.dispatch === 'local' ? 'local process' : 'work pod';
+  return log.truncated ? `${source} · earlier output dropped` : source;
+}
+
 export type EvidenceKind = 'result' | 'payload' | 'file' | 'log';
 
 /// One row of the evidence list, and what the pane beside it reads. A body of null is a file the
