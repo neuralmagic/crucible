@@ -19,9 +19,9 @@ use starlark_syntax::codemap::FileSpan;
 use crate::plan::ir::TaskName;
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    AnswerRefValue, BoundValue, CONVERTED, DeciderValue, EachValue, ExternalText, OptionalValue,
-    OthersValue, OutputRefValue, QuestionValue, SchemaValue, SendBackValue, SessionValue,
-    TaskDefaultsValue, TaskValue, WhenValue, WorkflowValue,
+    AnswerRefValue, BoundValue, BrokenTask, CONVERTED, DeciderValue, EachValue, ExternalText,
+    OptionalValue, OthersValue, OutputRefValue, PoisonValue, QuestionValue, SchemaValue,
+    SendBackValue, SessionValue, TaskDefaultsValue, TaskValue, WhenValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -320,10 +320,62 @@ fn dispatch<'v>(
     eval: &mut Evaluator<'v, '_, '_>,
 ) -> starlark::Result<Value<'v>> {
     let (state, at) = compile_site(eval)?;
-    match call(function, args, kwargs, state, &at) {
-        Ok(value) => Ok(alloc(eval.heap(), value)),
-        Err(error) => Err(state.throw(error)),
+    let heap = eval.heap();
+    let broken = TASKS
+        .contains(&function)
+        .then(|| kwargs.get("name")?.unpack_str())
+        .flatten()
+        .and_then(|name| TaskName::declared(name).ok());
+    let failed = |heap: Heap<'v>| match broken.clone() {
+        Some(name) => heap.alloc(BrokenTask(name)),
+        None => heap.alloc(PoisonValue),
+    };
+    let follows_an_error = args
+        .items
+        .iter()
+        .chain(kwargs.values())
+        .any(|value| tainted(*value, 0))
+        || (ENDS.contains(&function) && state.has_errors());
+    if follows_an_error {
+        return Ok(failed(heap));
     }
+    match call(function, args, kwargs, state, &at) {
+        Ok(value) => Ok(alloc(heap, value)),
+        Err(error) => {
+            state.record(error);
+            Ok(failed(heap))
+        }
+    }
+}
+
+/// The constructors that build a task, which a failure leaves standing by name.
+const TASKS: &[&str] = &[
+    "agent", "skill", "command", "evaluate", "route", "report", "top_k", "propose", "apply",
+    "measure", "grade", "decide",
+];
+
+/// The constructors that assemble the graph, which an earlier error makes pointless to check.
+const ENDS: &[&str] = &["workflow", "default_autoresearch"];
+
+/// Whether `value` is, or holds, what a failed constructor handed back.
+fn tainted(value: Value<'_>, depth: usize) -> bool {
+    if depth > dsl::MAX_NESTING_DEPTH {
+        return false;
+    }
+    if PoisonValue::from_value(value).is_some() {
+        return true;
+    }
+    let inside = |value: Value<'_>| tainted(value, depth + 1);
+    if let Some(list) = ListRef::from_value(value) {
+        return list.iter().any(inside);
+    }
+    if let Some(tuple) = TupleRef::from_value(value) {
+        return tuple.iter().any(inside);
+    }
+    if let Some(dict) = DictRef::from_value(value) {
+        return dict.iter().any(|(key, value)| inside(key) || inside(value));
+    }
+    false
 }
 
 /// The compile state on the evaluator, and the call being evaluated.
@@ -532,6 +584,9 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     }
     if let Some(task) = TaskValue::from_value(value) {
         return Ok(dsl::Value::Task(Box::new(task.0.clone())));
+    }
+    if let Some(broken) = BrokenTask::from_value(value) {
+        return Ok(dsl::Value::Task(Box::new(dsl::placeholder(&broken.0))));
     }
     if let Some(output) = OutputRefValue::from_value(value) {
         return output.resolve().map(dsl::Value::Output);

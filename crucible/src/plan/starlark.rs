@@ -95,9 +95,24 @@ struct CompileContext {
     /// Bare-string session refs made before any declaration. A later declaration makes
     /// these errors: a session must be declared before use.
     string_session_refs: BTreeMap<String, FileSpan>,
-    /// The first [`CompileError`] a constructor raised, parked while the marker error unwinds
+    /// A [`CompileError`] that had to stop evaluation, parked while the marker error unwinds
     /// the evaluator.
     thrown: Option<CompileError>,
+    /// Every error a constructor raised and evaluation went on past.
+    errors: Vec<CompileError>,
+}
+
+/// How many errors one compile keeps.
+const MAX_ERRORS: usize = 64;
+
+/// A task standing in, by name, for one whose constructor failed.
+pub(crate) fn placeholder(name: &TaskName) -> Task {
+    Task {
+        task: TaskKind::Command {
+            command: String::new(),
+        },
+        ..engine(&name.0, EngineOp::Propose, None, Vec::new())
+    }
 }
 
 /// The route that answers a `when` reading `producer.field`.
@@ -387,6 +402,7 @@ impl CompileState {
                 bound_sessions: BTreeSet::new(),
                 string_session_refs: BTreeMap::new(),
                 thrown: None,
+                errors: Vec::new(),
             }),
         }
     }
@@ -411,6 +427,59 @@ impl CompileState {
 
     fn take_thrown(&self) -> Option<CompileError> {
         self.inner.borrow_mut().thrown.take()
+    }
+
+    /// Keep `error` and let evaluation go on. Past [`MAX_ERRORS`] the rest are dropped.
+    fn record(&self, error: CompileError) {
+        let mut context = self.inner.borrow_mut();
+        if context.errors.len() < MAX_ERRORS {
+            context.errors.push(error);
+        }
+    }
+
+    fn has_errors(&self) -> bool {
+        !self.inner.borrow().errors.is_empty()
+    }
+
+    fn error_count(&self) -> usize {
+        self.inner.borrow().errors.len()
+    }
+
+    /// Point each error recorded since `from` at the argument it is about.
+    fn narrow_from(&self, from: usize, idents: &idents::Idents) {
+        let mut context = self.inner.borrow_mut();
+        let recorded: Vec<CompileError> = context.errors.drain(from..).collect();
+        context.errors.extend(
+            recorded
+                .into_iter()
+                .map(|error| idents::narrow(error, idents)),
+        );
+    }
+
+    /// What the compile reports: `outcome` when no constructor failed, otherwise every recorded
+    /// error. An error that stopped evaluation is listed with them unless evaluation only
+    /// stopped on what a failed constructor handed back.
+    fn conclude<T>(&self, outcome: Result<T>) -> Result<T> {
+        let mut errors = std::mem::take(&mut self.inner.borrow_mut().errors);
+        if errors.is_empty() {
+            return outcome;
+        }
+        if let Err(stopped) = outcome {
+            let innermost = match &stopped {
+                CompileError::At { inner, .. } => inner.as_ref(),
+                other => other,
+            };
+            if !matches!(
+                innermost,
+                CompileError::Eval(_) | CompileError::Failed(_) | CompileError::NoWorkflowResult
+            ) {
+                errors.push(stopped);
+            }
+        }
+        Err(match errors.len() {
+            1 => errors.remove(0),
+            _ => CompileError::Many { errors },
+        })
     }
 
     fn into_context(self) -> CompileContext {
@@ -518,6 +587,9 @@ impl CompileError {
                     inner
                 }
             }
+            CompileError::Many { errors } => {
+                errors.iter().flat_map(CompileError::anchors).collect()
+            }
             CompileError::Parse { at, .. } => at.iter().cloned().collect(),
             CompileError::DroppedTasks { sites }
             | CompileError::LateSessionDeclaration { sites }
@@ -526,6 +598,14 @@ impl CompileError {
                 .map(|site| SourceAnchor::from(&site.at))
                 .collect(),
             _ => Vec::new(),
+        }
+    }
+
+    /// Each error this one stands for: itself, or every error a compile collected.
+    pub fn each(&self) -> Vec<&CompileError> {
+        match self {
+            CompileError::Many { errors } => errors.iter().collect(),
+            other => vec![other],
         }
     }
 
@@ -3329,14 +3409,20 @@ fn compile_source_here(
             }
         }
     }
-    let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
-    let mut workflow = catching_panics(|| {
+    let loader = match loader::resolve(&ast, &state, &globals, source.len(), lane) {
+        Ok(loader) => loader,
+        Err(error) => return state.conclude(Err(error)),
+    };
+    let evaluated = catching_panics(|| {
         Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
             let mut eval = Evaluator::new(&module);
             eval.extra = Some(&state);
             eval.set_loader(&loader);
             budgets(&mut eval)?;
-            match eval.eval_module(ast, &globals) {
+            let recorded = state.error_count();
+            let value = eval.eval_module(ast, &globals);
+            state.narrow_from(recorded, &idents);
+            match value {
                 Ok(value) => match WorkflowValue::from_value(value) {
                     Some(workflow) => Ok(workflow.0.clone()),
                     None => Err(CompileError::NoWorkflowResult),
@@ -3347,7 +3433,8 @@ fn compile_source_here(
                     .unwrap_or_else(|| idents::map_error(&error, &idents))),
             }
         })
-    })??;
+    })?;
+    let mut workflow = state.conclude(evaluated)?;
     let context = state.into_context();
     let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
     let site = |name: &String, at: &FileSpan| Site {
@@ -9735,5 +9822,181 @@ workflow(type = "playbook", tasks = [plan, draft, lint, proof, side, check])
             }),
             "plan is before the target and side is not downstream of it"
         );
+    }
+
+    /// Every error `source` compiles to, as (line, message).
+    fn errors(tag: &str, files: &[(&str, &str)], source: &str) -> Vec<(u32, String)> {
+        let pack = temp_pack(tag);
+        for (path, body) in files {
+            std::fs::write(pack.join(path), body).unwrap();
+        }
+        let error = compile_source(source, &pack.join("workflow.star"), &pack)
+            .err()
+            .unwrap_or_else(|| panic!("compiled: {source}"));
+        let _ = std::fs::remove_dir_all(&pack);
+        error
+            .each()
+            .into_iter()
+            .map(|error| {
+                (
+                    error.anchor().map_or(0, |at| at.span.begin_line),
+                    error.message(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_constructor_error_is_reported_where_it_was_written() {
+        let found = errors(
+            "all-errors",
+            &[],
+            r#"a = command(name = "a", run = "true", bogus = 1)
+b = agent(name = "b", prompt = "p", effort = "hgih")
+c = agent(name = "c", prompt = prompt_file("missing.md"))
+d = command(name = "d", run = "true")
+workflow(type = "playbook", tasks = [a, b, c, d])
+"#,
+        );
+        let lines: Vec<u32> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, [1, 2, 3], "{found:#?}");
+        assert!(
+            found[0].1.contains("unknown argument \"bogus\""),
+            "{found:#?}"
+        );
+        assert!(found[1].1.contains("unknown effort \"hgih\""), "{found:#?}");
+        assert!(found[2].1.contains("missing.md"), "{found:#?}");
+    }
+
+    #[test]
+    fn collected_errors_render_one_per_line_with_their_sites() {
+        let pack = temp_pack("all-errors-rendered");
+        let error = compile_source(
+            "a = command(name = \"a\", run = \"true\", bogus = 1)\n\
+             b = command(name = \"b\", run = \"true\", join = \"some\")\n\
+             workflow(type = \"playbook\", tasks = [a, b])\n",
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap_err();
+        assert!(matches!(&error, CompileError::Many { errors } if errors.len() == 2));
+        let rendered = error.to_string();
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines.len(), 2, "{rendered}");
+        assert!(
+            lines[0].contains("workflow.star:1:") && lines[0].contains("bogus"),
+            "{rendered}"
+        );
+        assert!(
+            lines[1].contains("workflow.star:2:") && lines[1].contains("\"some\""),
+            "{rendered}"
+        );
+        assert_eq!(error.anchors().len(), 2);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn what_follows_a_failed_constructor_is_checked_but_not_blamed_for_it() {
+        let found = errors(
+            "errors-follow",
+            &[],
+            r#"scan = command(name = "scan", run = "true", emits = {"items": "lsit"})
+fan = command(name = "fan", run = "true", over = each(scan.items, max = 4))
+gate = route(name = "gate", decider = output(scan), questions = {"q": noul(ask = "q?")})
+go = command(name = "go", run = "true", when = gate.q, depends_on = [fan])
+late = command(name = "late", run = "true", depends_on = [scan], join = "some")
+text = prompt_file("missing.md") + "\nmore"
+ask = agent(name = "ask", prompt = text, depends_on = [late])
+workflow(type = "playbook", tasks = [scan, fan, gate, go, late, ask], result = ask)
+"#,
+        );
+        let said: Vec<(u32, bool)> = found
+            .iter()
+            .map(|(line, message)| (*line, message.is_empty()))
+            .collect();
+        assert_eq!(said, [(1, false), (5, false), (6, false)], "{found:#?}");
+        assert!(found[0].1.contains("lsit"), "{found:#?}");
+        assert!(found[1].1.contains("\"some\""), "{found:#?}");
+        assert!(found[2].1.contains("missing.md"), "{found:#?}");
+    }
+
+    #[test]
+    fn evaluation_that_stops_on_a_failed_constructor_reports_only_the_failure() {
+        let found = errors(
+            "errors-stop",
+            &[],
+            "a = agent(prompt = \"p\")\nfor part in a:\n    pass\nworkflow(type = \"playbook\", tasks = [a])\n",
+        );
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].0, 1);
+        assert!(found[0].1.contains("\"name\""), "{found:#?}");
+    }
+
+    #[test]
+    fn an_error_that_stops_evaluation_by_itself_is_listed_with_the_rest() {
+        let found = errors(
+            "errors-stop-load",
+            &[],
+            "a = command(name = \"a\", run = \"true\", bogus = 1)\nfail(\"stop\")\n",
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "a fail() after an error may be its consequence: {found:#?}"
+        );
+
+        let found = errors(
+            "errors-alone",
+            &[],
+            "a = command(name = \"a\", run = \"true\")\nfail(\"stop\")\n",
+        );
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].1.contains("stop"), "{found:#?}");
+    }
+
+    #[test]
+    fn a_loaded_modules_errors_are_reported_beside_the_entrys() {
+        let pack = temp_pack("errors-loaded");
+        std::fs::write(
+            pack.join("lib.star"),
+            "shared = command(name = \"shared\", run = \"true\", bogus = 1)\n",
+        )
+        .unwrap();
+        let error = compile_source(
+            "load(\"lib.star\", \"shared\")\n\
+             own = command(name = \"own\", run = \"true\", depends_on = [shared], join = \"some\")\n\
+             workflow(type = \"playbook\", tasks = [shared, own])\n",
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap_err();
+        let sites: Vec<(String, u32)> = error
+            .anchors()
+            .into_iter()
+            .map(|at| {
+                let file = Path::new(&at.file)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                (file, at.span.begin_line)
+            })
+            .collect();
+        assert_eq!(
+            sites,
+            [("lib.star".to_owned(), 1), ("workflow.star".to_owned(), 2)]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_compile_keeps_a_bounded_number_of_errors() {
+        let found = errors(
+            "errors-bounded",
+            &[],
+            "tasks = [command(name = \"t%d\" % i, run = \"true\", bogus = 1) for i in range(200)]\n\
+             workflow(type = \"playbook\", tasks = tasks)\n",
+        );
+        assert_eq!(found.len(), MAX_ERRORS);
     }
 }
