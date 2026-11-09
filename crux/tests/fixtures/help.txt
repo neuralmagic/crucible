@@ -52,6 +52,7 @@ Commands:
   issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the
                         event trail
   adopt                 Adopt a scenario: a controller issue with no upstream
+  cancel                Cancel a playbook launch: park it and delete its running pods
   park                  Park an issue: stop working it, and record why
   unpark                Unpark an issue so the controller picks it up again
   bump                  Change an issue's priority. Higher runs sooner
@@ -194,6 +195,7 @@ Commands:
   issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the
                         event trail
   adopt                 Adopt a scenario: a controller issue with no upstream
+  cancel                Cancel a playbook launch: park it and delete its running pods
   park                  Park an issue: stop working it, and record why
   unpark                Unpark an issue so the controller picks it up again
   bump                  Change an issue's priority. Higher runs sooner
@@ -1951,6 +1953,59 @@ Options:
           
   -h, --help
           Print help
+==== crux cancel --help ====
+Cancel a playbook launch: park it and delete its running pods
+
+Usage: crux cancel [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>
+          Issue key the launch became
+
+Options:
+      --config <CONFIG>
+          Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
+          `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
+          wins over the file
+          
+          [env: CONTROLLER_CONFIG=]
+
+      --json
+          
+
+      --url <URL>
+          Controller base URL: the API route. Defaults to a controller on this machine,
+          `http://127.0.0.1:8870`
+          
+          [env: CONTROLLER_URL=]
+
+      --api-token <API_TOKEN>
+          The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
+          controller's static token, which authenticates as nobody
+          
+          [env: CONTROLLER_API_TOKEN]
+
+  -h, --help
+          Print help
+==== crux cancel -h ====
+Cancel a playbook launch: park it and delete its running pods
+
+Usage: crux cancel [OPTIONS] <KEY>
+
+Arguments:
+  <KEY>  Issue key the launch became
+
+Options:
+      --config <CONFIG>        Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux`
+                               (else `~/.config/crux`), which may be absent; a path given here must
+                               exist. A flag or env var wins over the file [env: CONTROLLER_CONFIG=]
+      --json                   
+      --url <URL>              Controller base URL: the API route. Defaults to a controller on this
+                               machine, `http://127.0.0.1:8870` [env: CONTROLLER_URL=]
+      --api-token <API_TOKEN>  The bearer: a minted `crk_` key, which authenticates as the person
+                               who minted it, or the controller's static token, which authenticates
+                               as nobody [env: CONTROLLER_API_TOKEN]
+  -h, --help                   Print help
 ==== crux park --help ====
 Park an issue: stop working it, and record why
 
@@ -4360,6 +4415,7 @@ Commands:
   issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the
                         event trail
   adopt                 Adopt a scenario: a controller issue with no upstream
+  cancel                Cancel a playbook launch: park it and delete its running pods
   park                  Park an issue: stop working it, and record why
   unpark                Unpark an issue so the controller picks it up again
   bump                  Change an issue's priority. Higher runs sooner
@@ -4476,6 +4532,7 @@ Commands:
   issue                 One issue in full: provenance, the whole park reason, scopes, runs, and the
                         event trail
   adopt                 Adopt a scenario: a controller issue with no upstream
+  cancel                Cancel a playbook launch: park it and delete its running pods
   park                  Park an issue: stop working it, and record why
   unpark                Unpark an issue so the controller picks it up again
   bump                  Change an issue's priority. Higher runs sooner

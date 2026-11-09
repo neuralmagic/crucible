@@ -3429,6 +3429,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/publish",
         "/api/playbook-runs",
         "/api/playbook-runs/{key}",
+        "/api/playbook-runs/{key}/cancel",
         "/api/one-shots",
         "/api/one-shots/{id}",
         "/api/schedules",
@@ -7605,6 +7606,86 @@ fn one_shot_body(fire_at: &str) -> serde_json::Value {
         "max_time": "30m",
         "fire_at": fire_at,
     })
+}
+
+/// A cancel is queued as an override for the daemon by whoever may update the launch's run: its
+/// owner or an administrator. Anyone else does not learn the launch is there.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_is_cancelled_by_its_owner_or_an_administrator_and_no_one_else(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let sink = test_sink();
+    let app = app_with_sink(
+        db.clone(),
+        sink.clone(),
+        vec!["wren".to_string()],
+        vec!["olive".to_string()],
+    );
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let (status, ack) = post_launch(
+        &app,
+        "survey",
+        serde_json::json!({"params": {"topic": "t", "depth": "deep"}, "max_cost": 1.0, "max_time": "30m"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{ack}");
+    let key = ack["key"].as_str().expect("key").to_string();
+    sqlx::query(
+        "UPDATE playbook_launches SET created_by = 'alice', owner = 'user:alice' WHERE key = $1",
+    )
+    .bind(&key)
+    .execute(db.pool())
+    .await?;
+    let cancel = format!("/api/playbook-runs/{}/cancel", urlencoding_encode(&key));
+
+    let (status, _) = send(&app, "POST", &cancel, "mallory", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a stranger may not cancel, nor learn the launch is there"
+    );
+    assert!(sink.pending().is_empty());
+
+    let (status, body) = send(&app, "POST", &cancel, "alice", None).await;
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "the launcher may: {}",
+        String::from_utf8_lossy(&body)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(v["reason"], "cancelled by alice");
+    let calls = sink.pending();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].key.0, key);
+    assert_eq!(calls[0].kind, crate::daemon::queue::OverrideKind::Cancel);
+    assert_eq!(calls[0].actor.as_deref(), Some("alice"));
+
+    let (status, _) = send(&app, "POST", &cancel, "wren", None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "an administrator may");
+    assert_eq!(sink.pending()[0].actor.as_deref(), Some("wren"));
+
+    let issue = crate::issues::store::get_issue(db.pool(), &key)
+        .await?
+        .expect("issue");
+    assert_ne!(
+        issue.status,
+        crate::model::Status::Parked,
+        "the request writes nothing itself"
+    );
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/playbook-runs/playbook%3Asurvey%3Anope/cancel",
+        "olive",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
 }
 
 /// The runs section is the relaunch source: every launch, a schedule's firings included, with the

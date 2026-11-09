@@ -760,6 +760,15 @@ impl Client {
         self.get("/api/whoami").await
     }
 
+    /// Cancel playbook launch `key`: the controller parks it and deletes its running pods.
+    pub async fn cancel_launch(&self, key: &str) -> Result<dto::CancelAck> {
+        self.post(
+            &format!("/api/playbook-runs/{}/cancel", encode(key)),
+            None::<&serde_json::Value>,
+        )
+        .await
+    }
+
     pub async fn park<T: DeserializeOwned>(&self, key: &str, reason: &str) -> Result<T> {
         let body = serde_json::json!({ "reason": reason });
         self.post(&format!("/api/issues/{}/park", encode(key)), Some(&body))

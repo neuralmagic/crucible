@@ -228,6 +228,39 @@ impl Operation for PlaybookRuns {
     }
 }
 
+/// Stop a playbook launch: the controller parks it, deletes its running runs' pods on the
+/// clusters they run on, and marks those runs cancelled.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
+pub struct Cancel {
+    /// Issue key the launch became.
+    #[schemars(description = "The launch's issue key, as playbook-runs lists it.")]
+    pub key: String,
+    #[arg(long)]
+    #[serde(default)]
+    pub json: bool,
+}
+
+impl Operation for Cancel {
+    type Output = crate::dto::CancelAck;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        Ok(serde_json::to_value(c.cancel_launch(&self.key).await?)?)
+    }
+
+    fn render(&self, _c: &Client, ack: Self::Output) -> Result<String> {
+        Ok(crate::render::ack(
+            "cancel",
+            &ack.key,
+            ack.actor.as_deref(),
+            &format!("reason: {}", ack.reason),
+        ))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
 /// One launch, whole. Always JSON: its `params` are arbitrary and the refusals are long, and
 /// both are exactly what a caller reads this for.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]

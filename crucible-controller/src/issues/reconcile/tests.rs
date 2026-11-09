@@ -8390,6 +8390,131 @@ async fn a_finished_spoke_pod_of_a_human_parked_playbook_run_is_collected_by_the
     Ok(())
 }
 
+/// The live failure behind two playbook launches left `running` for days: their pods were gone
+/// from the spoke and their pod rows already closed, so the resync, which read only `running` pod
+/// rows, never looked at the runs again. It now re-drives a `running` run whatever its pod row
+/// says, and the run is recorded lost.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_running_run_whose_pod_row_closed_is_recorded_lost_by_the_resync(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-31";
+    let pod = "crucible-run-glowing-coati";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-stuck-1",
+        pod,
+        "pirate",
+        std::time::Duration::from_secs(92 * 60 * 60),
+    )
+    .await?;
+    crate::runs::work_pods::set_work_pod_state(
+        db.pool(),
+        pod,
+        crate::runs::workpod::WorkPodState::Failed,
+        None,
+        Some("pod gone"),
+    )
+    .await?;
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher {
+        gone: true,
+        ..ClusterRunPodDispatcher::on("pirate", crate::runs::workpod::TurnPhase::TimedOut)
+    });
+
+    let enqueued = resync_and_reconcile(&db, &cfg, dispatcher).await?;
+
+    assert_eq!(enqueued, vec![key.to_string()]);
+    assert_eq!(
+        run_status(&db, "run-stuck-1").await?,
+        "infrastructure-error"
+    );
+    assert!(
+        resync_tick(&db).await?.is_empty(),
+        "a settled run is not re-driven"
+    );
+    Ok(())
+}
+
+/// A cancel parks the launch as a human would, deletes its running pod on the spoke it runs on,
+/// and marks the run `cancelled`, so the resync has nothing left to settle.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-32";
+    let pod = "crucible-run-savvy-euglena";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-cancel-1",
+        pod,
+        "pirate",
+        std::time::Duration::from_secs(5 * 60),
+    )
+    .await?;
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher::on(
+        "pirate",
+        crate::runs::workpod::TurnPhase::TimedOut,
+    ));
+    let mut cfg = cfg_with(dir.path(), Profile::default());
+    cfg.runtime.dispatcher = dispatcher.clone();
+
+    let store = std::sync::Arc::new(crate::daemon::overrides::OverrideStore::new());
+    crate::daemon::overrides::QueueOverrideSink::new(
+        store.clone(),
+        crate::daemon::queue::WorkQueue::new(),
+    )
+    .submit(crate::daemon::queue::Override {
+        key: crate::daemon::queue::IssueKey(key.into()),
+        kind: crate::daemon::queue::OverrideKind::Cancel,
+        reason: None,
+        priority: None,
+        actor: Some("wseaton".into()),
+    });
+    let applied = crate::daemon::overrides::apply_pending(&db, &store, key, false)
+        .await?
+        .expect("the cancel was pending");
+    assert_eq!(applied.kind, crate::daemon::queue::OverrideKind::Cancel);
+    let cancelled =
+        crate::runs::cancel::cancel_runs(&db, &cfg, key, applied.actor.as_deref()).await?;
+
+    assert_eq!(cancelled, 1);
+    assert_eq!(run_status(&db, "run-cancel-1").await?, "cancelled");
+    assert_eq!(
+        dispatcher.deleted(),
+        vec![("pirate".to_string(), pod.to_string())],
+        "the pod is deleted on the spoke it runs on"
+    );
+    let row = work_pod(&db, pod).await?;
+    assert_eq!(row.state, crate::runs::workpod::WorkPodState::Collected);
+    assert_eq!(row.result.as_deref(), Some("cancelled by wseaton"));
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    assert_eq!(issue.parked_by, Some(ParkedBy::Human));
+    assert_eq!(issue.parked_reason.as_deref(), Some("cancelled by wseaton"));
+
+    reconcile(&db, &cfg, key).await?;
+    assert_eq!(run_status(&db, "run-cancel-1").await?, "cancelled");
+    assert!(
+        resync_tick(&db).await?.is_empty(),
+        "a cancelled run is not re-driven"
+    );
+    assert_eq!(
+        crate::runs::cancel::cancel_runs(&db, &cfg, key, Some("wseaton")).await?,
+        0,
+        "a second cancel finds nothing running"
+    );
+    Ok(())
+}
+
 /// The scenario wedge: a loop pod stuck in init, parked by hand, then deleted by hand. With its
 /// issue off `running`, nothing ever looked at the pod again. The resync records the loss on the
 /// run and its pod row without overriding the human park.
