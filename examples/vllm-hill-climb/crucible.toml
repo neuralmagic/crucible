@@ -1,0 +1,31 @@
+# vllm-hill-climb: a seed command builds vLLM once through the run's buildit; an agent then hill
+# climbs vLLM's fused MoE path on an A100, building each candidate as a layer over the seed and
+# measuring it as a Kueue Job; a last command reports the speedup, iteration times and build reuse.
+# See README.md.
+[workspace]
+inject = [
+    "seed.py",
+    "hc.py",
+    "report.py",
+    "build/Dockerfile",
+    "build/bench/moe_bench.py",
+    "build/bench/serve_bench.sh",
+    { src = "gitignore", dst = ".gitignore" },
+]
+
+[agent]
+backend       = "openshell"
+harness       = "claude"
+model         = "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-triage-cc@sha256:36a11bb264a7268962eaf982986a631e7a2673848b468f8c8fd636c559770333"
+goal          = "Make vLLM's fused MoE path faster on an A100 without changing its output."
+
+[agent.openshell]
+binaries = ["/usr/bin/git", "/usr/lib/git-core/git-remote-https"]
+
+[agent.resources]
+node_selector = { "kubernetes.io/arch" = "amd64" }
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
