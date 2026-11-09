@@ -1,5 +1,5 @@
 import { Mono } from '../ui';
-import { FormGrid, TextAreaField, TextField } from './formControls';
+import { FormGrid, SelectField, TextAreaField, TextField } from './formControls';
 import { spellingOf, type ParamFieldSpec } from './playbookLaunchForm';
 
 export interface PlaybookParamFieldsProps {
@@ -42,6 +42,16 @@ export function PlaybookParamFields({
             spec.description ??
             (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined)),
         };
+        if (spec.choices !== null) {
+          const blank = spec.required && spec.defaultValue !== null ? [] : [{ value: '', label: spec.required ? 'Select…' : '—' }];
+          return (
+            <SelectField
+              key={spec.name}
+              {...field}
+              options={[...blank, ...spec.choices.map((choice) => ({ value: choice, label: choice }))]}
+            />
+          );
+        }
         return spec.multiline ? (
           <TextAreaField key={spec.name} rows={8} {...field} />
         ) : (
