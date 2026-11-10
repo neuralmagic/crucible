@@ -25,6 +25,7 @@ use starlark_syntax::syntax::{AstModule, Dialect};
 use crate::crucible::Direction;
 use crate::duration::TaskTimeout;
 use crate::errors::FileError;
+use crate::knobs::{Harness, ReasoningEffort};
 use crate::plan::diag;
 use crate::plan::ir::{
     Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_REPAIR_CEILING,
@@ -37,7 +38,10 @@ use crate::plan::starlark::error::{
     MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SCHEMA_BYTES, MAX_SOURCE_BYTES,
     MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, Site, SourceAnchor,
 };
-use crate::plan::starlark::values::{SchemaFile, SessionDecl, WorkflowValue};
+use crate::plan::starlark::values::{
+    AnswerRef, Bound, DeciderSpec, DeclaredOutput, Each, SchemaFile, Selection, SessionDecl,
+    Subject, TaskDefaults, WhenSpec, WorkflowValue, resolve_output,
+};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 use crucible_contract::decision::{
     ChoiceOption, CompiledQuestion, DynamicChoice, IdentError, Label, NOUL_YES, OptionSource,
@@ -78,6 +82,12 @@ struct CompileContext {
     constructed_tasks: BTreeMap<String, FileSpan>,
     /// Tasks with `otherwise = True`, expanded in `workflow()`.
     otherwise: BTreeSet<String>,
+    /// Routes `workflow()` adds for a `when` that reads a task's field, by route name.
+    field_routes: BTreeMap<TaskName, FieldRoute>,
+    /// Tasks whose `depends_on` lists `others()`, expanded in `workflow()`.
+    others: BTreeSet<String>,
+    /// Tasks that set `required` themselves, which `task_defaults` leaves alone.
+    explicit_required: BTreeSet<String>,
     /// `session(...)` declarations by name, with the declaring site.
     sessions: BTreeMap<String, (SessionDecl, FileSpan)>,
     /// Declared sessions bound to at least one task.
@@ -88,6 +98,14 @@ struct CompileContext {
     /// The first [`CompileError`] a constructor raised, parked while the marker error unwinds
     /// the evaluator.
     thrown: Option<CompileError>,
+}
+
+/// The route that answers a `when` reading `producer.field`.
+#[derive(Debug)]
+struct FieldRoute {
+    producer: TaskName,
+    question: QuestionId,
+    asked: Question,
 }
 
 /// What a pack-relative path is being resolved for. Only the `FileError` context strings differ.
@@ -362,6 +380,9 @@ impl CompileState {
                 total_embedded_bytes: 0,
                 constructed_tasks: BTreeMap::new(),
                 otherwise: BTreeSet::new(),
+                field_routes: BTreeMap::new(),
+                others: BTreeSet::new(),
+                explicit_required: BTreeSet::new(),
                 sessions: BTreeMap::new(),
                 bound_sessions: BTreeSet::new(),
                 string_session_refs: BTreeMap::new(),
@@ -445,6 +466,20 @@ enum Value {
     Schema(SchemaFile),
     /// `optional(task)`: a dependency whose settling not taken satisfies an `all` join.
     Optional(TaskName),
+    /// `route.question.any_of(...)` or `route.question.otherwise()`.
+    When(WhenSpec),
+    /// `each(producer.field, max = N)`.
+    Each(Each),
+    /// `send_back(tasks, rounds = N)`.
+    SendBack(Revise),
+    /// `at_least(n)` or `at_most(n)`.
+    Bound(Bound),
+    /// `model(...)`, `human(...)`, or `output(task)`.
+    Decider(DeciderSpec),
+    /// `others()`.
+    Others,
+    /// `task_defaults(...)`.
+    Defaults(TaskDefaults),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -543,14 +578,20 @@ pub enum MaterializeError {
 /// The constructors every lane has.
 const COMMON_FUNCTIONS: &[&str] = &[
     "agent",
+    "at_least",
+    "at_most",
     "command",
+    "each",
     "skill",
     "evaluate",
     "param",
     "prompt_file",
     "report",
+    "others",
     "schema_file",
+    "send_back",
     "session",
+    "task_defaults",
     "workflow",
 ];
 
@@ -566,7 +607,9 @@ const SCORED_FUNCTIONS: &[&str] = &[
 ];
 
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
-const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "optional", "pick", "route", "score"];
+const ROUTED_FUNCTIONS: &[&str] = &[
+    "choice", "human", "model", "noul", "optional", "output", "pick", "route", "score",
+];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
@@ -691,9 +734,16 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "otherwise",
         ],
         "top_k" => &["name", "k", "direction", "depends_on", "required"],
+        "each" => &["list", "max"],
+        "send_back" => &["tasks", "rounds"],
+        "at_least" | "at_most" => &["bound"],
+        "model" => &["min_confidence", "files"],
+        "human" => &["review", "timeout"],
+        "output" => &["task"],
         "route" => &[
             "name",
             "questions",
+            "decider",
             "min_confidence",
             "source",
             "human",
@@ -728,7 +778,9 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         "grade" => &["name", "score", "tiebreak", "evidence", "join"],
         "decide" => &["name", "measurement", "depends_on"],
         "session" => &["name", "harness", "model", "effort"],
-        "workflow" => &["type", "tasks", "result", "history_record"],
+        "others" => &[],
+        "task_defaults" => &["required"],
+        "workflow" => &["type", "tasks", "defaults", "result", "history_record"],
         _ => &[],
     }
 }
@@ -753,12 +805,13 @@ fn constructor(
                 });
             }
         };
+        let defaults = match named.remove("defaults") {
+            None | Some(Value::None) => TaskDefaults::default(),
+            Some(Value::Defaults(defaults)) => defaults,
+            Some(_) => return Err(wrong_type("defaults", "task_defaults(...)")),
+        };
         let tasks = match take_value(&mut named, "tasks")? {
-            Value::List(tasks) => {
-                let mut tasks = task_list("workflow", tasks)?;
-                expand_otherwise(&mut tasks, state)?;
-                tasks
-            }
+            Value::List(tasks) => assemble(task_list("workflow", tasks)?, defaults, state)?,
             _ => return Err(CompileError::TasksNotList),
         };
         let result = take_optional_task_name(&mut named, "result")?;
@@ -773,6 +826,7 @@ fn constructor(
             edition: Default::default(),
             params: BTreeMap::new(),
             env: crate::host_env::DeclaredEnv::default(),
+            servers: Vec::new(),
             history_record,
         };
         workflow.validate()?;
@@ -784,9 +838,9 @@ fn constructor(
             return Err(CompileError::InvalidSessionName { name });
         }
         let decl = SessionDecl {
-            harness: take_optional_string(&mut named, "harness")?,
+            harness: take_choice(&mut named, "harness")?,
             model: take_optional_string(&mut named, "model")?,
-            effort: take_optional_string(&mut named, "effort")?,
+            effort: take_choice(&mut named, "effort")?,
             name,
         };
         no_unknown_kwargs(function, &named)?;
@@ -853,6 +907,10 @@ fn constructor(
             .map_err(|error| CompileError::InvalidQuestion { error })?;
         return Ok(Value::Question(question));
     }
+    if let Some(value) = value_constructor(function, &mut named, state)? {
+        no_unknown_kwargs(function, &named)?;
+        return Ok(value);
+    }
     if matches!(
         function,
         "prompt_file" | "schema_file" | "param" | "optional" | "default_autoresearch"
@@ -870,33 +928,42 @@ fn constructor(
             } else {
                 take_prompt(&mut named, "prompt")?
             };
-            let mut harness = take_optional_string(&mut named, "harness")?;
+            let mut harness: Option<Harness> = take_choice(&mut named, "harness")?;
             let mut model = take_optional_string(&mut named, "model")?;
-            let mut effort = take_optional_string(&mut named, "effort")?;
+            let mut effort: Option<ReasoningEffort> = take_choice(&mut named, "effort")?;
             let sandbox = take_optional_string(&mut named, "sandbox")?;
             let session = take_session(&mut named, state, at)?;
             if let Some(decl) = &session {
                 // A session is one serial conversation under one agent config, so
                 // declared defaults fill unset knobs and conflicts are errors.
-                for (knob, own, default) in [
-                    ("harness", &mut harness, &decl.harness),
-                    ("model", &mut model, &decl.model),
-                    ("effort", &mut effort, &decl.effort),
-                ] {
-                    let Some(theirs) = default else { continue };
-                    match own {
-                        None => *own = Some(theirs.clone()),
-                        Some(mine) if mine.as_str() != theirs.as_str() => {
-                            return Err(CompileError::SessionConfigConflict {
-                                task: name.0.clone(),
-                                knob,
-                                mine: mine.clone(),
-                                session: decl.name.clone(),
-                                theirs: theirs.clone(),
-                            });
-                        }
-                        Some(_) => {}
+                let conflict =
+                    |knob, mine: &str, theirs: &str| CompileError::SessionConfigConflict {
+                        task: name.0.clone(),
+                        knob,
+                        mine: mine.to_owned(),
+                        session: decl.name.clone(),
+                        theirs: theirs.to_owned(),
+                    };
+                match (harness, decl.harness) {
+                    (Some(mine), Some(theirs)) if mine != theirs => {
+                        return Err(conflict("harness", mine.as_str(), theirs.as_str()));
                     }
+                    (None, theirs) => harness = theirs,
+                    _ => {}
+                }
+                match (&model, &decl.model) {
+                    (Some(mine), Some(theirs)) if mine != theirs => {
+                        return Err(conflict("model", mine, theirs));
+                    }
+                    (None, theirs) => model = theirs.clone(),
+                    _ => {}
+                }
+                match (effort, decl.effort) {
+                    (Some(mine), Some(theirs)) if mine != theirs => {
+                        return Err(conflict("effort", mine.as_flag(), theirs.as_flag()));
+                    }
+                    (None, theirs) => effort = theirs,
+                    _ => {}
                 }
             }
             let kind = TaskKind::Agent {
@@ -917,10 +984,12 @@ fn constructor(
         }
         "evaluate" => {
             let name = take_declared_name(&mut named, "name")?;
+            let command = take_string(&mut named, "run")?;
+            let (threshold, direction) = take_bound(&mut named)?;
             let kind = TaskKind::Evaluate {
-                command: take_string(&mut named, "run")?,
-                threshold: take_optional_number(&mut named, "threshold")?,
-                direction: take_optional_direction(&mut named, "direction")?,
+                command,
+                threshold,
+                direction,
             };
             dsl_task(&mut named, state, name, kind, None)?
         }
@@ -1002,39 +1071,16 @@ fn constructor(
         "route" => {
             let name = take_declared_name(&mut named, "name")?;
             let questions = take_questions(&mut named)?;
-            let min_confidence = take_optional_number(&mut named, "min_confidence")?;
-            let source = take_optional_task_name(&mut named, "source")?;
-            let files = take_route_files(&mut named)?;
-            let human = take_bool_default(&mut named, "human", false)?;
-            let review = match take_optional_string(&mut named, "review")? {
-                Some(_) if !human => return Err(CompileError::ReviewWithoutHuman { task: name.0 }),
-                Some(path) => Some(state.context_mut().prompt_file(&path)?),
-                None => None,
+            let DeciderSpec { decider, timeout } = take_decider(&mut named, state, &name)?;
+            let needs = match decider {
+                Decider::Model { .. } => crate::plan::ir::NEEDS_DECISION,
+                Decider::Output { .. } => "any",
+                Decider::Human { .. } => crate::plan::ir::NEEDS_HUMAN,
             };
-            let timeout = take_timeout(&mut named)?;
-            if timeout.is_some() && !human {
-                return Err(CompileError::TimeoutWithoutHuman { task: name.0 });
-            }
-            let (decider, needs) = match (min_confidence, source, human) {
-                (Some(min_confidence), None, false) => (
-                    Decider::Model {
-                        min_confidence,
-                        files,
-                    },
-                    crate::plan::ir::NEEDS_DECISION,
-                ),
-                (None, Some(_), false) if !files.is_empty() => {
-                    return Err(CompileError::RouteFilesWithSource { task: name.0 });
-                }
-                (None, None, true) if !files.is_empty() => {
-                    return Err(CompileError::RouteFilesWithHuman { task: name.0 });
-                }
-                (None, Some(task), false) => (Decider::Output { task }, "any"),
-                (None, None, true) => (Decider::Human { review }, crate::plan::ir::NEEDS_HUMAN),
-                _ => return Err(CompileError::RouteDecider { task: name.0 }),
-            };
-            let (depends_on, optional) = take_dependencies(&mut named)?;
-            let task = Task {
+            let (depends_on, optional) = take_dependencies(&mut named, state, &name)?;
+            let (over, max_fanout) = take_fanout(&mut named)?;
+            note_explicit_required(&named, state, &name);
+            let mut task = Task {
                 task: TaskKind::Route { questions, decider },
                 depends_on,
                 optional,
@@ -1046,8 +1092,8 @@ fn constructor(
                 stage: parse_stage(&take_string_default(&mut named, "stage", "iteration")?)?,
                 emits: crate::plan::ir::Emits::default(),
                 emits_files: Vec::new(),
-                over: take_over(&mut named)?,
-                max_fanout: take_optional_fanout(&mut named)?,
+                over,
+                max_fanout,
                 keyed: take_keyed(&mut named)?,
                 revise: None,
                 timeout,
@@ -1056,6 +1102,7 @@ fn constructor(
                 history: None,
                 repair: 0,
             };
+            imply_dependencies(&mut task);
             check_fanout(&task)?;
             task
         }
@@ -1139,6 +1186,106 @@ fn constructor(
         });
     }
     Ok(Value::Task(Box::new(task)))
+}
+
+/// The constructors that build an argument value rather than a task.
+fn value_constructor(
+    function: &str,
+    named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
+) -> Result<Option<Value>> {
+    let value = match function {
+        "each" => {
+            let output = match take_value(named, "list")? {
+                Value::Output(output) => output,
+                _ => return Err(CompileError::OverNotOutputField),
+            };
+            let max = fanout_width(Some(take_value(named, "max")?))?.ok_or_else(|| {
+                CompileError::MissingArgument {
+                    argument: "max".to_owned(),
+                }
+            })?;
+            Value::Each(Each { output, max })
+        }
+        "send_back" => {
+            let tasks = match take_value(named, "tasks")? {
+                list @ Value::List(_) => task_names("tasks", list)?,
+                single => vec![task_name_entry("tasks", single)?],
+            };
+            if tasks.is_empty() {
+                return Err(CompileError::ReviseNamesNoTask);
+            }
+            let max_rounds =
+                revise_rounds(Some(take_value(named, "rounds")?))?.ok_or_else(|| {
+                    CompileError::MissingArgument {
+                        argument: "rounds".to_owned(),
+                    }
+                })?;
+            Value::SendBack(Revise { tasks, max_rounds })
+        }
+        "others" => Value::Others,
+        "task_defaults" => Value::Defaults(TaskDefaults {
+            required: match named.remove("required") {
+                None | Some(Value::None) => None,
+                Some(Value::Bool(required)) => Some(required),
+                Some(_) => return Err(wrong_type("required", "True or False")),
+            },
+        }),
+        "at_least" | "at_most" => {
+            let threshold = match take_value(named, "bound")? {
+                Value::Int(value) => f64::from(value),
+                Value::Float(value) => value,
+                _ => return Err(wrong_type("bound", "a number")),
+            };
+            let direction = if function == "at_least" {
+                Direction::Higher
+            } else {
+                Direction::Lower
+            };
+            Value::Bound(Bound {
+                threshold,
+                direction,
+            })
+        }
+        "model" => {
+            let min_confidence =
+                take_optional_number(named, "min_confidence")?.ok_or_else(|| {
+                    CompileError::MissingArgument {
+                        argument: "min_confidence".to_owned(),
+                    }
+                })?;
+            Value::Decider(DeciderSpec {
+                decider: Decider::Model {
+                    min_confidence,
+                    files: take_route_files(named)?,
+                },
+                timeout: None,
+            })
+        }
+        "human" => {
+            let review = match take_optional_string(named, "review")? {
+                Some(path) => Some(state.context_mut().prompt_file(&path)?),
+                None => None,
+            };
+            Value::Decider(DeciderSpec {
+                decider: Decider::Human { review },
+                timeout: take_timeout(named)?,
+            })
+        }
+        "output" => Value::Decider(DeciderSpec {
+            decider: Decider::Output {
+                task: take_task_name(named, "task")?,
+            },
+            timeout: None,
+        }),
+        _ => return Ok(None),
+    };
+    Ok(Some(value))
+}
+
+/// A deprecated argument written beside the value that replaces it.
+fn replaced(old: &'static str, new: &'static str) -> CompileError {
+    CompileError::ReplacedArgument { old, new }
 }
 
 fn no_unknown_kwargs(function: &str, named: &BTreeMap<String, Value>) -> Result<()> {
@@ -1264,6 +1411,7 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         edition: Default::default(),
         params: BTreeMap::new(),
         env: crate::host_env::DeclaredEnv::default(),
+        servers: Vec::new(),
         history_record: None,
     };
     workflow.validate()?;
@@ -1292,8 +1440,10 @@ fn dsl_task(
 ) -> Result<Task> {
     let when = take_when(named, state, &name)?;
     let repair = take_repair(named, &kind)?;
-    let (depends_on, optional) = take_dependencies(named)?;
-    let task = Task {
+    let (depends_on, optional) = take_dependencies(named, state, &name)?;
+    let (over, max_fanout) = take_fanout(named)?;
+    note_explicit_required(named, state, &name);
+    let mut task = Task {
         name,
         task: kind,
         depends_on,
@@ -1306,8 +1456,8 @@ fn dsl_task(
         stage: parse_stage(&take_string_default(named, "stage", "iteration")?)?,
         emits: take_output_fields(named)?,
         emits_files: take_emitted_files(named)?,
-        over: take_over(named)?,
-        max_fanout: take_optional_fanout(named)?,
+        over,
+        max_fanout,
         keyed: take_keyed(named)?,
         when,
         revise: take_revise(named)?,
@@ -1315,8 +1465,10 @@ fn dsl_task(
         history: take_optional_history(named)?,
         repair,
     };
+    imply_dependencies(&mut task);
     check_fanout(&task)?;
-    if task.join == Join::Settled && task.depends_on.is_empty() {
+    let others = state.context_mut().others.contains(&task.name.0);
+    if task.join == Join::Settled && task.depends_on.is_empty() && !others {
         return Err(CompileError::SettledJoinWithoutDependencies {
             task: task.name.0.clone(),
         });
@@ -1334,9 +1486,38 @@ fn dsl_task(
     Ok(task)
 }
 
-/// A fan-out reads its items from a dependency and states its width before it runs. Both are
-/// checked here, where the task is whole, rather than at plan validation, so the diagnostic
-/// carries the source location the constructor was written at.
+fn note_explicit_required(named: &BTreeMap<String, Value>, state: &CompileState, name: &TaskName) {
+    if named.contains_key("required") {
+        state.context_mut().explicit_required.insert(name.0.clone());
+    }
+}
+
+/// Add every task this one names in `over`, `keyed`, `when`, or a route's decider and questions
+/// to its dependencies.
+fn imply_dependencies(task: &mut Task) {
+    let mut implied: Vec<TaskName> = Vec::new();
+    implied.extend(task.over.iter().map(|reference| reference.task.clone()));
+    implied.extend(task.keyed.iter().map(|reference| reference.task.clone()));
+    implied.extend(task.when.iter().map(|when| when.task.clone()));
+    if let TaskKind::Route { questions, decider } = &task.task {
+        if let Decider::Output { task: source } = decider {
+            implied.push(source.clone());
+        }
+        for asked in questions.values() {
+            let source = asked.options_from().or_else(|| asked.pick_source());
+            implied.extend(source.map(|source| TaskName(source.task.clone())));
+        }
+    }
+    for dependency in implied {
+        if dependency != task.name && !task.depends_on.contains(&dependency) {
+            task.depends_on.push(dependency);
+        }
+    }
+}
+
+/// A fan-out states its width before it runs. Checked here, where the task is whole, rather
+/// than at plan validation, so the diagnostic carries the source location the constructor was
+/// written at.
 fn check_fanout(task: &Task) -> Result<()> {
     match (&task.over, task.max_fanout) {
         (None, None) => Ok(()),
@@ -1347,14 +1528,7 @@ fn check_fanout(task: &Task) -> Result<()> {
             task: task.name.0.clone(),
             reference: reference.to_string(),
         }),
-        (Some(reference), Some(_)) => {
-            if !task.depends_on.contains(&reference.task) {
-                return Err(CompileError::OverNotADependency {
-                    task: task.name.0.clone(),
-                    reference: reference.to_string(),
-                    producer: reference.task.0.clone(),
-                });
-            }
+        (Some(_), Some(_)) => {
             if let Some(session) = &task.session {
                 return Err(CompileError::OverWithSession {
                     task: task.name.0.clone(),
@@ -1484,8 +1658,9 @@ fn take_questions(
         .collect()
 }
 
-/// `when = gate.area` with `answers = [...]` or `otherwise = True`. A noul's `answers` defaults
-/// to `"yes"`.
+/// `when = gate.area.any_of(...)`, `when = gate.area.otherwise()`, or a bare `when = gate.area`,
+/// which on a noul means `"yes"`. The deprecated `answers` and `otherwise` arguments select for a
+/// bare question.
 fn take_when(
     named: &mut BTreeMap<String, Value>,
     state: &CompileState,
@@ -1493,7 +1668,7 @@ fn take_when(
 ) -> Result<Option<When>> {
     let answers = take_labels(named, "answers")?;
     let otherwise = take_bool_default(named, "otherwise", false)?;
-    let asked = match named.remove("when") {
+    let (asked, answers, otherwise) = match named.remove("when") {
         None | Some(Value::None) => {
             return match (answers, otherwise) {
                 (Some(_), _) => Err(CompileError::AnswersWithoutWhen),
@@ -1501,7 +1676,34 @@ fn take_when(
                 (None, false) => Ok(None),
             };
         }
-        Some(Value::Answer(asked)) => asked,
+        Some(Value::Answer(asked)) => (asked, answers, otherwise),
+        Some(Value::Output(output)) => (field_question(output, state)?, answers, otherwise),
+        Some(Value::When(spec)) => {
+            if answers.is_some() {
+                return Err(replaced("answers", "when = question.any_of(...)"));
+            }
+            if otherwise {
+                return Err(replaced("otherwise", "when = question.otherwise()"));
+            }
+            let asked = match spec.subject {
+                Subject::Question(asked) => asked,
+                Subject::Field {
+                    reference,
+                    declared,
+                } => field_question(resolve_output(&reference, &declared)?, state)?,
+            };
+            match spec.selection {
+                Selection::Otherwise => (asked, None, true),
+                Selection::NotLabels => return Err(wrong_type("any_of", "label strings")),
+                Selection::Answers(labels) => {
+                    let labels = labels
+                        .into_iter()
+                        .map(|label| identifier("any_of", Label::new(label)))
+                        .collect::<Result<Vec<_>>>()?;
+                    (asked, Some(labels), false)
+                }
+            }
+        }
         Some(_) => return Err(CompileError::WhenNotAnAnswer),
     };
     if otherwise {
@@ -1559,6 +1761,271 @@ fn take_when(
         is,
         any_option: false,
     }))
+}
+
+/// The question a `when` asks of `producer.field`: yes or no of a boolean, one of the labels of a
+/// label list. The route that answers it from the producer's output is added in `workflow()`.
+fn field_question(output: DeclaredOutput, state: &CompileState) -> Result<AnswerRef> {
+    let reference = output.reference;
+    let kind = match &output.ty {
+        Some(FieldType::Boolean) => Some(QuestionKind::Noul),
+        Some(FieldType::OneOf(labels)) if labels.len() >= 2 => Some(QuestionKind::Choice {
+            options: labels
+                .iter()
+                .map(|label| ChoiceOption {
+                    label: label.clone(),
+                    description: None,
+                })
+                .collect(),
+            multiple: false,
+        }),
+        _ => None,
+    };
+    let Some(kind) = kind else {
+        return Err(CompileError::WhenFieldNotAnswerable {
+            reference: reference.to_string(),
+            declared: output
+                .ty
+                .map_or_else(|| "untyped".to_owned(), |ty| ty.to_string()),
+        });
+    };
+    let question = identifier("when", QuestionId::new(reference.field.0.clone()))?;
+    let route = TaskName::declared(&format!("{}-{}", reference.task, reference.field.0))?;
+    let asked = Question {
+        instructions: reference.to_string(),
+        kind,
+        drop: Vec::new(),
+    };
+    state.context_mut().field_routes.insert(
+        route.clone(),
+        FieldRoute {
+            producer: reference.task,
+            question: question.clone(),
+            asked: asked.clone(),
+        },
+    );
+    Ok(AnswerRef {
+        task: route,
+        question,
+        asked: CompiledQuestion::Declared(asked),
+    })
+}
+
+/// Everything `workflow()` does to the listed tasks before the graph is validated.
+pub(crate) fn assemble(
+    mut tasks: Vec<Task>,
+    defaults: TaskDefaults,
+    state: &CompileState,
+) -> Result<Vec<Task>> {
+    apply_defaults(&mut tasks, defaults, state);
+    add_field_routes(&mut tasks, state)?;
+    expand_others(&mut tasks, state)?;
+    expand_otherwise(&mut tasks, state)?;
+    drop_unread_answers(&mut tasks, state);
+    complete_revise_bodies(&mut tasks);
+    Ok(tasks)
+}
+
+fn apply_defaults(tasks: &mut [Task], defaults: TaskDefaults, state: &CompileState) {
+    let Some(required) = defaults.required else {
+        return;
+    };
+    let context = state.context_mut();
+    for task in tasks.iter_mut().filter(|task| {
+        matches!(
+            task.task,
+            TaskKind::Agent { .. }
+                | TaskKind::Command { .. }
+                | TaskKind::Evaluate { .. }
+                | TaskKind::Route { .. }
+        )
+    }) {
+        if !context.explicit_required.contains(&task.name.0) {
+            task.required = required;
+        }
+    }
+}
+
+/// An error at the site `task` was constructed at.
+fn at_task(state: &CompileState, task: &TaskName, error: CompileError) -> CompileError {
+    match state.context_mut().constructed_tasks.get(&task.0) {
+        Some(site) => CompileError::At {
+            at: site.clone(),
+            inner: Box::new(error),
+        },
+        None => error,
+    }
+}
+
+/// Add the route behind each `when` that reads a task's field, right after its producer.
+fn add_field_routes(tasks: &mut Vec<Task>, state: &CompileState) -> Result<()> {
+    let read: BTreeSet<TaskName> = tasks
+        .iter()
+        .filter_map(|task| task.when.as_ref().map(|when| when.task.clone()))
+        .collect();
+    let routes: Vec<(TaskName, TaskName, QuestionId, Question)> = state
+        .context_mut()
+        .field_routes
+        .iter()
+        .filter(|(name, _)| read.contains(*name))
+        .map(|(name, route)| {
+            (
+                name.clone(),
+                route.producer.clone(),
+                route.question.clone(),
+                route.asked.clone(),
+            )
+        })
+        .collect();
+    for (name, producer, question, asked) in routes.into_iter().rev() {
+        let Some(at) = tasks.iter().position(|task| task.name == producer) else {
+            continue;
+        };
+        if tasks[at].over.is_some() {
+            let reader = tasks
+                .iter()
+                .find(|task| task.when.as_ref().is_some_and(|when| when.task == name))
+                .map_or_else(|| producer.clone(), |task| task.name.clone());
+            return Err(at_task(
+                state,
+                &reader,
+                CompileError::WhenFieldOfMappedTask {
+                    reference: format!("{producer}.{question}"),
+                },
+            ));
+        }
+        let route = Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(question, CompiledQuestion::Declared(asked))]),
+                decider: Decider::Output {
+                    task: producer.clone(),
+                },
+            },
+            depends_on: vec![producer],
+            required: tasks[at].required,
+            stage: tasks[at].stage,
+            ..engine(&name.0, EngineOp::Propose, None, Vec::new())
+        };
+        tasks.insert(at + 1, route);
+    }
+    Ok(())
+}
+
+/// Replace `others()` with every main-graph task that no `others()` task feeds.
+fn expand_others(tasks: &mut [Task], state: &CompileState) -> Result<()> {
+    let others: BTreeSet<TaskName> = {
+        let context = state.context_mut();
+        tasks
+            .iter()
+            .filter(|task| context.others.contains(&task.name.0))
+            .map(|task| task.name.clone())
+            .collect()
+    };
+    if others.is_empty() {
+        return Ok(());
+    }
+    if let Some(task) = tasks
+        .iter()
+        .find(|task| others.contains(&task.name) && task.stage == Stage::Epilogue)
+    {
+        return Err(at_task(
+            state,
+            &task.name,
+            CompileError::OthersInEpilogue {
+                task: task.name.0.clone(),
+            },
+        ));
+    }
+    let mut fed = others.clone();
+    loop {
+        let more: Vec<TaskName> = tasks
+            .iter()
+            .filter(|task| !fed.contains(&task.name))
+            .filter(|task| task.depends_on.iter().any(|d| fed.contains(d)))
+            .map(|task| task.name.clone())
+            .collect();
+        if more.is_empty() {
+            break;
+        }
+        fed.extend(more);
+    }
+    let rest: Vec<TaskName> = tasks
+        .iter()
+        .filter(|task| task.stage == Stage::Iteration && !fed.contains(&task.name))
+        .map(|task| task.name.clone())
+        .collect();
+    for task in tasks.iter_mut().filter(|task| others.contains(&task.name)) {
+        for name in &rest {
+            if !task.depends_on.contains(name) {
+                task.depends_on.push(name.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A field's route drops every answer no `when` reads.
+fn drop_unread_answers(tasks: &mut [Task], state: &CompileState) {
+    let context = state.context_mut();
+    let mut read: BTreeMap<TaskName, BTreeSet<Label>> = BTreeMap::new();
+    for when in tasks.iter().filter_map(|task| task.when.as_ref()) {
+        if context.field_routes.contains_key(&when.task) {
+            read.entry(when.task.clone())
+                .or_default()
+                .extend(when.is.iter().cloned());
+        }
+    }
+    for task in tasks.iter_mut() {
+        let Some(read) = read.get(&task.name) else {
+            continue;
+        };
+        let TaskKind::Route { questions, .. } = &mut task.task else {
+            continue;
+        };
+        for asked in questions.values_mut() {
+            if let CompiledQuestion::Declared(question) = asked {
+                question.drop = question
+                    .labels()
+                    .into_iter()
+                    .filter(|label| !read.contains(label))
+                    .collect();
+            }
+        }
+    }
+}
+
+/// Add to each `revise` every task on a path from one it names to the reviewer.
+fn complete_revise_bodies(tasks: &mut [Task]) {
+    let depends: BTreeMap<TaskName, Vec<TaskName>> = tasks
+        .iter()
+        .map(|task| (task.name.clone(), task.depends_on.clone()))
+        .collect();
+    let ancestors = |of: &TaskName| -> BTreeSet<TaskName> {
+        let mut seen = BTreeSet::new();
+        let mut pending = vec![of.clone()];
+        while let Some(next) = pending.pop() {
+            for dependency in depends.get(&next).into_iter().flatten() {
+                if seen.insert(dependency.clone()) {
+                    pending.push(dependency.clone());
+                }
+            }
+        }
+        seen
+    };
+    let order: Vec<TaskName> = tasks.iter().map(|task| task.name.clone()).collect();
+    for task in tasks.iter_mut() {
+        let Some(revise) = &mut task.revise else {
+            continue;
+        };
+        let before_reviewer = ancestors(&task.name);
+        let between: Vec<TaskName> = order
+            .iter()
+            .filter(|name| before_reviewer.contains(*name) && !revise.tasks.contains(name))
+            .filter(|name| ancestors(name).iter().any(|a| revise.tasks.contains(a)))
+            .cloned()
+            .collect();
+        revise.tasks.extend(between);
+    }
 }
 
 /// Replace each `otherwise` with the labels no other `when` lists.
@@ -1635,25 +2102,33 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
     Ok(())
 }
 
-fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
-    match named.remove("over") {
-        None | Some(Value::None) => Ok(None),
-        Some(Value::Output(output)) => match output.ty {
-            None => Ok(Some(output.reference)),
-            Some(declared) if declared.is_list() => match declared.item_refusal() {
-                None => Ok(Some(output.reference)),
-                Some(why) => Err(CompileError::OverItemsNotStrings {
-                    reference: output.reference.to_string(),
-                    declared,
-                    why,
-                }),
-            },
-            Some(declared) => Err(CompileError::OverNotAList {
+/// `over = each(producer.field, max = N)`, or the deprecated `over = producer.field` beside
+/// `max_fanout = N`.
+fn take_fanout(named: &mut BTreeMap<String, Value>) -> Result<(Option<OutputRef>, Option<u32>)> {
+    let max_fanout = fanout_width(named.remove("max_fanout"))?;
+    let (output, max) = match named.remove("over") {
+        None | Some(Value::None) => return Ok((None, max_fanout)),
+        Some(Value::Each(_)) if max_fanout.is_some() => {
+            return Err(replaced("max_fanout", "over = each(..., max = ...)"));
+        }
+        Some(Value::Each(each)) => (each.output, Some(each.max)),
+        Some(Value::Output(output)) => (output, max_fanout),
+        Some(_) => return Err(CompileError::OverNotOutputField),
+    };
+    match output.ty {
+        None => Ok((Some(output.reference), max)),
+        Some(declared) if declared.is_list() => match declared.item_refusal() {
+            None => Ok((Some(output.reference), max)),
+            Some(why) => Err(CompileError::OverItemsNotStrings {
                 reference: output.reference.to_string(),
                 declared,
+                why,
             }),
         },
-        Some(_) => Err(CompileError::OverNotOutputField),
+        Some(declared) => Err(CompileError::OverNotAList {
+            reference: output.reference.to_string(),
+            declared,
+        }),
     }
 }
 
@@ -1695,8 +2170,8 @@ fn take_route_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>> 
         .collect()
 }
 
-fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
-    match named.remove("max_fanout") {
+fn fanout_width(value: Option<Value>) -> Result<Option<u32>> {
+    match value {
         None | Some(Value::None) => Ok(None),
         Some(Value::Int(n)) if n >= 1 && n as u32 <= MAX_FANOUT_CEILING => Ok(Some(n as u32)),
         Some(Value::Int(n)) => Err(CompileError::FanoutOutOfRange { got: n }),
@@ -1744,10 +2219,18 @@ fn take_timeout(named: &mut BTreeMap<String, Value>) -> Result<Option<TaskTimeou
     }
 }
 
-/// `revise` and `max_rounds` are one declaration written as two kwargs: a send-back states how
-/// many rounds it may take before it runs.
+/// `revise = send_back(tasks, rounds = N)`, or the deprecated `revise = tasks` beside
+/// `max_rounds = N`.
 fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
+    let rounds = revise_rounds(named.remove("max_rounds"))?;
     let tasks = match named.remove("revise") {
+        Some(Value::SendBack(_)) if rounds.is_some() => {
+            return Err(replaced(
+                "max_rounds",
+                "revise = send_back(..., rounds = ...)",
+            ));
+        }
+        Some(Value::SendBack(revise)) => return Ok(Some(revise)),
         Some(list @ Value::List(_)) => match task_names("revise", list)? {
             tasks if tasks.is_empty() => return Err(CompileError::ReviseNamesNoTask),
             tasks => Some(tasks),
@@ -1757,14 +2240,6 @@ fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
             take_optional_task_name(named, "revise")?.map(|task| vec![task])
         }
         None => None,
-    };
-    let rounds = match named.remove("max_rounds") {
-        None | Some(Value::None) => None,
-        Some(Value::Int(n)) => match u32::try_from(n) {
-            Ok(n) if (2..=MAX_ROUNDS_CEILING).contains(&n) => Some(n),
-            _ => return Err(CompileError::RoundsOutOfRange { got: n }),
-        },
-        Some(_) => return Err(CompileError::RoundsNotInteger),
     };
     match (tasks, rounds) {
         (None, None) => Ok(None),
@@ -1778,6 +2253,98 @@ fn take_revise(named: &mut BTreeMap<String, Value>) -> Result<Option<Revise>> {
         }),
         (None, Some(_)) => Err(CompileError::RoundsWithoutRevise),
     }
+}
+
+fn revise_rounds(value: Option<Value>) -> Result<Option<u32>> {
+    match value {
+        None | Some(Value::None) => Ok(None),
+        Some(Value::Int(n)) => match u32::try_from(n) {
+            Ok(n) if (2..=MAX_ROUNDS_CEILING).contains(&n) => Ok(Some(n)),
+            _ => Err(CompileError::RoundsOutOfRange { got: n }),
+        },
+        Some(_) => Err(CompileError::RoundsNotInteger),
+    }
+}
+
+/// `threshold = at_least(n)` or `threshold = at_most(n)`, or the deprecated number beside
+/// `direction`.
+fn take_bound(named: &mut BTreeMap<String, Value>) -> Result<(Option<f64>, Option<Direction>)> {
+    let direction = take_optional_direction(named, "direction")?;
+    match named.remove("threshold") {
+        Some(Value::Bound(_)) if direction.is_some() => Err(replaced(
+            "direction",
+            "threshold = at_least(...) or at_most(...)",
+        )),
+        Some(Value::Bound(bound)) => Ok((Some(bound.threshold), Some(bound.direction))),
+        Some(value) => {
+            named.insert("threshold".to_owned(), value);
+            Ok((take_optional_number(named, "threshold")?, direction))
+        }
+        None => Ok((None, direction)),
+    }
+}
+
+/// `decider = model(...)`, `human(...)`, or `output(task)`, or the deprecated arguments that
+/// spell one out on the route itself.
+fn take_decider(
+    named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
+    name: &TaskName,
+) -> Result<DeciderSpec> {
+    let decider = match named.remove("decider") {
+        None | Some(Value::None) => None,
+        Some(Value::Decider(spec)) => Some(spec),
+        Some(_) => {
+            return Err(wrong_type(
+                "decider",
+                "model(...), human(...), or output(task)",
+            ));
+        }
+    };
+    if let Some(spec) = decider {
+        const REPLACED: [&str; 6] = [
+            "min_confidence",
+            "source",
+            "human",
+            "review",
+            "timeout",
+            "files",
+        ];
+        return match REPLACED.into_iter().find(|old| named.contains_key(*old)) {
+            Some(old) => Err(replaced(old, "decider")),
+            None => Ok(spec),
+        };
+    }
+    let task = || name.0.clone();
+    let min_confidence = take_optional_number(named, "min_confidence")?;
+    let source = take_optional_task_name(named, "source")?;
+    let files = take_route_files(named)?;
+    let human = take_bool_default(named, "human", false)?;
+    let review = match take_optional_string(named, "review")? {
+        Some(_) if !human => return Err(CompileError::ReviewWithoutHuman { task: task() }),
+        Some(path) => Some(state.context_mut().prompt_file(&path)?),
+        None => None,
+    };
+    let timeout = take_timeout(named)?;
+    if timeout.is_some() && !human {
+        return Err(CompileError::TimeoutWithoutHuman { task: task() });
+    }
+    let decider = match (min_confidence, source, human) {
+        (Some(min_confidence), None, false) => Decider::Model {
+            min_confidence,
+            files,
+        },
+        (None, Some(_), false) if !files.is_empty() => {
+            return Err(CompileError::RouteFilesWithSource { task: task() });
+        }
+        (None, None, true) if !files.is_empty() => {
+            return Err(CompileError::RouteFilesWithHuman { task: task() });
+        }
+        (None, Some(task), false) => Decider::Output { task },
+        (None, None, true) => Decider::Human { review },
+        _ => return Err(CompileError::RouteDecider { task: task() }),
+    };
+    Ok(DeciderSpec { decider, timeout })
 }
 
 fn parse_stage(value: &str) -> Result<Stage> {
@@ -2134,6 +2701,29 @@ fn take_optional_string(named: &mut BTreeMap<String, Value>, name: &str) -> Resu
     }
 }
 
+/// One of a closed set of names, read case-insensitively as the manifest and CLI read it.
+fn take_choice<T: clap::ValueEnum>(
+    named: &mut BTreeMap<String, Value>,
+    name: &'static str,
+) -> Result<Option<T>> {
+    let Some(raw) = take_optional_string(named, name)? else {
+        return Ok(None);
+    };
+    T::from_str(&raw, true).map(Some).map_err(|_| {
+        let known: Vec<String> = T::value_variants()
+            .iter()
+            .filter_map(clap::ValueEnum::to_possible_value)
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        CompileError::UnknownChoice {
+            argument: name,
+            suggestion: diag::suggest(&raw, known.iter().map(String::as_str)).map(str::to_owned),
+            known: known.join(", "),
+            got: raw,
+        }
+    })
+}
+
 fn take_task_name(named: &mut BTreeMap<String, Value>, name: &str) -> Result<TaskName> {
     match take_value(named, name)? {
         Value::String(value) => Ok(TaskName(value)),
@@ -2214,9 +2804,12 @@ fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>>
     take_named_task_names_optional(named, "depends_on")
 }
 
-/// `depends_on` where an entry may be `optional(...)`: every dependency, and the optional ones.
+/// `depends_on` where an entry may be `optional(...)` or `others()`: every dependency, and the
+/// optional ones. `others()` is recorded against the task and expanded in `workflow()`.
 fn take_dependencies(
     named: &mut BTreeMap<String, Value>,
+    state: &CompileState,
+    task: &TaskName,
 ) -> Result<(Vec<TaskName>, Vec<TaskName>)> {
     let Some(value) = named.remove("depends_on") else {
         return Ok((Vec::new(), Vec::new()));
@@ -2233,6 +2826,9 @@ fn take_dependencies(
             Value::Optional(name) => {
                 optional.push(name.clone());
                 depends_on.push(name);
+            }
+            Value::Others => {
+                state.context_mut().others.insert(task.0.clone());
             }
             entry => depends_on.push(task_name_entry("depends_on", entry)?),
         }
@@ -2316,6 +2912,19 @@ pub fn compile_file_with(
     compile_source_with(&source, path, pack_dir, supplied)
 }
 
+/// [`compile_file_with`] for a launch. It skips the producer-closure probe, which registration
+/// and a choices refresh run.
+#[tracing::instrument(skip_all, fields(source = %path.display(), params = supplied.len()), err)]
+pub fn compile_launch_file(
+    path: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
+    let source =
+        std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
+    on_compile_stack(|| compile_source_here(&source, path, pack_dir, Binding::Launch(supplied)))
+}
+
 /// Compile `workflow.star` into the manifest's `[workflow]` block.
 ///
 /// A source that declares no parameters is a constant, so its graph is frozen into the manifest
@@ -2342,6 +2951,8 @@ pub fn materialize_manifest(
         file: &'a str,
         #[serde(skip_serializing_if = "crate::host_env::DeclaredEnv::is_empty")]
         env: &'a crate::host_env::DeclaredEnv,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        servers: &'a [crucible_contract::agent_servers::ServerName],
     }
 
     #[derive(serde::Serialize)]
@@ -2360,6 +2971,8 @@ pub fn materialize_manifest(
     struct DeclaredWorkflowEnv {
         #[serde(default)]
         env: crate::host_env::DeclaredEnv,
+        #[serde(default)]
+        servers: Vec<crucible_contract::agent_servers::ServerName>,
     }
 
     let manifest = std::fs::read_to_string(manifest_path)
@@ -2371,13 +2984,13 @@ pub fn materialize_manifest(
                 path: manifest_path.to_path_buf(),
                 cause,
             })?;
-    let env = toml::from_str::<DeclaredWorkflow>(&manifest)
+    let (env, servers) = toml::from_str::<DeclaredWorkflow>(&manifest)
         .map_err(|cause| MaterializeError::DeclaredEnv {
             path: manifest_path.to_path_buf(),
             cause,
         })?
         .workflow
-        .map(|workflow| workflow.env)
+        .map(|workflow| (workflow.env, workflow.servers))
         .unwrap_or_default();
 
     let manifest_dir = parent_or_cwd(manifest_path);
@@ -2391,6 +3004,7 @@ pub fn materialize_manifest(
                     workflow_type: compiled.workflow.workflow_type,
                     file: &file,
                     env: &env,
+                    servers: &servers,
                 },
             })?,
         )
@@ -2400,6 +3014,7 @@ pub fn materialize_manifest(
             toml::to_string(&ManifestWorkflow {
                 workflow: &WorkflowCfg {
                     env,
+                    servers,
                     ..compiled.workflow.clone()
                 },
             })?,
@@ -2543,7 +3158,129 @@ pub fn compile_source_with(
     pack_dir: &Path,
     supplied: &BTreeMap<String, String>,
 ) -> Result<CompiledWorkflow> {
-    on_compile_stack(|| compile_source_here(source, filename, pack_dir, supplied))
+    on_compile_stack(|| {
+        compile_source_here(source, filename, pack_dir, Binding::Supplied(supplied))
+    })
+}
+
+/// Compile only the tasks that produce launch-form choices and their dependencies, with no
+/// parameters ([ADR-0074]). Command tasks of such a graph read an empty `params` entry.
+///
+/// [ADR-0074]: ../../../docs/adr/ADR-0074.md
+pub fn compile_refresh_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+    let source =
+        std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
+    on_compile_stack(|| {
+        let declared = read_params(&source, path)?;
+        let producers = choice_producers(&declared);
+        if producers.is_empty() {
+            return Err(CompileError::RefreshWithoutProducers);
+        }
+        let probed = probe_choice_producers(&source, path, pack_dir, &producers)?;
+        let mut workflow = probed.workflow;
+        let keep: BTreeSet<String> = closure(&workflow, producers.keys().map(String::as_str))
+            .into_iter()
+            .map(|t| t.name.0.clone())
+            .collect();
+        workflow.tasks.retain(|t| keep.contains(&t.name.0));
+        workflow.params = BTreeMap::new();
+        workflow.result = workflow.result.filter(|r| keep.contains(&r.0));
+        workflow.history_record = workflow.history_record.filter(|r| keep.contains(&r.0));
+        let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
+        Ok(CompiledWorkflow {
+            workflow,
+            canonical_json,
+            declares_params: false,
+            ..probed
+        })
+    })
+}
+
+/// How a compile binds the declared parameters.
+#[derive(Clone, Copy)]
+enum Binding<'a> {
+    /// The values a launcher supplied, parsed and constrained by the declaration.
+    Supplied(&'a BTreeMap<String, String>),
+    /// As [`Binding::Supplied`], without probing the producer closure.
+    Launch(&'a BTreeMap<String, String>),
+    /// A value each declaration admits, for comparing two compiles that differ only in their
+    /// parameters.
+    Probe(bool),
+}
+
+/// Each choices_from and placeholder_from producer task, with a parameter it supplies.
+fn choice_producers(declared: &params::Params) -> BTreeMap<String, String> {
+    declared
+        .specs()
+        .iter()
+        .flat_map(|spec| {
+            spec.sources()
+                .map(|from| (from.task.clone(), spec.name.clone()))
+        })
+        .collect()
+}
+
+/// `roots` and every task they depend on, transitively.
+fn closure<'a, 'r>(
+    workflow: &'a WorkflowCfg,
+    roots: impl IntoIterator<Item = &'r str>,
+) -> Vec<&'a Task> {
+    let mut wanted: BTreeSet<&str> = roots.into_iter().collect();
+    loop {
+        let before = wanted.len();
+        for task in &workflow.tasks {
+            if wanted.contains(task.name.0.as_str()) {
+                wanted.extend(task.depends_on.iter().map(|d| d.0.as_str()));
+            }
+        }
+        if wanted.len() == before {
+            break;
+        }
+    }
+    workflow
+        .tasks
+        .iter()
+        .filter(|t| wanted.contains(t.name.0.as_str()))
+        .collect()
+}
+
+/// Compile under both probes and refuse a producer closure that differs between them, which is
+/// a closure built from something param() returned. Returns the first probe's compile.
+fn probe_choice_producers(
+    source: &str,
+    filename: &Path,
+    pack_dir: &Path,
+    producers: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
+    let probe = |second| {
+        compile_source_here(source, filename, pack_dir, Binding::Probe(second)).map_err(|inner| {
+            CompileError::ChoiceProbeFailed {
+                inner: Box::new(inner),
+            }
+        })
+    };
+    let first = probe(false)?;
+    let second = probe(true)?;
+    let json = |task: &Task| serde_json::to_value(task).ok();
+    for (producer, param) in producers {
+        let ours = closure(&first.workflow, [producer.as_str()]);
+        let theirs = closure(&second.workflow, [producer.as_str()]);
+        let differs = ours
+            .iter()
+            .find(|task| !theirs.iter().any(|t| json(t) == json(task)))
+            .or_else(|| {
+                theirs
+                    .iter()
+                    .find(|t| !ours.iter().any(|o| o.name == t.name))
+            });
+        if let Some(task) = differs {
+            return Err(CompileError::ChoiceProducerReadsParams {
+                param: param.clone(),
+                task: task.name.0.clone(),
+            });
+        }
+    }
+    Ok(first)
 }
 
 /// Run `work` on a thread whose stack covers the depths the budgets permit.
@@ -2564,7 +3301,7 @@ fn compile_source_here(
     source: &str,
     filename: &Path,
     pack_dir: &Path,
-    supplied: &BTreeMap<String, String>,
+    binding: Binding<'_>,
 ) -> Result<CompiledWorkflow> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(CompileError::SourceTooLarge {
@@ -2586,8 +3323,19 @@ fn compile_source_here(
     let declares_params = !declared_params.is_empty();
     {
         let mut context = state.context_mut();
-        context.params = declared_params.bind(supplied)?;
-        context.supplied = supplied.keys().cloned().collect();
+        match binding {
+            Binding::Supplied(supplied) | Binding::Launch(supplied) => {
+                context.params = declared_params.bind(supplied)?;
+                context.supplied = supplied.keys().cloned().collect();
+            }
+            Binding::Probe(second) => {
+                context.params = declared_params
+                    .specs()
+                    .iter()
+                    .map(|spec| (spec.name.clone(), spec.probe(second)))
+                    .collect();
+            }
+        }
     }
     let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
     let mut workflow = catching_panics(|| {
@@ -2623,6 +3371,11 @@ fn compile_source_here(
     if !dropped.is_empty() {
         return Err(CompileError::DroppedTasks { sites: dropped });
     }
+    check_choice_producers(&declared_params, &workflow)?;
+    let producers = choice_producers(&declared_params);
+    if matches!(binding, Binding::Supplied(_)) && !producers.is_empty() {
+        probe_choice_producers(source, filename, pack_dir, &producers)?;
+    }
     if !context.sessions.is_empty() && !context.string_session_refs.is_empty() {
         let refs: Vec<Site> = context
             .string_session_refs
@@ -2649,6 +3402,47 @@ fn compile_source_here(
         canonical_json,
         declares_params,
     })
+}
+
+/// A parameter's choices_from must name an unmapped task in this workflow that promises the field
+/// as a list, so the controller has one value to offer.
+fn check_choice_producers(declared: &params::Params, workflow: &WorkflowCfg) -> Result<()> {
+    use crate::plan::ir::Declared;
+    let sources = declared
+        .specs()
+        .iter()
+        .flat_map(|spec| spec.sources().map(move |from| (spec, from)));
+    for (spec, from) in sources {
+        let keyed = from.keyed_by.is_some();
+        let invalid = |detail| CompileError::ParamChoicesFromInvalid {
+            param: spec.name.clone(),
+            task: from.task.clone(),
+            field: from.field.clone(),
+            detail,
+        };
+        let Some(producer) = workflow.tasks.iter().find(|t| t.name.0 == from.task) else {
+            return Err(invalid("that task is not in the workflow"));
+        };
+        if producer.over.is_some() {
+            return Err(invalid("that task is mapped, so it has no single output"));
+        }
+        let fits = match producer.emits.field(&from.field) {
+            Declared::Untyped => true,
+            Declared::Typed(ty) if keyed => ty.is_object(),
+            Declared::Typed(ty) => ty.is_list(),
+            Declared::Unchecked | Declared::Omitted => {
+                return Err(invalid("that task does not declare the field in emits"));
+            }
+        };
+        if !fits {
+            return Err(invalid(if keyed {
+                "that field is not declared an object, which keyed_by needs"
+            } else {
+                "that field is not declared a list"
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// The evaluation ceilings every module runs under. A budget setter only fails when it is set
@@ -3581,7 +4375,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
             ),
         ] {
             let err = routed_error("routed-decider", &source);
-            assert!(err.contains("needs exactly one of min_confidence"), "{err}");
+            assert!(err.contains("needs a decider"), "{err}");
             assert!(err.contains("workflow.star:3:"), "{err}");
         }
     }
@@ -3619,14 +4413,8 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
     #[test]
     fn human_excludes_the_other_deciders_and_owns_review_and_timeout() {
         for (edit, needle) in [
-            (
-                "min_confidence = 0.8, human = True",
-                "needs exactly one of min_confidence",
-            ),
-            (
-                "source = classify, human = True",
-                "needs exactly one of min_confidence",
-            ),
+            ("min_confidence = 0.8, human = True", "needs a decider"),
+            ("source = classify, human = True", "needs a decider"),
             (
                 "min_confidence = 0.8, review = \"r.md\"",
                 "it needs human = True",
@@ -3705,7 +4493,7 @@ workflow(type = "playbook", tasks = [scan, gate, lint, unit, launch])
                     "when = gate.checks, answers = [\"lint\"]",
                     "when = gate.nodes, answers = [\"lint\"]",
                 ),
-                "must be one question of a route task",
+                "\"when\" reads gate.nodes, which is",
             ),
             (
                 ("source = scan.nodes", "source = scan"),
@@ -3786,7 +4574,7 @@ workflow(type = "playbook", tasks = [scan, gate, lint, unit, launch])
             &ROUTED.replace("when = gate.urgent", "when = classify.urgent"),
         );
         assert!(
-            err.contains("must be one question of a route task"),
+            err.contains("\"when\" reads classify.urgent, which is untyped"),
             "{err}"
         );
     }
@@ -4121,7 +4909,7 @@ workflow(type = "custom", tasks = [a, b], result = b)
                 panic!("expected agent task");
             };
             assert_eq!(model.as_deref(), Some("claude-opus-4-6"), "{}", task.name);
-            assert_eq!(effort.as_deref(), Some("high"), "{}", task.name);
+            assert_eq!(*effort, Some(ReasoningEffort::High), "{}", task.name);
         }
 
         let conflict = r#"
@@ -5061,6 +5849,46 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
                 "s = session(name = \"s\", harness = \"claude\", model = \"m\", effort = \"high\"{extra})\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"custom\", tasks = [a], result = a)\n",
             ),
             (
+                "route",
+                "u = command(name = \"u\", run = \"true\")\ng = route(name = \"g\", decider = human(), depends_on = [u], questions = {\"q\": noul(ask = \"q?\")}{extra})\nworkflow(type = \"playbook\", tasks = [u, g])\n",
+            ),
+            (
+                "each",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", depends_on = [u], over = each(list = u.items, max = 4{extra}))\nworkflow(type = \"playbook\", tasks = [u, c])\n",
+            ),
+            (
+                "send_back",
+                "u = command(name = \"u\", run = \"true\")\nc = command(name = \"c\", run = \"true\", depends_on = [u], revise = send_back(tasks = [u], rounds = 2{extra}))\nworkflow(type = \"playbook\", tasks = [u, c])\n",
+            ),
+            (
+                "at_least",
+                "e = evaluate(name = \"e\", run = \"true\", threshold = at_least(bound = 1{extra}))\nworkflow(type = \"playbook\", tasks = [e])\n",
+            ),
+            (
+                "at_most",
+                "e = evaluate(name = \"e\", run = \"true\", threshold = at_most(bound = 1{extra}))\nworkflow(type = \"playbook\", tasks = [e])\n",
+            ),
+            (
+                "model",
+                "u = command(name = \"u\", run = \"true\", emits_files = {\"r.json\": schema_file(\"r.schema.json\")})\ng = route(name = \"g\", decider = model(min_confidence = 0.5, files = [\"r.json\"]{extra}), depends_on = [u], questions = {\"q\": noul(ask = \"q?\")})\nworkflow(type = \"playbook\", tasks = [u, g])\n",
+            ),
+            (
+                "human",
+                "g = route(name = \"g\", decider = human(review = \"review.md\", timeout = \"1h\"{extra}), questions = {\"q\": noul(ask = \"q?\")})\nworkflow(type = \"playbook\", tasks = [g])\n",
+            ),
+            (
+                "output",
+                "u = command(name = \"u\", run = \"true\", emits = [\"q\"])\ng = route(name = \"g\", decider = output(task = u{extra}), depends_on = [u], questions = {\"q\": noul(ask = \"q?\")})\nworkflow(type = \"playbook\", tasks = [u, g])\n",
+            ),
+            (
+                "task_defaults",
+                "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [c], defaults = task_defaults(required = False{extra}))\n",
+            ),
+            (
+                "workflow",
+                "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"playbook\", tasks = [c], defaults = task_defaults(){extra})\n",
+            ),
+            (
                 "workflow",
                 "c = command(name = \"c\", run = \"true\")\nworkflow(type = \"custom\", tasks = [c], result = c{extra})\n",
             ),
@@ -5624,16 +6452,12 @@ workflow(type = "playbook", tasks = [discover, audit])
 
     /// A fan-out reads its items from a dependency, and says how wide it may get before it runs.
     #[test]
-    fn a_fanout_must_depend_on_its_producer_and_declare_its_width() {
+    fn a_fanout_declares_its_width() {
         let pack = temp_pack("over-coherence");
         let cases = [
             (
-                "depends_on = [],\n    over = discover.targets,\n    max_fanout = 4",
-                "does not depend on",
-            ),
-            (
                 "depends_on = [discover],\n    over = discover.targets",
-                "without max_fanout",
+                "without a width",
             ),
             (
                 "depends_on = [discover],\n    max_fanout = 4",
@@ -5703,15 +6527,15 @@ workflow(type = "playbook", tasks = [pick, build, confirm])
                 max_rounds: 2
             })
         );
-        let skipped = source.replace("revise = [pick, \"build\"]", "revise = [pick]");
-        let error = crate::errors::report(
-            &compile_source(&skipped, &pack.join("workflow.star"), &pack)
-                .err()
-                .unwrap_or_else(|| panic!("compiled a loop that skips build")),
-        );
-        assert!(
-            error.contains("\"build\" lies between two of them; list \"build\" in revise"),
-            "{error}"
+        let from_pick = source.replace("revise = [pick, \"build\"]", "revise = [pick]");
+        let compiled = compile_source(&from_pick, &pack.join("workflow.star"), &pack).unwrap();
+        assert_eq!(
+            compiled.workflow.tasks[2].revise,
+            Some(Revise {
+                tasks: vec!["pick".into(), "build".into()],
+                max_rounds: 2
+            }),
+            "build lies between pick and the reviewer"
         );
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -5958,6 +6782,408 @@ fail("evaluating this source is a bug")
         assert_eq!(
             schema["x-order"],
             serde_json::json!(["paper_url", "verifier", "max_steps", "split", "topics"])
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A gated parameter is only for when its switch is on: the form greys it out, and a value
+    /// supplied while the switch is off is refused rather than silently used or dropped.
+    #[test]
+    fn a_gated_param_binds_only_while_its_switch_is_on() {
+        let source = r#"
+params = {
+    "override_branch": {"type": "bool", "default": False},
+    "branch": {"type": "string", "default": "", "enabled_by": "override_branch"},
+}
+"#;
+        let params = read_params(source, Path::new("workflow.star"))
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            params.json_schema()["properties"]["branch"]["x-enabled-by"],
+            "override_branch"
+        );
+        let supplied = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        assert!(
+            params
+                .bind(&supplied(&[
+                    ("override_branch", "true"),
+                    ("branch", "main")
+                ]))
+                .is_ok()
+        );
+        assert!(params.bind(&supplied(&[])).is_ok());
+        for off in [
+            supplied(&[("branch", "main")]),
+            supplied(&[("override_branch", "false"), ("branch", "main")]),
+        ] {
+            let error = params.bind(&off).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ParamNotEnabled { name, gate } if name == "branch" && gate == "override_branch"),
+                "{}",
+                crate::errors::report(&error)
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_by_must_name_an_ungated_bool_and_gate_an_optional_param() {
+        for (gate_decl, gated_extra, detail) in [
+            ("", "", "is not declared"),
+            (
+                r#""switch": {"type": "string", "default": ""},"#,
+                "",
+                "is not a bool",
+            ),
+            (
+                r#""other": {"type": "bool", "default": False}, "switch": {"type": "bool", "default": False, "enabled_by": "other"},"#,
+                "",
+                "is itself enabled_by another parameter",
+            ),
+            (
+                r#""switch": {"type": "bool", "default": False},"#,
+                "required",
+                "cannot gate a required parameter",
+            ),
+        ] {
+            let gated = if gated_extra == "required" {
+                r#""gated": {"type": "string", "required": True, "enabled_by": "switch"}"#
+            } else {
+                r#""gated": {"type": "string", "default": "", "enabled_by": "switch"}"#
+            };
+            let source = format!("params = {{{gate_decl} {gated}}}\n");
+            let error = read_params(&source, Path::new("workflow.star")).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ParamBadEnabledBy { detail: d, .. } if *d == detail),
+                "{detail}: {}",
+                crate::errors::report(&error)
+            );
+        }
+    }
+
+    /// A choice list a task produces at run time: the schema names the producer for the controller,
+    /// and allow_other turns any list into suggestions the engine no longer enforces.
+    #[test]
+    fn choices_from_names_a_producer_and_allow_other_makes_choices_suggestions() {
+        let pack = temp_pack("params-choices-from");
+        let source = r#"
+params = {
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}, "allow_other": True},
+    "size": {"type": "string", "default": "s", "choices": ["s", "m"], "allow_other": True},
+    "mode": {"type": "string", "default": "a", "choices": ["a", "b"]},
+}
+options = command(name = "options", run = "./options.sh", emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [options])
+"#;
+        let path = pack.join("workflow.star");
+        let schema = declared_params(source, &path)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let release = &schema["properties"]["release"];
+        assert_eq!(
+            release["x-choices-from"],
+            serde_json::json!({"task": "options", "field": "releases"})
+        );
+        assert_eq!(release["x-allow-other"], true);
+        assert_eq!(
+            schema["properties"]["size"]["x-choices"],
+            serde_json::json!(["s", "m"])
+        );
+        assert!(schema["properties"]["size"].get("enum").is_none());
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["a", "b"])
+        );
+        let with = |pairs: &[(&str, &str)]| {
+            let supplied = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            compile_source_with(source, &path, &pack, &supplied)
+        };
+        assert!(with(&[("size", "xl"), ("release", "3.9 GA")]).is_ok());
+        assert!(matches!(
+            with(&[("mode", "c")]),
+            Err(CompileError::ParamConstraintFailed { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// keyed_by makes a choices_from field an object of lists per value of another parameter, and
+    /// placeholder_from reads an object of strings the same way; both reach the schema and both
+    /// producers join the refresh.
+    #[test]
+    fn keyed_choices_and_placeholders_read_objects_keyed_by_another_parameter() {
+        let pack = temp_pack("params-keyed");
+        let path = pack.join("workflow.star");
+        let source = r#"
+params = {
+    "release": {"type": "string", "required": True, "choices_from": {"task": "options", "field": "releases"}},
+    "component": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "components", "keyed_by": "release"}},
+    "branch": {"type": "string", "default": "", "placeholder_from": {"task": "branches", "field": "branch", "keyed_by": "release"}},
+}
+options = command(name = "options", run = "./o.sh", emits = {"releases": "list", "components": "object"})
+branches = command(name = "branches", run = "./b.sh", emits = {"branch": "object"})
+workflow(type = "playbook", tasks = [options, branches])
+"#;
+        std::fs::write(&path, source).unwrap();
+        let schema = declared_params(source, &path)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            schema["properties"]["component"]["x-choices-from"],
+            serde_json::json!({"task": "options", "field": "components", "keyed_by": "release"})
+        );
+        assert_eq!(
+            schema["properties"]["branch"]["x-placeholder-from"],
+            serde_json::json!({"task": "branches", "field": "branch", "keyed_by": "release"})
+        );
+        let refresh = compile_refresh_file(&path, &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(refresh.workflow.tasks.len(), 2);
+
+        let decl = |fields: &str| {
+            read_params(
+                &format!("params = {{\"release\": {{\"type\": \"string\", \"default\": \"\"}}, \"n\": {{\"type\": \"int\", \"default\": 1}}, \"p\": {{\"type\": \"string\", \"default\": \"\", {fields}}}}}\n"),
+                &path,
+            )
+            .map(|_| ())
+        };
+        for (fields, detail) in [
+            (
+                r#""choices_from": {"task": "t", "field": "f", "keyed_by": "nope"}"#,
+                "that parameter is not declared",
+            ),
+            (
+                r#""choices_from": {"task": "t", "field": "f", "keyed_by": "p"}"#,
+                "a parameter cannot be keyed by itself",
+            ),
+            (
+                r#""placeholder_from": {"task": "t", "field": "f", "keyed_by": "n"}"#,
+                "that parameter is not a string",
+            ),
+        ] {
+            assert!(
+                matches!(decl(fields), Err(CompileError::ParamKeyedByInvalid { detail: d, .. }) if d == detail),
+                "{fields}"
+            );
+        }
+        assert!(matches!(
+            decl(r#""placeholder_from": {"task": "t", "field": "f"}"#),
+            Err(CompileError::ParamFieldWrongShape {
+                field: "placeholder_from",
+                ..
+            })
+        ));
+
+        let listy = source.replace(r#""components": "object""#, r#""components": "list""#);
+        assert!(matches!(
+            compile_source_with(&listy, &path, &pack, &BTreeMap::from([("release".to_owned(), "a".to_owned())])),
+            Err(CompileError::ParamChoicesFromInvalid { param, .. }) if param == "component"
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A refresh compiles the producer and what it depends on, without the required parameter the
+    /// rest of the graph reads, and hands its command tasks no parameters.
+    #[test]
+    fn a_refresh_compiles_only_the_producer_closure_without_parameters() {
+        let pack = temp_pack("params-choices-refresh");
+        let path = pack.join("workflow.star");
+        std::fs::write(
+            &path,
+            r#"
+params = {
+    "pr": {"type": "int", "required": True},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}
+sheet = command(name = "sheet", run = "./sheet.sh", emits = ["rows"])
+options = command(name = "options", run = "./options.sh", depends_on = [sheet], emits = {"releases": "list"})
+work = agent(name = "work", prompt = "Backport " + str(param("pr")) + " into " + param("release"), depends_on = [options])
+workflow(type = "playbook", tasks = [sheet, options, work])
+"#,
+        )
+        .unwrap();
+        let compiled = compile_refresh_file(&path, &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let names: Vec<&str> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|t| t.name.0.as_str())
+            .collect();
+        assert_eq!(names, ["sheet", "options"]);
+        assert!(compiled.workflow.params.is_empty());
+        assert!(!compiled.declares_params);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A producer closure built from a parameter, by text or by branching on it, is refused by an
+    /// authoring compile, so the author learns before the first refresh. A launch compile skips
+    /// the check.
+    #[test]
+    fn a_producer_closure_that_reads_a_parameter_is_refused() {
+        let pack = temp_pack("params-choices-reads");
+        let path = pack.join("workflow.star");
+        let decl = r#"params = {
+    "flag": {"type": "bool", "default": False},
+    "topic": {"type": "string", "default": "x"},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}"#;
+        for (tasks, culprit) in [
+            (
+                r#"seed = agent(name = "seed", prompt = "List releases about " + param("topic"))
+options = command(name = "options", run = "./o.sh", depends_on = [seed], emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [seed, options])"#,
+                "seed",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh" if param("flag") else "./p.sh", emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [options])"#,
+                "options",
+            ),
+        ] {
+            let source = format!("{decl}\n{tasks}\n");
+            let error = compile_source_with(&source, &path, &pack, &BTreeMap::new()).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ChoiceProducerReadsParams { task, param } if task == culprit && param == "release"),
+                "{culprit}: {}",
+                crate::errors::report(&error)
+            );
+            std::fs::write(&path, &source).unwrap();
+            compile_launch_file(&path, &pack, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The probe compiles bind values each declaration admits, so a source that relies on its
+    /// own constraints compiles beside a choices_from parameter. One that cannot evaluate without
+    /// launch values says so, since a refresh has none to give it.
+    #[test]
+    fn probe_values_satisfy_the_declared_constraints() {
+        let pack = temp_pack("params-choices-probe");
+        let path = pack.join("workflow.star");
+        let source = |tier: &str| {
+            format!(
+                r##"params = {{
+    "tier": {{"type": "string", "default": "s"{tier}}},
+    "width": {{"type": "int", "default": 2, "min": 1, "max": 4}},
+    "ratio": {{"type": "number", "default": -2.0, "max": -1.5}},
+    "pr": {{"type": "string", "default": "org/repo#1", "pattern": "^[^/]+/[^#]+#[0-9]+$"}},
+    "release": {{"type": "string", "default": "", "choices_from": {{"task": "options", "field": "releases"}}}},
+}}
+MODELS = {{"s": "small", "m": "medium"}}
+options = command(name = "options", run = "./o.sh", emits = {{"releases": "list"}})
+work = agent(
+    name = "work",
+    prompt = "Use " + MODELS[param("tier")] + " at " + str(8 // param("width")) + " on " + param("pr").split("#")[1],
+    depends_on = [options],
+)
+workflow(type = "playbook", tasks = [options, work])
+"##
+            )
+        };
+        let supplied = BTreeMap::from([("ratio".to_owned(), "-2".to_owned())]);
+        compile_source_with(
+            &source(r#", "choices": ["s", "m"]"#),
+            &path,
+            &pack,
+            &supplied,
+        )
+        .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let error = compile_source_with(&source(""), &path, &pack, &supplied).unwrap_err();
+        assert!(
+            matches!(&error, CompileError::ChoiceProbeFailed { .. }),
+            "{}",
+            crate::errors::report(&error)
+        );
+
+        let declared = read_params(&source(r#", "choices": ["s", "m"]"#), &path).unwrap();
+        let probes = |second| -> Vec<ParamValue> {
+            declared
+                .specs()
+                .iter()
+                .map(|spec| spec.probe(second))
+                .collect()
+        };
+        assert_eq!(
+            probes(false),
+            [
+                ParamValue::String("s".to_owned()),
+                ParamValue::Int(1),
+                ParamValue::Number(-1.5),
+                ParamValue::String("org/repo#1".to_owned()),
+                ParamValue::String("crucible-probe-0".to_owned()),
+            ]
+        );
+        assert_eq!(
+            probes(true),
+            [
+                ParamValue::String("m".to_owned()),
+                ParamValue::Int(2),
+                ParamValue::Number(-1.5),
+                ParamValue::String("org/repo#1".to_owned()),
+                ParamValue::String("crucible-probe-1".to_owned()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn choices_from_must_name_an_unmapped_task_promising_a_list() {
+        let pack = temp_pack("params-choices-from-invalid");
+        let path = pack.join("workflow.star");
+        let decl = r#"params = {"release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}}}"#;
+        for (tasks, detail) in [
+            (
+                r#"other = command(name = "other", run = "./o.sh")
+workflow(type = "playbook", tasks = [other])"#,
+                "that task is not in the workflow",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh", emits = ["ok"])
+workflow(type = "playbook", tasks = [options])"#,
+                "that task does not declare the field in emits",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh", emits = {"releases": "string"})
+workflow(type = "playbook", tasks = [options])"#,
+                "that field is not declared a list",
+            ),
+        ] {
+            let source = format!("{decl}\n{tasks}\n");
+            let error = compile_source_with(&source, &path, &pack, &BTreeMap::new()).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ParamChoicesFromInvalid { detail: d, .. } if *d == detail),
+                "{detail}: {}",
+                crate::errors::report(&error)
+            );
+        }
+        let declaration = |fields: &str| {
+            read_params(&format!("params = {{\"p\": {{{fields}}}}}\n"), &path).map(|_| ())
+        };
+        assert!(matches!(
+            declaration(
+                r#""type": "string", "default": "", "choices": ["a"], "choices_from": {"task": "t", "field": "f"}"#
+            ),
+            Err(CompileError::ParamChoicesConflict { .. })
+        ));
+        assert!(matches!(
+            declaration(r#""type": "string", "default": "", "allow_other": True"#),
+            Err(CompileError::ParamAllowOtherWithoutChoices { .. })
+        ));
+        assert!(matches!(
+            declaration(
+                r#""type": "int", "default": 1, "choices_from": {"task": "t", "field": "f"}"#
+            ),
+            Err(CompileError::ParamConstraintMismatch { .. })
+        ));
+        assert!(
+            declaration(r#""type": "string", "default": "", "choices_from": {"task": "t"}"#)
+                .is_err()
         );
         let _ = std::fs::remove_dir_all(&pack);
     }
@@ -7927,5 +9153,595 @@ analyze = agent(name = "analyze", prompt = "p", depends_on = [prepare, match], o
             assert!(report.contains(needle), "{needle}: {report}");
         }
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    const REPLACED_HEAD: &str = r#"scan = command(name = "scan", run = "true", emits = {"items": "list", "q": "boolean"})
+author = agent(name = "author", prompt = "p")
+"#;
+
+    const REPLACED_TAIL: &str = r#"workflow(type = "playbook", tasks = [scan, author, gate, a, b, c, fan, review, ask, src])
+"#;
+
+    const DEPRECATED_FORMS: &str = r#"gate = route(
+    name = "gate",
+    min_confidence = 0.8,
+    files = [],
+    depends_on = [scan],
+    questions = {
+        "area": choice(ask = "which?", options = ["x", "y", "z"]),
+        "go": noul(ask = "go?", drop = ["no", "uncertain"]),
+    },
+)
+a = command(name = "a", run = "true", depends_on = [gate], when = gate.area, answers = ["x", "y"])
+b = command(name = "b", run = "true", depends_on = [gate], when = gate.area, otherwise = True)
+c = command(name = "c", run = "true", depends_on = [gate], when = gate.go)
+fan = command(name = "fan", run = "true", depends_on = [scan], over = scan.items, max_fanout = 4)
+review = evaluate(name = "review", run = "true", depends_on = [author], threshold = 1, direction = "higher", revise = author, max_rounds = 3)
+ask = route(name = "ask", human = True, review = "review.md", timeout = "1h", depends_on = [scan], questions = {"ok": noul(ask = "ok?")})
+src = route(name = "src", source = scan, depends_on = [scan], questions = {"q": noul(ask = "q?")})
+"#;
+
+    const VALUE_FORMS: &str = r#"gate = route(
+    name = "gate",
+    decider = model(min_confidence = 0.8),
+    depends_on = [scan],
+    questions = {
+        "area": choice(ask = "which?", options = ["x", "y", "z"]),
+        "go": noul(ask = "go?", drop = ["no", "uncertain"]),
+    },
+)
+a = command(name = "a", run = "true", depends_on = [gate], when = gate.area.any_of("x", "y"))
+b = command(name = "b", run = "true", depends_on = [gate], when = gate.area.otherwise())
+c = command(name = "c", run = "true", depends_on = [gate], when = gate.go)
+fan = command(name = "fan", run = "true", depends_on = [scan], over = each(scan.items, max = 4))
+review = evaluate(name = "review", run = "true", depends_on = [author], threshold = at_least(1), revise = send_back(author, rounds = 3))
+ask = route(name = "ask", decider = human(review = "review.md", timeout = "1h"), depends_on = [scan], questions = {"ok": noul(ask = "ok?")})
+src = route(name = "src", decider = output(scan), depends_on = [scan], questions = {"q": noul(ask = "q?")})
+"#;
+
+    fn replaced_pack(tag: &str) -> PathBuf {
+        let pack = temp_pack(tag);
+        std::fs::write(pack.join("review.md"), "launch?\n").unwrap();
+        pack
+    }
+
+    #[test]
+    fn value_constructors_compile_to_the_graph_the_deprecated_arguments_do() {
+        let pack = replaced_pack("value-forms");
+        let compile = |body: &str| {
+            compile_source(
+                &format!("{REPLACED_HEAD}{body}{REPLACED_TAIL}"),
+                &pack.join("workflow.star"),
+                &pack,
+            )
+            .unwrap()
+        };
+        let deprecated = compile(DEPRECATED_FORMS);
+        let value = compile(VALUE_FORMS);
+        assert_eq!(value.canonical_json, deprecated.canonical_json);
+
+        let task = |name: &str| {
+            value
+                .workflow
+                .tasks
+                .iter()
+                .find(|task| task.name.0 == name)
+                .unwrap()
+        };
+        let labels = |name: &str| -> Vec<String> {
+            let when = task(name).when.as_ref().unwrap();
+            when.is.iter().map(ToString::to_string).collect()
+        };
+        assert_eq!(labels("a"), ["x", "y"]);
+        assert_eq!(labels("b"), ["z", "uncertain"]);
+        assert_eq!(labels("c"), ["yes"]);
+        assert_eq!(task("fan").max_fanout, Some(4));
+        assert_eq!(task("fan").over.as_ref().unwrap().to_string(), "scan.items");
+        assert_eq!(
+            task("review").revise,
+            Some(Revise {
+                tasks: vec!["author".into()],
+                max_rounds: 3
+            })
+        );
+        assert!(matches!(
+            task("review").task,
+            TaskKind::Evaluate {
+                threshold: Some(t),
+                direction: Some(Direction::Higher),
+                ..
+            } if t == 1.0
+        ));
+        assert!(matches!(
+            &task("gate").task,
+            TaskKind::Route { decider: Decider::Model { min_confidence, files }, .. }
+                if *min_confidence == 0.8 && files.is_empty()
+        ));
+        assert_eq!(task("gate").needs, crate::plan::ir::NEEDS_DECISION);
+        assert!(matches!(
+            &task("ask").task,
+            TaskKind::Route { decider: Decider::Human { review: Some(review) }, .. }
+                if review == "launch?\n"
+        ));
+        assert_eq!(task("ask").needs, crate::plan::ir::NEEDS_HUMAN);
+        assert_eq!(task("ask").timeout, Some("1h".parse().unwrap()));
+        assert!(matches!(
+            &task("src").task,
+            TaskKind::Route { decider: Decider::Output { task }, .. } if task.0 == "scan"
+        ));
+        assert_eq!(task("src").needs, "any");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn at_most_passes_the_lower_side() {
+        let pack = temp_pack("at-most");
+        let compiled = compile_source(
+            "e = evaluate(name = \"e\", run = \"true\", threshold = at_most(0.5))\n\
+             workflow(type = \"playbook\", tasks = [e])\n",
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.workflow.tasks[0].task,
+            TaskKind::Evaluate {
+                threshold: Some(t),
+                direction: Some(Direction::Lower),
+                ..
+            } if t == 0.5
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_deprecated_argument_beside_its_replacement_is_refused() {
+        let pack = replaced_pack("value-forms-mixed");
+        for (from, to, old) in [
+            (
+                "when = gate.area.any_of(\"x\", \"y\")",
+                "when = gate.area.any_of(\"x\"), answers = [\"y\"]",
+                "answers",
+            ),
+            (
+                "when = gate.area.otherwise()",
+                "when = gate.area.otherwise(), otherwise = True",
+                "otherwise",
+            ),
+            (
+                "over = each(scan.items, max = 4)",
+                "over = each(scan.items, max = 4), max_fanout = 4",
+                "max_fanout",
+            ),
+            (
+                "revise = send_back(author, rounds = 3)",
+                "revise = send_back(author, rounds = 3), max_rounds = 3",
+                "max_rounds",
+            ),
+            (
+                "threshold = at_least(1)",
+                "threshold = at_least(1), direction = \"higher\"",
+                "direction",
+            ),
+            (
+                "decider = model(min_confidence = 0.8)",
+                "decider = model(min_confidence = 0.8), min_confidence = 0.8",
+                "min_confidence",
+            ),
+            (
+                "decider = output(scan)",
+                "decider = output(scan), source = scan",
+                "source",
+            ),
+            (
+                "decider = human(review = \"review.md\", timeout = \"1h\")",
+                "decider = human(), human = True",
+                "human",
+            ),
+            (
+                "decider = human(review = \"review.md\", timeout = \"1h\")",
+                "decider = human(), review = \"review.md\"",
+                "review",
+            ),
+            (
+                "decider = human(review = \"review.md\", timeout = \"1h\")",
+                "decider = human(), timeout = \"1h\"",
+                "timeout",
+            ),
+            (
+                "decider = model(min_confidence = 0.8)",
+                "decider = model(min_confidence = 0.8), files = []",
+                "files",
+            ),
+        ] {
+            assert!(VALUE_FORMS.contains(from), "{from}");
+            let source = format!(
+                "{REPLACED_HEAD}{}{REPLACED_TAIL}",
+                VALUE_FORMS.replace(from, to)
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{to}: compiled")),
+            );
+            assert!(
+                error.contains(&format!("argument {old:?} is deprecated")),
+                "{to}: {error}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn value_constructors_refuse_what_they_cannot_mean() {
+        let pack = replaced_pack("value-forms-refused");
+        for (from, to, needle) in [
+            (
+                "gate.area.any_of(\"x\", \"y\")",
+                "gate.area.any_of()",
+                "lists no labels",
+            ),
+            (
+                "gate.area.any_of(\"x\", \"y\")",
+                "gate.area.any_of(\"x\", \"w\")",
+                "\"w\"",
+            ),
+            (
+                "gate.area.any_of(\"x\", \"y\")",
+                "gate.area.any_of(1)",
+                "must be label strings",
+            ),
+            (
+                "each(scan.items, max = 4)",
+                "each(scan.items)",
+                "missing required argument \"max\"",
+            ),
+            (
+                "each(scan.items, max = 4)",
+                "each(scan.items, max = 0)",
+                "outside 1..=256",
+            ),
+            ("each(scan.items, max = 4)", "each(scan, max = 4)", "over"),
+            ("each(scan.items, max = 4)", "each(scan.items, 4)", "each()"),
+            (
+                "send_back(author, rounds = 3)",
+                "send_back(author)",
+                "missing required argument \"rounds\"",
+            ),
+            (
+                "send_back(author, rounds = 3)",
+                "send_back(author, rounds = 9)",
+                "9",
+            ),
+            (
+                "send_back(author, rounds = 3)",
+                "send_back([], rounds = 3)",
+                "revise",
+            ),
+            ("at_least(1)", "at_least(\"1\")", "must be a number"),
+            (
+                "model(min_confidence = 0.8)",
+                "model()",
+                "missing required argument \"min_confidence\"",
+            ),
+            (
+                "decider = model(min_confidence = 0.8)",
+                "decider = 0.8",
+                "must be model(...), human(...), or output(task)",
+            ),
+            (
+                "    decider = model(min_confidence = 0.8),\n",
+                "",
+                "needs a decider",
+            ),
+        ] {
+            assert!(VALUE_FORMS.contains(from), "{from}");
+            let source = format!(
+                "{REPLACED_HEAD}{}{REPLACED_TAIL}",
+                VALUE_FORMS.replace(from, to)
+            );
+            let error = crate::errors::report(
+                &compile_source(&source, &pack.join("workflow.star"), &pack)
+                    .err()
+                    .unwrap_or_else(|| panic!("{to}: compiled")),
+            );
+            assert!(error.contains(needle), "{to}: {error}");
+            assert!(error.contains("workflow.star:"), "{to}: {error}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn compiled(tag: &str, source: &str) -> CompiledWorkflow {
+        let pack = temp_pack(tag);
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let _ = std::fs::remove_dir_all(&pack);
+        compiled
+    }
+
+    fn refused(tag: &str, source: &str) -> String {
+        let pack = temp_pack(tag);
+        let error = compile_source(source, &pack.join("workflow.star"), &pack)
+            .err()
+            .unwrap_or_else(|| panic!("compiled: {source}"));
+        let _ = std::fs::remove_dir_all(&pack);
+        crate::errors::report(&error)
+    }
+
+    fn named<'a>(compiled: &'a CompiledWorkflow, name: &str) -> &'a Task {
+        compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|task| task.name.0 == name)
+            .unwrap_or_else(|| panic!("no task {name}"))
+    }
+
+    fn dependencies(task: &Task) -> Vec<&str> {
+        task.depends_on.iter().map(|d| d.0.as_str()).collect()
+    }
+
+    #[test]
+    fn a_task_named_by_over_keyed_when_or_a_route_is_a_dependency_without_being_listed() {
+        let compiled = compiled(
+            "implied-deps",
+            r#"scan = command(name = "scan", run = "true", emits = {"items": "list", "facts": "object", "q": "boolean", "picks": "list"})
+gate = route(name = "gate", decider = output(scan), questions = {"q": noul(ask = "q?", drop = ["no", "uncertain"])})
+ask = route(name = "ask", decider = human(), questions = {"which": pick(ask = "which?", source = scan.picks)})
+fan = command(name = "fan", run = "true", over = each(scan.items, max = 4), keyed = [scan.facts])
+go = command(name = "go", run = "true", when = gate.q)
+both = command(name = "both", run = "true", depends_on = [fan, scan], when = gate.q)
+workflow(type = "playbook", tasks = [scan, gate, ask, fan, go, both])
+"#,
+        );
+        assert_eq!(dependencies(named(&compiled, "gate")), ["scan"]);
+        assert_eq!(dependencies(named(&compiled, "ask")), ["scan"]);
+        assert_eq!(dependencies(named(&compiled, "fan")), ["scan"]);
+        assert_eq!(dependencies(named(&compiled, "go")), ["gate"]);
+        assert_eq!(
+            dependencies(named(&compiled, "both")),
+            ["fan", "scan", "gate"],
+            "listed dependencies keep their order and are not repeated"
+        );
+    }
+
+    const FIELD_WHEN: &str = r#"check = command(name = "check", run = "true", required = False, emits = {"ok": "boolean", "verdict": ["ship", "hold", "drop"]})
+go = command(name = "go", run = "true", required = False, when = check.ok)
+ship = command(name = "ship", run = "true", required = False, when = check.verdict.any_of("ship"))
+rest = command(name = "rest", run = "true", required = False, when = check.verdict.otherwise())
+done = command(name = "done", run = "true", depends_on = [go, ship, rest], join = "passed")
+workflow(type = "playbook", tasks = [check, go, ship, rest, done])
+"#;
+
+    #[test]
+    fn a_when_on_a_typed_field_compiles_to_a_route_its_producer_answers() {
+        let compiled = compiled("field-when", FIELD_WHEN);
+        let names: Vec<&str> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|task| task.name.0.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "check",
+                "check-ok",
+                "check-verdict",
+                "go",
+                "ship",
+                "rest",
+                "done"
+            ],
+            "each route follows its producer"
+        );
+
+        let ok = named(&compiled, "check-ok");
+        assert_eq!(dependencies(ok), ["check"]);
+        assert!(!ok.required, "advisory like the task it reads");
+        assert_eq!(ok.needs, "any");
+        let TaskKind::Route { questions, decider } = &ok.task else {
+            panic!("not a route: {ok:?}");
+        };
+        assert_eq!(
+            decider,
+            &Decider::Output {
+                task: "check".into()
+            }
+        );
+        let asked = questions[&QuestionId::new("ok").unwrap()]
+            .declared()
+            .unwrap();
+        assert_eq!(asked.kind, QuestionKind::Noul);
+        assert_eq!(asked.instructions, "check.ok");
+        let dropped: Vec<&str> = asked.drop.iter().map(Label::as_str).collect();
+        assert_eq!(dropped, ["no"], "no when reads it");
+
+        let verdict = named(&compiled, "check-verdict");
+        let TaskKind::Route { questions, .. } = &verdict.task else {
+            panic!("not a route: {verdict:?}");
+        };
+        let asked = questions[&QuestionId::new("verdict").unwrap()]
+            .declared()
+            .unwrap();
+        assert!(asked.drop.is_empty(), "otherwise reads the rest");
+
+        let when = |name: &str| {
+            let when = named(&compiled, name).when.as_ref().unwrap();
+            let labels: Vec<String> = when.is.iter().map(ToString::to_string).collect();
+            (when.task.0.clone(), when.question.to_string(), labels)
+        };
+        assert_eq!(
+            when("go"),
+            ("check-ok".into(), "ok".into(), vec!["yes".into()])
+        );
+        assert_eq!(
+            when("ship"),
+            (
+                "check-verdict".into(),
+                "verdict".into(),
+                vec!["ship".into()]
+            )
+        );
+        assert_eq!(
+            when("rest"),
+            (
+                "check-verdict".into(),
+                "verdict".into(),
+                vec!["hold".into(), "drop".into()]
+            )
+        );
+        assert_eq!(dependencies(named(&compiled, "go")), ["check-ok"]);
+    }
+
+    #[test]
+    fn a_when_on_a_field_that_cannot_answer_is_refused_where_it_is_written() {
+        for (from, to, needle) in [
+            (
+                "\"ok\": \"boolean\"",
+                "\"ok\": \"string\"",
+                "\"when\" reads check.ok, which is string",
+            ),
+            (
+                "\"verdict\": [\"ship\", \"hold\", \"drop\"]",
+                "\"verdict\": [\"ship\"]",
+                "\"when\" reads check.verdict, which is",
+            ),
+            ("when = check.ok", "when = check.nope", "nope"),
+            (
+                "check.verdict.any_of(\"ship\")",
+                "check.verdict.any_of(\"sihp\")",
+                "did you mean \"ship\"",
+            ),
+            (
+                "check.verdict.any_of(\"ship\")",
+                "check.verdict",
+                "missing required argument \"answers\"",
+            ),
+            (
+                "run = \"true\", required = False, emits",
+                "run = \"true\", depends_on = [seed], over = each(seed.items, max = 2), emits",
+                "a field of a mapped task",
+            ),
+        ] {
+            assert!(FIELD_WHEN.contains(from), "{from}");
+            let source = format!(
+                "seed = command(name = \"seed\", run = \"true\", emits = [\"items\"])\n{}",
+                FIELD_WHEN
+                    .replace(from, to)
+                    .replace("tasks = [check,", "tasks = [seed, check,")
+            );
+            let error = refused("field-when-refused", &source);
+            assert!(error.contains(needle), "{to}: {error}");
+            assert!(error.contains("workflow.star:"), "{to}: {error}");
+        }
+    }
+
+    const DEFAULTED: &str = r#"a = command(name = "a", run = "true")
+b = agent(name = "b", prompt = "p", depends_on = [a], join = "passed", required = True)
+g = route(name = "g", decider = output(a), questions = {"q": noul(ask = "q?")})
+e = evaluate(name = "e", run = "true", depends_on = [b], join = "settled")
+r = report(name = "r", destination = {"kind": "slack"}, template = "t.md")
+workflow(type = "playbook", tasks = [a, b, g, e, r], defaults = task_defaults(required = False))
+"#;
+
+    #[test]
+    fn task_defaults_fill_what_a_task_does_not_set() {
+        let pack = temp_pack("task-defaults");
+        std::fs::write(pack.join("t.md"), "report\n").unwrap();
+        let compile = |source: &str| {
+            compile_source(source, &pack.join("workflow.star"), &pack)
+                .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)))
+        };
+        let defaulted = compile(DEFAULTED);
+        let required = |compiled: &CompiledWorkflow, name: &str| named(compiled, name).required;
+        assert!(!required(&defaulted, "a"));
+        assert!(required(&defaulted, "b"), "a task's own value wins");
+        assert!(!required(&defaulted, "g"));
+        assert!(!required(&defaulted, "e"));
+        assert!(required(&defaulted, "r"), "a report is engine-owned");
+
+        let plain = compile(&DEFAULTED.replace(", defaults = task_defaults(required = False)", ""));
+        assert!(
+            ["a", "b", "g", "e", "r"]
+                .iter()
+                .all(|name| required(&plain, name))
+        );
+
+        let error = crate::errors::report(
+            &compile_source(
+                &DEFAULTED.replace("task_defaults(required = False)", "False"),
+                &pack.join("workflow.star"),
+                &pack,
+            )
+            .unwrap_err(),
+        );
+        assert!(error.contains("must be task_defaults(...)"), "{error}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    const OTHERS: &str = r#"a = command(name = "a", run = "true", required = False)
+b = command(name = "b", run = "true", depends_on = [a], required = False)
+look = command(name = "look", run = "true", depends_on = [others()], join = "settled", required = False)
+judge = command(name = "judge", run = "true", depends_on = [others(), look], join = "settled")
+ship = command(name = "ship", run = "true", depends_on = [judge])
+late = command(name = "late", run = "true", depends_on = [b], required = False)
+down = command(name = "down", run = "true", stage = "epilogue")
+workflow(type = "playbook", tasks = [a, b, look, judge, ship, late, down])
+"#;
+
+    #[test]
+    fn others_stands_for_every_main_graph_task_no_others_task_feeds() {
+        let compiled = compiled("others", OTHERS);
+        assert_eq!(dependencies(named(&compiled, "look")), ["a", "b", "late"]);
+        assert_eq!(
+            dependencies(named(&compiled, "judge")),
+            ["look", "a", "b", "late"]
+        );
+        assert_eq!(dependencies(named(&compiled, "ship")), ["judge"]);
+        assert_eq!(dependencies(named(&compiled, "late")), ["b"]);
+    }
+
+    #[test]
+    fn others_is_refused_where_it_cannot_apply() {
+        for (from, to, needle) in [
+            (
+                "run = \"true\", stage = \"epilogue\"",
+                "run = \"true\", stage = \"epilogue\", depends_on = [others()]",
+                "lists others() in the epilogue",
+            ),
+            (
+                "depends_on = [judge]",
+                "depends_on = [judge], revise = send_back(others(), rounds = 2)",
+                "tasks entries must be tasks",
+            ),
+        ] {
+            assert!(OTHERS.contains(from), "{from}");
+            let error = refused("others-refused", &OTHERS.replace(from, to));
+            assert!(error.contains(needle), "{to}: {error}");
+        }
+    }
+
+    #[test]
+    fn send_back_takes_every_task_between_its_targets_and_the_reviewer() {
+        let compiled = compiled(
+            "send-back-between",
+            r#"plan = agent(name = "plan", prompt = "p")
+draft = agent(name = "draft", prompt = "p", depends_on = [plan])
+lint = command(name = "lint", run = "true", depends_on = [draft])
+proof = command(name = "proof", run = "true", depends_on = [draft])
+side = command(name = "side", run = "true", depends_on = [plan])
+check = evaluate(name = "check", run = "true", depends_on = [lint, proof, side], revise = send_back(draft, rounds = 2))
+workflow(type = "playbook", tasks = [plan, draft, lint, proof, side, check])
+"#,
+        );
+        assert_eq!(
+            named(&compiled, "check").revise,
+            Some(Revise {
+                tasks: vec!["draft".into(), "lint".into(), "proof".into()],
+                max_rounds: 2
+            }),
+            "plan is before the target and side is not downstream of it"
+        );
     }
 }

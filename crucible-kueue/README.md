@@ -24,6 +24,18 @@ KubeRay accepts a TTL; a JobSet's deadline goes on each replicated Job, a PyTorc
 `runPolicy`). Both defaults are flags. `workload_plan` and `workload_submit` report that TTL as
 `finished_retention_seconds`; past it the object, its pods, logs and task are gone.
 
+Planning or submitting a workload that already exists with the same plan hash answers as the
+first time did (`dry_run: "already submitted with this plan"`, `submitted: false`), so a retried
+caller can run plan then submit again. One of that name with other content is refused.
+
+`workload_plan` and `workload_submit` take `expose`, a list of up to eight ports of a Deployment,
+StatefulSet or LeaderWorkerSet. The server creates a ClusterIP Service of the workload's name for
+them, selecting the pods by the `workload` label it stamps (a LeaderWorkerSet's leaders only) and
+owned by the workload, so deleting the workload deletes it. Plan, submit and `workload_status`
+answer `service`: its `name`, its `host` (`<name>.<namespace>.svc.<cluster domain>`) and `ports`.
+The ports are part of the plan hash. A Service of that name that is not the workload's refuses
+the submit.
+
 Every tool answers JSON text with a `status`: `ok`, `refused`, `rejected`, `not_found`, `error`,
 or `failed` (a completed task whose workload failed). Anything but `ok` is a tool result with
 `isError: true` and a `retryable` flag (an admission webhook's refusal, a 5xx, or an API server
@@ -39,10 +51,14 @@ without that part, and `omitted` says which parts were left out and why. `until`
 (`admitted`/`running`/`ready`/`finished`) waits on the server for up to `timeout_seconds` (max
 50) and stops early once the workload settles short of it or a pod is stuck.
 
-`workload_logs` shares a byte budget (16 KiB by default, `max_bytes` up to 64 KiB) across at most
+`workload_logs` shares a byte budget (16 KiB by default, `max_bytes` up to 1 MiB) across at most
 four pods, failed ones first, then a RayJob's head and submitter or a LeaderWorkerSet's leader.
-Each pod keeps the end of its log; `truncated` and `bytes_omitted` say what was cut. `grep` and
-`since_seconds` narrow it first.
+Each pod keeps the end of its log; `truncated` and `bytes_omitted` say what was cut. `grep`,
+`since_seconds` and `since_time` narrow it first, and `timestamps` starts each line with the time
+it was written. `follow_seconds` (max 50) keeps every selected pod's log open that long and
+answers what was written by then, so a pod that crashes and is deleted during the call is read to
+its end. A caller that repeats the call with `since_time` set to the last time it saw reads a log
+as it is written.
 
 ## Tasks
 
@@ -114,7 +130,8 @@ crucible-kueue \
   account: `get`/`list` for reads, `use` on the LocalQueue (`--queue-verb get` where roles do not
   grant Kueue's custom verb) and `create` on the kind to submit, `get` on each Secret and
   PersistentVolumeClaim a manifest names, and `update`/`delete` (or the scale subresource) to
-  control. A caller's subject that is not a label value is sanitized with a hash.
+  control, and `create` on Services for a submit that exposes ports. A caller's subject that is
+  not a label value is sanitized with a hash.
 - `--ownership rbac` lets a caller observe and control any workload of a served kind its RBAC
   permits; `workload_list` with `filter: "all"` lists them. `managed` (the default) limits
   control to what this server created for the caller.
@@ -143,6 +160,7 @@ crucible-kueue \
 | `--suspend` (`SUSPEND`) | `true` | Create Jobs, JobSets and PyTorchJobs suspended for Kueue |
 | `--namespace` (`NAMESPACES`) | discovered | Namespaces the server is installed in; empty lists LocalQueues cluster-wide to find them |
 | `--pull-secret` (`PULL_SECRETS`) | none | Image pull secrets pod templates may name, as `name` or `name=registry` (host or host/path prefix; repeat for more registries). The server adds a secret to any pod whose image is on its registry and lists it in the plan's `server_changes`. With none, `imagePullSecrets` is refused |
+| `--cluster-domain` (`CLUSTER_DOMAIN`) | `cluster.local` | The cluster's DNS domain, for the host of an exposed workload's Service |
 | `--accelerator-resource` (`ACCELERATOR_RESOURCES`) | `nvidia.com/gpu`, `nvidia.com/mig-*`, `amd.com/gpu`, `habana.ai/gaudi`, `google.com/tpu` | Resources `hardware_describe` counts; `*` matches a prefix |
 | `--accelerator-product-label` (`ACCELERATOR_PRODUCT_LABELS`) | `nvidia.com/gpu.product`, `amd.com/gpu.product-name`, `habana.ai/gaudi.product`, `cloud.google.com/gke-tpu-accelerator` | Node labels naming the product |
 
@@ -190,7 +208,7 @@ crucible deploy apply --kueue --issuer <CONTROLLER_AGENT_ISSUER> --profile <prof
 The server's identity gets get/list on `clusterqueues`, `resourceflavors`, and `nodes`
 cluster-wide; in the workload namespace only, get/list on `localqueues`, get/list/patch on
 `workloads`, get/list on `localqueues/pendingworkloads` in `visibility.kueue.x-k8s.io`,
-create/get/list/patch/delete on each submittable kind under its own API group, and get/list on pods, `pods/log`, and
+create/get/list/patch/delete on each submittable kind under its own API group, get/create on services, and get/list on pods, `pods/log`, and
 events (discovery of the kinds needs no grant); cluster-wide it may also create `subjectaccessreviews` and, with `kube_authz = "openshift"`,
 list `groups.user.openshift.io`. The server trusts runs' tokens from `--issuer` (the controller's
 `CONTROLLER_AGENT_ISSUER`) with keys from `run_jwks_uri` (default the issuer's

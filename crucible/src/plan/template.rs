@@ -97,6 +97,7 @@ pub(crate) fn iteration_template(
         edition: Default::default(),
         params: std::collections::BTreeMap::new(),
         env: Default::default(),
+        servers: Vec::new(),
         history_record: None,
     };
     workflow

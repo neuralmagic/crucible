@@ -1,0 +1,674 @@
+diff --git a/crates/rune-mac/src/dock.rs b/crates/rune-mac/src/dock.rs
+new file mode 100644
+index 0000000..0a67f1a
+--- /dev/null
++++ b/crates/rune-mac/src/dock.rs
+@@ -0,0 +1,146 @@
++//! The app's Dock tile: a badge label, and a progress bar drawn over the app's icon.
++//!
++//! Call these on the main thread (from `poll` or a handle update). Off macOS they do nothing.
++
++/// Shows `label` as the Dock icon's badge, or clears the badge with `None` or an empty label.
++#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
++pub fn set_badge(label: Option<&str>) {
++    #[cfg(target_os = "macos")]
++    mac::set_badge(label.filter(|l| !l.is_empty()));
++}
++
++/// Draws a progress bar across the bottom of the Dock icon, filled to `fraction` (clamped to
++/// 0..=1), or puts the plain icon back with `None`.
++#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
++pub fn set_progress(fraction: Option<f64>) {
++    #[cfg(target_os = "macos")]
++    mac::set_progress(fraction.map(clamp));
++}
++
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn clamp(fraction: f64) -> f64 {
++    if fraction.is_nan() { 0.0 } else { fraction.clamp(0.0, 1.0) }
++}
++
++/// The bar's track and fill, as `[x, y, width, height]` in a square icon `side` points wide with
++/// its origin at the bottom left.
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn bar(side: f64, fraction: f64) -> ([f64; 4], [f64; 4]) {
++    let inset = side * 0.12;
++    let height = side * 0.1;
++    let y = side * 0.08;
++    let width = side - 2.0 * inset;
++    ([inset, y, width, height], [inset, y, width * clamp(fraction), height])
++}
++
++#[cfg(target_os = "macos")]
++mod mac {
++    use objc2::runtime::AnyObject;
++    use objc2::{Encode, Encoding, class, msg_send};
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct Size {
++        w: f64,
++        h: f64,
++    }
++
++    // SAFETY: two doubles, laid out as CGSize.
++    unsafe impl Encode for Size {
++        const ENCODING: Encoding = Encoding::Struct("CGSize", &[f64::ENCODING, f64::ENCODING]);
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct Point {
++        x: f64,
++        y: f64,
++    }
++
++    // SAFETY: two doubles, laid out as CGPoint.
++    unsafe impl Encode for Point {
++        const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
++    }
++
++    #[repr(C)]
++    #[derive(Clone, Copy)]
++    struct Rect {
++        origin: Point,
++        size: Size,
++    }
++
++    // SAFETY: a CGPoint then a CGSize, laid out as CGRect.
++    unsafe impl Encode for Rect {
++        const ENCODING: Encoding = Encoding::Struct("CGRect", &[Point::ENCODING, Size::ENCODING]);
++    }
++
++    fn rect([x, y, w, h]: [f64; 4]) -> Rect {
++        Rect { origin: Point { x, y }, size: Size { w, h } }
++    }
++
++    unsafe fn ns(s: &str) -> *mut AnyObject {
++        let c = std::ffi::CString::new(s.replace('\0', "")).unwrap_or_default();
++        unsafe { msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()] }
++    }
++
++    unsafe fn tile() -> *mut AnyObject {
++        unsafe {
++            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
++            msg_send![app, dockTile]
++        }
++    }
++
++    pub(super) fn set_badge(label: Option<&str>) {
++        objc2::rc::autoreleasepool(|_| unsafe {
++            let label = label.map_or(std::ptr::null_mut(), |l| ns(l));
++            let _: () = msg_send![tile(), setBadgeLabel: label];
++        });
++    }
++
++    unsafe fn fill(color: *mut AnyObject, bounds: [f64; 4]) {
++        let radius = bounds[3] / 2.0;
++        unsafe {
++            let _: () = msg_send![color, setFill];
++            let path: *mut AnyObject = msg_send![
++                class!(NSBezierPath),
++                bezierPathWithRoundedRect: rect(bounds),
++                xRadius: radius,
++                yRadius: radius
++            ];
++            let _: () = msg_send![path, fill];
++        }
++    }
++
++    pub(super) fn set_progress(fraction: Option<f64>) {
++        objc2::rc::autoreleasepool(|_| unsafe {
++            let tile = tile();
++            let Some(fraction) = fraction else {
++                let _: () = msg_send![tile, setContentView: std::ptr::null_mut::<AnyObject>()];
++                let _: () = msg_send![tile, display];
++                return;
++            };
++            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
++            let icon: *mut AnyObject = msg_send![app, applicationIconImage];
++            let side = 128.0;
++            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
++            let image: *mut AnyObject = msg_send![image, initWithSize: Size { w: side, h: side }];
++            let _: () = msg_send![image, lockFocus];
++            let whole = rect([0.0, 0.0, side, side]);
++            let none = rect([0.0; 4]);
++            // NSCompositingOperationSourceOver
++            let _: () = msg_send![icon, drawInRect: whole, fromRect: none, operation: 2usize, fraction: 1.0f64];
++            let (track, done) = super::bar(side, fraction);
++            fill(msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.55f64], track);
++            fill(msg_send![class!(NSColor), systemBlueColor], done);
++            let _: () = msg_send![image, unlockFocus];
++            let view: *mut AnyObject = msg_send![class!(NSImageView), imageViewWithImage: image];
++            let _: () = msg_send![image, release];
++            let _: () = msg_send![tile, setContentView: view];
++            let _: () = msg_send![tile, display];
++        });
++    }
++}
++
++#[cfg(test)]
++#[path = "dock_tests.rs"]
++mod tests;
+diff --git a/crates/rune-mac/src/dock_tests.rs b/crates/rune-mac/src/dock_tests.rs
+new file mode 100644
+index 0000000..09c3faf
+--- /dev/null
++++ b/crates/rune-mac/src/dock_tests.rs
+@@ -0,0 +1,11 @@
++use super::{bar, clamp};
++
++#[test]
++fn the_bar_fills_its_track_by_the_fraction_and_never_past_it() {
++    let (track, half) = bar(100.0, 0.5);
++    assert_eq!(track[2] / 2.0, half[2]);
++    assert_eq!([track[0], track[1], track[3]], [half[0], half[1], half[3]]);
++    assert_eq!(bar(100.0, 3.0).1[2], track[2]);
++    assert_eq!(bar(100.0, -1.0).1[2], 0.0);
++    assert_eq!(clamp(f64::NAN), 0.0);
++}
+diff --git a/crates/rune-mac/src/files.rs b/crates/rune-mac/src/files.rs
+new file mode 100644
+index 0000000..85599a2
+--- /dev/null
++++ b/crates/rune-mac/src/files.rs
+@@ -0,0 +1,199 @@
++//! Files and folders the system opens with the app: dropped on its Dock icon, or opened with it
++//! from Finder. The bundle declares what it takes (`CFBundleDocumentTypes`).
++//!
++//! macOS sends them as an open-documents Apple event, which winit does not forward. Call `listen`
++//! in `main` before the event loop starts, so a drop that launches the app is kept too, then
++//! `on_open` once the app can take them: it gets what arrived so far, then each batch as it
++//! comes. Off macOS neither does anything.
++
++use std::path::PathBuf;
++use std::sync::{Mutex, OnceLock};
++
++type Handler = Box<dyn Fn(Vec<PathBuf>) + Send + Sync>;
++
++/// The app's handler, or the batches that arrived before it had one.
++enum Sink {
++    Waiting(Vec<Vec<PathBuf>>),
++    Handler(Handler),
++}
++
++fn sink() -> &'static Mutex<Sink> {
++    static SINK: OnceLock<Mutex<Sink>> = OnceLock::new();
++    SINK.get_or_init(|| Mutex::new(Sink::Waiting(Vec::new())))
++}
++
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn deliver(paths: Vec<PathBuf>) {
++    if paths.is_empty() {
++        return;
++    }
++    match &mut *sink().lock().unwrap_or_else(|e| e.into_inner()) {
++        Sink::Handler(f) => f(paths),
++        Sink::Waiting(kept) => kept.push(paths),
++    }
++}
++
++/// Starts taking open-documents events, keeping them until `on_open`. Call it in `main` on the
++/// main thread before the event loop runs: AppKit sets its own handler while launching, so this
++/// sets Rune's again when the app is about to finish launching, before AppKit hands it the
++/// documents the app was launched with.
++pub fn listen() {
++    #[cfg(target_os = "macos")]
++    mac::install_at_launch();
++}
++
++/// Calls `f` with each batch of paths the system opens with the app, those kept since `listen`
++/// first, on the main thread (wake the app's loop from it).
++pub fn on_open(f: impl Fn(Vec<PathBuf>) + Send + Sync + 'static) {
++    let kept = {
++        let mut sink = sink().lock().unwrap_or_else(|e| e.into_inner());
++        match std::mem::replace(&mut *sink, Sink::Handler(Box::new(f))) {
++            Sink::Waiting(kept) => kept,
++            Sink::Handler(_) => Vec::new(),
++        }
++    };
++    for paths in kept {
++        deliver(paths);
++    }
++    #[cfg(target_os = "macos")]
++    mac::install();
++}
++
++/// The path a `file://` URL names, percent-decoded and without a trailing slash; `None` for any
++/// other URL.
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn path_of(url: &str) -> Option<PathBuf> {
++    let rest = url.strip_prefix("file://")?;
++    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
++    if !rest.starts_with('/') {
++        return None;
++    }
++    let bytes = rest.as_bytes();
++    let mut out = Vec::with_capacity(bytes.len());
++    let mut i = 0;
++    while i < bytes.len() {
++        let hex = bytes.get(i + 1..i + 3).and_then(|h| std::str::from_utf8(h).ok());
++        match (bytes[i], hex.and_then(|h| u8::from_str_radix(h, 16).ok())) {
++            (b'%', Some(byte)) => {
++                out.push(byte);
++                i += 3;
++            }
++            (byte, _) => {
++                out.push(byte);
++                i += 1;
++            }
++        }
++    }
++    let path = String::from_utf8(out).ok()?;
++    let trimmed = path.trim_end_matches('/');
++    Some(PathBuf::from(if trimmed.is_empty() { "/" } else { trimmed }))
++}
++
++#[cfg(target_os = "macos")]
++mod mac {
++    use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
++    use objc2::{class, msg_send, sel};
++
++    const CORE_EVENT: u32 = u32::from_be_bytes(*b"aevt");
++    const OPEN_DOCUMENTS: u32 = u32::from_be_bytes(*b"odoc");
++    const DIRECT_OBJECT: u32 = u32::from_be_bytes(*b"----");
++    const FILE_URL: u32 = u32::from_be_bytes(*b"furl");
++
++    /// The `file://` URL one descriptor of the event's list holds.
++    unsafe fn url(item: *mut AnyObject) -> Option<String> {
++        unsafe {
++            let furl: *mut AnyObject = msg_send![item, coerceToDescriptorType: FILE_URL];
++            if furl.is_null() {
++                return None;
++            }
++            let data: *mut AnyObject = msg_send![furl, data];
++            if data.is_null() {
++                return None;
++            }
++            let length: usize = msg_send![data, length];
++            let bytes: *const u8 = msg_send![data, bytes];
++            if bytes.is_null() {
++                return None;
++            }
++            let raw = std::slice::from_raw_parts(bytes, length);
++            Some(String::from_utf8_lossy(raw).trim_end_matches('\0').to_string())
++        }
++    }
++
++    extern "C" fn opened(_this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject, _reply: *mut AnyObject) {
++        let paths = objc2::rc::autoreleasepool(|_| unsafe {
++            let list: *mut AnyObject = msg_send![event, paramDescriptorForKeyword: DIRECT_OBJECT];
++            if list.is_null() {
++                return Vec::new();
++            }
++            let n: isize = msg_send![list, numberOfItems];
++            if n == 0 {
++                return url(list).as_deref().and_then(super::path_of).into_iter().collect();
++            }
++            (1..=n)
++                .filter_map(|i| {
++                    let item: *mut AnyObject = msg_send![list, descriptorAtIndex: i];
++                    url(item).as_deref().and_then(super::path_of)
++                })
++                .collect()
++        });
++        super::deliver(paths);
++    }
++
++    fn target_class() -> &'static AnyClass {
++        const NAME: &str = "RuneMacOpenDocumentsTarget";
++        if let Some(c) = AnyClass::get(NAME) {
++            return c;
++        }
++        let mut b = ClassBuilder::new(NAME, class!(NSObject)).expect("open-documents target class");
++        unsafe {
++            b.add_method(sel!(opened:withReply:), opened as extern "C" fn(_, _, _, _));
++        }
++        b.register()
++    }
++
++    /// The object the event manager calls; it holds its handler weakly, so this one lives as long
++    /// as the process.
++    fn target() -> usize {
++        static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++        *TARGET.get_or_init(|| {
++            let made: *mut AnyObject = unsafe { msg_send![target_class(), new] };
++            made as usize
++        })
++    }
++
++    pub(super) fn install_at_launch() {
++        use block2::RcBlock;
++        let installed = RcBlock::new(|_note: *mut AnyObject| install());
++        unsafe {
++            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
++            let name = std::ffi::CString::new("NSApplicationWillFinishLaunchingNotification").unwrap_or_default();
++            let name: *mut AnyObject = msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];
++            let _: *mut AnyObject = msg_send![
++                center,
++                addObserverForName: name,
++                object: std::ptr::null_mut::<AnyObject>(),
++                queue: std::ptr::null_mut::<AnyObject>(),
++                usingBlock: &*installed
++            ];
++        }
++    }
++
++    pub(super) fn install() {
++        unsafe {
++            let target = target() as *mut AnyObject;
++            let manager: *mut AnyObject = msg_send![class!(NSAppleEventManager), sharedAppleEventManager];
++            let _: () = msg_send![
++                manager,
++                setEventHandler: target,
++                andSelector: sel!(opened:withReply:),
++                forEventClass: CORE_EVENT,
++                andEventID: OPEN_DOCUMENTS
++            ];
++        }
++    }
++}
++
++#[cfg(test)]
++#[path = "files_tests.rs"]
++mod tests;
+diff --git a/crates/rune-mac/src/files_tests.rs b/crates/rune-mac/src/files_tests.rs
+new file mode 100644
+index 0000000..c646b23
+--- /dev/null
++++ b/crates/rune-mac/src/files_tests.rs
+@@ -0,0 +1,34 @@
++use std::path::PathBuf;
++
++use super::{deliver, listen, on_open, path_of};
++
++#[test]
++fn file_urls_become_decoded_paths() {
++    assert_eq!(path_of("file:///Users/me/My%20Pack/"), Some(PathBuf::from("/Users/me/My Pack")));
++    assert_eq!(path_of("file://localhost/tmp/x"), Some(PathBuf::from("/tmp/x")));
++    assert_eq!(path_of("file:///caf%C3%A9"), Some(PathBuf::from("/café")));
++    assert_eq!(path_of("file:///a%2"), Some(PathBuf::from("/a%2")), "a cut escape stays as written");
++    assert_eq!(path_of("file:///"), Some(PathBuf::from("/")));
++}
++
++#[test]
++fn other_urls_are_not_paths() {
++    assert_eq!(path_of("https://example.com/x"), None);
++    assert_eq!(path_of("file://host/x"), None);
++}
++
++#[test]
++fn paths_that_arrive_before_the_app_listens_are_kept_for_it() {
++    listen();
++    deliver(vec![PathBuf::from("/early")]);
++    deliver(Vec::new());
++    let (tx, rx) = std::sync::mpsc::channel();
++    let tx = std::sync::Mutex::new(tx);
++    on_open(move |paths| {
++        let _ = tx.lock().map(|tx| tx.send(paths));
++    });
++    deliver(vec![PathBuf::from("/late")]);
++    assert_eq!(rx.recv().unwrap(), [PathBuf::from("/early")]);
++    assert_eq!(rx.recv().unwrap(), [PathBuf::from("/late")]);
++    assert!(rx.try_recv().is_err(), "an empty batch is not delivered");
++}
+diff --git a/crates/rune-mac/src/lib.rs b/crates/rune-mac/src/lib.rs
+index a91aed8..19f87b5 100644
+--- a/crates/rune-mac/src/lib.rs
++++ b/crates/rune-mac/src/lib.rs
+@@ -4,9 +4,13 @@
+ //! Off macOS every helper is a no-op: `remember_frame` returns true (so a `poll` that waits on it
+ //! stops), `saved_size` returns `None`, `is_full_screen` returns false, and `toggle_full_screen`,
+ //! `launch` and `busy` do nothing. `notify` posts nothing and reports `available() == false`.
++//! `dock` and `status` draw nothing.
+ 
++pub mod dock;
++pub mod files;
+ pub mod notify;
+ mod quiet;
++pub mod status;
+ pub use quiet::launch;
+ 
+ /// Has AppKit save the app's window frame under `name` and put the next launch's window in the
+diff --git a/crates/rune-mac/src/status.rs b/crates/rune-mac/src/status.rs
+new file mode 100644
+index 0000000..a852a44
+--- /dev/null
++++ b/crates/rune-mac/src/status.rs
+@@ -0,0 +1,208 @@
++//! A menu bar extra: one `NSStatusItem` with a title and a menu the app rebuilds whole, whose
++//! picks come back by the id each line was given.
++//!
++//! Call `show` and `hide` on the main thread (from `poll` or a handle update); `on_pick` from
++//! anywhere. Off macOS they do nothing.
++
++use std::sync::{Mutex, OnceLock};
++
++/// One line of the menu.
++#[derive(Clone, Debug, PartialEq)]
++pub enum Line {
++    /// A line the person can pick, reported to `on_pick` by `id`, with a check mark when
++    /// `checked`.
++    Item { id: String, title: String, checked: bool },
++    /// A line that only says something.
++    Label(String),
++    Separator,
++}
++
++impl Line {
++    pub fn item(id: impl Into<String>, title: impl Into<String>) -> Line {
++        Line::Item { id: id.into(), title: title.into(), checked: false }
++    }
++
++    pub fn checked(self, on: bool) -> Line {
++        match self {
++            Line::Item { id, title, .. } => Line::Item { id, title, checked: on },
++            other => other,
++        }
++    }
++}
++
++type Handler = Box<dyn Fn(String) + Send + Sync>;
++
++fn handler() -> &'static Mutex<Option<Handler>> {
++    static HANDLER: OnceLock<Mutex<Option<Handler>>> = OnceLock::new();
++    HANDLER.get_or_init(|| Mutex::new(None))
++}
++
++#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
++fn deliver(id: String) {
++    if let Some(f) = handler().lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
++        f(id);
++    }
++}
++
++/// Calls `f` with the id of every line picked from the menu, on the main thread (wake the app's
++/// loop from it).
++pub fn on_pick(f: impl Fn(String) + Send + Sync + 'static) {
++    *handler().lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(f));
++}
++
++/// Puts the status item in the menu bar, if it is not there, titled `title` with `lines` as its
++/// menu.
++#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
++pub fn show(title: &str, lines: &[Line]) {
++    #[cfg(target_os = "macos")]
++    mac::show(title, lines);
++}
++
++/// Takes the status item out of the menu bar.
++pub fn hide() {
++    #[cfg(target_os = "macos")]
++    mac::hide();
++}
++
++#[cfg(target_os = "macos")]
++mod mac {
++    use std::cell::Cell;
++
++    use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
++    use objc2::{class, msg_send, sel};
++
++    use super::Line;
++
++    // NSVariableStatusItemLength
++    const VARIABLE: f64 = -1.0;
++
++    thread_local! {
++        static ITEM: Cell<*mut AnyObject> = const { Cell::new(std::ptr::null_mut()) };
++        static TARGET: Cell<*mut AnyObject> = const { Cell::new(std::ptr::null_mut()) };
++    }
++
++    unsafe fn ns(s: &str) -> *mut AnyObject {
++        let c = std::ffi::CString::new(s.replace('\0', "")).unwrap_or_default();
++        unsafe { msg_send![class!(NSString), stringWithUTF8String: c.as_ptr()] }
++    }
++
++    unsafe fn string(s: *mut AnyObject) -> Option<String> {
++        if s.is_null() {
++            return None;
++        }
++        let utf8: *const std::ffi::c_char = unsafe { msg_send![s, UTF8String] };
++        (!utf8.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(utf8) }.to_string_lossy().into_owned())
++    }
++
++    extern "C" fn picked(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
++        let id = objc2::rc::autoreleasepool(|_| unsafe { string(msg_send![sender, representedObject]) });
++        if let Some(id) = id {
++            super::deliver(id);
++        }
++    }
++
++    fn target_class() -> &'static AnyClass {
++        const NAME: &str = "RuneMacStatusTarget";
++        if let Some(c) = AnyClass::get(NAME) {
++            return c;
++        }
++        let mut b = ClassBuilder::new(NAME, class!(NSObject)).expect("status target class");
++        unsafe {
++            b.add_method(sel!(picked:), picked as extern "C" fn(_, _, _));
++        }
++        b.register()
++    }
++
++    /// The object menu items send `picked:` to; it lives as long as the process.
++    fn target() -> *mut AnyObject {
++        TARGET.with(|t| {
++            if t.get().is_null() {
++                let made: *mut AnyObject = unsafe { msg_send![target_class(), new] };
++                t.set(made);
++            }
++            t.get()
++        })
++    }
++
++    fn item() -> *mut AnyObject {
++        ITEM.with(|i| {
++            if i.get().is_null() {
++                let made: *mut AnyObject = unsafe {
++                    let bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
++                    let item: *mut AnyObject = msg_send![bar, statusItemWithLength: VARIABLE];
++                    msg_send![item, retain]
++                };
++                i.set(made);
++            }
++            i.get()
++        })
++    }
++
++    unsafe fn menu(lines: &[Line]) -> *mut AnyObject {
++        unsafe {
++            let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
++            let _: () = msg_send![menu, setAutoenablesItems: false];
++            for line in lines {
++                let entry: *mut AnyObject = match line {
++                    Line::Separator => msg_send![class!(NSMenuItem), separatorItem],
++                    Line::Label(text) => {
++                        let entry: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
++                        let entry: *mut AnyObject = msg_send![
++                            entry,
++                            initWithTitle: ns(text),
++                            action: Option::<Sel>::None,
++                            keyEquivalent: ns("")
++                        ];
++                        let _: () = msg_send![entry, setEnabled: false];
++                        msg_send![entry, autorelease]
++                    }
++                    Line::Item { id, title, checked } => {
++                        let entry: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
++                        let entry: *mut AnyObject = msg_send![
++                            entry,
++                            initWithTitle: ns(title),
++                            action: sel!(picked:),
++                            keyEquivalent: ns("")
++                        ];
++                        let _: () = msg_send![entry, setTarget: target()];
++                        let _: () = msg_send![entry, setRepresentedObject: ns(id)];
++                        // NSControlStateValueOn / Off
++                        let _: () = msg_send![entry, setState: if *checked { 1isize } else { 0isize }];
++                        msg_send![entry, autorelease]
++                    }
++                };
++                let _: () = msg_send![menu, addItem: entry];
++            }
++            msg_send![menu, autorelease]
++        }
++    }
++
++    pub(super) fn show(title: &str, lines: &[Line]) {
++        objc2::rc::autoreleasepool(|_| unsafe {
++            let item = item();
++            let button: *mut AnyObject = msg_send![item, button];
++            if !button.is_null() {
++                let _: () = msg_send![button, setTitle: ns(title)];
++            }
++            let _: () = msg_send![item, setMenu: menu(lines)];
++            let _: () = msg_send![item, setVisible: true];
++        });
++    }
++
++    pub(super) fn hide() {
++        ITEM.with(|i| {
++            let item = i.replace(std::ptr::null_mut());
++            if !item.is_null() {
++                unsafe {
++                    let bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
++                    let _: () = msg_send![bar, removeStatusItem: item];
++                    let _: () = msg_send![item, release];
++                }
++            }
++        });
++    }
++}
++
++#[cfg(test)]
++#[path = "status_tests.rs"]
++mod tests;
+diff --git a/crates/rune-mac/src/status_tests.rs b/crates/rune-mac/src/status_tests.rs
+new file mode 100644
+index 0000000..acf2a47
+--- /dev/null
++++ b/crates/rune-mac/src/status_tests.rs
+@@ -0,0 +1,22 @@
++use super::{Line, deliver, on_pick};
++
++#[test]
++fn checked_marks_items_and_leaves_other_lines_alone() {
++    assert_eq!(
++        Line::item("a", "Alpha").checked(true),
++        Line::Item { id: "a".into(), title: "Alpha".into(), checked: true }
++    );
++    assert_eq!(Line::Separator.checked(true), Line::Separator);
++    assert_eq!(Line::Label("x".into()).checked(true), Line::Label("x".into()));
++}
++
++#[test]
++fn a_pick_reaches_the_installed_handler_by_id() {
++    let (tx, rx) = std::sync::mpsc::channel();
++    let tx = std::sync::Mutex::new(tx);
++    on_pick(move |id| {
++        let _ = tx.lock().map(|tx| tx.send(id));
++    });
++    deliver("launch:7".into());
++    assert_eq!(rx.recv().unwrap(), "launch:7");
++}

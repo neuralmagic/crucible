@@ -30,7 +30,8 @@ const EVENT_STREAM_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 ///
 /// The body comes back as text rather than a parsed value on purpose — a non-2xx body is usually
 /// the sentence naming what the caller got wrong, and it has to survive verbatim.
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait Transport: Send + Sync {
     async fn send(
         &self,
@@ -104,11 +105,52 @@ pub enum Credential {
     EdgeApiKey,
 }
 
+/// The request header naming the team a request acts as. The controller answers a team it
+/// refuses with the same header set to `refused`.
+pub const ACT_AS_HEADER: &str = "x-crucible-act-as";
+
+/// The team every request acts as, and why the controller refused it once it has.
+#[derive(Debug, Clone)]
+pub struct ActAs {
+    team: String,
+    refused: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl ActAs {
+    /// `team` is the principal, `team:<slug>`.
+    pub fn new(team: impl Into<String>) -> Self {
+        ActAs {
+            team: team.into(),
+            refused: std::sync::Arc::default(),
+        }
+    }
+
+    pub fn team(&self) -> &str {
+        &self.team
+    }
+
+    /// The controller's reason, once a response has refused the team.
+    pub fn refused(&self) -> Option<String> {
+        self.refused.lock().ok().and_then(|reason| reason.clone())
+    }
+
+    fn note_refusal(&self, body: &str) {
+        let reason = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| body.get("error")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| format!("the controller refused to act as {}", self.team));
+        if let Ok(mut slot) = self.refused.lock() {
+            *slot = Some(reason);
+        }
+    }
+}
+
 /// The HTTP wire: a reqwest client and the credential it presents.
 pub struct HttpTransport {
     http: reqwest::Client,
     endpoint: Endpoint,
     auth: Auth,
+    act_as: Option<ActAs>,
 }
 
 /// Where an import fetches a pack, and the manifest variant it reads.
@@ -127,11 +169,27 @@ pub struct Client {
 
 impl HttpTransport {
     pub fn connect(cfg: &Config) -> Result<Self> {
+        Self::with_client(cfg, Self::builder())
+    }
+
+    /// The builder [`HttpTransport::connect`] starts from, for a caller that adds a proxy or
+    /// resolver overrides before handing it to [`HttpTransport::with_client`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder().timeout(Duration::from_secs(120))
+    }
+
+    /// The browser's fetch has no client-wide timeout.
+    #[cfg(target_arch = "wasm32")]
+    pub fn builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+    }
+
+    pub fn with_client(cfg: &Config, builder: reqwest::ClientBuilder) -> Result<Self> {
         if cfg.url.is_empty() {
             bail!("no controller to talk to: set CONTROLLER_URL, or `url` in the config file");
         }
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+        let http = builder
             .build()
             .context("building the controller http client")?;
         Ok(Self {
@@ -140,7 +198,14 @@ impl HttpTransport {
                 url: cfg.url.clone(),
             },
             auth: cfg.auth.clone(),
+            act_as: None,
         })
+    }
+
+    /// Send every request as `act_as`'s team.
+    pub fn acting_as(mut self, act_as: ActAs) -> Self {
+        self.act_as = Some(act_as);
+        self
     }
 
     fn req(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -160,11 +225,24 @@ impl HttpTransport {
         for (name, value) in self.auth.headers() {
             req = req.header(name, value);
         }
+        if let Some(act_as) = &self.act_as {
+            req = req.header(ACT_AS_HEADER, act_as.team());
+        }
         req
+    }
+
+    /// The team acted as, when `resp` refuses it.
+    fn refused_by(&self, resp: &reqwest::Response) -> Option<&ActAs> {
+        let refused = resp
+            .headers()
+            .get(ACT_AS_HEADER)
+            .is_some_and(|value| value == "refused");
+        self.act_as.as_ref().filter(|_| refused)
     }
 }
 
-#[async_trait::async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl Transport for HttpTransport {
     /// Send, and hand back the status beside the body. Ruling on the status is the [`Client`]'s
     /// job: one caller (the draft save) needs a 409 body as an answer rather than a failure.
@@ -184,7 +262,12 @@ impl Transport for HttpTransport {
             .await
             .with_context(|| format!("requesting {path}"))?;
         let status = resp.status();
-        Ok((status, resp.text().await.unwrap_or_default()))
+        let refused = self.refused_by(&resp);
+        let body = resp.text().await.unwrap_or_default();
+        if let Some(act_as) = refused {
+            act_as.note_refusal(&body);
+        }
+        Ok((status, body))
     }
 
     async fn get_bytes(&self, path: &str) -> Result<(reqwest::StatusCode, Vec<u8>)> {
@@ -194,10 +277,14 @@ impl Transport for HttpTransport {
             .await
             .with_context(|| format!("requesting {path}"))?;
         let status = resp.status();
+        let refused = self.refused_by(&resp);
         let bytes = resp
             .bytes()
             .await
             .with_context(|| format!("reading the body of {path}"))?;
+        if let Some(act_as) = refused {
+            act_as.note_refusal(&String::from_utf8_lossy(&bytes));
+        }
         Ok((status, bytes.to_vec()))
     }
 
@@ -213,22 +300,42 @@ impl Transport for HttpTransport {
         if let Some(id) = last_event_id {
             req = req.header("last-event-id", id);
         }
-        let mut resp = req
+        let resp = req
             .send()
             .await
             .with_context(|| format!("requesting {path}"))?;
         let status = resp.status();
         if !status.is_success() {
-            return Ok((status, resp.text().await.unwrap_or_default()));
+            let refused = self.refused_by(&resp);
+            let body = resp.text().await.unwrap_or_default();
+            if let Some(act_as) = refused {
+                act_as.note_refusal(&body);
+            }
+            return Ok((status, body));
         }
         let mut parser = SseParser::default();
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .with_context(|| format!("reading the stream of {path}"))?
+        #[cfg(not(target_arch = "wasm32"))]
         {
-            for event in parser.push(&chunk) {
-                on_event(event)?;
+            let mut resp = resp;
+            while let Some(chunk) = resp
+                .chunk()
+                .await
+                .with_context(|| format!("reading the stream of {path}"))?
+            {
+                for event in parser.push(&chunk) {
+                    on_event(event)?;
+                }
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            use futures_util::StreamExt;
+            let mut chunks = resp.bytes_stream();
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.with_context(|| format!("reading the stream of {path}"))?;
+                for event in parser.push(&chunk) {
+                    on_event(event)?;
+                }
             }
         }
         Ok((status, String::new()))
@@ -378,6 +485,15 @@ impl Client {
         self.get(&format!("/api/issues{}", q.finish())).await
     }
 
+    /// The issues the controller works for itself, playbook launches left out, in `status`
+    /// when one is named.
+    pub async fn lane_issues(&self, status: Option<&str>) -> Result<Vec<dto::Issue>> {
+        let mut q = Query::new();
+        q.push("exclude_kind", Some("playbook"));
+        q.push("status", status);
+        self.get(&format!("/api/issues{}", q.finish())).await
+    }
+
     pub async fn issue<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
         self.get(&format!("/api/issues/{}", encode(key))).await
     }
@@ -475,6 +591,28 @@ impl Client {
         self.get("/api/approvals").await
     }
 
+    /// Register pending import `import` under registry id `body.id`, pinned at its rev.
+    pub async fn register_import(
+        &self,
+        import: &str,
+        body: &crate::dto::RegisterImport<'_>,
+    ) -> Result<crate::dto::Registered> {
+        self.post(
+            &format!("/api/playbooks/imports/{}/register", encode(import)),
+            Some(body),
+        )
+        .await
+    }
+
+    /// Discard pending import `import`.
+    pub async fn discard_import(&self, import: &str) -> Result<serde_json::Value> {
+        self.post(
+            &format!("/api/playbooks/imports/{}/discard", encode(import)),
+            None::<&serde_json::Value>,
+        )
+        .await
+    }
+
     pub async fn playbooks<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/playbooks").await
     }
@@ -484,8 +622,35 @@ impl Client {
     }
 
     /// Every provider registration the caller may read, disabled ones included.
+    pub async fn register_provider(&self, body: &dto::RegisterProvider) -> Result<dto::Provider> {
+        self.post("/api/providers", Some(body)).await
+    }
+
+    pub async fn update_provider(
+        &self,
+        id: &str,
+        body: &dto::ProviderBody,
+    ) -> Result<dto::Provider> {
+        self.put(&format!("/api/providers/{}", encode(id)), body)
+            .await
+    }
+
+    /// Refused while issues or schedules still pin the provider.
+    pub async fn delete_provider(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/api/providers/{}", encode(id))).await
+    }
+
     pub async fn providers<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/providers").await
+    }
+
+    /// The clusters the caller may dispatch onto, default first, narrowed to what registered
+    /// playbook `playbook` can run on when one is named.
+    pub async fn dispatch_targets<T: DeserializeOwned>(&self, playbook: Option<&str>) -> Result<T> {
+        let mut q = Query::new();
+        q.push("playbook", playbook);
+        self.get(&format!("/api/dispatch-targets{}", q.finish()))
+            .await
     }
 
     /// The secrets the caller owns or is an owner-group member of. Metadata only.
@@ -505,6 +670,275 @@ impl Client {
         self.post(
             &format!("/api/secrets/{}/bindings", encode(secret_id)),
             Some(body),
+        )
+        .await
+    }
+
+    /// Hand secret `id` to `owner` (`user:<login>` or `team:<slug>`).
+    pub async fn transfer_secret(&self, id: &str, owner: &str) -> Result<dto::Secret> {
+        self.put(
+            &format!("/api/secrets/{}/owner", encode(id)),
+            &serde_json::json!({ "owner": owner }),
+        )
+        .await
+    }
+
+    /// A secret and its bindings.
+    pub async fn secret(&self, id: &str) -> Result<dto::SecretDetail> {
+        self.get(&format!("/api/secrets/{}", encode(id))).await
+    }
+
+    /// Who did what to a secret, newest first.
+    pub async fn secret_audit(&self, id: &str) -> Result<Vec<dto::SecretAudit>> {
+        self.get(&format!("/api/secrets/{}/audit", encode(id)))
+            .await
+    }
+
+    /// Write `value` as the secret's next version.
+    pub async fn rotate_secret(&self, id: &str, value: &str) -> Result<dto::Secret> {
+        self.post(
+            &format!("/api/secrets/{}/rotate", encode(id)),
+            Some(&serde_json::json!({ "value": value })),
+        )
+        .await
+    }
+
+    pub async fn unbind_secret(&self, id: &str, binding: &str) -> Result<()> {
+        self.delete(&format!(
+            "/api/secrets/{}/bindings/{}",
+            encode(id),
+            encode(binding)
+        ))
+        .await
+    }
+
+    pub async fn shares(&self, of: &Shared) -> Result<Vec<dto::Share>> {
+        self.get(&format!("{}/shares", of.path())).await
+    }
+
+    /// Give `grantee` (`user:<login>` or `team:<slug>`) `role` until `not_after`, replacing any
+    /// share it had.
+    pub async fn grant_share(
+        &self,
+        of: &Shared,
+        grantee: &str,
+        role: &str,
+        not_after: Option<&str>,
+    ) -> Result<dto::Share> {
+        self.put(
+            &format!("{}/shares/{}", of.path(), encode(grantee)),
+            &serde_json::json!({ "role": role, "not_after": not_after }),
+        )
+        .await
+    }
+
+    pub async fn revoke_share(&self, of: &Shared, grantee: &str) -> Result<()> {
+        self.delete(&format!("{}/shares/{}", of.path(), encode(grantee)))
+            .await
+    }
+
+    /// Every stored policy set, the active one marked.
+    pub async fn policy_sets(&self) -> Result<Vec<dto::PolicySet>> {
+        self.get("/api/authz/policy-sets").await
+    }
+
+    /// Store `text` as a policy set. Refused, naming the failing policy, when it does not
+    /// validate. Storing does not activate it.
+    pub async fn create_policy_set(&self, text: &str) -> Result<dto::PolicySet> {
+        let body = serde_json::json!({ "text": text });
+        self.post("/api/authz/policy-sets", Some(&body)).await
+    }
+
+    /// Make the stored set `digest` the one every decision uses.
+    pub async fn activate_policy_set(&self, digest: &str) -> Result<()> {
+        self.post::<serde_json::Value>(
+            &format!("/api/authz/policy-sets/{}/activate", encode(digest)),
+            None::<&serde_json::Value>,
+        )
+        .await
+        .map(drop)
+    }
+
+    /// How the active policy decides `action` for `login`, on `resource` when one is named.
+    pub async fn explain(
+        &self,
+        login: &str,
+        action: &str,
+        resource: Option<&str>,
+    ) -> Result<dto::Explanation> {
+        let mut path = format!(
+            "/api/authz/explain?login={}&action={}",
+            encode(login),
+            encode(action)
+        );
+        if let Some(resource) = resource {
+            path.push_str(&format!("&resource={}", encode(resource)));
+        }
+        self.get(&path).await
+    }
+
+    pub async fn config(&self) -> Result<dto::ControllerConfig> {
+        self.get("/api/config").await
+    }
+
+    /// Replace the whole override set: a setting left out goes back to its env or default
+    /// value. Admin only, and `justification` is recorded.
+    pub async fn set_overrides(
+        &self,
+        overrides: &serde_json::Map<String, serde_json::Value>,
+        justification: &str,
+    ) -> Result<dto::ControllerConfig> {
+        let mut body = overrides.clone();
+        body.insert("justification".into(), justification.into());
+        self.put("/api/config/overrides", &body).await
+    }
+
+    pub async fn access(&self) -> Result<dto::Access> {
+        self.get("/api/access").await
+    }
+
+    pub async fn autopilot(&self) -> Result<dto::Autopilot> {
+        self.get("/api/autopilot").await
+    }
+
+    /// Turn the controller's own dispatching on or off. Admin only.
+    pub async fn set_autopilot(&self, enabled: bool, reason: &str) -> Result<dto::Autopilot> {
+        let body = serde_json::json!({ "enabled": enabled, "reason": reason });
+        self.post("/api/autopilot", Some(&body)).await
+    }
+
+    pub async fn repos(&self) -> Result<Vec<dto::WatchedRepo>> {
+        self.get("/api/repos").await
+    }
+
+    /// Start watching `repo` (`owner/name`). Admin only.
+    pub async fn add_repo(&self, repo: &str, justification: &str) -> Result<()> {
+        let body = serde_json::json!({ "repo": repo, "justification": justification });
+        self.post::<serde_json::Value>("/api/repos", Some(&body))
+            .await
+            .map(drop)
+    }
+
+    /// Pause discovery for `repo`, or resume it. It stays watched either way.
+    pub async fn pause_repo(&self, repo: &str, paused: bool) -> Result<()> {
+        let action = if paused { "pause" } else { "resume" };
+        self.post::<serde_json::Value>(
+            &format!("/api/repos/{}/{action}", encode(repo)),
+            None::<&serde_json::Value>,
+        )
+        .await
+        .map(drop)
+    }
+
+    pub async fn unwatch_repo(&self, repo: &str) -> Result<()> {
+        self.send(
+            reqwest::Method::DELETE,
+            &format!("/api/repos/{}", encode(repo)),
+            None,
+        )
+        .await
+        .map(drop)
+    }
+
+    /// The newest `limit` status transitions across everything the controller works.
+    pub async fn events(&self, limit: usize) -> Result<Vec<dto::Event>> {
+        self.get(&format!("/api/events?limit={limit}")).await
+    }
+
+    /// Every team the caller may see, each with its members.
+    pub async fn teams(&self) -> Result<Vec<dto::Team>> {
+        self.get("/api/teams").await
+    }
+
+    pub async fn create_team(&self, slug: &str, display_name: &str) -> Result<dto::Team> {
+        let body = serde_json::json!({ "slug": slug, "display_name": display_name });
+        self.post("/api/teams", Some(&body)).await
+    }
+
+    pub async fn rename_team(&self, slug: &str, display_name: &str) -> Result<dto::Team> {
+        let body = serde_json::json!({ "display_name": display_name });
+        self.put(&format!("/api/teams/{}", encode(slug)), &body)
+            .await
+    }
+
+    /// Refused while the team still owns resources; the refusal names them.
+    pub async fn delete_team(&self, slug: &str) -> Result<()> {
+        self.delete(&format!("/api/teams/{}", encode(slug))).await
+    }
+
+    /// Replace the team's whole member list.
+    pub async fn put_team_members(
+        &self,
+        slug: &str,
+        members: &[dto::TeamMemberBody],
+    ) -> Result<dto::Team> {
+        let body = serde_json::json!({ "members": members });
+        self.put(&format!("/api/teams/{}/members", encode(slug)), &body)
+            .await
+    }
+
+    /// Who changed the team, newest first. Owners only.
+    pub async fn team_audit(&self, slug: &str) -> Result<Vec<dto::TeamAudit>> {
+        self.get(&format!("/api/teams/{}/audit", encode(slug)))
+            .await
+    }
+
+    /// The caller's API keys. Refused for a caller that presents a key: only a signed-in session
+    /// manages keys.
+    pub async fn api_keys(&self) -> Result<Vec<dto::ApiKey>> {
+        self.get("/api/keys").await
+    }
+
+    /// Mint a key named `name` that expires in `days`, or never when `None`.
+    pub async fn mint_api_key(&self, name: &str, days: Option<i64>) -> Result<dto::MintedKey> {
+        let body = serde_json::json!({ "name": name, "expires_in_days": days });
+        self.post("/api/keys", Some(&body)).await
+    }
+
+    pub async fn revoke_api_key(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/api/keys/{}", encode(id))).await
+    }
+
+    pub async fn mcp_sign_ins(&self) -> Result<dto::McpSignIns> {
+        self.get("/api/me/mcp-sign-ins").await
+    }
+
+    /// Sign out MCP client `client_id`, or every client when `None`.
+    pub async fn sign_out_mcp(&self, client_id: Option<&str>) -> Result<dto::McpSignedOut> {
+        let path = match client_id {
+            Some(id) => format!("/api/me/mcp-sign-ins?client_id={}", encode(id)),
+            None => "/api/me/mcp-sign-ins".to_string(),
+        };
+        parse(
+            self.send(reqwest::Method::DELETE, &path, None).await?,
+            &path,
+        )
+    }
+
+    /// The open decision requests the caller may answer.
+    pub async fn decisions(&self) -> Result<dto::Decisions> {
+        self.get("/api/decisions").await
+    }
+
+    pub async fn decision(&self, id: &str) -> Result<dto::Decision> {
+        self.get(&format!("/api/decisions/{}", encode(id))).await
+    }
+
+    /// Answer every question of request `id`, as of the evidence `digest` names.
+    pub async fn answer_decision(
+        &self,
+        id: &str,
+        labels: &std::collections::BTreeMap<String, Vec<String>>,
+        digest: &str,
+        note: Option<&str>,
+    ) -> Result<dto::Decision> {
+        self.post(
+            &format!("/api/decisions/{}/answer", encode(id)),
+            Some(&serde_json::json!({
+                "labels": labels,
+                "evidence_digest": digest,
+                "note": note,
+            })),
         )
         .await
     }
@@ -578,6 +1012,24 @@ impl Client {
         self.get("/api/schedules").await
     }
 
+    pub async fn create_schedule<T: DeserializeOwned>(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        self.post("/api/schedules", Some(body)).await
+    }
+
+    /// Replace schedule `id` whole with `body`; [`dto::Schedule::body`] builds one from a stored
+    /// schedule.
+    pub async fn update_schedule<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<T> {
+        self.put(&format!("/api/schedules/{}", encode(id)), body)
+            .await
+    }
+
     pub async fn watches<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/watches").await
     }
@@ -592,6 +1044,71 @@ impl Client {
 
     pub async fn webhook<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
         self.get(&format!("/api/webhooks/{}", encode(id))).await
+    }
+
+    /// Create a webhook. Its secret is in this answer and nowhere else.
+    pub async fn create_webhook(&self, body: &dto::WebhookBody) -> Result<dto::WebhookSecret> {
+        self.post("/api/webhooks", Some(body)).await
+    }
+
+    /// Replace a webhook. Its verifier and secret stay as created.
+    pub async fn update_webhook(&self, id: &str, body: &dto::WebhookBody) -> Result<dto::Webhook> {
+        self.put(&format!("/api/webhooks/{}", encode(id)), body)
+            .await
+    }
+
+    pub async fn webhook_presets(&self) -> Result<Vec<dto::WebhookPreset>> {
+        self.get("/api/webhooks/presets").await
+    }
+
+    /// Check a transform's CEL the way a save does.
+    pub async fn check_webhook(&self, body: &dto::WebhookBody) -> Result<dto::WebhookCheck> {
+        let transform = serde_json::json!({
+            "filter": body.filter,
+            "dedupe": body.dedupe,
+            "derive": body.derive,
+        });
+        self.post("/api/webhooks/check", Some(&transform)).await
+    }
+
+    /// Run a transform on `sample`, delivered with `headers`. Nothing is stored.
+    pub async fn preview_webhook(
+        &self,
+        body: &dto::WebhookBody,
+        sample: &serde_json::Value,
+        headers: &std::collections::BTreeMap<String, String>,
+    ) -> Result<dto::WebhookPreview> {
+        let asked = serde_json::json!({
+            "filter": body.filter,
+            "dedupe": body.dedupe,
+            "derive": body.derive,
+            "sample": sample,
+            "headers": headers,
+        });
+        self.post("/api/webhooks/preview", Some(&asked)).await
+    }
+
+    /// Pause a webhook (its address answers not found) or resume it.
+    pub async fn set_webhook_enabled(&self, id: &str, enabled: bool) -> Result<dto::Webhook> {
+        let body = serde_json::json!({ "enabled": enabled });
+        self.post(
+            &format!("/api/webhooks/{}/enabled", encode(id)),
+            Some(&body),
+        )
+        .await
+    }
+
+    /// Replace a webhook's secret. The old one stops verifying at once.
+    pub async fn rotate_webhook_secret(&self, id: &str) -> Result<dto::WebhookSecret> {
+        self.post(
+            &format!("/api/webhooks/{}/secret", encode(id)),
+            None::<&serde_json::Value>,
+        )
+        .await
+    }
+
+    pub async fn delete_webhook(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/api/webhooks/{}", encode(id))).await
     }
 
     /// A page of a webhook's deliveries, newest first: at most `limit`, recorded before `before`.
@@ -618,6 +1135,15 @@ impl Client {
 
     pub async fn whoami(&self) -> Result<dto::Whoami> {
         self.get("/api/whoami").await
+    }
+
+    /// Cancel playbook launch `key`: the controller parks it and deletes its running pods.
+    pub async fn cancel_launch(&self, key: &str) -> Result<dto::CancelAck> {
+        self.post(
+            &format!("/api/playbook-runs/{}/cancel", encode(key)),
+            None::<&serde_json::Value>,
+        )
+        .await
     }
 
     pub async fn park<T: DeserializeOwned>(&self, key: &str, reason: &str) -> Result<T> {
@@ -1055,6 +1581,24 @@ pub fn tracker_url(playbook: &str, key: &str) -> String {
 /// RFC 3986 unreserved set only. Deliberately stricter than a URL library's per-component rules:
 /// an issue key is `owner/repo#12`, and both `/` and `#` MUST encode or the request goes to a
 /// different path (or drops everything after the fragment marker).
+/// Something the controller lets its owner share.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Shared {
+    Playbook(String),
+    Draft(String),
+    Provider(String),
+}
+
+impl Shared {
+    fn path(&self) -> String {
+        match self {
+            Shared::Playbook(id) => format!("/api/playbooks/{}", encode(id)),
+            Shared::Draft(id) => format!("/api/playbook-drafts/{}", encode(id)),
+            Shared::Provider(id) => format!("/api/providers/{}", encode(id)),
+        }
+    }
+}
+
 pub fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -1071,6 +1615,15 @@ pub fn encode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use crate::client::*;
+
+    /// A JSON object body with its keys in order, so a test reads the same whichever way
+    /// serde_json orders a map; anything else as it came.
+    fn sorted(body: &str) -> String {
+        serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(body)
+            .ok()
+            .and_then(|object| serde_json::to_string(&object).ok())
+            .unwrap_or_else(|| body.to_string())
+    }
 
     /// The bug this prevents: `GET /api/issues/owner/repo#12` reaches a route that doesn't exist
     /// and 404s, which reads exactly like "no such issue".
@@ -1333,5 +1886,904 @@ mod tests {
         );
         assert_eq!(LiveEnd::of(Some("timeout"), 9), LiveEnd::Resume);
         assert_eq!(LiveEnd::of(None, 9), LiveEnd::Resume);
+    }
+
+    #[tokio::test]
+    async fn keys_and_mcp_sign_ins_go_to_their_routes_with_the_lifetime_and_client_asked() {
+        use axum::extract::{Path, Query, State};
+        use axum::http::StatusCode;
+        use axum::routing::{delete, get};
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+
+        async fn mint(State(seen): State<Seen>, body: String) -> String {
+            seen.lock().unwrap().push(format!("mint {}", sorted(&body)));
+            r#"{"id":"k2","name":"ci","created_at":"2026-11-10T00:00:00Z","expires_at":null,
+                "last_used_at":null,"revoked_at":null,"secret":"crk_once",
+                "mcp_url":"https://mcp.example/mcp"}"#
+                .into()
+        }
+        async fn revoke(State(seen): State<Seen>, Path(id): Path<String>) -> StatusCode {
+            seen.lock().unwrap().push(format!("revoke {id}"));
+            StatusCode::NO_CONTENT
+        }
+        async fn sign_out(
+            State(seen): State<Seen>,
+            Query(query): Query<HashMap<String, String>>,
+        ) -> String {
+            seen.lock()
+                .unwrap()
+                .push(format!("sign-out {:?}", query.get("client_id")));
+            r#"{"revoked":2}"#.into()
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/keys",
+                get(|| async {
+                    r#"[{"id":"k1","name":"laptop","created_at":"2026-11-01T00:00:00Z",
+                        "expires_at":"2027-01-30T00:00:00Z","last_used_at":null,
+                        "revoked_at":null}]"#
+                })
+                .post(mint),
+            )
+            .route("/api/keys/{id}", delete(revoke))
+            .route(
+                "/api/me/mcp-sign-ins",
+                get(|| async {
+                    r#"{"enabled":true,"sign_ins":[{"client_id":"dyn-abc","client_name":"Editor",
+                        "client_host":null,"client_kind":"dynamic","resource":"https://mcp.example",
+                        "cluster":"hub","approved_at":"2026-11-02T00:00:00Z",
+                        "last_used_at":"2026-11-09T00:00:00Z"}]}"#
+                })
+                .delete(sign_out),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let keys = client.api_keys().await.expect("keys");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].expires_at.as_deref(), Some("2027-01-30T00:00:00Z"));
+
+        let minted = client.mint_api_key("ci", None).await.expect("mint");
+        assert_eq!(
+            (minted.key.id.as_str(), minted.secret.as_str()),
+            ("k2", "crk_once")
+        );
+        assert_eq!(minted.mcp_url.as_deref(), Some("https://mcp.example/mcp"));
+        client.mint_api_key("ci", Some(30)).await.expect("mint");
+        client.revoke_api_key("k 1").await.expect("revoke");
+
+        let live = client.mcp_sign_ins().await.expect("sign-ins");
+        assert!(live.enabled);
+        assert_eq!(live.sign_ins[0].client_kind, dto::McpClientKind::Dynamic);
+        assert_eq!(
+            client
+                .sign_out_mcp(Some("dyn-abc"))
+                .await
+                .expect("one")
+                .revoked,
+            2
+        );
+        client.sign_out_mcp(None).await.expect("all");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                r#"mint {"expires_in_days":null,"name":"ci"}"#,
+                r#"mint {"expires_in_days":30,"name":"ci"}"#,
+                "revoke k 1",
+                r#"sign-out Some("dyn-abc")"#,
+                "sign-out None",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn team_calls_carry_the_slug_the_name_and_the_whole_member_list() {
+        use axum::extract::{Path, State};
+        use axum::http::{Method, StatusCode};
+        use axum::routing::{get, put};
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+        const TEAM: &str = r#"{"slug":"infra","display_name":"Infra","created_by":"user:wynn",
+            "created_at":"2026-11-01T00:00:00Z","updated_at":"2026-11-01T00:00:00Z",
+            "members":[{"kind":"user","member":"wynn","role":"owner","since":"2026-11-01T00:00:00Z",
+            "added_by":null,"signed_in":true},{"kind":"group","member":"eng","role":"member",
+            "since":"2026-11-02T00:00:00Z","added_by":"user:wynn","signed_in":false}],
+            "my_role":"owner","reachable":true}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            path: Option<Path<String>>,
+            body: String,
+        ) -> (StatusCode, String) {
+            let slug = path.map_or_else(String::new, |Path(slug)| slug);
+            seen.lock()
+                .unwrap()
+                .push(format!("{method} {slug} {}", sorted(&body)));
+            if method == Method::DELETE {
+                return (StatusCode::NO_CONTENT, String::new());
+            }
+            (StatusCode::OK, TEAM.to_string())
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/teams",
+                get(|| async { format!("[{TEAM}]") }).post(note),
+            )
+            .route("/api/teams/{slug}", put(note).delete(note))
+            .route("/api/teams/{slug}/members", put(note))
+            .route(
+                "/api/teams/{slug}/audit",
+                get(|| async {
+                    r#"[{"id":4,"at":"2026-11-01T00:00:00Z","actor":"user:wynn","subject":null,
+                        "auth_path":"session","action":"team:create","resource_type":"team",
+                        "resource_id":"infra","decision":"allow","rule":"owner","prior":null,
+                        "result":{}}]"#
+                }),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let teams = client.teams().await.expect("teams");
+        assert_eq!(teams[0].my_role, Some(dto::TeamRole::Owner));
+        assert_eq!(
+            teams[0]
+                .members
+                .iter()
+                .map(|m| (m.kind, m.role, m.signed_in))
+                .collect::<Vec<_>>(),
+            [
+                (dto::MemberKind::User, dto::TeamRole::Owner, true),
+                (dto::MemberKind::Group, dto::TeamRole::Member, false),
+            ]
+        );
+        assert_eq!(
+            client.team_audit("infra").await.expect("audit")[0].action,
+            "team:create"
+        );
+
+        client.create_team("infra", "Infra").await.expect("create");
+        client
+            .rename_team("infra", "Platform")
+            .await
+            .expect("rename");
+        let members = [dto::TeamMemberBody {
+            kind: dto::MemberKind::Rule,
+            member: "email-domain:example.com".into(),
+            role: dto::TeamRole::Maintainer,
+        }];
+        client
+            .put_team_members("infra", &members)
+            .await
+            .expect("members");
+        client.delete_team("infra").await.expect("delete");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                r#"POST  {"display_name":"Infra","slug":"infra"}"#,
+                r#"PUT infra {"display_name":"Platform"}"#,
+                r#"PUT infra {"members":[{"kind":"rule","member":"email-domain:example.com","role":"maintainer"}]}"#,
+                "DELETE infra ",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_team_acted_as_rides_every_request_and_its_refusal_is_kept() {
+        use axum::http::{HeaderMap, StatusCode};
+        use axum::routing::get;
+
+        async fn whoami(headers: HeaderMap) -> (StatusCode, HeaderMap, String) {
+            let asked = headers
+                .get(ACT_AS_HEADER)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("nobody")
+                .to_string();
+            if asked == "team:closed" {
+                let mut marked = HeaderMap::new();
+                marked.insert(ACT_AS_HEADER, "refused".parse().unwrap());
+                return (
+                    StatusCode::FORBIDDEN,
+                    marked,
+                    r#"{"error":"you are not a member of team:closed"}"#.into(),
+                );
+            }
+            (
+                StatusCode::OK,
+                HeaderMap::new(),
+                format!(r#"{{"user":"{asked}"}}"#),
+            )
+        }
+
+        let app = axum::Router::new().route("/api/whoami", get(whoami));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let cfg = crate::config::Config {
+            url: format!("http://{}", listener.local_addr().expect("addr")),
+            auth: Auth::None,
+        };
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let through = |act_as: Option<ActAs>| {
+            let wire = HttpTransport::connect(&cfg).expect("connect");
+            let wire = match act_as {
+                Some(act_as) => wire.acting_as(act_as),
+                None => wire,
+            };
+            Client::new(std::sync::Arc::new(wire))
+        };
+
+        let plain: dto::Whoami = through(None).get("/api/whoami").await.expect("whoami");
+        assert_eq!(plain.user.as_deref(), Some("nobody"));
+
+        let infra = ActAs::new("team:infra");
+        let as_team: dto::Whoami = through(Some(infra.clone()))
+            .get("/api/whoami")
+            .await
+            .expect("whoami");
+        assert_eq!(as_team.user.as_deref(), Some("team:infra"));
+        assert_eq!(infra.refused(), None);
+
+        let closed = ActAs::new("team:closed");
+        let client = through(Some(closed.clone()));
+        let refusal = client
+            .get::<dto::Whoami>("/api/whoami")
+            .await
+            .expect_err("a refused team is an error");
+        assert!(
+            format!("{refusal:#}").contains("not a member"),
+            "{refusal:#}"
+        );
+        assert_eq!(
+            closed.refused().as_deref(),
+            Some("you are not a member of team:closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_calls_read_the_transform_and_send_pause_rotate_and_delete() {
+        use axum::extract::{Path, State};
+        use axum::http::{Method, StatusCode};
+        use axum::routing::{delete, get, post};
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+        const HOOK: &str = r#"{"id":"w1","playbook":"triage","verifier":"path_token","enabled":true,
+            "max_launches_per_hour":3,"last_delivery_at":null,"consecutive_failures":0,
+            "owner_principal":"user:wynn","delivery_url":"https://hooks.example/hooks/w1",
+            "filter":"body.action == \"opened\"","dedupe":"string(body.issue.id)",
+            "derive":{"repo":"body.repository.full_name"},"params":{"limit":"1"},
+            "max_cost":3.0,"max_time":"25m","dispatch_target":"waldorf","header":null}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            Path(id): Path<String>,
+            body: String,
+        ) -> (StatusCode, String) {
+            seen.lock()
+                .unwrap()
+                .push(format!("{method} {id} {}", sorted(&body)));
+            if method == Method::DELETE {
+                return (StatusCode::NO_CONTENT, String::new());
+            }
+            (StatusCode::OK, HOOK.to_string())
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route("/api/webhooks", get(|| async { format!("[{HOOK}]") }))
+            .route("/api/webhooks/{id}", delete(note))
+            .route("/api/webhooks/{id}/enabled", post(note))
+            .route(
+                "/api/webhooks/{id}/secret",
+                post(|| async {
+                    format!(
+                        r#"{{"webhook":{HOOK},"secret":"whsec_once",
+                            "delivery_url":"https://hooks.example/hooks/w1/tok"}}"#
+                    )
+                }),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let hooks: Vec<dto::Webhook> = client.webhooks().await.expect("webhooks");
+        assert_eq!(
+            hooks[0].filter.as_deref(),
+            Some(r#"body.action == "opened""#)
+        );
+        assert_eq!(hooks[0].derive["repo"], "body.repository.full_name");
+        assert_eq!(hooks[0].params["limit"], "1");
+        assert_eq!(
+            (hooks[0].max_cost, hooks[0].max_time.as_str()),
+            (3.0, "25m")
+        );
+
+        let paused = client
+            .set_webhook_enabled("w1", false)
+            .await
+            .expect("pause");
+        assert_eq!(paused.id, "w1");
+        let rotated = client.rotate_webhook_secret("w1").await.expect("rotate");
+        assert_eq!(rotated.secret, "whsec_once");
+        assert_eq!(
+            rotated.delivery_url.as_deref(),
+            Some("https://hooks.example/hooks/w1/tok")
+        );
+        client.delete_webhook("w1").await.expect("delete");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [r#"POST w1 {"enabled":false}"#, "DELETE w1 "]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_webhook_form_saves_checks_and_previews_what_it_holds() {
+        use axum::extract::State;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::routing::{get, post, put};
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+        const HOOK: &str = r#"{"id":"w9","playbook":"triage","verifier":"hmac_sha256",
+            "header":"x-hub-signature-256","retention_days":7,"enabled":true}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            uri: Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            let sent = serde_json::from_str(&body).expect("a JSON body");
+            seen.lock()
+                .unwrap()
+                .push((format!("{method} {}", uri.path()), sent));
+            let answer = match (method.as_str(), uri.path()) {
+                ("POST", "/api/webhooks") => {
+                    format!(r#"{{"webhook":{HOOK},"secret":"whsec_new","delivery_url":null}}"#)
+                }
+                ("POST", "/api/webhooks/check") => r#"{"diagnostics":[{"field":"filter",
+                    "message":"undeclared reference to 'bod'","line":1,"column":0}]}"#
+                    .to_string(),
+                ("POST", "/api/webhooks/preview") => r#"{"filter":{"value":true,"error":null},
+                    "dedupe":{"value":"42","error":null},
+                    "derive":{"value":null,"error":"no such key: repository"}}"#
+                    .to_string(),
+                _ => HOOK.to_string(),
+            };
+            (StatusCode::OK, answer)
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route("/api/webhooks", post(note))
+            .route("/api/webhooks/{id}", put(note))
+            .route("/api/webhooks/check", post(note))
+            .route("/api/webhooks/preview", post(note))
+            .route(
+                "/api/webhooks/presets",
+                get(|| async {
+                    r#"[{"id":"github-issues","title":"GitHub issues","verifier":"hmac_sha256",
+                        "header":"x-hub-signature-256","filter":"body.action == \"opened\"",
+                        "dedupe":"string(body.issue.id)",
+                        "derive":{"repo":"body.repository.full_name"}}]"#
+                }),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let presets = client.webhook_presets().await.expect("presets");
+        assert_eq!(presets[0].verifier, dto::WebhookVerifier::HmacSha256);
+        assert_eq!(presets[0].derive["repo"], "body.repository.full_name");
+
+        let body = dto::WebhookBody {
+            playbook: "triage".into(),
+            verifier: dto::WebhookVerifier::HmacSha256,
+            header: Some("x-hub-signature-256".into()),
+            filter: "body.action == \"opened\"".into(),
+            dedupe: "string(body.issue.id)".into(),
+            derive: BTreeMap::from([("repo".into(), "body.repository.full_name".into())]),
+            params: BTreeMap::from([("limit".into(), "1".into())]),
+            max_launches_per_hour: 3,
+            retention_days: 7,
+            max_cost: 3.0,
+            max_time: "25m".into(),
+            dispatch_target: None,
+        };
+        let created = client.create_webhook(&body).await.expect("create");
+        assert_eq!(created.secret, "whsec_new");
+        assert_eq!(
+            created.webhook.header.as_deref(),
+            Some("x-hub-signature-256")
+        );
+        assert_eq!(created.webhook.retention_days, 7);
+        client.update_webhook("w9", &body).await.expect("update");
+
+        let check = client.check_webhook(&body).await.expect("check");
+        assert_eq!(check.diagnostics[0].field, "filter");
+        let sample = serde_json::json!({ "action": "opened" });
+        let headers = BTreeMap::from([("x-github-event".to_string(), "issues".to_string())]);
+        let preview = client
+            .preview_webhook(&body, &sample, &headers)
+            .await
+            .expect("preview");
+        assert_eq!(preview.filter.value, Some(serde_json::json!(true)));
+        assert_eq!(
+            preview.derive.error.as_deref(),
+            Some("no such key: repository")
+        );
+
+        let sent = seen.lock().unwrap().clone();
+        let whole = serde_json::json!({
+            "playbook": "triage", "verifier": "hmac_sha256", "header": "x-hub-signature-256",
+            "filter": "body.action == \"opened\"", "dedupe": "string(body.issue.id)",
+            "derive": { "repo": "body.repository.full_name" }, "params": { "limit": "1" },
+            "max_launches_per_hour": 3, "retention_days": 7, "max_cost": 3.0,
+            "max_time": "25m", "dispatch_target": null,
+        });
+        let transform = serde_json::json!({
+            "filter": "body.action == \"opened\"", "dedupe": "string(body.issue.id)",
+            "derive": { "repo": "body.repository.full_name" },
+        });
+        let mut previewed = transform.clone();
+        previewed["sample"] = sample;
+        previewed["headers"] = serde_json::json!({ "x-github-event": "issues" });
+        assert_eq!(
+            sent,
+            [
+                ("POST /api/webhooks".to_string(), whole.clone()),
+                ("PUT /api/webhooks/w9".to_string(), whole),
+                ("POST /api/webhooks/check".to_string(), transform),
+                ("POST /api/webhooks/preview".to_string(), previewed),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_calls_send_only_the_fields_a_kind_uses() {
+        use axum::extract::State;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::routing::{get, put};
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+        const PROVIDER: &str = r#"{"id":"lab","display_name":"Lab vLLM","kind":"custom",
+            "models":["glm-5-3"],"default_model":"glm-5-3","roles":["agent"],
+            "harness":"opencode","harness_override":null,"endpoint":"https://vllm.example/v1",
+            "protocol":"chat_completions","secret_name":"lab-key","secret_owner":"team:infra",
+            "price":null,"enabled":true,"owner":"team:infra","actions":["read","update","delete"]}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            uri: Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            let sent = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            seen.lock()
+                .unwrap()
+                .push((format!("{method} {}", uri.path()), sent));
+            if method == Method::DELETE {
+                return (StatusCode::NO_CONTENT, String::new());
+            }
+            (StatusCode::OK, PROVIDER.to_string())
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/providers",
+                get(|| async { format!("[{PROVIDER}]") }).post(note),
+            )
+            .route("/api/providers/{id}", put(note).delete(note))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let listed: Vec<dto::Provider> = client.providers().await.expect("providers");
+        assert_eq!(
+            listed[0].protocol,
+            Some(dto::InferenceProtocol::ChatCompletions)
+        );
+        assert_eq!(
+            listed[0].endpoint.as_deref(),
+            Some("https://vllm.example/v1")
+        );
+        assert_eq!(listed[0].secret_owner.as_deref(), Some("team:infra"));
+        assert_eq!(listed[0].actions, ["read", "update", "delete"]);
+
+        let hosted = dto::ProviderBody {
+            display_name: "OpenAI".into(),
+            kind: dto::ProviderKind::Openai,
+            models: Vec::new(),
+            default_model: None,
+            endpoint: None,
+            protocol: None,
+            harness: None,
+            secret_name: None,
+            secret_owner: None,
+            enabled: true,
+        };
+        client
+            .register_provider(&dto::RegisterProvider {
+                id: "openai".into(),
+                owner: "user:wynn".into(),
+                provider: hosted,
+            })
+            .await
+            .expect("register");
+        let custom = dto::ProviderBody {
+            display_name: "Lab vLLM".into(),
+            kind: dto::ProviderKind::Custom,
+            models: vec!["glm-5-3".into()],
+            default_model: Some("glm-5-3".into()),
+            endpoint: Some("https://vllm.example/v1".into()),
+            protocol: Some(dto::InferenceProtocol::SystemOne),
+            harness: Some("opencode".into()),
+            secret_name: Some("lab-key".into()),
+            secret_owner: Some("team:infra".into()),
+            enabled: false,
+        };
+        client
+            .update_provider("lab", &custom)
+            .await
+            .expect("update");
+        client.delete_provider("lab").await.expect("delete");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (
+                    "POST /api/providers".to_string(),
+                    serde_json::json!({
+                        "id": "openai", "owner": "user:wynn", "display_name": "OpenAI",
+                        "kind": "openai", "models": [], "enabled": true,
+                    })
+                ),
+                (
+                    "PUT /api/providers/lab".to_string(),
+                    serde_json::json!({
+                        "display_name": "Lab vLLM", "kind": "custom", "models": ["glm-5-3"],
+                        "default_model": "glm-5-3", "endpoint": "https://vllm.example/v1",
+                        "protocol": "system_one", "harness": "opencode",
+                        "secret_name": "lab-key", "secret_owner": "team:infra",
+                        "enabled": false,
+                    })
+                ),
+                (
+                    "DELETE /api/providers/lab".to_string(),
+                    serde_json::Value::Null
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_calls_carry_their_justification_and_address_a_repo_by_its_whole_name() {
+        use axum::extract::State;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::routing::{get, post, put};
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+        const CONFIG: &str = r#"{"knobs":[{"name":"max_concurrent_pods","value":10,
+            "source":"override","overridable":true,"description":"Pods at once."}],
+            "contract":{},"draft_head_schedules_disabled":0}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            uri: Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            let sent = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            seen.lock()
+                .unwrap()
+                .push((format!("{method} {}", uri.path()), sent));
+            let answer = match uri.path() {
+                "/api/config/overrides" => CONFIG,
+                "/api/autopilot" => r#"{"enabled":false,"changed_by":"wynn","reason":"deploy"}"#,
+                _ => r#"{"repo":"llm-d/llm-d","action":"done"}"#,
+            };
+            (StatusCode::OK, answer.to_string())
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route("/api/config", get(|| async { CONFIG }))
+            .route("/api/config/overrides", put(note))
+            .route(
+                "/api/access",
+                get(|| async { r#"{"admins":["wynn"],"operators":[],"allowed_orgs":["llm-d"]}"# }),
+            )
+            .route(
+                "/api/autopilot",
+                get(|| async { r#"{"enabled":true,"changed_by":null}"# }).post(note),
+            )
+            .route(
+                "/api/repos",
+                get(|| async {
+                    r#"[{"repo":"llm-d/llm-d","running":1,"parked":3,"total":9,
+                        "watermark":"2026-10-30T00:15:49Z","watched":true,"paused":false}]"#
+                })
+                .post(note),
+            )
+            .route("/api/repos/{repo}/pause", post(note))
+            .route("/api/repos/{repo}/resume", post(note))
+            .route("/api/repos/{repo}", axum::routing::delete(note))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let config = client.config().await.expect("config");
+        assert_eq!(config.knobs[0].value, serde_json::json!(10));
+        assert_eq!(
+            client.access().await.expect("access").allowed_orgs,
+            ["llm-d"]
+        );
+        assert!(client.autopilot().await.expect("autopilot").enabled);
+        let repos = client.repos().await.expect("repos");
+        assert_eq!((repos[0].total, repos[0].paused), (9, false));
+
+        let overrides = serde_json::json!({ "max_concurrent_pods": 4 });
+        client
+            .set_overrides(overrides.as_object().expect("a map"), "quiet week")
+            .await
+            .expect("overrides");
+        let off = client.set_autopilot(false, "deploy").await.expect("off");
+        assert_eq!(off.changed_by.as_deref(), Some("wynn"));
+        client
+            .add_repo("llm-d/llm-d", "asked for")
+            .await
+            .expect("add");
+        client.pause_repo("llm-d/llm-d", true).await.expect("pause");
+        client
+            .pause_repo("llm-d/llm-d", false)
+            .await
+            .expect("resume");
+        client.unwatch_repo("llm-d/llm-d").await.expect("unwatch");
+
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (
+                    "PUT /api/config/overrides".to_string(),
+                    serde_json::json!({ "max_concurrent_pods": 4, "justification": "quiet week" })
+                ),
+                (
+                    "POST /api/autopilot".to_string(),
+                    serde_json::json!({ "enabled": false, "reason": "deploy" })
+                ),
+                (
+                    "POST /api/repos".to_string(),
+                    serde_json::json!({ "repo": "llm-d/llm-d", "justification": "asked for" })
+                ),
+                (
+                    "POST /api/repos/llm-d%2Fllm-d/pause".to_string(),
+                    serde_json::json!({})
+                ),
+                (
+                    "POST /api/repos/llm-d%2Fllm-d/resume".to_string(),
+                    serde_json::json!({})
+                ),
+                ("DELETE /api/repos/llm-d%2Fllm-d".to_string(), null),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_calls_store_activate_and_explain() {
+        use axum::extract::{Path, Query, State};
+        use axum::routing::{get, post};
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+        const SET: &str = r#"{"digest":"abc123","text":"permit(principal, action, resource);",
+            "owner":"team:platform-administrators","schema_version":1,"created_by":"user:wynn",
+            "created_at":"2026-11-04T21:28:21Z","activated_by":null,"activated_at":null,
+            "active":false}"#;
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/authz/policy-sets",
+                get(|| async { format!("[{SET}]") }).post(
+                    |State(seen): State<Seen>, body: String| async move {
+                        seen.lock().unwrap().push(format!("store {body}"));
+                        SET
+                    },
+                ),
+            )
+            .route(
+                "/api/authz/policy-sets/{digest}/activate",
+                post(|State(seen): State<Seen>, Path(digest): Path<String>| async move {
+                    seen.lock().unwrap().push(format!("activate {digest}"));
+                    r#"{"prior":null,"active":"abc123"}"#
+                }),
+            )
+            .route(
+                "/api/authz/explain",
+                get(
+                    |State(seen): State<Seen>, Query(q): Query<BTreeMap<String, String>>| async move {
+                        seen.lock().unwrap().push(format!("explain {q:?}"));
+                        r#"{"login":"wynn","action":"team:read","resource":"team","owner":"",
+                            "allowed":true,"rules":["everyone-read-platform"],"policy":"abc123",
+                            "groups":[],"groups_at":null,"teams":[]}"#
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let sets = client.policy_sets().await.expect("sets");
+        assert_eq!((sets[0].digest.as_str(), sets[0].active), ("abc123", false));
+        let stored = client
+            .create_policy_set("permit(principal, action, resource);")
+            .await;
+        assert_eq!(
+            stored.expect("store").created_by.as_deref(),
+            Some("user:wynn")
+        );
+        client
+            .activate_policy_set("abc123")
+            .await
+            .expect("activate");
+        let all = client
+            .explain("wynn", "team:read", None)
+            .await
+            .expect("explain");
+        assert!(all.allowed);
+        assert_eq!(all.rules, ["everyone-read-platform"]);
+        client
+            .explain("wynn", "playbook:launch", Some("playbook:triage"))
+            .await
+            .expect("explain");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                r#"store {"text":"permit(principal, action, resource);"}"#,
+                "activate abc123",
+                r#"explain {"action": "team:read", "login": "wynn"}"#,
+                r#"explain {"action": "playbook:launch", "login": "wynn", "resource": "playbook:triage"}"#,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_issues_leave_playbook_launches_out_and_whoami_names_entitlements() {
+        use axum::extract::RawQuery;
+        use axum::routing::get;
+
+        let app = axum::Router::new()
+            .route(
+                "/api/issues",
+                get(|RawQuery(query): RawQuery| async move {
+                    let status = match query.as_deref() {
+                        Some("exclude_kind=playbook&status=parked") => "parked",
+                        Some("exclude_kind=playbook") => "running",
+                        other => panic!("unexpected query {other:?}"),
+                    };
+                    format!(
+                        r#"[{{"key":"scenario:cold","kind":{{"type":"scenario","id":"cold"}},
+                        "status":"{status}"}}]"#
+                    )
+                }),
+            )
+            .route(
+                "/api/whoami",
+                get(|| async { r#"{"user":"wynn","entitlements":["autoresearch"]}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let parked = client.lane_issues(Some("parked")).await.expect("parked");
+        assert_eq!(parked[0].status, "parked");
+        let all = client.lane_issues(None).await.expect("all");
+        assert_eq!(all[0].status, "running");
+        assert_eq!(
+            client.whoami().await.expect("whoami").entitlements,
+            ["autoresearch"]
+        );
     }
 }

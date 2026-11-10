@@ -158,6 +158,24 @@ impl TryFrom<String> for ServiceAccountRef {
     }
 }
 
+/// The allowlist profile crucible-kueue checks pod templates against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KueueAllowlist {
+    #[default]
+    Strict,
+    Tenant,
+}
+
+impl KueueAllowlist {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Tenant => "tenant",
+        }
+    }
+}
+
 /// The `[kueue]` table. The server on each of `clusters` accepts runs' tokens from the controller's
 /// agent issuer and acts for each as its `kube_user`, as Kubernetes RBAC decides.
 #[derive(Debug, Deserialize)]
@@ -212,6 +230,15 @@ pub struct KueueCfg {
     /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
+    /// What a pod template may ask for. `strict`, the default, refuses Secrets, volume claims
+    /// beyond ephemeral ones, tolerations, priority classes and resource claims; `tenant` admits
+    /// them, which GPU workloads that tolerate a node taint or read a model token need.
+    #[serde(default)]
+    pub allowlist_profile: KueueAllowlist,
+    /// Secrets in the shared namespaces a run's pod templates may read, besides the pull
+    /// secrets. Under `tenant` only: `strict` refuses every Secret reference.
+    #[serde(default)]
+    pub secrets: Vec<KubeName>,
     /// Also serve people's MCP clients, with tokens from the same issuer: each cluster's server is
     /// then a resource people may get tokens for.
     #[serde(default)]
@@ -800,6 +827,12 @@ pub struct Cluster {
     /// they exchange for agent tokens. Default [`DEFAULT_SPIFFE_SOCKET`].
     #[serde(default)]
     pub sandbox_spiffe_socket: Option<String>,
+    /// Whether the cluster's SPIRE issues loop pods an SVID
+    /// `spiffe://<trust domain>/crucible/run/<pod name>`. The loop pod then mounts the Workload
+    /// API socket (`csi.spiffe.io`) at [`ClusterCfg::spiffe_socket`], and the controller issues a
+    /// run's task tokens only with that SVID beside its pod token.
+    #[serde(default)]
+    pub loop_svid: bool,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]

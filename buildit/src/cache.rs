@@ -217,6 +217,7 @@ async fn write_blob(
         return StatusCode::BAD_REQUEST.into_response();
     };
     if !store.may_write(&headers) {
+        drain(body, store.max_blob).await;
         return unauthorized();
     }
     let declared = headers
@@ -268,6 +269,18 @@ async fn remove_blob(
 enum Received {
     Whole,
     TooLarge,
+}
+
+/// Read and discard up to `max` bytes of a refused upload.
+async fn drain(body: Body, max: u64) {
+    let mut stream = body.into_data_stream();
+    let mut total = 0u64;
+    while let Some(Ok(chunk)) = stream.next().await {
+        total += chunk.len() as u64;
+        if total > max {
+            return;
+        }
+    }
 }
 
 async fn receive(upload: &Path, body: Body, max: u64) -> std::io::Result<Received> {
@@ -439,6 +452,32 @@ mod tests {
         assert_eq!(with("Digest abc"), None);
         assert_eq!(with("abc"), None);
         assert_eq!(presented_token(&HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_upload_is_read_whole_so_its_sender_sees_the_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let url = serve(store(tmp.path(), u64::MAX, 64 << 20)).await;
+        let addr = url.trim_start_matches("http://").to_string();
+        let status = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let body = vec![b'x'; 8 << 20];
+            let mut conn = std::net::TcpStream::connect(&addr).unwrap();
+            write!(
+                conn,
+                "PUT /store/k1.tar HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer nope\r\n\
+                 Content-Length: {}\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            conn.write_all(&body).expect("the whole body is taken");
+            let mut head = [0u8; 12];
+            conn.read_exact(&mut head).unwrap();
+            String::from_utf8_lossy(&head).to_string()
+        })
+        .await
+        .unwrap();
+        assert_eq!(status, "HTTP/1.1 401");
     }
 
     #[tokio::test]

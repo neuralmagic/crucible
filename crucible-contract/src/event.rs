@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// A telemetry sample the agent emits roughly every few thousand tokens.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 pub struct Tokens {
     #[serde(default)]
     pub input: u64,
@@ -45,7 +45,7 @@ pub struct ModelUsage {
 /// One normalized event from the agent run. `#[serde(tag = "kind")]` decodes the
 /// NDJSON directly; unknown fields (like `v`) are ignored, and an unknown `kind`
 /// fails to decode so the caller can fall back to the scraper.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// One-shot run header. The schema also carries backend/harness/workdir;
@@ -94,8 +94,8 @@ pub enum AgentEvent {
         delta: String,
     },
     /// A tool or subagent invocation, with the compact summary line. `input`/`result`
-    /// are populated only under verbose tool IO (`CRUCIBLE_SESSION_TOOL_IO=full`),
-    /// bounded producer-side; the default stays name+summary so the log stays compact.
+    /// carry bounded, scrubbed tool IO unless the turn sets `CRUCIBLE_SESSION_TOOL_IO=compact`,
+    /// which keeps only name+summary.
     Tool {
         #[serde(default)]
         name: String,
@@ -190,7 +190,7 @@ pub enum AgentEvent {
     Raw { text: String, stream: RawStream },
 }
 
-/// Which OS stream an unclassified line came from.
+/// Which OS stream a line came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawStream {

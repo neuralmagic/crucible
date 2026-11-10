@@ -78,8 +78,10 @@ jobs:
           mkdir -p prebuilt/bin
           find target/release -maxdepth 1 -type f -executable -exec cp {} prebuilt/bin/ \;
           echo "staged binaries:" && ls -la prebuilt/bin/
-          # The docker build only needs prebuilt/bin; target/ otherwise starves the docker step of disk.
-          rm -rf target
+          # The crucible_kueue Python package the image ships for packs' command tasks.
+          scripts/crucible-kueue-py-stage.sh prebuilt/python
+          # The docker build only needs prebuilt/; target/ otherwise starves the docker step of disk.
+          rm -rf target crucible-kueue-py/target
 
       # Prove the runner-built binaries actually load on the runtime base BEFORE baking the
       # image: every dynamic dep must resolve (the glibc/zlib compatibility gate) and the

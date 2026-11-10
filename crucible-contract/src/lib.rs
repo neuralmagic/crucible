@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod ask;
 pub mod buildit;
 pub mod cluster_link;
+pub mod console;
 pub mod decision;
 pub mod decision_request;
 pub mod distress;
@@ -34,6 +35,7 @@ pub mod report;
 pub mod sandbox;
 pub mod scope;
 pub mod session;
+pub mod task_servers;
 pub mod tier;
 pub mod verdict;
 
@@ -43,7 +45,7 @@ pub mod verdict;
 /// `crucible --contract-version` and the runtime image carries it as the
 /// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
 /// controller it talks to without a probe.
-pub const CONTRACT_VERSION: &str = "1.23.0";
+pub const CONTRACT_VERSION: &str = "1.24.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,

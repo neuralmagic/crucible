@@ -111,8 +111,62 @@ jobs:
             --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
           gh release upload "$tag" dist/* --clobber
 
-  # The macOS desktop app, signed ad hoc: a downloaded copy needs Open Anyway (or
-  # `xattr -d com.apple.quarantine`) on first launch.
+  # The desktop app as a Fedora RPM, crucible-lsp beside it, for x86_64 and aarch64.
+  desktop-linux:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    container: registry.fedoraproject.org/fedora:45
+    steps:
+      - name: git
+        run: dnf -y install git
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Fedora packages
+        run: sh crucible-desktop/linux/deps.sh
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+          cache-workspaces: |
+            . -> target
+            crucible-desktop -> target
+
+      - name: Rune
+        run: sh crucible-desktop/rune-patches.sh
+
+      - name: Build the RPM
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          cargo build --release --locked -p crucible-lsp
+          ( cd crucible-desktop && cargo build --release --locked )
+          VERSION="${tag#v}" sh crucible-desktop/linux-bundle.sh
+          mkdir -p dist
+          cp crucible-desktop/target/linux/*.rpm dist/
+          ( cd dist && for f in *.rpm; do sha256sum "$f" > "$f.sha256"; done )
+          ls -la dist/
+
+      - name: Upload to release
+        if: ${{ github.ref_type == 'tag' || inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          dnf -y install gh
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" \
+            --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "$tag" -R "$GITHUB_REPOSITORY" dist/* --clobber
+
+  # The macOS desktop app (Crucible Playbooks.app, crucible-lsp inside), signed ad hoc: a
+  # downloaded copy needs Open Anyway (or `xattr -d com.apple.quarantine`) on first launch.
   desktop:
     runs-on: macos-latest
     steps:
@@ -121,28 +175,35 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.tag || github.ref }}
 
+      # rustflags off: the action's default `-D warnings` reaches the vendored Rune, whose release
+      # build warns about debug-only tooling.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
-          cache-workspaces: crucible-desktop -> target
+          rustflags: ""
+          cache-workspaces: |
+            . -> target
+            crucible-desktop -> target
 
-      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+      - name: Rune
+        run: sh crucible-desktop/rune-patches.sh
 
-      - name: Build Crucible.app
-        working-directory: crucible-desktop
+      - name: Build Crucible Playbooks.app
+        env:
+          SQLX_OFFLINE: "true"
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
-          version="${tag#v}"
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || version="0.0.0"
-          bunx @tauri-apps/cli@2.12.1 build --bundles app --config "{\"version\":\"$version\"}"
+          cargo build --release --locked -p crucible-lsp
+          ( cd crucible-desktop && cargo build --release --locked )
+          VERSION="${tag#v}" sh crucible-desktop/macos-bundle.sh
 
       - name: Package
         run: |
           set -euo pipefail
           tag="${{ inputs.tag || github.ref_name }}"
-          name="Crucible-${tag}-aarch64-apple-darwin"
+          name="Crucible-Playbooks-${tag}-aarch64-apple-darwin"
           mkdir -p dist
-          ditto -c -k --keepParent crucible-desktop/target/release/bundle/macos/Crucible.app "dist/${name}.zip"
+          ditto -c -k --keepParent "crucible-desktop/target/release/Crucible Playbooks.app" "dist/${name}.zip"
           ( cd dist && shasum -a 256 "${name}.zip" > "${name}.zip.sha256" )
           ls -la dist/
 

@@ -1,0 +1,20 @@
+[package]
+name = "crucible-kueue-py"
+description = "Python bindings for crucible-kueue-client."
+version = "0.6.1"
+license = "MIT OR Apache-2.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+crucible-kueue-client = { path = "../crucible-kueue-client" }
+pyo3 = { version = "0.30", features = ["abi3-py39"] }
+pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
+serde_json = "1"
+
+[workspace]

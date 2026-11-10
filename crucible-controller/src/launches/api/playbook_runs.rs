@@ -302,6 +302,76 @@ pub(crate) async fn get_playbook_run(
     .into_response())
 }
 
+/// What a cancel queued: the launch, who asked, and the reason it is parked under.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CancelAck {
+    pub key: String,
+    pub actor: Option<String>,
+    pub reason: String,
+}
+
+/// `POST /api/playbook-runs/{key}/cancel` — stop a launch: park it as a human would, so nothing
+/// dispatches it again, then delete its running runs' pods on the clusters they run on and mark
+/// those runs `cancelled`. The daemon applies it on its next pass of the key. Who may is the
+/// policy's call on updating the run.
+#[utoipa::path(
+    post,
+    path = "/api/playbook-runs/{key}/cancel",
+    params(("key" = String, Path, description = "The launch's issue key")),
+    responses(
+        (status = 202, description = "The cancel is queued", body = CancelAck),
+        (status = 403, description = "The caller may not update the run", body = ErrorBody),
+        (status = 404, description = "No launch under that key", body = ErrorBody)
+    )
+)]
+pub(crate) async fn cancel_playbook_run(
+    State(state): State<ApiState>,
+    Path(key): Path<String>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+) -> ApiResult<Response> {
+    let owner: Option<Option<String>> =
+        sqlx::query_scalar("SELECT owner FROM playbook_launches WHERE key = $1")
+            .bind(&key)
+            .fetch_optional(state.db.pool())
+            .await
+            .map_err(anyhow::Error::from)?;
+    let Some(owner) = owner else {
+        return Ok(not_found(format!("no playbook launch {key:?}")));
+    };
+    let launch = crate::authz::decision::Resource::new(
+        crate::authz::action::ResourceType::Run,
+        &key,
+        crate::authz::model::Principal::stored(owner.as_deref()),
+    );
+    if let Err(refusal) =
+        crate::authz::owner::decide_on(&state, &caller, &launch, crate::authz::action::Verb::Update)
+            .await
+    {
+        return Ok(refusal.into_response());
+    }
+    let reason = format!(
+        "cancelled by {}",
+        identity.0.as_deref().unwrap_or("an operator")
+    );
+    state.sink.submit(crate::daemon::queue::Override {
+        key: crate::daemon::queue::IssueKey(key.clone()),
+        kind: crate::daemon::queue::OverrideKind::Cancel,
+        reason: Some(reason.clone()),
+        priority: None,
+        actor: identity.0.clone(),
+    });
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CancelAck {
+            key,
+            actor: identity.0,
+            reason,
+        }),
+    )
+        .into_response())
+}
+
 /// Fold the launch's history into its dispatch state: a run means the engine started, and the
 /// failed attempts are the events [`crate::runs::claim::PLAYBOOK_DISPATCH_FAILED`] stamps.
 fn dispatch_state(

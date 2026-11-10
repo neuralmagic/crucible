@@ -120,8 +120,18 @@ pub async fn assemble(
         let cfg = rec_cfg.clone();
         let store = overrides.clone();
         Box::pin(async move {
-            crate::daemon::overrides::apply_pending(&db, &store, &key.0, cfg.issues_agent_tokens())
-                .await?;
+            let applied = crate::daemon::overrides::apply_pending(
+                &db,
+                &store,
+                &key.0,
+                cfg.issues_run_tokens(),
+            )
+            .await?;
+            if let Some(ov) = applied
+                && ov.kind == crate::daemon::queue::OverrideKind::Cancel
+            {
+                crate::runs::cancel::cancel_runs(&db, &cfg, &key.0, ov.actor.as_deref()).await?;
+            }
             crate::issues::reconcile::reconcile(&db, &cfg, &key.0).await
         })
     });

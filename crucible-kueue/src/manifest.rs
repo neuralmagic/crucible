@@ -8,7 +8,7 @@ use crate::config::{Config, Lifetimes, QUEUE_LABEL};
 use kube::core::ApiResource;
 use kube_quantity::ParsedQuantity;
 use rmcp::schemars;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,6 +24,12 @@ pub enum WorkloadKind {
     JobSet,
     PyTorchJob,
 }
+
+/// The most ports one workload exposes.
+pub const MAX_EXPOSED_PORTS: usize = 8;
+
+/// The label a LeaderWorkerSet puts on each pod with its index in the group; the leader is `0`.
+const LWS_WORKER_INDEX_LABEL: &str = "leaderworkerset.sigs.k8s.io/worker-index";
 
 /// How Kueue admits the pods of a kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -129,6 +135,12 @@ pub enum ManifestError {
     #[error("manifest must be a JSON object")]
     NotObject,
     #[error(
+        "expose takes a Deployment, StatefulSet or LeaderWorkerSet; a {kind} serves nothing to reach"
+    )]
+    ExposeBatch { kind: &'static str },
+    #[error("expose takes 1 to {MAX_EXPOSED_PORTS} distinct ports from 1 to 65535, got {got:?}")]
+    ExposePorts { got: Vec<u16> },
+    #[error(
         "{api_version}/{kind} is not submittable; allowed: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1 LeaderWorkerSet, apps/v1 Deployment, apps/v1 StatefulSet, jobset.x-k8s.io/v1alpha2 JobSet, kubeflow.org/v1 PyTorchJob"
     )]
     Kind { api_version: String, kind: String },
@@ -193,6 +205,8 @@ pub struct Normalized {
     pub name: String,
     pub object: Value,
     pub pod_sets: Vec<PodSet>,
+    /// The ports a Service of the workload's name exposes; none, no Service.
+    pub expose: Vec<u16>,
     pub plan_hash: String,
     /// What the server added to the manifest beyond its own labels and defaults, for the plan.
     pub server_changes: Vec<String>,
@@ -201,6 +215,76 @@ pub struct Normalized {
 impl Normalized {
     pub fn total_requests(&self) -> BTreeMap<String, ParsedQuantity> {
         total_requests(&self.pod_sets)
+    }
+
+    /// Expose `ports` of the workload's pods through a Service of its name. Only kinds that serve
+    /// take one. The ports are part of the plan, so they change its hash.
+    pub fn exposing(mut self, ports: &[u16]) -> Result<Self, ManifestError> {
+        if ports.is_empty() {
+            return Ok(self);
+        }
+        if self.kind.is_batch() {
+            return Err(ManifestError::ExposeBatch {
+                kind: self.kind.kind(),
+            });
+        }
+        let mut distinct = ports.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        if distinct.len() != ports.len() || ports.len() > MAX_EXPOSED_PORTS || ports.contains(&0) {
+            return Err(ManifestError::ExposePorts {
+                got: ports.to_vec(),
+            });
+        }
+        self.expose = distinct;
+        self.plan_hash = plan_hash(&json!({"object": self.object, "expose": self.expose}));
+        Ok(self)
+    }
+
+    /// The Service exposing the workload's ports in `namespace`, selecting its pods by the
+    /// `workload_label` the server stamps on them (a LeaderWorkerSet's leaders only), carrying
+    /// the workload's own labels, and owned by the workload when `owner_uid` names it, so it is
+    /// deleted with it. `None` when nothing is exposed.
+    pub fn service(
+        &self,
+        namespace: &str,
+        workload_label: &str,
+        owner_uid: Option<&str>,
+    ) -> Option<Value> {
+        if self.expose.is_empty() {
+            return None;
+        }
+        let mut selector = serde_json::Map::new();
+        selector.insert(workload_label.to_string(), json!(self.name));
+        if self.kind == WorkloadKind::LeaderWorkerSet {
+            selector.insert(LWS_WORKER_INDEX_LABEL.to_string(), json!("0"));
+        }
+        let ports: Vec<Value> = self
+            .expose
+            .iter()
+            .map(|port| {
+                json!({"name": format!("port-{port}"), "port": port, "targetPort": port, "protocol": "TCP"})
+            })
+            .collect();
+        let mut metadata = json!({
+            "name": self.name,
+            "namespace": namespace,
+            "labels": self.object.pointer("/metadata/labels").cloned().unwrap_or_else(|| json!({})),
+        });
+        if let Some(uid) = owner_uid {
+            metadata["ownerReferences"] = json!([{
+                "apiVersion": self.kind.api_version(),
+                "kind": self.kind.kind(),
+                "name": self.name,
+                "uid": uid,
+            }]);
+        }
+        Some(json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": metadata,
+            "spec": {"type": "ClusterIP", "selector": selector, "ports": ports},
+        }))
     }
 
     /// How long Kubernetes keeps the object after it finishes, when it is deleted then.
@@ -428,6 +512,7 @@ pub fn normalize(
     Ok(Normalized {
         kind,
         name,
+        expose: Vec::new(),
         object,
         pod_sets,
         plan_hash,
@@ -2067,6 +2152,116 @@ mod tests {
         let n = normalize(deployment, &caller(), &queue(), &Config::default()).unwrap();
         assert_eq!(n.object.pointer("/spec/activeDeadlineSeconds"), None);
         assert_eq!(n.object.pointer("/spec/ttlSecondsAfterFinished"), None);
+    }
+
+    fn deployment() -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "serve"},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "c"}]}}}
+        })
+    }
+
+    #[test]
+    fn an_exposed_workload_gets_a_service_of_its_name_selecting_its_pods() {
+        let plain = normalize(deployment(), &caller(), &queue(), &Config::default()).unwrap();
+        assert_eq!(plain.service("team-a", "crucible.dev/workload", None), None);
+        let unexposed = plain.plan_hash.clone();
+        assert_eq!(plain.exposing(&[]).unwrap().plan_hash, unexposed);
+
+        let n = normalize(deployment(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[8000, 9090])
+            .unwrap();
+        assert_ne!(n.plan_hash, unexposed, "the ports are part of the plan");
+        let reordered = normalize(deployment(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[9090, 8000])
+            .unwrap();
+        assert_eq!(n.plan_hash, reordered.plan_hash);
+        let service = n
+            .service("team-a", "crucible.dev/workload", Some("uid-1"))
+            .unwrap();
+        assert_eq!(
+            service["metadata"],
+            json!({
+                "name": "serve",
+                "namespace": "team-a",
+                "labels": n.object["metadata"]["labels"],
+                "ownerReferences": [{
+                    "apiVersion": "apps/v1", "kind": "Deployment", "name": "serve", "uid": "uid-1"
+                }],
+            })
+        );
+        assert_eq!(
+            service["spec"],
+            json!({
+                "type": "ClusterIP",
+                "selector": {"crucible.dev/workload": "serve"},
+                "ports": [
+                    {"name": "port-8000", "port": 8000, "targetPort": 8000, "protocol": "TCP"},
+                    {"name": "port-9090", "port": 9090, "targetPort": 9090, "protocol": "TCP"},
+                ],
+            })
+        );
+        assert_eq!(
+            n.object["spec"]["template"]["metadata"]["labels"]["crucible.dev/workload"], "serve",
+            "the selector matches the label the server stamps on the pods"
+        );
+        assert!(
+            n.service("team-a", "crucible.dev/workload", None).unwrap()["metadata"]
+                .get("ownerReferences")
+                .is_none(),
+            "a dry run names no owner"
+        );
+    }
+
+    #[test]
+    fn a_leader_worker_sets_service_selects_its_leaders() {
+        let lws = json!({
+            "apiVersion": "leaderworkerset.x-k8s.io/v1",
+            "kind": "LeaderWorkerSet",
+            "metadata": {"name": "vllm"},
+            "spec": {"replicas": 1, "leaderWorkerTemplate": {"size": 2, "workerTemplate": {
+                "spec": {"containers": [{"name": "c"}]}
+            }}}
+        });
+        let n = normalize(lws, &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[8000])
+            .unwrap();
+        assert_eq!(
+            n.service("team-a", "crucible.dev/workload", None).unwrap()["spec"]["selector"],
+            json!({
+                "crucible.dev/workload": "vllm",
+                "leaderworkerset.sigs.k8s.io/worker-index": "0",
+            })
+        );
+    }
+
+    #[test]
+    fn only_serving_kinds_expose_and_only_a_few_distinct_ports() {
+        let batch = normalize(job(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&[8000]);
+        assert_eq!(
+            batch.unwrap_err().to_string(),
+            "expose takes a Deployment, StatefulSet or LeaderWorkerSet; a Job serves nothing to reach"
+        );
+        for bad in [vec![0], vec![8000, 8000], (1..=9).collect::<Vec<u16>>()] {
+            let refused = normalize(deployment(), &caller(), &queue(), &Config::default())
+                .unwrap()
+                .exposing(&bad);
+            assert!(
+                matches!(&refused, Err(ManifestError::ExposePorts { got }) if got == &bad),
+                "{bad:?}"
+            );
+        }
+        normalize(deployment(), &caller(), &queue(), &Config::default())
+            .unwrap()
+            .exposing(&(1..=8).collect::<Vec<u16>>())
+            .unwrap();
     }
 
     #[test]

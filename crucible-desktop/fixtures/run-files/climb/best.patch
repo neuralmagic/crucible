@@ -1,0 +1,120 @@
+diff --git a/vllm/model_executor/layers/fused_moe/configs/E=128,N=768,device_name=NVIDIA_A100-SXM4-80GB.json b/vllm/model_executor/layers/fused_moe/configs/E=128,N=768,device_name=NVIDIA_A100-SXM4-80GB.json
+new file mode 100644
+index 0000000..8f6e69e
+--- /dev/null
++++ b/vllm/model_executor/layers/fused_moe/configs/E=128,N=768,device_name=NVIDIA_A100-SXM4-80GB.json
+@@ -0,0 +1,65 @@
++{
++    "1": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "GROUP_SIZE_M": 1,
++        "SPLIT_K": 1,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "128": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 128,
++        "GROUP_SIZE_M": 1,
++        "SPLIT_K": 1,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "2048": {
++        "BLOCK_SIZE_K": 64,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 256,
++        "GROUP_SIZE_M": 16,
++        "SPLIT_K": 1,
++        "num_stages": 3,
++        "num_warps": 8
++    },
++    "32": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "GROUP_SIZE_M": 1,
++        "SPLIT_K": 1,
++        "num_stages": 4,
++        "num_warps": 4
++    },
++    "512": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 32,
++        "BLOCK_SIZE_N": 128,
++        "GROUP_SIZE_M": 16,
++        "SPLIT_K": 1,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "8": {
++        "BLOCK_SIZE_K": 128,
++        "BLOCK_SIZE_M": 16,
++        "BLOCK_SIZE_N": 64,
++        "GROUP_SIZE_M": 1,
++        "SPLIT_K": 1,
++        "num_stages": 3,
++        "num_warps": 4
++    },
++    "8192": {
++        "BLOCK_SIZE_K": 64,
++        "BLOCK_SIZE_M": 128,
++        "BLOCK_SIZE_N": 256,
++        "GROUP_SIZE_M": 16,
++        "SPLIT_K": 1,
++        "num_stages": 3,
++        "num_warps": 8
++    }
++}
+diff --git a/vllm/model_executor/layers/fused_moe/fused_moe.py b/vllm/model_executor/layers/fused_moe/fused_moe.py
+index e0610c8..b62b627 100644
+--- a/vllm/model_executor/layers/fused_moe/fused_moe.py
++++ b/vllm/model_executor/layers/fused_moe/fused_moe.py
+@@ -351,6 +351,11 @@ def fused_moe_kernel(
+     SWAP_AB: tl.constexpr,
+     # Tensor-descriptor path for the A gather and B load in the K-loop.
+     USE_TD: tl.constexpr = False,
++    # When BLOCK_SIZE_K divides K and BLOCK_SIZE_N divides N the K-loop's
++    # boundary masks are provably all-true; dropping them lets Triton emit
++    # unpredicated (vectorized) loads instead of masked per-element ones.
++    K_DIVISIBLE: tl.constexpr = False,
++    EVEN_N: tl.constexpr = False,
+ ):
+     """Implements the fused computation for a Mixture of Experts (MOE) using
+     token and expert matrices.
+@@ -437,7 +442,12 @@ def fused_moe_kernel(
+         )
+         return
+ 
+-    offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)) % N
++    if EVEN_N:
++        offs_bn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
++    else:
++        offs_bn = (
++            pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N).to(tl.int64)
++        ) % N
+     offs_k = tl.arange(0, BLOCK_SIZE_K)
+     # TD gather and the SWAP_AB accumulator layout are mutually exclusive.
+     tl.static_assert(not (USE_TD and SWAP_AB))
+@@ -526,6 +536,9 @@ def fused_moe_kernel(
+             b_mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
+             a = tl.load(a_ptrs, mask=a_mask, other=0.0)
+             b = tl.load(b_ptrs, mask=b_mask, other=0.0)
++        elif K_DIVISIBLE:
++            a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
++            b = tl.load(b_ptrs)
+         else:
+             a = tl.load(
+                 a_ptrs,
+@@ -904,6 +917,8 @@ def invoke_fused_moe_triton_kernel(
+         BLOCK_SIZE_K=BLOCK_SIZE_K,
+         SWAP_AB=SWAP_AB,
+         USE_TD=use_td,
++        K_DIVISIBLE=A.size(1) % BLOCK_SIZE_K == 0,
++        EVEN_N=B.size(1) % config["BLOCK_SIZE_N"] == 0,
+         **config,
+     )
+ 

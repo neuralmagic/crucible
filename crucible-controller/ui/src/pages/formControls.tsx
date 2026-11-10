@@ -55,6 +55,7 @@ export interface TextFieldProps {
   /** A refusal to render against this input: a client check, or a server field-level rejection. */
   error?: string | null;
   onBlur?: () => void;
+  disabled?: boolean;
 }
 
 export function TextField({
@@ -69,6 +70,7 @@ export function TextField({
   autoFocus,
   error,
   onBlur,
+  disabled,
 }: TextFieldProps) {
   return (
     <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
@@ -79,8 +81,9 @@ export function TextField({
         onBlur={onBlur}
         placeholder={placeholder}
         autoFocus={autoFocus}
+        disabled={disabled}
         aria-invalid={Boolean(error)}
-        className={cn(CONTROL, mono && MONO_CONTROL, Boolean(error) && 'border-red')}
+        className={cn(CONTROL, mono && MONO_CONTROL, Boolean(error) && 'border-red', disabled && 'cursor-not-allowed opacity-50')}
       />
     </FieldShell>
   );
@@ -137,6 +140,7 @@ export interface TextAreaFieldProps {
   mono?: boolean;
   error?: string | null;
   onBlur?: () => void;
+  disabled?: boolean;
 }
 
 export function TextAreaField({
@@ -152,6 +156,7 @@ export function TextAreaField({
   mono = false,
   error,
   onBlur,
+  disabled,
 }: TextAreaFieldProps) {
   return (
     <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
@@ -161,6 +166,7 @@ export function TextAreaField({
         rows={rows}
         placeholder={placeholder}
         autoFocus={autoFocus}
+        disabled={disabled}
         onChange={(event) => {
           onChange(event.target.value);
         }}
@@ -258,6 +264,9 @@ export interface SelectFieldProps {
   options: readonly SelectOption[];
   hint?: ReactNode;
   required?: boolean;
+  error?: string | null;
+  onBlur?: () => void;
+  disabled?: boolean;
 }
 
 export function SelectField({
@@ -268,16 +277,21 @@ export function SelectField({
   options,
   hint,
   required,
+  error,
+  onBlur,
+  disabled,
 }: SelectFieldProps) {
   return (
-    <FieldShell label={label} htmlFor={id} required={required} hint={hint}>
+    <FieldShell label={label} htmlFor={id} required={required} hint={hint} error={error}>
       <select
         id={id}
         value={value}
         onChange={(event) => {
           onChange(event.target.value);
         }}
-        className={cn(CONTROL, MONO_CONTROL, 'cursor-pointer')}
+        onBlur={onBlur}
+        disabled={disabled}
+        className={cn(CONTROL, MONO_CONTROL, 'cursor-pointer', disabled && 'cursor-not-allowed opacity-50')}
       >
         {options.map((option) => (
           <option key={option.value} value={option.value}>

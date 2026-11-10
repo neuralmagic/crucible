@@ -180,6 +180,13 @@ struct Cli {
         value_parser = PullSecret::parse
     )]
     pull_secrets: Vec<PullSecret>,
+    /// The cluster's DNS domain, for the host an exposed workload's Service is reached at.
+    #[arg(
+        long = "cluster-domain",
+        env = "CRUCIBLE_KUEUE_CLUSTER_DOMAIN",
+        default_value = config::DEFAULT_CLUSTER_DOMAIN
+    )]
+    cluster_domain: String,
     /// Node labels naming an accelerator product, first match wins. Repeatable.
     #[arg(
         long = "accelerator-product-label",
@@ -249,6 +256,7 @@ impl Cli {
             },
             namespaces: self.namespaces.clone(),
             pull_secrets: config::merge_pull_secrets(self.pull_secrets.clone()),
+            cluster_domain: self.cluster_domain.clone(),
         })
     }
 }

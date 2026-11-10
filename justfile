@@ -210,6 +210,14 @@ kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/p
         PACK={{pack}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
 
+# The kueue e2e's task pack on <name>: a command task with no agent runs GPU Jobs on two queues
+# and serves a LeaderWorkerSet through crucible-kueue with its task token, on loop pods that carry
+# an SVID of their own (scripts/kueue-e2e.sh, TASKS=1).
+kueue-task-e2e name loop_image kueue_image controller_image:
+    set -a && . e2e/kueue/clusters/{{name}}.env && set +a && \
+        TASKS=1 MAX_TIME=60m TIMEOUT_SECS=3600 LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
+        CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
+
 # The verifier of examples/optimize-loop against real report, evidence and image files, and the
 # pack compiled in both variants.
 optimize-loop-test:
@@ -275,16 +283,103 @@ route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
 route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
     kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found
 
-# Build the macOS desktop app and install it as ~/Applications/Crucible.app.
-desktop-install:
-    cd crucible-desktop && bunx @tauri-apps/cli@2.12.1 build --bundles app
-    mkdir -p ~/Applications
-    rm -rf ~/Applications/Crucible.app
-    ditto crucible-desktop/target/release/bundle/macos/Crucible.app ~/Applications/Crucible.app
+# Open the desktop app (Crucible Playbooks), its own Cargo workspace on Rune.
+desktop-run:
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo run
 
-# Format, lint and test the desktop app, which is its own Cargo workspace.
+# Build the release binary and open it as a bundled .app with the dock icon, crucible-lsp inside.
+desktop-release *args:
+    cargo build --release -p crucible-lsp
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo build --release
+    sh crucible-desktop/macos-bundle.sh
+    open "crucible-desktop/target/release/Crucible Playbooks.app" --args {{ args }}
+
+# Build and install the release .app, crucible-lsp inside, into ~/Applications.
+desktop-install:
+    cargo build --release -p crucible-lsp
+    sh crucible-desktop/rune-patches.sh
+    cd crucible-desktop && cargo build --release
+    sh crucible-desktop/macos-bundle.sh
+    mkdir -p ~/Applications
+    rm -rf "$HOME/Applications/Crucible Playbooks.app"
+    ditto "crucible-desktop/target/release/Crucible Playbooks.app" "$HOME/Applications/Crucible Playbooks.app"
+    open ~/Applications/"Crucible Playbooks.app"
+
+# Hot-reload dev loop: patches src/ui.rs in the open window, rebuilds and relaunches on
+# anything else. Needs Python >= 3.13 (rune-dev uses PurePosixPath.full_match).
+desktop-hot:
+    sh crucible-desktop/rune-patches.sh
+    python3.14 vendor/rune/scripts/rune-dev \
+        --manifest-path crucible-desktop/Cargo.toml --patch 'src/ui/*.rs' --local -- --scene local
+
+# Format, lint and test the desktop app.
 desktop-check:
+    sh crucible-desktop/rune-patches.sh
     cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
+
+# Lint the desktop app's library, and the crux client under it, for the browser (wasm32, Rune's
+# web target).
+desktop-web-check:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cargo clippy -p crux --no-default-features --target wasm32-unknown-unknown -- -D warnings
+    cd crucible-desktop && cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
+
+# Build the desktop app for the browser (dev profile) and serve it on http://localhost:8765,
+# forwarding /api to the controller in crux's config with crux's key. Read-only unless
+# `just desktop-web --write`. Needs the wasm-bindgen CLI at the version in
+# crucible-desktop/Cargo.lock.
+desktop-web *args:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --dev --out target/web
+    python3 crucible-desktop/web-dev-proxy.py --dir crucible-desktop/target/web {{ args }}
+
+# Run a command in the Fedora builder (crucible-desktop/linux/Containerfile) with the repo at /src,
+# for the host's architecture. Cargo's registry and target directory persist in podman volumes.
+[private]
+desktop-fedora *cmd:
+    podman build -q -t crucible-desktop-fedora crucible-desktop/linux
+    podman run --rm -v "$PWD":/src:Z -v crucible-desktop-cargo:/opt/cargo/registry \
+        -v crucible-desktop-target:/target -e CARGO_TARGET_DIR=/target -e SQLX_OFFLINE=true \
+        -e VERSION -w /src crucible-desktop-fedora sh -euc '{{ cmd }}'
+
+# Lint and test the desktop app on Fedora, in a container.
+desktop-linux-check:
+    just desktop-fedora 'sh crucible-desktop/rune-patches.sh && cargo build --locked -p crucible-lsp \
+        && cd crucible-desktop && cargo clippy --all-targets --all-features --locked -- -D warnings \
+        && CRUCIBLE_LSP=/target/debug/crucible-lsp dbus-run-session -- cargo test --locked'
+
+# Install the newest RPM `desktop-linux` built into a Fedora 45 GNOME VM (Lima, crucible-desktop/linux/lima.yaml)
+# and open the app in its window. The first run installs GNOME, which takes a while.
+desktop-linux-vm:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="$PWD/crucible-desktop/target/linux"
+    rpm=$(ls -t "$dir"/*.rpm 2>/dev/null | head -1)
+    [ -n "$rpm" ] || { echo "no RPM in $dir: run just desktop-linux first" >&2; exit 1; }
+    if ! limactl list -q | grep -qx crucible-fedora; then
+        limactl create -y --name crucible-fedora --mount-only "$dir" crucible-desktop/linux/lima.yaml
+    fi
+    limactl start -y crucible-fedora 2>/dev/null || true
+    limactl shell crucible-fedora sh -euc "
+        if rpm -q crucible-playbooks >/dev/null; then sudo dnf -y reinstall '$rpm'; else sudo dnf -y install '$rpm'; fi
+        uid=\$(id -u)
+        until [ -S /run/user/\$uid/wayland-0 ]; do sleep 1; done
+        export XDG_RUNTIME_DIR=/run/user/\$uid WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus
+        pkill -x crucible-playbo || true
+        setsid crucible-playbooks >/tmp/crucible-playbooks.log 2>&1 < /dev/null &
+    "
+    echo "running in the crucible-fedora window; log: limactl shell crucible-fedora cat /tmp/crucible-playbooks.log"
+
+# Build the desktop app's Fedora RPM, in a container, into crucible-desktop/target/linux.
+desktop-linux version="0.0.0":
+    VERSION={{ version }} just desktop-fedora 'sh crucible-desktop/rune-patches.sh \
+        && cargo build --release --locked -p crucible-lsp \
+        && (cd crucible-desktop && cargo build --release --locked) \
+        && sh crucible-desktop/linux-bundle.sh'
 
 # Prepare a cluster for the gateway isolation e2e (crucible-controller/tests/kueue_gateway_e2e.rs): the
 # profile's loop and sandbox namespaces, its pull secret copied from `pull_from`, the loop and

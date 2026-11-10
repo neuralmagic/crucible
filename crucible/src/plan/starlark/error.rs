@@ -205,6 +205,51 @@ pub enum CompileError {
     },
     #[error("parameter {param:?} pattern does not compile: {detail}")]
     ParamBadPattern { param: String, detail: String },
+    #[error("parameter {param:?} declares both choices and choices_from; offer one list")]
+    ParamChoicesConflict { param: String },
+    #[error("parameter {param:?} sets allow_other without choices or choices_from")]
+    ParamAllowOtherWithoutChoices { param: String },
+    #[error("parameter {param:?} is keyed by {keyed_by:?}, but {detail}")]
+    ParamKeyedByInvalid {
+        param: String,
+        keyed_by: String,
+        detail: &'static str,
+    },
+    #[error("parameter {param:?} reads its form options from {task}.{field}, but {detail}")]
+    ParamChoicesFromInvalid {
+        param: String,
+        task: String,
+        field: String,
+        detail: &'static str,
+    },
+    #[error(
+        "task {task:?} produces or feeds the choices of parameter {param:?}, but it changes with \
+         the launch values; a choices refresh runs without them, so build {task:?} from nothing \
+         param() returns"
+    )]
+    ChoiceProducerReadsParams { param: String, task: String },
+    #[error(
+        "a source that declares choices_from must compile without launch values, so a choices \
+         refresh can run, but it failed with placeholder values bound: {inner}"
+    )]
+    ChoiceProbeFailed {
+        #[source]
+        inner: Box<CompileError>,
+    },
+    #[error(
+        "a choices refresh needs a parameter that declares choices_from, and this source has none"
+    )]
+    RefreshWithoutProducers,
+    #[error("parameter {param:?} is enabled_by {gate:?}, which {detail}")]
+    ParamBadEnabledBy {
+        param: String,
+        gate: String,
+        detail: &'static str,
+    },
+    #[error(
+        "parameter {name:?} was supplied while {gate:?} is false; set {gate} to true to use it"
+    )]
+    ParamNotEnabled { name: String, gate: String },
     #[error(
         "no value for required parameter {name:?}{}",
         if doc.is_empty() { String::new() } else { format!(" ({doc})") }
@@ -414,17 +459,8 @@ pub enum CompileError {
     #[error("max_fanout = {got} is outside 1..={MAX_FANOUT_CEILING}")]
     FanoutOutOfRange { got: i32 },
     #[error(
-        "task {task:?} maps over {reference} but does not depend on {producer:?}; a fan-out \
-         reads its items from a dependency's output"
-    )]
-    OverNotADependency {
-        task: String,
-        reference: String,
-        producer: String,
-    },
-    #[error(
-        "task {task:?} maps over {reference} without max_fanout; a fan-out states how wide it \
-         may get before it runs, not after"
+        "task {task:?} maps over {reference} without a width; write `over = each({reference}, \
+         max = N)`. A fan-out states how wide it may get before it runs, not after"
     )]
     OverWithoutFanout { task: String, reference: String },
     #[error(
@@ -527,8 +563,8 @@ pub enum CompileError {
         error: crucible_contract::decision::QuestionError,
     },
     #[error(
-        "route {task:?} needs exactly one of min_confidence (a decision model answers), \
-         source (a dependency's output answers), or human = True (a person answers)"
+        "route {task:?} needs a decider: `decider = model(...)` (a decision model answers), \
+         `output(task)` (a dependency's output answers), or `human(...)` (a person answers)"
     )]
     RouteDecider { task: String },
     #[error("route {task:?}: review is shown to the person who answers, so it needs human = True")]
@@ -537,8 +573,26 @@ pub enum CompileError {
         "route {task:?}: timeout bounds how long a person has to answer, so it needs human = True"
     )]
     TimeoutWithoutHuman { task: String },
-    #[error("argument \"when\" must be one question of a route task, like `gate.area`")]
+    #[error(
+        "argument \"when\" must be one question of a route task, like `gate.area`, or a typed \
+         field of a task, like `check.ok`"
+    )]
     WhenNotAnAnswer,
+    #[error(
+        "\"when\" reads {reference}, which is {declared}; declare it \"boolean\" or as a list \
+         of at least two labels in emits"
+    )]
+    WhenFieldNotAnswerable { reference: String, declared: String },
+    #[error(
+        "\"when\" reads {reference}, a field of a mapped task; branch on a route mapped over the \
+         same list instead"
+    )]
+    WhenFieldOfMappedTask { reference: String },
+    #[error(
+        "task {task:?} lists others() in the epilogue; an epilogue task already reads every \
+         main-graph task under `outcome`"
+    )]
+    OthersInEpilogue { task: String },
     #[error(
         "\"source\" must name a declared list field of a task the route depends on, as \
          `source = producer.field`"
@@ -552,6 +606,23 @@ pub enum CompileError {
     OtherwiseWithoutWhen,
     #[error("a task takes \"answers\" or \"otherwise\", not both")]
     OtherwiseWithAnswers,
+    #[error(
+        "unknown {argument} {got:?}; use one of {known}{}",
+        suggestion.as_ref().map(|s| format!(". Did you mean {s:?}?")).unwrap_or_default()
+    )]
+    UnknownChoice {
+        argument: &'static str,
+        got: String,
+        known: String,
+        suggestion: Option<String>,
+    },
+    #[error(
+        "argument {old:?} is deprecated and cannot be combined with `{new}`, which replaces it"
+    )]
+    ReplacedArgument {
+        old: &'static str,
+        new: &'static str,
+    },
     #[error(
         "unreachable otherwise on {task:?}: every answer of {asked} is listed, dropped, or one its \
          source can never give"
