@@ -1045,6 +1045,9 @@ pub const MAX_FANOUT_CEILING: u32 = 256;
 /// autoresearch shape live in [`crate::plan::workflow::WorkflowCfg`].
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum PlanError {
+    /// Several errors from one validation, each with the task it was found on.
+    #[error("{}", .errors.iter().map(|(_, error)| error.to_string()).collect::<Vec<_>>().join("\n"))]
+    Many { errors: Vec<(TaskName, PlanError)> },
     #[error("unsupported plan version {version}; this build supports only version 1")]
     UnsupportedVersion { version: u32 },
     #[error("plan declares no tasks")]
@@ -1736,6 +1739,18 @@ pub fn declared_questions(
         .collect()
 }
 
+impl PlanError {
+    /// Nothing when `errors` is empty, the error itself when there is one, and
+    /// [`PlanError::Many`] otherwise.
+    fn all(mut errors: Vec<(TaskName, PlanError)>) -> Result<(), PlanError> {
+        match errors.len() {
+            0 => Ok(()),
+            1 => Err(errors.remove(0).1),
+            _ => Err(PlanError::Many { errors }),
+        }
+    }
+}
+
 impl Plan {
     /// A dynamic choice's `options_from`: a field of an unmapped dependency, typed as a list, or
     /// for a mapped route as an object keyed by element.
@@ -1857,803 +1872,816 @@ impl Plan {
                 });
             }
         }
+        let mut errors: Vec<(TaskName, PlanError)> = Vec::new();
         for t in &self.tasks {
-            let task = || t.name.0.clone();
-            let mut seen = BTreeSet::new();
-            for d in &t.depends_on {
-                if d == &t.name {
-                    return Err(PlanError::SelfDependency { task: task() });
-                }
-                if !index.contains_key(d) {
-                    return Err(PlanError::UnknownDependency {
-                        task: task(),
-                        dependency: d.0.clone(),
-                    });
-                }
-                if !seen.insert(d) {
-                    return Err(PlanError::RepeatedDependency {
-                        task: task(),
-                        dependency: d.0.clone(),
-                    });
-                }
-                if crate::plan::ir::RESERVED_INPUTS.contains(&d.0.as_str()) {
-                    return Err(PlanError::ReservedDependencyName {
-                        task: task(),
-                        dependency: d.0.clone(),
-                    });
-                }
-                let dependency_stage = index.get(d).map_or(t.stage, |&i| self.tasks[i].stage);
-                if dependency_stage != t.stage {
-                    return Err(PlanError::CrossStageDependency {
-                        task: task(),
-                        stage: t.stage,
-                        dependency: d.0.clone(),
-                        dependency_stage,
-                    });
-                }
-            }
-            let mut optional = BTreeSet::new();
-            for d in &t.optional {
-                if !t.depends_on.contains(d) {
-                    return Err(PlanError::OptionalNotADependency {
-                        task: task(),
-                        dependency: d.0.clone(),
-                    });
-                }
-                if !optional.insert(d) {
-                    return Err(PlanError::RepeatedOptional {
-                        task: task(),
-                        dependency: d.0.clone(),
-                    });
-                }
-                if let Some(revise) = &t.revise
-                    && revise.tasks.contains(d)
-                {
-                    return Err(PlanError::OptionalReviseTarget {
-                        task: task(),
-                        target: d.0.clone(),
-                    });
-                }
-            }
-            if !t.optional.is_empty() && t.join != Join::All {
-                return Err(PlanError::OptionalOutsideAllJoin {
-                    task: task(),
-                    join: t.join.as_str(),
-                });
-            }
-            if let Some(depth) = t.history {
-                if !(1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) {
-                    return Err(PlanError::HistoryDepthOutOfRange {
-                        task: task(),
-                        got: depth,
-                    });
-                }
-                if !matches!(
-                    t.task,
-                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
-                ) {
-                    return Err(PlanError::HistoryOnUnsupportedTask {
-                        task: task(),
-                        kind: t.task.label(),
-                    });
-                }
-            }
-            if let Some(field) = t
-                .emits
-                .names()
-                .into_iter()
-                .find(|field| RESERVED_OUTPUTS.contains(&field.as_str()))
-            {
-                return Err(PlanError::ReservedOutputField {
-                    task: task(),
-                    field,
-                });
-            }
-            if t.join == Join::Passed && t.depends_on.is_empty() {
-                return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
-            }
-            if t.join == Join::Settled {
-                if t.depends_on.is_empty() {
-                    return Err(PlanError::JoinSettledWithoutDependencies { task: task() });
-                }
-                if matches!(
-                    t.task,
-                    TaskKind::TopK { .. } | TaskKind::Report { .. } | TaskKind::Engine { .. }
-                ) {
-                    return Err(PlanError::SettledJoinOnFixedContext {
-                        task: task(),
-                        kind: t.task.label(),
-                    });
-                }
-            }
-            if t.required && t.join == Join::All {
+            let checked = (|| -> Result<(), PlanError> {
+                let task = || t.name.0.clone();
+                let mut seen = BTreeSet::new();
                 for d in &t.depends_on {
-                    if index.get(d).is_some_and(|&i| !self.tasks[i].required) {
-                        return Err(PlanError::AdvisoryGatesRequired {
+                    if d == &t.name {
+                        return Err(PlanError::SelfDependency { task: task() });
+                    }
+                    if !index.contains_key(d) {
+                        return Err(PlanError::UnknownDependency {
                             task: task(),
                             dependency: d.0.clone(),
                         });
                     }
-                }
-            }
-            if t.timeout.is_some()
-                && !matches!(
-                    t.task,
-                    TaskKind::Agent { .. }
-                        | TaskKind::Command { .. }
-                        | TaskKind::Evaluate { .. }
-                        | TaskKind::Route {
-                            decider: Decider::Human { .. },
-                            ..
-                        }
-                )
-            {
-                return Err(PlanError::TimeoutOnUntimedTask {
-                    task: task(),
-                    kind: t.task.label(),
-                });
-            }
-            if let TaskKind::TopK { k, .. } = &t.task {
-                if *k == 0 {
-                    return Err(PlanError::TopKZero { task: task() });
-                }
-                if t.depends_on.is_empty() {
-                    return Err(PlanError::TopKWithoutDependencies { task: task() });
-                }
-            }
-            if let TaskKind::Evaluate {
-                threshold,
-                direction,
-                ..
-            } = &t.task
-            {
-                if threshold.is_some() != direction.is_some() {
-                    return Err(PlanError::ThresholdWithoutDirection { task: task() });
-                }
-                if threshold.is_some_and(|value| !value.is_finite()) {
-                    return Err(PlanError::NonFiniteThreshold { task: task() });
-                }
-            }
-            if let TaskKind::Report {
-                result,
-                severity_field,
-                ..
-            } = &t.task
-            {
-                match (result, severity_field) {
-                    (None, Some(field)) => {
-                        return Err(PlanError::SeverityWithoutResult {
+                    if !seen.insert(d) {
+                        return Err(PlanError::RepeatedDependency {
                             task: task(),
-                            field: field.0.clone(),
+                            dependency: d.0.clone(),
                         });
                     }
-                    (None, None) => {}
-                    (Some(result), severity_field) => {
-                        let Some(&result_index) = index.get(result) else {
-                            return Err(PlanError::UnknownReportResult {
-                                task: task(),
-                                result: result.0.clone(),
-                            });
-                        };
-                        let selected = &self.tasks[result_index];
-                        if selected.stage == Stage::Epilogue {
-                            return Err(PlanError::EpilogueReportResult {
-                                task: task(),
-                                result: result.0.clone(),
-                            });
-                        }
-                        if let Some(field) = severity_field
-                            && !selected.emits.names().contains(&field.0)
-                        {
-                            return Err(PlanError::UndeclaredSeverityField {
-                                task: task(),
-                                result: result.0.clone(),
-                                field: field.0.clone(),
-                                declared: selected.emits.names(),
-                            });
-                        }
-                    }
-                }
-            }
-            if let TaskKind::Route { questions, decider } = &t.task {
-                if questions.is_empty() {
-                    return Err(PlanError::RouteWithoutQuestions { task: task() });
-                }
-                for (id, question) in questions {
-                    question
-                        .validate()
-                        .map_err(|error| PlanError::InvalidQuestion {
+                    if crate::plan::ir::RESERVED_INPUTS.contains(&d.0.as_str()) {
+                        return Err(PlanError::ReservedDependencyName {
                             task: task(),
-                            question: id.to_string(),
-                            error,
-                        })?;
-                    let human = matches!(decider, Decider::Human { .. });
-                    if human && id.as_str() == DECISION_KEY {
-                        return Err(PlanError::ReservedQuestion {
-                            task: task(),
-                            question: id.to_string(),
+                            dependency: d.0.clone(),
                         });
                     }
-                    if let Some(what) = match question.declared().map(|q| &q.kind) {
-                        Some(QuestionKind::Pick { .. }) => Some("pick"),
-                        Some(QuestionKind::Choice { multiple: true, .. }) => {
-                            Some("multiple choice")
-                        }
-                        _ => None,
+                    let dependency_stage = index.get(d).map_or(t.stage, |&i| self.tasks[i].stage);
+                    if dependency_stage != t.stage {
+                        return Err(PlanError::CrossStageDependency {
+                            task: task(),
+                            stage: t.stage,
+                            dependency: d.0.clone(),
+                            dependency_stage,
+                        });
                     }
-                    .filter(|_| !human)
+                }
+                let mut optional = BTreeSet::new();
+                for d in &t.optional {
+                    if !t.depends_on.contains(d) {
+                        return Err(PlanError::OptionalNotADependency {
+                            task: task(),
+                            dependency: d.0.clone(),
+                        });
+                    }
+                    if !optional.insert(d) {
+                        return Err(PlanError::RepeatedOptional {
+                            task: task(),
+                            dependency: d.0.clone(),
+                        });
+                    }
+                    if let Some(revise) = &t.revise
+                        && revise.tasks.contains(d)
                     {
-                        return Err(PlanError::HumanOnlyQuestion {
+                        return Err(PlanError::OptionalReviseTarget {
                             task: task(),
-                            question: id.to_string(),
-                            what,
+                            target: d.0.clone(),
                         });
                     }
-                    if let Some(source) = question.pick_source() {
-                        let reference = format!("{}.{}", source.task, source.field);
-                        let producer = TaskName(source.task.clone());
-                        if !t.depends_on.contains(&producer) {
-                            return Err(PlanError::PickNotADependency {
+                }
+                if !t.optional.is_empty() && t.join != Join::All {
+                    return Err(PlanError::OptionalOutsideAllJoin {
+                        task: task(),
+                        join: t.join.as_str(),
+                    });
+                }
+                if let Some(depth) = t.history {
+                    if !(1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) {
+                        return Err(PlanError::HistoryDepthOutOfRange {
+                            task: task(),
+                            got: depth,
+                        });
+                    }
+                    if !matches!(
+                        t.task,
+                        TaskKind::Agent { .. }
+                            | TaskKind::Command { .. }
+                            | TaskKind::Evaluate { .. }
+                    ) {
+                        return Err(PlanError::HistoryOnUnsupportedTask {
+                            task: task(),
+                            kind: t.task.label(),
+                        });
+                    }
+                }
+                if let Some(field) = t
+                    .emits
+                    .names()
+                    .into_iter()
+                    .find(|field| RESERVED_OUTPUTS.contains(&field.as_str()))
+                {
+                    return Err(PlanError::ReservedOutputField {
+                        task: task(),
+                        field,
+                    });
+                }
+                if t.join == Join::Passed && t.depends_on.is_empty() {
+                    return Err(PlanError::JoinPassedWithoutDependencies { task: task() });
+                }
+                if t.join == Join::Settled {
+                    if t.depends_on.is_empty() {
+                        return Err(PlanError::JoinSettledWithoutDependencies { task: task() });
+                    }
+                    if matches!(
+                        t.task,
+                        TaskKind::TopK { .. } | TaskKind::Report { .. } | TaskKind::Engine { .. }
+                    ) {
+                        return Err(PlanError::SettledJoinOnFixedContext {
+                            task: task(),
+                            kind: t.task.label(),
+                        });
+                    }
+                }
+                if t.required && t.join == Join::All {
+                    for d in &t.depends_on {
+                        if index.get(d).is_some_and(|&i| !self.tasks[i].required) {
+                            return Err(PlanError::AdvisoryGatesRequired {
+                                task: task(),
+                                dependency: d.0.clone(),
+                            });
+                        }
+                    }
+                }
+                if t.timeout.is_some()
+                    && !matches!(
+                        t.task,
+                        TaskKind::Agent { .. }
+                            | TaskKind::Command { .. }
+                            | TaskKind::Evaluate { .. }
+                            | TaskKind::Route {
+                                decider: Decider::Human { .. },
+                                ..
+                            }
+                    )
+                {
+                    return Err(PlanError::TimeoutOnUntimedTask {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
+                }
+                if let TaskKind::TopK { k, .. } = &t.task {
+                    if *k == 0 {
+                        return Err(PlanError::TopKZero { task: task() });
+                    }
+                    if t.depends_on.is_empty() {
+                        return Err(PlanError::TopKWithoutDependencies { task: task() });
+                    }
+                }
+                if let TaskKind::Evaluate {
+                    threshold,
+                    direction,
+                    ..
+                } = &t.task
+                {
+                    if threshold.is_some() != direction.is_some() {
+                        return Err(PlanError::ThresholdWithoutDirection { task: task() });
+                    }
+                    if threshold.is_some_and(|value| !value.is_finite()) {
+                        return Err(PlanError::NonFiniteThreshold { task: task() });
+                    }
+                }
+                if let TaskKind::Report {
+                    result,
+                    severity_field,
+                    ..
+                } = &t.task
+                {
+                    match (result, severity_field) {
+                        (None, Some(field)) => {
+                            return Err(PlanError::SeverityWithoutResult {
+                                task: task(),
+                                field: field.0.clone(),
+                            });
+                        }
+                        (None, None) => {}
+                        (Some(result), severity_field) => {
+                            let Some(&result_index) = index.get(result) else {
+                                return Err(PlanError::UnknownReportResult {
+                                    task: task(),
+                                    result: result.0.clone(),
+                                });
+                            };
+                            let selected = &self.tasks[result_index];
+                            if selected.stage == Stage::Epilogue {
+                                return Err(PlanError::EpilogueReportResult {
+                                    task: task(),
+                                    result: result.0.clone(),
+                                });
+                            }
+                            if let Some(field) = severity_field
+                                && !selected.emits.names().contains(&field.0)
+                            {
+                                return Err(PlanError::UndeclaredSeverityField {
+                                    task: task(),
+                                    result: result.0.clone(),
+                                    field: field.0.clone(),
+                                    declared: selected.emits.names(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if let TaskKind::Route { questions, decider } = &t.task {
+                    if questions.is_empty() {
+                        return Err(PlanError::RouteWithoutQuestions { task: task() });
+                    }
+                    for (id, question) in questions {
+                        question
+                            .validate()
+                            .map_err(|error| PlanError::InvalidQuestion {
                                 task: task(),
                                 question: id.to_string(),
-                                field: reference,
+                                error,
+                            })?;
+                        let human = matches!(decider, Decider::Human { .. });
+                        if human && id.as_str() == DECISION_KEY {
+                            return Err(PlanError::ReservedQuestion {
+                                task: task(),
+                                question: id.to_string(),
                             });
                         }
-                        match self.tasks[index[&producer]].emits.field(&source.field) {
-                            Declared::Unchecked | Declared::Untyped => {}
-                            Declared::Typed(declared) if declared.is_list() => {
-                                if let Some(why) = declared.item_refusal() {
-                                    return Err(PlanError::PickItemsNotStrings {
+                        if let Some(what) = match question.declared().map(|q| &q.kind) {
+                            Some(QuestionKind::Pick { .. }) => Some("pick"),
+                            Some(QuestionKind::Choice { multiple: true, .. }) => {
+                                Some("multiple choice")
+                            }
+                            _ => None,
+                        }
+                        .filter(|_| !human)
+                        {
+                            return Err(PlanError::HumanOnlyQuestion {
+                                task: task(),
+                                question: id.to_string(),
+                                what,
+                            });
+                        }
+                        if let Some(source) = question.pick_source() {
+                            let reference = format!("{}.{}", source.task, source.field);
+                            let producer = TaskName(source.task.clone());
+                            if !t.depends_on.contains(&producer) {
+                                return Err(PlanError::PickNotADependency {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    field: reference,
+                                });
+                            }
+                            match self.tasks[index[&producer]].emits.field(&source.field) {
+                                Declared::Unchecked | Declared::Untyped => {}
+                                Declared::Typed(declared) if declared.is_list() => {
+                                    if let Some(why) = declared.item_refusal() {
+                                        return Err(PlanError::PickItemsNotStrings {
+                                            task: task(),
+                                            question: id.to_string(),
+                                            field: reference,
+                                            declared: Box::new(declared.clone()),
+                                            why,
+                                        });
+                                    }
+                                }
+                                Declared::Omitted => {
+                                    return Err(PlanError::PickFieldOmitted {
                                         task: task(),
                                         question: id.to_string(),
                                         field: reference,
+                                    });
+                                }
+                                Declared::Typed(declared) => {
+                                    return Err(PlanError::PickNotAList {
+                                        task: task(),
+                                        question: id.to_string(),
+                                        field: reference,
+                                        declared: Box::new(declared.clone()),
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(source) = question.options_from() {
+                            self.validate_options_from(t, id, source, &index)?;
+                        }
+                    }
+                    match decider {
+                        Decider::Model { min_confidence, .. } => {
+                            if !(*min_confidence > 0.0 && *min_confidence <= 1.0) {
+                                return Err(PlanError::MinConfidenceOutOfRange {
+                                    task: task(),
+                                    got: *min_confidence,
+                                });
+                            }
+                            if t.needs != NEEDS_DECISION {
+                                return Err(PlanError::RouteNeeds {
+                                    task: task(),
+                                    decider: "model",
+                                    want: NEEDS_DECISION,
+                                    got: t.needs.clone(),
+                                });
+                            }
+                        }
+                        Decider::Human { .. } => {
+                            if t.needs != NEEDS_HUMAN {
+                                return Err(PlanError::RouteNeeds {
+                                    task: task(),
+                                    decider: "human",
+                                    want: NEEDS_HUMAN,
+                                    got: t.needs.clone(),
+                                });
+                            }
+                            if t.over.is_some() {
+                                return Err(PlanError::HumanRouteWithOver { task: task() });
+                            }
+                        }
+                        Decider::Output { task: source } => {
+                            if !t.depends_on.contains(source) {
+                                return Err(PlanError::RouteSourceNotADependency {
+                                    task: task(),
+                                    source_task: source.0.clone(),
+                                });
+                            }
+                            let source_task = &self.tasks[index[source]];
+                            let emits = &source_task.emits;
+                            let keyed_source = t.over.is_some() && !aligned(t, source_task);
+                            if keyed_source && source_task.over.is_some() {
+                                return Err(PlanError::RouteSourceMappedUnaligned {
+                                    task: task(),
+                                    source_task: source.0.clone(),
+                                });
+                            }
+                            for (id, question) in &declared_questions(&t.name, questions)? {
+                                if keyed_source {
+                                    if let Declared::Typed(declared) = emits.field(id.as_str())
+                                        && !declared.is_object()
+                                    {
+                                        return Err(PlanError::RouteSourceNotKeyed {
+                                            task: task(),
+                                            route_over: t
+                                                .over
+                                                .as_ref()
+                                                .map(ToString::to_string)
+                                                .unwrap_or_default(),
+                                            source_task: source.0.clone(),
+                                            question: id.to_string(),
+                                            declared: Box::new(declared.clone()),
+                                        });
+                                    }
+                                    if emits.field(id.as_str()) != Declared::Omitted {
+                                        continue;
+                                    }
+                                }
+                                match emits.field(id.as_str()) {
+                                    Declared::Unchecked | Declared::Untyped => {}
+                                    Declared::Omitted => {
+                                        return Err(PlanError::RouteSourceOmitsQuestion {
+                                            task: task(),
+                                            source_task: source.0.clone(),
+                                            question: id.to_string(),
+                                        });
+                                    }
+                                    Declared::Typed(declared) if answers(question, declared) => {}
+                                    Declared::Typed(declared) => {
+                                        return Err(PlanError::RouteSourceUnanswerable {
+                                            task: task(),
+                                            source_task: source.0.clone(),
+                                            question: id.to_string(),
+                                            declared: Box::new(declared.clone()),
+                                            expected: answerable_types(question),
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if t.depends_on.iter().any(|d| d.0 == FILES_INPUT) {
+                        return Err(PlanError::RouteDependsOnFiles { task: task() });
+                    }
+                    if let Decider::Model { files, .. } = decider {
+                        for path in files {
+                            let declaring: Vec<(&Task, &DeclaredFile)> = t
+                                .depends_on
+                                .iter()
+                                .map(|d| &self.tasks[index[d]])
+                                .filter_map(|d| {
+                                    Some((d, d.emits_files.iter().find(|f| &f.path == path)?))
+                                })
+                                .collect();
+                            if declaring.is_empty() {
+                                return Err(PlanError::RouteFileUndeclared {
+                                    task: task(),
+                                    path: path.clone(),
+                                });
+                            }
+                            if declaring.iter().all(|(_, f)| f.schema.is_none()) {
+                                return Err(PlanError::RouteFileWithoutSchema {
+                                    task: task(),
+                                    path: path.clone(),
+                                });
+                            }
+                            if declaring
+                                .iter()
+                                .all(|(d, _)| d.over.is_some() && !aligned(t, d))
+                            {
+                                return Err(PlanError::RouteFileFromUnaligned {
+                                    task: task(),
+                                    path: path.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(when) = &t.when {
+                    let route = || when.task.0.clone();
+                    let question = || when.question.to_string();
+                    if !t.depends_on.contains(&when.task) {
+                        return Err(PlanError::WhenNotADependency {
+                            task: task(),
+                            route: route(),
+                        });
+                    }
+                    let target = &self.tasks[index[&when.task]];
+                    let TaskKind::Route { questions, .. } = &target.task else {
+                        return Err(PlanError::WhenNotARoute {
+                            task: task(),
+                            route: route(),
+                            kind: target.task.label(),
+                        });
+                    };
+                    if let Some(route_over) = &target.over
+                        && !aligned(t, target)
+                    {
+                        return Err(PlanError::WhenOnUnalignedRoute {
+                            task: task(),
+                            route: route(),
+                            route_over: route_over.to_string(),
+                            task_over: match &t.over {
+                                Some(over) => format!("maps over {over}"),
+                                None => "is not mapped".to_string(),
+                            },
+                        });
+                    }
+                    let Some(asked) = questions.get(&when.question) else {
+                        return Err(PlanError::WhenUnknownQuestion {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                            declared: questions.keys().map(ToString::to_string).collect(),
+                        });
+                    };
+                    if asked.pick_source().is_some() {
+                        return Err(PlanError::WhenOnPick {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                        });
+                    }
+                    if when.is.is_empty() && !when.any_option {
+                        return Err(PlanError::WhenWithoutLabels {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                        });
+                    }
+                    let dynamic = asked.options_from().is_some();
+                    if when.any_option && !dynamic {
+                        return Err(PlanError::WhenAnyOptionOnDeclared {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                        });
+                    }
+                    if dynamic && let Some(label) = when.is.iter().find(|l| !l.is_uncertain()) {
+                        return Err(PlanError::WhenNamesDynamicOption {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                            label: label.to_string(),
+                        });
+                    }
+                    let lookup = |name: &TaskName| index.get(name).map(|&i| &self.tasks[i]);
+                    let typed = typed_answers(target, &when.question, lookup)
+                        .filter(|_| !reads_keyed_source(target, lookup));
+                    let mut listed = BTreeSet::new();
+                    for label in &when.is {
+                        if let Some((source, declared, possible)) = &typed
+                            && asked.resolves_to(label)
+                            && !possible.contains(label)
+                        {
+                            return Err(PlanError::WhenNeverAnswered(Box::new(NeverAnswered {
+                                task: task(),
+                                route: route(),
+                                question: question(),
+                                label: label.to_string(),
+                                source_task: source.0.clone(),
+                                declared: (*declared).clone(),
+                                possible: possible.iter().map(ToString::to_string).collect(),
+                            })));
+                        }
+                        if !asked.resolves_to(label) {
+                            return Err(PlanError::WhenUnknownLabel {
+                                task: task(),
+                                route: route(),
+                                question: question(),
+                                label: label.to_string(),
+                                declared: asked
+                                    .labels()
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .chain([UNCERTAIN.to_owned()])
+                                    .collect(),
+                            });
+                        }
+                        if !listed.insert(label) {
+                            return Err(PlanError::WhenRepeatedLabel {
+                                task: task(),
+                                route: route(),
+                                question: question(),
+                                label: label.to_string(),
+                            });
+                        }
+                    }
+                }
+                if !t.emits.is_empty() {
+                    if matches!(
+                        t.task,
+                        TaskKind::TopK { .. } | TaskKind::Route { .. } | TaskKind::Engine { .. }
+                    ) {
+                        return Err(PlanError::EmitsOnEngineTask {
+                            task: task(),
+                            kind: t.task.label(),
+                        });
+                    }
+                    let mut fields = BTreeSet::new();
+                    for (field, ty) in t.emits.fields() {
+                        if field.0.is_empty()
+                            || field.0.len() > 64
+                            || !field
+                                .0
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        {
+                            return Err(PlanError::InvalidOutputField {
+                                task: task(),
+                                field: field.0.clone(),
+                            });
+                        }
+                        if !fields.insert(&field.0) {
+                            return Err(PlanError::DuplicateOutputField {
+                                task: task(),
+                                field: field.0.clone(),
+                            });
+                        }
+                        if let Some(ty) = ty {
+                            ty.validate().map_err(|error| PlanError::InvalidFieldType {
+                                task: task(),
+                                field: field.0.clone(),
+                                error,
+                            })?;
+                        }
+                    }
+                }
+                // A declared emits that omits `score`, or types it as something other than a number,
+                // where a score is read is a wiring bug worth failing before any spend.
+                let score = |name: &TaskName| {
+                    index
+                        .get(name)
+                        .map_or(Declared::Unchecked, |&i| self.tasks[i].emits.field("score"))
+                };
+                let not_numeric =
+                    |source: &TaskName, declared: &FieldType| PlanError::ScoreNotNumeric {
+                        task: task(),
+                        source_task: source.0.clone(),
+                        declared: declared.clone(),
+                    };
+                if matches!(t.task, TaskKind::TopK { .. }) {
+                    for d in &t.depends_on {
+                        match score(d) {
+                            Declared::Omitted => {
+                                return Err(PlanError::TopKSourceOmitsScore {
+                                    task: task(),
+                                    dependency: d.0.clone(),
+                                });
+                            }
+                            Declared::Typed(declared) if !declared.is_numeric() => {
+                                return Err(not_numeric(d, declared));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if let TaskKind::Engine {
+                    op: EngineOp::Grade,
+                    source,
+                    tiebreak,
+                } = &t.task
+                {
+                    for source in source.iter().chain(tiebreak) {
+                        match score(source) {
+                            Declared::Omitted => {
+                                return Err(PlanError::GradeSourceOmitsScore {
+                                    task: task(),
+                                    from: source.0.clone(),
+                                });
+                            }
+                            Declared::Typed(declared) if !declared.is_numeric() => {
+                                return Err(not_numeric(source, declared));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if let TaskKind::Evaluate {
+                    threshold: Some(_), ..
+                } = &t.task
+                {
+                    match t.emits.field("score") {
+                        Declared::Omitted => {
+                            return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
+                        }
+                        Declared::Typed(declared) if !declared.is_numeric() => {
+                            return Err(not_numeric(&t.name, declared));
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(session) = &t.session {
+                    if session.is_empty()
+                        || session.len() > 64
+                        || !session
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                    {
+                        return Err(PlanError::InvalidSessionName {
+                            task: task(),
+                            session: session.clone(),
+                        });
+                    }
+                    if !matches!(
+                        t.task,
+                        TaskKind::Agent { .. }
+                            | TaskKind::Engine {
+                                op: EngineOp::Propose,
+                                ..
+                            }
+                    ) {
+                        return Err(PlanError::SessionOnUnsupportedTask { task: task() });
+                    }
+                    if t.isolation.is_some() {
+                        return Err(PlanError::SessionWithIsolation {
+                            task: task(),
+                            session: session.clone(),
+                        });
+                    }
+                }
+                match (&t.over, t.max_fanout) {
+                    (None, None) => {}
+                    (None, Some(_)) => return Err(PlanError::FanoutWithoutOver { task: task() }),
+                    (Some(reference), None) => {
+                        return Err(PlanError::OverWithoutFanout {
+                            task: task(),
+                            reference: reference.to_string(),
+                        });
+                    }
+                    (Some(reference), Some(width)) => {
+                        if !t.depends_on.contains(&reference.task) {
+                            return Err(PlanError::OverNotADependency {
+                                task: task(),
+                                reference: reference.to_string(),
+                                producer: reference.task.0.clone(),
+                            });
+                        }
+                        let producer = &self.tasks[index[&reference.task]];
+                        match producer.emits.field(&reference.field.0) {
+                            Declared::Unchecked | Declared::Untyped => {}
+                            Declared::Typed(declared) if declared.is_list() => {
+                                if let Some(why) = declared.item_refusal() {
+                                    return Err(PlanError::OverItemsNotStrings {
+                                        task: task(),
+                                        reference: reference.to_string(),
+                                        producer: reference.task.0.clone(),
                                         declared: Box::new(declared.clone()),
                                         why,
                                     });
                                 }
                             }
                             Declared::Omitted => {
-                                return Err(PlanError::PickFieldOmitted {
-                                    task: task(),
-                                    question: id.to_string(),
-                                    field: reference,
-                                });
-                            }
-                            Declared::Typed(declared) => {
-                                return Err(PlanError::PickNotAList {
-                                    task: task(),
-                                    question: id.to_string(),
-                                    field: reference,
-                                    declared: Box::new(declared.clone()),
-                                });
-                            }
-                        }
-                    }
-                    if let Some(source) = question.options_from() {
-                        self.validate_options_from(t, id, source, &index)?;
-                    }
-                }
-                match decider {
-                    Decider::Model { min_confidence, .. } => {
-                        if !(*min_confidence > 0.0 && *min_confidence <= 1.0) {
-                            return Err(PlanError::MinConfidenceOutOfRange {
-                                task: task(),
-                                got: *min_confidence,
-                            });
-                        }
-                        if t.needs != NEEDS_DECISION {
-                            return Err(PlanError::RouteNeeds {
-                                task: task(),
-                                decider: "model",
-                                want: NEEDS_DECISION,
-                                got: t.needs.clone(),
-                            });
-                        }
-                    }
-                    Decider::Human { .. } => {
-                        if t.needs != NEEDS_HUMAN {
-                            return Err(PlanError::RouteNeeds {
-                                task: task(),
-                                decider: "human",
-                                want: NEEDS_HUMAN,
-                                got: t.needs.clone(),
-                            });
-                        }
-                        if t.over.is_some() {
-                            return Err(PlanError::HumanRouteWithOver { task: task() });
-                        }
-                    }
-                    Decider::Output { task: source } => {
-                        if !t.depends_on.contains(source) {
-                            return Err(PlanError::RouteSourceNotADependency {
-                                task: task(),
-                                source_task: source.0.clone(),
-                            });
-                        }
-                        let source_task = &self.tasks[index[source]];
-                        let emits = &source_task.emits;
-                        let keyed_source = t.over.is_some() && !aligned(t, source_task);
-                        if keyed_source && source_task.over.is_some() {
-                            return Err(PlanError::RouteSourceMappedUnaligned {
-                                task: task(),
-                                source_task: source.0.clone(),
-                            });
-                        }
-                        for (id, question) in &declared_questions(&t.name, questions)? {
-                            if keyed_source {
-                                if let Declared::Typed(declared) = emits.field(id.as_str())
-                                    && !declared.is_object()
-                                {
-                                    return Err(PlanError::RouteSourceNotKeyed {
-                                        task: task(),
-                                        route_over: t
-                                            .over
-                                            .as_ref()
-                                            .map(ToString::to_string)
-                                            .unwrap_or_default(),
-                                        source_task: source.0.clone(),
-                                        question: id.to_string(),
-                                        declared: Box::new(declared.clone()),
-                                    });
-                                }
-                                if emits.field(id.as_str()) != Declared::Omitted {
-                                    continue;
-                                }
-                            }
-                            match emits.field(id.as_str()) {
-                                Declared::Unchecked | Declared::Untyped => {}
-                                Declared::Omitted => {
-                                    return Err(PlanError::RouteSourceOmitsQuestion {
-                                        task: task(),
-                                        source_task: source.0.clone(),
-                                        question: id.to_string(),
-                                    });
-                                }
-                                Declared::Typed(declared) if answers(question, declared) => {}
-                                Declared::Typed(declared) => {
-                                    return Err(PlanError::RouteSourceUnanswerable {
-                                        task: task(),
-                                        source_task: source.0.clone(),
-                                        question: id.to_string(),
-                                        declared: Box::new(declared.clone()),
-                                        expected: answerable_types(question),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                if t.depends_on.iter().any(|d| d.0 == FILES_INPUT) {
-                    return Err(PlanError::RouteDependsOnFiles { task: task() });
-                }
-                if let Decider::Model { files, .. } = decider {
-                    for path in files {
-                        let declaring: Vec<(&Task, &DeclaredFile)> = t
-                            .depends_on
-                            .iter()
-                            .map(|d| &self.tasks[index[d]])
-                            .filter_map(|d| {
-                                Some((d, d.emits_files.iter().find(|f| &f.path == path)?))
-                            })
-                            .collect();
-                        if declaring.is_empty() {
-                            return Err(PlanError::RouteFileUndeclared {
-                                task: task(),
-                                path: path.clone(),
-                            });
-                        }
-                        if declaring.iter().all(|(_, f)| f.schema.is_none()) {
-                            return Err(PlanError::RouteFileWithoutSchema {
-                                task: task(),
-                                path: path.clone(),
-                            });
-                        }
-                        if declaring
-                            .iter()
-                            .all(|(d, _)| d.over.is_some() && !aligned(t, d))
-                        {
-                            return Err(PlanError::RouteFileFromUnaligned {
-                                task: task(),
-                                path: path.clone(),
-                            });
-                        }
-                    }
-                }
-            }
-            if let Some(when) = &t.when {
-                let route = || when.task.0.clone();
-                let question = || when.question.to_string();
-                if !t.depends_on.contains(&when.task) {
-                    return Err(PlanError::WhenNotADependency {
-                        task: task(),
-                        route: route(),
-                    });
-                }
-                let target = &self.tasks[index[&when.task]];
-                let TaskKind::Route { questions, .. } = &target.task else {
-                    return Err(PlanError::WhenNotARoute {
-                        task: task(),
-                        route: route(),
-                        kind: target.task.label(),
-                    });
-                };
-                if let Some(route_over) = &target.over
-                    && !aligned(t, target)
-                {
-                    return Err(PlanError::WhenOnUnalignedRoute {
-                        task: task(),
-                        route: route(),
-                        route_over: route_over.to_string(),
-                        task_over: match &t.over {
-                            Some(over) => format!("maps over {over}"),
-                            None => "is not mapped".to_string(),
-                        },
-                    });
-                }
-                let Some(asked) = questions.get(&when.question) else {
-                    return Err(PlanError::WhenUnknownQuestion {
-                        task: task(),
-                        route: route(),
-                        question: question(),
-                        declared: questions.keys().map(ToString::to_string).collect(),
-                    });
-                };
-                if asked.pick_source().is_some() {
-                    return Err(PlanError::WhenOnPick {
-                        task: task(),
-                        route: route(),
-                        question: question(),
-                    });
-                }
-                if when.is.is_empty() && !when.any_option {
-                    return Err(PlanError::WhenWithoutLabels {
-                        task: task(),
-                        route: route(),
-                        question: question(),
-                    });
-                }
-                let dynamic = asked.options_from().is_some();
-                if when.any_option && !dynamic {
-                    return Err(PlanError::WhenAnyOptionOnDeclared {
-                        task: task(),
-                        route: route(),
-                        question: question(),
-                    });
-                }
-                if dynamic && let Some(label) = when.is.iter().find(|l| !l.is_uncertain()) {
-                    return Err(PlanError::WhenNamesDynamicOption {
-                        task: task(),
-                        route: route(),
-                        question: question(),
-                        label: label.to_string(),
-                    });
-                }
-                let lookup = |name: &TaskName| index.get(name).map(|&i| &self.tasks[i]);
-                let typed = typed_answers(target, &when.question, lookup)
-                    .filter(|_| !reads_keyed_source(target, lookup));
-                let mut listed = BTreeSet::new();
-                for label in &when.is {
-                    if let Some((source, declared, possible)) = &typed
-                        && asked.resolves_to(label)
-                        && !possible.contains(label)
-                    {
-                        return Err(PlanError::WhenNeverAnswered(Box::new(NeverAnswered {
-                            task: task(),
-                            route: route(),
-                            question: question(),
-                            label: label.to_string(),
-                            source_task: source.0.clone(),
-                            declared: (*declared).clone(),
-                            possible: possible.iter().map(ToString::to_string).collect(),
-                        })));
-                    }
-                    if !asked.resolves_to(label) {
-                        return Err(PlanError::WhenUnknownLabel {
-                            task: task(),
-                            route: route(),
-                            question: question(),
-                            label: label.to_string(),
-                            declared: asked
-                                .labels()
-                                .iter()
-                                .map(ToString::to_string)
-                                .chain([UNCERTAIN.to_owned()])
-                                .collect(),
-                        });
-                    }
-                    if !listed.insert(label) {
-                        return Err(PlanError::WhenRepeatedLabel {
-                            task: task(),
-                            route: route(),
-                            question: question(),
-                            label: label.to_string(),
-                        });
-                    }
-                }
-            }
-            if !t.emits.is_empty() {
-                if matches!(
-                    t.task,
-                    TaskKind::TopK { .. } | TaskKind::Route { .. } | TaskKind::Engine { .. }
-                ) {
-                    return Err(PlanError::EmitsOnEngineTask {
-                        task: task(),
-                        kind: t.task.label(),
-                    });
-                }
-                let mut fields = BTreeSet::new();
-                for (field, ty) in t.emits.fields() {
-                    if field.0.is_empty()
-                        || field.0.len() > 64
-                        || !field
-                            .0
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                    {
-                        return Err(PlanError::InvalidOutputField {
-                            task: task(),
-                            field: field.0.clone(),
-                        });
-                    }
-                    if !fields.insert(&field.0) {
-                        return Err(PlanError::DuplicateOutputField {
-                            task: task(),
-                            field: field.0.clone(),
-                        });
-                    }
-                    if let Some(ty) = ty {
-                        ty.validate().map_err(|error| PlanError::InvalidFieldType {
-                            task: task(),
-                            field: field.0.clone(),
-                            error,
-                        })?;
-                    }
-                }
-            }
-            // A declared emits that omits `score`, or types it as something other than a number,
-            // where a score is read is a wiring bug worth failing before any spend.
-            let score = |name: &TaskName| {
-                index
-                    .get(name)
-                    .map_or(Declared::Unchecked, |&i| self.tasks[i].emits.field("score"))
-            };
-            let not_numeric =
-                |source: &TaskName, declared: &FieldType| PlanError::ScoreNotNumeric {
-                    task: task(),
-                    source_task: source.0.clone(),
-                    declared: declared.clone(),
-                };
-            if matches!(t.task, TaskKind::TopK { .. }) {
-                for d in &t.depends_on {
-                    match score(d) {
-                        Declared::Omitted => {
-                            return Err(PlanError::TopKSourceOmitsScore {
-                                task: task(),
-                                dependency: d.0.clone(),
-                            });
-                        }
-                        Declared::Typed(declared) if !declared.is_numeric() => {
-                            return Err(not_numeric(d, declared));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let TaskKind::Engine {
-                op: EngineOp::Grade,
-                source,
-                tiebreak,
-            } = &t.task
-            {
-                for source in source.iter().chain(tiebreak) {
-                    match score(source) {
-                        Declared::Omitted => {
-                            return Err(PlanError::GradeSourceOmitsScore {
-                                task: task(),
-                                from: source.0.clone(),
-                            });
-                        }
-                        Declared::Typed(declared) if !declared.is_numeric() => {
-                            return Err(not_numeric(source, declared));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if let TaskKind::Evaluate {
-                threshold: Some(_), ..
-            } = &t.task
-            {
-                match t.emits.field("score") {
-                    Declared::Omitted => {
-                        return Err(PlanError::ThresholdedEvaluateOmitsScore { task: task() });
-                    }
-                    Declared::Typed(declared) if !declared.is_numeric() => {
-                        return Err(not_numeric(&t.name, declared));
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(session) = &t.session {
-                if session.is_empty()
-                    || session.len() > 64
-                    || !session
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-                {
-                    return Err(PlanError::InvalidSessionName {
-                        task: task(),
-                        session: session.clone(),
-                    });
-                }
-                if !matches!(
-                    t.task,
-                    TaskKind::Agent { .. }
-                        | TaskKind::Engine {
-                            op: EngineOp::Propose,
-                            ..
-                        }
-                ) {
-                    return Err(PlanError::SessionOnUnsupportedTask { task: task() });
-                }
-                if t.isolation.is_some() {
-                    return Err(PlanError::SessionWithIsolation {
-                        task: task(),
-                        session: session.clone(),
-                    });
-                }
-            }
-            match (&t.over, t.max_fanout) {
-                (None, None) => {}
-                (None, Some(_)) => return Err(PlanError::FanoutWithoutOver { task: task() }),
-                (Some(reference), None) => {
-                    return Err(PlanError::OverWithoutFanout {
-                        task: task(),
-                        reference: reference.to_string(),
-                    });
-                }
-                (Some(reference), Some(width)) => {
-                    if !t.depends_on.contains(&reference.task) {
-                        return Err(PlanError::OverNotADependency {
-                            task: task(),
-                            reference: reference.to_string(),
-                            producer: reference.task.0.clone(),
-                        });
-                    }
-                    let producer = &self.tasks[index[&reference.task]];
-                    match producer.emits.field(&reference.field.0) {
-                        Declared::Unchecked | Declared::Untyped => {}
-                        Declared::Typed(declared) if declared.is_list() => {
-                            if let Some(why) = declared.item_refusal() {
-                                return Err(PlanError::OverItemsNotStrings {
+                                return Err(PlanError::OverFieldOmitted {
                                     task: task(),
                                     reference: reference.to_string(),
                                     producer: reference.task.0.clone(),
-                                    declared: Box::new(declared.clone()),
-                                    why,
+                                    field: reference.field.0.clone(),
+                                });
+                            }
+                            Declared::Typed(declared) => {
+                                return Err(PlanError::OverNotAList {
+                                    task: task(),
+                                    reference: reference.to_string(),
+                                    producer: reference.task.0.clone(),
+                                    declared: declared.clone(),
                                 });
                             }
                         }
-                        Declared::Omitted => {
-                            return Err(PlanError::OverFieldOmitted {
+                        if width == 0 || width > MAX_FANOUT_CEILING {
+                            return Err(PlanError::FanoutOutOfRange {
+                                task: task(),
+                                got: width,
+                            });
+                        }
+                        if let Some(session) = &t.session {
+                            return Err(PlanError::OverWithSession {
                                 task: task(),
                                 reference: reference.to_string(),
+                                session: session.clone(),
+                            });
+                        }
+                    }
+                }
+                if !t.keyed.is_empty() && t.over.is_none() {
+                    return Err(PlanError::KeyedWithoutOver { task: task() });
+                }
+                for reference in &t.keyed {
+                    let keyed = || reference.to_string();
+                    if !t.depends_on.contains(&reference.task) {
+                        return Err(PlanError::KeyedNotADependency {
+                            task: task(),
+                            reference: keyed(),
+                        });
+                    }
+                    let producer = &self.tasks[index[&reference.task]];
+                    if producer.over.is_some() {
+                        return Err(PlanError::KeyedFromMapped {
+                            task: task(),
+                            reference: keyed(),
+                        });
+                    }
+                    match producer.emits.field(&reference.field.0) {
+                        Declared::Untyped => {}
+                        Declared::Typed(declared) if declared.is_object() => {}
+                        Declared::Typed(declared) => {
+                            return Err(PlanError::KeyedNotObject {
+                                task: task(),
+                                reference: keyed(),
+                                declared: Box::new(declared.clone()),
+                            });
+                        }
+                        Declared::Unchecked | Declared::Omitted => {
+                            return Err(PlanError::KeyedUndeclared {
+                                task: task(),
+                                reference: keyed(),
                                 producer: reference.task.0.clone(),
                                 field: reference.field.0.clone(),
                             });
                         }
-                        Declared::Typed(declared) => {
-                            return Err(PlanError::OverNotAList {
+                    }
+                }
+                if t.repair > MAX_REPAIR_CEILING {
+                    return Err(PlanError::RepairOutOfRange {
+                        task: task(),
+                        got: t.repair,
+                    });
+                }
+                if t.repair > 0 && !matches!(t.task, TaskKind::Agent { .. }) {
+                    return Err(PlanError::RepairOnUnsupportedTask {
+                        task: task(),
+                        kind: t.task.label(),
+                    });
+                }
+                if let Some(revise) = &t.revise {
+                    if t.when.is_some() {
+                        return Err(PlanError::WhenOnReviewer { task: task() });
+                    }
+                    if !(2..=MAX_ROUNDS_CEILING).contains(&revise.max_rounds) {
+                        return Err(PlanError::RoundsOutOfRange {
+                            task: task(),
+                            got: revise.max_rounds,
+                        });
+                    }
+                    if revise.tasks.is_empty() {
+                        return Err(PlanError::ReviseNamesNoTask { task: task() });
+                    }
+                    for (i, target) in revise.tasks.iter().enumerate() {
+                        if revise.tasks[..i].contains(target) {
+                            return Err(PlanError::ReviseTargetRepeated {
                                 task: task(),
-                                reference: reference.to_string(),
-                                producer: reference.task.0.clone(),
-                                declared: declared.clone(),
+                                target: target.0.clone(),
+                            });
+                        }
+                        if !index.contains_key(target) {
+                            return Err(PlanError::ReviseUnknownTarget {
+                                task: task(),
+                                target: target.0.clone(),
                             });
                         }
                     }
-                    if width == 0 || width > MAX_FANOUT_CEILING {
-                        return Err(PlanError::FanoutOutOfRange {
-                            task: task(),
-                            got: width,
-                        });
-                    }
-                    if let Some(session) = &t.session {
-                        return Err(PlanError::OverWithSession {
-                            task: task(),
-                            reference: reference.to_string(),
-                            session: session.clone(),
-                        });
-                    }
                 }
-            }
-            if !t.keyed.is_empty() && t.over.is_none() {
-                return Err(PlanError::KeyedWithoutOver { task: task() });
-            }
-            for reference in &t.keyed {
-                let keyed = || reference.to_string();
-                if !t.depends_on.contains(&reference.task) {
-                    return Err(PlanError::KeyedNotADependency {
-                        task: task(),
-                        reference: keyed(),
-                    });
-                }
-                let producer = &self.tasks[index[&reference.task]];
-                if producer.over.is_some() {
-                    return Err(PlanError::KeyedFromMapped {
-                        task: task(),
-                        reference: keyed(),
-                    });
-                }
-                match producer.emits.field(&reference.field.0) {
-                    Declared::Untyped => {}
-                    Declared::Typed(declared) if declared.is_object() => {}
-                    Declared::Typed(declared) => {
-                        return Err(PlanError::KeyedNotObject {
-                            task: task(),
-                            reference: keyed(),
-                            declared: Box::new(declared.clone()),
-                        });
-                    }
-                    Declared::Unchecked | Declared::Omitted => {
-                        return Err(PlanError::KeyedUndeclared {
-                            task: task(),
-                            reference: keyed(),
-                            producer: reference.task.0.clone(),
-                            field: reference.field.0.clone(),
-                        });
-                    }
-                }
-            }
-            if t.repair > MAX_REPAIR_CEILING {
-                return Err(PlanError::RepairOutOfRange {
-                    task: task(),
-                    got: t.repair,
-                });
-            }
-            if t.repair > 0 && !matches!(t.task, TaskKind::Agent { .. }) {
-                return Err(PlanError::RepairOnUnsupportedTask {
-                    task: task(),
-                    kind: t.task.label(),
-                });
-            }
-            if let Some(revise) = &t.revise {
-                if t.when.is_some() {
-                    return Err(PlanError::WhenOnReviewer { task: task() });
-                }
-                if !(2..=MAX_ROUNDS_CEILING).contains(&revise.max_rounds) {
-                    return Err(PlanError::RoundsOutOfRange {
-                        task: task(),
-                        got: revise.max_rounds,
-                    });
-                }
-                if revise.tasks.is_empty() {
-                    return Err(PlanError::ReviseNamesNoTask { task: task() });
-                }
-                for (i, target) in revise.tasks.iter().enumerate() {
-                    if revise.tasks[..i].contains(target) {
-                        return Err(PlanError::ReviseTargetRepeated {
-                            task: task(),
-                            target: target.0.clone(),
-                        });
-                    }
-                    if !index.contains_key(target) {
-                        return Err(PlanError::ReviseUnknownTarget {
-                            task: task(),
-                            target: target.0.clone(),
-                        });
-                    }
-                }
+                Ok(())
+            })();
+            if let Err(error) = checked {
+                errors.push((t.name.clone(), error));
             }
         }
         let conditional = may_settle_not_taken(&self.tasks);
         for t in &self.tasks {
             if let Some(d) = t.optional.iter().find(|d| !conditional.contains(d)) {
-                return Err(PlanError::OptionalNeverNotTaken {
-                    task: t.name.0.clone(),
-                    dependency: d.0.clone(),
-                });
+                errors.push((
+                    t.name.clone(),
+                    PlanError::OptionalNeverNotTaken {
+                        task: t.name.0.clone(),
+                        dependency: d.0.clone(),
+                    },
+                ));
             }
         }
+        PlanError::all(std::mem::take(&mut errors))?;
         let mut handled: BTreeMap<(&TaskName, &QuestionId), (BTreeSet<&Label>, bool)> =
             BTreeMap::new();
         for t in &self.tasks {
@@ -2672,10 +2700,14 @@ impl Plan {
                 continue;
             };
             if asked.options_from().is_some() && !any_option {
-                return Err(PlanError::UnroutedOptions {
-                    route: route.0.clone(),
-                    question: question.to_string(),
-                });
+                errors.push((
+                    (*route).clone(),
+                    PlanError::UnroutedOptions {
+                        route: route.0.clone(),
+                        question: question.to_string(),
+                    },
+                ));
+                continue;
             }
             let lookup = |name: &TaskName| index.get(name).map(|&i| &self.tasks[i]);
             let possible = typed_answers(route_task, question, lookup)
@@ -2694,13 +2726,17 @@ impl Plan {
                 .map(|l| l.to_string())
                 .collect();
             if !unrouted.is_empty() {
-                return Err(PlanError::UnroutedLabels {
-                    route: route.0.clone(),
-                    question: question.to_string(),
-                    labels: unrouted,
-                });
+                errors.push((
+                    (*route).clone(),
+                    PlanError::UnroutedLabels {
+                        route: route.0.clone(),
+                        question: question.to_string(),
+                        labels: unrouted,
+                    },
+                ));
             }
         }
+        PlanError::all(std::mem::take(&mut errors))?;
         // Kahn's algorithm; leftovers mean a cycle. The ready set is a min-heap on the
         // declaration index so the order is deterministic and declaration-stable: ties
         // dispatch in the order the author wrote them, which the UI, the cache, and the
@@ -2763,11 +2799,14 @@ impl Plan {
             for (offset, left) in tasks.iter().enumerate() {
                 for right in &tasks[offset + 1..] {
                     if !reaches(*left, *right) && !reaches(*right, *left) {
-                        return Err(PlanError::UnorderedSession {
-                            left: self.tasks[*left].name.0.clone(),
-                            right: self.tasks[*right].name.0.clone(),
-                            session: session.to_owned(),
-                        });
+                        errors.push((
+                            self.tasks[*right].name.clone(),
+                            PlanError::UnorderedSession {
+                                left: self.tasks[*left].name.0.clone(),
+                                right: self.tasks[*right].name.0.clone(),
+                                session: session.to_owned(),
+                            },
+                        ));
                     }
                 }
             }
@@ -2775,63 +2814,72 @@ impl Plan {
         let mut loop_of: BTreeMap<&TaskName, &TaskName> = BTreeMap::new();
         for t in &self.tasks {
             let Some(revise) = &t.revise else { continue };
-            let reviewer = index[&t.name];
-            let body: Vec<usize> = revise
-                .tasks
-                .iter()
-                .map(|target| index[target])
-                .chain([reviewer])
-                .collect();
-            for &target in &body[..body.len() - 1] {
-                if !reaches(target, reviewer) {
-                    return Err(PlanError::ReviseTargetUnreachable {
+            let checked = (|| -> Result<(), PlanError> {
+                let reviewer = index[&t.name];
+                let body: Vec<usize> = revise
+                    .tasks
+                    .iter()
+                    .map(|target| index[target])
+                    .chain([reviewer])
+                    .collect();
+                for &target in &body[..body.len() - 1] {
+                    if !reaches(target, reviewer) {
+                        return Err(PlanError::ReviseTargetUnreachable {
+                            task: t.name.0.clone(),
+                            target: self.tasks[target].name.0.clone(),
+                        });
+                    }
+                }
+                for &m in &body {
+                    let member = &self.tasks[m];
+                    let offending = || (t.name.0.clone(), member.name.0.clone());
+                    if !matches!(
+                        member.task,
+                        TaskKind::Agent { .. }
+                            | TaskKind::Command { .. }
+                            | TaskKind::Evaluate { .. }
+                    ) {
+                        let (task, member_name) = offending();
+                        return Err(PlanError::ReviseOnUnsupportedTask {
+                            task,
+                            member: member_name,
+                            kind: member.task.label(),
+                        });
+                    }
+                    if member.over.is_some() {
+                        let (task, member) = offending();
+                        return Err(PlanError::ReviseWithFanout { task, member });
+                    }
+                    if m != reviewer && member.revise.is_some() {
+                        let (task, target) = offending();
+                        return Err(PlanError::NestedRevise { task, target });
+                    }
+                    if let Some(other) = loop_of.insert(&member.name, &t.name) {
+                        return Err(PlanError::ReviseBodiesOverlap {
+                            left: other.0.clone(),
+                            right: t.name.0.clone(),
+                            member: member.name.0.clone(),
+                        });
+                    }
+                }
+                if let Some(skipped) = (0..n).find(|&x| {
+                    !body.contains(&x)
+                        && body.iter().any(|&from| reaches(from, x))
+                        && body.iter().any(|&to| reaches(x, to))
+                }) {
+                    return Err(PlanError::ReviseSkipsATask {
                         task: t.name.0.clone(),
-                        target: self.tasks[target].name.0.clone(),
+                        skipped: self.tasks[skipped].name.0.clone(),
+                        body: body.iter().map(|&m| self.tasks[m].name.0.clone()).collect(),
                     });
                 }
-            }
-            for &m in &body {
-                let member = &self.tasks[m];
-                let offending = || (t.name.0.clone(), member.name.0.clone());
-                if !matches!(
-                    member.task,
-                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
-                ) {
-                    let (task, member_name) = offending();
-                    return Err(PlanError::ReviseOnUnsupportedTask {
-                        task,
-                        member: member_name,
-                        kind: member.task.label(),
-                    });
-                }
-                if member.over.is_some() {
-                    let (task, member) = offending();
-                    return Err(PlanError::ReviseWithFanout { task, member });
-                }
-                if m != reviewer && member.revise.is_some() {
-                    let (task, target) = offending();
-                    return Err(PlanError::NestedRevise { task, target });
-                }
-                if let Some(other) = loop_of.insert(&member.name, &t.name) {
-                    return Err(PlanError::ReviseBodiesOverlap {
-                        left: other.0.clone(),
-                        right: t.name.0.clone(),
-                        member: member.name.0.clone(),
-                    });
-                }
-            }
-            if let Some(skipped) = (0..n).find(|&x| {
-                !body.contains(&x)
-                    && body.iter().any(|&from| reaches(from, x))
-                    && body.iter().any(|&to| reaches(x, to))
-            }) {
-                return Err(PlanError::ReviseSkipsATask {
-                    task: t.name.0.clone(),
-                    skipped: self.tasks[skipped].name.0.clone(),
-                    body: body.iter().map(|&m| self.tasks[m].name.0.clone()).collect(),
-                });
+                Ok(())
+            })();
+            if let Err(error) = checked {
+                errors.push((t.name.clone(), error));
             }
         }
+        PlanError::all(errors)?;
         Ok(ValidPlan { plan: self, topo })
     }
 }
@@ -6577,5 +6625,83 @@ emits = ["lines"]
             .unwrap();
         assert!(listed.admits("scheduler"));
         assert!(!listed.admits("frontend"));
+    }
+
+    #[test]
+    fn every_task_with_an_error_is_reported_with_its_name() {
+        let mut lonely = agent("lonely", &[]);
+        lonely.join = Join::Passed;
+        let error = plan(vec![
+            agent("a", &["a"]),
+            agent("fine", &[]),
+            agent("b", &["nope"]),
+            lonely,
+        ])
+        .validate()
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PlanError::Many {
+                errors: vec![
+                    ("a".into(), PlanError::SelfDependency { task: "a".into() }),
+                    (
+                        "b".into(),
+                        PlanError::UnknownDependency {
+                            task: "b".into(),
+                            dependency: "nope".into()
+                        }
+                    ),
+                    (
+                        "lonely".into(),
+                        PlanError::JoinPassedWithoutDependencies {
+                            task: "lonely".into()
+                        }
+                    ),
+                ]
+            }
+        );
+        let rendered = error.to_string();
+        assert_eq!(rendered.lines().count(), 3, "{rendered}");
+        assert!(
+            rendered.contains("depends on unknown task \"nope\""),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn one_error_is_returned_as_itself_and_only_the_first_per_task() {
+        let mut both = agent("both", &["both"]);
+        both.join = Join::Passed;
+        assert_eq!(
+            plan(vec![both, agent("fine", &[])]).validate().unwrap_err(),
+            PlanError::SelfDependency {
+                task: "both".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_looked_for_only_once_every_task_stands_alone() {
+        let error = plan(vec![
+            agent("a", &["b"]),
+            agent("b", &["a"]),
+            agent("c", &["nope"]),
+        ])
+        .validate()
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PlanError::UnknownDependency {
+                task: "c".into(),
+                dependency: "nope".into()
+            }
+        );
+        let error = plan(vec![agent("a", &["b"]), agent("b", &["a"])])
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(error, PlanError::DependencyCycle { .. }),
+            "{error}"
+        );
     }
 }
