@@ -146,6 +146,16 @@ pub(crate) struct ResourcesWithoutSandbox {
     backend: manifest::AgentBackend,
 }
 
+/// A claude turn with no declared tool surface. Nothing can approve a tool call mid-flight —
+/// on the host or inside the sandbox — so the surface must be declared rather than granted
+/// in full.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "a claude turn runs unattended, with no one to approve a tool call mid-flight; declare the \
+     turn's tool surface as [agent].allowed_tools (e.g. [\"Read\", \"Edit\", \"Write\"])"
+)]
+pub(crate) struct UndeclaredToolSurface;
+
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
 /// provisioning broker. Shared by the single-domain and composite run paths.
 pub(crate) fn apply_agent_cfg(
@@ -165,6 +175,7 @@ pub(crate) fn apply_agent_cfg(
     }
     args.codex = agent.codex.clone();
     args.disallowed_tools = agent.disallowed_tools.clone();
+    args.allowed_tools = agent.allowed_tools.clone();
     // Reasoning effort: CLI `--effort` wins, else the manifest's `[agent].reasoning_effort`, else
     // `medium`, the loop IS the search, so heavy per-turn thinking mostly duplicates keep/discard.
     // A known-hard domain can still opt up to `high`/`max` in its manifest.
@@ -179,6 +190,15 @@ pub(crate) fn apply_agent_cfg(
     // (Local) means "unset" → take the manifest's.
     if args.agent_backend == manifest::AgentBackend::Local {
         args.agent_backend = agent.backend;
+    }
+    // Checked after backend resolution: every backend that spawns the claude CLI scopes the
+    // turn to the pack's declared surface, and an undeclared one is refused rather than
+    // granted full tools. The command backend spawns no claude turn at all.
+    if args.agent_backend != manifest::AgentBackend::Command
+        && args.harness() == manifest::Harness::Claude
+        && args.allowed_tools.is_empty()
+    {
+        return Err(UndeclaredToolSurface.into());
     }
     // CLI `--sandbox-image` wins; else the manifest's. A task's named sandbox wins over both.
     if args.sandbox_image.is_none() {
@@ -751,7 +771,7 @@ mod tests {
         };
         let resources = apply(
             "openshell",
-            "sandbox_image = \"sandbox:dev\"\nresources = { gpus = 1, memory = \"32Gi\" }",
+            "allowed_tools = [\"Read\"]\nsandbox_image = \"sandbox:dev\"\nresources = { gpus = 1, memory = \"32Gi\" }",
         )
         .expect("the openshell backend takes resources");
         assert_eq!(resources.gpus, 1);
@@ -761,14 +781,62 @@ mod tests {
         );
 
         for backend in ["local", "command"] {
-            let err = apply(backend, "resources = { gpus = 1 }")
+            // The local leg declares a tool surface so the refusal under test is the
+            // resources one, not the undeclared-surface one.
+            let surface = if backend == "local" {
+                "allowed_tools = [\"Read\"]\n"
+            } else {
+                ""
+            };
+            let err = apply(backend, &format!("{surface}resources = {{ gpus = 1 }}"))
                 .expect_err("a backend with no sandbox refuses resources");
             assert!(
                 err.to_string().contains("[agent.resources]"),
                 "{backend}: {err:#}"
             );
         }
-        assert!(apply("local", "").is_ok(), "an absent table is no request");
+        assert!(
+            apply("local", "allowed_tools = [\"Read\"]\n").is_ok(),
+            "an absent table is no request"
+        );
+    }
+
+    /// A turn has no one to approve a tool call mid-flight — on the host or inside the sandbox
+    /// — so a pack must declare its surface; the refusal names the missing declaration, and
+    /// the command backend, which spawns no claude turn, is exempt.
+    #[test]
+    fn a_claude_turn_without_a_declared_tool_surface_is_refused() {
+        for backend in ["local", "openshell"] {
+            let text = manifest_toml("")
+                .replace("backend = \"command\"", &format!("backend = \"{backend}\""));
+            let m: manifest::Manifest = toml::from_str(&text).unwrap();
+            let mut a = args_from(&["crucible"]);
+            let err = apply_agent_cfg(
+                &mut a,
+                &m.agent,
+                &m.secrets,
+                Path::new("ws"),
+                &FrozenProjection::default(),
+            )
+            .expect_err("an undeclared surface refuses the launch");
+            assert!(
+                err.to_string().contains("[agent].allowed_tools"),
+                "{backend}: {err:#}"
+            );
+        }
+
+        let text = manifest_toml("allowed_tools = [\"Read\"]\n")
+            .replace("backend = \"command\"", "backend = \"local\"");
+        let m: manifest::Manifest = toml::from_str(&text).unwrap();
+        let mut a = args_from(&["crucible"]);
+        apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            &m.secrets,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        )
+        .expect("a declared surface admits the turn");
     }
 
     #[test]
@@ -963,6 +1031,7 @@ mod tests {
             [agent]
             backend = "openshell"
             goal = "g"
+            allowed_tools = ["Read"]
         "#,
         )
         .unwrap();
@@ -1009,6 +1078,7 @@ mod tests {
             [agent]
             backend = "openshell"
             goal = "g"
+            allowed_tools = ["Read"]
             [agent.env]
             ANTHROPIC_VERTEX_PROJECT_ID = "proj-from-manifest"
         "#,
@@ -1056,6 +1126,7 @@ mod tests {
             [agent]
             backend = "openshell"
             goal = "g"
+            allowed_tools = ["Read"]
             [agent.sandbox.go]
             image = "ghcr.io/acme/sandbox-go@sha256:bb"
             secrets = ["registry"]

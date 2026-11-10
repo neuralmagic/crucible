@@ -602,6 +602,7 @@ mod tests {
             [agent]
             backend = "openshell"
             goal = "g"
+            allowed_tools = ["Read", "mcp__buildit"]
             mcp = ["buildit"]
             [mcp.buildit]
             bin = "sh"

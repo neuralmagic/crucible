@@ -16,6 +16,7 @@ setup_cmd = "mkdir -p workspace && cp params.py sim.py workspace/ && git -C work
 [agent]
 backend       = "local"        # a real agent turn (counter uses the deterministic `command` backend)
 model         = "claude-opus-4-6"
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep"]
 method_prompt = "method.md"
 goal          = "Minimize the simulated p99 latency by editing the knobs in params.py. Target: under 13 ms."
 [agent.env]

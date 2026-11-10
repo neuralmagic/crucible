@@ -28,9 +28,10 @@ evaluating a line of it.
 
 ## Before you run it
 
-- **It spends real money.** `backend = "local"` runs the `claude` CLI on your machine with
-  `--permission-mode bypassPermissions`, so the turn can edit files and run commands inside
-  `workspace/`. That directory is a fresh shallow clone, which is the blast radius.
+- **It spends real money.** `backend = "local"` runs the `claude` CLI on your machine, scoped
+  to the pack's `[agent].allowed_tools` (file tools and Bash), so the turn can edit files and
+  run commands inside `workspace/`. That directory is a fresh shallow clone, which is the blast
+  radius.
 - **It needs network**, for the clone and the paper fetch.
 - **It clones a third-party repository** into `examples/paper/workspace/`, which is gitignored.
   Delete it and `state/` to start clean.

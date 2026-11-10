@@ -26,8 +26,6 @@ const END_OF_OPTIONS: &str = "--";
 pub(crate) fn claude_base_args(agent: &TurnAgent<'_>) -> Vec<String> {
     let mut a = vec![
         "claude".to_string(),
-        "--permission-mode".to_string(),
-        "bypassPermissions".to_string(),
         "--model".to_string(),
         agent.model.to_string(),
         "--output-format".to_string(),
@@ -48,6 +46,12 @@ pub(crate) fn claude_base_args(agent: &TurnAgent<'_>) -> Vec<String> {
     if !agent.disallowed_tools.is_empty() {
         a.push("--disallowed-tools".to_string());
         a.push(agent.disallowed_tools.join(","));
+    }
+    // Same one-value invariant as `--disallowed-tools`. Every turn — host or sandboxed — runs
+    // the CLI's default permission mode scoped to this list; no path carries a blanket grant.
+    if !agent.allowed_tools.is_empty() {
+        a.push("--allowed-tools".to_string());
+        a.push(agent.allowed_tools.join(","));
     }
     a.push("-p".to_string());
     a
@@ -239,10 +243,9 @@ mod tests {
             v.windows(2)
                 .any(|w| w == ["--output-format", "stream-json"])
         );
-        assert!(
-            v.windows(2)
-                .any(|w| w == ["--permission-mode", "bypassPermissions"])
-        );
+        // The local turn runs the CLI's default permission mode scoped to the declared tool
+        // surface; it never carries a blanket permission grant.
+        assert!(!v.iter().any(|s| s == "--permission-mode"));
         assert!(v.iter().any(|s| s == "--include-partial-messages"));
     }
 
@@ -284,6 +287,38 @@ mod tests {
                 "-p",
             ]
         );
+    }
+
+    /// The flag takes `<tools...>`, so the names must arrive as ONE comma-joined value, and the
+    /// local turn carries no permission mode: the declared surface is the grant.
+    #[test]
+    fn allowed_tools_join_into_one_value_and_carry_no_permission_mode() {
+        let mut a = args(&[]);
+        assert!(
+            !claude_base_args(&a.turn_agent())
+                .iter()
+                .any(|s| s == "--allowed-tools")
+        );
+
+        a.allowed_tools = vec!["Read".to_string(), "Edit".to_string(), "Write".to_string()];
+        let v = claude_base_args(&a.turn_agent());
+        assert_eq!(
+            &v[v.len() - 3..],
+            &["--allowed-tools", "Read,Edit,Write", "-p"]
+        );
+        assert!(!v.iter().any(|s| s == "--permission-mode"));
+    }
+
+    #[test]
+    fn sandbox_turns_are_scoped_to_the_declared_surface_like_local_ones() {
+        let mut a = args(&[]);
+        let bare = Claude.sandbox_argv(&a.turn_agent(), true);
+        assert!(!bare.iter().any(|s| s == "--permission-mode"));
+
+        a.allowed_tools = vec!["Read".to_string()];
+        let scoped = Claude.sandbox_argv(&a.turn_agent(), true);
+        assert!(!scoped.iter().any(|s| s == "--permission-mode"));
+        assert!(scoped.windows(2).any(|w| w == ["--allowed-tools", "Read"]));
     }
 
     #[test]
