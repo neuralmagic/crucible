@@ -93,9 +93,6 @@ pub struct BuildCfg {
 #[derive(Debug, Clone, PartialEq, Hash)]
 pub struct BuildMutableKwargs {
     pub mode: Vec<BuildMode>,
-    /// Digest-pinned images a build may name as `base` in place of `base_image`. Empty = only
-    /// `base_image`.
-    pub base: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -151,23 +148,6 @@ impl BuildCfg {
                     .collect::<Vec<_>>()
                     .join(", ")
             ))
-        }
-    }
-
-    /// The image a build derives from: `base_image`, or a `base` the scenario allows.
-    pub fn resolve_base(&self, base: Option<&str>) -> Result<String, String> {
-        match base.map(str::trim).filter(|b| !b.is_empty()) {
-            None => Ok(self.base_image.clone()),
-            Some(b) if b == self.base_image || self.mutable_kwargs.base.iter().any(|a| a == b) => {
-                Ok(b.to_string())
-            }
-            Some(b) => Err(format!(
-                "base {b:?} is not allowed for this scenario (allowed: {})",
-                std::iter::once(self.base_image.as_str())
-                    .chain(self.mutable_kwargs.base.iter().map(String::as_str))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )),
         }
     }
 
@@ -272,7 +252,6 @@ pub struct BuildOverlay {
 #[serde(default, deny_unknown_fields)]
 pub struct BuildMutableKwargsOverlay {
     pub mode: Option<Vec<BuildMode>>,
-    pub base: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -380,11 +359,6 @@ impl ToolsOverlay {
                         .mutable_kwargs
                         .mode
                         .or(base.build.mutable_kwargs.mode),
-                    base: self
-                        .build
-                        .mutable_kwargs
-                        .base
-                        .or(base.build.mutable_kwargs.base),
                 },
             },
             benchmark: BenchOverlay {
@@ -461,7 +435,6 @@ impl ToolsOverlay {
                     .mutable_kwargs
                     .mode
                     .unwrap_or_else(|| vec![BuildMode::Derive]),
-                base: pinned_bases(self.build.mutable_kwargs.base.unwrap_or_default())?,
             },
         };
         let benchmark = BenchCfg {
@@ -530,25 +503,6 @@ fn finalize_profile(o: ProfileOverlay) -> Result<ProfileCfg, String> {
     })
 }
 
-/// Each allowed `base` must name exactly one image: `<repository>@sha256:<64 hex>`.
-fn pinned_bases(bases: Vec<String>) -> Result<Vec<String>, String> {
-    for base in &bases {
-        let pinned = base.rsplit_once("@sha256:").is_some_and(|(repo, hex)| {
-            !repo.is_empty()
-                && hex.len() == 64
-                && hex
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
-        });
-        if !pinned {
-            return Err(format!(
-                "build.mutable_kwargs.base entry {base:?} must be digest-pinned (<repository>@sha256:<64 hex>)"
-            ));
-        }
-    }
-    Ok(bases)
-}
-
 fn require_cmd(v: Option<String>, field: &str) -> Result<String, String> {
     v.filter(|s| !s.trim().is_empty())
         .ok_or_else(|| format!("{field} is required (the frozen command is server-side)"))
@@ -579,24 +533,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    /// An allowed build base must be digest-pinned.
-    #[test]
-    fn allowed_bases_are_digest_pinned() {
-        let pinned = format!("quay.io/rh/vllm@sha256:{}", "a".repeat(64));
-        let cfg = minimal(serde_json::json!({
-            "build": {"mutable_kwargs": {"base": [pinned.clone()]}}
-        }))
-        .finalize(2)
-        .unwrap();
-        assert_eq!(cfg.build.mutable_kwargs.base, [pinned]);
-        for bad in ["quay.io/rh/vllm:latest", "quay.io/rh/vllm@sha256:abc"] {
-            let err = minimal(serde_json::json!({"build": {"mutable_kwargs": {"base": [bad]}}}))
-                .finalize(2)
-                .unwrap_err();
-            assert!(err.contains("digest-pinned"), "{bad}: {err}");
         }
     }
 

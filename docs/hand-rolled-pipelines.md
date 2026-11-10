@@ -150,9 +150,6 @@ Required fields are `gpus`, `build.base_image`, `build.src_dir`, `build.install_
 `benchmark.command`, and `lm_eval.command`. The `profile` section is optional. Omitting it
 makes `codegen_profile` return `unconfigured`.
 
-`build.mutable_kwargs.base` lists further digest-pinned images a build may derive from, passed
-as `codegen_build`'s `base`. Without it, every build derives from `build.base_image`.
-
 Build modes have distinct purposes:
 
 | Mode | Configuration | Intended use |
@@ -269,7 +266,7 @@ The MCP server name controls the agent-visible prefix. The example above exposes
 
 | Tool | Arguments | Successful result |
 | --- | --- | --- |
-| `codegen_build` | `mode` (`derive` by default); optional `base` from `build.mutable_kwargs.base` | `built` with `tree_hash`, source, digest, mode, cache state, and build-log handle. |
+| `codegen_build` | `mode` (`derive` by default) | `built` with `tree_hash`, source, digest, mode, cache state, and build-log handle. |
 | `codegen_benchmark` | built `digest`; optional `toggles`, `reps` | `measured` with numeric metrics, objective, log handles, and cache state. |
 | `codegen_lm_eval` | built `digest`; optional `limit` | `measured` with the configured objective score, log handles, and cache state. |
 | `codegen_profile` | built `digest` | `profiled` with a binary trace handle, log handles, and cache state. |

@@ -179,10 +179,6 @@ pub struct CodegenBuildArgs {
     /// or `full` (slow kernel-compile path). Only modes the scenario declares are accepted. Default `derive`.
     #[serde(default = "default_build_mode")]
     mode: String,
-    /// The digest-pinned image to derive from, in place of the scenario's base image. Only images
-    /// the scenario allows are accepted. Default: the scenario's base image.
-    #[serde(default)]
-    base: Option<String>,
 }
 
 fn default_build_mode() -> String {
@@ -610,11 +606,9 @@ impl McpServer {
             return refused(&detail);
         }
         let state = self.codegen.clone();
-        crate::telemetry::spawn_blocking(move || {
-            crate::codegen::build(&state, &args.mode, args.base.as_deref())
-        })
-        .await
-        .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"build task failed: {e}"}}"#))
+        crate::telemetry::spawn_blocking(move || crate::codegen::build(&state, &args.mode))
+            .await
+            .unwrap_or_else(|e| format!(r#"{{"status":"error","error":"build task failed: {e}"}}"#))
     }
 
     #[tool(

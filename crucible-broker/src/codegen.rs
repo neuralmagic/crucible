@@ -528,8 +528,8 @@ fn artifacts_pvc(
     })
 }
 
-pub(crate) fn build(state: &CodegenState, mode: &str, base: Option<&str>) -> String {
-    guard(|cfg| do_build(state, cfg, mode, base))
+pub(crate) fn build(state: &CodegenState, mode: &str) -> String {
+    guard(|cfg| do_build(state, cfg, mode))
 }
 
 /// The registry [`build`] pushes the candidate to, for the caller to validate against the run's
@@ -765,22 +765,12 @@ fn guard(f: impl FnOnce(&ToolsConfig) -> CodegenReply) -> String {
     json_reply(&f(&cfg))
 }
 
-fn do_build(
-    state: &CodegenState,
-    cfg: &ToolsConfig,
-    mode: &str,
-    base: Option<&str>,
-) -> CodegenReply {
+fn do_build(state: &CodegenState, cfg: &ToolsConfig, mode: &str) -> CodegenReply {
     let mode = match cfg.build.parse_mode(mode) {
         Ok(m) => m,
         Err(reason) => return CodegenReply::RejectedKwarg { reason },
     };
-    let mut cfg = cfg.clone();
-    cfg.build.base_image = match cfg.build.resolve_base(base) {
-        Ok(b) => b,
-        Err(reason) => return CodegenReply::RejectedKwarg { reason },
-    };
-    match build_inner(state, &cfg, mode) {
+    match build_inner(state, cfg, mode) {
         Ok(r) => r,
         Err(e) => CodegenReply::Error { error: e },
     }
@@ -2699,7 +2689,7 @@ mod tests {
             return;
         }
         let st = test_state();
-        assert!(build(&st, "derive", None).contains(r#""status":"disabled""#));
+        assert!(build(&st, "derive").contains(r#""status":"disabled""#));
         assert!(benchmark(&st, "repo@sha256:x", &[], None).contains(r#""status":"disabled""#));
         assert!(lm_eval(&st, "repo@sha256:x", None).contains(r#""status":"disabled""#));
         assert!(profile(&st, "repo@sha256:x").contains(r#""status":"disabled""#));
@@ -2829,36 +2819,6 @@ mod tests {
         st.mark_built("ghcr.io/ok/img@sha256:cafe");
         assert!(st.is_built("ghcr.io/ok/img@sha256:cafe"));
         assert!(!st.is_built("ghcr.io/evil/img@sha256:beef"));
-    }
-    /// `base` picks one of the scenario's allowed images, and a different base is a different
-    /// build.
-    #[test]
-    fn a_build_base_must_be_allowed_and_keys_the_memo() {
-        let mut cfg = bench_cfg();
-        let other = format!("quay.io/rh/vllm@sha256:{}", "a".repeat(64));
-        cfg.build.mutable_kwargs.base = vec![other.clone()];
-        assert_eq!(cfg.build.resolve_base(None).unwrap(), cfg.build.base_image);
-        assert_eq!(cfg.build.resolve_base(Some(&other)).unwrap(), other);
-        assert!(
-            cfg.build
-                .resolve_base(Some("quay.io/evil/x@sha256:00"))
-                .is_err()
-        );
-        assert!(matches!(
-            do_build(
-                &test_state(),
-                &cfg,
-                "derive",
-                Some("quay.io/evil/x@sha256:00")
-            ),
-            CodegenReply::RejectedKwarg { .. }
-        ));
-        let mut rebased = cfg.build.clone();
-        rebased.base_image = other;
-        assert_ne!(
-            build_key("tree", BuildMode::Derive, &cfg.build),
-            build_key("tree", BuildMode::Derive, &rebased)
-        );
     }
 
     #[test]
