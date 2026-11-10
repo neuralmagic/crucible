@@ -1155,7 +1155,7 @@ mod tests {
 
     use crate::plan::attempt::DeclaredStatus;
     use crate::plan::starlark::reference::functions;
-    use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals};
+    use crate::plan::starlark::{dsl_functions, known_kwargs, lane_globals, replacement};
     use crate::plan::workflow::WorkflowType;
     use crucible_contract::session::TaskStatus;
 
@@ -1199,6 +1199,23 @@ mod tests {
                 function.kwargs.iter().map(|kwarg| kwarg.name).collect();
             let known: BTreeSet<&str> = known_kwargs(function.name).iter().copied().collect();
             assert_eq!(documented, known, "{}()", function.name);
+        }
+    }
+
+    /// What the reference calls deprecated is what the compiler warns about, with the same
+    /// replacement.
+    #[test]
+    fn deprecated_kwargs_match_the_compilers_warnings() {
+        for function in functions() {
+            for kwarg in &function.kwargs {
+                assert_eq!(
+                    kwarg.replaced_by,
+                    replacement(function.name, kwarg.name).map(|(_, replacement)| replacement),
+                    "{}({})",
+                    function.name,
+                    kwarg.name
+                );
+            }
         }
     }
 

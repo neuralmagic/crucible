@@ -15,14 +15,14 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
     CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
-    CompletionResponse, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, Location,
-    MarkupContent, MarkupKind, OneOf, ReferenceParams, SaveOptions, ServerCapabilities, ServerInfo,
-    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
-    WorkspaceEdit,
+    CompletionResponse, Diagnostic, DiagnosticSeverity, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DidSaveTextDocumentParams,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, InitializeParams, InitializeResult,
+    Location, MarkupContent, MarkupKind, OneOf, ReferenceParams, SaveOptions, ServerCapabilities,
+    ServerInfo, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions,
+    TextDocumentSyncSaveOptions, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -256,9 +256,21 @@ impl Backend {
     }
 }
 
-/// A file's diagnostics: the compiler's, then the lints that do not repeat one of them.
+/// A file's diagnostics: the compiler's, then the lints that do not repeat one of them. A
+/// compiler warning a lint also found is left to the lint, which marks the exact text and has
+/// the quick fix.
 fn merge(local: &[Finding], compiled: &[Finding], text: &Text) -> Vec<Diagnostic> {
-    let compiled: Vec<Diagnostic> = compiled.iter().map(|f| f.diagnostic(text)).collect();
+    let compiled: Vec<Diagnostic> = compiled
+        .iter()
+        .filter(|finding| {
+            finding.severity == DiagnosticSeverity::ERROR
+                || !local.iter().any(|lint| {
+                    lint.code == finding.code
+                        && check::overlaps(&lint.range(text), &finding.range(text))
+                })
+        })
+        .map(|f| f.diagnostic(text))
+        .collect();
     let local = local.iter().filter(|finding| {
         finding.origin == Origin::Compiler
             || !lint::SHADOWS_COMPILE.contains(&finding.code.as_str())

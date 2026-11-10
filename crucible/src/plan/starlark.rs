@@ -36,7 +36,8 @@ use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
     MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SCHEMA_BYTES, MAX_SOURCE_BYTES,
-    MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, Site, SourceAnchor,
+    MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, Site, SourceAnchor, Warning,
+    WarningKind,
 };
 use crate::plan::starlark::values::{
     AnswerRef, Bound, DeciderSpec, DeclaredOutput, Each, SchemaFile, Selection, SessionDecl,
@@ -63,6 +64,15 @@ pub struct CompiledWorkflow {
     /// Whether the source declares a `params` block. Such a graph is a function of its launch
     /// arguments, so it is compiled per run instead of frozen into the manifest.
     pub declares_params: bool,
+    /// What the compile noticed along the way.
+    pub warnings: Vec<Warning>,
+}
+
+/// A compile's result and its warnings, which a failed compile has too.
+#[derive(Debug)]
+pub struct Checked {
+    pub outcome: Result<CompiledWorkflow>,
+    pub warnings: Vec<Warning>,
 }
 
 #[derive(Debug)]
@@ -100,10 +110,60 @@ struct CompileContext {
     thrown: Option<CompileError>,
     /// Every error a constructor raised and evaluation went on past.
     errors: Vec<CompileError>,
+    /// The constructor call being evaluated, which a warning is located at.
+    call: Option<FileSpan>,
+    /// Every warning a constructor raised, at its call.
+    warnings: Vec<(FileSpan, WarningKind)>,
 }
 
-/// How many errors one compile keeps.
+/// How many errors, and how many warnings, one compile keeps.
 const MAX_ERRORS: usize = 64;
+
+const TASK_CONSTRUCTORS: [&str; 5] = ["agent", "skill", "command", "evaluate", "route"];
+
+/// Arguments a value constructor replaced: the constructors that take one, its name, and what
+/// to write in its place.
+const REPLACED: &[(&[&str], &str, &str)] = &[
+    (&TASK_CONSTRUCTORS, "answers", "when = question.any_of(...)"),
+    (
+        &TASK_CONSTRUCTORS,
+        "otherwise",
+        "when = question.otherwise()",
+    ),
+    (
+        &TASK_CONSTRUCTORS,
+        "max_fanout",
+        "over = each(producer.field, max = N)",
+    ),
+    (
+        &["agent", "skill", "command", "evaluate"],
+        "max_rounds",
+        "revise = send_back(tasks, rounds = N)",
+    ),
+    (
+        &["evaluate"],
+        "direction",
+        "threshold = at_least(n) or at_most(n)",
+    ),
+    (
+        &["route"],
+        "min_confidence",
+        "decider = model(min_confidence = N)",
+    ),
+    (&["route"], "source", "decider = output(task)"),
+    (&["route"], "human", "decider = human()"),
+    (&["route"], "review", "decider = human(review = path)"),
+    (&["route"], "timeout", "decider = human(timeout = duration)"),
+    (&["route"], "files", "decider = model(files = [...])"),
+];
+
+/// The deprecated `argument` of `function`, by its static name, and what replaces it.
+pub(crate) fn replacement(function: &str, argument: &str) -> Option<(&'static str, &'static str)> {
+    REPLACED
+        .iter()
+        .find(|(functions, name, _)| *name == argument && functions.contains(&function))
+        .map(|(_, name, replacement)| (*name, *replacement))
+}
 
 /// A task standing in, by name, for one whose constructor failed.
 pub(crate) fn placeholder(name: &TaskName) -> Task {
@@ -403,6 +463,8 @@ impl CompileState {
                 string_session_refs: BTreeMap::new(),
                 thrown: None,
                 errors: Vec::new(),
+                call: None,
+                warnings: Vec::new(),
             }),
         }
     }
@@ -437,16 +499,50 @@ impl CompileState {
         }
     }
 
+    /// Keep a warning about the call being evaluated. Past [`MAX_ERRORS`] the rest are dropped.
+    fn warn(&self, kind: WarningKind) {
+        let mut context = self.inner.borrow_mut();
+        if context.warnings.len() < MAX_ERRORS
+            && let Some(call) = context.call.clone()
+        {
+            context.warnings.push((call, kind));
+        }
+    }
+
+    fn warning_count(&self) -> usize {
+        self.inner.borrow().warnings.len()
+    }
+
+    /// Point each warning recorded since `from` at the argument it is about.
+    fn narrow_warnings_from(&self, from: usize, idents: &idents::Idents) {
+        for (at, kind) in self.inner.borrow_mut().warnings.iter_mut().skip(from) {
+            *at = idents.argument_or_call(at.clone(), kind.argument());
+        }
+    }
+
+    fn take_warnings(&self) -> Vec<Warning> {
+        std::mem::take(&mut self.inner.borrow_mut().warnings)
+            .into_iter()
+            .map(|(at, kind)| Warning {
+                at: SourceAnchor::from(&at),
+                kind,
+            })
+            .collect()
+    }
+
     fn has_errors(&self) -> bool {
         !self.inner.borrow().errors.is_empty()
     }
 
-    fn error_count(&self) -> usize {
-        self.inner.borrow().errors.len()
+    /// How many errors and warnings are recorded, to narrow the ones a module adds.
+    fn recorded(&self) -> (usize, usize) {
+        (self.inner.borrow().errors.len(), self.warning_count())
     }
 
     /// Point each error recorded since `from` at the argument it is about.
-    fn narrow_from(&self, from: usize, idents: &idents::Idents) {
+    fn narrow_from(&self, from: (usize, usize), idents: &idents::Idents) {
+        self.narrow_warnings_from(from.1, idents);
+        let from = from.0;
         let mut context = self.inner.borrow_mut();
         let recorded: Vec<CompileError> = context.errors.drain(from..).collect();
         context.errors.extend(
@@ -480,10 +576,6 @@ impl CompileState {
             1 => errors.remove(0),
             _ => CompileError::Many { errors },
         })
-    }
-
-    fn into_context(self) -> CompileContext {
-        self.inner.into_inner()
     }
 }
 
@@ -873,6 +965,15 @@ fn constructor(
     state: &CompileState,
     at: &FileSpan,
 ) -> Result<Value> {
+    state.context_mut().call = Some(at.clone());
+    for argument in named.keys() {
+        if let Some((argument, replacement)) = replacement(function, argument) {
+            state.warn(WarningKind::DeprecatedArgument {
+                argument,
+                replacement,
+            });
+        }
+    }
     if function == "workflow" {
         let workflow_type = match take_string_default(&mut named, "type", "autoresearch")?.as_str()
         {
@@ -1181,7 +1282,7 @@ fn constructor(
                 history: None,
                 repair: 0,
             };
-            imply_dependencies(&mut task);
+            imply_dependencies(&mut task, state);
             check_fanout(&task)?;
             task
         }
@@ -1543,7 +1644,7 @@ fn dsl_task(
         history: take_optional_history(named)?,
         repair,
     };
-    imply_dependencies(&mut task);
+    imply_dependencies(&mut task, state);
     check_fanout(&task)?;
     let others = state.context_mut().others.contains(&task.name.0);
     if task.join == Join::Settled && task.depends_on.is_empty() && !others {
@@ -1571,24 +1672,33 @@ fn note_explicit_required(named: &BTreeMap<String, Value>, state: &CompileState,
 }
 
 /// Add every task this one names in `over`, `keyed`, `when`, or a route's decider and questions
-/// to its dependencies.
-fn imply_dependencies(task: &mut Task) {
-    let mut implied: Vec<TaskName> = Vec::new();
-    implied.extend(task.over.iter().map(|reference| reference.task.clone()));
-    implied.extend(task.keyed.iter().map(|reference| reference.task.clone()));
-    implied.extend(task.when.iter().map(|when| when.task.clone()));
+/// to its dependencies, and warn about one `depends_on` lists anyway.
+fn imply_dependencies(task: &mut Task, state: &CompileState) {
+    let mut implied: Vec<(TaskName, &'static str)> = Vec::new();
+    implied.extend(task.over.iter().map(|r| (r.task.clone(), "over")));
+    implied.extend(task.keyed.iter().map(|r| (r.task.clone(), "keyed")));
+    implied.extend(task.when.iter().map(|when| (when.task.clone(), "when")));
     if let TaskKind::Route { questions, decider } = &task.task {
         if let Decider::Output { task: source } = decider {
-            implied.push(source.clone());
+            implied.push((source.clone(), "decider"));
         }
         for asked in questions.values() {
             let source = asked.options_from().or_else(|| asked.pick_source());
-            implied.extend(source.map(|source| TaskName(source.task.clone())));
+            implied.extend(source.map(|source| (TaskName(source.task.clone()), "questions")));
         }
     }
-    for dependency in implied {
-        if dependency != task.name && !task.depends_on.contains(&dependency) {
+    let listed = task.depends_on.clone();
+    for (dependency, by) in implied {
+        if dependency == task.name {
+            continue;
+        }
+        if !task.depends_on.contains(&dependency) {
             task.depends_on.push(dependency);
+        } else if listed.contains(&dependency) && !task.optional.contains(&dependency) {
+            state.warn(WarningKind::ImpliedDependency {
+                dependency: dependency.0,
+                by,
+            });
         }
     }
 }
@@ -3000,7 +3110,7 @@ pub fn compile_launch_file(
 ) -> Result<CompiledWorkflow> {
     let source =
         std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
-    on_compile_stack(|| compile_source_here(&source, path, pack_dir, Binding::Launch(supplied)))
+    on_compile_stack(|| check_bound(&source, path, pack_dir, Binding::Launch(supplied)).outcome)
 }
 
 /// Compile `workflow.star` into the manifest's `[workflow]` block.
@@ -3230,9 +3340,42 @@ pub fn compile_source_with(
     pack_dir: &Path,
     supplied: &BTreeMap<String, String>,
 ) -> Result<CompiledWorkflow> {
+    check_source_with(source, filename, pack_dir, supplied).outcome
+}
+
+/// Compile, and say what was noticed whether or not the compile succeeded.
+pub fn check_source_with(
+    source: &str,
+    filename: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Checked {
     on_compile_stack(|| {
-        compile_source_here(source, filename, pack_dir, Binding::Supplied(supplied))
+        Ok(check_bound(
+            source,
+            filename,
+            pack_dir,
+            Binding::Supplied(supplied),
+        ))
     })
+    .unwrap_or_else(|error| Checked {
+        outcome: Err(error),
+        warnings: Vec::new(),
+    })
+}
+
+/// Compile under `binding` on the calling thread, which must be the compile thread.
+fn check_bound(source: &str, filename: &Path, pack_dir: &Path, binding: Binding<'_>) -> Checked {
+    let state = CompileState::new(pack_dir, filename);
+    let outcome = compile_source_here(&state, source, filename, pack_dir, binding);
+    let warnings = state.take_warnings();
+    Checked {
+        outcome: outcome.map(|compiled| CompiledWorkflow {
+            warnings: warnings.clone(),
+            ..compiled
+        }),
+        warnings,
+    }
 }
 
 /// Compile only the tasks that produce launch-form choices and their dependencies, with no
@@ -3325,11 +3468,11 @@ fn probe_choice_producers(
     producers: &BTreeMap<String, String>,
 ) -> Result<CompiledWorkflow> {
     let probe = |second| {
-        compile_source_here(source, filename, pack_dir, Binding::Probe(second)).map_err(|inner| {
-            CompileError::ChoiceProbeFailed {
+        check_bound(source, filename, pack_dir, Binding::Probe(second))
+            .outcome
+            .map_err(|inner| CompileError::ChoiceProbeFailed {
                 inner: Box::new(inner),
-            }
-        })
+            })
     };
     let first = probe(false)?;
     let second = probe(true)?;
@@ -3370,6 +3513,7 @@ fn on_compile_stack<T: Send>(work: impl FnOnce() -> Result<T> + Send) -> Result<
 }
 
 fn compile_source_here(
+    state: &CompileState,
     source: &str,
     filename: &Path,
     pack_dir: &Path,
@@ -3390,7 +3534,6 @@ fn compile_source_here(
     let lane = idents::declared_lane(&ast);
     let idents = idents::scan(&ast, lane);
     let globals = lane_globals(lane);
-    let state = CompileState::new(pack_dir, filename);
     let declared_params = params::Params::read(&ast)?;
     let declares_params = !declared_params.is_empty();
     {
@@ -3409,17 +3552,17 @@ fn compile_source_here(
             }
         }
     }
-    let loader = match loader::resolve(&ast, &state, &globals, source.len(), lane) {
+    let loader = match loader::resolve(&ast, state, &globals, source.len(), lane) {
         Ok(loader) => loader,
         Err(error) => return state.conclude(Err(error)),
     };
     let evaluated = catching_panics(|| {
         Module::with_temp_heap(|module| -> Result<WorkflowCfg> {
             let mut eval = Evaluator::new(&module);
-            eval.extra = Some(&state);
+            eval.extra = Some(state);
             eval.set_loader(&loader);
             budgets(&mut eval)?;
-            let recorded = state.error_count();
+            let recorded = state.recorded();
             let value = eval.eval_module(ast, &globals);
             state.narrow_from(recorded, &idents);
             match value {
@@ -3435,7 +3578,7 @@ fn compile_source_here(
         })
     })?;
     let mut workflow = state.conclude(evaluated)?;
-    let context = state.into_context();
+    let mut context = state.context_mut();
     let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
     let site = |name: &String, at: &FileSpan| Site {
         name: name.clone(),
@@ -3472,14 +3615,19 @@ fn compile_source_here(
     if !unbound.is_empty() {
         return Err(CompileError::UnboundSessions { sites: unbound });
     }
-    workflow.params = context.params;
+    workflow.params = std::mem::take(&mut context.params);
     let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
     Ok(CompiledWorkflow {
         workflow,
-        prompt_files: context.prompt_files.into_iter().collect(),
-        schema_files: context.schema_files.into_iter().collect(),
+        prompt_files: std::mem::take(&mut context.prompt_files)
+            .into_iter()
+            .collect(),
+        schema_files: std::mem::take(&mut context.schema_files)
+            .into_iter()
+            .collect(),
         canonical_json,
         declares_params,
+        warnings: Vec::new(),
     })
 }
 
@@ -9999,4 +10147,158 @@ workflow(type = "playbook", tasks = [scan, fan, gate, go, late, ask], result = a
         );
         assert_eq!(found.len(), MAX_ERRORS);
     }
+
+    fn checked(tag: &str, files: &[(&str, &str)], source: &str) -> Checked {
+        let pack = temp_pack(tag);
+        for (path, body) in files {
+            std::fs::write(pack.join(path), body).unwrap();
+        }
+        let checked =
+            check_source_with(source, &pack.join("workflow.star"), &pack, &BTreeMap::new());
+        let _ = std::fs::remove_dir_all(&pack);
+        checked
+    }
+
+    fn warned(checked: &Checked) -> Vec<(u32, u32, String)> {
+        checked
+            .warnings
+            .iter()
+            .map(|warning| {
+                (
+                    warning.at.span.begin_line,
+                    warning.at.span.begin_column,
+                    warning.kind.to_string(),
+                )
+            })
+            .collect()
+    }
+
+    const WARNED: &str = r#"scan = command(name = "scan", run = "true", emits = ["items", "q"])
+gate = route(name = "gate", source = scan, depends_on = [scan], questions = {"q": noul(ask = "q?", drop = ["no", "uncertain"])})
+deps = [scan, gate]
+common = {"max_fanout": 4}
+fan = command(name = "fan", run = "true", depends_on = deps, over = scan.items, when = gate.q, **common)
+workflow(type = "playbook", tasks = [scan, gate, fan])
+"#;
+
+    #[test]
+    fn a_compile_warns_about_deprecated_and_implied_arguments_where_they_were_written() {
+        let checked = checked("warnings", &[], WARNED);
+        let compiled = checked
+            .outcome
+            .as_ref()
+            .expect("warnings do not fail a compile");
+        assert_eq!(compiled.warnings, checked.warnings);
+        let column = |line: usize, needle: &str| {
+            WARNED.lines().nth(line - 1).unwrap().find(needle).unwrap() as u32 + 1
+        };
+        assert_eq!(
+            warned(&checked),
+            [
+                (
+                    2,
+                    column(2, "source"),
+                    "`source` is deprecated; write `decider = output(task)`".to_owned()
+                ),
+                (
+                    2,
+                    column(2, "depends_on"),
+                    "`decider` already makes `scan` a dependency".to_owned()
+                ),
+                (
+                    5,
+                    column(5, "command("),
+                    "`max_fanout` is deprecated; write `over = each(producer.field, max = N)`"
+                        .to_owned()
+                ),
+                (
+                    5,
+                    column(5, "depends_on"),
+                    "`over` already makes `scan` a dependency".to_owned()
+                ),
+                (
+                    5,
+                    column(5, "depends_on"),
+                    "`when` already makes `gate` a dependency".to_owned()
+                ),
+            ],
+            "an argument that arrives through ** is located at its call"
+        );
+        let codes: Vec<&str> = checked.warnings.iter().map(|w| w.kind.code()).collect();
+        assert_eq!(
+            codes,
+            [
+                "deprecated-argument",
+                "implied-dependency",
+                "deprecated-argument",
+                "implied-dependency",
+                "implied-dependency"
+            ]
+        );
+        assert!(
+            checked.warnings[0].to_string().ends_with(
+                "workflow.star:2:29: `source` is deprecated; write `decider = output(task)`"
+            ),
+            "{}",
+            checked.warnings[0]
+        );
+    }
+
+    #[test]
+    fn a_failed_compile_keeps_its_warnings() {
+        let failing = WARNED.replace(
+            "workflow(type = \"playbook\", tasks = [scan, gate, fan])",
+            "keep = command(name = \"keep\", run = \"true\", depends_on = [optional(gate)], when = gate.q)\n\
+             workflow(type = \"playbook\", tasks = [scan, gate, fan, keep])",
+        );
+        let checked = checked("warnings-failed", &[], &failing);
+        let error = checked
+            .outcome
+            .as_ref()
+            .expect_err("gate is never not taken");
+        assert!(
+            error.message().contains("can never settle not taken"),
+            "{error}"
+        );
+        let lines: Vec<u32> = warned(&checked).iter().map(|(line, _, _)| *line).collect();
+        assert_eq!(
+            lines,
+            [2, 2, 5, 5, 5],
+            "the warnings stand, and an optional() entry on line 6 is not implied"
+        );
+    }
+
+    #[test]
+    fn a_loaded_modules_warnings_are_located_in_the_module() {
+        let checked = checked(
+            "warnings-loaded",
+            &[(
+                "lib.star",
+                "def fan(scan):\n    return command(name = \"fan\", run = \"true\", over = scan.items, max_fanout = 2)\n",
+            )],
+            "load(\"lib.star\", \"fan\")\n\
+             scan = command(name = \"scan\", run = \"true\", emits = [\"items\"])\n\
+             made = fan(scan)\n\
+             workflow(type = \"playbook\", tasks = [scan, made])\n",
+        );
+        checked.outcome.as_ref().expect("compiles");
+        assert_eq!(checked.warnings.len(), 1);
+        let at = &checked.warnings[0].at;
+        assert!(at.file.ends_with("lib.star"), "{at:?}");
+        assert_eq!(at.span.begin_line, 2);
+    }
+
+    #[test]
+    fn a_pack_in_the_current_forms_has_no_warnings() {
+        let checked = checked("warnings-none", &[], VALUE_FORMS_WHOLE);
+        checked.outcome.as_ref().expect("compiles");
+        assert_eq!(checked.warnings, Vec::new());
+    }
+
+    const VALUE_FORMS_WHOLE: &str = r#"scan = command(name = "scan", run = "true", emits = {"items": "list", "ok": "boolean"})
+gate = route(name = "gate", decider = output(scan), questions = {"ok": noul(ask = "ok?", drop = ["no", "uncertain"])})
+fan = command(name = "fan", run = "true", over = each(scan.items, max = 4), when = gate.ok)
+read = command(name = "read", run = "true", depends_on = [scan], when = scan.ok)
+workflow(type = "playbook", tasks = [scan, gate, fan, read])
+"#;
 }
