@@ -79,7 +79,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         // The engine runtime a `--propose` openshell turn runs on; held for the duration of
         // `scope::run`.
         let engine = crate::agent::engine::EngineCtx::new()?;
-        return crate::scope::run(args, engine.handle());
+        cli.run.compile_secret_rules();
+        return crate::scope::run(args, engine.handle(), cli.run.secret_rules.clone());
     }
 
     #[cfg(feature = "autoresearch")]
