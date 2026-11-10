@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react';
 import { $api } from '../api/client';
+import { useRunGraph } from '../api/useRunGraph';
 import { cn, Empty, ExternalLinks, FoldSection, SectionBody, Tooltip } from '../ui';
 import {
   attemptsSummary,
@@ -340,13 +341,7 @@ function GridBody({ runId, grid, provider }: GridBodyProps) {
 /// The run's attempts on the grid surface. Shares the graph endpoint's cache key with
 /// `RunTaskGraph`, so drawing both costs one fetch.
 export function RunTaskGrid({ runId }: { runId: string }) {
-  const query = $api.useQuery(
-    'get',
-    '/api/runs/{run_id}/graph',
-    { params: { path: { run_id: runId } } },
-    // A transient 5xx (a pod mid-rollout) must not blank the section for the session.
-    { retry: 2 }
-  );
+  const query = useRunGraph(runId);
   // The provider's name lives on the run's launch pin, not in anything the engine logs. Shares
   // the detail endpoint's cache key with the rest of the page.
   const detail = $api.useQuery('get', '/api/runs/{run_id}', {

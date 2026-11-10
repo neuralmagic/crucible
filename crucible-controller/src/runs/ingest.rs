@@ -712,6 +712,39 @@ pub async fn ingest_session(
     Ok(parsed)
 }
 
+/// Fold a live run's session-so-far into the task-graph index: every admitted plan and every
+/// task result that has already landed, upserted so the run page's graph and grid draw while the
+/// engine runs and the completion fold replays onto the same rows. Deliberately narrower than
+/// [`ingest_session`] — no run summary row, no candidates, no ledger — because those describe the
+/// run as finished and would be premature mid-run.
+pub async fn fold_live_graph(db: &Db, run_id: &str, content: &str) -> Result<()> {
+    let parsed = parse_session(content);
+    let mut tx = db
+        .pool()
+        .begin()
+        .await
+        .context("opening the live task-graph fold")?;
+    for plan in &parsed.plans {
+        crate::runs::task_results::upsert_run_plan(
+            &mut *tx,
+            run_id,
+            plan.plan_version,
+            &plan.graph_json,
+        )
+        .await
+        .context("recording an admitted plan")?;
+    }
+    for result in &parsed.task_results {
+        crate::runs::task_results::upsert_task_result(&mut *tx, run_id, result)
+            .await
+            .context("recording a task result")?;
+    }
+    tx.commit()
+        .await
+        .context("committing the live task-graph fold")?;
+    Ok(())
+}
+
 /// What one adopt did, for the CLI's summary line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AdoptOutcome {
@@ -1311,6 +1344,69 @@ mod tests {
                 .await?
                 .len(),
             5
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_live_fold_lands_the_graph_rows_the_completion_fold_replays(
+        pool: PgPool,
+    ) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        let partial = plan_run_log()
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fold_live_graph(&db, "run-live", &partial).await?;
+        let plan = crate::runs::task_results::latest_run_plan(db.pool(), "run-live")
+            .await?
+            .expect("the admitted plan mid-run");
+        assert_eq!(
+            plan.plan_version, 1,
+            "the plan row lands before the run finishes"
+        );
+        assert_eq!(
+            crate::runs::task_results::list_task_results(db.pool(), "run-live")
+                .await?
+                .len(),
+            2,
+            "the results that already landed are live"
+        );
+
+        fold_live_graph(&db, "run-live", &partial).await?;
+        assert_eq!(
+            crate::runs::task_results::list_task_results(db.pool(), "run-live")
+                .await?
+                .len(),
+            2,
+            "folding a log twice lands the same rows"
+        );
+
+        ingest_session(
+            &db,
+            &IngestTarget {
+                run_id: "run-live",
+                scope_id: None,
+                issue: None,
+                pod: None,
+                session_uri: "s3://b/x",
+            },
+            &plan_run_log(),
+        )
+        .await?;
+        assert_eq!(
+            crate::runs::task_results::list_task_results(db.pool(), "run-live")
+                .await?
+                .len(),
+            5,
+            "the completion fold replays onto the live rows without duplicating them"
+        );
+        assert!(
+            crate::runs::store::get_run(db.pool(), "run-live")
+                .await?
+                .is_some(),
+            "the completion fold writes the summary row the live fold left absent"
         );
         Ok(())
     }

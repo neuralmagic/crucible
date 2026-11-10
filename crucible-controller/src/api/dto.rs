@@ -383,6 +383,9 @@ dto! {
 pub struct RunDetail {
     pub run: RunDto,
     pub candidates: Vec<CandidateDto>,
+    /// Whether the run ever admitted a work plan. The SPA hides every graph panel for a plan-less
+    /// run without probing the graph endpoint (whose 404 is the same answer, but a noisy one).
+    pub has_plan: bool,
     /// The MCP servers the run's agent was granted at dispatch; absent when it was granted none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_tools: Vec<crate::runs::agent_tools::AgentTool>,
@@ -947,6 +950,7 @@ pub async fn issue_detail(
             }
             let transport_losses =
                 crate::runs::task_results::count_transport_losses(db.pool(), &run.run_id).await?;
+            let has_plan = crate::runs::task_results::has_run_plan(db.pool(), &run.run_id).await?;
             let agent_tools = tools.remove(&run.run_id).unwrap_or_default();
             run_details.push(RunDetail {
                 run: RunDto::from_parts(
@@ -957,6 +961,7 @@ pub async fn issue_detail(
                     transport_losses,
                 ),
                 candidates: candidates.into_iter().map(CandidateDto::from).collect(),
+                has_plan,
                 agent_tools,
             });
         }

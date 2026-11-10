@@ -44,6 +44,7 @@ import { RerunSection } from './RerunSection';
 import { LaunchWallTime } from './LaunchWallTime';
 import { RunLinks } from './RunLinks';
 import { RunTaskGraph } from './RunTaskGraph';
+import { EngineLogSection } from './EngineLogSection';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
 
@@ -183,6 +184,10 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
       <ParamsSection launch={launch} />
 
       {runId !== null && <RunTaskGraph runId={runId} engineBounds />}
+
+      {runId !== null && (
+        <EngineLogSection runId={runId} live={detail.runs[0]?.status === 'running'} />
+      )}
 
       {runId !== null && detail.runs[0]?.status !== 'running' && (
         <RerunSection detail={detail} runId={runId} />

@@ -64,11 +64,18 @@ export function TaskEvidence({ runId, task }: { runId: string; task: string }) {
     { params: { path: { run_id: runId, task } } },
     { retry: false }
   );
+  // The run log is the panel's default selection when a task has no evidence of its own yet —
+  // mid-run, usually — so it must read in that state too, not only once picked by hand.
   const log = $api.useQuery(
     'get',
     '/api/runs/{run_id}/log',
     { params: { path: { run_id: runId } } },
-    { retry: false, enabled: picked === LOG_ID }
+    {
+      retry: false,
+      enabled:
+        picked === LOG_ID ||
+        (picked === null && evidence.data !== undefined && evidenceItems(evidence.data).length === 0),
+    }
   );
 
   if (evidence.data === undefined) return null;
