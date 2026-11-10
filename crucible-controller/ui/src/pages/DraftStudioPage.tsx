@@ -27,6 +27,7 @@ import {
   Notice,
   NumberInputField,
   SelectField,
+  TextAreaField,
   TextField,
 } from './formControls';
 import { useMediaQuery } from '../useMediaQuery';
@@ -45,6 +46,7 @@ import { ProviderModelField } from './ProviderModelField';
 import { NO_AGENT_PICK, type AgentPick } from './agentPick';
 import { WorkflowGraph } from './WorkflowGraph';
 import { projectionLabel, reasonLabel } from './blueprints';
+import { formatCost } from './runReport';
 import {
   clampCeiling,
   initialValues,
@@ -72,8 +74,28 @@ import {
 } from './draftStudio';
 
 type CompileDto = components['schemas']['DraftCompileDto'];
+type GeneratedDto = components['schemas']['GeneratedDraftDto'];
 type LeftBinding = components['schemas']['LeftBindingDto'];
 type SecretDto = components['schemas']['SecretDto'];
+
+/// What the last generate did, as the studio reports it back: one line under the panel.
+interface GenerateReport {
+  version: number;
+  rounds: number;
+  costUsd: number;
+  ok: boolean;
+  overBudget: boolean;
+}
+
+function reportOf(dto: GeneratedDto): GenerateReport {
+  return {
+    version: dto.version,
+    rounds: dto.rounds,
+    costUsd: dto.cost_usd,
+    ok: dto.ok,
+    overBudget: dto.over_budget,
+  };
+}
 
 /// The stored tree, read outside the query cache so the buffers are not reloaded.
 async function fetchDraftFiles(id: string): Promise<Record<string, string>> {
@@ -133,6 +155,7 @@ function DraftStudio({ id }: { id: string }) {
   );
 
   const save = $api.useMutation('post', '/api/playbook-drafts/{id}/versions');
+  const generate = $api.useMutation('post', '/api/playbook-drafts/{id}/generate');
   const drop = $api.useMutation('delete', '/api/playbook-drafts/{id}');
   const rename = $api.useMutation('post', '/api/playbook-drafts/{id}/rename');
   const clone = $api.useMutation('post', '/api/playbook-drafts/{id}/clone');
@@ -162,6 +185,20 @@ function DraftStudio({ id }: { id: string }) {
   const [agent, setAgent] = useState<AgentPick>(NO_AGENT_PICK);
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<ReadonlyMap<string, string>>(NO_ERRORS);
+
+  const [intent, setIntent] = useState('');
+  const [generateError, setGenerateError] = useState<string | null>(null);
+  const [generateReport, setGenerateReport] = useState<GenerateReport | null>(null);
+  const [genElapsed, setGenElapsed] = useState(0);
+  useEffect(() => {
+    if (!generate.isPending) return;
+    setGenElapsed(0);
+    const started = Date.now();
+    const timer = window.setInterval(() => {
+      setGenElapsed(Math.floor((Date.now() - started) / 1000));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [generate.isPending]);
 
   const [gradRepo, setGradRepo] = useState('');
   const [gradPath, setGradPath] = useState('');
@@ -265,6 +302,37 @@ function DraftStudio({ id }: { id: string }) {
       setStale(overtaken);
       // The refusal names the version that won but not its text, and the diff is the point of the
       // prompt: read the stored tree without touching the buffers this writer still holds.
+      try {
+        setOvertaking(await fetchDraftFiles(id));
+      } catch {
+        setOvertaking({});
+      }
+    }
+  };
+
+  /// The turn spends before anything is stored, so a refusal still books its cost; what the
+  /// buffers hold is seeded from the newest save, not from unsaved edits.
+  const handleGenerate = async () => {
+    if (retired) return;
+    setGenerateError(null);
+    setStale(null);
+    setGenerateReport(null);
+    try {
+      const dto = await generate.mutateAsync({
+        params: { path: { id } },
+        body: { intent: intent.trim() },
+      });
+      setPreview(dto);
+      setGenerateReport(reportOf(dto));
+      void files.refetch();
+      void draft.refetch();
+    } catch (err: unknown) {
+      const overtaken = staleBaseOf(err);
+      if (overtaken === null) {
+        setGenerateError(formatError(err));
+        return;
+      }
+      setStale(overtaken);
       try {
         setOvertaking(await fetchDraftFiles(id));
       } catch {
@@ -410,6 +478,58 @@ function DraftStudio({ id }: { id: string }) {
 
   const sourceColumn = (
     <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto">
+      {author ? (
+        <Section>
+          <SectionHeader title="Generate" />
+          <SectionBody>
+            <div className="grid gap-2" data-testid="draft-generate">
+              <TextAreaField
+                id="studio-generate-intent"
+                label="Intent"
+                placeholder="Describe the experiment you want — the model, the knob to sweep, how to rank the arms."
+                hint="The engine's drafting turn writes the next version from the newest save and this intent. It takes a few minutes."
+                value={intent}
+                onChange={setIntent}
+              />
+            </div>
+          </SectionBody>
+          {generateError === null ? null : (
+            <SectionBody>
+              <FormError>{generateError}</FormError>
+            </SectionBody>
+          )}
+          <FormActions>
+            <Button
+              variant="filled"
+              className="uppercase"
+              disabled={
+                !writable || isDirty(state) || generate.isPending || intent.trim().length === 0
+              }
+              onClick={() => {
+                void handleGenerate();
+              }}
+            >
+              {generate.isPending ? `Drafting… ${genElapsed}s` : 'Generate'}
+            </Button>
+            {isDirty(state) && (
+              <Mono size="data" tone="ink-3">
+                seeds from the newest save
+              </Mono>
+            )}
+            {generateReport === null ? null : (
+              <Mono size="data" tone="ink-3">
+                {`v${generateReport.version} · ${generateReport.rounds} rounds · ${formatCost(generateReport.costUsd)} · check ${generateReport.ok ? 'passed' : 'failed'}`}
+              </Mono>
+            )}
+          </FormActions>
+          {generateReport !== null && generateReport.overBudget ? (
+            <SectionBody>
+              <Note>The drafting turn ran past its budget; what it wrote is stored as it stood.</Note>
+            </SectionBody>
+          ) : null}
+        </Section>
+      ) : null}
+
       <div className="flex min-h-[20rem] flex-1 flex-col gap-3 min-[900px]:flex-row">
         <FileTreePanel
           paths={paths}
