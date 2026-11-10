@@ -242,7 +242,19 @@ test.describe('draft authoring studio', () => {
     await expect(treeItem(page, 'workflow.star')).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByTestId('draft-editor').locator('.native-edit-context')).toBeFocused();
     // An unanchored one has no line to go to, so it offers no navigation.
-    await expect(diagnostics.getByRole('button').nth(1)).toBeDisabled();
+    await expect(diagnostics.getByRole('button')).toHaveCount(1);
+
+    // The text is selectable with the mouse, so a diagnostic can be copied out.
+    const message = diagnostics.getByText('unknown identifier `agnet`');
+    const box = await message.boundingBox();
+    if (box === null) throw new Error('the diagnostic has no box');
+    const lastLine = box.y + box.height - 14;
+    await page.mouse.move(box.x + box.width - 4, lastLine);
+    await page.mouse.down();
+    await page.mouse.move(box.x + 14, lastLine, { steps: 5 });
+    await page.mouse.up();
+    const selected = await page.evaluate(() => window.getSelection()?.toString());
+    expect(selected).toContain('unknown identifier');
 
     await savesWith(page, RECOMPILED);
     await retype(page, 'params = {}\nsettle = command(name = "settle", run = "./settle.sh")\n');

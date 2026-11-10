@@ -593,21 +593,23 @@ function DraftStudio({ id }: { id: string }) {
               {diagnostics.map((diagnostic, index) => {
                 const anchor = anchorOf(diagnostic, paths);
                 return (
-                  <li key={`${diagnostic.message}-${index}`}>
-                    <button
-                      type="button"
-                      disabled={anchor === null}
-                      onClick={() => {
-                        if (anchor === null) return;
-                        dispatch({ kind: 'select', file: anchor.file });
-                        setFocus({ line: anchor.line, col: anchor.col, nonce: Date.now() });
-                      }}
-                      className="w-full cursor-pointer border border-red bg-surface px-3 py-2 text-left font-mono text-data whitespace-pre-wrap text-red hover:bg-hi"
-                    >
-                      {anchor === null
-                        ? diagnostic.message
-                        : `${anchor.file}:${anchor.line}:${anchor.col}\n${diagnostic.message}`}
-                    </button>
+                  <li
+                    key={`${diagnostic.message}-${index}`}
+                    className="border border-red bg-surface px-3 py-2 font-mono text-data whitespace-pre-wrap text-red"
+                  >
+                    {anchor === null ? null : (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          dispatch({ kind: 'select', file: anchor.file });
+                          setFocus({ line: anchor.line, col: anchor.col, nonce: Date.now() });
+                        }}
+                        className="block cursor-pointer border-0 bg-transparent p-0 text-left font-mono text-data text-red underline hover:text-ink"
+                      >
+                        {`${anchor.file}:${anchor.line}:${anchor.col}`}
+                      </button>
+                    )}
+                    {diagnostic.message}
                   </li>
                 );
               })}
