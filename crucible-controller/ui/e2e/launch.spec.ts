@@ -179,7 +179,8 @@ test.describe('playbook launch form', () => {
 
     const release = page.locator('#launch-param-release');
     await expect(release.locator('option')).toHaveText(['Select…', '3.6.0 GA', '3.7 Fast-1']);
-    await expect(page.getByText(/Options from release_options, \d+s ago/)).toBeVisible();
+    await page.getByRole('button', { name: 'About the options' }).hover();
+    await expect(page.getByText(/release_options · \d+s ago/)).toBeVisible();
     await release.selectOption('3.7 Fast-1');
 
     const component = page.locator('#launch-param-component');

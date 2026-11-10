@@ -7,6 +7,7 @@ import {
   paramBlocks,
   mapServerRejection,
   offeredChoices,
+  optionSources,
   parseParamsSchema,
   placeholderFor,
   refreshBody,
@@ -235,6 +236,26 @@ describe('parseParamsSchema', () => {
       },
     });
     expect(keyedByBool.kind).toBe('unrenderable');
+  });
+
+  it('lists each options task once with its snapshot time', () => {
+    const specs = specsOf({
+      type: 'object',
+      properties: {
+        release: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'releases' },
+          'x-choices-snapshot': { value: ['3.7'], captured_at: '2026-11-09T12:00:00Z' },
+        },
+        component: { type: 'string', 'x-choices-from': { task: 'options', field: 'components', keyed_by: 'release' } },
+        branch: { type: 'string', 'x-placeholder-from': { task: 'branches', field: 'branch', keyed_by: 'release' } },
+        pr: { type: 'string' },
+      },
+    });
+    expect(optionSources(specs)).toEqual([
+      { task: 'options', passed: true, capturedAt: '2026-11-09T12:00:00Z' },
+      { task: 'branches', passed: false, capturedAt: null },
+    ]);
   });
 
   it('refreshes with the refresh setting alone', () => {

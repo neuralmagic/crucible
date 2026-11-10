@@ -1285,7 +1285,7 @@ impl Manifest {
         let compiled = if launch.refresh() {
             crate::plan::starlark::compile_refresh_file(&source, manifest_dir)
         } else {
-            crate::plan::starlark::compile_file_with(&source, manifest_dir, &declared_params)
+            crate::plan::starlark::compile_launch_file(&source, manifest_dir, &declared_params)
         }
         .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
         if compiled.workflow.workflow_type != declared {

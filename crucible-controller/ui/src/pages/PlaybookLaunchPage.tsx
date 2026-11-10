@@ -8,6 +8,7 @@ import {
   Breadcrumb,
   Button,
   Empty,
+  InfoTip,
   LoadingBlock,
   Mono,
   PageHeader,
@@ -27,6 +28,7 @@ import {
   TextField,
 } from './formControls';
 import { PlaybookParamFields } from './PlaybookParamFields';
+import { relativeTime } from './journeyView';
 import { PackDispatchNotice } from './PackDispatchNotice';
 import { DispatchTargetField } from './DispatchTargetField';
 import {
@@ -35,6 +37,7 @@ import {
   initialValues,
   launchBody,
   mapServerRejection,
+  optionSources,
   parseParamsSchema,
   previewMatches,
   refreshBody,
@@ -375,13 +378,22 @@ export function PlaybookLaunchPage() {
             pack === undefined ? undefined : (
               <span className="flex items-center gap-3">
                 {refreshable(specs) ? (
-                  <Button
-                    className="border border-rule-hard uppercase"
-                    onClick={() => void handleRefresh()}
-                    disabled={launch.isPending}
-                  >
-                    Refresh options
-                  </Button>
+                  <>
+                    <InfoTip label="About the options">
+                      {optionSources(specs).map((source) => (
+                        <div key={source.task}>
+                          {source.task} · {source.passed ? (relativeTime(source.capturedAt) ?? 'run') : 'not run'}
+                        </div>
+                      ))}
+                    </InfoTip>
+                    <Button
+                      className="border border-rule-hard uppercase"
+                      onClick={() => void handleRefresh()}
+                      disabled={launch.isPending}
+                    >
+                      Refresh options
+                    </Button>
+                  </>
                 ) : null}
                 <Mono size="data" tone="ink-3">
                   {pack.schema_digest}

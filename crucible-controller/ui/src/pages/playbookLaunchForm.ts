@@ -373,6 +373,27 @@ export function placeholderFor(spec: ParamFieldSpec, values: Readonly<Record<str
   return spec.placeholderSnapshot.value[(values[key] ?? '').trim()] ?? null;
 }
 
+/// Each task the form's options come from, with the capture time of its snapshot, or `passed`
+/// false before it has one.
+export function optionSources(specs: readonly ParamFieldSpec[]): OptionSource[] {
+  const byTask = new Map<string, OptionSource>();
+  const note = (from: ChoicesSource | null, snap: Snapshot<unknown> | null) => {
+    if (from === null || byTask.get(from.task)?.passed === true) return;
+    byTask.set(from.task, { task: from.task, passed: snap !== null, capturedAt: snap?.capturedAt ?? null });
+  };
+  for (const spec of specs) {
+    note(spec.choicesFrom, spec.choicesSnapshot);
+    note(spec.placeholderFrom, spec.placeholderSnapshot);
+  }
+  return [...byTask.values()];
+}
+
+export interface OptionSource {
+  task: string;
+  passed: boolean;
+  capturedAt: string | null;
+}
+
 /// Whether the pack has options computed by a task, which a refresh launch recomputes.
 export function refreshable(specs: readonly ParamFieldSpec[]): boolean {
   return specs.some((spec) => spec.choicesFrom !== null || spec.placeholderFrom !== null);

@@ -372,7 +372,8 @@ The launch form offers the list as a select and says how old it is. With `allow_
 select ends in "Other…", which opens a text input.
 
 The task and everything it depends on must not depend on parameters, so they can run alone.
-The compiler checks this and names the task that does. It checks by compiling the source with
+The compiler checks this when the pack is compiled for authoring, registered, or refreshed, not
+at each launch, and names the task that does. It checks by compiling the source with
 placeholder values that satisfy each declaration (a choice, a number in range, a default where
 there is a pattern), so the source must also compile under those. Launch with `choices.refresh=true` and
 nothing else to run just those tasks and refresh the list. The launch form's "Refresh options"

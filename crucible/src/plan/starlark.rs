@@ -2316,6 +2316,19 @@ pub fn compile_file_with(
     compile_source_with(&source, path, pack_dir, supplied)
 }
 
+/// [`compile_file_with`] for a launch. It skips the producer-closure probe, which registration
+/// and a choices refresh run.
+#[tracing::instrument(skip_all, fields(source = %path.display(), params = supplied.len()), err)]
+pub fn compile_launch_file(
+    path: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
+    let source =
+        std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
+    on_compile_stack(|| compile_source_here(&source, path, pack_dir, Binding::Launch(supplied)))
+}
+
 /// Compile `workflow.star` into the manifest's `[workflow]` block.
 ///
 /// A source that declares no parameters is a constant, so its graph is frozen into the manifest
@@ -2586,6 +2599,8 @@ pub fn compile_refresh_file(path: &Path, pack_dir: &Path) -> Result<CompiledWork
 enum Binding<'a> {
     /// The values a launcher supplied, parsed and constrained by the declaration.
     Supplied(&'a BTreeMap<String, String>),
+    /// As [`Binding::Supplied`], without probing the producer closure.
+    Launch(&'a BTreeMap<String, String>),
     /// A value each declaration admits, for comparing two compiles that differ only in their
     /// parameters.
     Probe(bool),
@@ -2707,7 +2722,7 @@ fn compile_source_here(
     {
         let mut context = state.context_mut();
         match binding {
-            Binding::Supplied(supplied) => {
+            Binding::Supplied(supplied) | Binding::Launch(supplied) => {
                 context.params = declared_params.bind(supplied)?;
                 context.supplied = supplied.keys().cloned().collect();
             }
@@ -6373,8 +6388,9 @@ workflow(type = "playbook", tasks = [sheet, options, work])
         let _ = std::fs::remove_dir_all(&pack);
     }
 
-    /// A producer closure built from a parameter, by text or by branching on it, is refused at
-    /// every compile, so the author learns at save time rather than at the first refresh.
+    /// A producer closure built from a parameter, by text or by branching on it, is refused by an
+    /// authoring compile, so the author learns before the first refresh. A launch compile skips
+    /// the check.
     #[test]
     fn a_producer_closure_that_reads_a_parameter_is_refused() {
         let pack = temp_pack("params-choices-reads");
@@ -6404,6 +6420,9 @@ workflow(type = "playbook", tasks = [options])"#,
                 "{culprit}: {}",
                 crate::errors::report(&error)
             );
+            std::fs::write(&path, &source).unwrap();
+            compile_launch_file(&path, &pack, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
         }
         let _ = std::fs::remove_dir_all(&pack);
     }

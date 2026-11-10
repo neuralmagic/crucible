@@ -1,6 +1,5 @@
 import { useState } from 'react';
 import { Mono } from '../ui';
-import { relativeTime } from './journeyView';
 import { CheckField, FormGrid, SelectField, TextAreaField, TextField } from './formControls';
 import {
   isEnabled,
@@ -14,19 +13,6 @@ import {
 /// The select entry that switches an open choice to a typed value. Not a value any choice can
 /// take: the form never submits it.
 const OTHER = '\u0000other';
-
-/// Where a param's options came from and how old they are, for its hint.
-function sourceHint(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): string | null {
-  const from = spec.choicesFrom;
-  if (from === null) return null;
-  if (spec.choicesSnapshot === null) return `Options appear once ${from.task} has passed; refresh to compute them`;
-  const key = from.keyedBy;
-  const keyValue = key === null ? '' : (values[key] ?? '').trim();
-  if (key !== null && keyValue === '') return `Pick ${key} to see options`;
-  const age = relativeTime(spec.choicesSnapshot.capturedAt);
-  const scope = key === null ? '' : ` for ${key} ${keyValue}`;
-  return `Options${scope} from ${from.task}${age === null ? '' : `, ${age}`}`;
-}
 
 export interface PlaybookParamFieldsProps {
   idPrefix: string;
@@ -75,7 +61,7 @@ export function PlaybookParamFields({
       },
       error: errors.get(spec.name) ?? null,
       hint:
-        [spec.description, sourceHint(spec, values)].filter((part) => part !== null).join(' · ') ||
+        spec.description ??
         (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined)),
     };
     const offered = offeredChoices(spec, values);

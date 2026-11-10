@@ -668,8 +668,15 @@ fn extract_params_schema(
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))
         .map_err(RegisterError::Internal)?;
-    let schema = declared_params(&text, &source)
-        .map_err(|e| RegisterError::Compile(crucible::errors::report(&e)))?;
+    let compile_error = |e| RegisterError::Compile(crucible::errors::report(&e));
+    let schema = declared_params(&text, &source).map_err(compile_error)?;
+    if refreshable(&schema) {
+        crucible::plan::starlark::compile_refresh_file(
+            &source,
+            crucible::plan::starlark::parent_or_cwd(&source),
+        )
+        .map_err(compile_error)?;
+    }
     let digest = schema_digest(&schema).map_err(RegisterError::Internal)?;
     Ok((schema, digest))
 }
@@ -686,7 +693,7 @@ pub(crate) fn compiled_plan(
     let compiled = if is_refresh(params) {
         crucible::plan::starlark::compile_refresh_file(&source, pack_dir)
     } else {
-        crucible::plan::starlark::compile_file_with(&source, pack_dir, params)
+        crucible::plan::starlark::compile_launch_file(&source, pack_dir, params)
     }
     .map_err(|e| crucible::errors::report(&e))?;
     compiled
@@ -1462,14 +1469,7 @@ fn validate_refresh(
             "a choices refresh is launched with the value true",
         );
     }
-    let declares = schema
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|p| {
-            p.values()
-                .any(|v| v.get("x-choices-from").is_some() || v.get("x-placeholder-from").is_some())
-        });
-    if !declares {
+    if !refreshable(schema) {
         return refuse(
             CHOICES_REFRESH,
             "this playbook declares no choices_from or placeholder_from parameter, so there is \
@@ -1477,6 +1477,17 @@ fn validate_refresh(
         );
     }
     Ok(serde_json::json!({ CHOICES_REFRESH: "true" }))
+}
+
+/// Whether a params schema names a task output for a form's choices or placeholder.
+fn refreshable(schema: &serde_json::Value) -> bool {
+    schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|p| {
+            p.values()
+                .any(|v| v.get("x-choices-from").is_some() || v.get("x-placeholder-from").is_some())
+        })
 }
 
 /// A param name as one JSON Pointer reference token.
@@ -2321,6 +2332,35 @@ mod tests {
             list(&pool).await.expect("list").is_empty(),
             "nothing half-registers"
         );
+    }
+
+    /// Registration compiles the choices refresh, so a producer that reads a parameter is refused
+    /// there and a launch does not check it again.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_producer_that_reads_a_parameter_fails_registration(pool: PgPool) {
+        let source = r#"params = {
+    "topic": {"type": "string", "default": "x"},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}
+seed = agent(name = "seed", prompt = "List releases about " + param("topic"))
+options = command(name = "options", run = "./o.sh", depends_on = [seed], emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [seed, options])
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = git_pack_repo(dir.path(), PLAYBOOK_REPO_MANIFEST, source);
+
+        let err = register(&pool, &PackGit::default(), request("survey", &repo), None)
+            .await
+            .expect_err("the refresh does not compile");
+        assert!(
+            matches!(err, RegisterError::Compile(ref e) if e.contains("\"seed\"") && e.contains("choices refresh")),
+            "{err:#}"
+        );
+
+        let launch = tempfile::tempdir().expect("tempdir");
+        let root = crate::testing::fixtures::write_playbook_pack(launch.path(), source);
+        compiled_plan(&root, &std::collections::BTreeMap::new(), None)
+            .expect("a launch compile leaves the probe to registration");
     }
 
     /// Drafts and the registry share the launch-key namespace in both directions: a live draft
