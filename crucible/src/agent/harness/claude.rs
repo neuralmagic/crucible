@@ -4,7 +4,7 @@
 use crate::agent::harness::{Backend, McpServer, TurnArtifacts, json_servers};
 use crate::agent::inference::InferenceEnv;
 use crate::args::TurnAgent;
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use crate::stream_json::StreamJsonParser;
 use crate::turn_trace::GenAiRecord;
 use crucible::harness::HarnessSpec;

@@ -786,6 +786,7 @@ mod tests {
                 &pool,
                 launch_key,
                 &NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/packs",
                     title: "reads a paper",
@@ -928,6 +929,7 @@ mod tests {
             &pool,
             key,
             &NewPlaybookLaunch {
+                choice_snapshots: None,
                 playbook: "survey",
                 repo: "owner/packs",
                 title: "reads a paper",

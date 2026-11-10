@@ -70,7 +70,7 @@ read = command(name = "read", run = "./classify.sh", emits = ["bucket"])
 gate = route(
     name = "gate",
     depends_on = [read],
-    source = read,
+    decider = output(read),
     questions = {
         "bucket": choice(
             ask = "Which queue owns this ticket?",
@@ -80,11 +80,11 @@ gate = route(
 )
 
 oncall = command(name = "oncall", run = "./file.sh oncall", depends_on = [gate],
-                 when = gate.bucket, answers = "outage")
+                 when = gate.bucket.any_of("outage"))
 finance = command(name = "finance", run = "./file.sh finance", depends_on = [gate],
-                  when = gate.bucket, answers = "billing")
+                  when = gate.bucket.any_of("billing"))
 backlog = command(name = "backlog", run = "./file.sh backlog", depends_on = [gate],
-                  when = gate.bucket, otherwise = True)
+                  when = gate.bucket.otherwise())
 
 filed = command(name = "filed", run = "./file.sh filed",
                 depends_on = [oncall, finance, backlog], join = "passed")
@@ -105,7 +105,7 @@ verdict: valid
 ```
 
 The branches that no answer selects settle `not_taken`. They do not dispatch and do not
-spend. If you replace `source = read` with `min_confidence = 0.8`, a decision model answers
+spend. If you replace `output(read)` with `model(min_confidence = 0.8)`, a decision model answers
 the question. The engine records a low-confidence answer as `uncertain`, and the `otherwise`
 task takes it.
 

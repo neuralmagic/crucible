@@ -10,8 +10,7 @@ review = command(
     run = "./check.sh",
     depends_on = [author],
     emits_files = ["evidence/review.json"],
-    revise = author,
-    max_rounds = 3,
+    revise = send_back(author, rounds = 3),
 )
 
 workflow(type = "playbook", tasks = [author, review])

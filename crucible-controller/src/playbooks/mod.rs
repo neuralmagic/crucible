@@ -3,6 +3,7 @@
 
 pub(crate) mod api;
 pub mod blueprints;
+pub mod choices;
 pub mod co_draft;
 pub mod dispatch;
 pub mod drafts;

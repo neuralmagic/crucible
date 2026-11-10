@@ -17,7 +17,7 @@ use crate::agent::event::AgentEvent;
 use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::agent::sandbox_env::sh_quote;
 use crate::args::TurnAgent;
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use crate::openshell::provider::CodexAuth;
 use crate::turn_trace::{GenAiRecord, ToolInvocation};
 use crucible::harness::{AuthProvider, HarnessSpec};

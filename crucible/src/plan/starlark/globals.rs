@@ -19,8 +19,9 @@ use starlark_syntax::codemap::FileSpan;
 use crate::plan::ir::TaskName;
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    AnswerRefValue, CONVERTED, ExternalText, OptionalValue, OutputRefValue, QuestionValue,
-    SchemaValue, SessionValue, TaskValue, WorkflowValue,
+    AnswerRefValue, BoundValue, CONVERTED, DeciderValue, EachValue, ExternalText, OptionalValue,
+    OthersValue, OutputRefValue, QuestionValue, SchemaValue, SendBackValue, SessionValue,
+    TaskDefaultsValue, TaskValue, WhenValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
@@ -34,9 +35,66 @@ const POSITIONAL: &[&str] = &[
     "default_autoresearch",
 ];
 
+/// Constructors whose one positional argument binds to a named one.
+const LEADING: &[(&str, &str)] = &[
+    ("each", "list"),
+    ("send_back", "tasks"),
+    ("at_least", "bound"),
+    ("at_most", "bound"),
+    ("output", "task"),
+];
+
 /// The constructors every lane has.
 #[starlark_module]
 pub(crate) fn common(builder: &mut GlobalsBuilder) {
+    fn each<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("each", args, kwargs, eval)
+    }
+
+    fn others<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("others", args, kwargs, eval)
+    }
+
+    fn task_defaults<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("task_defaults", args, kwargs, eval)
+    }
+
+    fn send_back<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("send_back", args, kwargs, eval)
+    }
+
+    fn at_least<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("at_least", args, kwargs, eval)
+    }
+
+    fn at_most<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("at_most", args, kwargs, eval)
+    }
+
     fn agent<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
@@ -121,6 +179,30 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
 /// Typed decisions, for the playbook and custom lanes.
 #[starlark_module]
 pub(crate) fn routed(builder: &mut GlobalsBuilder) {
+    fn model<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("model", args, kwargs, eval)
+    }
+
+    fn human<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("human", args, kwargs, eval)
+    }
+
+    fn output<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("output", args, kwargs, eval)
+    }
+
     fn choice<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
@@ -262,6 +344,17 @@ fn compile_site<'a>(
     Ok((state, at))
 }
 
+/// Attach the call site to an error that does not already carry a location.
+fn located(at: &FileSpan, error: dsl::CompileError) -> dsl::CompileError {
+    match error {
+        located @ dsl::CompileError::At { .. } => located,
+        error => dsl::CompileError::At {
+            at: at.clone(),
+            inner: Box::new(error),
+        },
+    }
+}
+
 fn call<'v>(
     function: &'static str,
     args: UnpackTuple<Value<'v>>,
@@ -294,8 +387,9 @@ fn call<'v>(
             ("param", dsl::Value::String(name)) => state.context_mut().param(&name),
             ("optional", dsl::Value::Task(task)) => Ok(dsl::Value::Optional(task.name)),
             ("optional", dsl::Value::String(name)) => Ok(dsl::Value::Optional(TaskName(name))),
-            ("workflow", dsl::Value::List(tasks)) => {
-                dsl::task_list("workflow", tasks).and_then(|tasks| {
+            ("workflow", dsl::Value::List(tasks)) => dsl::task_list("workflow", tasks)
+                .and_then(|tasks| dsl::assemble(tasks, Default::default(), state))
+                .and_then(|tasks| {
                     let workflow = WorkflowCfg {
                         workflow_type: WorkflowType::Autoresearch,
                         result: None,
@@ -309,8 +403,7 @@ fn call<'v>(
                     };
                     workflow.validate()?;
                     Ok(dsl::Value::Workflow(workflow))
-                })
-            }
+                }),
             ("default_autoresearch", dsl::Value::List(tasks)) => {
                 dsl::task_list("default_autoresearch", tasks)
                     .and_then(dsl::default_autoresearch)
@@ -322,14 +415,22 @@ fn call<'v>(
         };
         return value.map_err(|error| located(at, error));
     }
-    if !args.items.is_empty() {
-        return Err(located(
-            at,
-            dsl::CompileError::PositionalArgument {
-                function: function.to_owned(),
-            },
-        ));
-    }
+    let leading = LEADING
+        .iter()
+        .find(|(name, _)| *name == function)
+        .map(|(_, argument)| *argument);
+    let leading = match (leading, args.items.as_slice()) {
+        (_, []) => None,
+        (Some(argument), [value]) if !kwargs.contains_key(argument) => Some((argument, *value)),
+        _ => {
+            return Err(located(
+                at,
+                dsl::CompileError::PositionalArgument {
+                    function: function.to_owned(),
+                },
+            ));
+        }
+    };
     let named = kwargs
         .into_iter()
         .map(|(name, value)| {
@@ -340,20 +441,10 @@ fn call<'v>(
             };
             Ok((name, value))
         })
+        .chain(leading.map(|(argument, value)| Ok((argument.to_owned(), convert(value)?))))
         .collect::<dsl::Result<BTreeMap<String, dsl::Value>>>()
         .map_err(|error| located(at, error))?;
     dsl::constructor(function, named, state, at).map_err(|error| located(at, error))
-}
-
-/// Attach the call site to an error that does not already carry a location.
-fn located(at: &FileSpan, error: dsl::CompileError) -> dsl::CompileError {
-    match error {
-        located @ dsl::CompileError::At { .. } => located,
-        error => dsl::CompileError::At {
-            at: at.clone(),
-            inner: Box::new(error),
-        },
-    }
 }
 
 /// A starlark argument as the constructor tables see it. Anything outside the DSL's own value
@@ -463,6 +554,27 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(optional) = OptionalValue::from_value(value) {
         return Ok(dsl::Value::Optional(optional.0.clone()));
     }
+    if let Some(when) = WhenValue::from_value(value) {
+        return Ok(dsl::Value::When(when.0.clone()));
+    }
+    if let Some(each) = EachValue::from_value(value) {
+        return Ok(dsl::Value::Each(each.0.clone()));
+    }
+    if let Some(send_back) = SendBackValue::from_value(value) {
+        return Ok(dsl::Value::SendBack(send_back.0.clone()));
+    }
+    if let Some(bound) = BoundValue::from_value(value) {
+        return Ok(dsl::Value::Bound(bound.0));
+    }
+    if let Some(decider) = DeciderValue::from_value(value) {
+        return Ok(dsl::Value::Decider(decider.0.clone()));
+    }
+    if OthersValue::from_value(value).is_some() {
+        return Ok(dsl::Value::Others);
+    }
+    if let Some(defaults) = TaskDefaultsValue::from_value(value) {
+        return Ok(dsl::Value::Defaults(defaults.0));
+    }
     Ok(dsl::Value::Opaque)
 }
 
@@ -519,5 +631,12 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Workflow(workflow) => heap.alloc(WorkflowValue(workflow)),
         dsl::Value::Schema(schema) => heap.alloc(SchemaValue(schema)),
         dsl::Value::Optional(name) => heap.alloc(OptionalValue(name)),
+        dsl::Value::When(when) => heap.alloc(WhenValue(when)),
+        dsl::Value::Each(each) => heap.alloc(EachValue(each)),
+        dsl::Value::SendBack(revise) => heap.alloc(SendBackValue(revise)),
+        dsl::Value::Bound(bound) => heap.alloc(BoundValue(bound)),
+        dsl::Value::Decider(decider) => heap.alloc(DeciderValue(decider)),
+        dsl::Value::Others => heap.alloc(OthersValue),
+        dsl::Value::Defaults(defaults) => heap.alloc(TaskDefaultsValue(defaults)),
     }
 }

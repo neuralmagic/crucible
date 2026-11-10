@@ -22,7 +22,7 @@
 
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result, bail};
-use crucible::manifest::Harness;
+use crucible::knobs::Harness;
 use crucible_contract::inference::{
     EnvName, InferenceBinding, InferenceProtocol as WireProtocol, InferenceRole, ResolvedInference,
     TokenPrice, UsdPerMtok,
@@ -1397,7 +1397,7 @@ pub async fn chain_for_issue(
 #[cfg(test)]
 mod tests {
     use crate::playbooks::providers::*;
-    use crucible::manifest::Harness;
+    use crucible::knobs::Harness;
     use sqlx::PgPool;
 
     #[test]

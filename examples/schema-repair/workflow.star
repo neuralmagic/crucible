@@ -17,9 +17,7 @@ plan = agent(
 audit = agent(
     name = "audit",
     prompt = "Audit one lane and write AUDIT.json.",
-    depends_on = [plan],
-    over = plan.lanes,
-    max_fanout = 4,
+    over = each(plan.lanes, max = 4),
     emits_files = {"AUDIT.json": schema_file("schemas/result.json")},
     repair = 1,
     required = False,

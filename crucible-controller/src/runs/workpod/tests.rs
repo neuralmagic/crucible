@@ -182,10 +182,10 @@ fn turn_opts_scope_carries_the_resolved_harness_and_model() {
     assert_eq!(unresolved.model, None);
 
     let resolved = scope_with(AgentSelection {
-        harness: Some(crucible::manifest::Harness::Codex),
+        harness: Some(crucible::knobs::Harness::Codex),
         model: Some("gpt-5.6-luna".to_string()),
     });
-    assert_eq!(resolved.harness, Some(crucible::manifest::Harness::Codex));
+    assert_eq!(resolved.harness, Some(crucible::knobs::Harness::Codex));
     assert_eq!(resolved.model.as_deref(), Some("gpt-5.6-luna"));
 }
 

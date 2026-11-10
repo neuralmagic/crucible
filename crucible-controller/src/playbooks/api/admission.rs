@@ -226,6 +226,8 @@ pub(crate) struct AuthorizedLaunch<P> {
     pub params: serde_json::Value,
     pub max_cost: f64,
     pub max_time: crate::model::MaxTime,
+    /// The `{param: {run_id, digest}}` choice snapshots the values were validated against.
+    pub choice_snapshots: serde_json::Value,
 }
 
 /// What a pack whose manifest never parsed is refused with. A launch would fail at the engine's
@@ -256,6 +258,10 @@ pub(crate) async fn admit<P: Admissible>(
 ) -> Result<AuthorizedLaunch<P>, Response> {
     let target = pack.target();
     let (schema, max_time) = admit_pack(state, target, request).await?;
+    let (schema, choice_snapshots) =
+        crate::playbooks::choices::attach(state.db.pool(), target.id(), &schema)
+            .await
+            .map_err(|e| ApiError::from(e).into_response())?;
     let params = crate::playbooks::registry::validate_params(&schema, request.params)
         .map_err(invalid_fields)?;
     check_plan(
@@ -270,6 +276,7 @@ pub(crate) async fn admit<P: Admissible>(
         params,
         max_cost: request.max_cost,
         max_time,
+        choice_snapshots,
     })
 }
 

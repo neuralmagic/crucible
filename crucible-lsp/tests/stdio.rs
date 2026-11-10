@@ -295,6 +295,131 @@ fn an_edit_session_reports_fixes_and_answers_requests() {
 }
 
 #[test]
+fn deprecated_and_implied_arguments_are_flagged_and_their_quick_fixes_rewrite_the_call() {
+    const DEPRECATED: &str = "scan = command(name = \"scan\", run = \"true\", emits = [\"items\"])\n\
+         fan = command(name = \"fan\", run = \"true\", depends_on = [scan], over = scan.items, max_fanout = 4)\n\
+         workflow(type = \"playbook\", tasks = [scan, fan])\n";
+    let (_root, dir) = pack();
+    let entry = dir.join("workflow.star");
+    std::fs::write(&entry, DEPRECATED).expect("entry");
+    let entry_uri = uri(&entry);
+    let mut client = Client::spawn();
+    initialize(&mut client, &dir);
+    client.notify(
+        "textDocument/didOpen",
+        json!({"textDocument": {"uri": entry_uri, "languageId": "starlark", "version": 1, "text": DEPRECATED}}),
+    );
+
+    let found = client.diagnostics(&entry_uri, |d| d.len() == 2);
+    let coded = |found: &[Value], code: &str| -> Value {
+        found
+            .iter()
+            .find(|d| d["code"] == code)
+            .unwrap_or_else(|| panic!("no {code} in {found:#?}"))
+            .clone()
+    };
+    let flagged = coded(&found, "deprecated-argument");
+    assert_eq!(flagged["severity"], 2, "a warning: the pack still compiles");
+    assert_eq!(flagged["tags"], json!([2]), "deprecated");
+    assert_eq!(
+        flagged["message"],
+        "`max_fanout` is deprecated; write `over = each(producer.field, max = N)`"
+    );
+    let implied = coded(&found, "implied-dependency");
+    assert_eq!(implied["severity"], 4, "a hint");
+    assert_eq!(implied["tags"], json!([1]), "unnecessary");
+    assert_eq!(
+        implied["message"],
+        "`over` already makes `scan` a dependency"
+    );
+
+    let mut text = DEPRECATED.to_owned();
+    let mut version = 1;
+    let mut fix = |client: &mut Client, diagnostic: &Value, title: &str, text: &mut String| {
+        let actions = client.request(
+            "textDocument/codeAction",
+            json!({
+                "textDocument": {"uri": entry_uri},
+                "range": diagnostic["range"],
+                "context": {"diagnostics": [diagnostic]},
+            }),
+        );
+        let actions = actions.as_array().expect("actions");
+        assert_eq!(actions.len(), 1, "{actions:#?}");
+        let action = &actions[0];
+        assert_eq!(action["title"], title);
+        assert_eq!(action["kind"], "quickfix");
+        assert_eq!(action["diagnostics"], json!([diagnostic]));
+
+        let mut edits: Vec<(usize, usize, String)> = action["edit"]["changes"][&entry_uri]
+            .as_array()
+            .expect("edits")
+            .iter()
+            .map(|edit| {
+                let column = |end: &str| {
+                    assert_eq!(edit["range"][end]["line"], 1, "{edit}");
+                    edit["range"][end]["character"].as_u64().expect("column") as usize
+                };
+                (
+                    column("start"),
+                    column("end"),
+                    edit["newText"].as_str().expect("text").to_owned(),
+                )
+            })
+            .collect();
+        edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+        let mut lines: Vec<String> = text.lines().map(str::to_owned).collect();
+        for (start, end, new) in edits {
+            lines[1].replace_range(start..end, &new);
+        }
+        *text = lines.join("\n") + "\n";
+        version += 1;
+        client.notify(
+            "textDocument/didChange",
+            json!({"textDocument": {"uri": entry_uri, "version": version}, "contentChanges": [{"text": *text}]}),
+        );
+    };
+
+    fix(
+        &mut client,
+        &flagged,
+        "Rewrite as `over = each(..., max = N)`",
+        &mut text,
+    );
+    assert_eq!(
+        text.lines().nth(1),
+        Some(
+            "fan = command(name = \"fan\", run = \"true\", depends_on = [scan], over = each(scan.items, max = 4))"
+        )
+    );
+    let found = client.diagnostics(&entry_uri, |d| codes(d) == ["implied-dependency"]);
+    fix(
+        &mut client,
+        &found[0],
+        "Remove `scan`: `over` already names it",
+        &mut text,
+    );
+    assert_eq!(
+        text.lines().nth(1),
+        Some("fan = command(name = \"fan\", run = \"true\", over = each(scan.items, max = 4))")
+    );
+
+    let found = client.diagnostics(&entry_uri, <[Value]>::is_empty);
+    assert!(found.is_empty(), "{found:#?}");
+    let none = client.request(
+        "textDocument/codeAction",
+        json!({
+            "textDocument": {"uri": entry_uri},
+            "range": flagged["range"],
+            "context": {"diagnostics": []},
+        }),
+    );
+    assert_eq!(none, json!([]));
+
+    client.shutdown();
+}
+
+#[test]
 fn an_error_in_a_loaded_module_is_published_against_that_module() {
     let (_root, dir) = pack();
     let entry = "load(\"lib.star\", \"make\")\nworkflow(type = \"playbook\", tasks = [make()])\n";

@@ -50,6 +50,7 @@ pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
+use crate::knobs::{Harness, ReasoningEffort};
 use crate::manifest::edition::Edition;
 use crate::manifest::variant::{VariantName, Variants};
 use anyhow::{Context, Result};
@@ -133,6 +134,13 @@ pub enum ManifestError {
         declared: WorkflowType,
         compiled: WorkflowType,
     },
+    #[error(
+        "a choices refresh takes no parameters, but {} supplied",
+        names.join(", ")
+    )]
+    RefreshWithParams { names: Vec<String> },
+    #[error("a choices refresh needs a compiled workflow source, and this manifest has none")]
+    RefreshWithoutSource,
     #[error("a composite needs at least two [[component]] entries")]
     CompositeTooSmall,
     #[error("duplicate component domain `{domain}`")]
@@ -651,77 +659,6 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Which agent harness runs the turn. `claude` is the default everywhere; `codex` (OpenAI's
-/// Codex CLI) is selected per-domain for harness ablations; `opencode` and `pi` are the harnesses
-/// that speak either API family through a provider table.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    clap::ValueEnum,
-    serde::Deserialize,
-    serde::Serialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Harness {
-    #[default]
-    Claude,
-    Codex,
-    #[value(name = "opencode")]
-    OpenCode,
-    Pi,
-}
-
-impl Harness {
-    /// The default model when neither the CLI nor the manifest names one.
-    pub const fn default_model(self) -> &'static str {
-        self.spec().default_model
-    }
-
-    /// The manifest and CLI spelling of the harness.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude",
-            Harness::Codex => "codex",
-            Harness::OpenCode => "opencode",
-            Harness::Pi => "pi",
-        }
-    }
-}
-
-/// The agent's reasoning-effort tier, passed to Claude Code as `--effort <level>`. A closed set
-/// (Claude Code 2.1: low|medium|high|xhigh|max); unset means we don't pass the flag and Claude
-/// Code picks its own default. Per-domain because the right tier is task-dependent (mechanical
-/// remove-deprecated fixes need ~none; algorithmic issues want real reasoning), and it's a harness
-/// hyperparameter worth ablating: does more thinking find better fixes, or just better reward hacks?
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl ReasoningEffort {
-    /// The exact token Claude Code's `--effort` flag expects.
-    pub fn as_flag(self) -> &'static str {
-        match self {
-            ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-            ReasoningEffort::Xhigh => "xhigh",
-            ReasoningEffort::Max => "max",
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCfg {
@@ -991,7 +928,6 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
-        launch::check_agent_knobs(&w.tasks)?;
         validate_task_sandboxes(c.agent, w)?;
     }
     match c.judge {
@@ -1253,6 +1189,17 @@ impl Manifest {
             }
             self.repo.git_ref = Some(r.clone());
         }
+        if launch.refresh() {
+            if !declared_params.is_empty() {
+                return Err(ManifestError::RefreshWithParams {
+                    names: declared_params.keys().cloned().collect(),
+                }
+                .into());
+            }
+            if !workflow.is_unresolved() {
+                return Err(ManifestError::RefreshWithoutSource.into());
+            }
+        }
         if !workflow.is_unresolved() {
             refuse_unconsumable(&declared_params)?;
             if !launch.is_empty() {
@@ -1264,9 +1211,12 @@ impl Manifest {
         let declared = workflow.workflow_type;
         let file = workflow.file.clone().unwrap_or_default();
         let source = manifest_dir.join(&file);
-        let compiled =
-            crate::plan::starlark::compile_file_with(&source, manifest_dir, &declared_params)
-                .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
+        let compiled = if launch.refresh() {
+            crate::plan::starlark::compile_refresh_file(&source, manifest_dir)
+        } else {
+            crate::plan::starlark::compile_launch_file(&source, manifest_dir, &declared_params)
+        }
+        .with_context(|| format!("compiling [workflow].file = {file:?}"))?;
         if compiled.workflow.workflow_type != declared {
             return Err(ManifestError::WorkflowTypeMismatch {
                 declared,
@@ -2077,6 +2027,60 @@ mod tests {
             .expect("nothing supplied, nothing to refuse");
     }
 
+    /// `choices.refresh` compiles the producer closure in place of the graph, refuses declared
+    /// parameters beside it, and needs a source to compile.
+    #[test]
+    fn a_choices_refresh_compiles_the_producer_closure_and_takes_no_parameters() {
+        let dir = std::env::temp_dir().join(format!("crucible-wf-refresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("graph.star"),
+            r#"params = {
+    "pr": {"type": "int", "required": True},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}
+options = command(name = "options", run = "./o.sh", emits = {"releases": "list"})
+work = agent(name = "work", prompt = "Backport " + str(param("pr")), depends_on = [options])
+workflow(type = "playbook", tasks = [options, work])
+"#,
+        )
+        .unwrap();
+        let table = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"";
+        let refresh = |pairs: &[(&str, &str)]| {
+            let supplied: std::collections::BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            let mut m = toml::from_str::<Manifest>(&task_manifest(table)).expect("parses");
+            m.resolve_workflow_with(&dir, &supplied).map(|()| m)
+        };
+        let m = refresh(&[("choices.refresh", "true")]).expect("refresh compiles");
+        let workflow = m.workflow.as_ref().unwrap();
+        assert_eq!(workflow.tasks.len(), 1);
+        assert_eq!(workflow.tasks[0].name.0, "options");
+        let Err(err) = refresh(&[("choices.refresh", "true"), ("pr", "7")]) else {
+            panic!("a refresh beside a parameter compiled");
+        };
+        assert!(err.to_string().contains("takes no parameters"), "{err:#}");
+        let inline = "[workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .resolve_workflow_with(
+                &dir,
+                &std::collections::BTreeMap::from([(
+                    "choices.refresh".to_owned(),
+                    "true".to_owned(),
+                )]),
+            )
+            .expect_err("nothing to compile");
+        assert!(
+            err.to_string().contains("needs a compiled workflow source"),
+            "{err:#}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_workflow_declaring_both_a_file_and_tasks_is_refused() {
         let both = "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\n[[workflow.task]]\nname = \"a\"\nkind = \"command\"\ncommand = \"true\"";
@@ -2862,7 +2866,7 @@ mod tests {
             .collect()
     }
 
-    fn agent_knobs(m: &Manifest, task: &str) -> (Option<String>, Option<String>) {
+    fn agent_knobs(m: &Manifest, task: &str) -> (Option<String>, Option<ReasoningEffort>) {
         let workflow = m.workflow.as_ref().expect("a workflow");
         let task = workflow
             .tasks
@@ -2870,9 +2874,7 @@ mod tests {
             .find(|t| t.name.0 == task)
             .expect("task exists");
         match &task.task {
-            crate::plan::ir::TaskKind::Agent { model, effort, .. } => {
-                (model.clone(), effort.clone())
-            }
+            crate::plan::ir::TaskKind::Agent { model, effort, .. } => (model.clone(), *effort),
             other => panic!("not an agent task: {other:?}"),
         }
     }
@@ -2902,10 +2904,10 @@ mod tests {
             ]),
         )
         .expect("resolves");
-        assert_eq!(agent_knobs(&m, "plan"), (None, Some("high".into())));
+        assert_eq!(agent_knobs(&m, "plan"), (None, Some(ReasoningEffort::High)));
         assert_eq!(
             agent_knobs(&m, "review"),
-            (Some("launched".into()), Some("high".into()))
+            (Some("launched".into()), Some(ReasoningEffort::High))
         );
         let workflow = serde_json::to_value(m.workflow.as_ref().expect("workflow")).expect("json");
         assert_eq!(workflow["params"]["topic"], "sinks");
@@ -3069,15 +3071,15 @@ mod tests {
         for (source, needle) in [
             (
                 "a = agent(name = \"a\", prompt = \"p\", effort = \"extreme\")\nworkflow(type = \"playbook\", tasks = [a])\n",
-                "sets effort \"extreme\", which is not low, medium, high, xhigh or max",
+                "graph.star:1:5-56: unknown effort \"extreme\"; use one of low, medium, high, xhigh, max",
             ),
             (
                 "a = agent(name = \"a\", prompt = \"p\", harness = \"gpt\")\nworkflow(type = \"playbook\", tasks = [a])\n",
-                "sets harness \"gpt\", which is not claude, codex, opencode or pi",
+                "unknown harness \"gpt\"; use one of claude, codex, opencode, pi",
             ),
             (
                 "s = session(name = \"s\", effort = \"hgih\")\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"playbook\", tasks = [a])\n",
-                "sets effort \"hgih\"",
+                "graph.star:1:5-41: unknown effort \"hgih\"; use one of low, medium, high, xhigh, max. Did you mean \"high\"?",
             ),
         ] {
             std::fs::write(dir.join("graph.star"), source).expect("write source");
@@ -3104,12 +3106,12 @@ mod tests {
         let inline = "[workflow]\ntype = \"playbook\"\n\
              [[workflow.task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"\neffort = \"extreme\"";
         let err = toml::from_str::<Manifest>(&task_manifest(inline))
-            .expect("parses")
-            .validate()
-            .expect_err("an inline graph is checked at load");
+            .map(|_| ())
+            .expect_err("an inline graph is checked as it parses");
         assert!(
-            format!("{err:#}").contains("sets effort \"extreme\""),
-            "{err:#}"
+            err.to_string()
+                .contains("effort \"extreme\" is not low, medium, high, xhigh or max"),
+            "{err}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

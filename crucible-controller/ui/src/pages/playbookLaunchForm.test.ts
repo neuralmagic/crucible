@@ -6,7 +6,11 @@ import {
   launchBody,
   paramBlocks,
   mapServerRejection,
+  offeredChoices,
+  optionSources,
   parseParamsSchema,
+  placeholderFor,
+  refreshBody,
   parseMaxTime,
   previewMatches,
   runSnapshot,
@@ -51,8 +55,13 @@ describe('parseParamsSchema', () => {
         multiline: false,
         choices: null,
         enabledBy: null,
+        choicesFrom: null,
+        choicesSnapshot: null,
+        allowOther: false,
+        placeholderFrom: null,
+        placeholderSnapshot: null,
       },
-      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
       {
         name: 'since',
         valueType: 'string',
@@ -63,8 +72,13 @@ describe('parseParamsSchema', () => {
         multiline: false,
         choices: null,
         enabledBy: null,
+        choicesFrom: null,
+        choicesSnapshot: null,
+        allowOther: false,
+        placeholderFrom: null,
+        placeholderSnapshot: null,
       },
-      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
     ]);
   });
 
@@ -76,7 +90,7 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
     ]);
   });
 
@@ -136,6 +150,121 @@ describe('parseParamsSchema', () => {
     for (const choices of [[], [1, 2], 'a', ['a', null]]) {
       expect(parseParamsSchema({ type: 'object', properties: { p: { type: 'string', enum: choices } } }).kind).toBe('unrenderable');
     }
+  });
+
+  it('offers a task-sourced list from its snapshot, per key value when keyed', () => {
+    const [release, component, branch, untouched] = specsOf({
+      type: 'object',
+      properties: {
+        release: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'releases' },
+          'x-choices-snapshot': { value: ['3.6', '3.7'], captured_at: '2026-11-09T10:00:00Z' },
+        },
+        component: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'components', keyed_by: 'release' },
+          'x-choices-snapshot': { value: { '3.7': ['vllm', 'flashinfer'] } },
+        },
+        branch: {
+          type: 'string',
+          'x-placeholder-from': { task: 'options', field: 'branches', keyed_by: 'release' },
+          'x-placeholder-snapshot': { value: { '3.7': 'sync-v0.33.0' } },
+        },
+        untouched: { type: 'string', 'x-choices-from': { task: 'options', field: 'never' } },
+      },
+    });
+    if (!release || !component || !branch || !untouched) throw new Error('four specs');
+    const values = { release: '3.7', component: '', branch: '', untouched: '' };
+    expect(offeredChoices(release, values)).toEqual(['3.6', '3.7']);
+    expect(offeredChoices(component, values)).toEqual(['vllm', 'flashinfer']);
+    expect(offeredChoices(component, { ...values, release: '3.6' })).toEqual([]);
+    expect(offeredChoices(untouched, values)).toBeNull();
+    expect(validateParam(release, '3.8', values)).toBe('release must be one of 3.6, 3.7');
+    expect(validateParam(component, 'vllm', values)).toBeNull();
+    expect(validateParam(component, 'vllm', { ...values, release: '3.6' })).toBe('component has no options for this release');
+    expect(validateParam(untouched, 'anything', values)).toBeNull();
+    expect(placeholderFor(branch, values)).toBe('sync-v0.33.0');
+    expect(placeholderFor(branch, { ...values, release: '3.6' })).toBeNull();
+  });
+
+  it('accepts a value outside the offered list when the choices are open', () => {
+    const [component] = specsOf({
+      type: 'object',
+      properties: {
+        component: {
+          type: 'string',
+          'x-allow-other': true,
+          'x-choices-from': { task: 'options', field: 'components' },
+          'x-choices-snapshot': { value: ['vllm'] },
+        },
+      },
+    });
+    if (!component) throw new Error('one spec');
+    expect(offeredChoices(component, {})).toEqual(['vllm']);
+    expect(validateParam(component, 'triton', {})).toBeNull();
+  });
+
+  it('offers a written list that is open as suggestions', () => {
+    const [size] = specsOf({
+      type: 'object',
+      properties: { size: { type: 'string', default: 's', 'x-allow-other': true, 'x-choices': ['s', 'm'] } },
+    });
+    if (!size) throw new Error('one spec');
+    expect(size.choices).toEqual(['s', 'm']);
+    expect(size.allowOther).toBe(true);
+    expect(validateParam(size, 'xl', {})).toBeNull();
+  });
+
+  it('drops a snapshot of the wrong shape and refuses a key that is not a declared string', () => {
+    const [flat] = specsOf({
+      type: 'object',
+      properties: {
+        flat: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'f' },
+          'x-choices-snapshot': { value: { '3.7': ['a'] } },
+        },
+      },
+    });
+    expect(flat?.choicesSnapshot).toBeNull();
+    const keyedByBool = parseParamsSchema({
+      type: 'object',
+      properties: {
+        gate: { type: 'boolean' },
+        p: { type: 'string', 'x-choices-from': { task: 'o', field: 'f', keyed_by: 'gate' } },
+      },
+    });
+    expect(keyedByBool.kind).toBe('unrenderable');
+  });
+
+  it('lists each options task once with its snapshot time', () => {
+    const specs = specsOf({
+      type: 'object',
+      properties: {
+        release: {
+          type: 'string',
+          'x-choices-from': { task: 'options', field: 'releases' },
+          'x-choices-snapshot': { value: ['3.7'], captured_at: '2026-11-09T12:00:00Z' },
+        },
+        component: { type: 'string', 'x-choices-from': { task: 'options', field: 'components', keyed_by: 'release' } },
+        branch: { type: 'string', 'x-placeholder-from': { task: 'branches', field: 'branch', keyed_by: 'release' } },
+        pr: { type: 'string' },
+      },
+    });
+    expect(optionSources(specs)).toEqual([
+      { task: 'options', passed: true, capturedAt: '2026-11-09T12:00:00Z' },
+      { task: 'branches', passed: false, capturedAt: null },
+    ]);
+  });
+
+  it('refreshes with the refresh setting alone', () => {
+    expect(refreshBody({ maxCost: 1, maxTime: ' 10m ', schemaDigest: 'sha256:x' })).toEqual({
+      params: { 'choices.refresh': 'true' },
+      max_cost: 1,
+      max_time: '10m',
+      schema_digest: 'sha256:x',
+    });
   });
 
   it('takes a gated param only while its switch is on', () => {
@@ -274,6 +403,11 @@ describe('validateParam', () => {
       multiline: false,
       choices: null,
       enabledBy: null,
+      choicesFrom: null,
+      choicesSnapshot: null,
+      allowOther: false,
+      placeholderFrom: null,
+      placeholderSnapshot: null,
     };
     expect(validateParam(rustOnly, 'whatever')).toBeNull();
   });
@@ -507,7 +641,7 @@ describe('runSnapshot', () => {
 describe('paramBlocks', () => {
   const spec = (name: string, valueType: ParamFieldSpec['valueType'], enabledBy: string | null = null): ParamFieldSpec => ({
     name, valueType, required: false, defaultValue: null, pattern: null, description: null, multiline: false,
-    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy,
+    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null,
   });
 
   it('moves a gate to the head of a group at its first gated field and leaves other booleans alone', () => {

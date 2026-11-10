@@ -3013,6 +3013,7 @@ mod tests {
             &mut tx,
             key,
             &crate::launches::model::NewPlaybookLaunch {
+                choice_snapshots: None,
                 playbook,
                 repo: "owner/repo",
                 title: playbook,

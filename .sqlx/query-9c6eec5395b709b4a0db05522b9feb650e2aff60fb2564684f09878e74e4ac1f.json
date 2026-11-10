@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, advance_dedupe, dedupe_schedule, origin, draft_version, created_by, launcher_groups, owner, created_at, exposure, exposure_digest, rerun_of, rerun_from, choice_snapshots) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Float8",
+        "Text",
+        "Bool",
+        "Text",
+        "Text",
+        "Int8",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c6eec5395b709b4a0db05522b9feb650e2aff60fb2564684f09878e74e4ac1f"
+}
