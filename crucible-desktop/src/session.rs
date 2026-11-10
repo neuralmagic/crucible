@@ -51,6 +51,8 @@ pub struct TaskView {
     pub over: String,
     pub when: String,
     pub timeout: String,
+    /// What a command or evaluate task runs; empty for other kinds and for logs that predate it.
+    pub command: String,
     /// The fields its output promises, typed when the pack says.
     pub emits: Vec<EmitWire>,
     /// The files its output includes, with their schemas when the pack gives them.
@@ -158,6 +160,17 @@ impl TaskState {
 }
 
 impl TaskView {
+    /// The command's first line that says something, and how many more lines follow it.
+    pub fn command_brief(&self) -> Option<(&str, usize)> {
+        let mut lines = self
+            .command
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let first = lines.next()?;
+        Some((first, lines.count()))
+    }
+
     fn from_wire(task: PlanTaskWire) -> Self {
         TaskView {
             name: task.name,
@@ -168,6 +181,7 @@ impl TaskView {
             over: task.over,
             when: task.when,
             timeout: task.timeout,
+            command: task.command,
             emits: task.emits,
             files: task.emits_files,
             keyed: task.keyed,
@@ -641,7 +655,7 @@ mod tests {
     use crucible_contract::emits::{DeclaredFile, EmitWire};
     use crucible_contract::session::{BlockedReasonKind, TaskStatus};
 
-    const FANOUT: &str = r##"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":10.0,"tasks":[{"name":"seed","kind":"command","depends_on":[],"required":true,"emits":[{"field":"kernels"}],"emits_files":["traces/seed.log"],"timeout":"90m"},{"name":"edit","kind":"agent","depends_on":["seed"],"required":true,"over":"seed.kernels"},{"name":"audit","kind":"agent","depends_on":["edit"],"required":false}]}
+    const FANOUT: &str = r##"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":10.0,"tasks":[{"name":"seed","kind":"command","depends_on":[],"required":true,"emits":[{"field":"kernels"}],"emits_files":["traces/seed.log"],"timeout":"90m","command":"\nset -eu\n\n  python seed.py --out traces/seed.log\n"},{"name":"edit","kind":"agent","depends_on":["seed"],"required":true,"over":"seed.kernels"},{"name":"audit","kind":"agent","depends_on":["edit"],"required":false}]}
 {"v":1,"kind":"task_started","task":"seed","attempt":1,"estimate_usd":0.0}
 {"v":1,"kind":"task_result","task":"seed","status":"pass","task_kind":"command","attempts":1,"cost_usd":0.0,"output":{"kernels":["a","b"]},"note":"","secs":3.5}
 {"v":1,"kind":"task_started","task":"edit[a]","attempt":1,"estimate_usd":1.25}
@@ -751,6 +765,19 @@ not json at all
         );
         assert!(fold.tasks[0].result.is_some());
         assert_eq!(fold.tasks[1].state(), TaskState::Pending);
+    }
+
+    #[test]
+    fn a_command_task_keeps_what_it_runs_and_briefs_it_by_its_first_line() {
+        let fold = fold(FANOUT);
+        let seed = &fold.tasks[0];
+        assert_eq!(
+            seed.command,
+            "\nset -eu\n\n  python seed.py --out traces/seed.log\n"
+        );
+        assert_eq!(seed.command_brief(), Some(("set -eu", 1)));
+        assert_eq!(fold.tasks[1].command, "");
+        assert_eq!(fold.tasks[1].command_brief(), None);
     }
 
     #[test]

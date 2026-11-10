@@ -258,6 +258,8 @@ mod tests {
         assert_eq!(fix.over, "scan.cves");
         assert_eq!(fix.state(), TaskState::Pending);
         assert_eq!(preview.fold.tasks[0].emits[0].field, "cves");
+        assert_eq!(preview.fold.tasks[0].command, "true");
+        assert_eq!(fix.command, "");
     }
 
     #[test]
