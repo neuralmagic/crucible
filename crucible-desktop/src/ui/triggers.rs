@@ -7,7 +7,9 @@ use rune::{El, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Switch};
 
 use crate::admin::{Action, relative};
-use crate::ui::desk::{card, frame, heading, landed, none, now, reading, scrolled, stacked};
+use crate::ui::desk::{
+    card, confirm, fact, frame, heading, landed, mono, none, now, reading, scrolled, stacked,
+};
 use crate::ui::{Paint, Tone, flag, schedules, tag, webhook_form};
 use crate::webhook::WebhookForm;
 use crate::{App, Selection};
@@ -215,23 +217,6 @@ fn webhook_row(hook: &Webhook, open: bool, app: &App, now: i64, p: &Paint) -> El
         )
 }
 
-fn mono(key: String, value: String, p: &Paint) -> El {
-    text(value)
-        .key(key)
-        .font(p.mono(12.0, 480.0))
-        .color(p.c.text_base)
-        .selectable(true)
-        .wrap()
-}
-
-fn fact(label: &str, key: String, value: String, p: &Paint) -> El {
-    col()
-        .w_full()
-        .gap(4.0)
-        .child(heading(label, p))
-        .child(mono(key, value, p))
-}
-
 fn pairs(map: &BTreeMap<String, String>) -> String {
     map.iter()
         .map(|(name, value)| format!("{name} = {value}"))
@@ -391,26 +376,16 @@ fn delivery_row(delivery: &WebhookDelivery, now: i64, p: &Paint) -> El {
 }
 
 fn controls(hook: &Webhook, app: &App, p: &Paint) -> El {
-    let armed = |what: &str| format!("webhook-{what}:{}", hook.id);
-    let button = |label: &'static str, confirm: &'static str, key: String, action: Action| {
-        let on = app.remote.desk.armed.as_deref() == Some(key.as_str());
-        let test_key = key.replace(':', "-");
-        Button::new(if on { confirm } else { label })
-            .variant(if on {
-                ButtonVariant::Danger
-            } else {
-                ButtonVariant::Ghost
-            })
-            .disabled(app.remote.desk.busy())
-            .on_press(move |app: &mut App| {
-                if app.remote.desk.armed.as_deref() == Some(key.as_str()) {
-                    app.act(action.clone());
-                } else {
-                    app.remote.desk.armed = Some(key.clone());
-                }
-            })
-            .build(p.k)
-            .key(test_key)
+    let twice = |what: &'static str, labels: (&'static str, &'static str), action: Action| {
+        confirm(
+            format!("webhook-{what}-{}", hook.id),
+            &format!("webhook-{what}:{}", hook.id),
+            labels,
+            true,
+            action,
+            app,
+            p,
+        )
     };
     let editing = hook.clone();
     row()
@@ -425,18 +400,16 @@ fn controls(hook: &Webhook, app: &App, p: &Paint) -> El {
                 .build(p.k)
                 .key(format!("webhook-edit-{}", hook.id)),
         )
-        .child(button(
-            "Rotate secret",
-            "Confirm rotate",
-            armed("rotate"),
+        .child(twice(
+            "rotate",
+            ("Rotate secret", "Confirm rotate"),
             Action::RotateWebhook {
                 id: hook.id.clone(),
             },
         ))
-        .child(button(
-            "Delete",
-            "Confirm delete",
-            armed("delete"),
+        .child(twice(
+            "delete",
+            ("Delete", "Confirm delete"),
             Action::DeleteWebhook {
                 id: hook.id.clone(),
             },

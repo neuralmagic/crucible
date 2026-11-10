@@ -246,6 +246,84 @@ pub(crate) fn suggestions(
     Some(chips)
 }
 
+/// A list beside what is picked from it, each as tall as the page.
+pub(crate) fn split(key: &str, rows: Vec<El>, width: f32, picked: El, p: &Paint) -> El {
+    row()
+        .key(format!("{key}-body"))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(16.0)
+        .child(
+            card(
+                &format!("{key}-list-card"),
+                list(&format!("{key}-list"), rows, p),
+                p,
+            )
+            .w(width)
+            .h_full(),
+        )
+        .child(
+            col()
+                .key(format!("{key}-detail"))
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .min_h(0.0)
+                .child(scrolled(&format!("{key}-scroll"), picked, p)),
+        )
+}
+
+/// A button that does `action` on its second press: the first arms it under `armed`, and it then
+/// reads `sure`.
+pub(crate) fn confirm(
+    key: impl Into<String>,
+    armed: &str,
+    (label, sure): (&'static str, &'static str),
+    enabled: bool,
+    action: crate::admin::Action,
+    app: &App,
+    p: &Paint,
+) -> El {
+    let on = app.remote.desk.armed.as_deref() == Some(armed);
+    let armed = armed.to_string();
+    Button::new(if on { sure } else { label })
+        .variant(if on {
+            ButtonVariant::Danger
+        } else {
+            ButtonVariant::Ghost
+        })
+        .disabled(!enabled || app.remote.desk.busy())
+        .on_press(move |app: &mut App| {
+            if app.remote.desk.armed.as_deref() == Some(armed.as_str()) {
+                app.act(action.clone());
+            } else {
+                app.remote.desk.armed = Some(armed.clone());
+            }
+        })
+        .build(p.k)
+        .key(key.into())
+}
+
+/// A value in mono that can be selected and copied.
+pub(crate) fn mono(key: impl Into<String>, value: impl Into<String>, p: &Paint) -> El {
+    text(value.into())
+        .key(key.into())
+        .font(p.mono(12.0, 480.0))
+        .color(p.c.text_base)
+        .selectable(true)
+        .wrap()
+}
+
+/// A heading over a [`mono`] value.
+pub(crate) fn fact(label: &str, key: impl Into<String>, value: impl Into<String>, p: &Paint) -> El {
+    col()
+        .w_full()
+        .gap(4.0)
+        .child(heading(label, p))
+        .child(mono(key, value, p))
+}
+
 /// A small muted heading over a group of rows.
 pub(crate) fn heading(label: &str, p: &Paint) -> El {
     text(label.to_string())

@@ -6,7 +6,9 @@ use rune_kit::{Button, ButtonVariant, Switch, TextInput};
 use crate::App;
 use crate::admin::{Action, relative};
 use crate::apikeys::{KeyState, by_client, mcp_install};
-use crate::ui::desk::{card, field, frame, heading, landed, none, now, scrolled, stacked};
+use crate::ui::desk::{
+    card, confirm, fact, field, frame, heading, landed, mono, none, now, scrolled, stacked,
+};
 use crate::ui::{Paint, Tone, flag, tag};
 
 const NAME: f32 = 280.0;
@@ -45,24 +47,18 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
 }
 
 fn minted_card(minted: &crux::dto::MintedKey, p: &Paint) -> El {
-    let copyable = |key: &str, value: String| {
-        text(value)
-            .key(key.to_string())
-            .font(p.mono(12.0, 480.0))
-            .color(p.c.text_base)
-            .selectable(true)
-            .wrap()
-    };
     let mut body = col()
         .key("key-minted")
         .w_full()
         .gap(8.0)
         .child(heading("Shown once", p))
-        .child(copyable("key-minted-secret", minted.secret.clone()));
+        .child(mono("key-minted-secret", minted.secret.clone(), p));
     if let Some(url) = &minted.mcp_url {
-        body = body.child(heading("MCP client", p)).child(copyable(
+        body = body.child(fact(
+            "MCP client",
             "key-minted-install",
             mcp_install(&minted.secret, url),
+            p,
         ));
     }
     card("key-minted-card", body, p)
@@ -203,26 +199,15 @@ fn key_row(key: &crux::dto::ApiKey, state: KeyState, app: &App, now: i64, p: &Pa
                 ),
         );
     if state == KeyState::Live {
-        let id = key.id.clone();
-        let armed = app.remote.desk.armed.as_deref() == Some(key.id.as_str());
-        line = line.child(
-            Button::new(if armed { "Confirm revoke" } else { "Revoke" })
-                .variant(if armed {
-                    ButtonVariant::Danger
-                } else {
-                    ButtonVariant::Ghost
-                })
-                .disabled(app.remote.desk.busy())
-                .on_press(move |app: &mut App| {
-                    if app.remote.desk.armed.as_deref() == Some(id.as_str()) {
-                        app.act(Action::RevokeKey { id: id.clone() });
-                    } else {
-                        app.remote.desk.armed = Some(id.clone());
-                    }
-                })
-                .build(p.k)
-                .key(format!("key-revoke-{}", key.id)),
-        );
+        line = line.child(confirm(
+            format!("key-revoke-{}", key.id),
+            &key.id,
+            ("Revoke", "Confirm revoke"),
+            true,
+            Action::RevokeKey { id: key.id.clone() },
+            app,
+            p,
+        ));
     }
     line
 }

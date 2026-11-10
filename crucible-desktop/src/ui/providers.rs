@@ -10,7 +10,7 @@ use crate::admin::Action;
 use crate::provider::{
     KINDS, PROTOCOLS, ProviderForm, harnesses, kind_label, may, protocol_label, reach,
 };
-use crate::ui::desk::{card, field, frame, landed, list, none, pills, scrolled};
+use crate::ui::desk::{card, confirm, fact, field, frame, landed, none, pills, split};
 use crate::ui::{Paint, tag};
 
 const LIST: f32 = 300.0;
@@ -94,49 +94,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         (None, None) if providers.is_empty() => none("providers-none", "No providers", p),
         (None, None) => none("provider-unpicked", "Pick a provider", p),
     };
-    page.child(
-        row()
-            .key("providers-body")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .gap(16.0)
-            .child(
-                card("providers-list-card", list("providers-list", rows, p), p)
-                    .w(LIST)
-                    .h_full(),
-            )
-            .child(
-                col()
-                    .key("provider-detail")
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .h_full()
-                    .min_h(0.0)
-                    .child(scrolled("provider-scroll", shown, p)),
-            ),
-    )
-}
-
-fn fact(label: &str, value: String, p: &Paint) -> El {
-    row()
-        .w_full()
-        .gap(12.0)
-        .child(
-            text(label.to_string())
-                .font(p.k.ty.small_medium)
-                .color(p.c.text_muted)
-                .w(110.0),
-        )
-        .child(
-            text(value)
-                .font(p.mono(12.0, 480.0))
-                .color(p.c.text_base)
-                .selectable(true)
-                .wrap()
-                .grow(1.0)
-                .min_w(0.0),
-        )
+    page.child(split("providers", rows, LIST, shown, p))
 }
 
 fn detail(provider: &Provider, app: &App, p: &Paint) -> El {
@@ -190,49 +148,59 @@ fn detail(provider: &Provider, app: &App, p: &Paint) -> El {
             );
     }
     if may(provider, "delete") {
-        let id = provider.id.clone();
-        let key = format!("provider-delete:{id}");
-        let armed = app.remote.desk.armed.as_deref() == Some(key.as_str());
-        head = head.child(
-            Button::new(if armed { "Confirm delete" } else { "Delete" })
-                .variant(if armed {
-                    ButtonVariant::Danger
-                } else {
-                    ButtonVariant::Ghost
-                })
-                .disabled(app.remote.desk.busy())
-                .on_press(move |app: &mut App| {
-                    if app.remote.desk.armed.as_deref() == Some(key.as_str()) {
-                        app.act(Action::DeleteProvider { id: id.clone() });
-                    } else {
-                        app.remote.desk.armed = Some(key.clone());
-                    }
-                })
-                .build(p.k)
-                .key("provider-delete"),
-        );
+        head = head.child(confirm(
+            "provider-delete",
+            &format!("provider-delete:{}", provider.id),
+            ("Delete", "Confirm delete"),
+            true,
+            Action::DeleteProvider {
+                id: provider.id.clone(),
+            },
+            app,
+            p,
+        ));
     }
     let mut facts = col()
         .w_full()
         .gap(8.0)
-        .child(fact("Reach", reach(provider), p))
-        .child(fact("Owner", provider.owner.clone(), p))
-        .child(fact("Default", provider.default_model.clone(), p));
+        .child(fact("Reach", "provider-reach", reach(provider), p))
+        .child(fact("Owner", "provider-owner", provider.owner.clone(), p))
+        .child(fact(
+            "Default",
+            "provider-default",
+            provider.default_model.clone(),
+            p,
+        ));
     if !provider.models.is_empty() {
-        facts = facts.child(fact("Models", provider.models.join("\n"), p));
+        facts = facts.child(fact(
+            "Models",
+            "provider-models",
+            provider.models.join("\n"),
+            p,
+        ));
     }
     if let Some(harness) = &provider.harness {
-        facts = facts.child(fact("Agent CLI", harness.clone(), p));
+        facts = facts.child(fact("Agent CLI", "provider-agent-cli", harness.clone(), p));
     }
     if !provider.roles.is_empty() {
-        facts = facts.child(fact("Serves", provider.roles.join(", "), p));
+        facts = facts.child(fact(
+            "Serves",
+            "provider-serves",
+            provider.roles.join(", "),
+            p,
+        ));
     }
     if let Some(secret) = &provider.secret_name {
         let owner = provider
             .secret_owner
             .as_deref()
             .map_or(String::new(), |owner| format!(" ({owner})"));
-        facts = facts.child(fact("Secret", format!("{secret}{owner}"), p));
+        facts = facts.child(fact(
+            "Secret",
+            "provider-secret",
+            format!("{secret}{owner}"),
+            p,
+        ));
     }
     card(
         "provider-card",

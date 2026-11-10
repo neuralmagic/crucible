@@ -12,7 +12,7 @@ use crate::teams::{
     sorted_teams, with_member, with_role, without_member,
 };
 use crate::ui::desk::{
-    card, field, frame, heading, landed, list, none, now, pills, reading, scrolled, stacked,
+    card, confirm, field, frame, heading, landed, none, now, pills, reading, split, stacked,
 };
 use crate::ui::{Paint, Tone, flag, tag};
 
@@ -73,28 +73,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         (None, None) if teams.is_empty() => none("teams-none", "No teams", p),
         (None, None) => none("team-unpicked", "Pick a team", p),
     };
-    page.child(
-        row()
-            .key("teams-body")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .gap(16.0)
-            .child(
-                card("teams-list-card", list("teams-list", rows, p), p)
-                    .w(LIST)
-                    .h_full(),
-            )
-            .child(
-                col()
-                    .key("team-detail")
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .h_full()
-                    .min_h(0.0)
-                    .child(scrolled("team-scroll", shown, p)),
-            ),
-    )
+    page.child(split("teams", rows, LIST, shown, p))
 }
 
 fn new_team(form: &TeamForm, app: &App, p: &Paint) -> El {
@@ -204,9 +183,7 @@ fn head(team: &Team, owner: bool, app: &App, p: &Paint) -> El {
     if !owner {
         return column.child(title);
     }
-    let slug = team.slug.clone();
     let name = team.display_name.clone();
-    let armed = app.remote.desk.armed.as_deref() == Some(delete_key(&team.slug).as_str());
     title = title
         .child(
             Button::new("Rename")
@@ -218,25 +195,17 @@ fn head(team: &Team, owner: bool, app: &App, p: &Paint) -> El {
                 .build(p.k)
                 .key("team-rename"),
         )
-        .child(
-            Button::new(if armed { "Confirm delete" } else { "Delete" })
-                .variant(if armed {
-                    ButtonVariant::Danger
-                } else {
-                    ButtonVariant::Ghost
-                })
-                .disabled(app.remote.desk.busy())
-                .on_press(move |app: &mut App| {
-                    let key = delete_key(&slug);
-                    if app.remote.desk.armed.as_deref() == Some(key.as_str()) {
-                        app.act(Action::DeleteTeam { slug: slug.clone() });
-                    } else {
-                        app.remote.desk.armed = Some(key);
-                    }
-                })
-                .build(p.k)
-                .key("team-delete"),
-        );
+        .child(confirm(
+            "team-delete",
+            &delete_key(&team.slug),
+            ("Delete", "Confirm delete"),
+            true,
+            Action::DeleteTeam {
+                slug: team.slug.clone(),
+            },
+            app,
+            p,
+        ));
     column = column.child(title);
     if let Some(next) = &app.remote.desk.rename_team {
         let slug = team.slug.clone();
@@ -366,29 +335,19 @@ fn member_row(team: &Team, member: &TeamMember, owner: bool, app: &App, p: &Pain
         p,
     ));
     let rest = without_member(held, kind, &name);
-    let armed = app.remote.desk.armed.as_deref() == Some(key.as_str());
-    let (slug, armed_key) = (team.slug.clone(), key.clone());
-    line.child(
-        Button::new(if armed { "Confirm remove" } else { "Remove" })
-            .variant(if armed {
-                ButtonVariant::Danger
-            } else {
-                ButtonVariant::Ghost
-            })
-            .disabled(app.remote.desk.busy() || !keeps_an_owner(&rest))
-            .on_press(move |app: &mut App| {
-                if app.remote.desk.armed.as_deref() == Some(armed_key.as_str()) {
-                    app.act(Action::PutMembers {
-                        slug: slug.clone(),
-                        members: rest.clone(),
-                    });
-                } else {
-                    app.remote.desk.armed = Some(armed_key.clone());
-                }
-            })
-            .build(p.k)
-            .key(format!("member-remove-{key}")),
-    )
+    let removable = keeps_an_owner(&rest);
+    line.child(confirm(
+        format!("member-remove-{key}"),
+        &key,
+        ("Remove", "Confirm remove"),
+        removable,
+        Action::PutMembers {
+            slug: team.slug.clone(),
+            members: rest,
+        },
+        app,
+        p,
+    ))
 }
 
 fn add_member(team: &Team, app: &App, p: &Paint) -> El {
