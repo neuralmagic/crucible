@@ -169,7 +169,7 @@ impl Db {
         )
         .await?;
         // Re-export the spend the moment it's booked: `kind` is the cost_tag (a bounded set —
-        // rank/rank-grounded/scope/run/capped), so this stays low-cardinality.
+        // rank/rank-grounded/scope/run/capped/draft), so this stays low-cardinality.
         if let Some(m) = &self.metrics {
             m.record_spend(kind, cost_usd);
         }

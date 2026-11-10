@@ -96,6 +96,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::get_playbook_draft_diff,
         crate::playbooks::api::drafts::get_playbook_draft_tarball,
         crate::playbooks::api::drafts::save_playbook_draft,
+        crate::playbooks::api::drafts::generate_playbook_draft,
         crate::playbooks::api::drafts::delete_playbook_draft,
         crate::playbooks::api::drafts::rename_playbook_draft,
         crate::playbooks::api::drafts::clone_playbook_draft,
@@ -277,6 +278,8 @@ pub(crate) mod tests;
         crate::playbooks::api::import::PackImportDto,
         crate::playbooks::api::drafts::CreateDraftBody,
         crate::playbooks::api::drafts::SaveDraftBody,
+        crate::playbooks::api::drafts::GenerateDraftBody,
+        crate::playbooks::api::drafts::GeneratedDraftDto,
         crate::playbooks::api::drafts::LaunchDraftBody,
         crate::playbooks::api::drafts::GraduateDraftBody,
         crate::playbooks::api::drafts::GraduateAck,
@@ -537,6 +540,9 @@ pub fn router(state: ApiState) -> Router {
                 ),
             ),
         )
+        .routes(routes!(
+            crate::playbooks::api::drafts::generate_playbook_draft
+        ))
         .routes(routes!(
             crate::playbooks::api::drafts::rename_playbook_draft
         ))
