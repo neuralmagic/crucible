@@ -102,6 +102,14 @@ RUN curl -fsSL "https://github.com/nushell/nushell/releases/download/${NU_VERSIO
 
 # crucible (engine) + crucible-broker + forge bins on PATH (staged by docker.yml).
 COPY prebuilt/bin/ /usr/local/bin/
+# crucible_kueue, the client a pack's command and evaluate tasks import to reach crucible-kueue
+# (staged by scripts/crucible-kueue-py-stage.sh into prebuilt/python/ before this build).
+COPY prebuilt/python/ /opt/crucible/python/
+RUN site="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" \
+    && mkdir -p "$site" \
+    && cp -r /opt/crucible/python/crucible_kueue "$site/" \
+    && rm -rf /opt/crucible/python \
+    && python3 -c 'import crucible_kueue'
 RUN test "$(crucible --contract-version)" = "${CONTRACT_VERSION}" \
     || { echo "io.crucible.contract-version=${CONTRACT_VERSION} does not match the shipped binary ($(crucible --contract-version))" >&2; exit 1; }
 

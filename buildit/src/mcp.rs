@@ -4744,17 +4744,24 @@ mod tests {
         assert!(e.contains("failed (exit"), "{e}");
         let args = serde_json::json!({
             "build_id": id,
-            "cmd": ["sh", "-c", "echo out-1; exit 5"],
-            "fetch_paths": ["/out/a.txt", "/nope"],
+            "cmd": ["sh", "-c", "echo out-1; mkdir -p /made && echo made > /made/new.txt; exit 5"],
+            "fetch_paths": ["/out/a.txt", "/made", "/nope"],
         });
         let ran = a("run", args).await.unwrap();
         assert_eq!(ran["exit"], 5, "{ran}");
         assert_eq!(ran["log"], "run:1");
         assert!(ran["log_tail"].as_str().unwrap().contains("out-1"), "{ran}");
         let fetched = format!(".buildit/{id}/out/a.txt");
-        assert_eq!(ran["fetched"], serde_json::json!([fetched]));
+        let made = format!(".buildit/{id}/made/new.txt");
+        assert_eq!(
+            ran["fetched"],
+            serde_json::json!([fetched, made]),
+            "a path the command creates is fetched like one the image had"
+        );
         let body = std::fs::read_to_string(work.join(&fetched)).unwrap();
         assert_eq!(body, "artifact\n");
+        let body = std::fs::read_to_string(work.join(&made)).unwrap();
+        assert_eq!(body, "made\n");
 
         let args = serde_json::json!({ "build_id": id, "grep": "^hello-from-build$" });
         let grep = a("logs", args).await.unwrap();

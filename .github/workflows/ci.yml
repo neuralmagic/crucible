@@ -31,12 +31,12 @@ env:
   CARGO_NET_RETRY: "10"
 
 jobs:
-  # Same-repo refs get the org's beefy self-hosted runners (32-core, sccache in S3, baked
-  # toolchain); fork PRs MUST stay on hosted runners — self-hosted instances carry an IAM role,
-  # and this is a public repo.
+  # Same-repo refs and fork PRs from org members get the org's beefy self-hosted runners (32-core,
+  # sccache in S3, baked toolchain); other fork PRs MUST stay on hosted runners — self-hosted
+  # instances carry an IAM role, and this is a public repo.
   test-all-features:
-    timeout-minutes: 40
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    timeout-minutes: 80
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -176,7 +176,7 @@ jobs:
   # Formatting, guards, clippy, and generated docs; beside the test jobs, fmt first.
   lint:
     timeout-minutes: 20
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -300,8 +300,8 @@ jobs:
   # The default-feature build's tests. Vault and Keycloak suites skip here;
   # test-all-features runs them.
   test-default-features:
-    timeout-minutes: 30
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -342,7 +342,7 @@ jobs:
   # the required check until it has a flake-free record.
   kind-e2e:
     timeout-minutes: 45
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -399,8 +399,35 @@ jobs:
         run: docker rm -f "$PG_CONTAINER" || true
 
   # The required check: green only when every job it needs is.
+  # The crucible_kueue Python client, staged as the runtime image ships it, against the real
+  # crucible-kueue router (crucible-kueue-client's serve example).
+  kueue-python:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          components: rustfmt, clippy
+      - name: Format and lint the extension crate
+        working-directory: crucible-kueue-py
+        run: |
+          cargo fmt --check
+          PYO3_BUILD_EXTENSION_MODULE=1 cargo clippy --locked -- -D warnings
+      - name: Stage the package
+        run: PROFILE=dev scripts/crucible-kueue-py-stage.sh "$RUNNER_TEMP/python"
+      - name: Test against the real router
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet 'pytest>=8'
+          PYTHONPATH="$RUNNER_TEMP/python" "$RUNNER_TEMP/venv/bin/python" -m pytest -q crucible-kueue-py/tests
+
   build-and-test:
-    needs: [lint, test-all-features, test-default-features, ui, audit]
+    needs: [lint, test-all-features, test-default-features, ui, audit, kueue-python]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -409,13 +436,14 @@ jobs:
             [ "${{ needs.test-all-features.result }}" = success ] &&
             [ "${{ needs.test-default-features.result }}" = success ] &&
             [ "${{ needs.ui.result }}" = success ] &&
-            [ "${{ needs.audit.result }}" = success ]
+            [ "${{ needs.audit.result }}" = success ] &&
+            [ "${{ needs.kueue-python.result }}" = success ]
 
   # The controller SPA, independent of the Rust build. The package pre-hooks regenerate the
   # OpenAPI spec (from the controller's own bin) and the typed client before check/test/build.
   ui:
     timeout-minutes: 15
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:

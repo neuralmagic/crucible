@@ -326,7 +326,7 @@ pub(crate) enum PlanAction {
         /// The harness every agent task runs, replacing the manifest's `[agent].harness`. A task
         /// that pins its own harness keeps it. Only a `--manifest` run has an agent to replace.
         #[arg(long, value_enum, requires = "manifest")]
-        harness: Option<crate::manifest::Harness>,
+        harness: Option<crate::knobs::Harness>,
         /// The model every agent task asks for, replacing the manifest's `[agent].model`. A task
         /// that pins its own model keeps it.
         #[arg(long, requires = "manifest")]
@@ -477,7 +477,7 @@ pub(crate) struct RenderTurnArgs {
     /// The agent harness the in-pod turn runs, forwarded as `--harness …`. Absent = the in-pod
     /// engine's own default.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// The model the in-pod turn runs, forwarded as `--model …`. Absent = the model the in-pod
     /// engine derives from its harness.
     #[arg(long)]
@@ -590,7 +590,7 @@ pub(crate) struct DeployArgs {
     /// The agent harness the rendered loop runs, emitted as the wrapper's `--harness=…`. Absent =
     /// the manifest's `[agent].harness`.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// The model the rendered loop runs, emitted as the wrapper's `--model=…`. Absent = the model
     /// the loop derives from its harness.
     #[arg(long)]

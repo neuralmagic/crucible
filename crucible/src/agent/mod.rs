@@ -74,7 +74,7 @@ pub(crate) fn supports_persistent_sessions(args: &Args) -> bool {
 /// Capability predicate used by runtime admission and scope preview.
 pub(crate) fn backend_supports_persistent_sessions(
     backend: AgentBackend,
-    harness: crate::manifest::Harness,
+    harness: crate::knobs::Harness,
 ) -> bool {
     backend == AgentBackend::Command || harness.spec().persistent_sessions
 }

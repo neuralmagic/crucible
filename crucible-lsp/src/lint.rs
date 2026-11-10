@@ -114,6 +114,7 @@ fn starlark_lints(module: &AstModule, cx: &LintContext<'_>) -> Vec<Finding> {
                 at: At::Bytes(bytes(lint.location.span)),
                 severity,
                 unnecessary: UNNECESSARY.contains(&lint.short_name.as_str()),
+                deprecated: false,
                 code: lint.short_name,
                 origin: Origin::Starlark,
                 message: lint.problem,
@@ -142,7 +143,11 @@ impl Lints<'_> {
             code: code.to_owned(),
             origin: Origin::Crucible,
             message,
-            unnecessary: code == "redundant-default" || code == "unused-param",
+            unnecessary: matches!(
+                code,
+                "redundant-default" | "unused-param" | "implied-dependency"
+            ),
+            deprecated: code == "deprecated-argument",
         });
     }
 
@@ -187,6 +192,8 @@ impl Lints<'_> {
             }
             self.wrong_lane(call);
             self.unknown_arguments(call);
+            self.deprecated_arguments(call);
+            self.implied_dependencies(call);
             self.redundant_defaults(call);
             self.pack_files(call);
             self.sandbox(call);
@@ -240,10 +247,72 @@ impl Lints<'_> {
         }
     }
 
+    fn implied_dependencies(&mut self, call: &Call) {
+        let Some(ValueKind::List(entries)) = call.kwarg("depends_on").map(|d| &d.kind) else {
+            return;
+        };
+        let implied: Vec<_> = self
+            .index
+            .implied_entries(call)
+            .into_iter()
+            .map(|(position, name, argument)| {
+                (
+                    entries[position].span.clone(),
+                    format!("`{argument}` already makes `{name}` a dependency"),
+                )
+            })
+            .collect();
+        for (at, message) in implied {
+            self.push(at, DiagnosticSeverity::HINT, "implied-dependency", message);
+        }
+    }
+
+    fn deprecated_arguments(&mut self, call: &Call) {
+        let Some(function) = self.cx.reference.function(&call.callee) else {
+            return;
+        };
+        let deprecated: Vec<_> = call
+            .args
+            .iter()
+            .filter_map(|arg| arg.name.as_ref())
+            .filter_map(|(name, at)| {
+                let kwarg = function.kwargs.iter().find(|k| k.name == name)?;
+                let replacement = kwarg.replaced_by?;
+                Some((
+                    at.clone(),
+                    format!("`{name}` is deprecated; write `{replacement}`"),
+                ))
+            })
+            .collect();
+        for (at, message) in deprecated {
+            self.push(
+                at,
+                DiagnosticSeverity::WARNING,
+                "deprecated-argument",
+                message,
+            );
+        }
+    }
+
+    /// Whether `required` may have another default here: the file's `workflow()` sets
+    /// `defaults`, or the file is a module some other file's `workflow()` lists.
+    fn required_may_be_defaulted(&self) -> bool {
+        let mut workflows = self
+            .index
+            .calls
+            .iter()
+            .filter(|call| call.callee == "workflow" && self.is_constructor(call))
+            .peekable();
+        workflows.peek().is_none() || workflows.any(|call| call.kwarg("defaults").is_some())
+    }
+
     fn redundant_defaults(&mut self, call: &Call) {
         let mut found = Vec::new();
+        let required_defaulted = self.required_may_be_defaulted();
         for (functions, kwarg, default) in DEFAULTS {
-            if !functions.contains(&call.callee.as_str()) {
+            if !functions.contains(&call.callee.as_str())
+                || (*kwarg == "required" && required_defaulted)
+            {
                 continue;
             }
             let Some(arg) = call
@@ -525,6 +594,81 @@ mod tests {
     }
 
     #[test]
+    fn a_deprecated_argument_names_what_replaces_it() {
+        let fixture = fixture();
+        let source = "s = command(name = \"s\", run = \"true\", emits = [\"items\"])\n\
+                      g = route(name = \"g\", min_confidence = 0.8, depends_on = [s], questions = {\"q\": noul(ask = \"?\")})\n\
+                      a = command(name = \"a\", run = \"true\", depends_on = [s, g], over = s.items, max_fanout = 4, when = g.q, answers = \"yes\")\n\
+                      e = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", revise = a, max_rounds = 2)\n\
+                      k = top_k(name = \"k\", k = 1, direction = \"lower\", depends_on = [e])\n\
+                      workflow(type = \"custom\", tasks = [s, g, a, e, k])\n";
+        let found = lint(&fixture, source, None);
+        let deprecated = coded(&found, "deprecated-argument");
+        let names: Vec<_> = deprecated.iter().map(|f| covered(source, f)).collect();
+        assert_eq!(
+            names,
+            [
+                "min_confidence",
+                "max_fanout",
+                "answers",
+                "direction",
+                "max_rounds"
+            ]
+        );
+        assert!(
+            deprecated
+                .iter()
+                .all(|f| f.deprecated && f.severity == DiagnosticSeverity::WARNING)
+        );
+        assert_eq!(
+            deprecated[1].message,
+            "`max_fanout` is deprecated; write `over = each(producer.field, max = N)`"
+        );
+
+        let current = "s = command(name = \"s\", run = \"true\", emits = [\"items\"])\n\
+                       g = route(name = \"g\", decider = model(min_confidence = 0.8), depends_on = [s], questions = {\"q\": noul(ask = \"?\")})\n\
+                       a = command(name = \"a\", run = \"true\", depends_on = [s, g], over = each(s.items, max = 4), when = g.q.any_of(\"yes\"))\n\
+                       e = evaluate(name = \"e\", run = \"true\", threshold = at_least(1), revise = send_back(a, rounds = 2))\n\
+                       workflow(type = \"custom\", tasks = [s, g, a, e])\n";
+        assert!(coded(&lint(&fixture, current, None), "deprecated-argument").is_empty());
+    }
+
+    #[test]
+    fn a_dependency_another_argument_names_is_flagged_as_implied() {
+        let fixture = fixture();
+        let source = "scan = command(name = \"scan\", run = \"true\", emits = {\"items\": \"list\", \"facts\": \"object\", \"ok\": \"boolean\"})\n\
+                      gate = route(name = \"gate\", decider = output(scan), depends_on = [scan], questions = {\"q\": noul(ask = \"?\")})\n\
+                      ask = route(name = \"ask\", decider = human(), depends_on = [scan], questions = {\"n\": pick(ask = \"?\", source = scan.items)})\n\
+                      fan = command(name = \"fan\", run = \"true\", depends_on = [scan, gate], over = each(scan.items, max = 4), when = gate.q.any_of(\"yes\"))\n\
+                      key = command(name = \"key\", run = \"true\", depends_on = [gate, scan], over = each(gate.n, max = 2), keyed = [scan.facts])\n\
+                      read = command(name = \"read\", run = \"true\", depends_on = [scan, fan, optional(gate)], when = scan.ok)\n\
+                      workflow(type = \"playbook\", tasks = [scan, gate, ask, fan, key, read])\n";
+        let found = lint(&fixture, source, None);
+        let implied = coded(&found, "implied-dependency");
+        let said: Vec<_> = implied
+            .iter()
+            .map(|f| (covered(source, f), f.message.as_str()))
+            .collect();
+        assert_eq!(
+            said,
+            [
+                ("scan", "`decider` already makes `scan` a dependency"),
+                ("scan", "`questions` already makes `scan` a dependency"),
+                ("scan", "`over` already makes `scan` a dependency"),
+                ("gate", "`when` already makes `gate` a dependency"),
+                ("gate", "`over` already makes `gate` a dependency"),
+                ("scan", "`keyed` already makes `scan` a dependency"),
+            ],
+            "a field read by `when` and an optional() entry are not implied"
+        );
+        assert!(
+            implied
+                .iter()
+                .all(|f| f.unnecessary && f.severity == DiagnosticSeverity::HINT)
+        );
+    }
+
+    #[test]
     fn a_shadowed_constructor_is_not_checked_as_the_constructor() {
         let fixture = fixture();
         let source = "def agent(**kw):\n    return kw\nx = agent(anything = 1)\n";
@@ -546,6 +690,24 @@ mod tests {
                 .iter()
                 .all(|f| f.unnecessary && f.severity == DiagnosticSeverity::HINT)
         );
+    }
+
+    #[test]
+    fn required_is_not_redundant_where_task_defaults_may_change_it() {
+        let fixture = fixture();
+        let task = "a = command(name = \"a\", run = \"x\", required = True, join = \"all\")\n";
+        for rest in [
+            "workflow(type = \"playbook\", tasks = [a], defaults = task_defaults(required = False))\n",
+            "",
+        ] {
+            let source = format!("{task}{rest}");
+            let found = lint(&fixture, &source, None);
+            let spans: Vec<_> = coded(&found, "redundant-default")
+                .iter()
+                .map(|f| covered(&source, f))
+                .collect();
+            assert_eq!(spans, ["join = \"all\""], "{rest}");
+        }
     }
 
     #[test]

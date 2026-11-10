@@ -3,7 +3,7 @@
 //! preview surfaces, the launch endpoints and the reconcile-side dispatch alike.
 use std::collections::BTreeMap;
 
-use crucible::manifest::Harness;
+use crucible::knobs::Harness;
 use crucible_capability::{Unsatisfied, unsatisfied};
 use serde::Serialize;
 use utoipa::ToSchema;
@@ -420,7 +420,7 @@ pub fn rank(
 mod tests {
     use std::collections::BTreeMap;
 
-    use crucible::manifest::Harness;
+    use crucible::knobs::Harness;
     use crucible_capability::{CAPABILITIES_SCHEMA, CapabilityDoc};
 
     use crate::images::model::CatalogImage;

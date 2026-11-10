@@ -1174,6 +1174,7 @@ pub(crate) async fn launch_playbook_draft(
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
     let title = format!("draft {id}: {}", head.draft.description);
     let launch = crate::launches::model::NewPlaybookLaunch {
+        choice_snapshots: Some(&authorized.choice_snapshots),
         playbook: &id,
         repo: head.target().launch_repo(),
         title: &title,

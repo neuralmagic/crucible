@@ -271,6 +271,7 @@ async fn authorize_watch(
         .map_err(invalid_fields)?;
     Ok((
         AuthorizedLaunch {
+            choice_snapshots: serde_json::json!({}),
             pack,
             params,
             max_cost: body.max_cost,

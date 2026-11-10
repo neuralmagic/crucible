@@ -313,7 +313,7 @@ async fn start_local(
                 dispatch: RunDispatch::Local,
                 location: &RunLocation::hub(),
                 work_pod: None,
-                stamp_dispatcher: cfg.issues_agent_tokens(),
+                stamp_dispatcher: cfg.issues_run_tokens(),
             },
         )
         .await?;

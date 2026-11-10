@@ -61,8 +61,9 @@ pub enum ConfigError {
     #[error("CONTROLLER_AGENT_SPIRE names no cluster's SPIRE")]
     NoSpire,
     #[error(
-        "CONTROLLER_AGENT_ISSUER is set but neither CONTROLLER_AGENT_SPIRE (agent tokens) nor \
-         a deploy profile server with `people = true` (people's tokens) says whom it issues to"
+        "CONTROLLER_AGENT_ISSUER is set but nothing says whom it issues to: \
+         CONTROLLER_AGENT_SPIRE (sandboxes), a deploy profile server outside the loop pod (runs' \
+         tasks), or one with `people = true` (people)"
     )]
     NoRecipients,
     #[error("CONTROLLER_AGENT_SPIRE names {0:?} twice; each cluster and each SVID issuer once")]
@@ -155,6 +156,8 @@ impl fmt::Debug for SigningKey {
 /// An MCP resource a token may be minted for, and the scopes a token for it may carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audience {
+    /// The server's name, as a pack names it in `[workflow].servers`.
+    pub server: String,
     /// The resource URL, compared to the requested `audience` as an exact string.
     pub resource: String,
     /// The cluster whose runs get tokens for it. The same URL on another cluster is another
@@ -163,6 +166,9 @@ pub struct Audience {
     pub scopes: Vec<String>,
     /// The namespaces a token names, the first as the default.
     pub namespaces: Vec<String>,
+    /// Whether its tokens need no sandbox, so a task may hold one: the server runs outside the
+    /// loop pod.
+    pub remote: bool,
 }
 
 impl Audience {
@@ -170,10 +176,12 @@ impl Audience {
     /// needs, as the deploy profile describes it.
     pub fn of(server: &ServerSpec) -> impl Iterator<Item = Audience> + '_ {
         server.clusters.iter().map(|cluster| Audience {
+            server: server.name.to_string(),
             resource: server.url.clone(),
             cluster: cluster.clone(),
             scopes: server.scopes.clone(),
             namespaces: server.namespaces.clone(),
+            remote: matches!(server.hosting, crucible::deploy::servers::Hosting::Remote),
         })
     }
 
@@ -349,6 +357,15 @@ pub struct Sandbox {
     pub id: SandboxId,
 }
 
+/// A loop pod a verified JWT-SVID names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPodId {
+    /// The cluster whose SPIRE issued the SVID.
+    pub cluster: String,
+    pub pod: String,
+    pub spiffe_id: String,
+}
+
 /// An OpenShell gateway id: a DNS-1123 label, the `openshell.ai/gateway-id` label value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayId(String);
@@ -399,6 +416,8 @@ pub enum AssertionError {
     Audience { expected: String, got: Value },
     #[error("assertion sub {sub:?} is not <gateway>/sandbox/<id> under {prefix}")]
     NotASandbox { sub: String, prefix: String },
+    #[error("assertion sub {sub:?} is not {prefix}<pod name>")]
+    NotARunPod { sub: String, prefix: String },
     #[error(transparent)]
     GatewayId(#[from] GatewayIdError),
     #[error("assertion has no numeric iat")]
@@ -440,6 +459,23 @@ pub enum GrantError {
     },
     #[error("run {run_id} records nobody it was dispatched for")]
     NoLauncher { run_id: String },
+    #[error("audience {audience:?} runs in the loop pod and takes tokens from sandboxes only")]
+    NotForTasks { audience: String },
+    #[error(
+        "run {run_id}'s pack does not name {server} in [workflow].servers, so its tasks get no \
+         token for it"
+    )]
+    NotDeclared { run_id: String, server: String },
+    #[error(
+        "the SVID names pod {svid_pod} on cluster {svid_cluster}, not the run's pod {pod} on \
+         {cluster}"
+    )]
+    NotTheRunsPod {
+        svid_pod: String,
+        svid_cluster: String,
+        pod: String,
+        cluster: String,
+    },
 }
 
 /// The `sub` of a run's token: whoever asked for the dispatch, else the launch's owner, without a
@@ -520,10 +556,18 @@ impl RunIdentity {
     }
 }
 
+/// Who presents a run's token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Actor {
+    Sandbox(Sandbox),
+    /// A command or evaluate task in the run's pod, as the engine named it.
+    Task(String),
+}
+
 /// Everything a minted token says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentGrant {
-    pub sandbox: Sandbox,
+    pub actor: Actor,
     pub launcher: String,
     /// The run's Kubernetes identity, for the `kube_user` and `kube_groups` claims.
     pub kube: RunIdentity,
@@ -700,16 +744,15 @@ impl AgentIssuer {
         Some(fresh)
     }
 
-    /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against the keys
-    /// of the cluster SPIRE its `iss` names, carry exactly one `aud` equal to this issuer, and
-    /// name a SPIFFE ID `<that cluster's gateway prefix><gateway id>/sandbox/<sandbox id>`.
-    pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
+    /// The SPIRE that signed the JWT-SVID `assertion`, and its subject. The SVID must verify
+    /// against the keys of the cluster SPIRE its `iss` names, carry exactly one `aud` equal to
+    /// this issuer, and live no longer than [`MAX_SVID_LIFETIME_SECS`].
+    async fn svid(&self, assertion: &str) -> Result<(Arc<TrustedSpire>, String), AssertionError> {
         let issuer = self.issuer.as_str();
         let claimed = unverified_issuer(assertion)?;
         let trusted = self
             .spire_of(&claimed)
             .ok_or(AssertionError::UnknownSpire(claimed))?;
-        let spire = &trusted.spire;
         let claims = trusted.svids.verify(assertion, &[issuer]).await?;
         let aud = claims.get("aud").cloned().unwrap_or(Value::Null);
         let single = match &aud {
@@ -743,7 +786,17 @@ impl AgentIssuer {
         let sub = claims
             .get("sub")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
+        Ok((trusted, sub))
+    }
+
+    /// The sandbox a JWT-SVID client assertion identifies: one naming a SPIFFE ID
+    /// `<its cluster's gateway prefix><gateway id>/sandbox/<sandbox id>`.
+    pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
+        let (trusted, sub) = self.svid(assertion).await?;
+        let spire = &trusted.spire;
+        let sub = sub.as_str();
         let not_a_sandbox = || AssertionError::NotASandbox {
             sub: sub.to_string(),
             prefix: spire.gateway_prefix.as_str().to_string(),
@@ -757,6 +810,26 @@ impl AgentIssuer {
             gateway: GatewayId::parse(gateway)?,
             id: SandboxId::parse(id)?,
         })
+    }
+
+    /// The cluster and name of the loop pod a JWT-SVID identifies: one naming a SPIFFE ID
+    /// `spiffe://<its cluster's trust domain>/crucible/run/<pod name>`.
+    pub async fn run_pod(&self, assertion: &str) -> Result<RunPodId, AssertionError> {
+        let (trusted, sub) = self.svid(assertion).await?;
+        let spire = &trusted.spire;
+        let prefix = format!(
+            "spiffe://{}/{}",
+            spire.gateway_prefix.trust_domain(),
+            crucible_contract::task_servers::RUN_SPIFFE_PATH
+        );
+        match sub.strip_prefix(prefix.as_str()) {
+            Some(pod) if !pod.is_empty() && !pod.contains('/') => Ok(RunPodId {
+                cluster: spire.cluster.clone(),
+                pod: pod.to_string(),
+                spiffe_id: sub.clone(),
+            }),
+            _ => Err(AssertionError::NotARunPod { sub, prefix }),
+        }
     }
 
     /// The requested audience, when it is an MCP resource allowlisted for runs on `cluster`.
@@ -791,6 +864,12 @@ impl AgentIssuer {
     pub fn mint(&self, grant: &AgentGrant, now: u64) -> Result<Minted, MintError> {
         let jti = token_id()?;
         let scope = grant.scopes.join(" ");
+        let actor = match &grant.actor {
+            Actor::Sandbox(sandbox) => sandbox.spiffe_id.clone(),
+            Actor::Task(task) => {
+                crucible_contract::task_servers::task_actor(&grant.run.pod_name, task)
+            }
+        };
         let mut claims = json!({
             "iss": self.issuer.as_str(),
             "sub": grant.launcher,
@@ -799,7 +878,7 @@ impl AgentIssuer {
             "nbf": now,
             "exp": now.saturating_add(self.ttl.secs()),
             "jti": jti,
-            "act": {"sub": grant.sandbox.spiffe_id},
+            "act": {"sub": actor},
             "run_id": grant.run.pod_name,
             "kube_cluster": grant.run.cluster,
             "scope": scope,
@@ -873,6 +952,11 @@ impl AgentIssuer {
                 .push("private_key_jwt");
             metadata.token_endpoint_auth_signing_alg_values_supported =
                 crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec();
+        }
+        if self.audiences.iter().any(|a| a.remote) {
+            metadata
+                .grant_types_supported
+                .push(crucible_contract::task_servers::TOKEN_EXCHANGE_GRANT);
         }
         if let Some(people) = people {
             metadata.client_id_metadata_document_supported = people.client_id_metadata_documents;
@@ -1407,13 +1491,13 @@ mod tests {
 
     fn grant(namespaces: &[&str]) -> AgentGrant {
         AgentGrant {
-            sandbox: Sandbox {
+            actor: Actor::Sandbox(Sandbox {
                 spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
                 cluster: CLUSTER.into(),
                 tenant: None,
                 gateway: GatewayId::of_run_pod(POD),
                 id: crate::agent_auth::sandbox::SandboxId::parse("sbx-1").unwrap(),
-            },
+            }),
             launcher: "alice".into(),
             kube: RunIdentity::of(POD, Some("team:ml")),
             run: run(Some("user:alice"), Some("team:ml")),
@@ -1586,7 +1670,14 @@ mod tests {
         assert_eq!(doc["issuer"], ISSUER);
         assert_eq!(doc["token_endpoint"], format!("{ISSUER}/oauth/token"));
         assert_eq!(doc["jwks_uri"], format!("{ISSUER}/.well-known/jwks.json"));
-        assert_eq!(doc["grant_types_supported"], json!(["client_credentials"]));
+        assert_eq!(
+            doc["grant_types_supported"],
+            json!([
+                "client_credentials",
+                "urn:ietf:params:oauth:grant-type:token-exchange"
+            ]),
+            "sandboxes by their SVIDs, and runs' tasks by their pod tokens"
+        );
         assert_eq!(
             doc["scopes_supported"],
             json!([

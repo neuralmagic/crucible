@@ -42,6 +42,8 @@ pub(crate) struct NewPlaybookLaunch<'a> {
     pub rerun: Option<&'a RerunOf>,
     /// Where the launch dispatches and with which model, written with the launch row.
     pub dispatch: DispatchPin<'a>,
+    /// The `{param: {run_id, digest}}` choice snapshots admission validated against (ADR-0074).
+    pub choice_snapshots: Option<&'a serde_json::Value>,
 }
 
 /// The cluster and the provider/model a launch dispatches with. Written in the transaction that

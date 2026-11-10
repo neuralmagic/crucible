@@ -1527,7 +1527,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crucible"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "allocative",
  "anyhow",
@@ -1562,6 +1562,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_norway",
+ "spiffe",
  "starlark",
  "starlark_syntax",
  "tar",
@@ -1582,7 +1583,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-broker"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1610,7 +1611,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-contract"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -1625,7 +1626,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-harness"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "axum",
  "crucible-contract",
@@ -1638,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-playbooks"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1648,6 +1649,7 @@ dependencies = [
  "crux",
  "futures-util",
  "jiff",
+ "keyring",
  "libc",
  "rand 0.10.3",
  "reqwest",
@@ -1672,7 +1674,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-vcs"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "git2",
@@ -1687,7 +1689,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2730,7 +2732,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -8937,6 +8939,32 @@ checksum = "94bf565ee1681b4473aa5a9d71d807347c28021bd1d8947cb626b02f42a0141f"
 dependencies = [
  "itertools 0.14.0",
  "quickcheck",
+]
+
+[[package]]
+name = "spiffe"
+version = "0.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bb3330f98f1b0c56c42e8d25f4793b242ffd2df57cb21d0cfdd8dfc24cc444b8"
+dependencies = [
+ "arc-swap",
+ "base64ct",
+ "fastrand",
+ "futures",
+ "hyper-util",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tower",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

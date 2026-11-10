@@ -96,6 +96,8 @@ changed = [
     "C-COMMANDS: a manifest's top-level edition decides what host commands receive; edition 1, the default, inherits the engine's environment, warns, and refuses an env list at parse; edition 2 is the declared allowlist; an edition the engine does not support fails the parse",
     "C-CAPABILITY-DISCLOSURE: under edition 1, each table whose host commands run is disclosed as holding the engine's whole environment",
     "C-COMMANDS: the edition-2 base adds the run's identity, CRUCIBLE_RUN_NAME, CRUCIBLE_RUN_DISPLAY_NAME, and CRUCIBLE_UI_BASE_URL; the pod token and the controller URL reach a command only by declaration",
+    "C-COMMANDS: [workflow].servers gives workflow command and evaluate tasks CRUCIBLE_TASK_SERVERS: each named server's URL and a file holding a token the engine keeps valid for that task",
+    "C-CAPABILITY-DISCLOSURE: the servers [workflow].servers names are disclosed as reach the pack's commands hold as the run",
     "C-COMMANDS: [agent.broker].tasks hands workflow command and evaluate tasks the broker as CRUCIBLE_BROKER_URL and BROKER_TOKEN",
     "C-CAPABILITY-DISCLOSURE: broker reach granted to workflow tasks is disclosed with the broker's address",
 ]

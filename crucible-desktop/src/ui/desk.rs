@@ -52,7 +52,7 @@ pub(crate) fn frame(
 
 /// The newest action's outcome, or a spinner while one is on its way.
 fn outcome(app: &App, p: &Paint) -> Option<El> {
-    if app.desk.busy() {
+    if app.remote.desk.busy() {
         return Some(
             row()
                 .key("outcome")
@@ -66,7 +66,7 @@ fn outcome(app: &App, p: &Paint) -> Option<El> {
                 ),
         );
     }
-    match app.desk.outcome.as_ref()? {
+    match app.remote.desk.outcome.as_ref()? {
         Ok(what) => Some(
             text(what.clone())
                 .key("outcome")

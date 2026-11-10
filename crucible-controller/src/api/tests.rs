@@ -12790,7 +12790,7 @@ async fn every_launch_surface_agrees_on_what_a_provider_pin_means(pool: PgPool) 
     )
     .await?
     .expect("the pin resolves");
-    assert_eq!(resolved.harness, crucible::manifest::Harness::Codex);
+    assert_eq!(resolved.harness, crucible::knobs::Harness::Codex);
     assert_eq!(resolved.model, "gpt-5.6-luna");
     let (status, view) = get_json_value(
         &app,

@@ -42,6 +42,7 @@ pub enum Verdict {
     Valid,
     Invalid,
     Error,
+    Cancelled,
 }
 
 impl Verdict {
@@ -53,6 +54,7 @@ impl Verdict {
             Verdict::Valid => "Valid",
             Verdict::Invalid => "Invalid",
             Verdict::Error => "Error",
+            Verdict::Cancelled => "Cancelled",
         }
     }
 
@@ -319,7 +321,7 @@ impl Pack {
         let started = dir.join(RUN_START).is_file();
         let files = PackFiles::read_dir(&dir);
         Some(Pack {
-            workflow: workflow.clone(),
+            workflow,
             manifest: manifest_path
                 .strip_prefix(repo)
                 .unwrap_or(&manifest_path)

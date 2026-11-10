@@ -44,6 +44,8 @@ pub enum Capability {
     /// The broker the workflow's `command` and `evaluate` tasks reach, and so every agent that can
     /// edit a script they run.
     TaskBroker { url: String },
+    /// The run's MCP servers the workflow's `command` and `evaluate` tasks reach as the run.
+    TaskServers { names: Vec<String> },
     /// What of the engine's environment a manifest table's commands outside the sandbox hold.
     HostEnv {
         table: String,
@@ -147,6 +149,11 @@ pub fn capabilities(m: &Manifest) -> Vec<Capability> {
     if m.agent.broker.enabled && m.agent.broker.tasks {
         out.push(Capability::TaskBroker {
             url: crate::manifest::resolve_broker_url(&m.agent.broker, "127.0.0.1"),
+        });
+    }
+    if let Some(workflow) = m.workflow.as_ref().filter(|w| !w.servers.is_empty()) {
+        out.push(Capability::TaskServers {
+            names: workflow.servers.iter().map(ToString::to_string).collect(),
         });
     }
     out.extend(host_env(m));
@@ -541,6 +548,10 @@ fn render_capability(cap: &Capability) -> String {
             "task-broker [workflow] command and evaluate tasks reach the broker at {url} with its \
              token, so every agent in the run can through a script they run"
         ),
+        Capability::TaskServers { names } => format!(
+            "task-servers [workflow] command and evaluate tasks reach {} as the run",
+            names.join(", ")
+        ),
         Capability::HostEnv {
             table,
             reach: HostReach::Inherited,
@@ -813,6 +824,40 @@ mod tests {
             [Capability::TaskBroker {
                 url: "http://127.0.0.1:8849/mcp".into()
             }]
+        );
+    }
+
+    #[test]
+    fn servers_for_workflow_tasks_are_disclosed_only_when_declared() {
+        let workflow = |servers: &str| {
+            manifest(&format!(
+                "{OPENSHELL}
+                [workflow]
+                {servers}
+                [[workflow.task]]
+                name = \"probe\"
+                kind = \"command\"
+                command = \"./probe.py\"
+                "
+            ))
+        };
+        let task_servers = |m: &Manifest| {
+            capabilities(m)
+                .into_iter()
+                .filter(|c| matches!(c, Capability::TaskServers { .. }))
+                .collect::<Vec<_>>()
+        };
+        assert!(task_servers(&workflow("")).is_empty());
+        let declared = workflow("servers = [\"kueue\"]");
+        assert_eq!(
+            task_servers(&declared),
+            [Capability::TaskServers {
+                names: vec!["kueue".into()]
+            }]
+        );
+        assert_eq!(
+            render_capability(&task_servers(&declared)[0]),
+            "task-servers [workflow] command and evaluate tasks reach kueue as the run"
         );
     }
 

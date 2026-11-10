@@ -809,7 +809,7 @@ pub(crate) async fn dispatch_run(
                     cost_tag: WorkKind::Run.cost_tag().to_string(),
                     cluster: cluster.clone(),
                 }),
-                stamp_dispatcher: cfg.issues_agent_tokens(),
+                stamp_dispatcher: cfg.issues_run_tokens(),
             },
         )
         .await?;
@@ -886,6 +886,17 @@ pub(crate) async fn dispatch_run(
             )
                 .await
                 .context("recording the run's agent tools")?;
+        }
+        if let Some(endpoint) = crate::runs::workpod::agent_servers::task_endpoint(cfg)?
+            && let Some(access) = crate::runs::workpod::agent_servers::task_access(
+                &agent_servers,
+                &cluster,
+                &endpoint,
+            )?
+        {
+            delivery.merge(access).map_err(|e| {
+                anyhow::anyhow!("folding the task servers' access into the run's: {e}")
+            })?;
         }
         if crate::runs::workpod::git_sidecar::granted(&delivery)?.is_some() {
             for var in delivery.absorb_github()? {

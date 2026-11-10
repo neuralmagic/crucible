@@ -63,6 +63,9 @@ pub struct ShellRunner {
     /// The run's broker, exported to command and evaluate tasks as [`BROKER_URL_ENV`] and
     /// [`BROKER_TOKEN_ENV`].
     pub broker: Option<TaskBroker>,
+    /// The MCP servers command and evaluate tasks reach with the tokens in their files, exported
+    /// as [`crucible_contract::task_servers::ENV_TASK_SERVERS`].
+    pub task_servers: Vec<crucible_contract::task_servers::TaskServer>,
 }
 
 impl TaskRunner for ShellRunner {
@@ -127,6 +130,7 @@ impl ShellRunner {
         cmd.env_remove(BUILDIT_SOCKET_ENV);
         cmd.env_remove(BROKER_URL_ENV);
         cmd.env_remove(BROKER_TOKEN_ENV);
+        cmd.env_remove(crucible_contract::task_servers::ENV_TASK_SERVERS);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -163,6 +167,19 @@ impl ShellRunner {
                 if let Some(broker) = &self.broker {
                     cmd.env(BROKER_URL_ENV, &broker.url);
                     cmd.env(BROKER_TOKEN_ENV, &broker.token);
+                }
+                if !self.task_servers.is_empty() {
+                    match crucible_contract::task_servers::encode(&self.task_servers) {
+                        Ok(servers) => {
+                            cmd.env(crucible_contract::task_servers::ENV_TASK_SERVERS, servers);
+                        }
+                        Err(e) => {
+                            return Attempt::failed(
+                                0.0,
+                                format!("task servers not serializable: {e}"),
+                            );
+                        }
+                    }
                 }
                 if self.github {
                     for (name, value) in crucible_contract::git::task_env() {
@@ -206,13 +223,13 @@ impl ShellRunner {
                     }
                 }
                 if let Some(h) = harness {
-                    cmd.env("CRUCIBLE_HARNESS", h);
+                    cmd.env("CRUCIBLE_HARNESS", h.as_str());
                 }
                 if let Some(m) = model {
                     cmd.env("CRUCIBLE_MODEL", m);
                 }
                 if let Some(e) = effort {
-                    cmd.env("CRUCIBLE_EFFORT", e);
+                    cmd.env("CRUCIBLE_EFFORT", e.as_flag());
                 }
             }
             TaskKind::Report {
@@ -517,6 +534,7 @@ mod tests {
             buildit_socket: None,
             github: false,
             broker: None,
+            task_servers: Vec::new(),
         }
     }
 
@@ -1404,6 +1422,7 @@ mod tests {
             buildit_socket: None,
             github: false,
             broker: None,
+            task_servers: Vec::new(),
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
@@ -1450,6 +1469,44 @@ mod tests {
     }
 
     #[test]
+    fn task_servers_reach_command_and_evaluate_tasks_and_never_an_agent() {
+        let show = r#"printf '{"servers":%s,"pass":true}\n' "${CRUCIBLE_TASK_SERVERS-null}""#;
+        let mut agent = command("a", "unused", &[]);
+        agent.task = TaskKind::Agent {
+            prompt: "probe it".into(),
+            harness: None,
+            model: None,
+            effort: None,
+            sandbox: None,
+        };
+        let mut r = ShellRunner {
+            agent_cmd: Some(show.into()),
+            task_servers: vec![crucible_contract::task_servers::TaskServer {
+                name: crucible_contract::agent_servers::ServerName::parse("kueue").unwrap(),
+                url: "http://kueue.example.svc:8850/mcp".into(),
+                token_file: "/tmp/crucible-task-tokens-x/kueue".into(),
+            }],
+            ..runner()
+        };
+        let seen =
+            |r: &mut ShellRunner, task: &Task| match r.run(task, 1, &BTreeMap::new(), None).outcome
+            {
+                AttemptOutcome::Pass(v) => v["servers"].clone(),
+                other => panic!("{}: {other:?}", task.name),
+            };
+        let servers = serde_json::json!([{
+            "name": "kueue",
+            "url": "http://kueue.example.svc:8850/mcp",
+            "token_file": "/tmp/crucible-task-tokens-x/kueue",
+        }]);
+        assert_eq!(seen(&mut r, &command("c", show, &[])), servers);
+        assert_eq!(seen(&mut r, &evaluate("e", show, None)), servers);
+        assert_eq!(seen(&mut r, &agent), Value::Null);
+        r.task_servers = Vec::new();
+        assert_eq!(seen(&mut r, &command("c", show, &[])), Value::Null);
+    }
+
+    #[test]
     fn the_buildit_socket_reaches_command_and_evaluate_tasks_and_never_an_agent() {
         let show = r#"printf '{"socket":"%s","pass":true}\n' "${CRUCIBLE_BUILDIT_SOCKET-unset}""#;
         let mut agent = command("a", "unused", &[]);
@@ -1465,6 +1522,7 @@ mod tests {
             buildit_socket: Some("/runs/r1/pack/state/buildit.sock".into()),
             github: false,
             broker: None,
+            task_servers: Vec::new(),
             ..runner()
         };
         let seen =
@@ -1524,7 +1582,7 @@ mod tests {
             name: "a".into(),
             task: TaskKind::Agent {
                 prompt: "improve the cache".into(),
-                harness: Some("hermes".into()),
+                harness: Some(crate::knobs::Harness::Codex),
                 model: Some("codex".into()),
                 effort: None,
                 sandbox: None,
@@ -1557,7 +1615,7 @@ mod tests {
         assert!(out.valid, "{:?}", out.results);
         let v = out.results[&"a".into()].output.as_ref().unwrap();
         assert_eq!(v["prompt"], "improve the cache");
-        assert_eq!(v["harness"], "hermes");
+        assert_eq!(v["harness"], "codex");
         assert_eq!(v["model"], "codex");
     }
 

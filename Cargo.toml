@@ -10,6 +10,7 @@ members = [
     "crux",
     "crucible-lsp",
     "crucible-kueue",
+    "crucible-kueue-client",
     "crucible-mcp-auth",
     "buildit",
     "crucible-git",
@@ -19,11 +20,11 @@ members = [
 # Vendored upstream sources (see third_party/NOTICE). Excluded from the workspace so
 # `cargo fmt --all` / clippy lint our code and leave theirs byte-identical to upstream;
 # they are still consumed as path dependencies.
-exclude = ["third_party/dagre_rust", "third_party/graphlib_rust", "third_party/mermaid-to-svg", "third_party/ordered_hashmap", "third_party/xai-grok-mermaid", "vendor"]
+exclude = ["crucible-kueue-py", "third_party/dagre_rust", "third_party/graphlib_rust", "third_party/mermaid-to-svg", "third_party/ordered_hashmap", "third_party/xai-grok-mermaid", "vendor"]
 resolver = "3"
 
 [workspace.package]
-version = "0.6.0"
+version = "0.6.1"
 # Dual-licensed like the repo (LICENSE-MIT / LICENSE-APACHE); the public export's cargo-deny
 # licenses check requires every workspace crate to declare it.
 license = "MIT OR Apache-2.0"

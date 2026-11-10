@@ -10,7 +10,7 @@
 //! | workload_status, tasks/get            | kueue.read   | `get` the workload                     |
 //! | workload_list                         | kueue.read   | `list` kueue workloads                 |
 //! | workload_logs                         | kueue.read   | `get` pods/log                         |
-//! | workload_plan, workload_submit        | kueue.submit | `use` (or `get`) the localqueue, `create` the kind, `get` each Secret and PVC it names |
+//! | workload_plan, workload_submit        | kueue.submit | `use` (or `get`) the localqueue, `create` the kind, `get` each Secret and PVC it names, `create` services when it exposes ports |
 //! | workload_scale                        | kueue.submit | `update` the workload's scale          |
 //! | workload_stop, workload_resume        | kueue.submit | `update` the workload; `patch` kueue workloads unless it scales |
 //! | tasks/cancel                          | kueue.submit | `update` the workload; `patch` kueue workloads unless it scales |
@@ -334,6 +334,19 @@ fn tool_checks(
                     "",
                 ),
             ];
+            if args
+                .get("expose")
+                .and_then(Value::as_array)
+                .is_some_and(|ports| !ports.is_empty())
+            {
+                checks.push(c.check(
+                    "service-create",
+                    "you may not create a Service in this namespace",
+                    ("", "services", ""),
+                    "create",
+                    "",
+                ));
+            }
             let (secrets, claims) = referenced(args.get("manifest").unwrap_or(&Value::Null));
             for secret in secrets {
                 checks.push(c.check(
@@ -599,6 +612,24 @@ mod tests {
                 "pvc-get /persistentvolumeclaims/ get ns=team-b name=data",
             ]
         );
+    }
+
+    #[test]
+    fn exposing_ports_is_checked_as_creating_a_service() {
+        let args = |expose: Value| {
+            json!({"namespace": "team-b", "queue": "gpu", "expose": expose,
+                   "manifest": {"kind": "Deployment"}})
+        };
+        for tool in ["workload_plan", "workload_submit"] {
+            let checks = tool_checks_for(&person(), tool, args(json!([8000]))).unwrap();
+            assert_eq!(
+                shown(checks)[2..],
+                ["service-create /services/ create ns=team-b name="],
+                "{tool}"
+            );
+            let checks = tool_checks_for(&person(), tool, args(json!([]))).unwrap();
+            assert_eq!(shown(checks).len(), 2, "{tool}");
+        }
     }
 
     #[test]

@@ -249,6 +249,13 @@ fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result
     for secret in &cfg.pull_secrets {
         args.extend(["--pull-secret".to_string(), secret.clone()]);
     }
+    args.extend(["--cluster-domain".to_string(), cfg.cluster_domain.clone()]);
+    if cfg.allowlist_profile != crate::deploy::profile::KueueAllowlist::Strict {
+        args.extend([
+            "--allowlist-profile".to_string(),
+            cfg.allowlist_profile.as_str().to_string(),
+        ]);
+    }
     if jwks.scheme() == "http" {
         args.push("--insecure-jwks-http".to_string());
     }
@@ -427,6 +434,7 @@ fn workload_cluster_role() -> rbac::ClusterRole {
             rule(&["jobset.x-k8s.io"], &["jobsets"], WORKLOAD_VERBS),
             rule(&["kubeflow.org"], &["pytorchjobs"], WORKLOAD_VERBS),
             rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
+            rule(&[""], &["services"], &["get", "create"]),
         ]),
         ..Default::default()
     }
@@ -451,21 +459,26 @@ fn caller_cluster_role(cfg: &KueueCfg) -> rbac::ClusterRole {
         rule(&[KUEUE_GROUP], &["workloads"], &["get", "list", "patch"]),
         rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
         rule(&[""], &["persistentvolumeclaims"], &["get"]),
+        rule(&[""], &["services"], &["create"]),
     ];
     for kind in SERVED_KINDS {
         let plural = kind.1;
         rules.push(rule(&[kind.0], &[plural], CALLER_KIND_VERBS));
         rules.push(rule(&[kind.0], &[&format!("{plural}/scale")], &["update"]));
     }
-    let pull_secrets: Vec<String> = cfg
+    let mut readable: Vec<String> = cfg
         .pull_secrets
         .iter()
         .map(|entry| entry.split('=').next().unwrap_or_default().to_string())
         .filter(|name| !name.is_empty())
         .collect();
-    if !pull_secrets.is_empty() {
+    if cfg.allowlist_profile == crate::deploy::profile::KueueAllowlist::Tenant {
+        readable.extend(cfg.secrets.iter().map(|name| name.to_string()));
+    }
+    readable.dedup();
+    if !readable.is_empty() {
         rules.push(rbac::PolicyRule {
-            resource_names: Some(pull_secrets),
+            resource_names: Some(readable),
             ..rule(&[""], &["secrets"], &["get"])
         });
     }
@@ -584,6 +597,8 @@ mod tests {
                 "ocp",
                 "--namespace",
                 "crucible-kueue-e2e",
+                "--cluster-domain",
+                "cluster.local",
                 "--insecure-jwks-http",
             ]
         );
@@ -917,6 +932,49 @@ mod tests {
         assert!(toml::from_str::<DeployProfile>(&empty).is_err());
     }
 
+    /// `strict` is the server's own default and takes no flag; `tenant` is passed, and only it
+    /// lets runs read the Secrets the profile names.
+    #[test]
+    fn the_allowlist_profile_decides_the_flag_and_which_secrets_runs_read() {
+        let secrets = |rendered: &[serde_json::Value]| -> Option<serde_json::Value> {
+            find(rendered, "ClusterRole", "crucible-kueue-caller")["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["resources"] == serde_json::json!(["secrets"]))
+                .map(|r| r["resourceNames"].clone())
+        };
+        let with = |tables: &str| PROFILE.replace("[kueue]", &format!("[kueue]\n{tables}"));
+
+        let strict = docs(&with(
+            "pull_secrets = [\"quay-pull\"]\nsecrets = [\"hf-token\"]",
+        ));
+        assert!(!args(&strict).iter().any(|a| a == "--allowlist-profile"));
+        assert_eq!(secrets(&strict), Some(serde_json::json!(["quay-pull"])));
+
+        let tenant = docs(&with(
+            "allowlist_profile = \"tenant\"\npull_secrets = [\"quay-pull\"]\nsecrets = [\"hf-token\"]",
+        ));
+        let flags = args(&tenant);
+        assert!(
+            flags
+                .windows(2)
+                .any(|w| w == ["--allowlist-profile", "tenant"]),
+            "{flags:?}"
+        );
+        assert_eq!(
+            secrets(&tenant),
+            Some(serde_json::json!(["quay-pull", "hf-token"]))
+        );
+
+        let none = docs(&with("allowlist_profile = \"tenant\""));
+        assert_eq!(secrets(&none), None, "tenant alone reads no Secret");
+        assert!(
+            toml::from_str::<DeployProfile>(&with("allowlist_profile = \"open\"")).is_err(),
+            "only the two named profiles"
+        );
+    }
+
     /// The caller role is bound to `crucible:runs` in exactly the shared namespaces, and reads
     /// only the profile's pull secrets.
     #[test]
@@ -1133,6 +1191,7 @@ mod tests {
             .collect();
         let mut expected: Vec<(String, String)> = crucible_kueue_kinds()
             .into_iter()
+            .chain([("", "services")])
             .map(|(g, r)| (g.to_string(), r.to_string()))
             .collect();
         let mut granted_sorted = granted.clone();

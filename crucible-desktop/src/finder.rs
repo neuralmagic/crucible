@@ -1,15 +1,15 @@
-//! The run finder: asks the cache's search index on a worker thread and, while it answers, pulls
+//! The run finder: asks the cache's search index on a task of its own and, while it answers, pulls
 //! the runs of the pack being searched into the cache, so the index covers every run and not only
 //! the ones opened.
 
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use rune::{TextEdit, Waker};
 use serde_json::Value;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::live::{Cache, Connection};
-use crate::profile::Target;
+use crate::httpcache::Store;
+use crate::net::{Connection, Connector, Task, within};
 use crate::search::Hit;
 
 /// Hits read for one query.
@@ -49,21 +49,38 @@ struct Ask {
     launches: Vec<String>,
 }
 
-/// The UI-side handle to the worker. Dropping it stops the thread.
+/// The UI-side handle to the worker. Dropping it ends its task.
 pub struct Client {
-    tx: Sender<Ask>,
+    tx: UnboundedSender<Ask>,
     shared: Arc<Mutex<(u64, Found, Option<Waker>)>>,
+    _task: Option<Task>,
 }
 
 impl Client {
-    pub fn spawn(target: Target) -> Self {
-        let (tx, rx) = mpsc::channel();
+    pub fn spawn(connector: Connector) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Mutex::new((0, Found::default(), None)));
-        let worker = Arc::clone(&shared);
-        let _ = std::thread::Builder::new()
-            .name("crucible-playbooks-finder".into())
-            .spawn(move || run(target, rx, worker));
-        Client { tx, shared }
+        let task = match connector.runtime() {
+            Ok(runtime) => Some(Task::spawn(
+                &runtime,
+                run(connector, rx, Arc::clone(&shared)),
+            )),
+            Err(why) => {
+                publish(
+                    &shared,
+                    Found {
+                        error: Some(why),
+                        ..Found::default()
+                    },
+                );
+                None
+            }
+        };
+        Client {
+            tx,
+            shared,
+            _task: task,
+        }
     }
 
     pub fn set_waker(&self, waker: Waker) {
@@ -96,8 +113,21 @@ fn publish(shared: &Mutex<(u64, Found, Option<Waker>)>, found: Found) {
     }
 }
 
-fn run(target: Target, rx: Receiver<Ask>, shared: Arc<Mutex<(u64, Found, Option<Waker>)>>) {
-    let Some(cache) = Cache::open() else {
+/// `work` on the store, on the blocking pool.
+async fn on_store<T: Send + 'static>(
+    store: &Arc<Store>,
+    work: impl FnOnce(&Store) -> T + Send + 'static,
+) -> Option<T> {
+    let store = Arc::clone(store);
+    tokio::task::spawn_blocking(move || work(&store)).await.ok()
+}
+
+async fn run(
+    connector: Connector,
+    mut rx: UnboundedReceiver<Ask>,
+    shared: Arc<Mutex<(u64, Found, Option<Waker>)>>,
+) {
+    let Some(store) = connector.store().cloned() else {
         publish(
             &shared,
             Found {
@@ -107,14 +137,13 @@ fn run(target: Target, rx: Receiver<Ask>, shared: Arc<Mutex<(u64, Found, Option<
         );
         return;
     };
-    let mut connection: Option<Connection> = None;
     let mut pending: Vec<String> = Vec::new();
     let mut ask: Option<Ask> = None;
     loop {
         let mut newest = if pending.is_empty() {
-            match rx.recv() {
-                Ok(next) => Some(next),
-                Err(_) => return,
+            match rx.recv().await {
+                Some(next) => Some(next),
+                None => return,
             }
         } else {
             None
@@ -127,37 +156,42 @@ fn run(target: Target, rx: Receiver<Ask>, shared: Arc<Mutex<(u64, Found, Option<
             ask = Some(next);
         }
         let Some(current) = &ask else { continue };
-        if connection.is_none() {
-            match Connection::open(&target, Some(&cache)) {
-                Ok(open) => connection = Some(open),
-                Err(why) => {
-                    publish(
-                        &shared,
-                        Found {
-                            seq: current.seq,
-                            error: Some(why),
-                            ..Found::default()
-                        },
-                    );
-                    pending.clear();
-                    continue;
-                }
+        let c = match connector.connect().await {
+            Ok(open) => open,
+            Err(why) => {
+                publish(
+                    &shared,
+                    Found {
+                        seq: current.seq,
+                        error: Some(why),
+                        ..Found::default()
+                    },
+                );
+                pending.clear();
+                continue;
             }
-        }
-        let Some(c) = &connection else { continue };
+        };
         let base = c.client.base().to_string();
         if let Some(key) = pending.first().cloned() {
-            pull(c, &cache, &base, &key);
+            pull(&c, &store, &base, &key).await;
             pending.remove(0);
         }
         let total = current.launches.len();
+        let (within_base, playbook, query) = (
+            base.clone(),
+            current.playbook.clone(),
+            current.query.clone(),
+        );
+        let hits = on_store(&store, move |store| {
+            store.search(&within_base, &playbook, &query, HITS)
+        })
+        .await
+        .unwrap_or_default();
         publish(
             &shared,
             Found {
                 seq: current.seq,
-                hits: cache
-                    .store
-                    .search(&base, &current.playbook, &current.query, HITS),
+                hits,
                 indexed: total - pending.len(),
                 total,
                 ..Found::default()
@@ -168,17 +202,24 @@ fn run(target: Target, rx: Receiver<Ask>, shared: Arc<Mutex<(u64, Found, Option<
 
 /// Read launch `key`'s record, and each of its runs' session and console, through the cache,
 /// which indexes them as it stores them. What the index already holds is not asked again.
-fn pull(c: &Connection, cache: &Cache, base: &str, key: &str) {
+async fn pull(c: &Connection, store: &Arc<Store>, base: &str, key: &str) {
     let encode = crux::client::encode;
     let record_path = format!("/api/playbook-runs/{}", encode(key));
-    let record: Option<Value> = if cache.store.indexed(base, &record_path) {
-        cache
-            .store
-            .get(base, &record_path)
-            .and_then(|(body, _)| serde_json::from_slice(&body).ok())
-    } else {
-        c.call("the launch", c.client.playbook_run::<Value>(key))
-            .ok()
+    let (at, path) = (base.to_string(), record_path);
+    let cached = on_store(store, move |store| {
+        store.indexed(&at, &path).then(|| {
+            store
+                .get(&at, &path)
+                .and_then(|(body, _)| serde_json::from_slice::<Value>(&body).ok())
+        })
+    })
+    .await
+    .flatten();
+    let record: Option<Value> = match cached {
+        Some(record) => record,
+        None => within("the launch", c.client.playbook_run::<Value>(key))
+            .await
+            .ok(),
     };
     let runs: Vec<String> = record
         .as_ref()
@@ -191,12 +232,18 @@ fn pull(c: &Connection, cache: &Cache, base: &str, key: &str) {
         .unwrap_or_default();
     for run in runs {
         let session = format!("/api/runs/{}/artifacts/session.jsonl", encode(&run));
-        if !cache.store.indexed(base, &session) {
-            let _ = c.call("the session", c.client.run_session(&run));
-        }
         let log = format!("/api/runs/{}/log", encode(&run));
-        if !cache.store.indexed(base, &log) {
-            let _ = c.call("the console", c.client.run_log::<Value>(&run));
+        let at = base.to_string();
+        let (has_session, has_log) = on_store(store, move |store| {
+            (store.indexed(&at, &session), store.indexed(&at, &log))
+        })
+        .await
+        .unwrap_or((false, false));
+        if !has_session {
+            let _ = within("the session", c.client.run_session(&run)).await;
+        }
+        if !has_log {
+            let _ = within("the console", c.client.run_log::<Value>(&run)).await;
         }
     }
 }
@@ -218,7 +265,7 @@ fn shown(hits: &[Hit]) -> (Vec<Hit>, Vec<(String, usize)>) {
 impl crate::App {
     /// Open the finder on the selected playbook, or close it.
     pub fn toggle_finder(&mut self) {
-        if self.finder.take().is_some() {
+        if self.remote.finder.take().is_some() {
             return;
         }
         let playbook = match &self.selection {
@@ -227,7 +274,7 @@ impl crate::App {
         };
         let mut query = TextEdit::new("");
         query.focused = true;
-        self.finder = Some(Finder {
+        self.remote.finder = Some(Finder {
             query,
             playbook,
             selected: 0,
@@ -239,9 +286,10 @@ impl crate::App {
 
     /// Search the open finder's query, and read its launches into the index.
     pub fn ask_finder(&mut self) {
-        let launches: Vec<String> = match &self.finder {
+        let launches: Vec<String> = match &self.remote.finder {
             Some(finder) => {
                 let mut launches: Vec<&crate::live::LivePlaybook> = self
+                    .remote
                     .live
                     .launches()
                     .iter()
@@ -252,12 +300,12 @@ impl crate::App {
             }
             None => return,
         };
-        let Some(finder) = &mut self.finder else {
+        let Some(finder) = &mut self.remote.finder else {
             return;
         };
         finder.seq += 1;
         finder.selected = 0;
-        self.finder_client.ask(Ask {
+        self.remote.finder_client.ask(Ask {
             seq: finder.seq,
             query: finder.query.text.clone(),
             playbook: finder.playbook.clone(),
@@ -266,7 +314,7 @@ impl crate::App {
     }
 
     pub fn apply_found(&mut self, found: Found) {
-        if let Some(finder) = &mut self.finder
+        if let Some(finder) = &mut self.remote.finder
             && found.seq == finder.seq
         {
             let mut found = found;
@@ -279,7 +327,7 @@ impl crate::App {
     }
 
     pub fn step_finder(&mut self, by: i32) {
-        if let Some(finder) = &mut self.finder {
+        if let Some(finder) = &mut self.remote.finder {
             let last = finder.found.hits.len().saturating_sub(1) as i32;
             finder.selected = (finder.selected as i32 + by).clamp(0, last) as usize;
         }
@@ -287,7 +335,7 @@ impl crate::App {
 
     /// Open the run a hit came from, at its task, with the log filtered to the query.
     pub fn open_hit(&mut self, index: Option<usize>) {
-        let Some(finder) = self.finder.take() else {
+        let Some(finder) = self.remote.finder.take() else {
             return;
         };
         let Some(hit) = finder
@@ -308,7 +356,7 @@ impl crate::App {
             launch: Some(hit.launch.clone()),
         });
         if !hit.task.is_empty() {
-            self.expanded = Some(hit.task.clone());
+            self.run.expanded = Some(hit.task.clone());
         }
         let pane = match hit.source {
             crate::search::Source::Console => {

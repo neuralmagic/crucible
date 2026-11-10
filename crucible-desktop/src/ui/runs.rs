@@ -5,19 +5,25 @@ use rune::{Color, El, ScrollSpec, col, el, icon, row, text};
 
 use crate::live::LivePlaybook;
 use crate::model::Verdict;
-use crate::runs::{DAY, Day, Summary, calendar, date, day_label, lanes, month_labels};
+use crate::runs::{
+    DAY, Day, Summary, axis, calendar, date, day_label, lanes, month_labels, ticks, wall,
+    weeks_shown,
+};
 use crate::ui::Flight;
 use crate::ui::{
-    Paint, SECTION, TITLE, age, meter, pulsing, runs_note, stat, verdict_color, verdict_tone,
+    Paint, SECTION, TITLE, age, meter, pulsing, runs_note, stat, verdict_color, verdict_icon,
 };
 use crate::{App, Selection};
+use jiff::tz::TimeZone;
 use rune_kit::Spinner;
 
 const DOT: f32 = 12.0;
 const LANE: f32 = 18.0;
 const CELL: f32 = 14.0;
 const CELL_GAP: f32 = 3.0;
-const WEEKS: usize = 12;
+const WEEKS: (usize, usize) = (5, 12);
+/// How far along the axis a mark can sit and still have room for its label.
+const LAST_LABEL: f32 = 0.94;
 
 pub(crate) fn runs_page(
     launch: Option<El>,
@@ -42,6 +48,7 @@ pub(crate) fn runs_page(
         .iter()
         .find_map(|launch| launch.description.clone())
         .unwrap_or_default();
+    let zone = TimeZone::system();
 
     col()
         .key("runs-page")
@@ -79,7 +86,7 @@ pub(crate) fn runs_page(
                 })),
         )
         .child(stats(&summary, newest, now, p))
-        .child(card("Timeline", timeline(launches, now, p), p))
+        .child(card("Timeline", timeline(launches, now, &zone, p), p))
         .child(
             row()
                 .w_full()
@@ -91,7 +98,7 @@ pub(crate) fn runs_page(
                         .gap(16.0)
                         .h_full()
                         .min_h(0.0)
-                        .child(card("Calendar", heatmap(launches, now, p), p))
+                        .child(card("Calendar", heatmap(launches, now, &zone, p), p))
                         .children(shares.map(|shares| card("Shares", shares, p))),
                 )
                 .child(
@@ -145,8 +152,14 @@ fn stats(summary: &Summary, newest: i64, now: i64, p: &Paint) -> El {
         .child(stat(
             "spent",
             "Spend",
-            &format!("${:.2}", summary.spent),
-            p.c.text_base,
+            &summary
+                .spent
+                .map_or("\u{2014}".to_string(), |spent| format!("${spent:.2}")),
+            if summary.spent.is_some() {
+                p.c.text_base
+            } else {
+                p.c.text_muted
+            },
             None,
             "",
             p,
@@ -218,7 +231,7 @@ fn dot(launch: &LivePlaybook, p: &Paint) -> El {
         .label(format!("{} \u{2014} {}", launch.landed_at, launch.status))
         .size(DOT + 6.0, DOT + 6.0)
         .center()
-        .radius((DOT + 6.0) / 2.0)
+        .radius(f32::midpoint(DOT, 6.0))
         .hover(p.c.hover)
         .focusable(true)
         .help(format!("{} \u{b7} {}", launch.landed_at, launch.status))
@@ -227,10 +240,13 @@ fn dot(launch: &LivePlaybook, p: &Paint) -> El {
         .child(mark)
 }
 
-/// Each launch as a dot where it landed, from the first launch to now, in lanes so none overlap.
-fn timeline(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
-    let start = launches.iter().map(|l| l.landed).min().unwrap_or(now);
-    let span = (now - start).max(3_600) as f32;
+/// Each launch as a dot where it landed, from the first launch to the last, in lanes so none
+/// overlap.
+fn timeline(launches: &[&LivePlaybook], now: i64, zone: &TimeZone, p: &Paint) -> El {
+    let landed: Vec<i64> = launches.iter().map(|l| l.landed).collect();
+    let running = launches.iter().any(|l| l.status.is_running());
+    let (start, end) = axis(&landed, running, now);
+    let span = (end - start) as f32;
     let xs: Vec<f32> = launches
         .iter()
         .map(|l| ((l.landed - start) as f32 / span).clamp(0.0, 1.0))
@@ -249,19 +265,9 @@ fn timeline(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
         );
     }
 
-    // Day boundaries along the axis.
     let mut axis = el().key("runs-axis").w_full().h(16.0);
-    let first_day = start.div_euclid(DAY) + 1;
-    let days = ((now - start) / DAY + 1).max(1);
-    let every = match days {
-        0..=8 => 1,
-        9..=21 => 3,
-        22..=60 => 7,
-        _ => 30,
-    };
-    let mut day = first_day;
-    while day * DAY < now {
-        let x = ((day * DAY - start) as f32 / span).clamp(0.0, 1.0);
+    for tick in ticks(start, end, zone) {
+        let x = ((tick.at - start) as f32 / span).clamp(0.0, 1.0);
         axis = axis.child(
             row()
                 .absolute(0.0, 0.0)
@@ -270,14 +276,13 @@ fn timeline(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
                 .center_y()
                 .child(el().w_frac(x))
                 .child(el().w(1.0).h(6.0).fill(p.c.border_strong))
-                .child(
-                    text(day_label(day))
+                .children((x < LAST_LABEL).then(|| {
+                    text(tick.label)
                         .font(p.k.ty.small)
                         .color(p.c.text_faint)
-                        .pl(4.0),
-                ),
+                        .pl(4.0)
+                })),
         );
-        day += every;
     }
 
     col()
@@ -295,15 +300,22 @@ fn timeline(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
         .child(row().w_full().px(12.0).child(axis))
 }
 
-/// Twelve weeks of days, Monday at the top, coloured by how each day's launches ended.
-fn heatmap(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
+/// The weeks back to the first launch, Monday at the top, each day coloured by how its launches
+/// ended.
+fn heatmap(launches: &[&LivePlaybook], now: i64, zone: &TimeZone, p: &Paint) -> El {
+    let landed: Vec<(i64, &LivePlaybook)> = launches
+        .iter()
+        .map(|l| (wall(l.landed, zone), *l))
+        .collect();
+    let now = wall(now, zone);
+    let first = landed.iter().map(|(at, _)| *at).min().unwrap_or(now);
     let days = calendar(
-        &launches
+        &landed
             .iter()
-            .map(|l| (l.landed, l.verdict()))
+            .map(|(at, l)| (*at, l.verdict()))
             .collect::<Vec<_>>(),
         now,
-        WEEKS,
+        weeks_shown(first, now, WEEKS.0, WEEKS.1),
     );
     let busiest = days.iter().map(|d| d.runs).max().unwrap_or(1).max(1);
     let today = now.div_euclid(DAY);
@@ -325,14 +337,14 @@ fn heatmap(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
                 .w(CELL),
         );
         for d in week {
-            column = column.child(cell(d, busiest, today, launches, p));
+            column = column.child(cell(d, busiest, today, &landed, p));
         }
         grid = grid.child(column);
     }
     grid
 }
 
-fn cell(d: &Day, busiest: usize, today: i64, launches: &[&LivePlaybook], p: &Paint) -> El {
+fn cell(d: &Day, busiest: usize, today: i64, landed: &[(i64, &LivePlaybook)], p: &Paint) -> El {
     let future = d.day > today;
     let fill = if d.runs == 0 {
         if future {
@@ -341,12 +353,10 @@ fn cell(d: &Day, busiest: usize, today: i64, launches: &[&LivePlaybook], p: &Pai
             p.c.layer_03
         }
     } else {
-        let base = if d.failed > 0 && d.failed >= d.passed {
-            p.fail
-        } else if d.running > 0 && d.passed == 0 {
-            p.live
-        } else {
-            p.pass
+        let base = match d.fail_rate() {
+            Some(failed) => p.pass.mix(p.fail, failed),
+            None if d.running > 0 => p.live,
+            None => p.c.text_faint,
         };
         base.alpha(0.35 + 0.65 * d.runs as f32 / busiest as f32)
     };
@@ -361,11 +371,11 @@ fn cell(d: &Day, busiest: usize, today: i64, launches: &[&LivePlaybook], p: &Pai
     if d.runs == 0 {
         return c;
     }
-    let newest = launches
+    let newest = landed
         .iter()
-        .filter(|l| l.landed.div_euclid(DAY) == d.day)
-        .max_by_key(|l| l.landed)
-        .copied();
+        .filter(|(at, _)| at.div_euclid(DAY) == d.day)
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, launch)| *launch);
     let mut summary = format!("{} \u{b7} {}", day_label(d.day), runs_note(d.runs as i64));
     if d.failed > 0 {
         summary.push_str(&format!(" \u{b7} {} failed", d.failed));
@@ -383,7 +393,7 @@ fn cell(d: &Day, busiest: usize, today: i64, launches: &[&LivePlaybook], p: &Pai
     }
 }
 
-/// Every launch, newest first.
+/// Every launch, newest first, under its column heads.
 fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
     let columns =
         rune::memo::layout_with("runs-list", |rect| Columns::fit(rect[2])).unwrap_or(Columns::All);
@@ -404,11 +414,16 @@ fn list(launches: &[&LivePlaybook], now: i64, p: &Paint) -> El {
         }
         rows = rows.child(list_row(i, launch, now, columns, p));
     }
-    p.k.scroll_bar(rows).w_full().grow(1.0).min_h(0.0)
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(heads(columns, p))
+        .child(el().h(p.hair).w_full().fill(p.c.border_muted))
+        .child(p.k.scroll_bar(rows).w_full().grow(1.0).min_h(0.0))
 }
 
-/// Row `i` of the list, newest first; keyed by position so a script can pick "run-0".
-/// Which of a run row's columns fit the list's width; origin goes first, then status.
+/// Which of a run row's columns fit the list's width; origin goes first, then the result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Columns {
     Fewest,
@@ -427,11 +442,51 @@ impl Columns {
     }
 }
 
+const LANDED: f32 = 110.0;
+const ORIGIN: f32 = 84.0;
+const COST: f32 = 64.0;
+const AGE: f32 = 36.0;
+
+fn heads(columns: Columns, p: &Paint) -> El {
+    let head = |label: &'static str| text(label).font(p.k.ty.small).color(p.c.text_faint);
+    row()
+        .key("runs-heads")
+        .w_full()
+        .h(24.0)
+        .px(6.0)
+        .gap(10.0)
+        .center_y()
+        .child(el().w(16.0))
+        .child(head("Landed").w(LANDED))
+        .child(
+            head(if columns >= Columns::NoOrigin {
+                "Result"
+            } else {
+                ""
+            })
+            .grow(1.0)
+            .min_w(0.0),
+        )
+        .children((columns == Columns::All).then(|| head("Origin").w(ORIGIN)))
+        .child(head("Cost").w(COST))
+        .child(head("Age").w(AGE))
+}
+
+/// What the Result column says: why a launch failed when the controller gave a reason, else its
+/// status.
+fn result(launch: &LivePlaybook) -> String {
+    launch
+        .why
+        .clone()
+        .unwrap_or_else(|| launch.status.to_string())
+}
+
+/// Row `i` of the list, newest first; keyed by position so a script can pick "run-0".
 fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Paint) -> El {
     let verdict = launch.verdict();
-    let glyph = match verdict_tone(verdict) {
+    let glyph = match verdict_icon(verdict) {
         _ if verdict == Verdict::Running => Spinner::new().size(14.0).color(p.live).build(p.k),
-        Some((_, glyph)) => icon(glyph, 14.0).color(verdict_color(verdict, p)),
+        Some(glyph) => icon(glyph, 14.0).color(verdict_color(verdict, p)),
         None => el()
             .size(10.0, 10.0)
             .radius(5.0)
@@ -442,6 +497,7 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
     } else {
         glyph
     };
+    let result = result(launch);
     row()
         .key(format!("run-{i}"))
         .role("button")
@@ -462,21 +518,11 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
             text(launch.landed_at.clone())
                 .font(p.k.ty.ui_medium)
                 .color(p.c.text_base)
-                .w(110.0),
+                .w(LANDED),
         )
-        .children((columns >= Columns::NoOrigin).then(|| {
-            text(launch.status.clone())
-                .font(p.k.ty.ui)
-                .color(p.c.text_muted)
-                .w(80.0)
-        }))
         .child(
-            text(if columns == Columns::All {
-                if launch.origin.is_empty() {
-                    "launch".to_string()
-                } else {
-                    launch.origin.clone()
-                }
+            text(if columns >= Columns::NoOrigin {
+                result.clone()
             } else {
                 String::new()
             })
@@ -484,31 +530,59 @@ fn list_row(i: usize, launch: &LivePlaybook, now: i64, columns: Columns, p: &Pai
             .color(p.c.text_muted)
             .grow(1.0)
             .min_w(0.0)
-            .truncate(),
+            .truncate()
+            .help_when_truncated(result),
         )
+        .children((columns == Columns::All).then(|| {
+            text(if launch.origin.is_empty() {
+                "launch".to_string()
+            } else {
+                launch.origin.clone()
+            })
+            .font(p.k.ty.ui)
+            .color(p.c.text_muted)
+            .w(ORIGIN)
+            .truncate()
+        }))
         .child(
-            text(launch.cost.map_or("—".to_string(), |c| format!("${c:.2}")))
-                .font(p.mono(12.0, 400.0).features("'tnum' 1"))
-                .color(p.c.text_muted)
-                .w(64.0),
+            text(
+                launch
+                    .cost
+                    .map_or("\u{2014}".to_string(), |c| format!("${c:.2}")),
+            )
+            .font(p.mono(12.0, 400.0).features("'tnum' 1"))
+            .color(p.c.text_muted)
+            .w(COST),
         )
         .child(
             text(age(launch.landed, now))
                 .font(p.k.ty.small)
                 .color(p.c.text_faint)
-                .w(36.0),
+                .w(AGE),
         )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::ui::runs::Columns;
+    use crate::live::{LaunchStatus, LivePlaybook};
+    use crate::ui::runs::{Columns, result};
 
     #[test]
-    fn a_narrow_list_drops_origin_then_status() {
+    fn a_narrow_list_drops_origin_then_the_result() {
         assert_eq!(Columns::fit(600.0), Columns::All);
         assert_eq!(Columns::fit(440.0), Columns::All);
         assert_eq!(Columns::fit(400.0), Columns::NoOrigin);
         assert_eq!(Columns::fit(300.0), Columns::Fewest);
+    }
+
+    #[test]
+    fn the_result_is_why_a_launch_failed_when_that_is_known() {
+        let mut launch = LivePlaybook {
+            status: LaunchStatus::Error,
+            ..LivePlaybook::default()
+        };
+        assert_eq!(result(&launch), "error");
+        launch.why = Some("no such secret".into());
+        assert_eq!(result(&launch), "no such secret");
     }
 }

@@ -1,0 +1,12 @@
+[workspace]
+inject = ["probe.py", "serve.py"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Run a Job on Kueue from a command task."
+
+[workflow]
+type    = "playbook"
+file    = "workflow.star"
+servers = ["kueue"]
