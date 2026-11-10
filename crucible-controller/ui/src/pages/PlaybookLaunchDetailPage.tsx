@@ -42,8 +42,10 @@ import { runStatusColor } from './runStatus';
 import { formatCost } from './runReport';
 import { RerunSection } from './RerunSection';
 import { LaunchWallTime } from './LaunchWallTime';
+import { PackOverviewSection } from './PackOverviewSection';
 import { RunLinks } from './RunLinks';
 import { RunTaskGraph } from './RunTaskGraph';
+import { TaskOutputSection } from './TaskOutputSection';
 import { EngineLogSection } from './EngineLogSection';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
@@ -183,7 +185,17 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
 
       <ParamsSection launch={launch} />
 
+      {launch.draft_version !== null &&
+        launch.draft_version !== undefined &&
+        detail.source_exists && (
+          <PackOverviewSection draftId={launch.playbook} version={launch.draft_version} />
+        )}
+
       {runId !== null && <RunTaskGraph runId={runId} engineBounds />}
+
+      {runId !== null && (
+        <TaskOutputSection runId={runId} live={detail.runs[0]?.status === 'running'} />
+      )}
 
       {runId !== null && (
         <EngineLogSection runId={runId} live={detail.runs[0]?.status === 'running'} />

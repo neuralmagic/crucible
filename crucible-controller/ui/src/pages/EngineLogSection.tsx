@@ -41,7 +41,7 @@ export function EngineLogSection({ runId, live }: { runId: string; live: boolean
         {logPath(log.data) === null ? (
           <Mono tone="ink-3">{logBody(log.data)}</Mono>
         ) : (
-          <LogView text={logBody(log.data)} testId="run-engine-log" />
+          <LogView text={logBody(log.data)} testId="run-engine-log" follow />
         )}
       </SectionBody>
     </Section>

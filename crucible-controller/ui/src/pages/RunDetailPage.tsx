@@ -16,7 +16,9 @@ import { flowThemeStyle, injectFlowTheme } from './flowTheme';
 import { AgentProviderTag } from './ProviderIcon';
 import { RunAgentTools } from './RunAgentTools';
 import { LaunchWallTime } from './LaunchWallTime';
+import { PackOverviewSection } from './PackOverviewSection';
 import { RunLinks } from './RunLinks';
+import { TaskOutputSection } from './TaskOutputSection';
 import { useLiveEvents } from '../api/useLiveEvents';
 import { formatError } from '../api/errors';
 import { useAgentTools } from '../api/lanes';
@@ -159,12 +161,13 @@ export function RunDetailPage() {
   const flowAbsent =
     isLiveRun || flowListed === false || flowProbe.isError || flowProbe.data === null;
   const launchKeyOfRun = runDetail.data?.run.issue_key ?? '';
-  const launch = $api.useQuery(
+  const launchDetail = $api.useQuery(
     'get',
     '/api/playbook-runs/{key}',
     { params: { path: { key: launchKeyOfRun } } },
     { enabled: isLaunchKey(launchKeyOfRun) },
-  ).data?.launch;
+  ).data;
+  const launch = launchDetail?.launch;
 
   // When the live stream ends because the run finished or is no longer running, refetch the run's
   // queries so the freshly-ingested record replaces the live pane (mirrors the old RunsPage behavior).
@@ -304,6 +307,12 @@ export function RunDetailPage() {
 
       {agentTools ? <RunAgentTools tools={runDetail.data?.agent_tools ?? []} /> : null}
 
+      {launch?.draft_version !== null &&
+        launch?.draft_version !== undefined &&
+        launchDetail?.source_exists === true && (
+          <PackOverviewSection draftId={launch.playbook} version={launch.draft_version} />
+        )}
+
       {isLiveRun && (
         <Section>
           <SectionHeader title="Live session" />
@@ -316,6 +325,8 @@ export function RunDetailPage() {
       <RunTaskGraph runId={runId} />
 
       <RunTaskGrid runId={runId} />
+
+      <TaskOutputSection runId={runId} live={isLiveRun} />
 
       <EngineLogSection runId={runId} live={isLiveRun} />
 
