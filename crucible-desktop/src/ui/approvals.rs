@@ -10,7 +10,7 @@ use crate::ui::desk::{card, frame, landed, none, now, scrolled, stacked};
 use crate::ui::{Paint, Tone, flag, tag};
 
 pub(crate) fn page(app: &App, p: &Paint) -> El {
-    let note = match &app.admin.approvals {
+    let note = match &app.remote.admin.approvals {
         Some(Ok(queue)) => format!(
             "{} imports \u{b7} {} scopes \u{b7} {} kept PRs",
             queue.pending_imports.len(),
@@ -20,7 +20,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         _ => String::new(),
     };
     let page = frame("approvals", "Approvals", note, None, app, p);
-    let queue = match landed(&app.admin.approvals, "the approval queue", p) {
+    let queue = match landed(&app.remote.admin.approvals, "the approval queue", p) {
         Err(standin) => return page.child(*standin),
         Ok(queue) => queue,
     };
@@ -83,11 +83,11 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
                 link_row(
                     &format!("kept-{i}"),
                     row().child(
-                        text(pr.issue.clone())
+                        text(pr_label(&pr.pr_url).unwrap_or_else(|| pr.pr_url.clone()))
                             .font(p.k.ty.ui_medium)
                             .color(p.c.text_base),
                     ),
-                    pr.pr_url.clone(),
+                    pr.issue.clone(),
                     &pr.pr_url,
                     p,
                 )
@@ -146,6 +146,20 @@ fn link_row(key: &str, title: El, detail: String, url: &str, p: &Paint) -> El {
         )
 }
 
+/// `owner/repo#7` for a pull request's URL on any forge that puts it at `/owner/repo/pull/7`.
+fn pr_label(url: &str) -> Option<String> {
+    let (_, path) = url.split_once("://")?.1.split_once('/')?;
+    let mut parts = path.trim_end_matches('/').split('/');
+    let (owner, repo, "pull", number) =
+        (parts.next()?, parts.next()?, parts.next()?, parts.next()?)
+    else {
+        return None;
+    };
+    let numbered = !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit());
+    (numbered && parts.next().is_none() && !owner.is_empty() && !repo.is_empty())
+        .then(|| format!("{owner}/{repo}#{number}"))
+}
+
 /// The registry id an import suggests: its pack folder's name.
 pub(crate) fn suggested_id(path: &str) -> String {
     path.trim_end_matches('/')
@@ -189,8 +203,9 @@ fn import_row(import: &crux::dto::PendingImport, app: &App, now: i64, p: &Paint)
     about.push(relative(&import.created_at, now));
 
     let armed_key = format!("discard:{id}");
-    let armed = app.desk.armed.as_deref() == Some(armed_key.as_str());
+    let armed = app.remote.desk.armed.as_deref() == Some(armed_key.as_str());
     let registering = app
+        .remote
         .desk
         .register
         .as_ref()
@@ -202,9 +217,9 @@ fn import_row(import: &crux::dto::PendingImport, app: &App, now: i64, p: &Paint)
             Button::new("Register")
                 .variant(ButtonVariant::Neutral)
                 .control_size(ControlSize::Small)
-                .disabled(app.desk.busy() || !import.compiles)
+                .disabled(app.remote.desk.busy() || !import.compiles)
                 .on_press(move |app: &mut App| {
-                    app.desk.register = Some((
+                    app.remote.desk.register = Some((
                         open_id.clone(),
                         TextEdit::new(suggested_id(&path)),
                         TextEdit::new(""),
@@ -223,15 +238,15 @@ fn import_row(import: &crux::dto::PendingImport, app: &App, now: i64, p: &Paint)
                 ButtonVariant::Ghost
             })
             .control_size(ControlSize::Small)
-            .disabled(app.desk.busy())
+            .disabled(app.remote.desk.busy())
             .on_press(move |app: &mut App| {
                 let key = format!("discard:{discard}");
-                if app.desk.armed.as_deref() == Some(key.as_str()) {
+                if app.remote.desk.armed.as_deref() == Some(key.as_str()) {
                     app.act(Action::DiscardImport {
                         import: discard.clone(),
                     });
                 } else {
-                    app.desk.armed = Some(key);
+                    app.remote.desk.armed = Some(key);
                 }
             })
             .build(p.k)
@@ -253,7 +268,7 @@ fn import_row(import: &crux::dto::PendingImport, app: &App, now: i64, p: &Paint)
             )
             .child(actions),
     );
-    if registering && let Some((_, registry_id, description)) = &app.desk.register {
+    if registering && let Some((_, registry_id, description)) = &app.remote.desk.register {
         body = body.child(register_form(&id, registry_id, description, app, p));
     }
     body.key(format!("import-{id}"))
@@ -269,7 +284,7 @@ fn register_form(
     let ready = !registry_id.text.trim().is_empty() && !description.text.trim().is_empty();
     let import = import.to_string();
     let submit = move |app: &mut App| {
-        let Some((_, id, description)) = &app.desk.register else {
+        let Some((_, id, description)) = &app.remote.desk.register else {
             return;
         };
         let (id, description) = (
@@ -279,7 +294,7 @@ fn register_form(
         if id.is_empty() || description.is_empty() {
             return;
         }
-        app.desk.register = None;
+        app.remote.desk.register = None;
         app.act(Action::RegisterImport {
             import: import.clone(),
             id,
@@ -296,7 +311,7 @@ fn register_form(
             TextInput::new(registry_id)
                 .placeholder("registry id")
                 .width(Some(180.0))
-                .on_edit(|app: &mut App| match &mut app.desk.register {
+                .on_edit(|app: &mut App| match &mut app.remote.desk.register {
                     Some((_, id, _)) => id,
                     None => &mut app.scratch,
                 })
@@ -306,7 +321,7 @@ fn register_form(
         .child(
             TextInput::new(description)
                 .placeholder("What it does")
-                .on_edit(|app: &mut App| match &mut app.desk.register {
+                .on_edit(|app: &mut App| match &mut app.remote.desk.register {
                     Some((_, _, description)) => description,
                     None => &mut app.scratch,
                 })
@@ -320,7 +335,7 @@ fn register_form(
             Button::new("Cancel")
                 .variant(ButtonVariant::Ghost)
                 .control_size(ControlSize::Small)
-                .on_press(|app: &mut App| app.desk.register = None)
+                .on_press(|app: &mut App| app.remote.desk.register = None)
                 .build(p.k)
                 .key("import-register-cancel"),
         )
@@ -328,7 +343,7 @@ fn register_form(
             Button::new("Register")
                 .variant(ButtonVariant::Submit)
                 .control_size(ControlSize::Small)
-                .disabled(!ready || app.desk.busy())
+                .disabled(!ready || app.remote.desk.busy())
                 .on_press(submit)
                 .build(p.k)
                 .key("import-register-save"),
@@ -337,7 +352,32 @@ fn register_form(
 
 #[cfg(test)]
 mod tests {
-    use crate::ui::approvals::suggested_id;
+    use crate::ui::approvals::{pr_label, suggested_id};
+
+    #[test]
+    fn a_pull_request_is_named_by_its_repository_and_number() {
+        let label = |url| pr_label(url).unwrap();
+        assert_eq!(
+            label("https://github.com/acme/relay/pull/2"),
+            "acme/relay#2"
+        );
+        assert_eq!(
+            label("https://git.example.com/acme/relay/pull/41/"),
+            "acme/relay#41"
+        );
+        for url in [
+            "",
+            "acme/relay/pull/2",
+            "https://github.com/acme/relay",
+            "https://github.com/acme/relay/issues/2",
+            "https://github.com/acme/relay/pull/",
+            "https://github.com/acme/relay/pull/two",
+            "https://github.com/acme/relay/pull/2/files",
+            "https://github.com//relay/pull/2",
+        ] {
+            assert_eq!(pr_label(url), None, "{url}");
+        }
+    }
 
     #[test]
     fn an_import_suggests_its_folder_as_the_registry_id() {

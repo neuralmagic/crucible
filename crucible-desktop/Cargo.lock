@@ -1648,6 +1648,7 @@ dependencies = [
  "crux",
  "futures-util",
  "jiff",
+ "keyring",
  "libc",
  "rand 0.10.3",
  "reqwest",

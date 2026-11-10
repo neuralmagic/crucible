@@ -22,13 +22,12 @@ const FILE_LIST: f32 = 190.0;
 /// Problems listed under a file before the list scrolls.
 const LISTED: usize = 4;
 
-pub(crate) fn pack_view(
-    pack: &Result<PackFiles, String>,
-    font: LogFont,
-    app: &App,
-    p: &Paint,
-) -> El {
-    let working = app.working_pack.as_ref().filter(|_| app.showing_working());
+pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App, p: &Paint) -> El {
+    let working = app
+        .remote
+        .working_pack
+        .as_ref()
+        .filter(|_| app.showing_working());
     let pack = match (working, pack) {
         (Some(pack), _) => pack,
         (None, Ok(pack)) if !pack.files.is_empty() => pack,
@@ -36,6 +35,7 @@ pub(crate) fn pack_view(
         (None, Err(error)) => return note("Could not read the pack.", error, p),
     };
     let open = app
+        .run
         .pack_file
         .as_deref()
         .and_then(|path| pack.file(path))
@@ -71,7 +71,7 @@ pub(crate) fn pack_view(
         .min_h(0.0)
         .gap(8.0)
         .child(toolbar(app, pack, p))
-        .children(app.draft_note.as_ref().map(|note| {
+        .children(app.run.draft_note.as_ref().map(|note| {
             let (message, color) = match note {
                 Ok(message) => (message, p.c.text_muted),
                 Err(error) => (error, p.fail),
@@ -103,7 +103,7 @@ pub(crate) fn pack_view(
 fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
     let mut bar = row().w_full().gap(8.0).center_y().h(28.0);
     let draft = app.draft_target();
-    if app.working_pack.is_some() {
+    if app.remote.working_pack.is_some() {
         let showing = usize::from(app.showing_working());
         bar = bar.child(
             SegmentedControl::new(&["Run", "Draft"], Some(showing))
@@ -128,16 +128,17 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
             .selection_color(p.k.selection())
             .grow(1.0)
             .min_w(0.0)
-            .truncate(),
+            .truncate_head()
+            .help_when_truncated(pack.origin.clone()),
     );
-    if app.draft_busy {
+    if app.remote.draft_busy {
         return bar.child(Spinner::new().size(14.0).build(p.k));
     }
     let Some((draft, template)) = draft else {
         return bar;
     };
     if !app.showing_working() {
-        if app.working_pack.is_none() {
+        if app.remote.working_pack.is_none() {
             let label = if template.is_some() { "Draft" } else { "Edit" };
             bar = bar.child(
                 Button::new(label)
@@ -153,7 +154,7 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
         }
         return bar;
     }
-    let edited = app.working_edited;
+    let edited = app.remote.working_edited;
     bar.child(
         Button::new("Pull")
             .variant(ButtonVariant::Neutral)
@@ -298,7 +299,7 @@ fn file_row(file: &PackFile, selected: bool, worst: Option<Severity>, p: &Paint)
         })
         .hover(p.c.hover)
         .focusable(true)
-        .on_press(move |app: &mut App| app.pack_file = Some(path.clone()))
+        .on_press(move |app: &mut App| app.run.pack_file = Some(path.clone()))
         .child(icon(&oc::CODE_LINES, 14.0).min_w(14.0).color(if selected {
             p.c.icon_base
         } else {
@@ -459,7 +460,7 @@ fn source(file: &PackFile, found_problems: &[Problem], font: LogFont, app: &App,
                     stick_bottom: false,
                 })
                 .scroll_xy()
-                .scroll_edge_fade(8.0)
+                .scroll_edge_fade(16.0)
                 .child(body),
         )
         .children(problem_list(&file.path, found_problems, p))

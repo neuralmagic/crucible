@@ -13,7 +13,7 @@ const LANE: f32 = 5.0;
 const STRIP: f32 = 30.0;
 
 pub(crate) fn timeline_view(pane: &Pane, p: &Paint) -> El {
-    let plan = schedule(&pane.tasks);
+    let plan = schedule(pane.tasks);
     if plan.bars.is_empty() || plan.span <= 0.0 {
         return col()
             .key("timeline-empty")
