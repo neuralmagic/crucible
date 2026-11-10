@@ -31,12 +31,12 @@ env:
   CARGO_NET_RETRY: "10"
 
 jobs:
-  # Same-repo refs get the org's beefy self-hosted runners (32-core, sccache in S3, baked
-  # toolchain); fork PRs MUST stay on hosted runners — self-hosted instances carry an IAM role,
-  # and this is a public repo.
+  # Same-repo refs and fork PRs from org members get the org's beefy self-hosted runners (32-core,
+  # sccache in S3, baked toolchain); other fork PRs MUST stay on hosted runners — self-hosted
+  # instances carry an IAM role, and this is a public repo.
   test-all-features:
     timeout-minutes: 80
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -176,7 +176,7 @@ jobs:
   # Formatting, guards, clippy, and generated docs; beside the test jobs, fmt first.
   lint:
     timeout-minutes: 20
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -301,7 +301,7 @@ jobs:
   # test-all-features runs them.
   test-default-features:
     timeout-minutes: 60
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -342,7 +342,7 @@ jobs:
   # the required check until it has a flake-free record.
   kind-e2e:
     timeout-minutes: 45
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-24.04' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-24.04' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
@@ -415,7 +415,7 @@ jobs:
   # OpenAPI spec (from the controller's own bin) and the typed client before check/test/build.
   ui:
     timeout-minutes: 15
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
