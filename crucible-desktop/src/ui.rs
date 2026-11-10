@@ -9,6 +9,7 @@ mod dock;
 mod files;
 mod finder;
 mod graph;
+mod keys;
 mod launch;
 mod launcher;
 mod log;
@@ -21,9 +22,11 @@ mod secrets;
 mod shares;
 mod slider;
 mod tasks;
+mod teams;
 mod theme;
 mod timeline;
 mod transcript;
+mod triggers;
 
 use rune::{Color, Cx, El, Icon, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::RowStatus;
@@ -47,6 +50,7 @@ use crucible_contract::session::TaskStatus;
 
 /// The band across the top that holds the window buttons and drags the window.
 const TITLE_BAND: f32 = 52.0;
+#[cfg(not(target_arch = "wasm32"))]
 /// The close button's top-left, centring the buttons in the title band.
 #[cfg(not(feature = "hot"))]
 pub const TRAFFIC_LIGHTS: (f32, f32) = (18.0, 19.0);
@@ -612,6 +616,16 @@ fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(pack_list(app, p))
         .children((app.backend == Backend::Controller).then(|| pages_nav(app, p)))
         .child(rule("sidebar-foot-rule", false, p))
+        .children(app.act_as_refused.as_ref().map(|why| {
+            text(why.clone())
+                .key("act-as-refused")
+                .role("status")
+                .font(p.k.ty.small)
+                .color(p.fail)
+                .wrap()
+                .px(12.0)
+                .pt(8.0)
+        }))
         .child(account(app, source, p, layer))
 }
 
@@ -646,8 +660,10 @@ fn pages_nav(app: &App, p: &Paint) -> El {
             &oc::CIRCLE_CHECK,
             (app.approvals_waiting() > 0).then(|| app.approvals_waiting().to_string()),
         ))
-        .child(entry(crate::Page::Schedules, &oc::STATUS, None))
+        .child(entry(crate::Page::Triggers, &oc::STATUS, None))
         .child(entry(crate::Page::Secrets, &rune_kit::glyphs::LOCK, None))
+        .child(entry(crate::Page::Teams, &oc::SUBAGENT, None))
+        .children(crate::SESSION_AUTH.then(|| entry(crate::Page::Keys, &oc::KEYBOARD, None)))
 }
 
 /// Who is signed in, bottom left, with the settings button beside it. Pressing it opens a menu of
@@ -673,9 +689,19 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
         .chars()
         .find(|c| c.is_alphanumeric())
         .map_or("?".to_string(), |c| c.to_uppercase().to_string());
-    let place = match app.backend {
-        Backend::Local => "Local".to_string(),
-        Backend::Controller => app.remote.target.name.clone(),
+    let acting = app
+        .remote
+        .target
+        .act_as()
+        .map(|act_as| act_as.team().to_string());
+    let place = match (app.backend, &acting) {
+        (Backend::Local, _) => "Local".to_string(),
+        (Backend::Controller, Some(team)) => format!(
+            "{} \u{b7} as {}",
+            app.remote.target.name,
+            team.trim_start_matches("team:")
+        ),
+        (Backend::Controller, None) => app.remote.target.name.clone(),
     };
     let trigger = row()
         .key("source-menu-button")
@@ -739,16 +765,42 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
             app.use_profile(&name);
         }));
     }
-    let menu = menu
-        .separator()
-        .item(
+    let teams: Vec<String> = app
+        .owners()
+        .into_iter()
+        .filter(|owner| owner.starts_with("team:"))
+        .collect();
+    if app.backend == Backend::Controller && (!teams.is_empty() || acting.is_some()) {
+        menu = menu.separator().group_label("Act as").item(
+            rune_kit::MenuItem::new("Yourself")
+                .checked(acting.is_none())
+                .on_select(|app: &mut App| {
+                    app.source_menu = false;
+                    app.act_as(None);
+                }),
+        );
+        for team in teams {
+            let label = team.trim_start_matches("team:").to_string();
+            let current = acting.as_deref() == Some(team.as_str());
+            menu = menu.item(rune_kit::MenuItem::new(label).checked(current).on_select(
+                move |app: &mut App| {
+                    app.source_menu = false;
+                    app.act_as(Some(team.clone()));
+                },
+            ));
+        }
+    }
+    if crate::LOCAL_PACKS {
+        menu = menu.separator().item(
             rune_kit::MenuItem::new("Local packs")
                 .checked(app.backend == Backend::Local)
                 .on_select(|app: &mut App| {
                     app.source_menu = false;
                     app.switch(Backend::Local);
                 }),
-        )
+        );
+    }
+    let menu = menu
         .separator()
         .item(
             rune_kit::MenuItem::new("Edit profiles\u{2026}").on_select(|app: &mut App| {
@@ -1204,10 +1256,12 @@ fn verdict_icon(verdict: Verdict) -> Option<&'static Icon> {
 fn detail(app: &App, p: &Paint) -> El {
     match app.page {
         crate::Page::Settings => return settings_pane(app, p),
-        crate::Page::Schedules => return schedules::page(app, p),
+        crate::Page::Triggers => return triggers::page(app, p),
         crate::Page::Secrets => return secrets::page(app, p),
         crate::Page::Decisions => return decisions::page(app, p),
         crate::Page::Approvals => return approvals::page(app, p),
+        crate::Page::Teams => return teams::page(app, p),
+        crate::Page::Keys => return keys::page(app, p),
         crate::Page::Runs => {}
     }
     if let (

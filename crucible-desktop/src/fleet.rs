@@ -3,11 +3,12 @@
 //! profile that does not answer is reported so.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use crate::net::Handle;
 use futures_util::future::join_all;
 use rune::Waker;
-use tokio::runtime::Handle;
+use rune::time::Instant;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::net::{Connector, Task, within};
@@ -79,7 +80,7 @@ async fn run(mut rx: UnboundedReceiver<Vec<Connector>>, shared: Shared) {
     let mut next = Instant::now() + EVERY;
     loop {
         let wait = next.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(wait, rx.recv()).await {
+        match crate::net::timeout(wait, rx.recv()).await {
             Ok(Some(now)) => {
                 targets = now;
                 while let Ok(newer) = rx.try_recv() {

@@ -1647,6 +1647,7 @@ dependencies = [
  "crucible-contract",
  "crux",
  "futures-util",
+ "gloo-timers",
  "jiff",
  "keyring",
  "libc",
@@ -1667,6 +1668,9 @@ dependencies = [
  "tokio",
  "toml 0.8.23",
  "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
  "wgpu",
  "zbus 6.2.1",
 ]
@@ -1693,6 +1697,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "crucible-contract",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
@@ -4624,10 +4629,12 @@ dependencies = [
  "jiff-core",
  "jiff-static",
  "jiff-tzdb-platform",
+ "js-sys",
  "log",
  "portable-atomic",
  "portable-atomic-util",
  "serde_core",
+ "wasm-bindgen",
  "windows-link",
 ]
 

@@ -3,29 +3,29 @@
 //! of the slot's mark names the effect, its `effect_data` carries a linear-light colour and one
 //! number, and its presented rect and corner radius are the shape.
 //!
-//! The `hot` dev build runs without a compositor, so its slots draw nothing.
+//! The `hot` dev build and the browser build run without a compositor, so their slots draw nothing.
 //!
 //! Only effects that move keep the window drawing: pulses and shimmer on running work, the glow
 //! on a drop target, the CRT beam and the lava while a run is live, and the lava for a moment
 //! after a click or a window move. At rest the window draws nothing.
 
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 mod crt;
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 mod molten;
 
 use rune::Color;
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 use rune::compose::{Compositor, Frame};
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 use rune::render::{EffectPhase, EffectSite, KIND_EFFECT};
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 use rune_fx::{
     Fx, FxFrame, FxLayer, FxOptions, FxRenderer, FxSlot, GlowParams, GlowStyle, GrainParams,
     PulseParams, PulseStyle, Rgb, Shape, ShimmerParams,
 };
 
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 use crate::App;
 
 /// A slow breathing ring around something running.
@@ -49,7 +49,7 @@ pub fn data(color: Color, value: f32) -> [f32; 4] {
     [r, g, b, value]
 }
 
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 /// The layer for one slot, and whether it moves on its own.
 fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32) -> Option<(FxLayer, bool)> {
     let color = Rgb([d[0], d[1], d[2]]);
@@ -98,7 +98,7 @@ fn layer(kind: u32, d: [f32; 4], shape: Shape, t: f32) -> Option<(FxLayer, bool)
     Some((fx.on(shape).at(if moving { t } else { 0.0 }), moving))
 }
 
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 #[derive(Default)]
 pub struct Gfx {
     fx: Option<FxRenderer>,
@@ -107,7 +107,7 @@ pub struct Gfx {
     moving: bool,
 }
 
-#[cfg(not(feature = "hot"))]
+#[cfg(not(any(feature = "hot", target_arch = "wasm32")))]
 impl Compositor<App> for Gfx {
     fn animating(&self) -> bool {
         self.moving

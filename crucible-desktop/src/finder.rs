@@ -119,7 +119,7 @@ async fn on_store<T: Send + 'static>(
     work: impl FnOnce(&Store) -> T + Send + 'static,
 ) -> Option<T> {
     let store = Arc::clone(store);
-    tokio::task::spawn_blocking(move || work(&store)).await.ok()
+    crate::net::blocking(move || work(&store)).await
 }
 
 async fn run(

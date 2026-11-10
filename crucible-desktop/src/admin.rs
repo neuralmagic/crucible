@@ -4,10 +4,11 @@
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crux::client::Shared;
 use crux::dto;
+use rune::time::Instant;
 use rune::{TextEdit, Waker};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
@@ -17,6 +18,8 @@ use crate::net::{Connection, Connector, Task, within};
 const SHOWN: Duration = Duration::from_secs(15);
 /// How often the decision queue is read while nothing shows it, for the badge and notifications.
 const QUEUE: Duration = Duration::from_secs(30);
+/// How many of a webhook's newest deliveries are read.
+const DELIVERIES: i64 = 20;
 
 /// A read that has not come back yet, failed, or landed.
 pub type Loaded<T> = Option<Result<T, String>>;
@@ -31,6 +34,14 @@ pub struct Watch {
     pub secret: Option<String>,
     pub shares: Option<Shared>,
     pub decision: Option<String>,
+    /// The API keys page is shown.
+    pub keys: bool,
+    pub teams: bool,
+    /// The team whose audit trail the Teams page shows.
+    pub team_audit: Option<String>,
+    pub webhooks: bool,
+    /// The webhook whose deliveries the Triggers page shows.
+    pub webhook: Option<String>,
 }
 
 /// A change to make on the controller.
@@ -89,6 +100,45 @@ pub enum Action {
     CancelLaunch {
         key: String,
     },
+    /// Mint an API key that expires in `days`, or never.
+    MintKey {
+        name: String,
+        days: Option<i64>,
+    },
+    RevokeKey {
+        id: String,
+    },
+    /// Sign out one MCP client, or all of them.
+    SignOutMcp {
+        client: Option<String>,
+    },
+    CreateTeam {
+        slug: String,
+        name: String,
+    },
+    RenameTeam {
+        slug: String,
+        name: String,
+    },
+    DeleteTeam {
+        slug: String,
+    },
+    /// Replace team `slug`'s whole member list.
+    PutMembers {
+        slug: String,
+        members: Vec<dto::TeamMemberBody>,
+    },
+    /// Resume (`on`) or pause a webhook.
+    EnableWebhook {
+        id: String,
+        on: bool,
+    },
+    RotateWebhook {
+        id: String,
+    },
+    DeleteWebhook {
+        id: String,
+    },
 }
 
 /// Which kind of action an outcome answers.
@@ -106,6 +156,16 @@ pub enum Did {
     RegisterImport,
     DiscardImport,
     CancelLaunch,
+    MintKey,
+    RevokeKey,
+    SignOutMcp,
+    CreateTeam,
+    RenameTeam,
+    DeleteTeam,
+    PutMembers,
+    EnableWebhook,
+    RotateWebhook,
+    DeleteWebhook,
 }
 
 impl Action {
@@ -123,6 +183,16 @@ impl Action {
             Action::RegisterImport { .. } => Did::RegisterImport,
             Action::DiscardImport { .. } => Did::DiscardImport,
             Action::CancelLaunch { .. } => Did::CancelLaunch,
+            Action::MintKey { .. } => Did::MintKey,
+            Action::RevokeKey { .. } => Did::RevokeKey,
+            Action::SignOutMcp { .. } => Did::SignOutMcp,
+            Action::CreateTeam { .. } => Did::CreateTeam,
+            Action::RenameTeam { .. } => Did::RenameTeam,
+            Action::DeleteTeam { .. } => Did::DeleteTeam,
+            Action::PutMembers { .. } => Did::PutMembers,
+            Action::EnableWebhook { .. } => Did::EnableWebhook,
+            Action::RotateWebhook { .. } => Did::RotateWebhook,
+            Action::DeleteWebhook { .. } => Did::DeleteWebhook,
         }
     }
 
@@ -147,6 +217,17 @@ impl Action {
             Action::RegisterImport { id, .. } => format!("Registered {id}"),
             Action::DiscardImport { .. } => "Discarded the import".to_string(),
             Action::CancelLaunch { .. } => "Cancelling the launch".to_string(),
+            Action::MintKey { name, .. } => format!("Minted {name}"),
+            Action::RevokeKey { .. } => "Revoked".to_string(),
+            Action::SignOutMcp { .. } => "Signed out".to_string(),
+            Action::CreateTeam { slug, .. } => format!("Created {slug}"),
+            Action::RenameTeam { name, .. } => format!("Renamed to {name}"),
+            Action::DeleteTeam { slug } => format!("Deleted {slug}"),
+            Action::PutMembers { .. } => "Saved the members".to_string(),
+            Action::EnableWebhook { on: true, .. } => "Resumed the webhook".to_string(),
+            Action::EnableWebhook { .. } => "Paused the webhook".to_string(),
+            Action::RotateWebhook { .. } => "Rotated the secret".to_string(),
+            Action::DeleteWebhook { .. } => "Deleted the webhook".to_string(),
         }
     }
 }
@@ -177,6 +258,16 @@ pub struct AdminView {
     pub decision: Option<(String, Loaded<dto::Decision>)>,
     /// Scope packs to approve, imports to settle and kept PRs to review.
     pub approvals: Loaded<dto::Approvals>,
+    pub keys: Loaded<Vec<dto::ApiKey>>,
+    pub mcp: Loaded<dto::McpSignIns>,
+    pub teams: Loaded<Vec<dto::Team>>,
+    pub team_audit: Option<(String, Loaded<Vec<dto::TeamAudit>>)>,
+    pub webhooks: Loaded<Vec<dto::Webhook>>,
+    pub deliveries: Option<(String, Loaded<Vec<dto::WebhookDelivery>>)>,
+    /// The webhook secret just rotated in, for as long as its webhook stays picked.
+    pub rotated: Option<dto::WebhookSecret>,
+    /// The key just minted, with its secret, for as long as the API keys page stays open.
+    pub minted: Option<dto::MintedKey>,
     pub acted: Option<Acted>,
 }
 
@@ -286,12 +377,33 @@ impl Worker {
         self.view.secret = read.secret.map(|(id, view)| (id, Some(view)));
         self.view.shares = read.shares.map(|(of, shares)| (of, Some(shares)));
         self.view.decision = read.decision.map(|(id, decision)| (id, Some(decision)));
+        if let Some(keys) = read.keys {
+            self.view.keys = Some(keys);
+        }
+        if let Some(mcp) = read.mcp {
+            self.view.mcp = Some(mcp);
+        }
+        if !watch.keys {
+            self.view.minted = None;
+        }
+        if let Some(teams) = read.teams {
+            self.view.teams = Some(teams);
+        }
+        self.view.team_audit = read.team_audit.map(|(slug, audit)| (slug, Some(audit)));
+        if let Some(webhooks) = read.webhooks {
+            self.view.webhooks = Some(webhooks);
+        }
+        self.view.deliveries = read.deliveries.map(|(id, list)| (id, Some(list)));
+        let shown = watch.webhook.as_deref();
+        if self.view.rotated.as_ref().map(|r| r.webhook.id.as_str()) != shown {
+            self.view.rotated = None;
+        }
     }
 
     async fn act(&mut self, action: Action) {
         let what = action.what();
         let result = match self.connector.connect().await {
-            Ok(c) => act(&c, &action).await,
+            Ok(c) => act(&c, &action, &mut self.view).await,
             Err(why) => Err(why),
         };
         self.acted += 1;
@@ -312,6 +424,12 @@ struct Read {
     secret: Option<(String, Result<SecretView, String>)>,
     shares: Option<(Shared, Result<Vec<dto::Share>, String>)>,
     decision: Option<(String, Result<dto::Decision, String>)>,
+    keys: Option<Result<Vec<dto::ApiKey>, String>>,
+    mcp: Option<Result<dto::McpSignIns, String>>,
+    teams: Option<Result<Vec<dto::Team>, String>>,
+    team_audit: Option<(String, Result<Vec<dto::TeamAudit>, String>)>,
+    webhooks: Option<Result<Vec<dto::Webhook>, String>>,
+    deliveries: Option<(String, Result<Vec<dto::WebhookDelivery>, String>)>,
 }
 
 impl Read {
@@ -325,6 +443,15 @@ impl Read {
             secret: watch.secret.clone().map(|id| (id, Err(why.clone()))),
             shares: watch.shares.clone().map(|of| (of, Err(why.clone()))),
             decision: watch.decision.clone().map(|id| (id, Err(why.clone()))),
+            keys: watch.keys.then(|| Err(why.clone())),
+            mcp: watch.keys.then(|| Err(why.clone())),
+            teams: watch.teams.then(|| Err(why.clone())),
+            team_audit: watch
+                .team_audit
+                .clone()
+                .map(|slug| (slug, Err(why.clone()))),
+            webhooks: watch.webhooks.then(|| Err(why.clone())),
+            deliveries: watch.webhook.clone().map(|id| (id, Err(why.clone()))),
         }
     }
 }
@@ -358,7 +485,35 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         let decision = within("the decision request", client.decision(id)).await;
         Some((id.clone(), decision))
     };
-    let (decisions, approvals, schedules, secrets, secret, shares, decision) = tokio::join!(
+    let team_audit = async {
+        let slug = watch.team_audit.as_ref()?;
+        let audit = within("the team's audit trail", client.team_audit(slug)).await;
+        Some((slug.clone(), audit))
+    };
+    let deliveries = async {
+        let id = watch.webhook.as_ref()?;
+        let list = within(
+            "the deliveries",
+            client.webhook_deliveries(id, None, Some(DELIVERIES)),
+        )
+        .await;
+        Some((id.clone(), list))
+    };
+    let (
+        decisions,
+        approvals,
+        schedules,
+        secrets,
+        secret,
+        shares,
+        decision,
+        keys,
+        mcp,
+        teams,
+        team_audit,
+        webhooks,
+        deliveries,
+    ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
         when(watch.schedules, within("the schedules", client.schedules())),
@@ -366,6 +521,12 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         secret,
         shares,
         decision,
+        when(watch.keys, within("the API keys", client.api_keys())),
+        when(watch.keys, within("the MCP clients", client.mcp_sign_ins())),
+        when(watch.teams, within("the teams", client.teams())),
+        team_audit,
+        when(watch.webhooks, within("the webhooks", client.webhooks())),
+        deliveries,
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -375,10 +536,16 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         secret,
         shares,
         decision,
+        keys,
+        mcp,
+        teams,
+        team_audit,
+        webhooks,
+        deliveries,
     }
 }
 
-async fn act(c: &Connection, action: &Action) -> Result<(), String> {
+async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<(), String> {
     let client = &c.client;
     match action {
         Action::Enable { schedule, on } => within(
@@ -459,6 +626,36 @@ async fn act(c: &Connection, action: &Action) -> Result<(), String> {
         Action::CancelLaunch { key } => within("the cancel", client.cancel_launch(key))
             .await
             .map(drop),
+        Action::MintKey { name, days } => within("the new key", client.mint_api_key(name, *days))
+            .await
+            .map(|key| view.minted = Some(key)),
+        Action::RevokeKey { id } => within("the revoke", client.revoke_api_key(id)).await,
+        Action::SignOutMcp { client: one } => {
+            within("the sign-out", client.sign_out_mcp(one.as_deref()))
+                .await
+                .map(drop)
+        }
+        Action::CreateTeam { slug, name } => within("the new team", client.create_team(slug, name))
+            .await
+            .map(drop),
+        Action::RenameTeam { slug, name } => within("the rename", client.rename_team(slug, name))
+            .await
+            .map(drop),
+        Action::DeleteTeam { slug } => within("the delete", client.delete_team(slug)).await,
+        Action::PutMembers { slug, members } => {
+            within("the members", client.put_team_members(slug, members))
+                .await
+                .map(drop)
+        }
+        Action::EnableWebhook { id, on } => {
+            within("the webhook", client.set_webhook_enabled(id, *on))
+                .await
+                .map(drop)
+        }
+        Action::RotateWebhook { id } => within("the rotation", client.rotate_webhook_secret(id))
+            .await
+            .map(|rotated| view.rotated = Some(rotated)),
+        Action::DeleteWebhook { id } => within("the delete", client.delete_webhook(id)).await,
     }
 }
 
@@ -474,7 +671,7 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
         let wait = next
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(500));
-        match tokio::time::timeout(wait, rx.recv()).await {
+        match crate::net::timeout(wait, rx.recv()).await {
             Ok(Some(Msg::Watch(now))) => {
                 if now != watch {
                     watch = now;
@@ -509,7 +706,10 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.secrets
             || watch.secret.is_some()
             || watch.shares.is_some()
-            || watch.decision.is_some();
+            || watch.decision.is_some()
+            || watch.keys
+            || watch.teams
+            || watch.webhooks;
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -545,6 +745,17 @@ pub struct Desk {
     pub move_to: Option<String>,
     /// The import being registered: its id, and the registry id and description typed.
     pub register: Option<(String, TextEdit, TextEdit)>,
+    /// The webhook the Triggers page shows in full.
+    pub webhook: Option<String>,
+    /// The team the Teams page shows.
+    pub team: Option<String>,
+    /// The new-team form, while open.
+    pub new_team: Option<crate::teams::TeamForm>,
+    pub add_member: crate::teams::MemberForm,
+    /// The team's next display name, while its rename form is open.
+    pub rename_team: Option<TextEdit>,
+    /// The mint form on the API keys page.
+    pub new_key: crate::apikeys::KeyForm,
     /// The decision requests already announced; `None` until the first queue lands.
     seen: Option<HashSet<String>>,
 }
@@ -567,6 +778,12 @@ impl Default for Desk {
             new_secret: None,
             move_to: None,
             register: None,
+            new_key: crate::apikeys::KeyForm::default(),
+            webhook: None,
+            team: None,
+            new_team: None,
+            add_member: crate::teams::MemberForm::default(),
+            rename_team: None,
             seen: None,
         }
     }
@@ -586,6 +803,15 @@ impl Desk {
             self.rotate = None;
         }
         self.secret = Some(id.to_string());
+    }
+
+    pub fn pick_team(&mut self, slug: &str) {
+        if self.team.as_deref() != Some(slug) {
+            self.add_member = crate::teams::MemberForm::default();
+            self.rename_team = None;
+        }
+        self.new_team = None;
+        self.team = Some(slug.to_string());
     }
 
     pub fn busy(&self) -> bool {
@@ -866,7 +1092,7 @@ impl crate::App {
         let on = |page: crate::Page| controller && self.page == page;
         let watch = Watch {
             controller,
-            schedules: on(crate::Page::Schedules),
+            schedules: on(crate::Page::Triggers),
             secrets: on(crate::Page::Secrets),
             secret: self
                 .remote
@@ -881,11 +1107,31 @@ impl crate::App {
                 .decision
                 .clone()
                 .filter(|_| on(crate::Page::Decisions)),
+            keys: on(crate::Page::Keys),
+            webhooks: on(crate::Page::Triggers),
+            webhook: self
+                .remote
+                .desk
+                .webhook
+                .clone()
+                .filter(|_| on(crate::Page::Triggers)),
+            teams: on(crate::Page::Teams),
+            team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
         if self.remote.admin_sent.as_ref() != Some(&watch) {
             self.remote.admin_client.watch(watch.clone());
             self.remote.admin_sent = Some(watch);
         }
+    }
+
+    /// The picked team's slug, when the caller owns it and so may read its audit trail.
+    fn owned_team(&self) -> Option<String> {
+        let slug = self.remote.desk.team.as_ref()?;
+        let teams = self.remote.admin.teams.as_ref()?.as_ref().ok()?;
+        teams
+            .iter()
+            .find(|team| &team.slug == slug && team.my_role == Some(dto::TeamRole::Owner))
+            .map(|team| team.slug.clone())
     }
 
     /// What the runs page on screen can share: the selected playbook, or the draft it launched
@@ -937,16 +1183,37 @@ impl crate::App {
                     }
                     Did::CreateSecret => self.remote.desk.new_secret = None,
                     Did::MoveSecret => self.remote.desk.move_to = None,
+                    Did::MintKey => {
+                        self.remote.desk.new_key = crate::apikeys::KeyForm::default();
+                    }
+                    Did::CreateTeam => {
+                        if let Some(Ok((slug, _))) =
+                            self.remote.desk.new_team.as_ref().map(|form| form.ask())
+                        {
+                            self.remote.desk.pick_team(&slug);
+                        }
+                        self.remote.desk.new_team = None;
+                    }
+                    Did::RenameTeam => self.remote.desk.rename_team = None,
+                    Did::DeleteTeam => self.remote.desk.team = None,
+                    Did::DeleteWebhook => self.remote.desk.webhook = None,
+                    Did::PutMembers => {
+                        self.remote.desk.add_member = crate::teams::MemberForm::default();
+                    }
                     Did::SaveSchedule => {
                         self.remote.launcher = None;
-                        self.page = crate::Page::Schedules;
+                        self.page = crate::Page::Triggers;
                     }
                     Did::Enable
                     | Did::Revoke
                     | Did::Unbind
                     | Did::RegisterImport
                     | Did::DiscardImport
-                    | Did::CancelLaunch => {}
+                    | Did::CancelLaunch
+                    | Did::RevokeKey
+                    | Did::SignOutMcp
+                    | Did::EnableWebhook
+                    | Did::RotateWebhook => {}
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =
@@ -1073,6 +1340,341 @@ mod tests {
         assert_eq!(view.schedules.map(|s| s.map(|s| s.len())), Some(Ok(0)));
         assert_eq!(view.secrets.map(|s| s.map(|s| s.len())), Some(Ok(0)));
         assert!(view.secret.is_none() && view.shares.is_none() && view.decision.is_none());
+    }
+
+    /// The newest view once `done` holds for it.
+    fn until(client: &Client, done: impl Fn(&AdminView) -> bool) -> AdminView {
+        let asked = Instant::now();
+        loop {
+            if let Some((_, view)) = client.take(0)
+                && done(&view)
+            {
+                return view;
+            }
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "the view never got there"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn keys_are_read_only_while_their_page_shows_and_a_minted_secret_lasts_as_long() {
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requests);
+        let (url, _) = crate::testserver::serve(move |request| {
+            let line: Vec<&str> = request.split_whitespace().take(2).collect();
+            seen.lock().unwrap().push(line.join(" "));
+            match line[..] {
+                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+                ["GET", "/api/approvals"] => "{}".into(),
+                ["GET", "/api/keys"] => r#"[{"id":"k1","name":"laptop",
+                    "created_at":"2026-11-01T00:00:00Z","expires_at":null,
+                    "last_used_at":null,"revoked_at":null}]"#
+                    .into(),
+                ["POST", "/api/keys"] => r#"{"id":"k2","name":"ci",
+                    "created_at":"2026-11-10T00:00:00Z","expires_at":null,"last_used_at":null,
+                    "revoked_at":null,"secret":"crk_once","mcp_url":null}"#
+                    .into(),
+                ["GET", "/api/me/mcp-sign-ins"] => r#"{"enabled":true,"sign_ins":[]}"#.into(),
+                ["DELETE", "/api/me/mcp-sign-ins?client_id=dyn-1"] => r#"{"revoked":1}"#.into(),
+                _ => "[]".into(),
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+        let on_page = Watch {
+            keys: true,
+            ..elsewhere.clone()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.keys.is_none() && view.mcp.is_none());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/api/keys")),
+            "keys were read off their page"
+        );
+
+        client.watch(on_page);
+        let view = until(&client, |view| view.keys.is_some() && view.mcp.is_some());
+        assert_eq!(view.keys.map(|k| k.map(|k| k.len())), Some(Ok(1)));
+        assert_eq!(view.mcp.map(|m| m.map(|m| m.enabled)), Some(Ok(true)));
+
+        client.act(Action::MintKey {
+            name: "ci".into(),
+            days: None,
+        });
+        let view = until(&client, |view| view.acted.is_some());
+        assert_eq!(
+            view.acted.map(|a| (a.did, a.result)),
+            Some((Did::MintKey, Ok("Minted ci".to_string())))
+        );
+        assert_eq!(view.minted.map(|m| m.secret), Some("crk_once".to_string()));
+
+        client.act(Action::RevokeKey { id: "k1".into() });
+        until(&client, |view| {
+            view.acted.as_ref().is_some_and(|a| a.did == Did::RevokeKey)
+        });
+        client.act(Action::SignOutMcp {
+            client: Some("dyn-1".into()),
+        });
+        let view = until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::SignOutMcp)
+        });
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Signed out".to_string()))
+        );
+        assert!(
+            view.minted.is_some(),
+            "the secret went while its page showed"
+        );
+        let sent = requests.lock().unwrap().clone();
+        for change in [
+            "POST /api/keys",
+            "DELETE /api/keys/k1",
+            "DELETE /api/me/mcp-sign-ins?client_id=dyn-1",
+        ] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(elsewhere);
+        until(&client, |view| view.minted.is_none());
+    }
+
+    #[test]
+    fn teams_are_read_on_their_page_with_the_audit_of_the_one_asked_for() {
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requests);
+        let (url, _) = crate::testserver::serve(move |request| {
+            let line: Vec<&str> = request.split_whitespace().take(2).collect();
+            seen.lock().unwrap().push(line.join(" "));
+            match line[..] {
+                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+                ["GET", "/api/approvals"] => "{}".into(),
+                ["GET", "/api/teams"] => r#"[{"slug":"infra","display_name":"Infra",
+                    "members":[{"kind":"user","member":"wynn","role":"owner"}],
+                    "my_role":"owner","reachable":true}]"#
+                    .into(),
+                ["GET", "/api/teams/infra/audit"] => r#"[{"id":7,"at":"2026-11-01T00:00:00Z",
+                    "actor":"user:wynn","action":"team:create","decision":"allow","rule":"owner"}]"#
+                    .into(),
+                ["POST", "/api/teams"] | ["PUT", _] => {
+                    r#"{"slug":"infra","display_name":"Infra"}"#.into()
+                }
+                _ => "[]".into(),
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
+        let listed = Watch {
+            controller: true,
+            teams: true,
+            ..Watch::default()
+        };
+
+        client.watch(listed.clone());
+        let view = until(&client, |view| view.teams.is_some());
+        assert_eq!(
+            view.teams
+                .map(|teams| teams.map(|teams| (teams.len(), teams[0].my_role))),
+            Some(Ok((1, Some(dto::TeamRole::Owner))))
+        );
+        assert!(view.team_audit.is_none());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.ends_with("/audit")),
+            "an audit trail nobody asked for was read"
+        );
+
+        client.watch(Watch {
+            team_audit: Some("infra".into()),
+            ..listed.clone()
+        });
+        let view = until(&client, |view| view.team_audit.is_some());
+        let (slug, audit) = view.team_audit.unwrap();
+        assert_eq!(slug, "infra");
+        assert_eq!(
+            audit.map(|a| a.map(|a| a[0].action.clone())),
+            Some(Ok("team:create".to_string()))
+        );
+
+        let steps = [
+            (
+                Action::CreateTeam {
+                    slug: "infra".into(),
+                    name: "Infra".into(),
+                },
+                Did::CreateTeam,
+                "Created infra",
+                "POST /api/teams",
+            ),
+            (
+                Action::RenameTeam {
+                    slug: "infra".into(),
+                    name: "Platform".into(),
+                },
+                Did::RenameTeam,
+                "Renamed to Platform",
+                "PUT /api/teams/infra",
+            ),
+            (
+                Action::PutMembers {
+                    slug: "infra".into(),
+                    members: Vec::new(),
+                },
+                Did::PutMembers,
+                "Saved the members",
+                "PUT /api/teams/infra/members",
+            ),
+            (
+                Action::DeleteTeam {
+                    slug: "infra".into(),
+                },
+                Did::DeleteTeam,
+                "Deleted infra",
+                "DELETE /api/teams/infra",
+            ),
+        ];
+        for (action, did, said, sent) in steps {
+            client.act(action);
+            let view = until(&client, |view| {
+                view.acted.as_ref().is_some_and(|a| a.did == did)
+            });
+            assert_eq!(view.acted.map(|a| a.result), Some(Ok(said.to_string())));
+            assert!(
+                requests.lock().unwrap().iter().any(|r| r == sent),
+                "{sent} was not sent"
+            );
+        }
+
+        client.watch(listed);
+        until(&client, |view| view.team_audit.is_none());
+    }
+
+    #[test]
+    fn webhooks_are_read_on_triggers_and_a_rotated_secret_lasts_while_its_webhook_shows() {
+        const HOOK: &str = r#"{"id":"w1","playbook":"triage","verifier":"path_token",
+            "enabled":true,"max_launches_per_hour":3}"#;
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requests);
+        let (url, _) = crate::testserver::serve(move |request| {
+            let line: Vec<&str> = request.split_whitespace().take(2).collect();
+            seen.lock().unwrap().push(line.join(" "));
+            match line[..] {
+                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+                ["GET", "/api/approvals"] => "{}".into(),
+                ["GET", "/api/webhooks"] => format!("[{HOOK}]"),
+                ["GET", "/api/webhooks/w1/deliveries?limit=20"] => r#"[{"id":"d1",
+                    "received_at":"2026-11-01T00:00:00Z","outcome":"filtered",
+                    "reason":"the filter was false","launch_key":null}]"#
+                    .into(),
+                ["POST", "/api/webhooks/w1/secret"] => {
+                    format!(r#"{{"webhook":{HOOK},"secret":"whsec_once","delivery_url":null}}"#)
+                }
+                ["POST", "/api/webhooks/w1/enabled"] => HOOK.into(),
+                _ => "[]".into(),
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
+        let listed = Watch {
+            controller: true,
+            schedules: true,
+            webhooks: true,
+            ..Watch::default()
+        };
+        let opened = Watch {
+            webhook: Some("w1".into()),
+            ..listed.clone()
+        };
+
+        client.watch(listed.clone());
+        let view = until(&client, |view| view.webhooks.is_some());
+        assert_eq!(
+            view.webhooks
+                .map(|hooks| hooks.map(|hooks| hooks[0].playbook.clone())),
+            Some(Ok("triage".to_string()))
+        );
+        assert!(view.deliveries.is_none());
+        assert!(
+            !requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r.contains("/deliveries")),
+            "deliveries nobody opened were read"
+        );
+
+        client.watch(opened);
+        let view = until(&client, |view| view.deliveries.is_some());
+        let (id, list) = view.deliveries.unwrap();
+        assert_eq!(id, "w1");
+        assert_eq!(
+            list.map(|list| list.map(|list| list[0].outcome.clone())),
+            Some(Ok("filtered".to_string()))
+        );
+
+        client.act(Action::RotateWebhook { id: "w1".into() });
+        let view = until(&client, |view| view.rotated.is_some());
+        assert_eq!(
+            view.rotated.map(|r| r.secret),
+            Some("whsec_once".to_string())
+        );
+        client.act(Action::EnableWebhook {
+            id: "w1".into(),
+            on: false,
+        });
+        let view = until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::EnableWebhook)
+        });
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Paused the webhook".to_string()))
+        );
+        assert!(
+            view.rotated.is_some(),
+            "the secret went while its webhook showed"
+        );
+        client.act(Action::DeleteWebhook { id: "w1".into() });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::DeleteWebhook)
+        });
+        let sent = requests.lock().unwrap().clone();
+        for change in [
+            "POST /api/webhooks/w1/secret",
+            "POST /api/webhooks/w1/enabled",
+            "DELETE /api/webhooks/w1",
+        ] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(listed);
+        until(&client, |view| {
+            view.rotated.is_none() && view.deliveries.is_none()
+        });
     }
 
     fn summary(id: &str) -> dto::DecisionSummary {

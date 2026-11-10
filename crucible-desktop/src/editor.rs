@@ -349,9 +349,12 @@ fn launch_script(command: &str, dir: &Path) -> Result<PathBuf, String> {
         shell_quote(&dir.to_string_lossy())
     );
     std::fs::write(&path, body).map_err(|e| format!("writing {}: {e}", path.display()))?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| format!("making {} executable: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| format!("making {} executable: {e}", path.display()))?;
+    }
     Ok(path)
 }
 
@@ -466,14 +469,16 @@ pub fn open_text(editor: Editor, text: &str) -> Result<(), String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("starting {}: {e}", program.display()))?;
-    let mut stdin = child
+    let stdin = child
         .stdin
         .take()
         .ok_or_else(|| format!("{} has no stdin", program.display()))?;
     let text = text.to_string();
     std::thread::spawn(move || {
-        let _ = stdin.write_all(text.as_bytes());
-        drop(stdin);
+        {
+            let mut stdin = stdin;
+            let _ = stdin.write_all(text.as_bytes());
+        }
         let _ = child.wait();
     });
     Ok(())
