@@ -1,28 +1,31 @@
-//! The Schedules page: every schedule the caller may see, with a switch to pause or resume each.
+//! The schedules on the Triggers page: every one the caller may see, with a switch to pause or
+//! resume each.
 
 use rune::{El, col, row, text};
 use rune_kit::{Button, ButtonVariant, Switch};
 
 use crate::admin::{Action, relative};
-use crate::ui::desk::{card, frame, landed, none, now, scrolled, stacked};
+use crate::ui::desk::{card, heading, landed, none, now, stacked};
 use crate::ui::{Paint, Tone, flag, tag};
 use crate::{App, Selection};
 
-pub(crate) fn page(app: &App, p: &Paint) -> El {
-    let note = match &app.remote.admin.schedules {
-        Some(Ok(list)) => {
-            let on = list.iter().filter(|s| s.enabled).count();
-            format!("{} \u{b7} {on} enabled", list.len())
-        }
-        _ => String::new(),
-    };
-    let page = frame("schedules", "Schedules", note, None, app, p);
+/// The schedules as a card: each with a switch to pause or resume it.
+pub(crate) fn section(app: &App, p: &Paint) -> El {
+    let body = col()
+        .key("schedules")
+        .w_full()
+        .gap(6.0)
+        .child(heading("Schedules", p));
     let schedules = match landed(&app.remote.admin.schedules, "the schedules", p) {
-        Err(standin) => return page.child(*standin),
+        Err(standin) => return card("schedules-card", body.child(*standin), p),
         Ok(schedules) => schedules,
     };
     if schedules.is_empty() {
-        return page.child(none("schedules-none", "No schedules", p));
+        return card(
+            "schedules-card",
+            body.child(none("schedules-none", "None", p)),
+            p,
+        );
     }
     let mut sorted: Vec<&crux::dto::Schedule> = schedules.iter().collect();
     sorted.sort_by(|a, b| {
@@ -36,11 +39,11 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         .into_iter()
         .map(|schedule| schedule_row(schedule, app, now, p))
         .collect();
-    page.child(scrolled(
-        "schedules-scroll",
-        card("schedules-card", stacked("schedules-list", rows, p), p),
+    card(
+        "schedules-card",
+        body.child(stacked("schedules-list", rows, p)),
         p,
-    ))
+    )
 }
 
 fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) -> El {

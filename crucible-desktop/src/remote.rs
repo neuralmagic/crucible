@@ -82,6 +82,7 @@ pub struct Remote {
     pub sign_in_error: Option<String>,
     pub sign_in_done: Option<Receiver<Result<(), String>>>,
     /// Stops the sign-in that is waiting on the browser.
+    #[cfg(not(target_arch = "wasm32"))]
     pub sign_in_cancel: Option<crate::signin::Cancel>,
 }
 
@@ -129,6 +130,7 @@ impl Remote {
             signing_in: false,
             sign_in_error: None,
             sign_in_done: None,
+            #[cfg(not(target_arch = "wasm32"))]
             sign_in_cancel: None,
         };
         if let Some(waker) = waker {

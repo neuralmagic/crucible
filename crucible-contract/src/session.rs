@@ -183,6 +183,9 @@ pub struct PlanTaskWire {
     /// definitions. A rerun refuses to reuse a task whose definition moved since its parent.
     #[serde(default)]
     pub definition: String,
+    /// What a `command` or `evaluate` task runs, as the pack wrote it; empty for other kinds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
 }
 
 fn write_revise_targets<S: serde::Serializer>(targets: &[String], s: S) -> Result<S::Ok, S::Error> {
@@ -1109,6 +1112,7 @@ mod tests {
                 required: true,
                 join: "all".into(),
                 stage: "iteration".into(),
+                command: "make bench".into(),
                 over: "discover.targets".into(),
                 max_fanout: 8,
                 when: String::new(),
@@ -1221,6 +1225,7 @@ mod tests {
             timeout: String::new(),
             history_depth: 0,
             definition: String::new(),
+            command: String::new(),
             optional: Vec::new(),
         };
         let written = |revise: Vec<String>| {

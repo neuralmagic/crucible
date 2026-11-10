@@ -89,9 +89,10 @@ impl Lsp {
         }));
         let worker = Arc::clone(&shared);
         let wake = tx.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("crucible-playbooks-lsp".into())
-            .spawn(move || run(rx, wake, worker))
+        if crate::LOCAL_PACKS
+            && let Err(error) = std::thread::Builder::new()
+                .name("crucible-playbooks-lsp".into())
+                .spawn(move || run(rx, wake, worker))
         {
             update(&shared, |view| {
                 view.status = Status::Unavailable(format!("starting the LSP worker: {error}"));

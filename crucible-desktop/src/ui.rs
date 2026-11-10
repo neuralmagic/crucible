@@ -1,6 +1,9 @@
 //! The window: live playbooks and local packs on the left, the selected run on the right.
 
+mod activity;
+mod admin;
 mod approvals;
+mod blueprints;
 mod compare;
 mod data;
 mod decisions;
@@ -9,21 +12,28 @@ mod dock;
 mod files;
 mod finder;
 mod graph;
+mod issues;
+mod keys;
 mod launch;
 mod launcher;
 mod log;
 mod pack;
 mod palette;
+mod policy;
 mod profiles;
+mod providers;
 mod runs;
 mod schedules;
 mod secrets;
 mod shares;
 mod slider;
 mod tasks;
+mod teams;
 mod theme;
 mod timeline;
 mod transcript;
+mod triggers;
+mod webhook_form;
 
 use rune::{Color, Cx, El, Icon, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::RowStatus;
@@ -47,6 +57,7 @@ use crucible_contract::session::TaskStatus;
 
 /// The band across the top that holds the window buttons and drags the window.
 const TITLE_BAND: f32 = 52.0;
+#[cfg(not(target_arch = "wasm32"))]
 /// The close button's top-left, centring the buttons in the title band.
 #[cfg(not(feature = "hot"))]
 pub const TRAFFIC_LIGHTS: (f32, f32) = (18.0, 19.0);
@@ -612,22 +623,42 @@ fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(pack_list(app, p))
         .children((app.backend == Backend::Controller).then(|| pages_nav(app, p)))
         .child(rule("sidebar-foot-rule", false, p))
+        .children(app.act_as_refused.as_ref().map(|why| {
+            text(why.clone())
+                .key("act-as-refused")
+                .role("status")
+                .font(p.k.ty.small)
+                .color(p.fail)
+                .wrap()
+                .px(12.0)
+                .pt(8.0)
+        }))
         .child(account(app, source, p, layer))
 }
 
-/// The controller's management pages, under the playbooks.
+/// The controller's pages, under the playbooks. Setup pages are behind the gear.
 fn pages_nav(app: &App, p: &Paint) -> El {
-    let waiting = app.waiting();
-    let entry = |page: crate::Page, glyph: &'static Icon, badge: Option<String>| {
-        let mut entry = SidebarRow::new(page.title())
-            .icon(glyph)
-            .height(28.0)
-            .selected(app.page == page)
-            .on_select(move |app: &mut App, _: &mut Tx| app.toggle_page(page));
-        if let Some(badge) = badge {
-            entry = entry.badge(badge);
+    let row_ = |key: &str, title: &str, glyph: &'static Icon, on: bool, badge: usize| {
+        let mut entry = SidebarRow::new(title).icon(glyph).height(28.0).selected(on);
+        if badge > 0 {
+            entry = entry.badge(badge.to_string());
         }
-        entry.build(p.k).key(format!("nav-{}", page.id()))
+        (entry, format!("nav-{key}"))
+    };
+    let group = |group: crate::Group, glyph: &'static Icon, badge: usize| {
+        let on = app.page.group() == Some(group);
+        let (entry, key) = row_(group.id(), group.title(), glyph, on, badge);
+        entry
+            .on_select(move |app: &mut App, _: &mut Tx| app.toggle_group(group))
+            .build(p.k)
+            .key(key)
+    };
+    let page = |page: crate::Page, glyph: &'static Icon| {
+        let (entry, key) = row_(page.id(), page.title(), glyph, app.page == page, 0);
+        entry
+            .on_select(move |app: &mut App, _: &mut Tx| app.toggle_page(page))
+            .build(p.k)
+            .key(key)
     };
     col()
         .key("pages-nav")
@@ -636,18 +667,14 @@ fn pages_nav(app: &App, p: &Paint) -> El {
         .pb(6.0)
         .gap(2.0)
         .child(rule("pages-nav-rule", false, p).mb(6.0))
-        .child(entry(
-            crate::Page::Decisions,
-            &oc::HELP,
-            (waiting > 0).then(|| waiting.to_string()),
-        ))
-        .child(entry(
-            crate::Page::Approvals,
+        .child(group(
+            crate::Group::Inbox,
             &oc::CIRCLE_CHECK,
-            (app.approvals_waiting() > 0).then(|| app.approvals_waiting().to_string()),
+            app.waiting() + app.approvals_waiting(),
         ))
-        .child(entry(crate::Page::Schedules, &oc::STATUS, None))
-        .child(entry(crate::Page::Secrets, &rune_kit::glyphs::LOCK, None))
+        .child(page(crate::Page::Triggers, &oc::STATUS))
+        .child(page(crate::Page::Blueprints, &oc::GRID_PLUS))
+        .child(group(crate::Group::Activity, &oc::CHECKLIST, 0))
 }
 
 /// Who is signed in, bottom left, with the settings button beside it. Pressing it opens a menu of
@@ -673,9 +700,19 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
         .chars()
         .find(|c| c.is_alphanumeric())
         .map_or("?".to_string(), |c| c.to_uppercase().to_string());
-    let place = match app.backend {
-        Backend::Local => "Local".to_string(),
-        Backend::Controller => app.remote.target.name.clone(),
+    let acting = app
+        .remote
+        .target
+        .act_as()
+        .map(|act_as| act_as.team().to_string());
+    let place = match (app.backend, &acting) {
+        (Backend::Local, _) => "Local".to_string(),
+        (Backend::Controller, Some(team)) => format!(
+            "{} \u{b7} as {}",
+            app.remote.target.name,
+            team.trim_start_matches("team:")
+        ),
+        (Backend::Controller, None) => app.remote.target.name.clone(),
     };
     let trigger = row()
         .key("source-menu-button")
@@ -739,16 +776,42 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
             app.use_profile(&name);
         }));
     }
-    let menu = menu
-        .separator()
-        .item(
+    let teams: Vec<String> = app
+        .owners()
+        .into_iter()
+        .filter(|owner| owner.starts_with("team:"))
+        .collect();
+    if app.backend == Backend::Controller && (!teams.is_empty() || acting.is_some()) {
+        menu = menu.separator().group_label("Act as").item(
+            rune_kit::MenuItem::new("Yourself")
+                .checked(acting.is_none())
+                .on_select(|app: &mut App| {
+                    app.source_menu = false;
+                    app.act_as(None);
+                }),
+        );
+        for team in teams {
+            let label = team.trim_start_matches("team:").to_string();
+            let current = acting.as_deref() == Some(team.as_str());
+            menu = menu.item(rune_kit::MenuItem::new(label).checked(current).on_select(
+                move |app: &mut App| {
+                    app.source_menu = false;
+                    app.act_as(Some(team.clone()));
+                },
+            ));
+        }
+    }
+    if crate::LOCAL_PACKS {
+        menu = menu.separator().item(
             rune_kit::MenuItem::new("Local packs")
                 .checked(app.backend == Backend::Local)
                 .on_select(|app: &mut App| {
                     app.source_menu = false;
                     app.switch(Backend::Local);
                 }),
-        )
+        );
+    }
+    let menu = menu
         .separator()
         .item(
             rune_kit::MenuItem::new("Edit profiles\u{2026}").on_select(|app: &mut App| {
@@ -771,13 +834,13 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(el().grow(1.0))
         .child(
             IconButton::new(&oc::SETTINGS_GEAR)
-                .variant(if app.page == crate::Page::Settings {
+                .variant(if app.page.group() == Some(crate::Group::Settings) {
                     IconButtonVariant::Neutral
                 } else {
                     IconButtonVariant::GhostMuted
                 })
                 .label("Settings")
-                .on_press(|app: &mut App| app.toggle_page(crate::Page::Settings))
+                .on_press(|app: &mut App| app.toggle_group(crate::Group::Settings))
                 .build(p.k)
                 .key("settings-open"),
         )
@@ -1204,10 +1267,17 @@ fn verdict_icon(verdict: Verdict) -> Option<&'static Icon> {
 fn detail(app: &App, p: &Paint) -> El {
     match app.page {
         crate::Page::Settings => return settings_pane(app, p),
-        crate::Page::Schedules => return schedules::page(app, p),
+        crate::Page::Triggers => return triggers::page(app, p),
         crate::Page::Secrets => return secrets::page(app, p),
         crate::Page::Decisions => return decisions::page(app, p),
         crate::Page::Approvals => return approvals::page(app, p),
+        crate::Page::Teams => return teams::page(app, p),
+        crate::Page::Providers => return providers::page(app, p),
+        crate::Page::Blueprints => return blueprints::page(app, p),
+        crate::Page::Activity => return activity::page(app, p),
+        crate::Page::Issues => return issues::page(app, p),
+        crate::Page::Admin => return admin::page(app, p),
+        crate::Page::Keys => return keys::page(app, p),
         crate::Page::Runs => {}
     }
     if let (
@@ -1699,6 +1769,7 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                         .key("settings-done"),
                 ),
         )
+        .children(desk::group_tabs(app, p))
         .child(settings_section(
             "profiles",
             "Profiles",

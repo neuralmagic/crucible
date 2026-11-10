@@ -34,9 +34,14 @@ pub(crate) fn frame(
                 .center_y()
                 .window_drag()
                 .child(
-                    text(title.to_string())
-                        .font(p.sized(TITLE))
-                        .color(p.c.text_base),
+                    text(
+                        app.page
+                            .group()
+                            .map_or(title, |group| group.title())
+                            .to_string(),
+                    )
+                    .font(p.sized(TITLE))
+                    .color(p.c.text_base),
                 )
                 .child(
                     text(note)
@@ -47,7 +52,31 @@ pub(crate) fn frame(
                 )
                 .children(action),
         )
+        .children(group_tabs(app, p))
         .children(outcome(app, p))
+}
+
+/// The shown page's group as tabs, when it has more than one to offer.
+pub(crate) fn group_tabs(app: &App, p: &Paint) -> Option<El> {
+    let tabs = app.tabs(app.page.group()?);
+    if tabs.len() < 2 {
+        return None;
+    }
+    let options: Vec<(String, String)> = tabs
+        .iter()
+        .map(|page| (page.id().to_string(), page.tab().to_string()))
+        .collect();
+    Some(pills(
+        "group-tabs",
+        &options,
+        Some(app.page.id()),
+        move |app: &mut App, id: &str| {
+            if let Some(page) = tabs.iter().find(|page| page.id() == id) {
+                app.page = *page;
+            }
+        },
+        p,
+    ))
 }
 
 /// The newest action's outcome, or a spinner while one is on its way.
@@ -214,6 +243,114 @@ pub(crate) fn field(label: &str, control: El, p: &Paint) -> El {
                 .color(p.c.text_muted),
         )
         .child(control)
+}
+
+/// What the app knows that completes `typed`, as buttons that fill the field. Nothing when there
+/// is nothing to offer.
+pub(crate) fn suggestions(
+    key: &str,
+    typed: &str,
+    want: crate::principals::Want,
+    fill: fn(&mut App, &str),
+    app: &App,
+    p: &Paint,
+) -> Option<El> {
+    let offered = app.known_principals().suggest(typed, want, 6);
+    if offered.is_empty() {
+        return None;
+    }
+    let mut chips = row().key(key.to_string()).gap(6.0).flex_wrap();
+    for value in offered {
+        let chip = format!("{key}-{value}");
+        let label = value.clone();
+        chips = chips.child(
+            Button::new(label)
+                .variant(ButtonVariant::Outline)
+                .control_size(rune_kit::ControlSize::Small)
+                .on_press(move |app: &mut App| fill(app, &value))
+                .build(p.k)
+                .key(chip),
+        );
+    }
+    Some(chips)
+}
+
+/// A list beside what is picked from it, each as tall as the page.
+pub(crate) fn split(key: &str, rows: Vec<El>, width: f32, picked: El, p: &Paint) -> El {
+    row()
+        .key(format!("{key}-body"))
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .gap(16.0)
+        .child(
+            card(
+                &format!("{key}-list-card"),
+                list(&format!("{key}-list"), rows, p),
+                p,
+            )
+            .w(width)
+            .h_full(),
+        )
+        .child(
+            col()
+                .key(format!("{key}-detail"))
+                .grow(1.0)
+                .min_w(0.0)
+                .h_full()
+                .min_h(0.0)
+                .child(scrolled(&format!("{key}-scroll"), picked, p)),
+        )
+}
+
+/// A button that does `action` on its second press: the first arms it under `armed`, and it then
+/// reads `sure`.
+pub(crate) fn confirm(
+    key: impl Into<String>,
+    armed: &str,
+    (label, sure): (&'static str, &'static str),
+    enabled: bool,
+    action: crate::admin::Action,
+    app: &App,
+    p: &Paint,
+) -> El {
+    let on = app.remote.desk.armed.as_deref() == Some(armed);
+    let armed = armed.to_string();
+    Button::new(if on { sure } else { label })
+        .variant(if on {
+            ButtonVariant::Danger
+        } else {
+            ButtonVariant::Ghost
+        })
+        .disabled(!enabled || app.remote.desk.busy())
+        .on_press(move |app: &mut App| {
+            if app.remote.desk.armed.as_deref() == Some(armed.as_str()) {
+                app.act(action.clone());
+            } else {
+                app.remote.desk.armed = Some(armed.clone());
+            }
+        })
+        .build(p.k)
+        .key(key.into())
+}
+
+/// A value in mono that can be selected and copied.
+pub(crate) fn mono(key: impl Into<String>, value: impl Into<String>, p: &Paint) -> El {
+    text(value.into())
+        .key(key.into())
+        .font(p.mono(12.0, 480.0))
+        .color(p.c.text_base)
+        .selectable(true)
+        .wrap()
+}
+
+/// A heading over a [`mono`] value.
+pub(crate) fn fact(label: &str, key: impl Into<String>, value: impl Into<String>, p: &Paint) -> El {
+    col()
+        .w_full()
+        .gap(4.0)
+        .child(heading(label, p))
+        .child(mono(key, value, p))
 }
 
 /// A small muted heading over a group of rows.

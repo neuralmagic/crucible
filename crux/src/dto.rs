@@ -216,10 +216,14 @@ pub struct ScopeDetail {
     pub runs: Vec<RunDetail>,
 }
 
+/// One status transition the controller recorded.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Event {
     #[serde(default)]
     pub ts: String,
+    /// The issue or launch that moved.
+    #[serde(default)]
+    pub key: String,
     #[serde(default)]
     pub from: String,
     #[serde(default)]
@@ -440,6 +444,241 @@ pub struct CancelAck {
     pub reason: String,
 }
 
+/// An API key's public half. Its secret is shown once, when it is minted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApiKey {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+}
+
+/// `POST /api/keys`: the new key and its secret, which no later response carries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MintedKey {
+    #[serde(flatten)]
+    pub key: ApiKey,
+    pub secret: String,
+    /// Where an MCP client reaches this controller, when it serves one.
+    #[serde(default)]
+    pub mcp_url: Option<String>,
+}
+
+/// Who vouches for an MCP client: the operator, the host publishing its document, or nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpClientKind {
+    Registered,
+    Metadata,
+    Dynamic,
+}
+
+/// One MCP client approval whose refresh token is still live.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpSignIn {
+    pub client_id: String,
+    pub client_name: String,
+    #[serde(default)]
+    pub client_host: Option<String>,
+    pub client_kind: McpClientKind,
+    pub resource: String,
+    pub cluster: String,
+    pub approved_at: String,
+    pub last_used_at: String,
+}
+
+/// Whether the controller signs MCP clients in, and the caller's live approvals when it does.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpSignIns {
+    pub enabled: bool,
+    #[serde(default)]
+    pub sign_ins: Vec<McpSignIn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct McpSignedOut {
+    pub revoked: u64,
+}
+
+/// One controller setting: its effective value and where that came from.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Knob {
+    pub name: String,
+    pub value: serde_json::Value,
+    /// `default`, `env` or `override`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub overridable: bool,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// `GET /api/config`: the controller's settings as they are in effect.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ControllerConfig {
+    #[serde(default)]
+    pub knobs: Vec<Knob>,
+}
+
+/// `GET /api/access`: who administers and operates the controller, and the orgs a repo may be
+/// added from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Access {
+    #[serde(default)]
+    pub admins: Vec<String>,
+    #[serde(default)]
+    pub operators: Vec<String>,
+    #[serde(default)]
+    pub allowed_orgs: Vec<String>,
+}
+
+/// Whether the controller dispatches on its own, and who last changed that.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Autopilot {
+    pub enabled: bool,
+    #[serde(default)]
+    pub changed_by: Option<String>,
+    #[serde(default)]
+    pub changed_at: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A repo discovery sweeps, with how many of its issues sit in each state.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WatchedRepo {
+    pub repo: String,
+    #[serde(default)]
+    pub running: i64,
+    #[serde(default)]
+    pub pr_open: i64,
+    #[serde(default)]
+    pub parked: i64,
+    #[serde(default)]
+    pub done: i64,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub watermark: Option<String>,
+    #[serde(default)]
+    pub watched: bool,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub added_by: Option<String>,
+}
+
+/// One stored authorization policy set. Exactly one is active.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PolicySet {
+    pub digest: String,
+    /// The Cedar source.
+    pub text: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub activated_by: Option<String>,
+    #[serde(default)]
+    pub activated_at: Option<String>,
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// `GET /api/authz/explain`: how the active policy decides one action for one user, and the
+/// rules that decided it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Explanation {
+    pub login: String,
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+    #[serde(default)]
+    pub owner: String,
+    pub allowed: bool,
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+/// A role in a team, least first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRole {
+    Member,
+    Maintainer,
+    Owner,
+}
+
+/// How a team holds a member: a login, a group claim, another team, or a rule over claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberKind {
+    User,
+    Team,
+    Group,
+    Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TeamMember {
+    pub kind: MemberKind,
+    pub member: String,
+    pub role: TeamRole,
+    #[serde(default)]
+    pub since: String,
+    #[serde(default)]
+    pub added_by: Option<String>,
+    /// Whether a `user` member has ever signed in.
+    #[serde(default)]
+    pub signed_in: bool,
+}
+
+/// A member as a `PUT /api/teams/{slug}/members` body spells it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TeamMemberBody {
+    pub kind: MemberKind,
+    pub member: String,
+    pub role: TeamRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Team {
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub members: Vec<TeamMember>,
+    /// The caller's role in it, when they are in it.
+    #[serde(default)]
+    pub my_role: Option<TeamRole>,
+    /// Whether any user can reach the team through its members.
+    #[serde(default)]
+    pub reachable: bool,
+}
+
+/// One line of a team's audit trail.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TeamAudit {
+    pub id: i64,
+    pub at: String,
+    pub actor: String,
+    pub action: String,
+    #[serde(default)]
+    pub decision: String,
+    #[serde(default)]
+    pub rule: String,
+}
+
 /// A pack import waiting for an operator to register or discard it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PendingImport {
@@ -594,6 +833,9 @@ pub struct Whoami {
     /// The teams the caller belongs to, which it may act and own things as.
     #[serde(default)]
     pub teams: Vec<WhoamiTeam>,
+    /// The lanes the caller may use, such as `autoresearch`.
+    #[serde(default)]
+    pub entitlements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -934,6 +1176,76 @@ pub struct Provider {
     pub enabled: bool,
     #[serde(default)]
     pub owner: String,
+    /// The base URL a `custom` provider is reached at.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<InferenceProtocol>,
+    /// The agent CLI the registration names, when it overrides the kind's default.
+    #[serde(default)]
+    pub harness_override: Option<String>,
+    #[serde(default)]
+    pub secret_name: Option<String>,
+    #[serde(default)]
+    pub secret_owner: Option<String>,
+    /// What the caller may do to it: `update`, `delete` and the like.
+    #[serde(default)]
+    pub actions: Vec<String>,
+}
+
+/// Which service a provider registration talks to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    Openai,
+    Anthropic,
+    Vertex,
+    /// The registration's own endpoint: vLLM, a proxy, a gateway.
+    Custom,
+}
+
+/// The wire protocol a `custom` provider's endpoint speaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+    Messages,
+    Decisions,
+    SystemOne,
+}
+
+/// A provider as `PUT /api/providers/{id}` takes it. Fields a kind has no use for stay off the
+/// wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderBody {
+    pub display_name: String,
+    pub kind: ProviderKind,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<InferenceProtocol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_owner: Option<String>,
+    pub enabled: bool,
+}
+
+/// `POST /api/providers`: a new registration under `id`, owned by `owner`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegisterProvider {
+    pub id: String,
+    pub owner: String,
+    #[serde(flatten)]
+    pub provider: ProviderBody,
 }
 
 /// `GET /api/dispatch-targets`: where the caller may dispatch, default first.
@@ -1436,7 +1748,7 @@ pub struct Watch {
     pub owner_principal: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Webhook {
     pub id: String,
     #[serde(default)]
@@ -1453,9 +1765,105 @@ pub struct Webhook {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
+    /// Where senders deliver, when the controller knows its public address.
+    #[serde(default)]
+    pub delivery_url: Option<String>,
+    /// The CEL a delivery must satisfy to launch.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// The CEL whose value marks two deliveries as the same event.
+    #[serde(default)]
+    pub dedupe: Option<String>,
+    /// Param name to the CEL that derives it from a delivery.
+    #[serde(default)]
+    pub derive: std::collections::BTreeMap<String, String>,
+    /// The fixed values every launch carries.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub max_cost: f64,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub dispatch_target: Option<String>,
+    /// The header an `hmac_sha256` webhook reads the signature from.
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub retention_days: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// How a webhook tells a real delivery from a forged one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookVerifier {
+    /// A secret token in the delivery address.
+    #[default]
+    PathToken,
+    /// An HMAC-SHA256 signature of the body in a header.
+    HmacSha256,
+}
+
+/// A webhook as `POST /api/webhooks` and `PUT /api/webhooks/{id}` take it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WebhookBody {
+    pub playbook: String,
+    pub verifier: WebhookVerifier,
+    pub header: Option<String>,
+    pub filter: String,
+    pub dedupe: String,
+    pub derive: std::collections::BTreeMap<String, String>,
+    pub params: std::collections::BTreeMap<String, String>,
+    pub max_launches_per_hour: i32,
+    pub retention_days: i32,
+    pub max_cost: f64,
+    pub max_time: String,
+    pub dispatch_target: Option<String>,
+}
+
+/// A sender's verifier and transform to start a webhook form from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WebhookPreset {
+    pub id: String,
+    pub title: String,
+    pub verifier: WebhookVerifier,
+    #[serde(default)]
+    pub header: Option<String>,
+    pub filter: String,
+    pub dedupe: String,
+    #[serde(default)]
+    pub derive: std::collections::BTreeMap<String, String>,
+}
+
+/// What one expression of a transform came to on a sample delivery.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PreviewResult {
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `POST /api/webhooks/preview`: a transform run on a sample delivery, nothing stored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WebhookPreview {
+    pub filter: PreviewResult,
+    pub dedupe: PreviewResult,
+    pub derive: PreviewResult,
+}
+
+/// `POST /api/webhooks/{id}/secret`: the webhook with its new secret, which no later response
+/// carries.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WebhookSecret {
+    pub webhook: Webhook,
+    pub secret: String,
+    /// The delivery URL, token included for a `path_token` webhook.
+    #[serde(default)]
+    pub delivery_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WebhookDelivery {
     pub id: String,
     #[serde(default)]
@@ -1468,7 +1876,7 @@ pub struct WebhookDelivery {
     pub launch_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CelDiagnostic {
     pub field: String,
     pub message: String,
@@ -1478,7 +1886,7 @@ pub struct CelDiagnostic {
     pub column: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WebhookCheck {
     #[serde(default)]
     pub diagnostics: Vec<CelDiagnostic>,

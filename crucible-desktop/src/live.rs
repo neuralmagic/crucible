@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crucible_contract::session::SessionEvent;
 use jiff::Timestamp;
@@ -16,6 +16,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use rune::Waker;
+use rune::time::Instant;
 
 use crate::captured::{Body, Captured, Opened};
 use crate::draft::Working;
@@ -136,6 +137,8 @@ pub struct Identity {
     pub role: String,
     /// What the user may own things as: themself, then each of their teams.
     pub owners: Vec<String>,
+    /// The controller's own issue lane is open to the user.
+    pub autoresearch: bool,
 }
 
 impl Identity {
@@ -1240,13 +1243,13 @@ impl Fetcher {
             }
         };
         if let Some(dir) = crate::pack::cache_dir(&key) {
-            let copied = tokio::task::spawn_blocking(move || {
+            let copied = crate::net::blocking(move || {
                 let _ = pack.copy_to(&dir);
                 pack
             });
             pack = copied
                 .await
-                .map_err(|error| format!("copying the pack: {error}"))?;
+                .ok_or_else(|| "copying the pack stopped early".to_string())?;
         }
         self.packs.insert(key, pack.clone());
         Ok(pack)
@@ -1533,6 +1536,7 @@ fn identity(whoami: crux::dto::Whoami) -> Identity {
         user,
         role: whoami.role,
         owners,
+        autoresearch: whoami.entitlements.iter().any(|e| e == "autoresearch"),
     }
 }
 
@@ -1912,7 +1916,7 @@ async fn run_client(
         let wait = due
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(500));
-        match tokio::time::timeout(wait, rx.recv()).await {
+        match crate::net::timeout(wait, rx.recv()).await {
             Ok(Some(Msg::Select(playbook))) => {
                 selected = playbook;
                 next_detail = Instant::now();
@@ -2029,6 +2033,7 @@ mod tests {
                 user: "wren".into(),
                 role: String::new(),
                 owners: vec!["user:wren".into()],
+                autoresearch: false,
             },
             now: NOW,
             launches,

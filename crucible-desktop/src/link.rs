@@ -64,8 +64,16 @@ impl Route {
             ["playbooks", id, "launch"] => Route::Playbook { id: id.to_string() },
             ["decisions", id] => Route::Decision { id: id.to_string() },
             ["approvals"] => Route::Page(crate::Page::Approvals),
-            ["schedules"] | ["teams", _, "schedules"] => Route::Page(crate::Page::Schedules),
+            ["schedules" | "webhooks"]
+            | ["webhooks", _]
+            | ["teams", _, "schedules" | "webhooks"] => Route::Page(crate::Page::Triggers),
             ["secrets"] | ["teams", _, "secrets"] => Route::Page(crate::Page::Secrets),
+            ["teams"] | ["teams", _] | ["teams", _, "members"] => Route::Page(crate::Page::Teams),
+            ["providers"] | ["teams", _, "providers"] => Route::Page(crate::Page::Providers),
+            ["blueprints"] => Route::Page(crate::Page::Blueprints),
+            ["activity"] => Route::Page(crate::Page::Activity),
+            ["issues"] | ["issues", _] => Route::Page(crate::Page::Issues),
+            ["admin" | "policy"] => Route::Page(crate::Page::Admin),
             _ => Route::Home,
         }
     }
@@ -258,7 +266,7 @@ mod tests {
         );
         assert_eq!(
             Route::of("/teams/infra/schedules"),
-            Route::Page(crate::Page::Schedules)
+            Route::Page(crate::Page::Triggers)
         );
         assert_eq!(Route::of("/approvals"), Route::Page(crate::Page::Approvals));
         assert_eq!(

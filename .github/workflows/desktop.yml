@@ -73,6 +73,16 @@ jobs:
         working-directory: crucible-desktop
         run: CRUCIBLE_LSP="$GITHUB_WORKSPACE/target/debug/crucible-lsp" cargo test --locked
 
+      # The browser build: the library, and the crux client under it, linted for wasm32.
+      - name: web
+        env:
+          RUSTFLAGS: ""
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy -p crux --no-default-features --locked --target wasm32-unknown-unknown -- -D warnings
+          cd crucible-desktop
+          cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
+
   # The release bundle, built the way the release workflow builds it, so a change that breaks the
   # bundle fails here rather than on a tag.
   bundle:

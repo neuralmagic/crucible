@@ -27,7 +27,9 @@
 
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
-use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
+#[cfg(not(target_arch = "wasm32"))]
+use std::net::{IpAddr, SocketAddr};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +60,7 @@ const KEEP: &str = "CRUCIBLE_PLAYBOOKS_KEEP";
 /// The shell the supervisor runs the command under, when the profile names one.
 const KEEP_SHELL: &str = "CRUCIBLE_PLAYBOOKS_KEEP_SHELL";
 /// How long a tunnel has to stop on TERM before it is killed.
+#[cfg(not(target_arch = "wasm32"))]
 const KILL_AFTER: Duration = Duration::from_secs(3);
 
 /// Where a profile's key is kept.
@@ -212,6 +215,7 @@ pub struct Target {
     /// Where its own key is kept; `None` uses the one in crux's config.
     keys: Option<Store>,
     ready: Arc<Mutex<Readiness>>,
+    act_as: Option<crux::client::ActAs>,
 }
 
 impl Target {
@@ -226,7 +230,18 @@ impl Target {
             profile,
             keys,
             ready: Arc::new(Mutex::new(Readiness::Ready)),
+            act_as: None,
         }
+    }
+
+    /// This target with every request acting as `team` (`team:<slug>`), or as the caller.
+    pub fn acting_as(mut self, team: Option<String>) -> Target {
+        self.act_as = team.map(crux::client::ActAs::new);
+        self
+    }
+
+    pub fn act_as(&self) -> Option<&crux::client::ActAs> {
+        self.act_as.as_ref()
     }
 
     /// A target nothing answers at, for workers under test.
@@ -256,7 +271,14 @@ impl Target {
         }
     }
 
+    /// The browser's session cookie signs requests.
+    #[cfg(target_arch = "wasm32")]
+    pub fn key(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
     /// The key requests carry, read now so a sign-in takes effect on the next connection.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn key(&self) -> Result<Option<String>, String> {
         match &self.keys {
             Some(keys) => keys.key(&self.name),
@@ -288,8 +310,14 @@ impl Target {
         })
     }
 
+    #[cfg(target_arch = "wasm32")]
+    pub fn http(&self) -> Result<reqwest::ClientBuilder, String> {
+        Ok(crux::client::HttpTransport::builder())
+    }
+
     /// An HTTP client builder with the profile's proxy and resolver overrides. Names in
     /// `resolve` are looked up here, so this blocks on DNS.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn http(&self) -> Result<reqwest::ClientBuilder, String> {
         let mut builder = crux::client::HttpTransport::builder();
         if let Some(proxy) = &self.profile.proxy {
@@ -317,6 +345,9 @@ impl Target {
     /// The command this profile keeps running, and how long it has to answer: its tunnel, or for
     /// a profile on this machine with none, the local controller from `repo`.
     fn kept(&self) -> Option<(String, Duration, &'static str)> {
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
         if let Some(tunnel) = &self.profile.tunnel {
             return Some((
                 tunnel.trim().to_string(),
@@ -550,6 +581,7 @@ fn stopped(command: &str, status: std::process::ExitStatus, said: &str) -> Strin
 }
 
 /// `to` as addresses: an IP, an `ip:port`, or a name looked up now.
+#[cfg(not(target_arch = "wasm32"))]
 fn addresses(to: &str) -> std::io::Result<Vec<SocketAddr>> {
     let to = to.trim();
     if let Ok(ip) = to.parse::<IpAddr>() {
@@ -636,7 +668,7 @@ impl Kept {
     /// Close the pipe the supervisor reads, which then kills the command's process group, and
     /// reap it.
     fn end(mut self) {
-        drop(self.stdin.take());
+        self.stdin = None;
         let _ = std::thread::Builder::new()
             .name("crucible-playbooks-tunnel-reap".into())
             .spawn(move || {
@@ -660,6 +692,7 @@ pub fn supervisor() -> std::io::Result<Command> {
 ///      app exits, crashes or is killed: the pipe closes ──▶ killpg(TERM), then KILL
 ///      the command exits first: the supervisor exits with its code
 /// ```
+#[cfg(not(target_arch = "wasm32"))]
 pub fn keep() -> i32 {
     use std::os::unix::process::{CommandExt, ExitStatusExt};
     let Ok(command) = std::env::var(KEEP) else {
@@ -801,7 +834,23 @@ pub fn usable(settings: &crate::settings::Settings) -> BTreeMap<String, Profile>
     or_default(&good)
 }
 
+/// The controller that served this page.
+#[cfg(target_arch = "wasm32")]
+pub fn pick(_settings: &crate::settings::Settings) -> (String, Profile) {
+    let url = web_sys::window()
+        .and_then(|window| window.location().origin().ok())
+        .unwrap_or_default();
+    (
+        "controller".into(),
+        Profile {
+            url,
+            ..Profile::default()
+        },
+    )
+}
+
 /// The profile to start in: the one last used, else the first.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn pick(settings: &crate::settings::Settings) -> (String, Profile) {
     let mut usable = usable(settings);
     if let Some(name) = &settings.profile
@@ -908,7 +957,8 @@ impl crate::App {
     /// A fresh target for `name`, with what it keeps running started in place of the last one.
     fn start_target(&mut self, name: &str, profile: Profile) -> Target {
         self.targets.remove(name);
-        let target = Target::new(name, profile, &self.settings.keys());
+        let target =
+            Target::new(name, profile, &self.settings.keys()).acting_as(self.settings.act_as(name));
         let keeper = target.start(Path::new(&self.repo), supervisor);
         self.targets
             .insert(name.to_string(), (target.clone(), keeper));
@@ -950,6 +1000,36 @@ impl crate::App {
         if let Some(name) = usable(&self.settings).into_keys().nth(n) {
             self.use_profile(&name);
         }
+    }
+
+    /// Act as `team` (`team:<slug>`) on the profile in use, or as the caller, from fresh workers.
+    pub fn act_as(&mut self, team: Option<String>) {
+        self.act_as_refused = None;
+        self.switch_act_as(team);
+    }
+
+    fn switch_act_as(&mut self, team: Option<String>) {
+        let current = self.remote.target.act_as().map(|a| a.team().to_string());
+        if current == team {
+            return;
+        }
+        let name = self.remote.target.name.clone();
+        self.settings.set_act_as(&name, team.clone());
+        let target = self.remote.target.clone().acting_as(team);
+        if let Some((kept, _)) = self.targets.get_mut(&name) {
+            *kept = target.clone();
+        }
+        self.connect(target);
+    }
+
+    /// Drop back to the caller once the controller has refused the team acted as, keeping why.
+    pub fn heed_act_as_refusal(&mut self) -> bool {
+        let Some(reason) = self.remote.target.act_as().and_then(|a| a.refused()) else {
+            return false;
+        };
+        self.act_as_refused = Some(reason);
+        self.switch_act_as(None);
+        true
     }
 
     fn connect(&mut self, target: Target) {

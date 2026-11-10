@@ -319,6 +319,24 @@ desktop-check:
     sh crucible-desktop/rune-patches.sh
     cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
 
+# Lint the desktop app's library, and the crux client under it, for the browser (wasm32, Rune's
+# web target).
+desktop-web-check:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cargo clippy -p crux --no-default-features --target wasm32-unknown-unknown -- -D warnings
+    cd crucible-desktop && cargo clippy --lib --locked --target wasm32-unknown-unknown -- -D warnings
+
+# Build the desktop app for the browser (dev profile) and serve it on http://localhost:8765,
+# forwarding /api to the controller in crux's config with crux's key. Read-only unless
+# `just desktop-web --write`. Needs the wasm-bindgen CLI at the version in
+# crucible-desktop/Cargo.lock.
+desktop-web *args:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --dev --out target/web
+    python3 crucible-desktop/web-dev-proxy.py --dir crucible-desktop/target/web {{ args }}
+
 # Run a command in the Fedora builder (crucible-desktop/linux/Containerfile) with the repo at /src,
 # for the host's architecture. Cargo's registry and target directory persist in podman volumes.
 [private]

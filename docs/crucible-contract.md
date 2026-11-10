@@ -935,6 +935,9 @@ A `plan_admitted` event carries an additive `history_record`, the task a playboo
 its series or empty when it names none, and each task an additive `history_depth`, zero when it
 reads no history (contract 1.9.0).
 
+A `plan_admitted` task carries an additive `command` (contract 1.24.0): what a `command` or
+`evaluate` task runs, as the pack wrote it. It is omitted for other kinds.
+
 Additive event kinds beyond the compat set include:
 
 - **`identity`**: the run's `RunIdentity` (below), emitted once at setup and again on

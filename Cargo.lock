@@ -2365,6 +2365,7 @@ dependencies = [
  "axum",
  "clap",
  "crucible-contract",
+ "futures-util",
  "reqwest",
  "rmcp",
  "serde",

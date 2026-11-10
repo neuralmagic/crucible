@@ -9,16 +9,22 @@
 //!                  └─► trigrams OR'd ─────────┘──► then near misses
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
 use serde_json::Value;
 
+#[cfg(not(target_arch = "wasm32"))]
 use crate::logline::LogLine;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::session::RunFold;
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Lines kept from one response, so a huge console cannot crowd out everything else.
 const DOC_LINES: usize = 20_000;
+#[cfg(not(target_arch = "wasm32"))]
 /// Characters kept of one line.
 const LINE_CHARS: usize = 600;
 
+#[cfg(not(target_arch = "wasm32"))]
 /// One searchable line and where it came from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Doc {
@@ -59,6 +65,7 @@ impl Source {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// What one cached response adds to the index.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Indexed {
@@ -72,6 +79,7 @@ pub struct Indexed {
     pub docs: Vec<Doc>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The lines `body`, cached at `path`, adds; `None` for a response nothing searches.
 pub fn docs(path: &str, body: &[u8]) -> Option<Indexed> {
     let rest = path.strip_prefix("/api/")?;
@@ -140,6 +148,7 @@ pub fn docs(path: &str, body: &[u8]) -> Option<Indexed> {
     })
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// A run's agent transcript and every task's result, as lines.
 fn session_docs(run: &str, body: &[u8]) -> Indexed {
     let text = String::from_utf8_lossy(body);
@@ -190,6 +199,7 @@ fn session_docs(run: &str, body: &[u8]) -> Indexed {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// `value`'s leaves as `path: value` lines.
 fn flatten(path: &str, value: &Value, out: &mut Vec<String>) {
     if out.len() >= DOC_LINES {
@@ -217,6 +227,7 @@ fn flatten(path: &str, value: &Value, out: &mut Vec<String>) {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn clip(text: &str) -> String {
     match text.char_indices().nth(LINE_CHARS) {
         Some((at, _)) => format!("{}\u{2026}", &text[..at]),
@@ -224,11 +235,13 @@ fn clip(text: &str) -> String {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// A path segment, percent-decoded.
 fn decode(segment: &str) -> String {
     crate::link::decode(segment).unwrap_or_else(|| segment.to_string())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// `indexed` with the launch its run id names, when it names one.
 fn with_launch(mut indexed: Indexed) -> Indexed {
     if let Some((launch, playbook)) = launch_of_run(&indexed.run) {
@@ -238,6 +251,7 @@ fn with_launch(mut indexed: Indexed) -> Indexed {
     indexed
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The launch key and playbook a run id (`playbook_<id>_<launch>-<n>`) carries.
 pub fn launch_of_run(run: &str) -> Option<(String, String)> {
     let rest = run.strip_prefix("playbook_")?;
@@ -259,12 +273,14 @@ pub fn playbook_of(key: &str) -> String {
         .unwrap_or_default()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The FTS5 query that matches `query` as one phrase, quoted so its punctuation is literal.
 pub fn phrase(query: &str) -> Option<String> {
     let query = query.trim();
     (query.chars().count() >= 3).then(|| format!("\"{}\"", query.replace('"', "\"\"")))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The FTS5 query matching any of `query`'s trigrams, so a line sharing most of them ranks
 /// first: a misspelt or partly remembered key still finds its lines.
 pub fn near(query: &str) -> Option<String> {
@@ -282,6 +298,7 @@ pub fn near(query: &str) -> Option<String> {
     (!grams.is_empty()).then(|| grams.join(" OR "))
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 /// Whether `text` holds at least seven in ten of `query`'s trigrams, ignoring case.
 pub fn close(query: &str, text: &str) -> bool {
     let query: Vec<char> = query.trim().to_lowercase().chars().collect();

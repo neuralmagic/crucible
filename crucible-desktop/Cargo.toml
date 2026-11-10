@@ -10,35 +10,49 @@ publish = false
 # patches/rune, which rune-patches.sh lays down.
 [workspace]
 
+[lib]
+crate-type = ["cdylib", "rlib"]
+
 [dependencies]
 rune = { path = "../vendor/rune/crates/rune" }
 rune-kit = { path = "../vendor/rune/crates/rune-kit", default-features = false, features = ["markdown", "mermaid"] }
 rune-mermaid = { path = "../vendor/rune/crates/rune-mermaid" }
 rune-theme-opencode = { path = "../vendor/rune/themes/opencode" }
-rune-fx = { path = "../vendor/rune/crates/rune-fx" }
+rune-mac = { path = "../vendor/rune/crates/rune-mac" }
 rune-knobs = { path = "../vendor/rune/crates/rune-knobs" }
-wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
 crucible-contract = { path = "../crucible-contract" }
 crux = { path = "../crux", default-features = false }
-crucible = { path = "../crucible", default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "macros"] }
+tokio = { version = "1", features = ["sync", "macros"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 jiff = "0.2"
 base64 = "0.23"
-rand = "0.10"
 sha2 = "0.10"
 anyhow = "1"
 async-trait = "0.1"
-reqwest = { version = "0.13", default-features = false, features = ["socks"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
-rune-mac = { path = "../vendor/rune/crates/rune-mac" }
-keyring = "4"
-zbus = { version = "6", default-features = false, features = ["tokio", "service"] }
+reqwest = { version = "0.13", default-features = false }
 futures-util = "0.3"
 url = "2"
 toml = "0.8"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+crucible = { path = "../crucible", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["socks"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
+rune-fx = { path = "../vendor/rune/crates/rune-fx" }
+wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "wgsl"] }
+keyring = "4"
+zbus = { version = "6", default-features = false, features = ["tokio", "service"] }
 libc = "0.2"
+rand = "0.10"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
+web-sys = { version = "0.3", features = ["Window", "Location"] }
+jiff = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 tempfile = "3"
