@@ -2,6 +2,7 @@
 //! playbooks (through `crux`, with the same config a terminal uses) and the local `examples/` packs
 //! (through each pack's `state/session.jsonl`).
 
+mod activity;
 mod admin;
 mod apikeys;
 mod captured;
@@ -204,6 +205,8 @@ pub enum Page {
     Approvals,
     Teams,
     Providers,
+    Blueprints,
+    Activity,
     Keys,
     Settings,
 }
@@ -218,6 +221,8 @@ impl Page {
             Page::Approvals => "approvals",
             Page::Teams => "teams",
             Page::Providers => "providers",
+            Page::Blueprints => "blueprints",
+            Page::Activity => "activity",
             Page::Keys => "keys",
             Page::Settings => "settings",
         }
@@ -232,6 +237,8 @@ impl Page {
             Page::Approvals => "Approvals",
             Page::Teams => "Teams",
             Page::Providers => "Providers",
+            Page::Blueprints => "Blueprints",
+            Page::Activity => "Activity",
             Page::Keys => "API keys",
             Page::Settings => "Settings",
         }
@@ -1732,7 +1739,7 @@ pub fn run() {
                 scene_tab(app);
                 app.page = Page::Settings;
             }),
-            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams, providers or keys) against the
+            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams, providers, blueprints, activity or keys) against the
             // controller crux's config names.
             ("page", |app: &mut App| {
                 app.backend = Backend::Controller;
@@ -1744,6 +1751,8 @@ pub fn run() {
                     Page::Approvals,
                     Page::Teams,
                     Page::Providers,
+                    Page::Blueprints,
+                    Page::Activity,
                     Page::Keys,
                 ]
                 .into_iter()

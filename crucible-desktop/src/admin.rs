@@ -20,6 +20,8 @@ const SHOWN: Duration = Duration::from_secs(15);
 const QUEUE: Duration = Duration::from_secs(30);
 /// How many of a webhook's newest deliveries are read.
 const DELIVERIES: i64 = 20;
+/// How many of the newest transitions the Activity page reads.
+const EVENTS: usize = 200;
 
 /// A read that has not come back yet, failed, or landed.
 pub type Loaded<T> = Option<Result<T, String>>;
@@ -45,6 +47,8 @@ pub struct Watch {
     /// The playbook the open webhook form launches.
     pub webhook_form: Option<String>,
     pub providers: bool,
+    pub blueprints: bool,
+    pub activity: bool,
 }
 
 /// A change to make on the controller.
@@ -158,6 +162,12 @@ pub enum Action {
     DeleteProvider {
         id: String,
     },
+    /// Start draft `to` from blueprint `id`.
+    UseBlueprint {
+        id: String,
+        to: String,
+        description: Option<String>,
+    },
     /// Run the form's transform on a sample delivery.
     PreviewWebhook {
         body: Box<dto::WebhookBody>,
@@ -196,6 +206,7 @@ pub enum Did {
     PreviewWebhook,
     SaveProvider,
     DeleteProvider,
+    UseBlueprint,
 }
 
 impl Action {
@@ -228,6 +239,7 @@ impl Action {
             Action::PreviewWebhook { .. } => Did::PreviewWebhook,
             Action::SaveProvider { .. } => Did::SaveProvider,
             Action::DeleteProvider { .. } => Did::DeleteProvider,
+            Action::UseBlueprint { .. } => Did::UseBlueprint,
         }
     }
 
@@ -270,6 +282,7 @@ impl Action {
             Action::SaveProvider { id: None, register } => format!("Registered {}", register.id),
             Action::SaveProvider { id: Some(_), .. } => "Saved the provider".to_string(),
             Action::DeleteProvider { id } => format!("Deregistered {id}"),
+            Action::UseBlueprint { to, .. } => format!("Started draft {to}"),
         }
     }
 }
@@ -313,6 +326,10 @@ pub struct AdminView {
     pub webhook_schema: Option<(String, Loaded<serde_json::Value>)>,
     pub presets: Loaded<Vec<dto::WebhookPreset>>,
     pub providers: Loaded<Vec<dto::Provider>>,
+    pub blueprints: Loaded<Vec<dto::Blueprint>>,
+    /// The draft the last blueprint use started, while the Blueprints page stays open.
+    pub used: Option<dto::BlueprintUsed>,
+    pub events: Loaded<Vec<dto::Event>>,
     /// What the last check and preview of the open webhook form came to.
     pub webhook_check: Option<dto::WebhookCheck>,
     pub webhook_preview: Option<dto::WebhookPreview>,
@@ -459,6 +476,15 @@ impl Worker {
         if let Some(providers) = read.providers {
             self.view.providers = Some(providers);
         }
+        if let Some(blueprints) = read.blueprints {
+            self.view.blueprints = Some(blueprints);
+        }
+        if !watch.blueprints {
+            self.view.used = None;
+        }
+        if let Some(events) = read.events {
+            self.view.events = Some(events);
+        }
         if watch.webhook_form.is_none() {
             self.view.webhook_check = None;
             self.view.webhook_preview = None;
@@ -498,6 +524,8 @@ struct Read {
     webhook_schema: Option<(String, Result<serde_json::Value, String>)>,
     presets: Option<Result<Vec<dto::WebhookPreset>, String>>,
     providers: Option<Result<Vec<dto::Provider>, String>>,
+    blueprints: Option<Result<Vec<dto::Blueprint>, String>>,
+    events: Option<Result<Vec<dto::Event>, String>>,
 }
 
 impl Read {
@@ -523,6 +551,8 @@ impl Read {
             webhook_schema: watch.webhook_form.clone().map(|id| (id, Err(why.clone()))),
             presets: watch.webhook_form.is_some().then(|| Err(why.clone())),
             providers: watch.providers.then(|| Err(why.clone())),
+            blueprints: watch.blueprints.then(|| Err(why.clone())),
+            events: watch.activity.then(|| Err(why.clone())),
         }
     }
 }
@@ -592,6 +622,8 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         webhook_schema,
         presets,
         providers,
+        blueprints,
+        events,
     ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
@@ -612,6 +644,14 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
             within("the presets", client.webhook_presets()),
         ),
         when(watch.providers, within("the providers", client.providers())),
+        when(
+            watch.blueprints,
+            within("the blueprints", client.blueprints()),
+        ),
+        when(
+            watch.activity,
+            within("the activity", client.events(EVENTS))
+        ),
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -630,6 +670,8 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         webhook_schema,
         presets,
         providers,
+        blueprints,
+        events,
     }
 }
 
@@ -769,6 +811,16 @@ async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<()
         .await
         .map(drop),
         Action::DeleteProvider { id } => within("the delete", client.delete_provider(id)).await,
+        Action::UseBlueprint {
+            id,
+            to,
+            description,
+        } => within(
+            "the new draft",
+            client.use_blueprint(id, to, description.as_deref()),
+        )
+        .await
+        .map(|used| view.used = Some(used)),
         Action::CheckWebhook { body } => within("the check", client.check_webhook(body))
             .await
             .map(|check| view.webhook_check = Some(check)),
@@ -834,7 +886,9 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.teams
             || watch.webhooks
             || watch.webhook_form.is_some()
-            || watch.providers;
+            || watch.providers
+            || watch.blueprints
+            || watch.activity;
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -872,6 +926,8 @@ pub struct Desk {
     pub register: Option<(String, TextEdit, TextEdit)>,
     /// The webhook the Triggers page shows in full.
     pub webhook: Option<String>,
+    /// The blueprint being used, with the new draft's id and description, while its form is open.
+    pub use_blueprint: Option<(String, TextEdit, TextEdit)>,
     /// The provider the Providers page shows, and its form while open.
     pub provider: Option<String>,
     pub provider_form: Option<crate::provider::ProviderForm>,
@@ -909,6 +965,7 @@ impl Default for Desk {
             move_to: None,
             register: None,
             new_key: crate::apikeys::KeyForm::default(),
+            use_blueprint: None,
             provider: None,
             provider_form: None,
             webhook: None,
@@ -1256,6 +1313,8 @@ impl crate::App {
                 .filter(|_| on(crate::Page::Triggers))
                 .map(|form| form.playbook.clone()),
             providers: on(crate::Page::Providers),
+            blueprints: on(crate::Page::Blueprints),
+            activity: on(crate::Page::Activity),
             teams: controller,
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
@@ -1343,6 +1402,7 @@ impl crate::App {
                             self.remote.desk.provider = Some(form.id.text.trim().to_string());
                         }
                     }
+                    Did::UseBlueprint => self.remote.desk.use_blueprint = None,
                     Did::DeleteProvider => {
                         self.remote.desk.provider = None;
                         self.remote.desk.provider_form = None;
@@ -1509,6 +1569,25 @@ mod tests {
         assert!(view.secret.is_none() && view.shares.is_none() && view.decision.is_none());
     }
 
+    /// A worker reading a server that answers each `[method, path]` with `answer`, and every
+    /// request line that server took.
+    fn worker(
+        answer: impl Fn(&[&str]) -> String + Send + Sync + 'static,
+    ) -> (Client, Arc<Mutex<Vec<String>>>, tempfile::TempDir) {
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requests);
+        let (url, _) = crate::testserver::serve(move |request| {
+            let line: Vec<&str> = request.split_whitespace().take(2).collect();
+            seen.lock().unwrap().push(line.join(" "));
+            answer(&line)
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client =
+            Client::spawn(net.connector(crate::testserver::target("t", &url, keys.path())));
+        (client, requests, keys)
+    }
+
     /// The newest view once `done` holds for it.
     fn until(client: &Client, done: impl Fn(&AdminView) -> bool) -> AdminView {
         let asked = Instant::now();
@@ -1528,30 +1607,21 @@ mod tests {
 
     #[test]
     fn keys_are_read_only_while_their_page_shows_and_a_minted_secret_lasts_as_long() {
-        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen = Arc::clone(&requests);
-        let (url, _) = crate::testserver::serve(move |request| {
-            let line: Vec<&str> = request.split_whitespace().take(2).collect();
-            seen.lock().unwrap().push(line.join(" "));
-            match line[..] {
-                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
-                ["GET", "/api/approvals"] => "{}".into(),
-                ["GET", "/api/keys"] => r#"[{"id":"k1","name":"laptop",
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/keys"] => r#"[{"id":"k1","name":"laptop",
                     "created_at":"2026-11-01T00:00:00Z","expires_at":null,
                     "last_used_at":null,"revoked_at":null}]"#
-                    .into(),
-                ["POST", "/api/keys"] => r#"{"id":"k2","name":"ci",
+                .into(),
+            ["POST", "/api/keys"] => r#"{"id":"k2","name":"ci",
                     "created_at":"2026-11-10T00:00:00Z","expires_at":null,"last_used_at":null,
                     "revoked_at":null,"secret":"crk_once","mcp_url":null}"#
-                    .into(),
-                ["GET", "/api/me/mcp-sign-ins"] => r#"{"enabled":true,"sign_ins":[]}"#.into(),
-                ["DELETE", "/api/me/mcp-sign-ins?client_id=dyn-1"] => r#"{"revoked":1}"#.into(),
-                _ => "[]".into(),
-            }
+                .into(),
+            ["GET", "/api/me/mcp-sign-ins"] => r#"{"enabled":true,"sign_ins":[]}"#.into(),
+            ["DELETE", "/api/me/mcp-sign-ins?client_id=dyn-1"] => r#"{"revoked":1}"#.into(),
+            _ => "[]".into(),
         });
-        let dir = tempfile::tempdir().unwrap();
-        let net = crate::net::Net::uncached_for_tests();
-        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
         let elsewhere = Watch {
             controller: true,
             ..Watch::default()
@@ -1624,30 +1694,21 @@ mod tests {
 
     #[test]
     fn teams_are_read_on_their_page_with_the_audit_of_the_one_asked_for() {
-        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen = Arc::clone(&requests);
-        let (url, _) = crate::testserver::serve(move |request| {
-            let line: Vec<&str> = request.split_whitespace().take(2).collect();
-            seen.lock().unwrap().push(line.join(" "));
-            match line[..] {
-                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
-                ["GET", "/api/approvals"] => "{}".into(),
-                ["GET", "/api/teams"] => r#"[{"slug":"infra","display_name":"Infra",
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/teams"] => r#"[{"slug":"infra","display_name":"Infra",
                     "members":[{"kind":"user","member":"wynn","role":"owner"}],
                     "my_role":"owner","reachable":true}]"#
-                    .into(),
-                ["GET", "/api/teams/infra/audit"] => r#"[{"id":7,"at":"2026-11-01T00:00:00Z",
+                .into(),
+            ["GET", "/api/teams/infra/audit"] => r#"[{"id":7,"at":"2026-11-01T00:00:00Z",
                     "actor":"user:wynn","action":"team:create","decision":"allow","rule":"owner"}]"#
-                    .into(),
-                ["POST", "/api/teams"] | ["PUT", _] => {
-                    r#"{"slug":"infra","display_name":"Infra"}"#.into()
-                }
-                _ => "[]".into(),
+                .into(),
+            ["POST", "/api/teams"] | ["PUT", _] => {
+                r#"{"slug":"infra","display_name":"Infra"}"#.into()
             }
+            _ => "[]".into(),
         });
-        let dir = tempfile::tempdir().unwrap();
-        let net = crate::net::Net::uncached_for_tests();
-        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
         let listed = Watch {
             controller: true,
             teams: true,
@@ -1740,29 +1801,20 @@ mod tests {
     fn webhooks_are_read_on_triggers_and_a_rotated_secret_lasts_while_its_webhook_shows() {
         const HOOK: &str = r#"{"id":"w1","playbook":"triage","verifier":"path_token",
             "enabled":true,"max_launches_per_hour":3}"#;
-        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen = Arc::clone(&requests);
-        let (url, _) = crate::testserver::serve(move |request| {
-            let line: Vec<&str> = request.split_whitespace().take(2).collect();
-            seen.lock().unwrap().push(line.join(" "));
-            match line[..] {
-                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
-                ["GET", "/api/approvals"] => "{}".into(),
-                ["GET", "/api/webhooks"] => format!("[{HOOK}]"),
-                ["GET", "/api/webhooks/w1/deliveries?limit=20"] => r#"[{"id":"d1",
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/webhooks"] => format!("[{HOOK}]"),
+            ["GET", "/api/webhooks/w1/deliveries?limit=20"] => r#"[{"id":"d1",
                     "received_at":"2026-11-01T00:00:00Z","outcome":"filtered",
                     "reason":"the filter was false","launch_key":null}]"#
-                    .into(),
-                ["POST", "/api/webhooks/w1/secret"] => {
-                    format!(r#"{{"webhook":{HOOK},"secret":"whsec_once","delivery_url":null}}"#)
-                }
-                ["POST", "/api/webhooks/w1/enabled"] => HOOK.into(),
-                _ => "[]".into(),
+                .into(),
+            ["POST", "/api/webhooks/w1/secret"] => {
+                format!(r#"{{"webhook":{HOOK},"secret":"whsec_once","delivery_url":null}}"#)
             }
+            ["POST", "/api/webhooks/w1/enabled"] => HOOK.into(),
+            _ => "[]".into(),
         });
-        let dir = tempfile::tempdir().unwrap();
-        let net = crate::net::Net::uncached_for_tests();
-        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
         let listed = Watch {
             controller: true,
             schedules: true,
@@ -1854,35 +1906,26 @@ mod tests {
     #[test]
     fn a_webhook_form_reads_its_schema_and_presets_and_a_created_secret_is_kept() {
         const HOOK: &str = r#"{"id":"w2","playbook":"triage","verifier":"path_token"}"#;
-        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen = Arc::clone(&requests);
-        let (url, _) = crate::testserver::serve(move |request| {
-            let line: Vec<&str> = request.split_whitespace().take(2).collect();
-            seen.lock().unwrap().push(line.join(" "));
-            match line[..] {
-                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
-                ["GET", "/api/approvals"] => "{}".into(),
-                ["GET", "/api/playbooks/triage/schema"] => {
-                    r#"{"properties":{"repo":{"type":"string"}},"required":["repo"]}"#.into()
-                }
-                ["GET", "/api/webhooks/presets"] => r#"[{"id":"quay-push","title":"quay.io push",
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/playbooks/triage/schema"] => {
+                r#"{"properties":{"repo":{"type":"string"}},"required":["repo"]}"#.into()
+            }
+            ["GET", "/api/webhooks/presets"] => r#"[{"id":"quay-push","title":"quay.io push",
                     "verifier":"path_token","header":null,"filter":"true","dedupe":"delivery",
                     "derive":{}}]"#
-                    .into(),
-                ["POST", "/api/webhooks"] => {
-                    format!(r#"{{"webhook":{HOOK},"secret":"whsec_new","delivery_url":null}}"#)
-                }
-                ["PUT", "/api/webhooks/w2"] => HOOK.into(),
-                ["POST", "/api/webhooks/check"] => r#"{"diagnostics":[]}"#.into(),
-                ["POST", "/api/webhooks/preview"] => r#"{"filter":{"value":true},
-                    "dedupe":{"value":"d1"},"derive":{"error":"no such key"}}"#
-                    .into(),
-                _ => "[]".into(),
+                .into(),
+            ["POST", "/api/webhooks"] => {
+                format!(r#"{{"webhook":{HOOK},"secret":"whsec_new","delivery_url":null}}"#)
             }
+            ["PUT", "/api/webhooks/w2"] => HOOK.into(),
+            ["POST", "/api/webhooks/check"] => r#"{"diagnostics":[]}"#.into(),
+            ["POST", "/api/webhooks/preview"] => r#"{"filter":{"value":true},
+                    "dedupe":{"value":"d1"},"derive":{"error":"no such key"}}"#
+                .into(),
+            _ => "[]".into(),
         });
-        let dir = tempfile::tempdir().unwrap();
-        let net = crate::net::Net::uncached_for_tests();
-        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
         let listed = Watch {
             controller: true,
             webhooks: true,
@@ -1968,22 +2011,13 @@ mod tests {
     fn providers_are_read_on_their_page_and_a_save_registers_or_replaces() {
         const PROVIDER: &str = r#"{"id":"lab","display_name":"Lab","kind":"openai",
             "default_model":"gpt-5","enabled":true,"owner":"user:wynn","actions":["update"]}"#;
-        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
-        let seen = Arc::clone(&requests);
-        let (url, _) = crate::testserver::serve(move |request| {
-            let line: Vec<&str> = request.split_whitespace().take(2).collect();
-            seen.lock().unwrap().push(line.join(" "));
-            match line[..] {
-                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
-                ["GET", "/api/approvals"] => "{}".into(),
-                ["GET", "/api/providers"] => format!("[{PROVIDER}]"),
-                ["POST", "/api/providers"] | ["PUT", "/api/providers/lab"] => PROVIDER.into(),
-                _ => "[]".into(),
-            }
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/providers"] => format!("[{PROVIDER}]"),
+            ["POST", "/api/providers"] | ["PUT", "/api/providers/lab"] => PROVIDER.into(),
+            _ => "[]".into(),
         });
-        let dir = tempfile::tempdir().unwrap();
-        let net = crate::net::Net::uncached_for_tests();
-        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
         let elsewhere = Watch {
             controller: true,
             ..Watch::default()
@@ -2039,6 +2073,78 @@ mod tests {
                 .iter()
                 .any(|r| r == "DELETE /api/providers/lab")
         );
+    }
+
+    #[test]
+    fn activity_and_blueprints_are_read_on_their_pages_and_a_use_shows_what_it_started() {
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/events?limit=200"] => r#"[{"ts":"2026-11-10T18:01:39Z",
+                "key":"playbook:triage:01a1","from":"running","to":"done",
+                "reason":{"text":"run finished","truncated":false},"actor":null}]"#
+                .into(),
+            ["GET", "/api/blueprints"] => r#"[{"id":"triage","description":"Triage issues",
+                "owner":"team:infra","rev":"abc","public":true,
+                "secrets":[{"declared_name":"gh","carries":false}]}]"#
+                .into(),
+            ["POST", "/api/blueprints/triage/use"] => r#"{"id":"my-triage","version":1,
+                "bindings":[],"placeholders":[{"declared_name":"gh","projection_kind":"env",
+                "projection":"GH_TOKEN","reason":"personal_secret"}]}"#
+                .into(),
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.events.is_none() && view.blueprints.is_none());
+
+        client.watch(Watch {
+            activity: true,
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.events.is_some());
+        let events = view.events.unwrap().unwrap();
+        assert_eq!(events[0].key, "playbook:triage:01a1");
+        assert_eq!(
+            events[0].reason.as_ref().map(|r| r.text.as_str()),
+            Some("run finished")
+        );
+
+        let catalog = Watch {
+            blueprints: true,
+            ..elsewhere.clone()
+        };
+        client.watch(catalog);
+        let view = until(&client, |view| view.blueprints.is_some());
+        assert_eq!(view.blueprints.unwrap().unwrap()[0].secrets.len(), 1);
+        client.act(Action::UseBlueprint {
+            id: "triage".into(),
+            to: "my-triage".into(),
+            description: None,
+        });
+        let view = until(&client, |view| view.used.is_some());
+        let used = view.used.unwrap();
+        assert_eq!((used.id.as_str(), used.version), ("my-triage", 1));
+        assert_eq!(used.placeholders[0].reason, "personal_secret");
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Started draft my-triage".to_string()))
+        );
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == "POST /api/blueprints/triage/use")
+        );
+
+        client.watch(elsewhere);
+        until(&client, |view| view.used.is_none());
     }
 
     fn summary(id: &str) -> dto::DecisionSummary {

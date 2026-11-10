@@ -728,6 +728,11 @@ impl Client {
             .await
     }
 
+    /// The newest `limit` status transitions across everything the controller works.
+    pub async fn events(&self, limit: usize) -> Result<Vec<dto::Event>> {
+        self.get(&format!("/api/events?limit={limit}")).await
+    }
+
     /// Every team the caller may see, each with its members.
     pub async fn teams(&self) -> Result<Vec<dto::Team>> {
         self.get("/api/teams").await

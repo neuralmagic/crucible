@@ -70,6 +70,8 @@ impl Route {
             ["secrets"] | ["teams", _, "secrets"] => Route::Page(crate::Page::Secrets),
             ["teams"] | ["teams", _] | ["teams", _, "members"] => Route::Page(crate::Page::Teams),
             ["providers"] | ["teams", _, "providers"] => Route::Page(crate::Page::Providers),
+            ["blueprints"] => Route::Page(crate::Page::Blueprints),
+            ["activity"] => Route::Page(crate::Page::Activity),
             _ => Route::Home,
         }
     }

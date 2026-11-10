@@ -216,10 +216,14 @@ pub struct ScopeDetail {
     pub runs: Vec<RunDetail>,
 }
 
+/// One status transition the controller recorded.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Event {
     #[serde(default)]
     pub ts: String,
+    /// The issue or launch that moved.
+    #[serde(default)]
+    pub key: String,
     #[serde(default)]
     pub from: String,
     #[serde(default)]
