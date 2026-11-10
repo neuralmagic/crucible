@@ -12,9 +12,9 @@
 //!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=<namespace> \
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> CRUCIBLE_KUEUE_E2E_DATABASE_URL=<postgres url> \
 //!   cargo test -p crucible-controller --test kueue_oidc_e2e -- --ignored --nocapture --test-threads=1
-//!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<the launcher's Kubernetes user>
-//! The launcher's user needs `use` on that LocalQueue and Jobs in that namespace, and no
-//! Deployments; the realm's spike client carries the same user for the RBAC test.
+//! The cluster needs the caller role bound to Group crucible:runs in that namespace, as the
+//! deploy profile's shared_namespaces render does; the realm's spike client carries the person's
+//! user for the RBAC test.
 
 use base64::Engine;
 use crucible_controller::agent_auth::bindings::{self, Binding};
@@ -79,7 +79,6 @@ struct Env {
     namespace: String,
     queue: String,
     database_url: String,
-    kube_user: String,
 }
 
 fn env() -> Env {
@@ -90,7 +89,6 @@ fn env() -> Env {
         namespace: var("CRUCIBLE_KUEUE_E2E_NAMESPACE"),
         queue: var("CRUCIBLE_KUEUE_E2E_QUEUE"),
         database_url: var("CRUCIBLE_KUEUE_E2E_DATABASE_URL"),
-        kube_user: var("CRUCIBLE_KUEUE_E2E_KUBE_USER"),
     }
 }
 
@@ -122,28 +120,8 @@ fn signing_key_pem() -> String {
 }
 
 /// The run the spike's sandbox belongs to: a running run pod on the `dev` cluster, launched by
-/// alice (whose Kubernetes user is `kube_user`), with the sandbox bound through the controller's
-/// own bind path.
-async fn seed_run(pool: &sqlx::PgPool, kube_user: &str) {
-    crucible_controller::identity::oidc::users::record_login(
-        pool,
-        "sub-alice",
-        "alice",
-        None,
-        jiff::Timestamp::now(),
-    )
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
-         VALUES ('sub-alice', $1, $2, 'token-review', '2026-01-01T00:00:00Z')
-         ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user",
-    )
-    .bind("dev")
-    .bind(kube_user)
-    .execute(pool)
-    .await
-    .unwrap();
+/// alice, who has linked no Kubernetes username.
+async fn seed_run(pool: &sqlx::PgPool) {
     for sql in [
         "DELETE FROM run_sandboxes WHERE sandbox_id = $1 OR pod_name = $2",
         "DELETE FROM runs WHERE pod = $2",
@@ -196,7 +174,7 @@ async fn serve_controller(env: &Env, profile_dir: &std::path::Path) -> (String, 
     let pool = crucible_controller::connect(&env.database_url)
         .await
         .unwrap();
-    seed_run(&pool, &env.kube_user).await;
+    seed_run(&pool).await;
     let profile = profile_dir.join("profile.toml");
     std::fs::write(
         &profile,
@@ -217,9 +195,10 @@ image = "registry.example.com/crucible-kueue:latest"
 cluster = "dev"
 namespace = "crucible-system"
 workload_namespace = "{}"
+shared_namespaces = ["{}"]
 kube_authz = "openshift"
 "#,
-            env.namespace
+            env.namespace, env.namespace
         ),
     )
     .unwrap();
@@ -238,11 +217,12 @@ kube_authz = "openshift"
             .unwrap(),
         ],
         audiences: vec![Audience {
+            server: "kueue".to_string(),
             resource: RESOURCE.to_string(),
             cluster: "dev".to_string(),
             scopes: vec!["kueue.read".into(), "kueue.submit".into()],
-            requires_kube_user: false,
             namespaces: Vec::new(),
+            remote: true,
         }],
     };
     let jwks_uri = Url::parse(&format!("{}/keys", cluster::spire())).unwrap();
@@ -458,11 +438,13 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
             .contains(r#"error="invalid_token""#)
     );
 
+    caller_role(&kube, &env).await;
     let client = connect(&url, &token).await;
     let me = call(&client, "whoami", json!({})).await.unwrap();
     assert_eq!(me["run_id"], run_pod());
     assert_eq!(me["namespace"], env.namespace);
     assert_eq!(me["launched_by"], "alice");
+    assert_eq!(me["kube_user"], format!("crucible:run:{}", run_pod()));
 
     let name = format!("oidc-e2e-{}", std::process::id());
     let refused = call(
@@ -570,6 +552,62 @@ async fn a_tampered_svid_or_a_foreign_audience_gets_no_token() {
     assert_eq!(other.status(), 400);
     let body: Value = other.json().await.unwrap();
     assert_eq!(body["error"], "invalid_target", "{body}");
+}
+
+/// Bind the caller role to Group `crucible:runs` in the spike's namespace, as the deploy render
+/// does for a shared namespace.
+async fn caller_role(kube: &kube::Client, env: &Env) {
+    use kube::api::{Api, ApiResource, DynamicObject, GroupVersionKind, Patch, PatchParams};
+    async fn apply(kube: &kube::Client, env: &Env, object: Value, namespaced: bool) {
+        let api_version = object["apiVersion"].as_str().unwrap().to_string();
+        let (group, version) = api_version.split_once('/').unwrap_or(("", &api_version));
+        let gvk = GroupVersionKind::gvk(group, version, object["kind"].as_str().unwrap());
+        let name = object["metadata"]["name"].as_str().unwrap().to_string();
+        let resource = ApiResource::from_gvk(&gvk);
+        let api: Api<DynamicObject> = match namespaced {
+            true => Api::namespaced_with(kube.clone(), &env.namespace, &resource),
+            false => Api::all_with(kube.clone(), &resource),
+        };
+        let object: DynamicObject = serde_json::from_value(object).unwrap();
+        api.patch(
+            &name,
+            &PatchParams::apply("crucible-e2e"),
+            &Patch::Apply(&object),
+        )
+        .await
+        .unwrap();
+    }
+    apply(
+        kube,
+        env,
+        json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
+            "metadata": {"name": "crucible-kueue-caller"},
+            "rules": [
+                {"apiGroups": ["kueue.x-k8s.io"], "resources": ["localqueues"],
+                 "verbs": ["get", "list", "use"]},
+                {"apiGroups": ["batch"], "resources": ["jobs", "jobs/scale"],
+                 "verbs": ["create", "get", "list", "patch", "update", "delete"]},
+                {"apiGroups": [""], "resources": ["pods", "pods/log", "events"],
+                 "verbs": ["get", "list"]},
+            ],
+        }),
+        false,
+    )
+    .await;
+    apply(
+        kube,
+        env,
+        json!({
+            "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+            "metadata": {"name": "crucible-kueue-runs"},
+            "roleRef": {"apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "ClusterRole", "name": "crucible-kueue-caller"},
+            "subjects": [{"kind": "Group", "name": "crucible:runs"}],
+        }),
+        true,
+    )
+    .await;
 }
 
 fn deployment(name: &str) -> Value {

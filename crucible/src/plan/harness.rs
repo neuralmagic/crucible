@@ -9,8 +9,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::knobs::{Harness, ReasoningEffort};
 use anyhow::Context;
-use clap::ValueEnum;
 
 use serde_json::Value;
 
@@ -22,6 +22,7 @@ use crate::plan::exec::TaskRunner;
 use crate::plan::files::CapturedFiles;
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
+use crate::plan::transcript::Transcript;
 use crate::plan::turn_log::{Heartbeat, TurnLog};
 use crucible_contract::TransportCause;
 use crucible_contract::emits::DeclaredFile;
@@ -219,13 +220,18 @@ fn tree_bytes(dir: &Path) -> u64 {
 }
 
 impl TaskRunner for HarnessRunner {
+    fn prepare(&mut self) {
+        self.args.compile_secret_rules();
+    }
+
     fn run(
         &mut self,
         task: &Task,
         attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
+        let deadline = lane.and_then(Lane::deadline);
         run_task(
             &Dispatch {
                 args: &self.args,
@@ -239,7 +245,7 @@ impl TaskRunner for HarnessRunner {
                 inputs,
                 deadline,
                 budget_left: self.budget_left,
-                lane: None,
+                lane,
             },
             None,
         )
@@ -739,31 +745,24 @@ pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxEr
     Ok(())
 }
 
-/// The run's agent knobs with a task's own applied over them. Err names the knob the plan got
-/// wrong.
+/// The run's agent knobs with a task's own applied over them.
 fn agent_knobs(
     args: &Args,
-    harness: Option<&String>,
+    harness: Option<Harness>,
     model: Option<&String>,
-    effort: Option<&String>,
-) -> Result<Args, String> {
+    effort: Option<ReasoningEffort>,
+) -> Args {
     let mut args = args.clone();
-    if let Some(h) = harness {
-        args.harness = Some(
-            crate::manifest::Harness::from_str(h, true)
-                .map_err(|e| format!("task names unknown harness {h:?}: {e}"))?,
-        );
+    if harness.is_some() {
+        args.harness = harness;
     }
     if let Some(m) = model {
         args.model = Some(m.clone());
     }
-    if let Some(e) = effort {
-        args.reasoning_effort = Some(
-            crate::manifest::ReasoningEffort::from_str(e, true)
-                .map_err(|err| format!("task names unknown effort {e:?}: {err}"))?,
-        );
+    if effort.is_some() {
+        args.reasoning_effort = effort;
     }
-    Ok(args)
+    args
 }
 
 /// What a task's attempts run on, as the result event reports it. None for a task that runs no
@@ -780,7 +779,7 @@ pub(crate) fn resolved_agent(
             model,
             effort,
             ..
-        } => (harness.as_ref(), model.as_ref(), effort.as_ref()),
+        } => (*harness, model.as_ref(), *effort),
         // The loop's candidate turn is the only engine op that runs an agent, and it runs on the
         // run's knobs with none of its own.
         TaskKind::Engine {
@@ -789,7 +788,7 @@ pub(crate) fn resolved_agent(
         } => (None, None, None),
         _ => return None,
     };
-    let args = agent_knobs(args, knobs.0, knobs.1, knobs.2).ok()?;
+    let args = agent_knobs(args, knobs.0, knobs.1, knobs.2);
     let backend = crate::agent::harness::backend(args.harness());
     Some(crucible_contract::session::TaskAgent {
         harness: args.harness().as_str().to_string(),
@@ -799,6 +798,21 @@ pub(crate) fn resolved_agent(
             .map(|e| e.as_flag().to_string())
             .unwrap_or_default(),
     })
+}
+
+/// Tokens for `task` to each of `[workflow].servers`, kept fresh until dropped; none when the
+/// pack names no servers.
+fn task_tokens(
+    servers: &[crucible_contract::agent_servers::ServerName],
+    task: &str,
+) -> Result<Option<crate::plan::task_tokens::TaskTokens>, crate::plan::task_tokens::TaskTokenError>
+{
+    use crate::plan::task_tokens::{TaskTokens, TokenEndpoint, wanted};
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    let wanted = wanted(servers)?;
+    TaskTokens::grant(TokenEndpoint::from_env()?, wanted, task).map(Some)
 }
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
@@ -846,17 +860,32 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
                 }
                 _ => false,
             };
+            let tokens = match task.task {
+                TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
+                    match task_tokens(&args.workflow_servers, &task.name.0) {
+                        Ok(tokens) => tokens,
+                        Err(e) => {
+                            return Attempt::transport(TransportCause::Other, e.to_string());
+                        }
+                    }
+                }
+                _ => None,
+            };
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
                 env: args.workflow_env.clone(),
                 buildit_socket,
                 github,
+                task_servers: tokens
+                    .as_ref()
+                    .map(|t| t.servers().to_vec())
+                    .unwrap_or_default(),
             };
             return if task.isolation == Some(Isolation::Worktree) {
-                shell.run_in_prepared_worktree(task, inputs, deadline)
+                shell.run_in_prepared_worktree(task, inputs, deadline, lane)
             } else {
-                shell.run(task, attempt, inputs, deadline)
+                shell.run(task, attempt, inputs, lane)
             };
         }
         TaskKind::TopK { .. } => {
@@ -867,12 +896,8 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         }
     };
 
-    // Per-task knob overrides on a cloned Args: the heterogeneity axis. Unknown values
-    // are a measured failure.
-    let mut args = match agent_knobs(args, harness.as_ref(), model.as_ref(), effort.as_ref()) {
-        Ok(args) => args,
-        Err(note) => return Attempt::failed(0.0, note),
-    };
+    // Per-task knob overrides on a cloned Args: the heterogeneity axis.
+    let mut args = agent_knobs(args, *harness, model.as_ref(), *effort);
     // Name the task to the turn. A deterministic stand-in needs to know which task it is
     // without matching prompt prose, and a real harness gets it for free in its transcript.
     args.env
@@ -977,7 +1002,19 @@ fn agent_turn(
     let result_path = cx.paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
     let _ = std::fs::remove_file(&result_path);
-    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_, _, _| {});
+    let mut transcript = Transcript::new(crate::turn_trace::redact_enabled());
+    let (cost, stop) = stream_turn(cx, prompt, session, banked, &mut |_, _, ev| {
+        if let (Some(lane), Some(ev)) = (cx.lane, ev) {
+            for event in transcript.on_event(ev, Instant::now()) {
+                lane.record(event);
+            }
+        }
+    });
+    if let Some(lane) = cx.lane {
+        for event in transcript.finish() {
+            lane.record(event);
+        }
+    }
     let transport_error = match stop {
         TurnStop::TimedOut(deadline) => {
             let _ = std::fs::remove_file(&result_path);
@@ -1516,20 +1553,21 @@ mod tests {
 
     #[test]
     fn a_task_reports_the_knobs_it_resolved_and_a_command_reports_none() {
-        let agent = |harness: Option<&str>, model: Option<&str>, effort: Option<&str>| {
-            crate::plan::ir::Task {
-                task: TaskKind::Agent {
-                    prompt: "go".into(),
-                    harness: harness.map(str::to_string),
-                    model: model.map(str::to_string),
-                    effort: effort.map(str::to_string),
-                    sandbox: None,
-                },
-                ..emitting("a", &[])
-            }
-        };
+        let agent =
+            |harness: Option<Harness>, model: Option<&str>, effort: Option<ReasoningEffort>| {
+                crate::plan::ir::Task {
+                    task: TaskKind::Agent {
+                        prompt: "go".into(),
+                        harness,
+                        model: model.map(str::to_string),
+                        effort,
+                        sandbox: None,
+                    },
+                    ..emitting("a", &[])
+                }
+            };
         let mut args = sandboxed_args();
-        args.harness = Some(crate::manifest::Harness::Claude);
+        args.harness = Some(crate::knobs::Harness::Claude);
         args.model = Some("opus".into());
 
         let run = resolved_agent(&args, &agent(None, None, None)).expect("an agent task");
@@ -1539,8 +1577,15 @@ mod tests {
         );
         assert_eq!(run.effort, "", "nothing pinned an effort");
 
-        let pinned = resolved_agent(&args, &agent(Some("codex"), Some("glm-5.3"), Some("low")))
-            .expect("an agent task");
+        let pinned = resolved_agent(
+            &args,
+            &agent(
+                Some(Harness::Codex),
+                Some("glm-5.3"),
+                Some(ReasoningEffort::Low),
+            ),
+        )
+        .expect("an agent task");
         assert_eq!(
             (
                 pinned.harness.as_str(),
@@ -1553,18 +1598,18 @@ mod tests {
 
         let mut claude_named = args.clone();
         claude_named.model = Some("claude-opus-4-6".into());
-        let codex = resolved_agent(&claude_named, &agent(Some("codex"), None, None))
+        let codex = resolved_agent(&claude_named, &agent(Some(Harness::Codex), None, None))
             .expect("an agent task");
         assert_eq!(
             codex.model,
-            crate::manifest::Harness::Codex.default_model(),
+            crate::knobs::Harness::Codex.default_model(),
             "codex refuses a Claude name and runs its own default"
         );
 
         let mut slotted = claude_named.clone();
         slotted.codex.model = Some("gpt-5.6-terra".into());
         assert_eq!(
-            resolved_agent(&slotted, &agent(Some("codex"), None, None))
+            resolved_agent(&slotted, &agent(Some(Harness::Codex), None, None))
                 .expect("an agent task")
                 .model,
             "gpt-5.6-terra",
@@ -1598,11 +1643,6 @@ mod tests {
             "measure runs no agent"
         );
 
-        assert_eq!(
-            resolved_agent(&args, &agent(Some("nope"), None, None)),
-            None,
-            "a task whose knobs do not parse never runs"
-        );
         assert_eq!(resolved_agent(&args, &emitting("a", &[])), None);
     }
 
@@ -1865,6 +1905,7 @@ mod tests {
         let mut runner = crate::cli::setup::prep_plan_runner(&dir.join("crucible.toml"))
             .unwrap()
             .0;
+        runner.args.secret_rules = crate::testing::secret_rules();
         let out = execute(
             &plan,
             &Substrate::default(),
@@ -1913,10 +1954,10 @@ mod tests {
         let manifest = dir.join("crucible.toml");
 
         let (plain, _) = crate::cli::setup::prep_plan_runner(&manifest).unwrap();
-        assert_eq!(plain.args.harness(), crate::manifest::Harness::Claude);
+        assert_eq!(plain.args.harness(), crate::knobs::Harness::Claude);
         assert_eq!(
             plain.args.model(),
-            crate::manifest::Harness::Claude.default_model()
+            crate::knobs::Harness::Claude.default_model()
         );
 
         let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
@@ -1925,20 +1966,20 @@ mod tests {
             &BTreeMap::new(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
-                harness: Some(crate::manifest::Harness::Codex),
+                harness: Some(crate::knobs::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
             None,
             crate::cli::setup::Start::Fresh,
         )
         .unwrap();
-        assert_eq!(overridden.args.harness(), crate::manifest::Harness::Codex);
+        assert_eq!(overridden.args.harness(), crate::knobs::Harness::Codex);
         assert_eq!(overridden.args.model(), "gpt-5.6-luna");
         assert!(
             overridden
                 .paths
                 .workspace
-                .join(crate::manifest::Harness::Codex.spec().skills_dir)
+                .join(crate::knobs::Harness::Codex.spec().skills_dir)
                 .join("demo")
                 .is_dir(),
             "the toolbox lands in the override harness's skills dir"
@@ -3876,58 +3917,6 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A plan naming an unknown harness must fail measured, not spawn anything.
-    #[test]
-    fn unknown_harness_is_a_measured_failure() {
-        let t = crate::plan::ir::Task {
-            name: "a".into(),
-            task: TaskKind::Agent {
-                prompt: "go".into(),
-                harness: Some("not-a-harness".into()),
-                model: None,
-                effort: None,
-                sandbox: None,
-            },
-            depends_on: vec![],
-            session: None,
-            needs: "any".into(),
-            required: true,
-            isolation: None,
-            join: Join::default(),
-            stage: Stage::Iteration,
-            emits: crate::plan::ir::Emits::default(),
-            emits_files: Vec::new(),
-            over: None,
-            max_fanout: None,
-            keyed: Vec::new(),
-            when: None,
-            revise: None,
-            timeout: None,
-            history: None,
-            repair: 0,
-            optional: Vec::new(),
-        };
-        let mut runner = HarnessRunner {
-            args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])
-                .unwrap()
-                .run,
-            paths: crate::args::Paths::for_manifest(
-                std::env::temp_dir(),
-                std::env::temp_dir(),
-                &std::env::temp_dir(),
-                None,
-            ),
-            commit_per_task: false,
-            captured_bytes: AtomicU64::new(0),
-            staged: Default::default(),
-            budget_left: f64::INFINITY,
-        };
-        let a = runner.run(&t, 1, &BTreeMap::new(), None);
-        match a.outcome {
-            AttemptOutcome::Fail { note, .. } => assert!(note.contains("unknown harness")),
-            _ => panic!("expected a measured failure"),
-        }
-    }
     /// A fan-out in the shared workspace, run end to end with no model. The instances write one
     /// tree and one result file, so each has to be a serial task in its own right: every item is
     /// attributed to the instance that produced it, and the instance that fails takes its own
@@ -4572,6 +4561,7 @@ workflow(type = "playbook", tasks = [discover, audit])
                 {"result": {"lanes": ["a"]}, "writes": {"RESULT.json": "{\"ok\": true}"}, "sleep_ms": 6000}
             ]}}),
         );
+        crate::testing::secret_rules();
         let started = std::time::Instant::now();
         let out = run_playbook(&dir);
         let plan = &out.results[&"plan".into()];

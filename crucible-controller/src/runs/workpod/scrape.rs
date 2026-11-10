@@ -138,12 +138,22 @@ pub(crate) fn extract_run_session_logs(logs: &str) -> RunSessionScrape {
     let delimiter = last_delimiter(logs);
     // The authoritative delimited dump, if it carries JSON lines.
     if let Some((_, start, _)) = delimiter {
-        let p = &logs[start..];
+        let p = without_echoes(&logs[start..]);
         if p.lines().any(|l| l.trim_start().starts_with('{')) {
-            return RunSessionScrape::Found(cap_session_tail(p.to_string()));
+            return RunSessionScrape::Found(cap_session_tail(p));
         }
     }
-    // Fallback: the live-teed stream lines across the whole log (survives a lost tail dump).
+    // Fallback: the lines the wrapper echoed live, in file order, else the live-teed stream lines
+    // across the whole log (survives a lost tail dump).
+    let echoed: std::collections::BTreeMap<u64, &str> = logs
+        .lines()
+        .filter_map(|l| crucible_contract::parse_session_echo(l.trim_end()))
+        .filter(|(_, line)| !line.is_empty())
+        .collect();
+    if !echoed.is_empty() {
+        let lines: Vec<&str> = echoed.into_values().collect();
+        return RunSessionScrape::Found(cap_session_tail(lines.join("\n")));
+    }
     let streamed: Vec<&str> = logs
         .lines()
         .filter(|l| l.trim_start().starts_with('{'))
@@ -165,9 +175,16 @@ pub(crate) fn extract_run_session_logs(logs: &str) -> RunSessionScrape {
 
 /// The engine's own output in a finished pod's log: everything before the last
 /// [`RUN_SESSION_DELIMITER`] line, or the whole log when the wrapper never printed one (a pod
-/// that uploaded its session skips it).
-pub(crate) fn engine_log_of(logs: &str) -> &str {
-    &logs[..last_delimiter(logs).map_or(logs.len(), |(start, _, _)| start)]
+/// that uploaded its session skips it), less the session lines the wrapper echoed.
+pub(crate) fn engine_log_of(logs: &str) -> String {
+    without_echoes(&logs[..last_delimiter(logs).map_or(logs.len(), |(start, _, _)| start)])
+}
+
+/// `text` without the session lines the wrapper echoed into it.
+fn without_echoes(text: &str) -> String {
+    text.split_inclusive('\n')
+        .filter(|line| crucible_contract::parse_session_echo(line.trim_end()).is_none())
+        .collect()
 }
 
 /// The LAST session-delimiter line in `logs`: its start offset, the offset just past it (where the
@@ -221,7 +238,7 @@ fn cap_session_tail(payload: String) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::workpod::scrape::*;
 
     #[test]
     fn the_engine_log_is_what_precedes_the_last_delimiter_or_the_whole_log() {
@@ -234,5 +251,35 @@ mod tests {
             "plan v1: completed\n"
         );
         assert_eq!(engine_log_of(""), "");
+    }
+
+    #[test]
+    fn echoed_session_lines_are_session_not_engine_output() {
+        let echo = crucible_contract::RUN_SESSION_ECHO_MARKER;
+        let logs = format!(
+            "plan v1 admitted\n{echo}1 {{\"v\":1,\"kind\":\"plan_admitted\"}}\nTASK one pass\n\
+             {echo}2 {{\"v\":1,\"kind\":\"task_result\"}}\n\
+             === {RUN_SESSION_DELIMITER}0) ===\n{{\"v\":1,\"kind\":\"plan_admitted\"}}\n\
+             {echo}3 {{\"v\":1,\"kind\":\"outcome\"}}\n\
+             {{\"v\":1,\"kind\":\"task_result\"}}\n"
+        );
+        assert_eq!(engine_log_of(&logs), "plan v1 admitted\nTASK one pass\n");
+        match extract_run_session_logs(&logs) {
+            RunSessionScrape::Found(session) => assert_eq!(
+                session,
+                "{\"v\":1,\"kind\":\"plan_admitted\"}\n{\"v\":1,\"kind\":\"task_result\"}\n"
+            ),
+            other => panic!("expected the dump, got {other:?}"),
+        }
+
+        let lost_dump = format!(
+            "{echo}2 {{\"n\":2}}\nnoise\n{echo}1 {{\"n\":1}}\n{echo}3 \n{echo}2 {{\"n\":2}}\n"
+        );
+        match extract_run_session_logs(&lost_dump) {
+            RunSessionScrape::Found(session) => {
+                assert_eq!(session, "{\"n\":1}\n{\"n\":2}");
+            }
+            other => panic!("expected the echoes, got {other:?}"),
+        }
     }
 }

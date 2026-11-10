@@ -4,6 +4,7 @@ use std::fmt;
 
 use crate::crucible::Direction;
 use crate::duration::TaskTimeout;
+use crate::knobs::{Harness, ReasoningEffort};
 use crate::plan::param::ParamValue;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{
@@ -535,12 +536,12 @@ pub enum TaskKind {
     /// names an `[agent.sandbox.<name>]`.
     Agent {
         prompt: String,
-        #[serde(default)]
-        harness: Option<String>,
+        #[serde(default, deserialize_with = "crate::manifest::launch::harness_knob")]
+        harness: Option<Harness>,
         #[serde(default)]
         model: Option<String>,
-        #[serde(default)]
-        effort: Option<String>,
+        #[serde(default, deserialize_with = "crate::manifest::launch::effort_knob")]
+        effort: Option<ReasoningEffort>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
     },
@@ -3916,7 +3917,7 @@ mod tests {
             name = "propose-b"
             kind = "agent"
             prompt = "try the algorithm swap"
-            harness = "hermes"
+            harness = "codex"
 
             [[task]]
             name = "measure-a"
@@ -3951,7 +3952,7 @@ mod tests {
         ));
         let b = v.get(&"propose-b".into()).unwrap();
         match &b.task {
-            TaskKind::Agent { harness, .. } => assert_eq!(harness.as_deref(), Some("hermes")),
+            TaskKind::Agent { harness, .. } => assert_eq!(*harness, Some(Harness::Codex)),
             other => panic!("expected agent task, got {other:?}"),
         }
     }

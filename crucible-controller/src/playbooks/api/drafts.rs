@@ -1169,10 +1169,12 @@ pub(crate) async fn launch_playbook_draft(
             Err(refusal) => return refusal.into_response(),
         };
     let actor = saver.actor.as_deref();
+    let owner = caller.subject_principal().map(|p| p.to_string());
     let dispatch_target = saver.dispatch_target.clone();
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
     let title = format!("draft {id}: {}", head.draft.description);
     let launch = crate::launches::model::NewPlaybookLaunch {
+        choice_snapshots: Some(&authorized.choice_snapshots),
         playbook: &id,
         repo: head.target().launch_repo(),
         title: &title,
@@ -1185,6 +1187,7 @@ pub(crate) async fn launch_playbook_draft(
         origin: crate::model::LaunchOrigin::Draft,
         draft_version: Some(head.version),
         created_by: actor,
+        owner: owner.as_deref(),
         launcher_groups: Some(&saver.groups),
         rerun: rerun.as_ref(),
         dispatch: saver.pin(),

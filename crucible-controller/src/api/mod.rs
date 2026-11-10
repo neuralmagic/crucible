@@ -36,8 +36,6 @@ pub(crate) mod tests;
         system::healthz,
         system::version,
         system::whoami,
-        crate::identity::api::credentials::get_credential,
-        crate::identity::api::credentials::revoke_credential,
         crate::identity::api::keys::list_keys,
         crate::identity::api::keys::mint_key,
         crate::identity::api::keys::revoke_key,
@@ -114,6 +112,7 @@ pub(crate) mod tests;
         crate::playbooks::api::registry::launch_playbook,
         crate::launches::api::playbook_runs::list_playbook_runs,
         crate::launches::api::playbook_runs::get_playbook_run,
+        crate::launches::api::playbook_runs::cancel_playbook_run,
         crate::launches::api::playbook_runs::create_one_shot,
         crate::launches::api::playbook_runs::list_one_shots,
         crate::launches::api::playbook_runs::cancel_one_shot,
@@ -447,10 +446,6 @@ pub fn router(state: ApiState) -> Router {
         ))
         .routes(routes!(crate::authz::explain::explain))
         .routes(routes!(
-            crate::identity::api::credentials::get_credential,
-            crate::identity::api::credentials::revoke_credential
-        ))
-        .routes(routes!(
             crate::identity::api::keys::list_keys,
             crate::identity::api::keys::mint_key
         ))
@@ -565,6 +560,9 @@ pub fn router(state: ApiState) -> Router {
         ))
         .routes(routes!(
             crate::launches::api::playbook_runs::get_playbook_run
+        ))
+        .routes(routes!(
+            crate::launches::api::playbook_runs::cancel_playbook_run
         ))
         .routes(routes!(
             crate::launches::api::playbook_runs::create_one_shot
@@ -768,6 +766,7 @@ pub fn router(state: ApiState) -> Router {
             crate::authz::bindings::enforce,
         ))
         .layer(axum::middleware::from_fn(trace_requests))
+        .layer(tower_http::compression::CompressionLayer::new())
         .with_state(state)
 }
 

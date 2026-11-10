@@ -3,7 +3,6 @@ import { $api } from '../api/client';
 import { eyebrowFor, narrow, scopedPath } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
-  Button,
   createDataColumnHelper,
   DataTable,
   Empty,
@@ -16,16 +15,14 @@ import {
   useDataTable,
 } from '../ui';
 import type { StatusTone } from '../ui';
-import { scheduleView, signinNeededCount, type ScheduleDto, type ScheduleState } from './schedulesView';
+import { scheduleView, type ScheduleDto, type ScheduleState } from './schedulesView';
 import { shortRev } from './draftStudio';
 import { scheduleFiringsPath } from './playbookRunsView';
 
 const EMPTY: ScheduleDto[] = [];
 
 const TONE: Record<ScheduleState, StatusTone> = {
-  signin: 'red',
   disabled: 'grey',
-  failing: 'amber',
   live: 'green',
 };
 
@@ -100,30 +97,21 @@ const columnsFor = (team: string | null) => helper.columns([
     cell: ({ row }) => {
       const view = scheduleView(row.original);
       return (
-        <div className="flex items-start gap-3">
-          <Mono size="data" tone={view.state === 'live' ? 'ink-3' : 'ink-2'}>
-            {view.detail}
-          </Mono>
-          {view.signInHref !== null && (
-            <Button variant="filled" className="whitespace-nowrap uppercase" render={<a href={view.signInHref} />}>
-              Sign in
-            </Button>
-          )}
-        </div>
+        <Mono size="data" tone={view.state === 'live' ? 'ink-3' : 'ink-2'}>
+          {view.detail}
+        </Mono>
       );
     },
   }),
 ]);
 
-/// Every schedule and whether it will actually fire: disabled, its owner's last failed group
-/// refresh, and the sign-in that clears one.
+/// Every schedule and whether it will actually fire.
 export function SchedulesPage() {
   const schedules = $api.useQuery('get', '/api/schedules');
   const owner = useOwnerContext();
   const rows = narrow(schedules.data ?? EMPTY, owner.context, (row) => row.owner_principal);
   const columns = useMemo(() => columnsFor(owner.team), [owner.team]);
   const table = useDataTable({ columns, data: rows, getRowId: (row) => row.id });
-  const needSignin = signinNeededCount(rows);
 
   return (
     <>
@@ -145,7 +133,6 @@ export function SchedulesPage() {
           footer={
             <>
               {rows.length} schedule{rows.length === 1 ? '' : 's'}
-              {needSignin > 0 && `, ${needSignin} waiting on sign-in`}
             </>
           }
         />

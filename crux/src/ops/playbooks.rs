@@ -84,6 +84,23 @@ pub(crate) fn parse_json(s: &str) -> Result<Value, String> {
     serde_json::from_str(s).map_err(|e| format!("not valid JSON: {e}"))
 }
 
+/// A launch ack or record with the link that opens it in the desktop tracker beside its key.
+pub(crate) fn with_tracker_url(mut launch: Value) -> Value {
+    let url = match (
+        launch.get("playbook").and_then(Value::as_str),
+        launch.get("key").and_then(Value::as_str),
+    ) {
+        (Some(playbook), Some(key)) if !playbook.is_empty() => {
+            crate::client::tracker_url(playbook, key)
+        }
+        _ => return launch,
+    };
+    if let Some(obj) = launch.as_object_mut() {
+        obj.insert("tracker_url".to_string(), Value::String(url));
+    }
+    launch
+}
+
 /// A launch that reruns a finished run of the same pack from some of its tasks.
 pub(crate) fn put_rerun(body: &mut Value, rerun_of: Option<&str>, from: &[String]) {
     if let Some(of) = rerun_of {
@@ -166,7 +183,7 @@ impl Operation for Launch {
         put_trimmed(&mut body, "provider", self.provider.as_deref());
         put_trimmed(&mut body, "model", self.model.as_deref());
         put_rerun(&mut body, self.rerun_of.as_deref(), &self.from);
-        c.launch(&self.id, &body).await
+        Ok(with_tracker_url(c.launch(&self.id, &body).await?))
     }
 
     fn render(&self, c: &Client, ack: Self::Output) -> Result<String> {
@@ -211,6 +228,39 @@ impl Operation for PlaybookRuns {
     }
 }
 
+/// Stop a playbook launch: the controller parks it, deletes its running runs' pods on the
+/// clusters they run on, and marks those runs cancelled.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
+pub struct Cancel {
+    /// Issue key the launch became.
+    #[schemars(description = "The launch's issue key, as playbook-runs lists it.")]
+    pub key: String,
+    #[arg(long)]
+    #[serde(default)]
+    pub json: bool,
+}
+
+impl Operation for Cancel {
+    type Output = crate::dto::CancelAck;
+
+    async fn call(&self, c: &Client) -> Result<Value> {
+        Ok(serde_json::to_value(c.cancel_launch(&self.key).await?)?)
+    }
+
+    fn render(&self, _c: &Client, ack: Self::Output) -> Result<String> {
+        Ok(crate::render::ack(
+            "cancel",
+            &ack.key,
+            ack.actor.as_deref(),
+            &format!("reason: {}", ack.reason),
+        ))
+    }
+
+    fn json(&self) -> bool {
+        self.json
+    }
+}
+
 /// One launch, whole. Always JSON: its `params` are arbitrary and the refusals are long, and
 /// both are exactly what a caller reads this for.
 #[derive(Debug, Clone, PartialEq, Eq, clap::Args, Deserialize, schemars::JsonSchema)]
@@ -227,7 +277,14 @@ impl Operation for PlaybookRun {
     type Output = Value;
 
     async fn call(&self, c: &Client) -> Result<Value> {
-        c.playbook_run(&self.key).await
+        let mut out: Value = c.playbook_run(&self.key).await?;
+        if let Some(launch) = out.get("launch").cloned() {
+            let launch = with_tracker_url(launch);
+            if let (Some(url), Some(obj)) = (launch.get("tracker_url"), out.as_object_mut()) {
+                obj.insert("tracker_url".to_string(), url.clone());
+            }
+        }
+        Ok(out)
     }
 
     fn render(&self, _c: &Client, out: Self::Output) -> Result<String> {
@@ -349,6 +406,25 @@ fn import_preview_path(import_id: &str, id: Option<&str>, description: Option<&s
 mod tests {
     use crate::ops::playbooks::*;
     use crate::ops::test_client;
+
+    #[test]
+    fn a_launch_carries_the_link_that_opens_it_in_the_tracker() {
+        let ack = with_tracker_url(serde_json::json!({
+            "key": "playbook:triage:01a1", "playbook": "triage", "max_cost": 3.0
+        }));
+        assert_eq!(
+            ack["tracker_url"],
+            "crucible-playbooks://playbook/triage/launch/playbook%3Atriage%3A01a1"
+        );
+        assert_eq!(ack["max_cost"], 3.0, "the ack is otherwise untouched");
+        let no_playbook = with_tracker_url(serde_json::json!({"key": "pb-9", "playbook": ""}));
+        assert!(no_playbook.get("tracker_url").is_none());
+        assert!(
+            with_tracker_url(serde_json::json!([1]))
+                .get("tracker_url")
+                .is_none()
+        );
+    }
 
     /// The proposer's naming rides the link so the admin opens the review page on what the agent
     /// decided, rather than retyping it. An id it never supplied must not appear as an empty one.

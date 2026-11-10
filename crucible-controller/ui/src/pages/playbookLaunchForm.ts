@@ -21,7 +21,34 @@ export interface ParamFieldSpec {
   description: string | null;
   /// Typed in a text area: a string that may span lines, such as a pasted log.
   multiline: boolean;
+  /// Picked from a list rather than typed: a declared choice set, or true and false for a bool.
+  choices: string[] | null;
+  /// The bool param that must be true for this one to be supplied; greyed out and omitted otherwise.
+  enabledBy: string | null;
+  /// The task output the choices come from, and the latest passing run's value of it.
+  choicesFrom: ChoicesSource | null;
+  choicesSnapshot: Snapshot<string[] | Record<string, string[]>> | null;
+  /// The choices are suggestions; any value is accepted.
+  allowOther: boolean;
+  /// The task output whose value for the key param shows greyed out in the empty input.
+  placeholderFrom: ChoicesSource | null;
+  placeholderSnapshot: Snapshot<Record<string, string>> | null;
 }
+
+export interface ChoicesSource {
+  task: string;
+  field: string;
+  /// The string param whose value selects the entry of a keyed output.
+  keyedBy: string | null;
+}
+
+export interface Snapshot<T> {
+  value: T;
+  capturedAt: string | null;
+}
+
+/// The launch setting that runs only the tasks feeding the form's options.
+export const CHOICES_REFRESH = 'choices.refresh';
 
 /// A schema outside the closed subset renders nothing rather than a wrong form: the launch
 /// endpoint validates against the same document, so a form that dropped or mistyped a field would
@@ -63,6 +90,38 @@ function valueTypeOf(property: Record<string, unknown>): ParamValueType | null {
       return null;
   }
 }
+
+function choicesSource(raw: unknown): { ok: true; value: ChoicesSource | null } | { ok: false } {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (!isRecord(raw) || typeof raw.task !== 'string' || typeof raw.field !== 'string') return { ok: false };
+  if (raw.keyed_by !== undefined && typeof raw.keyed_by !== 'string') return { ok: false };
+  return { ok: true, value: { task: raw.task, field: raw.field, keyedBy: raw.keyed_by ?? null } };
+}
+
+const isStringList = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === 'string');
+
+/// A snapshot the server attached, when its value has the shape `accepts` admits. A malformed one
+/// is dropped: the launch endpoint checks the value against the snapshot it holds either way.
+function snapshot<T>(raw: unknown, accepts: (value: unknown) => value is T): Snapshot<T> | null {
+  if (!isRecord(raw) || !accepts(raw.value)) return null;
+  return { value: raw.value, capturedAt: typeof raw.captured_at === 'string' ? raw.captured_at : null };
+}
+
+function keyedOf<T>(accepts: (value: unknown) => value is T) {
+  return (value: unknown): value is Record<string, T> =>
+    isRecord(value) && Object.values(value).every((entry) => accepts(entry));
+}
+
+type ChoicesValue = string[] | Record<string, string[]>;
+
+/// The shape a choices snapshot must have: one list, or one list per value of the key param.
+function choicesShape(keyed: boolean) {
+  const keyedLists = keyedOf(isStringList);
+  return (value: unknown): value is ChoicesValue => (keyed ? keyedLists(value) : isStringList(value));
+}
+
+const isKeyedText = keyedOf((value: unknown): value is string => typeof value === 'string');
 
 function boolField(
   property: Record<string, unknown>,
@@ -182,6 +241,41 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     if (multiline.value && valueType !== 'string') {
       return { kind: 'unrenderable', reason: `param ${name} is multiline but not a string` };
     }
+    let choices: string[] | null = valueType === 'boolean' ? ['true', 'false'] : null;
+    const listed: unknown = raw.enum ?? raw['x-choices'];
+    if (listed !== undefined) {
+      const spelled = Array.isArray(listed) && valueType !== 'list' ? listed.map((item) => defaultText(item, valueType)) : [];
+      if (spelled.length === 0 || spelled.some((item) => !item.ok || item.value === null)) {
+        return { kind: 'unrenderable', reason: `param ${name} has choices that are not a nonempty list of its type` };
+      }
+      choices = spelled.map((item) => (item.ok ? (item.value ?? '') : ''));
+    }
+    const enabledBy = stringField(raw, 'x-enabled-by');
+    if (!enabledBy.ok) {
+      return { kind: 'unrenderable', reason: `param ${name} has a non-string x-enabled-by` };
+    }
+    const gate = enabledBy.value === null ? undefined : properties[enabledBy.value];
+    if (enabledBy.value !== null && !(isRecord(gate) && gate.type === 'boolean')) {
+      return { kind: 'unrenderable', reason: `param ${name} is enabled by ${enabledBy.value}, which is not a declared bool` };
+    }
+    const choicesSpec = choicesSource(raw['x-choices-from']);
+    const placeholderSpec = choicesSource(raw['x-placeholder-from']);
+    if (!choicesSpec.ok || !placeholderSpec.ok) {
+      return { kind: 'unrenderable', reason: `param ${name} names its options' task output in a shape this form does not read` };
+    }
+    const choicesFrom = choicesSpec.value;
+    const placeholderFrom = placeholderSpec.value;
+    for (const source of [choicesFrom, placeholderFrom]) {
+      const key = source?.keyedBy;
+      if (key !== undefined && key !== null && !(isRecord(properties[key]) && valueTypeOf(properties[key]) === 'string')) {
+        return { kind: 'unrenderable', reason: `param ${name} is keyed by ${key}, which is not a declared string` };
+      }
+    }
+    const allowOther = boolField(raw, 'x-allow-other');
+    if (!allowOther.ok) {
+      return { kind: 'unrenderable', reason: `param ${name} has a non-boolean x-allow-other` };
+    }
+    const keyedChoices = choicesFrom?.keyedBy !== undefined && choicesFrom.keyedBy !== null;
     const description = stringField(raw, 'description');
     specs.push({
       name,
@@ -191,6 +285,14 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       pattern: pattern.value,
       description: description.ok ? description.value : null,
       multiline: multiline.value,
+      choices,
+      enabledBy: enabledBy.value,
+      choicesFrom,
+      choicesSnapshot:
+        choicesFrom === null ? null : snapshot(raw['x-choices-snapshot'], choicesShape(keyedChoices)),
+      allowOther: allowOther.value,
+      placeholderFrom,
+      placeholderSnapshot: placeholderFrom === null ? null : snapshot(raw['x-placeholder-snapshot'], isKeyedText),
     });
   }
   if (orderRaw !== undefined) {
@@ -215,16 +317,114 @@ export function initialValues(
   return values;
 }
 
+/// One block of the rendered form: a lone field, or a boolean gate with the fields it enables.
+export type ParamBlock =
+  | { kind: 'field'; spec: ParamFieldSpec }
+  | { kind: 'gated'; gate: ParamFieldSpec; fields: ParamFieldSpec[] };
+
+/// The form's blocks in declaration order. A boolean another field names in enabled_by renders once,
+/// as the head of a group at its first gated field's position, so the gate sits with what it unlocks.
+export function paramBlocks(specs: readonly ParamFieldSpec[]): ParamBlock[] {
+  const gates = new Map(
+    specs
+      .filter((spec) => specs.some((other) => other.enabledBy === spec.name))
+      .map((spec) => [spec.name, spec])
+  );
+  const blocks: ParamBlock[] = [];
+  const groups = new Map<string, ParamFieldSpec[]>();
+  for (const spec of specs) {
+    if (gates.has(spec.name)) continue;
+    const gate = spec.enabledBy === null ? undefined : gates.get(spec.enabledBy);
+    if (gate === undefined) {
+      blocks.push({ kind: 'field', spec });
+      continue;
+    }
+    const fields = groups.get(gate.name);
+    if (fields === undefined) {
+      const group: ParamFieldSpec[] = [spec];
+      groups.set(gate.name, group);
+      blocks.push({ kind: 'gated', gate, fields: group });
+    } else {
+      fields.push(spec);
+    }
+  }
+  return blocks;
+}
+
+/// The values the form offers for this param right now: its declared choices, or the latest
+/// snapshot of the task output it reads, narrowed to the key param's value when it is keyed. Null
+/// when there is no list to offer, so the param is typed.
+export function offeredChoices(
+  spec: ParamFieldSpec,
+  values: Readonly<Record<string, string>>
+): string[] | null {
+  if (spec.choices !== null) return spec.choices;
+  const snap = spec.choicesSnapshot;
+  if (snap === null) return null;
+  if (Array.isArray(snap.value)) return snap.value;
+  const key = spec.choicesFrom?.keyedBy;
+  return key === undefined || key === null ? null : (snap.value[(values[key] ?? '').trim()] ?? []);
+}
+
+/// What the empty input shows greyed out: the pack's own pick for the key param's value.
+export function placeholderFor(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): string | null {
+  const key = spec.placeholderFrom?.keyedBy;
+  if (spec.placeholderSnapshot === null || key === undefined || key === null) return null;
+  return spec.placeholderSnapshot.value[(values[key] ?? '').trim()] ?? null;
+}
+
+/// Each task the form's options come from, with the capture time of its snapshot, or `passed`
+/// false before it has one.
+export function optionSources(specs: readonly ParamFieldSpec[]): OptionSource[] {
+  const byTask = new Map<string, OptionSource>();
+  const note = (from: ChoicesSource | null, snap: Snapshot<unknown> | null) => {
+    if (from === null || byTask.get(from.task)?.passed === true) return;
+    byTask.set(from.task, { task: from.task, passed: snap !== null, capturedAt: snap?.capturedAt ?? null });
+  };
+  for (const spec of specs) {
+    note(spec.choicesFrom, spec.choicesSnapshot);
+    note(spec.placeholderFrom, spec.placeholderSnapshot);
+  }
+  return [...byTask.values()];
+}
+
+export interface OptionSource {
+  task: string;
+  passed: boolean;
+  capturedAt: string | null;
+}
+
+/// Whether the pack has options computed by a task, which a refresh launch recomputes.
+export function refreshable(specs: readonly ParamFieldSpec[]): boolean {
+  return specs.some((spec) => spec.choicesFrom !== null || spec.placeholderFrom !== null);
+}
+
+/// Whether a gated param's switch is on, so its value is taken; an ungated param always is.
+export function isEnabled(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): boolean {
+  return spec.enabledBy === null || (values[spec.enabledBy] ?? '').trim().toLowerCase() === 'true';
+}
+
 /// Client-side convenience only. An unanchored `new RegExp` matches JSON Schema semantics, and a
 /// pattern the browser cannot compile (Rust-regex syntax the engine accepts) checks nothing here
 /// rather than failing a value the endpoint would have taken.
-export function validateParam(spec: ParamFieldSpec, value: string): string | null {
+export function validateParam(
+  spec: ParamFieldSpec,
+  value: string,
+  values?: Readonly<Record<string, string>>
+): string | null {
+  if (values !== undefined && !isEnabled(spec, values)) return null;
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     return spec.required ? `${spec.name} is required` : null;
   }
   if (!readsAs(spec.valueType, trimmed)) {
     return `${spec.name} must be ${spellingOf(spec.valueType) ?? 'text'}`;
+  }
+  const offered = spec.allowOther ? null : offeredChoices(spec, values ?? {});
+  if (offered !== null && !offered.includes(spec.valueType === 'boolean' ? trimmed.toLowerCase() : trimmed)) {
+    return offered.length === 0
+      ? `${spec.name} has no options for this ${spec.choicesFrom?.keyedBy ?? 'launch'}`
+      : `${spec.name} must be one of ${offered.join(', ')}`;
   }
   if (spec.pattern === null) return null;
   let re: RegExp;
@@ -253,7 +453,7 @@ export function trimmedParams(
   const params: Record<string, string> = {};
   for (const spec of specs) {
     const value = (values[spec.name] ?? '').trim();
-    if (value.length === 0 && !spec.required) continue;
+    if (!isEnabled(spec, values) || (value.length === 0 && !spec.required)) continue;
     params[spec.name] = value;
   }
   return params;
@@ -265,7 +465,15 @@ export function launchBody(
   values: Readonly<Record<string, string>>,
   ceilings: LaunchCeilings
 ): LaunchPlaybookBody {
-  const params = trimmedParams(specs, values);
+  return bodyOf(trimmedParams(specs, values), ceilings);
+}
+
+/// The launch POST body of a refresh: no params, only the setting that runs the option tasks.
+export function refreshBody(ceilings: LaunchCeilings): LaunchPlaybookBody {
+  return bodyOf({ [CHOICES_REFRESH]: 'true' }, ceilings);
+}
+
+function bodyOf(params: Record<string, string>, ceilings: LaunchCeilings): LaunchPlaybookBody {
   const target = (ceilings.dispatchTarget ?? '').trim();
   return {
     params,

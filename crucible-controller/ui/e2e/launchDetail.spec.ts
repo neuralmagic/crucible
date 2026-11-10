@@ -200,8 +200,8 @@ test.describe('the launch view', () => {
       'href',
       '/secrets',
     );
-    // The generic parked block would only repeat the same text with the prefix on it.
-    await expect(page.getByText('Parked', { exact: true })).toHaveCount(0);
+    // The generic error block would only repeat the same text with the prefix on it.
+    await expect(page.getByText('Error', { exact: true })).toHaveCount(0);
   });
 
   /// A dispatched launch draws its run's task graph on the same surface the wizard and the studio

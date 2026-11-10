@@ -158,6 +158,24 @@ impl TryFrom<String> for ServiceAccountRef {
     }
 }
 
+/// The allowlist profile crucible-kueue checks pod templates against.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KueueAllowlist {
+    #[default]
+    Strict,
+    Tenant,
+}
+
+impl KueueAllowlist {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Tenant => "tenant",
+        }
+    }
+}
+
 /// The `[kueue]` table. The server on each of `clusters` accepts runs' tokens from the controller's
 /// agent issuer and acts for each as its `kube_user`, as Kubernetes RBAC decides.
 #[derive(Debug, Deserialize)]
@@ -184,6 +202,15 @@ pub struct KueueCfg {
     /// `workload_namespace = "..."` for one.
     #[serde(alias = "workload_namespace", deserialize_with = "one_or_many_names")]
     pub workload_namespaces: Vec<KubeName>,
+    /// The workload namespaces every run may act in through the caller role:
+    /// `shared_namespaces = [...]`, or `shared_namespace = "..."` for one. A subset of
+    /// `workload_namespaces`.
+    #[serde(
+        default,
+        alias = "shared_namespace",
+        deserialize_with = "one_or_many_names"
+    )]
+    pub shared_namespaces: Vec<KubeName>,
     /// Where the server fetches the agent issuer's keys. Default
     /// `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json`; a server that cannot reach the issuer's
     /// own address names a route here.
@@ -203,6 +230,15 @@ pub struct KueueCfg {
     /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
+    /// What a pod template may ask for. `strict`, the default, refuses Secrets, volume claims
+    /// beyond ephemeral ones, tolerations, priority classes and resource claims; `tenant` admits
+    /// them, which GPU workloads that tolerate a node taint or read a model token need.
+    #[serde(default)]
+    pub allowlist_profile: KueueAllowlist,
+    /// Secrets in the shared namespaces a run's pod templates may read, besides the pull
+    /// secrets. Under `tenant` only: `strict` refuses every Secret reference.
+    #[serde(default)]
+    pub secrets: Vec<KubeName>,
     /// Also serve people's MCP clients, with tokens from the same issuer: each cluster's server is
     /// then a resource people may get tokens for.
     #[serde(default)]
@@ -580,9 +616,6 @@ pub struct AgentServerCfg {
         deserialize_with = "one_or_many"
     )]
     pub clusters: Vec<String>,
-    /// Whether it authorizes as the token's `kube_user`, so no token is minted without one.
-    #[serde(default)]
-    pub requires_kube_user: bool,
     /// The namespaces its tokens name, the first as the default.
     #[serde(default)]
     pub namespaces: Vec<KubeName>,
@@ -794,6 +827,12 @@ pub struct Cluster {
     /// they exchange for agent tokens. Default [`DEFAULT_SPIFFE_SOCKET`].
     #[serde(default)]
     pub sandbox_spiffe_socket: Option<String>,
+    /// Whether the cluster's SPIRE issues loop pods an SVID
+    /// `spiffe://<trust domain>/crucible/run/<pod name>`. The loop pod then mounts the Workload
+    /// API socket (`csi.spiffe.io`) at [`ClusterCfg::spiffe_socket`], and the controller issues a
+    /// run's task tokens only with that SVID beside its pod token.
+    #[serde(default)]
+    pub loop_svid: bool,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]
@@ -1201,6 +1240,12 @@ pub struct NamespaceOverlap {
     pub namespace: String,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("kueue.shared_namespaces names {namespace:?}, which kueue.workload_namespaces does not")]
+pub struct NotSharedNamespace {
+    pub namespace: String,
+}
+
 impl DeployProfile {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
@@ -1215,6 +1260,9 @@ impl DeployProfile {
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .check_cluster_names()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .check_shared_namespaces()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .agent_servers()
@@ -1280,6 +1328,21 @@ impl DeployProfile {
                     first,
                     second,
                     namespace: ns.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a `[kueue] shared_namespaces` entry that is not in `workload_namespaces`.
+    pub fn check_shared_namespaces(&self) -> Result<(), NotSharedNamespace> {
+        let Some(kueue) = &self.kueue else {
+            return Ok(());
+        };
+        for shared in &kueue.shared_namespaces {
+            if !kueue.workload_namespaces.contains(shared) {
+                return Err(NotSharedNamespace {
+                    namespace: shared.to_string(),
                 });
             }
         }

@@ -588,6 +588,13 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind("GET", "/api/playbook-runs", R::Run, V::Read, Route),
     bind("GET", "/api/playbook-runs/{key}", R::Run, V::Read, Route),
+    bind(
+        "POST",
+        "/api/playbook-runs/{key}/cancel",
+        R::Run,
+        V::Update,
+        Route,
+    ),
     bind("GET", "/api/one-shots", R::OneShot, V::Read, Route),
     bind("POST", "/api/one-shots", R::OneShot, V::Create, Route),
     bind(
@@ -822,8 +829,6 @@ pub static BINDINGS: &[Binding] = &[
     bind("GET", "/api/keys", R::ApiKey, V::Read, Route),
     bind("POST", "/api/keys", R::ApiKey, V::Create, Route),
     bind("DELETE", "/api/keys/{id}", R::ApiKey, V::Delete, Route),
-    bind("GET", "/api/credentials/me", R::ApiKey, V::Read, Route),
-    bind("DELETE", "/api/credentials/me", R::ApiKey, V::Delete, Route),
     bind("GET", "/api/prefs", R::UserPrefs, V::Read, Route),
     bind("PUT", "/api/prefs", R::UserPrefs, V::Update, Route),
     bind("GET", "/api/prefs/editor", R::UserPrefs, V::Read, Route),

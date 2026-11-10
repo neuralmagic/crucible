@@ -686,7 +686,7 @@ mod tests {
                 task: &Task,
                 _attempt: u32,
                 _inputs: &BTreeMap<TaskName, serde_json::Value>,
-                _deadline: Option<crate::deadline::Deadline>,
+                _lane: Option<&crate::plan::admission::Lane<'_>>,
             ) -> Attempt {
                 self.dispatched.push(task.name.0.clone());
                 if task.name.0 == "write" && self.crashed_at.is_none() {

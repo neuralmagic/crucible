@@ -1,10 +1,13 @@
 //! The secret values a turn handed its agent, scrubbed by value from everything the turn streams,
-//! records, or exports before it leaves the loop pod.
+//! records, or exports before it leaves the loop pod; with [`SecretRules`], also the secrets the
+//! agent found itself, scrubbed by Kingfisher's built-in rules.
 
 use crucible_contract::event::{AgentEvent, RawStream};
+use kingfisher_scanner::{RulesDatabase, Scanner, get_builtin_rules};
 use serde_json::Value;
 use std::borrow::Cow;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::ops::Range;
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 /// What a scrubbed secret reads as.
 pub const MASK: &str = "[REDACTED]";
@@ -12,22 +15,102 @@ pub const MASK: &str = "[REDACTED]";
 /// Shorter values are not registered: masking them would mangle ordinary output.
 pub const MIN_SECRET_CHARS: usize = 8;
 
-/// One turn's secret values. Clones share the set, so a value registered after a consumer took
-/// its clone (a token re-minted mid-turn) is scrubbed there too.
+/// Kingfisher's built-in secret rules, compiled on first use. Clones share the compile; a failed
+/// compile masks every string.
+#[derive(Clone, Default)]
+pub struct SecretRules(Arc<OnceLock<Option<Scanner>>>);
+
+impl std::fmt::Debug for SecretRules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SecretRules")
+            .field("compiled", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+fn compile() -> Option<Scanner> {
+    let db = RulesDatabase::from_rule_collection(get_builtin_rules(None).ok()?).ok()?;
+    Some(Scanner::new(Arc::new(db)))
+}
+
+impl SecretRules {
+    /// Compile the rules now if they have not been; whether they compiled.
+    pub fn ready(&self) -> bool {
+        self.0.get_or_init(compile).is_some()
+    }
+
+    /// The byte ranges of every finding in `s`, widened to char boundaries, sorted and merged;
+    /// `None` when the rules or the scan fail.
+    fn spans(&self, s: &str) -> Option<Vec<Range<usize>>> {
+        let scanner = self.0.get_or_init(compile).as_ref()?;
+        let mut spans: Vec<Range<usize>> = scanner
+            .scan_bytes(s.as_bytes())
+            .ok()?
+            .iter()
+            .map(|f| {
+                let start = s.floor_char_boundary(f.location.start_offset);
+                let end = s.ceil_char_boundary(f.location.end_offset);
+                start..end
+            })
+            .filter(|span| !span.is_empty())
+            .collect();
+        spans.sort_by_key(|span| span.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(spans.len());
+        for span in spans {
+            match merged.last_mut() {
+                Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+                _ => merged.push(span),
+            }
+        }
+        Some(merged)
+    }
+
+    /// `s` with every finding masked; all of `s` masked when the rules or the scan fail.
+    fn mask<'a>(&self, s: Cow<'a, str>) -> Cow<'a, str> {
+        let spans = match self.spans(&s) {
+            Some(spans) if spans.is_empty() => return s,
+            Some(spans) => spans,
+            None => return Cow::Owned(MASK.to_string()),
+        };
+        let mut out = String::with_capacity(s.len());
+        let mut at = 0;
+        for span in spans {
+            out.push_str(&s[at..span.start]);
+            out.push_str(MASK);
+            at = span.end;
+        }
+        out.push_str(&s[at..]);
+        Cow::Owned(out)
+    }
+}
+
+/// One turn's secret values, plus the rules that catch secrets nobody registered. Clones share
+/// the set, so a value registered after a consumer took its clone (a token re-minted mid-turn) is
+/// scrubbed there too.
 #[derive(Clone, Default)]
 pub struct Redactor {
     secrets: Arc<RwLock<Vec<Box<str>>>>,
+    rules: Option<SecretRules>,
 }
 
 impl std::fmt::Debug for Redactor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Redactor")
             .field("secrets", &self.read().len())
+            .field("rules", &self.rules.is_some())
             .finish()
     }
 }
 
 impl Redactor {
+    /// A redactor that also masks whatever `rules` find.
+    pub fn with_rules(rules: SecretRules) -> Self {
+        Self {
+            secrets: Arc::default(),
+            rules: Some(rules),
+        }
+    }
+
     /// Register `secret`, and its JSON-escaped spelling when that differs, so a raw JSON line
     /// carrying it is scrubbed as well as a decoded string.
     pub fn add(&self, secret: &str) {
@@ -51,11 +134,12 @@ impl Redactor {
         self.secrets.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Whether `text` can change nothing: no values registered and no rules.
     pub fn is_empty(&self) -> bool {
-        self.read().is_empty()
+        self.rules.is_none() && self.read().is_empty()
     }
 
-    /// `s` with every registered value masked, longest first.
+    /// `s` with every registered value masked, longest first, then every rule finding.
     pub fn text<'a>(&self, s: &'a str) -> Cow<'a, str> {
         let mut out = Cow::Borrowed(s);
         for secret in self.read().iter() {
@@ -63,7 +147,10 @@ impl Redactor {
                 out = Cow::Owned(out.replace(&**secret, MASK));
             }
         }
-        out
+        match &self.rules {
+            Some(rules) if !out.is_empty() => rules.mask(out),
+            _ => out,
+        }
     }
 
     /// Mask every string in `value`, object keys included. Returns whether anything changed.
@@ -263,5 +350,160 @@ mod tests {
         let shown = format!("{r:?}");
         assert!(!shown.contains(KEY), "{shown}");
         assert!(shown.contains("secrets: 1"), "{shown}");
+        assert!(shown.contains("rules: false"), "{shown}");
+    }
+
+    /// Credentials the agent could find on its own. The PEM key is a throwaway ed25519 key.
+    fn found_secrets() -> [(&'static str, String); 5] {
+        let label = ["PRIVATE", "KEY"].join(" ");
+        [
+            (
+                "github pat",
+                ["ghp", "_R2d9sXbQk7LmP4vT8wYzA1cE6fH3jN0uKoIq"].concat(),
+            ),
+            ("aws access key id", ["AKIA", "QYLPMN5HHHFPZAM2"].concat()),
+            (
+                "aws secret key",
+                ["1tUm636uS1yOEcfP5pvf", "qJ/ml36mF7AkyHsEU0IU"].concat(),
+            ),
+            (
+                "pem private key",
+                format!(
+                    "-----BEGIN {label}-----\n\
+                     MC4CAQAwBQYDK2VwBCIEIJG2GTB4rI7wQj5WHWdkvIwqT4HU0Kho7NI7c6uTa3vl\n\
+                     -----END {label}-----"
+                ),
+            ),
+            (
+                "jwt",
+                [
+                    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+                    "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ",
+                    "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c",
+                ]
+                .join("."),
+            ),
+        ]
+    }
+
+    fn patterns() -> Redactor {
+        Redactor::with_rules(SecretRules::default())
+    }
+
+    #[test]
+    fn found_secrets_are_masked_in_a_tool_input_and_result() {
+        let r = patterns();
+        assert!(
+            !r.is_empty(),
+            "patterns alone keep event from short-circuiting"
+        );
+        let [pat, aws_id, aws_secret, pem, jwt] = found_secrets().map(|(_, s)| s);
+        let env = format!("AWS_ACCESS_KEY_ID={aws_id}\nAWS_SECRET_ACCESS_KEY={aws_secret}\n");
+        let ev = AgentEvent::Tool {
+            name: "Bash".into(),
+            summary: "cat ~/.aws/credentials".into(),
+            subagent: false,
+            input: Some(json!({
+                "command": format!("curl -H 'Authorization: token {pat}' https://api.github.com"),
+                "env": env,
+                "key": pem,
+                "headers": { "authorization": format!("Bearer {jwt}") },
+            })),
+            result: Some(format!("{env}{pem}\ntoken: {jwt}\nGITHUB_TOKEN={pat}\n")),
+            failed: false,
+        };
+        let scrubbed = r.event(&ev);
+        assert!(matches!(scrubbed, Cow::Owned(_)));
+        let encoded = serde_json::to_string(scrubbed.as_ref()).unwrap();
+        for (name, secret) in found_secrets() {
+            assert!(!encoded.contains(&secret), "{name} leaked: {encoded}");
+        }
+        assert!(!encoded.contains("MC4CAQAw"), "pem body leaked: {encoded}");
+        let AgentEvent::Tool { input, result, .. } = scrubbed.as_ref() else {
+            panic!("{scrubbed:?}");
+        };
+        let input = input.as_ref().unwrap();
+        assert_eq!(input["key"], MASK);
+        assert_eq!(
+            input["command"],
+            format!("curl -H 'Authorization: token {MASK}' https://api.github.com")
+        );
+        assert!(result.as_ref().unwrap().contains(MASK));
+    }
+
+    #[test]
+    fn found_secrets_are_masked_in_their_json_escaped_and_base64_spellings() {
+        let r = patterns();
+        let [.., (_, pem), _] = found_secrets();
+        let line = serde_json::to_string(&json!({ "result": pem })).unwrap();
+        assert!(line.contains("\\n"), "{line}");
+        let scrubbed = r.text(&line);
+        assert!(!scrubbed.contains("MC4CAQAw"), "{scrubbed}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&scrubbed).unwrap()["result"],
+            MASK
+        );
+        let kubeconfig = format!("    client-key-data: {}", base64_encode(pem.as_bytes()));
+        assert_eq!(r.text(&kubeconfig), format!("    client-key-data: {MASK}"));
+    }
+
+    fn base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, b)| n | (u32::from(*b) << (16 - 8 * i)));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[(n >> (18 - 6 * i)) as usize & 63]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn ordinary_text_and_hashes_pass_through_pattern_scrubbing_unchanged() {
+        let r = patterns();
+        for clean in [
+            "",
+            "cargo build -p crucible-harness finished in 44.16s",
+            "commit 9c701758a1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "uuid 3fa85f64-5717-4562-b3fc-2c963f66afa6, ünïcödé ✓",
+            "AWS_REGION=us-east-1 GITHUB_REPOSITORY=neuralmagic/crucible",
+        ] {
+            assert!(matches!(r.text(clean), Cow::Borrowed(_)), "{clean:?}");
+        }
+        let ev = AgentEvent::Tool {
+            name: "Read".into(),
+            summary: "Cargo.lock".into(),
+            subagent: false,
+            input: Some(json!({ "file_path": "/workspace/Cargo.lock" })),
+            result: Some(
+                "checksum = \"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\""
+                    .into(),
+            ),
+            failed: false,
+        };
+        assert!(matches!(r.event(&ev), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn registered_values_are_still_masked_alongside_pattern_findings() {
+        let r = patterns();
+        r.add(KEY);
+        let [(_, pat), ..] = found_secrets();
+        let early = r.clone();
+        r.add("relayed-secret-value");
+        assert_eq!(
+            early.text(&format!("{KEY} é {pat} relayed-secret-value")),
+            format!("{MASK} é {MASK} {MASK}")
+        );
     }
 }

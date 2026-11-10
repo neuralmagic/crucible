@@ -6791,6 +6791,7 @@ async fn adopt_launch_with_groups(
                 db.pool(),
                 key,
                 &crate::launches::model::NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/repo",
                     title: "a survey",
@@ -6803,6 +6804,7 @@ async fn adopt_launch_with_groups(
                     origin: crate::model::LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
+                    owner: None,
                     launcher_groups,
                     rerun: None,
                     dispatch: Default::default(),
@@ -6862,6 +6864,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
         db.pool(),
         key,
         &crate::launches::model::NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/repo",
             title: "a survey",
@@ -6874,6 +6877,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             origin: crate::model::LaunchOrigin::Schedule,
             draft_version: None,
             created_by: Some("wren"),
+            owner: None,
             launcher_groups: None,
             rerun: None,
             dispatch: Default::default(),
@@ -7675,86 +7679,6 @@ async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
     Ok(())
 }
 
-/// An issuer that cannot be asked for a stale launcher's groups defers a launch whose scope binds a
-/// secret: it stays `new` for a later tick, and nothing runs or parks. A scope that binds nothing
-/// dispatches anyway. An issuer that refuses holds no groups, so the deferred launch parks.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
-    pool: PgPool,
-) -> Result<()> {
-    use crate::identity::oidc::credentials::{CredentialKeys, OwnerRefresh};
-    let _g = crate::ENV_LOCK.lock().await;
-    let (db, dir) = db_with(pool);
-    let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
-    unsafe {
-        std::env::set_var("CRUCIBLE_BIN", &bin);
-    }
-    let now = jiff::Timestamp::now();
-    seed_team_launcher(&db, now.checked_sub(jiff::SignedDuration::from_hours(2))?).await?;
-    let keys = std::sync::Arc::new(CredentialKeys::new(vec![vec![7u8; 32]])?);
-    let mut conn = db.pool().acquire().await?;
-    crate::identity::oidc::credentials::upsert(&mut conn, &keys, "sub-wren", "offline", now)
-        .await?;
-    drop(conn);
-    let cfg_for = |provider| ControllerCfg {
-        playbook_executor: crucible_controller::PlaybookExecutor::Local,
-        owner_refresh: Some(std::sync::Arc::new(OwnerRefresh::new(
-            db.pool().clone(),
-            provider,
-            keys.clone(),
-        ))),
-        ..cfg_with(dir.path(), Profile::default())
-    };
-    let unreachable = cfg_for(crate::identity::oidc::tests::provider_at(
-        "http://127.0.0.1:1/realms/nobody",
-    ));
-    let (_issuer, provider) = crate::identity::oidc::tests::issuer_answering(
-        wiremock::ResponseTemplate::new(400)
-            .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
-    )
-    .await;
-    let refusing = cfg_for(provider);
-    let recorded = serde_json::json!([TEAM_GROUP]);
-    let unbound = "playbook:survey:0199c0de-7c2c-71a5-8000-10";
-    adopt_launch_with_groups(&db, unbound, 3.5, Some(&recorded)).await;
-    let bound = "playbook:survey:0199c0de-7c2c-71a5-8000-11";
-    adopt_launch_with_groups(&db, bound, 3.5, Some(&recorded)).await;
-
-    let res = async {
-        reconcile(&db, &unreachable, unbound).await?;
-        bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
-        reconcile(&db, &unreachable, bound).await?;
-        let deferred = crate::issues::store::get_issue(db.pool(), bound)
-            .await?
-            .expect("issue");
-        reconcile(&db, &refusing, bound).await?;
-        anyhow::Ok(deferred)
-    }
-    .await;
-    unsafe {
-        std::env::remove_var("CRUCIBLE_BIN");
-    }
-    let deferred = res?;
-
-    let started = crate::issues::store::get_issue(db.pool(), unbound)
-        .await?
-        .expect("issue");
-    assert!(
-        matches!(started.status, Status::Running | Status::Done),
-        "{:?}: {:?}",
-        started.status,
-        started.parked_reason
-    );
-    assert_eq!(deferred.status, Status::New, "{:?}", deferred.parked_reason);
-    let reason = parked_reason(&db, bound).await?;
-    assert!(reason.contains("owned by team:tibrahim-all"), "{reason}");
-    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs")
-        .fetch_one(db.pool())
-        .await?;
-    assert_eq!(runs, 1, "only the launch binding nothing ran");
-    Ok(())
-}
-
 /// Local mode: the launch runs as a supervised subprocess with the launcher's own values and
 /// ceilings, and its session lands in the same ledger rows a pod run's would — marked as the local
 /// run it was.
@@ -8464,6 +8388,131 @@ async fn a_finished_spoke_pod_of_a_human_parked_playbook_run_is_collected_by_the
     assert!(
         resync_tick(&db).await?.is_empty(),
         "a collected row is not re-driven"
+    );
+    Ok(())
+}
+
+/// The live failure behind two playbook launches left `running` for days: their pods were gone
+/// from the spoke and their pod rows already closed, so the resync, which read only `running` pod
+/// rows, never looked at the runs again. It now re-drives a `running` run whatever its pod row
+/// says, and the run is recorded lost.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_running_run_whose_pod_row_closed_is_recorded_lost_by_the_resync(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-31";
+    let pod = "crucible-run-glowing-coati";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-stuck-1",
+        pod,
+        "pirate",
+        std::time::Duration::from_secs(92 * 60 * 60),
+    )
+    .await?;
+    crate::runs::work_pods::set_work_pod_state(
+        db.pool(),
+        pod,
+        crate::runs::workpod::WorkPodState::Failed,
+        None,
+        Some("pod gone"),
+    )
+    .await?;
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher {
+        gone: true,
+        ..ClusterRunPodDispatcher::on("pirate", crate::runs::workpod::TurnPhase::TimedOut)
+    });
+
+    let enqueued = resync_and_reconcile(&db, &cfg, dispatcher).await?;
+
+    assert_eq!(enqueued, vec![key.to_string()]);
+    assert_eq!(
+        run_status(&db, "run-stuck-1").await?,
+        "infrastructure-error"
+    );
+    assert!(
+        resync_tick(&db).await?.is_empty(),
+        "a settled run is not re-driven"
+    );
+    Ok(())
+}
+
+/// A cancel parks the launch as a human would, deletes its running pod on the spoke it runs on,
+/// and marks the run `cancelled`, so the resync has nothing left to settle.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_cancel_parks_the_launch_deletes_its_pod_and_marks_the_run_cancelled(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-32";
+    let pod = "crucible-run-savvy-euglena";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-cancel-1",
+        pod,
+        "pirate",
+        std::time::Duration::from_secs(5 * 60),
+    )
+    .await?;
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher::on(
+        "pirate",
+        crate::runs::workpod::TurnPhase::TimedOut,
+    ));
+    let mut cfg = cfg_with(dir.path(), Profile::default());
+    cfg.runtime.dispatcher = dispatcher.clone();
+
+    let store = std::sync::Arc::new(crate::daemon::overrides::OverrideStore::new());
+    crate::daemon::overrides::QueueOverrideSink::new(
+        store.clone(),
+        crate::daemon::queue::WorkQueue::new(),
+    )
+    .submit(crate::daemon::queue::Override {
+        key: crate::daemon::queue::IssueKey(key.into()),
+        kind: crate::daemon::queue::OverrideKind::Cancel,
+        reason: None,
+        priority: None,
+        actor: Some("wseaton".into()),
+    });
+    let applied = crate::daemon::overrides::apply_pending(&db, &store, key, false)
+        .await?
+        .expect("the cancel was pending");
+    assert_eq!(applied.kind, crate::daemon::queue::OverrideKind::Cancel);
+    let cancelled =
+        crate::runs::cancel::cancel_runs(&db, &cfg, key, applied.actor.as_deref()).await?;
+
+    assert_eq!(cancelled, 1);
+    assert_eq!(run_status(&db, "run-cancel-1").await?, "cancelled");
+    assert_eq!(
+        dispatcher.deleted(),
+        vec![("pirate".to_string(), pod.to_string())],
+        "the pod is deleted on the spoke it runs on"
+    );
+    let row = work_pod(&db, pod).await?;
+    assert_eq!(row.state, crate::runs::workpod::WorkPodState::Collected);
+    assert_eq!(row.result.as_deref(), Some("cancelled by wseaton"));
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    assert_eq!(issue.parked_by, Some(ParkedBy::Human));
+    assert_eq!(issue.parked_reason.as_deref(), Some("cancelled by wseaton"));
+
+    reconcile(&db, &cfg, key).await?;
+    assert_eq!(run_status(&db, "run-cancel-1").await?, "cancelled");
+    assert!(
+        resync_tick(&db).await?.is_empty(),
+        "a cancelled run is not re-driven"
+    );
+    assert_eq!(
+        crate::runs::cancel::cancel_runs(&db, &cfg, key, Some("wseaton")).await?,
+        0,
+        "a second cancel finds nothing running"
     );
     Ok(())
 }

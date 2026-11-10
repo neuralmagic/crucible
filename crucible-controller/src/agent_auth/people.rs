@@ -429,7 +429,7 @@ pub(crate) struct Pending {
     pub(crate) request: AuthorizeRequest,
 }
 
-fn escape(raw: &str) -> String {
+pub(crate) fn escape(raw: &str) -> String {
     raw.chars()
         .fold(String::with_capacity(raw.len()), |mut s, c| {
             match c {
@@ -445,6 +445,15 @@ fn escape(raw: &str) -> String {
 }
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
+    styled_page(status, title, body, "'none'")
+}
+
+/// A page whose forms post back to this origin.
+pub(crate) fn form_page(status: StatusCode, title: &str, body: &str) -> Response {
+    styled_page(status, title, body, "'self'")
+}
+
+fn styled_page(status: StatusCode, title: &str, body: &str, form_action: &'static str) -> Response {
     let html = format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{t}</title>\
@@ -461,12 +470,12 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let mut response = (status, Html(html)).into_response();
     let headers = response.headers_mut();
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'",
-        ),
+    let csp = format!(
+        "default-src 'none'; style-src 'unsafe-inline'; form-action {form_action}; frame-ancestors 'none'"
     );
+    if let Ok(csp) = HeaderValue::from_str(&csp) {
+        headers.insert(header::CONTENT_SECURITY_POLICY, csp);
+    }
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
@@ -503,13 +512,11 @@ fn session_failure(e: impl std::fmt::Display) -> Response {
     )
 }
 
-/// The signed-in person, `None` without a native session or with one whose groups refresh failed.
+/// The signed-in person, `None` without a native session.
 async fn signed_in(
     session: &Session,
 ) -> Result<Option<crate::identity::session::NativeClaims>, tower_sessions::session::Error> {
-    crate::identity::session::native_claims(session)
-        .await
-        .map(|c| c.filter(|c| !c.downgraded))
+    crate::identity::session::native_claims(session).await
 }
 
 pub fn router(state: Arc<AgentAuth>) -> axum::Router {
@@ -1271,8 +1278,6 @@ mod tests {
             login: "jordan".into(),
             email: Some("casey@example.com".into()),
             groups: Vec::new(),
-            groups_at: String::new(),
-            downgraded: false,
         };
         crate::identity::session::establish_native(&session, &claims, None)
             .await
@@ -2076,23 +2081,10 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         assert_eq!(live, 0, "the approval is revoked");
     }
 
-    /// A person the identity provider has refused, or one who is gone, refreshes nothing.
+    /// A person who is gone refreshes nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_refused_or_deleted_person_refreshes_nothing(pool: PgPool) {
+    async fn a_deleted_person_refreshes_nothing(pool: PgPool) {
         let h = harness(&pool).await;
-        let code = issued_code(&h, &pool).await;
-        let (_, first) = code_exchange(&h.app, &code).await;
-        sqlx::query(
-            "INSERT INTO user_credentials (sub, token_cipher, key_id, last_error, failures,
-                                           created_at, updated_at)
-             VALUES ($1, 'sealed', 'k1', 'invalid_grant: account disabled', 1, '', '')",
-        )
-        .bind(SUB)
-        .execute(&pool)
-        .await
-        .unwrap();
-        assert!(refused(&refreshed(&h.app, &first["refresh_token"]).await));
-
         let code = issued_code(&h, &pool).await;
         let (_, other) = code_exchange(&h.app, &code).await;
         sqlx::query("DELETE FROM users WHERE sub = $1")
@@ -2146,7 +2138,12 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         );
         assert_eq!(
             doc["grant_types_supported"],
-            json!(["client_credentials", "authorization_code", "refresh_token"])
+            json!([
+                "client_credentials",
+                "urn:ietf:params:oauth:grant-type:token-exchange",
+                "authorization_code",
+                "refresh_token"
+            ])
         );
         assert_eq!(doc["response_types_supported"], json!(["code"]));
         assert_eq!(doc["code_challenge_methods_supported"], json!(["S256"]));

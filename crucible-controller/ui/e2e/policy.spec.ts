@@ -196,7 +196,6 @@ test.describe('policy', () => {
           admin: false,
           role: 'viewer',
           groups: [],
-          downgraded: false,
           proves_groups: true,
           entitlements: [],
           teams: [],

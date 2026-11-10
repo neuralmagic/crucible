@@ -1,7 +1,7 @@
 import type { components } from '../api/schema';
 import { budgetState, resetsIn, type SharedBudget } from '../budget';
 import { launchPath } from './launchView';
-import { scheduleView, type ScheduleDto } from './schedulesView';
+import type { ScheduleDto } from './schedulesView';
 
 type PlaybookRunDto = components['schemas']['PlaybookRunDto'];
 type PlaybookDto = components['schemas']['PlaybookDto'];
@@ -11,14 +11,7 @@ export type RunRow = Pick<PlaybookRunDto, 'key' | 'playbook' | 'status' | 'parke
 export type PlaybookRow = Pick<PlaybookDto, 'id' | 'updated_at'>;
 export type ScheduleRow = Pick<
   ScheduleDto,
-  | 'id'
-  | 'playbook'
-  | 'enabled'
-  | 'next_due_at'
-  | 'consecutive_failures'
-  | 'owner_signin_required'
-  | 'owner_refresh_error'
-  | 'owner_refresh_at'
+  'id' | 'playbook' | 'enabled' | 'next_due_at' | 'consecutive_failures'
 >;
 
 /// Parked launches listed one by one before the rest collapse into a count.
@@ -62,20 +55,7 @@ export function attentionItems(
     });
   }
 
-  const states = schedules.map((row) => ({ row, state: scheduleView(row).state }));
-  const signin = states.filter((s) => s.state === 'signin').length;
-  if (signin > 0) {
-    items.push({
-      key: 'schedules:signin',
-      tone: 'red',
-      text:
-        signin === 1
-          ? '1 schedule stops firing until its owner signs in again'
-          : `${signin} schedules stop firing until their owners sign in again`,
-      to: '/schedules',
-    });
-  }
-  const stopped = states.filter((s) => s.state === 'disabled' && s.row.consecutive_failures > 0).length;
+  const stopped = schedules.filter((row) => !row.enabled && row.consecutive_failures > 0).length;
   if (stopped > 0) {
     items.push({
       key: 'schedules:stopped',
@@ -94,7 +74,6 @@ export function attentionItems(
     });
   }
 
-  items.sort((a, b) => (a.tone === b.tone ? 0 : a.tone === 'red' ? -1 : 1));
   return items;
 }
 
@@ -140,7 +119,7 @@ export function playbooksByUse<T extends PlaybookRow>(
 /// Schedules that will fire, soonest first.
 export function upcoming<T extends ScheduleRow>(schedules: readonly T[], limit: number): T[] {
   return schedules
-    .filter((row) => row.next_due_at && scheduleView(row).state !== 'signin' && row.enabled)
+    .filter((row) => row.next_due_at && row.enabled)
     .sort((a, b) => (a.next_due_at ?? '').localeCompare(b.next_due_at ?? ''))
     .slice(0, limit);
 }

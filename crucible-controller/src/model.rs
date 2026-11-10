@@ -196,13 +196,6 @@ pub enum ParkReason {
     /// The launch's scope binds secrets the launcher's principals do not cover, declares a name
     /// nothing is bound to, or was bound against a pack revision a pin bump moved.
     SecretsUnresolved { detail: String },
-    /// A standing launch (a schedule, a one-shot, a watch) fired with no usable snapshot of its
-    /// owner's groups, so there is no authorization to launch a scope's bound secrets under.
-    OwnerStale {
-        trigger: crate::model::Trigger,
-        id: String,
-        detail: String,
-    },
     /// A stored or event-log-replayed reason this build doesn't recognize: a pre-enum row, or a
     /// park call site this pass didn't enumerate. `parse` NEVER produces an `Err` — this is the
     /// catch-all it falls back to instead.
@@ -300,15 +293,6 @@ impl std::fmt::Display for ParkReason {
                 }
             }
             Self::SecretsUnresolved { detail } => write!(f, "secrets: {detail}"),
-            Self::OwnerStale {
-                trigger,
-                id,
-                detail,
-            } => write!(
-                f,
-                "{} {id} owner snapshot is stale: {detail}",
-                trigger.as_str()
-            ),
             Self::LocalRunFailed { run_id, detail } => write!(
                 f,
                 "run {run_id} ran locally and published no session: {detail}"

@@ -5,7 +5,7 @@
 //! This is the wire-only half of the format: plain-data types and the codec, with no dependency
 //! on the CLI's in-process `Row`/`Phase` state (that bridge lives in `crucible::session`).
 
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, RawStream};
 use crate::identity::RunIdentity;
 use serde::{Deserialize, Serialize};
 
@@ -183,6 +183,9 @@ pub struct PlanTaskWire {
     /// definitions. A rerun refuses to reuse a task whose definition moved since its parent.
     #[serde(default)]
     pub definition: String,
+    /// What a `command` or `evaluate` task runs, as the pack wrote it; empty for other kinds.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub command: String,
 }
 
 fn write_revise_targets<S: serde::Serializer>(targets: &[String], s: S) -> Result<S::Ok, S::Error> {
@@ -511,6 +514,33 @@ pub enum SessionEvent {
         task: String,
         attempt: u32,
         estimate_usd: f64,
+        /// When the attempt started, RFC 3339 UTC. Absent from logs written before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
+    },
+    /// One event from a playbook agent task's attempt, so a reader can follow each task's turn
+    /// on its own. `task` names a fan-out instance by its raw key. Text and thinking arrive as
+    /// whole blocks rather than deltas, each capped by the engine with the cut marked.
+    TaskAgent {
+        task: String,
+        attempt: u32,
+        event: AgentEvent,
+    },
+    /// Lines a playbook command or evaluate attempt printed, in arrival order, batched while
+    /// they come from one stream. `task` names a fan-out instance by its raw key. Each line is
+    /// capped by the engine with the cut marked.
+    TaskOutput {
+        task: String,
+        attempt: u32,
+        stream: RawStream,
+        lines: Vec<String>,
+    },
+    /// The attempt printed `lines` more lines past the engine's per-attempt output cap, none of
+    /// them recorded. Emitted once, after the attempt's last `TaskOutput`.
+    TaskOutputDropped {
+        task: String,
+        attempt: u32,
+        lines: u64,
     },
     /// One work-graph task attempt reached a terminal status. Covers both the plan executor
     /// (`plan_version` + `kind` + `output`) and measure-DAG walks (`iter` + `digest` + `job` +
@@ -558,8 +588,12 @@ pub enum SessionEvent {
         /// Present exactly when `status` is `transport`: what the last attempt died on.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         transport: Option<TransportCause>,
+        /// Wall time from the task's first attempt starting to this result, retries included.
         #[serde(default)]
         secs: f64,
+        /// When the task settled, RFC 3339 UTC. Absent from logs written before it was kept.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        at: Option<String>,
         #[serde(default)]
         trace_id: String,
         #[serde(default)]
@@ -1016,6 +1050,54 @@ mod tests {
     }
 
     #[test]
+    fn a_task_agent_event_round_trips_with_its_task_and_attempt() {
+        let ev = SessionEvent::TaskAgent {
+            task: "edit[layernorm]".into(),
+            attempt: 2,
+            event: AgentEvent::Text {
+                delta: "The build failed; retrying.\nSecond line kept.".into(),
+            },
+        };
+        assert_round_trips(ev);
+        let line = encode(&SessionEvent::TaskAgent {
+            task: "edit".into(),
+            attempt: 1,
+            event: AgentEvent::Retry {
+                attempt: 1,
+                max: 3,
+                error: "529".into(),
+            },
+        });
+        assert!(line.contains(r#""kind":"task_agent""#), "{line}");
+        assert!(line.contains(r#""event":{"kind":"retry""#), "{line}");
+    }
+
+    #[test]
+    fn a_task_event_without_a_time_still_decodes() {
+        let started =
+            decode(r#"{"v":1,"kind":"task_started","task":"a","attempt":1,"estimate_usd":0.5}"#);
+        assert!(
+            matches!(started, Some(SessionEvent::TaskStarted { at: None, .. })),
+            "{started:?}"
+        );
+        let result = decode(r#"{"v":1,"kind":"task_result","task":"a","status":"pass"}"#);
+        assert!(
+            matches!(result, Some(SessionEvent::TaskResult { at: None, .. })),
+            "{result:?}"
+        );
+        let line = encode(&SessionEvent::TaskStarted {
+            task: "a".into(),
+            attempt: 1,
+            estimate_usd: 0.5,
+            at: None,
+        });
+        assert!(
+            !line.contains("\"at\""),
+            "an absent time is left out: {line}"
+        );
+    }
+
+    #[test]
     fn plan_admitted_round_trips() {
         assert_round_trips(SessionEvent::PlanAdmitted {
             plan_version: 2,
@@ -1030,6 +1112,7 @@ mod tests {
                 required: true,
                 join: "all".into(),
                 stage: "iteration".into(),
+                command: "make bench".into(),
                 over: "discover.targets".into(),
                 max_fanout: 8,
                 when: String::new(),
@@ -1142,6 +1225,7 @@ mod tests {
             timeout: String::new(),
             history_depth: 0,
             definition: String::new(),
+            command: String::new(),
             optional: Vec::new(),
         };
         let written = |revise: Vec<String>| {
@@ -1196,6 +1280,7 @@ mod tests {
             task: "audit[a]".into(),
             attempt: 2,
             estimate_usd: 0.125,
+            at: Some("2026-11-08T13:30:00.25Z".into()),
         });
     }
 
@@ -1221,6 +1306,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: None,
             repairs: vec![TaskRepair {
                 label: "measure-a repair 1/2".into(),
@@ -1280,6 +1366,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1338,6 +1425,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1384,6 +1472,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
+            at: None,
             agent: Some(Box::new(TaskAgent {
                 harness: "claude".into(),
                 model: "glm-5.3".into(),
@@ -1459,6 +1548,44 @@ mod tests {
             }
             other => panic!("wrong variant: {other:?}"),
         }
+    }
+
+    #[test]
+    fn task_output_events_round_trip_with_their_wire_names() {
+        let output = SessionEvent::TaskOutput {
+            task: "build[3]".into(),
+            attempt: 2,
+            stream: RawStream::Stderr,
+            lines: vec!["warning: unused".into(), "error: boom".into()],
+        };
+        assert_eq!(
+            encode(&output),
+            r#"{"v":1,"kind":"task_output","task":"build[3]","attempt":2,"stream":"stderr","lines":["warning: unused","error: boom"]}"#
+        );
+        assert_round_trips(output);
+        let dropped = SessionEvent::TaskOutputDropped {
+            task: "build[3]".into(),
+            attempt: 2,
+            lines: 41,
+        };
+        assert_eq!(
+            encode(&dropped),
+            r#"{"v":1,"kind":"task_output_dropped","task":"build[3]","attempt":2,"lines":41}"#
+        );
+        assert_round_trips(dropped);
+    }
+
+    #[test]
+    fn a_reader_skips_a_kind_it_does_not_know_and_keeps_reading() {
+        let log = [
+            r#"{"v":1,"kind":"task_output_v9","task":"t","attempt":1,"chunks":[]}"#,
+            r#"{"v":1,"kind":"note","msg":"after"}"#,
+        ];
+        let decoded: Vec<SessionEvent> = log.iter().filter_map(|line| decode(line)).collect();
+        assert!(
+            matches!(decoded.as_slice(), [SessionEvent::Note { msg }] if msg == "after"),
+            "{decoded:?}"
+        );
     }
 
     #[test]

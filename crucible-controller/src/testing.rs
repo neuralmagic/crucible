@@ -76,9 +76,7 @@ struct ArgHarness {
 pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::ControllerCfg {
     crate::config::ControllerCfg {
         secret_provider: None,
-        owner_refresh: None,
         runtime: Default::default(),
-        schedule_owner_ttl_secs: 604800,
         local_secret_allowlist: Vec::new(),
         state_dir: state_dir.to_path_buf(),
         scratch_dir: None,
@@ -221,6 +219,7 @@ pub(crate) async fn launch_playbook(
         &mut tx,
         key,
         &crate::launches::model::NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/repo",
             title: "survey",
@@ -233,6 +232,7 @@ pub(crate) async fn launch_playbook(
             origin: crate::model::LaunchOrigin::Manual,
             draft_version: None,
             created_by: Some("wren"),
+            owner: None,
             launcher_groups: None,
             rerun: None,
             dispatch: Default::default(),

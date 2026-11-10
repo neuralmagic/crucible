@@ -7,6 +7,7 @@ mod cache;
 mod client;
 mod context;
 mod job;
+mod jobs;
 mod logs;
 mod mcp;
 mod oci;
@@ -243,34 +244,65 @@ pub struct BuildArgs {
     /// Print the started build at once instead of waiting for it to end
     #[arg(long, requires = "server", conflicts_with = "image")]
     pub no_wait: bool,
-    /// A cache every RUN step sees at PATH, kept for the sandbox's later builds; repeatable
+    /// A cache every RUN step sees at PATH, kept for the sandbox's later builds; `:cluster` also
+    /// keeps it in the server's shared cache; repeatable
     #[arg(
         long = "cache",
-        value_name = "NAME=PATH[:ro]",
+        value_name = "NAME=PATH[:ro][:cluster]",
         value_parser = parse_cache,
         requires = "server",
         conflicts_with = "image"
     )]
     pub caches: Vec<mcp::CacheSpec>,
+    /// A context file or directory whose contents key cluster cache NAME's snapshot; repeatable
+    #[arg(
+        long = "cache-key",
+        value_name = "NAME=PATH",
+        value_parser = parse_kv,
+        requires = "server",
+        conflicts_with = "image"
+    )]
+    pub cache_keys: Vec<(String, String)>,
     /// Point ccache in every RUN step at the server's shared cache; needs ccache 4.4 or later
     #[arg(long, requires = "server", conflicts_with = "image")]
     pub ccache: bool,
+    /// Run --script in this image instead of building the Dockerfile; the build is the image plus
+    /// --path as one new layer
+    #[arg(long, requires_all = ["server", "script", "path"], conflicts_with = "image")]
+    pub base: Option<String>,
+    /// With --base: the shell script, run with `sh -e` in --path
+    #[arg(long, requires = "base")]
+    pub script: Option<String>,
+    /// With --base: the absolute directory the context is placed at and the layer holds
+    #[arg(long, requires = "base")]
+    pub path: Option<String>,
     #[command(flatten)]
     pub server: ServerOpt,
 }
 
 fn parse_cache(raw: &str) -> Result<mcp::CacheSpec, String> {
-    let (name, rest) = raw
+    let (name, mut path) = raw
         .split_once('=')
-        .ok_or_else(|| format!("{raw:?} is not NAME=PATH[:ro]"))?;
-    let (path, read_only) = match rest.strip_suffix(":ro") {
-        Some(path) => (path, true),
-        None => (rest, false),
-    };
+        .ok_or_else(|| format!("{raw:?} is not NAME=PATH[:ro][:cluster]"))?;
+    let mut read_only = false;
+    let mut scope = crate::mcp::CacheScope::Pod;
+    loop {
+        if let Some(rest) = path.strip_suffix(":ro") {
+            read_only = true;
+            path = rest;
+        } else if let Some(rest) = path.strip_suffix(":cluster") {
+            scope = crate::mcp::CacheScope::Cluster;
+            path = rest;
+        } else {
+            break;
+        }
+    }
     Ok(mcp::CacheSpec {
         name: name.to_string(),
         path: path.to_string(),
         read_only,
+        scope,
+        key: Vec::new(),
     })
 }
 
@@ -330,14 +362,25 @@ impl BuildArgs {
                 _ => Err(anyhow!("--build-arg {kv:?} is not KEY=VALUE")),
             })
             .collect::<Result<BTreeMap<_, _>>>()?;
+        let mut caches = self.caches.clone();
+        for (name, path) in &self.cache_keys {
+            let cache = caches
+                .iter_mut()
+                .find(|c| &c.name == name)
+                .ok_or_else(|| anyhow!("--cache-key names {name}, which no --cache declares"))?;
+            cache.key.push(path.clone());
+        }
         Ok(BuildParams {
             context,
-            dockerfile: Some(self.dockerfile.clone()),
+            dockerfile: self.base.is_none().then(|| self.dockerfile.clone()),
             target: self.target.clone(),
             build_args,
             timeout_s: self.timeout,
-            caches: self.caches.clone(),
+            caches,
             ccache: self.ccache,
+            base: self.base.clone(),
+            script: self.script.clone(),
+            path: self.path.clone(),
         })
     }
 
@@ -560,6 +603,76 @@ mod tests {
         );
         assert!(refused(&["build", "--server", "/s", "--cache", "nopath"]).contains("NAME=PATH"));
         assert!(refused(&["build", "img:t", "--cache", "c=/c"]).contains("--cache"));
+    }
+
+    #[test]
+    fn a_server_build_keys_its_cluster_caches_by_context_paths() {
+        let Ok(Cmd::Build(args)) = parse(&[
+            "build",
+            "--server",
+            "/s",
+            "-c",
+            ".",
+            "--cache",
+            "deps=/src/vllm/.deps:cluster",
+            "--cache",
+            "pinned=/opt/pinned:ro:cluster",
+            "--cache",
+            "ccache=/root/.cache/ccache",
+            "--cache-key",
+            "deps=vllm/CMakeLists.txt",
+            "--cache-key",
+            "deps=vllm/cmake/external_projects",
+        ]) else {
+            panic!("a server build with cluster caches parses")
+        };
+        let params = args.params().unwrap();
+        let caches: Vec<(&str, &str, bool, crate::mcp::CacheScope, Vec<&str>)> = params
+            .caches
+            .iter()
+            .map(|c| {
+                let key = c.key.iter().map(String::as_str).collect();
+                (c.name.as_str(), c.path.as_str(), c.read_only, c.scope, key)
+            })
+            .collect();
+        assert_eq!(
+            caches,
+            [
+                (
+                    "deps",
+                    "/src/vllm/.deps",
+                    false,
+                    crate::mcp::CacheScope::Cluster,
+                    vec!["vllm/CMakeLists.txt", "vllm/cmake/external_projects"]
+                ),
+                (
+                    "pinned",
+                    "/opt/pinned",
+                    true,
+                    crate::mcp::CacheScope::Cluster,
+                    vec![]
+                ),
+                (
+                    "ccache",
+                    "/root/.cache/ccache",
+                    false,
+                    crate::mcp::CacheScope::Pod,
+                    vec![]
+                ),
+            ]
+        );
+        let Ok(Cmd::Build(stray)) = parse(&[
+            "build",
+            "--server",
+            "/s",
+            "-c",
+            ".",
+            "--cache-key",
+            "deps=vllm/cmake",
+        ]) else {
+            panic!("a stray --cache-key parses")
+        };
+        assert!(format!("{:#}", stray.params().unwrap_err()).contains("which no --cache declares"));
     }
 
     #[test]

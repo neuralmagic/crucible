@@ -35,7 +35,12 @@ pub struct Config {
     /// The image pull secrets a pod template may name, and the ones the server adds itself to a
     /// pod whose image is on their registries; none when empty.
     pub pull_secrets: Vec<PullSecret>,
+    /// The cluster's DNS domain, for the host an exposed workload's Service is reached at.
+    pub cluster_domain: String,
 }
+
+/// The DNS domain of a cluster that names none.
+pub const DEFAULT_CLUSTER_DOMAIN: &str = "cluster.local";
 
 /// An image pull secret in the served namespaces and the registries it pulls from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,6 +139,7 @@ impl Default for Config {
             hardware: Hardware::default(),
             namespaces: Vec::new(),
             pull_secrets: Vec::new(),
+            cluster_domain: DEFAULT_CLUSTER_DOMAIN.to_string(),
         }
     }
 }

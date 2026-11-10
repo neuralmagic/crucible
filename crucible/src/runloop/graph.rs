@@ -18,7 +18,7 @@ use crate::args::{Args, Paths, Prepared};
 
 use crate::agent;
 use crate::control;
-use crate::plan::admission::{Admission, Refusal};
+use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem};
 use crate::plan::exec::{ExecCfg, Substrate, TaskRunner, execute};
 use crate::plan::harness::CandidateEvent;
@@ -109,6 +109,7 @@ pub(crate) fn run_iteration(
     let mut task_events = Vec::new();
     let agent_args = runner.args.clone();
     let files = crate::plan::files::CapturedFiles::new(&runner.p.state);
+    let clock = crate::plan::admission::TaskClock::default();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -116,6 +117,7 @@ pub(crate) fn run_iteration(
             &crucible::inference::from_process_env()?,
         ),
         ExecCfg {
+            clock: Some(&clock),
             wall_clock: cx.time_left,
             files: Some(&files),
             ..ExecCfg::default()
@@ -129,6 +131,7 @@ pub(crate) fn run_iteration(
                 task,
                 result,
                 Some(&agent_args),
+                clock.secs(&task.name),
             ));
         },
     )?;
@@ -273,6 +276,7 @@ pub(crate) fn run_epilogue(
         kept.to_value(),
     )]);
     let mut task_events = Vec::new();
+    let clock = crate::plan::admission::TaskClock::default();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -280,6 +284,7 @@ pub(crate) fn run_epilogue(
             &crucible::inference::from_process_env()?,
         ),
         ExecCfg {
+            clock: Some(&clock),
             files: Some(&files),
             run_inputs: Some(&run_inputs),
             ..ExecCfg::default()
@@ -292,6 +297,7 @@ pub(crate) fn run_epilogue(
                 task,
                 result,
                 Some(args),
+                clock.secs(&task.name),
             ));
         },
     )?;
@@ -727,19 +733,24 @@ impl<'a> LoopTaskRunner<'a> {
 }
 
 impl TaskRunner for LoopTaskRunner<'_> {
+    fn prepare(&mut self) {
+        self.workflow_runner.prepare();
+    }
+
     fn run(
         &mut self,
         task: &Task,
         attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
+        let deadline = lane.and_then(Lane::deadline);
         match &task.task {
             TaskKind::Agent { .. }
             | TaskKind::Command { .. }
             | TaskKind::Evaluate { .. }
             | TaskKind::Route { .. }
-            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs, deadline),
+            | TaskKind::Report { .. } => self.workflow_runner.run(task, attempt, inputs, lane),
             TaskKind::Engine {
                 op: EngineOp::Propose,
                 ..
@@ -920,6 +931,7 @@ pub(crate) fn run_wide_tournament(
         fatal: None,
     };
     let mut task_events = Vec::new();
+    let clock = crate::plan::admission::TaskClock::default();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -927,6 +939,7 @@ pub(crate) fn run_wide_tournament(
             &crucible::inference::from_process_env()?,
         ),
         ExecCfg {
+            clock: Some(&clock),
             wall_clock: time_left,
             ..ExecCfg::default()
         },
@@ -938,6 +951,7 @@ pub(crate) fn run_wide_tournament(
                 task,
                 result,
                 Some(args),
+                clock.secs(&task.name),
             ));
         },
     )?;
@@ -1257,13 +1271,18 @@ impl WideRunner<'_> {
 }
 
 impl TaskRunner for WideRunner<'_> {
+    fn prepare(&mut self) {
+        self.args.compile_secret_rules();
+    }
+
     fn run(
         &mut self,
         task: &Task,
         _attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt {
+        let deadline = lane.and_then(Lane::deadline);
         match &task.task {
             TaskKind::Agent { prompt, .. } => {
                 // A batch of one (wide n=1) lands here instead of run_many.

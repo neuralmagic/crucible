@@ -61,8 +61,7 @@ check = command(
     name = "check",
     run = "./count.sh",
     depends_on = [poem],
-    revise = poem,
-    max_rounds = 2,
+    revise = send_back(poem, rounds = 2),
 )
 
 workflow(type = "playbook", tasks = [poem, check])
@@ -288,6 +287,37 @@ from upstream tasks. If a task had a secret, its output, files, and workspace ch
 go to the tasks after it. The capability disclosure lists each sandbox. At launch, the
 controller checks each sandbox image against the catalog.
 
+`command` and `evaluate` tasks run in the loop pod, not in a sandbox. `servers` in `[workflow]`
+names the run's MCP servers they reach, for example `servers = ["kueue"]`. Each task then gets
+`CRUCIBLE_TASK_SERVERS`, a JSON list of `name`, `url` and `token_file`. The token is the run's
+own, minted by the controller for that task and server, and the engine rewrites the file before
+it expires. The server checks each call as it checks an agent's. Only servers that run outside
+the loop pod can be named. Agent turns never get this variable. The capability disclosure lists
+the grant as `task-servers`.
+
+A Python task calls crucible-kueue with the `crucible_kueue` package. `AsyncClient` is for
+asyncio; `Client` has the same methods and blocks.
+
+```python
+import asyncio
+from crucible_kueue import AsyncClient
+
+async def main():
+    kueue = AsyncClient()
+    log = await kueue.run("gpu", job, grep="RESULT ")
+    async with kueue.serving("gpu", deployment, 8000) as url:
+        ...  # reach the workload at url, from this task or from another Job
+
+asyncio.run(main())
+```
+
+`run` submits a Job, waits for it to finish and answers its log; it raises when the Job fails.
+`serving` submits a Deployment, StatefulSet or LeaderWorkerSet with that port exposed, waits
+until it is ready, and deletes it and its Service on the way out. `follow_logs` yields a
+workload's log lines as they are written. Under them are the server's own tools as methods
+(`submit`, `wait`, `workload_status`, `workload_logs`, `workload_delete` and the rest), for
+anything the two do not cover. Cancelling a wait leaves the workload running.
+
 ## MCP servers
 
 With `openshell`, a pack can start MCP servers on the loop pod. Use them for tools that need
@@ -300,6 +330,7 @@ args = ["mcp"]
 env = { BUILDIT_NAMESPACE = "builds" }        # set on the server
 inherit = ["KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"]  # copied from the loop pod
 tools = ["build", "run", "logs"]              # passed as MCP_TOOLS
+log = "warn"                                  # its stderr lines crucible passes on (default)
 
 [agent]
 mcp = ["buildit"]                             # turns without a named sandbox
@@ -310,8 +341,13 @@ A turn can reach only the servers that its scope names. The scope is `[agent].mc
 configuration of the turn lists only those servers.
 
 Each server runs as a separate process on a separate port. Ports start at 8850 and follow key
-order. A server gets only these environment variables: `PATH`, `HOME`, its `env` and `inherit`
-names, `MCP_NAME`, `MCP_BIND`, `MCP_TOKENS_FILE`, and `MCP_TOOLS`. Every turn gets a new token
+order. A server gets only these environment variables: `PATH`, `HOME`, `NO_COLOR=1`, its `env`
+and `inherit` names, `MCP_NAME`, `MCP_BIND`, `MCP_TOKENS_FILE`, and `MCP_TOOLS`.
+
+The engine copies a server's stderr into its own log at the `log` level: `tracing` lines at that
+level or more severe, plus every line that is not a `tracing` line, such as a panic. The levels
+are `off`, `error`, `warn` (the default), `info`, `debug`, and `trace`. A server that fails to
+start reports its last 50 stderr lines whatever the level. Every turn gets a new token
 for each server. The engine writes the token to `MCP_TOKENS_FILE` with the sandbox and workdir
 of the turn ([format](crucible-contract.md#62-mcp-token-file-mcp_tokens_file)). The engine
 revokes the token when it deletes the sandbox. The server identifies the caller from the token
@@ -341,6 +377,58 @@ crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max
 
 A string parameter that sets `"multiline": True` takes its value in a text area on the control
 plane's launch, schedule and ask forms. The value is still one string.
+
+A string parameter can take its choices from a task's output instead of a written list:
+
+```python
+params = {
+    "release": {"type": "string", "required": True,
+                "choices_from": {"task": "release_options", "field": "releases"}},
+}
+```
+
+The task must be in the same workflow, unmapped, and promise the field in `emits` as a list.
+The control plane offers the list from the latest passing run of that task, and refuses a
+launch value outside it. Add `"allow_other": True` to accept other values too. Before the task
+has passed once, the field takes any value.
+
+Add `"keyed_by": "release"` to make the field an object of lists, one per value of the
+`release` parameter, so the form offers the list for the release entered. A parameter can also
+show a value greyed out in its empty input, the one the pack would choose itself:
+
+```python
+"target_branch": {"type": "string", "default": "",
+                  "placeholder_from": {"task": "release_options", "field": "branches",
+                                       "keyed_by": "target_release"}},
+```
+
+The field is an object from each release to one string. It is only shown, never submitted.
+
+The launch form offers the list as a select and says how old it is. With `allow_other`, the
+select ends in "Other…", which opens a text input.
+
+The task and everything it depends on must not depend on parameters, so they can run alone.
+The compiler checks this when the pack is compiled for authoring, registered, or refreshed, not
+at each launch, and names the task that does. It checks by compiling the source with
+placeholder values that satisfy each declaration (a choice, a number in range, a default where
+there is a pattern), so the source must also compile under those. Launch with `choices.refresh=true` and
+nothing else to run just those tasks and refresh the list. The launch form's "Refresh options"
+button does this; from the command line:
+
+```sh
+crucible plan run --manifest crucible.toml --param choices.refresh=true --max-cost 1 --max-time 10m
+```
+
+An optional parameter that sets `"enabled_by": "<bool param>"` is only taken while that boolean
+is true. The forms grey it out until then, and a launch that supplies it with the boolean false is
+refused before anything compiles:
+
+```python
+params = {
+    "override_branch": {"type": "bool", "default": False, "doc": "replace the branch picked from the release"},
+    "target_branch": {"type": "string", "default": "", "enabled_by": "override_branch"},
+}
+```
 
 Parameters go into prompts and skill arguments. They do not go into a command line. If you
 put a parameter into `run`, the compiler rejects the pack:

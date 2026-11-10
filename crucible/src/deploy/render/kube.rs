@@ -9,7 +9,6 @@ use crate::openshell::gateway::{
 };
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
-use crucible_contract::agent_servers::CacheWriters;
 use crucible_contract::driver_env::{BrokerEnv, SandboxDriverEnv};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
@@ -25,6 +24,11 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
+
+/// The loop pod's volume holding the SPIFFE Workload API socket.
+const LOOP_SPIFFE_VOLUME: &str = "spiffe-workload-api";
+/// The SPIFFE CSI driver, which serves the Workload API socket to a pod.
+const SPIFFE_CSI_DRIVER: &str = "csi.spiffe.io";
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -134,7 +138,7 @@ pub struct RenderOpts {
     pub clusters_file: Option<std::path::PathBuf>,
     /// The agent harness the loop runs, rendered as `--harness=<h>` into the wrapper's `crucible`
     /// invocation. `None` emits no flag, the loop keeps the manifest's `[agent].harness`.
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// The model the loop runs, rendered as `--model=<m>` into the wrapper's `crucible` invocation.
     /// `None` emits no flag, the loop derives the model from the resolved harness.
     pub model: Option<String>,
@@ -614,6 +618,43 @@ impl Renderer<'_> {
         })
     }
 
+    /// Echo each `state/session.jsonl` line into the pod log as it lands, numbered by its line
+    /// in the file, so a viewer on a spoke follows the session live. A start that does not resume
+    /// begins the file afresh first, so the numbering never runs over a truncation. Returns the
+    /// lines that start the echo and the lines that stop it once the engine has exited.
+    ///
+    /// ```text
+    /// read fd 3 ──> line? ──yes──> number it, print it
+    ///                 └──no (EOF)──> engine exited? ──yes──> done
+    ///                                     └──no──> sleep 0.2s, read again
+    /// ```
+    fn session_echo(&self) -> (String, String) {
+        let clear = if self.resumable() {
+            ""
+        } else {
+            "\n  rm -f \"$D/state/session.jsonl\""
+        };
+        let marker = crucible_contract::RUN_SESSION_ECHO_MARKER;
+        let max = crucible_contract::RUN_SESSION_ECHO_MAX;
+        let start = format!(
+            r#"{clear}
+  touch "$D/state/session.jsonl"
+  echo_done="${{TMPDIR:-/tmp}}/crucible-session-echo.$$"; rm -f "$echo_done"
+  {{ exec 3< "$D/state/session.jsonl"; i=0; part=
+    echo_line() {{ i=$((i+1)); [ ${{#1}} -le {max} ] && printf '%s%s %s\n' '{marker}' "$i" "$1"; }}
+    while :; do
+      if IFS= read -r l <&3; then echo_line "$part$l"; part=
+      else part="$part$l"; [ -e "$echo_done" ] && break; sleep 0.2; fi
+    done
+    [ -n "$part" ] && echo_line "$part"; }} &
+  echo_loop=$!"#
+        );
+        let stop = r#"
+  touch "$echo_done"; wait "$echo_loop"; rm -f "$echo_done""#
+            .to_string();
+        (start, stop)
+    }
+
     fn resume_flag(&self) -> &'static str {
         if self.resumable() {
             r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
@@ -846,8 +887,26 @@ impl Renderer<'_> {
     /// engine names only what it itself consumes (`BROKER_*` it reads, forge's `FORGE_*`, the openshell
     /// backend's runtime, mount-path consts); everything domain/environment-specific flows through the
     /// profile's + `[deploy]`'s generic maps, so no domain or Vertex name is baked into the engine.
+    /// The directory the loop pod mounts the SPIFFE Workload API at, when the profile says the
+    /// cluster gives loop pods an SVID.
+    fn loop_spiffe_dir(&self) -> Option<String> {
+        if !self.profile.cluster.loop_svid {
+            return None;
+        }
+        Path::new(self.profile.cluster.spiffe_socket())
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+    }
+
     fn env(&self) -> Result<Vec<core::EnvVar>> {
         let mut env = Vec::new();
+        if self.profile.cluster.loop_svid {
+            env.push(core::EnvVar {
+                name: crucible_contract::task_servers::ENV_LOOP_SPIFFE_SOCKET.to_string(),
+                value: Some(self.profile.cluster.spiffe_socket().to_string()),
+                ..Default::default()
+            });
+        }
 
         // Generic pod env from secrets (e.g. the backend's Vertex ADC), names are the profile's.
         env.extend(secret_env_vars(self.profile));
@@ -1048,15 +1107,16 @@ impl Renderer<'_> {
                 .map(|v| format!(" --variant {v}"))
                 .unwrap_or_default();
             let (rerun_setup, resume_flag) = self.playbook_resume(pb)?;
+            let (echo_setup, echo_stop) = self.session_echo();
             let invalid_verdict = crate::plan::INVALID_VERDICT_EXIT;
             return Ok(format!(
                 r#"D={domain_dir}
 mkdir -p "$D/state"
 n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$D/state/starts"
-if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}
+if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}{echo_setup}
   crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{variant_flag}{param_flags}{resume_flag}
-  rc=$?
+  rc=$?{echo_stop}
 else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
   rc=0
@@ -1124,12 +1184,13 @@ exit $rc
         }
         mounts.push(ro("kube-api", KUBE_API_DIR, None));
         mounts.push(ro("kubeconfig", KUBECONFIG_DIR, None));
+        if let Some(dir) = self.loop_spiffe_dir() {
+            mounts.push(ro(LOOP_SPIFFE_VOLUME, &dir, None));
+        }
         if self.profile.secrets.push_authfile.is_some() {
             mounts.push(ro("quay-push", PUSH_AUTHFILE_DIR, None));
         }
-        if buildit_cache::configured(self.profile)
-            .is_some_and(|(_, c)| c.writers != CacheWriters::None)
-        {
+        if buildit_cache::configured(self.profile).is_some() {
             mounts.push(ro("buildit-cache-token", buildit_cache::TOKEN_DIR, None));
         }
         if self.spoke.is_some() {
@@ -1185,6 +1246,18 @@ exit $rc
                 name: "quay-auth".to_string(),
                 secret: Some(core::SecretVolumeSource {
                     secret_name: Some(secret.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
+        if self.loop_spiffe_dir().is_some() {
+            volumes.push(core::Volume {
+                name: LOOP_SPIFFE_VOLUME.to_string(),
+                csi: Some(core::CSIVolumeSource {
+                    driver: SPIFFE_CSI_DRIVER.to_string(),
+                    read_only: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1248,9 +1321,7 @@ exit $rc
             });
         }
 
-        if let Some((_, cache)) = buildit_cache::configured(self.profile)
-            && cache.writers != CacheWriters::None
-        {
+        if let Some((_, cache)) = buildit_cache::configured(self.profile) {
             volumes.push(core::Volume {
                 name: "buildit-cache-token".to_string(),
                 secret: Some(core::SecretVolumeSource {
@@ -1863,17 +1934,20 @@ exit $rc
         objects
     }
 
-    /// With `[buildit]`, the loop account's rights over buildit's builder pods in buildit's own
-    /// namespace: create, watch and delete them, exec into them, and read their logs. None in the
-    /// loop namespace, where they would reach every run's loop pod and Secret.
+    /// With `[buildit]`, the loop account's rights over buildit's builds in buildit's own
+    /// namespace: create, watch, cancel and delete their Jobs, create each Job's inputs Secret,
+    /// and watch and read the logs of their pods. None in the loop namespace, where they would
+    /// reach every run's loop pod and Secret. Beside them, the namespace's default account, which
+    /// build pods run as, pushes to the cluster's registry, and every service account pulls the
+    /// builds, so workloads anywhere run them.
     fn buildit_rbac(&self) -> Vec<SandboxRbacObject> {
         let Some(buildit) = &self.profile.buildit else {
             return Vec::new();
         };
         let cluster = &self.profile.cluster;
         let name = format!("{}-buildit", cluster.service_account);
-        let rule = |resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
-            api_groups: Some(vec![String::new()]),
+        let rule = |group: &str, resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
+            api_groups: Some(vec![group.to_string()]),
             resources: Some(resources.iter().map(|r| r.to_string()).collect()),
             verbs: verbs.iter().map(|v| v.to_string()).collect(),
             ..Default::default()
@@ -1885,9 +1959,14 @@ exit $rc
                 ..Default::default()
             },
             rules: Some(vec![
-                rule(&["pods"], &["create", "delete", "get", "list", "watch"]),
-                rule(&["pods/exec"], &["create", "get"]),
-                rule(&["pods/log"], &["get"]),
+                rule(
+                    "batch",
+                    &["jobs"],
+                    &["create", "delete", "get", "list", "patch", "watch"],
+                ),
+                rule("", &["secrets"], &["create"]),
+                rule("", &["pods"], &["get", "list", "watch"]),
+                rule("", &["pods/log"], &["get"]),
             ]),
         };
         let binding = role_binding(
@@ -1898,14 +1977,42 @@ exit $rc
             cluster.service_account.clone(),
             cluster.loop_namespace.clone(),
         );
+        let pushers = role_binding(
+            format!("{name}-image-builders"),
+            buildit.namespace.to_string(),
+            "ClusterRole",
+            "system:image-builder",
+            "default".to_string(),
+            buildit.namespace.to_string(),
+        );
+        let pullers = rbac::RoleBinding {
+            metadata: ObjectMeta {
+                name: Some(format!("{name}-image-pullers")),
+                namespace: Some(buildit.namespace.to_string()),
+                ..Default::default()
+            },
+            role_ref: rbac::RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "ClusterRole".to_string(),
+                name: "system:image-puller".to_string(),
+            },
+            subjects: Some(vec![rbac::Subject {
+                api_group: Some("rbac.authorization.k8s.io".to_string()),
+                kind: "Group".to_string(),
+                name: "system:serviceaccounts".to_string(),
+                ..Default::default()
+            }]),
+        };
         vec![
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(binding),
+            SandboxRbacObject::RoleBinding(pushers),
+            SandboxRbacObject::RoleBinding(pullers),
         ]
     }
 
     /// With `[buildit]`, the builder pods' NetworkPolicy in buildit's namespace: no ingress, and
-    /// egress only to DNS and `[buildit] egress`.
+    /// egress only to DNS, the cluster's image registry, and `[buildit] egress`.
     fn builder_netpol(&self) -> Option<networking::NetworkPolicy> {
         let buildit = self.profile.buildit.as_ref()?;
         let unfenced = buildit.unfenced_egress();
@@ -1929,6 +2036,19 @@ exit $rc
                     .collect(),
             ),
             to: None,
+        };
+        let registry = networking::NetworkPolicyEgressRule {
+            ports: Some(vec![port(REGISTRY_PORT, "TCP")]),
+            to: Some(vec![networking::NetworkPolicyPeer {
+                namespace_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "kubernetes.io/metadata.name".to_string(),
+                        REGISTRY_NAMESPACE.to_string(),
+                    )])),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }]),
         };
         let allowed = buildit
             .egress
@@ -1960,7 +2080,8 @@ exit $rc
                 policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
                 ingress: None,
                 egress: Some(
-                    std::iter::once(dns)
+                    [dns, registry]
+                        .into_iter()
                         .chain(allowed)
                         .chain(buildit_cache::configured(self.profile).map(|_| {
                             buildit_cache::builder_egress(&self.profile.cluster.loop_namespace)
@@ -2089,6 +2210,9 @@ pub const SPIRE_READER: &str = "crucible-spire-reader";
 
 /// The builder pods' NetworkPolicy in `[buildit] namespace`.
 pub const BUILDER_NETPOL: &str = "buildit-builders";
+/// OpenShift's internal registry, which build pods push to and the kubelet pulls run images from.
+const REGISTRY_NAMESPACE: &str = "openshift-image-registry";
+const REGISTRY_PORT: u16 = 5000;
 
 /// The suffix of the builder pods' admission policy and binding, after `[buildit] namespace`.
 pub const BUILDER_ADMISSION: &str = "buildit-builders";
@@ -2261,7 +2385,7 @@ fn driver_env(profile: &DeployProfile, sandbox_image: Option<&str>) -> Result<Sa
 
 /// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
 /// the string the wrapper emits is by construction the one the in-pod CLI parses back.
-fn harness_flag(harness: Option<crate::manifest::Harness>, sep: char) -> String {
+fn harness_flag(harness: Option<crate::knobs::Harness>, sep: char) -> String {
     use clap::ValueEnum as _;
     harness
         .and_then(|h| h.to_possible_value())
@@ -2508,7 +2632,7 @@ mod tests {
         let manifest = dir.join("crucible.delta.toml");
         let profile = DeployProfile::load(&fixture_profile("delta")).expect("profile parses");
 
-        let render_with = |harness: Option<crate::manifest::Harness>, model: Option<&str>| {
+        let render_with = |harness: Option<crate::knobs::Harness>, model: Option<&str>| {
             let composite = CompositeManifest::load(&manifest).expect("composite parses");
             let input = RenderInput::from_composite(&composite, &dir).expect("render input");
             render(
@@ -2532,10 +2656,7 @@ mod tests {
             .expect("render")
         };
 
-        let set = render_with(
-            Some(crate::manifest::Harness::OpenCode),
-            Some("qwen-3-8-27b"),
-        );
+        let set = render_with(Some(crate::knobs::Harness::OpenCode), Some("qwen-3-8-27b"));
         assert!(set.contains("--harness=opencode"), "{set}");
         assert!(set.contains("--model=qwen-3-8-27b"), "{set}");
 
@@ -5153,10 +5274,34 @@ mod tests {
         assert_eq!(
             role["rules"],
             serde_json::json!([
-                {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]},
-                {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create", "get"]},
+                {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": ["create", "delete", "get", "list", "patch", "watch"]},
+                {"apiGroups": [""], "resources": ["secrets"], "verbs": ["create"]},
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "watch"]},
                 {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
             ])
+        );
+        let images = |suffix: &str| {
+            docs.iter()
+                .find(|d| {
+                    d["kind"] == "RoleBinding"
+                        && d["metadata"]["name"]
+                            == format!("autoresearch-publisher-buildit-image-{suffix}").as_str()
+                })
+                .unwrap_or_else(|| panic!("the image {suffix} binding: {yaml}"))
+        };
+        assert_eq!(
+            images("builders")["roleRef"]["name"],
+            "system:image-builder"
+        );
+        assert_eq!(images("builders")["subjects"][0]["name"], "default");
+        assert_eq!(
+            images("builders")["subjects"][0]["namespace"],
+            "crucible-builds"
+        );
+        assert_eq!(images("pullers")["roleRef"]["name"], "system:image-puller");
+        assert_eq!(
+            images("pullers")["subjects"][0]["name"],
+            "system:serviceaccounts"
         );
         let binding = named("RoleBinding");
         assert_eq!(binding["metadata"]["namespace"], "crucible-builds");
@@ -5187,11 +5332,21 @@ mod tests {
         let egress = builders["spec"]["egress"].as_array().unwrap();
         assert_eq!(egress[0].get("to"), None, "DNS anywhere");
         assert_eq!(
-            egress[1]["to"][0]["ipBlock"]["cidr"], "0.0.0.0/0",
+            egress[1],
+            serde_json::json!({
+                "ports": [{"port": 5000, "protocol": "TCP"}],
+                "to": [{"namespaceSelector": {"matchLabels": {
+                    "kubernetes.io/metadata.name": "openshift-image-registry"
+                }}}]
+            }),
+            "the cluster's image registry, which builds push to"
+        );
+        assert_eq!(
+            egress[2]["to"][0]["ipBlock"]["cidr"], "0.0.0.0/0",
             "by default, TCP 443 anywhere"
         );
         assert_eq!(
-            egress[1]["ports"],
+            egress[2]["ports"],
             serde_json::json!([{"port": 443, "protocol": "TCP"}])
         );
         let narrowed = render_k8s_manifest(
@@ -5206,10 +5361,10 @@ mod tests {
             .find(|d| d["metadata"]["name"] == BUILDER_NETPOL)
             .unwrap();
         assert_eq!(
-            narrowed["spec"]["egress"][1]["to"][0]["ipBlock"],
+            narrowed["spec"]["egress"][2]["to"][0]["ipBlock"],
             serde_json::json!({"cidr": "203.0.113.0/24", "except": ["203.0.113.8/29"]})
         );
-        assert_eq!(narrowed["spec"]["egress"].as_array().unwrap().len(), 2);
+        assert_eq!(narrowed["spec"]["egress"].as_array().unwrap().len(), 3);
         let netpol = yaml
             .split("\n---\n")
             .find(|d| d.contains("kind: NetworkPolicy"))
@@ -5224,6 +5379,59 @@ mod tests {
     /// With `[buildit.cache]` and any writers, the loop pod mounts the token Secret, optional since a
     /// cluster without the cache has none; builder pods may reach the cache either way. A run
     /// learns the cache itself from its buildit site, not the pod.
+    #[test]
+    fn a_cluster_that_gives_loop_pods_an_svid_mounts_the_workload_api() {
+        let manifest = k8s_manifest();
+        let pod = |profile: &DeployProfile| -> serde_json::Value {
+            let yaml = render_k8s_manifest(&manifest, profile);
+            serde_norway::Deserializer::from_str(&yaml)
+                .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+                .find(|d| d["kind"] == "Pod")
+                .unwrap()
+        };
+        let named = |items: &serde_json::Value, name: &str| -> Option<serde_json::Value> {
+            items
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["name"] == name)
+                .cloned()
+        };
+        let socket_env = crucible_contract::task_servers::ENV_LOOP_SPIFFE_SOCKET;
+
+        let mut profile = k8s_profile("");
+        let plain = pod(&profile);
+        assert!(named(&plain["spec"]["volumes"], "spiffe-workload-api").is_none());
+        assert!(named(&plain["spec"]["containers"][0]["env"], socket_env).is_none());
+
+        profile.cluster.loop_svid = true;
+        let with = pod(&profile);
+        assert_eq!(
+            named(&with["spec"]["volumes"], "spiffe-workload-api").unwrap()["csi"],
+            serde_json::json!({"driver": "csi.spiffe.io", "readOnly": true})
+        );
+        let container = &with["spec"]["containers"][0];
+        let mount = named(&container["volumeMounts"], "spiffe-workload-api").unwrap();
+        assert_eq!(mount["mountPath"], "/spiffe-workload-api");
+        assert_eq!(mount["readOnly"], true);
+        assert_eq!(
+            named(&container["env"], socket_env).unwrap()["value"],
+            "/spiffe-workload-api/spire-agent.sock"
+        );
+
+        profile.cluster.sandbox_spiffe_socket = Some("/run/spire/agent.sock".into());
+        let moved = pod(&profile);
+        let container = &moved["spec"]["containers"][0];
+        assert_eq!(
+            named(&container["volumeMounts"], "spiffe-workload-api").unwrap()["mountPath"],
+            "/run/spire"
+        );
+        assert_eq!(
+            named(&container["env"], socket_env).unwrap()["value"],
+            "/run/spire/agent.sock"
+        );
+    }
+
     #[test]
     fn the_shared_buildit_cache_s_token_and_port_reach_the_loop_and_builder_pods() {
         let manifest = k8s_manifest();
@@ -5304,7 +5512,10 @@ mod tests {
 
         let reads =
             docs("[buildit.cache]\ntoken_secret = \"buildit-cache-token\"\nwriters = \"none\"\n");
-        assert!(!mounted(&reads), "a read-only cache mounts no token");
+        assert!(
+            mounted(&reads),
+            "buildit uploads contexts and archives results even when builds only read"
+        );
         assert_eq!(
             builder_egress(&reads),
             egress,
@@ -5769,7 +5980,7 @@ mod tests {
     #[test]
     fn playbook_wrapper_emits_harness_and_model_flags_when_set() {
         let manifest = playbook_manifest();
-        let render_with = |harness: Option<crate::manifest::Harness>, model: Option<&str>| {
+        let render_with = |harness: Option<crate::knobs::Harness>, model: Option<&str>| {
             let input = RenderInput::from_playbook_manifest(&manifest, "alpha");
             render(
                 input,
@@ -5791,7 +6002,7 @@ mod tests {
             )
             .expect("render")
         };
-        let set = render_with(Some(crate::manifest::Harness::Codex), Some("gpt-5.6-luna"));
+        let set = render_with(Some(crate::knobs::Harness::Codex), Some("gpt-5.6-luna"));
         assert!(
             set.contains(
                 "--compute-driver=kubernetes --harness=codex --model=gpt-5.6-luna --param"
@@ -6162,19 +6373,24 @@ mod tests {
 
     impl Starts {
         fn new(yaml: &str) -> Self {
+            Self::with_engine(
+                yaml,
+                "#!/bin/sh\necho \"$*\" >> \"$FAKE_DIR/calls\"\necho row >> \"$FAKE_DIR/state/session.jsonl\"\nexit \"$FAKE_RC\"\n",
+            )
+        }
+
+        /// The wrapper with `engine` as its `crucible`.
+        fn with_engine(yaml: &str, engine: &str) -> Self {
             let tmp = Scratch::new("wrapper");
             let domain = tmp.path().join("domain");
             let bin = tmp.path().join("bin");
             std::fs::create_dir_all(&domain).expect("mkdir domain");
             std::fs::create_dir_all(&bin).expect("mkdir bin");
             let fake = bin.join("crucible");
-            std::fs::write(
-                &fake,
-                "#!/bin/sh\necho \"$*\" >> \"$FAKE_DIR/calls\"\necho row >> \"$FAKE_DIR/state/session.jsonl\"\nexit \"$FAKE_RC\"\n",
-            )
-            .expect("fake crucible");
+            std::fs::write(&fake, engine).expect("fake crucible");
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
             let wrapper = wrapper_of(yaml);
             let (first, rest) = wrapper.split_once('\n').expect("a D= line");
             assert!(first.starts_with("D="), "{wrapper}");
@@ -6190,7 +6406,12 @@ mod tests {
         }
 
         fn start(&self, rc: i32) -> Option<i32> {
-            std::process::Command::new("sh")
+            self.run(rc).0
+        }
+
+        /// One start's exit code and stdout.
+        fn run(&self, rc: i32) -> (Option<i32>, String) {
+            let out = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&self.script)
                 .env("PATH", &self.path)
@@ -6198,9 +6419,11 @@ mod tests {
                 .env("FAKE_DIR", &self.domain)
                 .env("CRUCIBLE_INGEST_URL", "https://ingest.example")
                 .output()
-                .expect("run the wrapper")
-                .status
-                .code()
+                .expect("run the wrapper");
+            (
+                out.status.code(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
         }
 
         fn calls(&self) -> Vec<String> {
@@ -6253,6 +6476,59 @@ mod tests {
             "an engine error is still an error"
         );
         assert_eq!(starts.start(137), Some(137), "a killed engine restarts");
+    }
+
+    /// The echoed lines of one start's stdout, as `(index, line)`.
+    fn echoed(stdout: &str) -> Vec<(u64, String)> {
+        stdout
+            .lines()
+            .filter_map(crucible_contract::parse_session_echo)
+            .map(|(seq, line)| (seq, line.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_playbook_wrapper_echoes_session_lines_by_their_index_in_the_file() {
+        let long = "x".repeat(crucible_contract::RUN_SESSION_ECHO_MAX + 1);
+        let starts = Starts::with_engine(
+            &render_playbook(&k8s_profile(""), playbook_launch()),
+            &format!(
+                "#!/bin/sh\ns=\"$FAKE_DIR/state/session.jsonl\"\n\
+                 echo '{{\"n\":1}}' >> \"$s\"\nsleep 1\n\
+                 printf '{{\"n\":' >> \"$s\"\nsleep 1\necho '2}}' >> \"$s\"\necho '{long}' >> \"$s\"\necho 'a b  c' >> \"$s\"\n\
+                 sleep 1\nexit \"$FAKE_RC\"\n"
+            ),
+        );
+        std::fs::create_dir_all(starts.domain.join("state")).expect("state dir");
+        std::fs::write(starts.domain.join("state/session.jsonl"), "stale\n").expect("stale log");
+
+        let (rc, stdout) = starts.run(0);
+        assert_eq!(rc, Some(0));
+        assert_eq!(
+            echoed(&stdout),
+            vec![
+                (1, r#"{"n":1}"#.to_string()),
+                (2, r#"{"n":2}"#.to_string()),
+                (4, "a b  c".to_string()),
+            ],
+            "a start that cannot resume drops the old log, a line written in two pieces is echoed \
+             whole, and an over-long line keeps its index without being echoed: {stdout}"
+        );
+    }
+
+    #[test]
+    fn a_resumed_playbook_echoes_the_lines_before_it_under_their_own_indices() {
+        let starts = Starts::new(&render_playbook(
+            &k8s_profile(r#"state_pvc = "shared""#),
+            playbook_launch(),
+        ));
+        let (_, first) = starts.run(137);
+        assert_eq!(echoed(&first), vec![(1, "row".to_string())]);
+        let (_, second) = starts.run(0);
+        assert_eq!(
+            echoed(&second),
+            vec![(1, "row".to_string()), (2, "row".to_string())]
+        );
     }
 
     #[test]

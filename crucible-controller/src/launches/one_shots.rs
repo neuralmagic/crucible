@@ -56,7 +56,6 @@ pub(crate) struct OneShot {
     pub fired_at: Option<String>,
     pub created_by: Option<String>,
     pub owner_principal: Option<String>,
-    pub owner_signin_required: bool,
     pub dispatch_target: Option<String>,
     pub agent_provider: Option<String>,
     pub agent_model: Option<String>,
@@ -112,7 +111,6 @@ fn decode(row: OneShotRow) -> Result<OneShot> {
         fired_at: row.fired_at,
         created_by: c.created_by,
         owner_principal: c.owner_principal,
-        owner_signin_required: c.owner_signin_required,
         dispatch_target: c.dispatch_target,
         agent_provider: c.agent_provider,
         agent_model: c.agent_model,
@@ -358,9 +356,8 @@ pub(crate) async fn fire_due(db: &Db, now: &str, cap: usize) -> Result<Vec<Strin
         .with_context(|| format!("fire_due: now {now:?}"))?;
     let cfg = SweepCfg {
         auto_disable_after: 1,
-        owner_ttl: std::time::Duration::from_secs(3600),
     };
-    let mut keys = standing::sweep(db, &OneShotTrigger, cfg, now, None, None, &[])
+    let mut keys = standing::sweep(db, &OneShotTrigger, cfg, now, None, &[])
         .await?
         .fired;
     keys.truncate(cap);
@@ -636,16 +633,9 @@ mod tests {
         defer(&pool, "2020-01-02T00:00:00Z").await;
 
         let queue = WorkQueue::new();
-        standing::TriggerSweep::new(
-            db,
-            vec![Arc::new(OneShotTrigger)],
-            5,
-            std::time::Duration::from_secs(3600),
-            None,
-            None,
-        )
-        .poll(queue.clone())
-        .await?;
+        standing::TriggerSweep::new(db, vec![Arc::new(OneShotTrigger)], 5, None)
+            .poll(queue.clone())
+            .await?;
 
         let keys = queue.pending().urgent;
         assert_eq!(keys.len(), 2, "{keys:?}");
@@ -700,14 +690,7 @@ mod tests {
         let held = defer(&pool, "2020-01-01T00:00:00Z").await;
         defer(&pool, "2020-01-02T00:00:00Z").await;
         defer(&pool, "2020-01-03T00:00:00Z").await;
-        let sweep = standing::TriggerSweep::new(
-            db,
-            vec![Arc::new(OneShotTrigger)],
-            5,
-            std::time::Duration::from_secs(3600),
-            None,
-            None,
-        );
+        let sweep = standing::TriggerSweep::new(db, vec![Arc::new(OneShotTrigger)], 5, None);
 
         let queue = WorkQueue::new();
         let pass = DueSource::pass(&sweep, queue.clone(), vec![held.id.clone()]).await?;

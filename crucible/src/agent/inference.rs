@@ -7,7 +7,7 @@
 //! the gateway's metadata emulator for Claude (and for opencode and pi, which speak Vertex through
 //! their own provider tables), the selected `[agent.codex]` auth for Codex.
 
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use anyhow::{Context, Result};
 use crucible::harness::ApiFamily;
 use crucible::openshell::endpoint::Endpoint;

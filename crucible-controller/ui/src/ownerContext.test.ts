@@ -22,7 +22,6 @@ function whoami(overrides: Partial<Whoami> = {}): Whoami {
     admin: false,
     role: 'viewer',
     groups: ['/groups/x', '/groups/x', ' '],
-    downgraded: false,
     proves_groups: true,
     entitlements: [],
     features: { agent_tools: false, identities: false },

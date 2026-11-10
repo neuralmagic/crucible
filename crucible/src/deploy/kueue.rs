@@ -123,6 +123,10 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) 
             yaml(&workload_binding(cfg, namespace)),
         )?;
     }
+    push("caller ClusterRole", yaml(&caller_cluster_role(cfg)))?;
+    for namespace in &cfg.shared_namespaces {
+        push("caller RoleBinding", yaml(&caller_binding(cfg, namespace)))?;
+    }
     Ok(docs.join("---\n"))
 }
 
@@ -244,6 +248,13 @@ fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result
     }
     for secret in &cfg.pull_secrets {
         args.extend(["--pull-secret".to_string(), secret.clone()]);
+    }
+    args.extend(["--cluster-domain".to_string(), cfg.cluster_domain.clone()]);
+    if cfg.allowlist_profile != crate::deploy::profile::KueueAllowlist::Strict {
+        args.extend([
+            "--allowlist-profile".to_string(),
+            cfg.allowlist_profile.as_str().to_string(),
+        ]);
     }
     if jwks.scheme() == "http" {
         args.push("--insecure-jwks-http".to_string());
@@ -423,6 +434,7 @@ fn workload_cluster_role() -> rbac::ClusterRole {
             rule(&["jobset.x-k8s.io"], &["jobsets"], WORKLOAD_VERBS),
             rule(&["kubeflow.org"], &["pytorchjobs"], WORKLOAD_VERBS),
             rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
+            rule(&[""], &["services"], &["get", "create"]),
         ]),
         ..Default::default()
     }
@@ -433,6 +445,73 @@ fn workload_binding(cfg: &KueueCfg, namespace: &KubeName) -> rbac::RoleBinding {
         metadata: meta(format!("{NAME}-workloads"), Some(namespace.as_str())),
         role_ref: role_ref("ClusterRole", &format!("{NAME}-workloads")),
         subjects: Some(vec![server_subject(cfg)]),
+    }
+}
+
+/// The group every run's token carries.
+const RUNS_GROUP: &str = "crucible:runs";
+
+/// Every verb crucible-kueue's access checks can ask of a caller, with Secret reads limited to
+/// the profile's pull secrets.
+fn caller_cluster_role(cfg: &KueueCfg) -> rbac::ClusterRole {
+    let mut rules = vec![
+        rule(&[KUEUE_GROUP], &["localqueues"], &["get", "list", "use"]),
+        rule(&[KUEUE_GROUP], &["workloads"], &["get", "list", "patch"]),
+        rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
+        rule(&[""], &["persistentvolumeclaims"], &["get"]),
+        rule(&[""], &["services"], &["create"]),
+    ];
+    for kind in SERVED_KINDS {
+        let plural = kind.1;
+        rules.push(rule(&[kind.0], &[plural], CALLER_KIND_VERBS));
+        rules.push(rule(&[kind.0], &[&format!("{plural}/scale")], &["update"]));
+    }
+    let mut readable: Vec<String> = cfg
+        .pull_secrets
+        .iter()
+        .map(|entry| entry.split('=').next().unwrap_or_default().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    if cfg.allowlist_profile == crate::deploy::profile::KueueAllowlist::Tenant {
+        readable.extend(cfg.secrets.iter().map(|name| name.to_string()));
+    }
+    readable.dedup();
+    if !readable.is_empty() {
+        rules.push(rbac::PolicyRule {
+            resource_names: Some(readable),
+            ..rule(&[""], &["secrets"], &["get"])
+        });
+    }
+    rbac::ClusterRole {
+        metadata: meta(format!("{NAME}-caller"), None),
+        rules: Some(rules),
+        ..Default::default()
+    }
+}
+
+/// The (group, plural) of every kind crucible-kueue serves.
+const SERVED_KINDS: &[(&str, &str)] = &[
+    ("batch", "jobs"),
+    ("ray.io", "rayjobs"),
+    ("leaderworkerset.x-k8s.io", "leaderworkersets"),
+    ("apps", "deployments"),
+    ("apps", "statefulsets"),
+    ("jobset.x-k8s.io", "jobsets"),
+    ("kubeflow.org", "pytorchjobs"),
+];
+
+const CALLER_KIND_VERBS: &[&str] = &["create", "get", "list", "patch", "update", "delete"];
+
+/// The caller role bound to Group `crucible:runs` in `namespace`.
+fn caller_binding(_cfg: &KueueCfg, namespace: &KubeName) -> rbac::RoleBinding {
+    rbac::RoleBinding {
+        metadata: meta(format!("{NAME}-runs"), Some(namespace.as_str())),
+        role_ref: role_ref("ClusterRole", &format!("{NAME}-caller")),
+        subjects: Some(vec![rbac::Subject {
+            kind: "Group".to_string(),
+            name: RUNS_GROUP.to_string(),
+            ..Default::default()
+        }]),
     }
 }
 
@@ -518,6 +597,8 @@ mod tests {
                 "ocp",
                 "--namespace",
                 "crucible-kueue-e2e",
+                "--cluster-domain",
+                "cluster.local",
                 "--insecure-jwks-http",
             ]
         );
@@ -851,6 +932,241 @@ mod tests {
         assert!(toml::from_str::<DeployProfile>(&empty).is_err());
     }
 
+    /// `strict` is the server's own default and takes no flag; `tenant` is passed, and only it
+    /// lets runs read the Secrets the profile names.
+    #[test]
+    fn the_allowlist_profile_decides_the_flag_and_which_secrets_runs_read() {
+        let secrets = |rendered: &[serde_json::Value]| -> Option<serde_json::Value> {
+            find(rendered, "ClusterRole", "crucible-kueue-caller")["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["resources"] == serde_json::json!(["secrets"]))
+                .map(|r| r["resourceNames"].clone())
+        };
+        let with = |tables: &str| PROFILE.replace("[kueue]", &format!("[kueue]\n{tables}"));
+
+        let strict = docs(&with(
+            "pull_secrets = [\"quay-pull\"]\nsecrets = [\"hf-token\"]",
+        ));
+        assert!(!args(&strict).iter().any(|a| a == "--allowlist-profile"));
+        assert_eq!(secrets(&strict), Some(serde_json::json!(["quay-pull"])));
+
+        let tenant = docs(&with(
+            "allowlist_profile = \"tenant\"\npull_secrets = [\"quay-pull\"]\nsecrets = [\"hf-token\"]",
+        ));
+        let flags = args(&tenant);
+        assert!(
+            flags
+                .windows(2)
+                .any(|w| w == ["--allowlist-profile", "tenant"]),
+            "{flags:?}"
+        );
+        assert_eq!(
+            secrets(&tenant),
+            Some(serde_json::json!(["quay-pull", "hf-token"]))
+        );
+
+        let none = docs(&with("allowlist_profile = \"tenant\""));
+        assert_eq!(secrets(&none), None, "tenant alone reads no Secret");
+        assert!(
+            toml::from_str::<DeployProfile>(&with("allowlist_profile = \"open\"")).is_err(),
+            "only the two named profiles"
+        );
+    }
+
+    /// The caller role is bound to `crucible:runs` in exactly the shared namespaces, and reads
+    /// only the profile's pull secrets.
+    #[test]
+    fn the_caller_role_is_bound_to_runs_only_in_the_shared_namespaces() {
+        let shared = PROFILE.replace(
+            "[kueue]",
+            "[kueue]\nshared_namespaces = [\"crucible-kueue-e2e\"]\npull_secrets = [\"quay-pull=quay.io/org\"]",
+        );
+        let rendered = docs(&shared);
+        let role = find(&rendered, "ClusterRole", "crucible-kueue-caller");
+        let rules = role["rules"].as_array().unwrap();
+        assert!(
+            rules.contains(&serde_json::json!({
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get"],
+                "resourceNames": ["quay-pull"],
+            })),
+            "{rules:?}"
+        );
+        let binding = find(&rendered, "RoleBinding", "crucible-kueue-runs");
+        assert_eq!(binding["metadata"]["namespace"], "crucible-kueue-e2e");
+        assert_eq!(binding["roleRef"]["name"], "crucible-kueue-caller");
+        assert_eq!(
+            binding["subjects"],
+            serde_json::json!([{"kind": "Group", "name": "crucible:runs"}])
+        );
+        let plain = docs(PROFILE);
+        assert!(
+            !plain
+                .iter()
+                .any(|d| d["kind"] == "RoleBinding"
+                    && d["metadata"]["name"] == "crucible-kueue-runs")
+        );
+    }
+
+    /// A shared namespace that is not a workload namespace refuses the profile load.
+    #[test]
+    fn a_shared_namespace_must_be_a_workload_namespace() {
+        let stray = PROFILE.replace("[kueue]", "[kueue]\nshared_namespace = \"elsewhere\"");
+        let err = toml::from_str::<DeployProfile>(&stray)
+            .expect("parses")
+            .check_shared_namespaces()
+            .unwrap_err();
+        assert_eq!(
+            err,
+            crate::deploy::profile::NotSharedNamespace {
+                namespace: "elsewhere".into()
+            }
+        );
+    }
+
+    /// The caller role covers every access check crucible-kueue can produce.
+    #[test]
+    fn the_caller_role_covers_every_access_check_crucible_kueue_can_produce() {
+        use crucible_kueue::access::KueueRules;
+        use crucible_mcp_auth::access::{AccessCheck, AccessRules, Call};
+        use crucible_mcp_auth::principal::{Callers, Principal};
+        let shared = PROFILE.replace(
+            "[kueue]",
+            "[kueue]\nshared_namespaces = [\"crucible-kueue-e2e\"]\npull_secrets = [\"quay-pull\"]",
+        );
+        let rendered = docs(&shared);
+        let role = find(&rendered, "ClusterRole", "crucible-kueue-caller");
+        let rules = role["rules"].as_array().unwrap().clone();
+        let covers = |check: &AccessCheck| {
+            rules.iter().any(|rule| {
+                rule["apiGroups"]
+                    .as_array()
+                    .is_some_and(|g| g.iter().any(|g| g.as_str() == Some(check.group.as_str())))
+                    && rule["resources"].as_array().is_some_and(|r| {
+                        r.iter().any(|r| {
+                            r.as_str().is_some_and(|r| {
+                                r == check.resource
+                                    || (!check.subresource.is_empty()
+                                        && r == format!("{}/{}", check.resource, check.subresource))
+                            })
+                        })
+                    })
+                    && rule["verbs"].as_array().is_some_and(|v| {
+                        v.iter().any(|v| {
+                            v.as_str() == Some(check.verb.as_str())
+                                || check
+                                    .or_verbs
+                                    .iter()
+                                    .any(|o| v.as_str() == Some(o.as_str()))
+                        })
+                    })
+                    && rule
+                        .get("resourceNames")
+                        .and_then(|n| n.as_array())
+                        .is_none_or(|names| {
+                            names
+                                .iter()
+                                .any(|n| n.as_str() == Some(check.name.as_str()))
+                        })
+            })
+        };
+        let principal = Principal::from_claims(
+            serde_json::json!({
+                "sub": "alice",
+                "kube_user": "crucible:run:crucible-run-x",
+                "namespace": "crucible-kueue-e2e",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            Callers::Runs,
+        )
+        .unwrap();
+        let rules_engine = KueueRules::default();
+        let kinds = [
+            "Job",
+            "RayJob",
+            "LeaderWorkerSet",
+            "Deployment",
+            "StatefulSet",
+            "JobSet",
+            "PyTorchJob",
+        ];
+        let mut calls: Vec<(&str, serde_json::Map<String, serde_json::Value>)> = Vec::new();
+        fn tool(
+            calls: &mut Vec<(&'static str, serde_json::Map<String, serde_json::Value>)>,
+            name: &'static str,
+            args: serde_json::Value,
+        ) {
+            let serde_json::Value::Object(args) = args else {
+                unreachable!()
+            };
+            calls.push((name, args));
+        }
+        for kind in kinds {
+            for name in [
+                "workload_status",
+                "workload_scale",
+                "workload_stop",
+                "workload_resume",
+                "workload_delete",
+            ] {
+                tool(
+                    &mut calls,
+                    name,
+                    serde_json::json!({"kind": kind, "name": "train"}),
+                );
+            }
+            tool(
+                &mut calls,
+                "workload_submit",
+                serde_json::json!({
+                    "queue": "crucible-e2e",
+                    "manifest": {"kind": kind, "spec": {"template": {"spec": {
+                        "volumes": [
+                            {"name": "a", "secret": {"secretName": "quay-pull"}},
+                            {"name": "b", "persistentVolumeClaim": {"claimName": "data"}}
+                        ]
+                    }}}}
+                }),
+            );
+        }
+        for (name, args) in [
+            ("queues_list", serde_json::json!({})),
+            (
+                "queue_describe",
+                serde_json::json!({"queue": "crucible-e2e"}),
+            ),
+            (
+                "hardware_describe",
+                serde_json::json!({"queue": "crucible-e2e"}),
+            ),
+            ("workload_list", serde_json::json!({})),
+            (
+                "workload_logs",
+                serde_json::json!({"kind": "Job", "name": "train"}),
+            ),
+            (
+                "workload_plan",
+                serde_json::json!({"queue": "crucible-e2e", "manifest": {"kind": "Job"}}),
+            ),
+        ] {
+            tool(&mut calls, name, args);
+        }
+        let mut checked = 0;
+        for (name, args) in &calls {
+            let call = Call::Tool { name, args };
+            for check in rules_engine.checks(&call, &principal).unwrap() {
+                assert!(covers(&check), "no rule covers {check:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 30, "the walk must reach the checks: {checked}");
+    }
+
     #[test]
     fn every_submittable_kind_is_granted_under_its_own_group_only() {
         let docs = docs(PROFILE);
@@ -875,6 +1191,7 @@ mod tests {
             .collect();
         let mut expected: Vec<(String, String)> = crucible_kueue_kinds()
             .into_iter()
+            .chain([("", "services")])
             .map(|(g, r)| (g.to_string(), r.to_string()))
             .collect();
         let mut granted_sorted = granted.clone();

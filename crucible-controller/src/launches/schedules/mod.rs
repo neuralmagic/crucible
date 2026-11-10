@@ -280,10 +280,6 @@ pub(crate) struct Schedule {
     pub created_by: Option<String>,
     pub owner_principal: Option<String>,
     pub owner_groups: Option<serde_json::Value>,
-    pub owner_groups_at: Option<String>,
-    pub owner_signin_required: bool,
-    pub owner_refresh_error: Option<String>,
-    pub owner_refresh_at: Option<String>,
     pub dispatch_target: Option<String>,
     pub agent_provider: Option<String>,
     pub agent_model: Option<String>,
@@ -350,10 +346,6 @@ impl From<ScheduleRow> for Schedule {
             created_by: c.created_by,
             owner_principal: c.owner_principal,
             owner_groups: c.owner_groups,
-            owner_groups_at: c.owner_groups_at,
-            owner_signin_required: c.owner_signin_required,
-            owner_refresh_error: c.owner_refresh_error,
-            owner_refresh_at: c.owner_refresh_at,
             dispatch_target: c.dispatch_target,
             agent_provider: c.agent_provider,
             agent_model: c.agent_model,
@@ -538,11 +530,6 @@ impl ScheduleStore {
         Ok(ids.len() as u64)
     }
 
-    /// Expire the launches a schedule parked for a stale owner snapshot. Returns the keys closed.
-    pub(crate) async fn expire_stale_owner_parks(&self, schedule_id: &str) -> Result<Vec<String>> {
-        standing::expire_stale_owner_parks(self.db.pool(), Trigger::Schedule, schedule_id).await
-    }
-
     async fn due_rows(&self, now: Timestamp, held: &[String]) -> Result<Vec<DueRow>> {
         sqlx::query_as::<_, DueRow>(
             r#"
@@ -711,11 +698,8 @@ impl ScheduleTrigger {
     }
 
     #[cfg(test)]
-    fn sweep_cfg(auto_disable_after: i64, owner_ttl: std::time::Duration) -> SweepCfg {
-        SweepCfg {
-            auto_disable_after,
-            owner_ttl,
-        }
+    fn sweep_cfg(auto_disable_after: i64) -> SweepCfg {
+        SweepCfg { auto_disable_after }
     }
 }
 
@@ -819,37 +803,21 @@ impl LaunchTrigger for ScheduleTrigger {
     }
 }
 
-/// [`fire_due_refreshing`] with no offline credential: every firing launches under the
-/// schedule-row snapshot alone, which is what a deployment with no issuer configured does.
+/// Fire every schedule due at `now`, up to `cap`, through the generic sweep. Returns the keys the
+/// launches landed under.
 #[cfg(test)]
 pub(crate) async fn fire_due(
     db: &Db,
     now: Timestamp,
     cap: usize,
     auto_disable_after: i64,
-    owner_ttl: std::time::Duration,
-) -> Result<Vec<String>> {
-    fire_due_refreshing(db, now, cap, auto_disable_after, owner_ttl, None).await
-}
-
-/// Fire every schedule due at `now`, up to `cap`, through the generic sweep. Returns the keys the
-/// launches landed under.
-#[cfg(test)]
-pub(crate) async fn fire_due_refreshing(
-    db: &Db,
-    now: Timestamp,
-    cap: usize,
-    auto_disable_after: i64,
-    owner_ttl: std::time::Duration,
-    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
 ) -> Result<Vec<String>> {
     let trigger = ScheduleTrigger::unpoliced(db.clone());
     let mut keys = standing::sweep(
         db,
         &trigger,
-        ScheduleTrigger::sweep_cfg(auto_disable_after, owner_ttl),
+        ScheduleTrigger::sweep_cfg(auto_disable_after),
         now,
-        refresh,
         None,
         &[],
     )
@@ -864,9 +832,7 @@ mod tests {
     use crate::daemon::queue::{DiscoverySource, WorkQueue};
     use crate::launches::model::{LaunchFilter, NewPlaybookLaunch};
     use crate::launches::schedules::*;
-    use crate::launches::standing::{
-        StandingTarget, Unadoptable, clear_owner_signin, require_owner_signin,
-    };
+    use crate::launches::standing::{StandingTarget, Unadoptable};
     use crate::model::LaunchOrigin;
     use crate::model::MaxTime;
     use crate::model::Status;
@@ -1037,14 +1003,7 @@ mod tests {
         pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
 
         let db = Db::new(pool.clone());
-        let keys = fire_due(
-            &db,
-            ts("2026-08-23T12:01:00Z"),
-            1,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let keys = fire_due(&db, ts("2026-08-23T12:01:00Z"), 1, 5).await?;
         assert_eq!(keys.len(), 1);
         let (recorded, digest) = launch_tree(&pool, &keys[0]).await;
         assert_eq!(recorded.as_deref(), Some(adopted_tree.as_str()));
@@ -1077,14 +1036,7 @@ mod tests {
             .execute(&pool)
             .await?;
 
-        let keys = fire_due(
-            &Db::new(pool.clone()),
-            ts("2026-08-23T12:01:00Z"),
-            1,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let keys = fire_due(&Db::new(pool.clone()), ts("2026-08-23T12:01:00Z"), 1, 5).await?;
         assert_eq!(keys.len(), 1);
         assert_eq!(
             crate::launches::store::launch_variant(&pool, &keys[0])
@@ -1142,9 +1094,7 @@ mod tests {
             let (db, pool, id) = (db.clone(), pool.clone(), scheduled.id.clone());
             async move {
                 set_due(&pool, &id, Some(due)).await;
-                let keys = fire_due(&db, ts(at), 1, 5, std::time::Duration::from_secs(3600))
-                    .await
-                    .expect("fire");
+                let keys = fire_due(&db, ts(at), 1, 5).await.expect("fire");
                 assert_eq!(keys.len(), 1);
                 keys[0].clone()
             }
@@ -1224,14 +1174,7 @@ mod tests {
         set_due(&pool, &scheduled.id, Some("2026-08-23T12:00:00Z")).await;
         pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
 
-        let keys = fire_due(
-            &Db::new(pool.clone()),
-            ts("2026-08-23T12:01:00Z"),
-            1,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let keys = fire_due(&Db::new(pool.clone()), ts("2026-08-23T12:01:00Z"), 1, 5).await?;
         assert_eq!(keys.len(), 1);
         assert_eq!(
             launch_tree(&pool, &keys[0]).await,
@@ -1350,6 +1293,7 @@ mod tests {
         let max_time = MaxTime::parse("30m").expect("duration");
         let params = params();
         let launch = NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/packs",
             title: "reads a paper",
@@ -1362,6 +1306,7 @@ mod tests {
             origin: LaunchOrigin::Manual,
             draft_version: None,
             created_by: Some("wren"),
+            owner: None,
             launcher_groups: None,
             rerun: None,
             dispatch: Default::default(),
@@ -1460,14 +1405,7 @@ mod tests {
             .execute(&pool)
             .await?;
         let db = Db::new(pool.clone());
-        let keys = fire_due(
-            &db,
-            ts("2026-08-23T12:01:00Z"),
-            1,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let keys = fire_due(&db, ts("2026-08-23T12:01:00Z"), 1, 5).await?;
         assert_eq!(keys.len(), 1);
         let issue = crate::issues::store::get_issue(&pool, &keys[0])
             .await?
@@ -1529,14 +1467,7 @@ mod tests {
             .await?;
 
         let db = Db::new(pool.clone());
-        let keys = fire_due(
-            &db,
-            ts("2026-08-23T12:01:00Z"),
-            1,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let keys = fire_due(&db, ts("2026-08-23T12:01:00Z"), 1, 5).await?;
         let launch = crate::launches::store::get_playbook_launch(&pool, &keys[0])
             .await?
             .expect("the minted launch");
@@ -1620,9 +1551,7 @@ mod tests {
             let (db, pool, id) = (db.clone(), pool.clone(), schedule.id.clone());
             async move {
                 set_due(&pool, &id, Some(due)).await;
-                let keys = fire_due(&db, ts(now), 1, 5, std::time::Duration::from_secs(3600))
-                    .await
-                    .expect("fire");
+                let keys = fire_due(&db, ts(now), 1, 5).await.expect("fire");
                 assert_eq!(keys.len(), 1, "one firing at {now}");
                 launch_tree(&pool, &keys[0]).await.0
             }
@@ -1743,46 +1672,31 @@ mod tests {
         .expect("bind");
     }
 
-    /// Own a stored schedule to `principal` with `groups`, snapshotted at `at`.
-    async fn own_schedule(pool: &PgPool, id: &str, principal: &str, groups: &[&str], at: &str) {
+    /// Own a stored schedule to `principal` with `groups`.
+    async fn own_schedule(pool: &PgPool, id: &str, principal: &str, groups: &[&str]) {
         let groups = serde_json::Value::from(groups.to_vec());
         sqlx::query(
             "UPDATE playbook_standing_launches
-             SET owner_principal = $2, owner_groups = $3, owner_groups_at = $4 WHERE id = $1",
+             SET owner_principal = $2, owner_groups = $3 WHERE id = $1",
         )
         .bind(id)
         .bind(principal)
         .bind(&groups)
-        .bind(at)
         .execute(pool)
         .await
         .expect("own");
     }
 
-    /// A schedule saved inside its TTL fires and its launch carries the snapshot the save took, so
-    /// the dispatch has the memberships it needs long after that session is gone.
+    /// A firing's launch carries the snapshot the save took, so the dispatch has the memberships it
+    /// needs long after that session is gone.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_fresh_owner_snapshot_rides_onto_the_launch(pool: PgPool) -> Result<()> {
         register_row(&pool, "survey").await;
         bind_playbook_secret(&pool, "survey").await;
         let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
-        own_schedule(
-            &pool,
-            &row.id,
-            "user:wren",
-            &["/groups/team-x"],
-            "2026-08-23T12:00:00Z",
-        )
-        .await;
+        own_schedule(&pool, &row.id, "user:wren", &["/groups/team-x"]).await;
         let db = Db::new(pool.clone());
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         assert_eq!(fired.len(), 1, "the firing launched");
         let launch = crate::launches::store::get_playbook_launch(&pool, &fired[0])
             .await?
@@ -1792,332 +1706,60 @@ mod tests {
         Ok(())
     }
 
-    /// Past the TTL there is no authorization left to launch a bound scope under, so the firing
-    /// parks with the reason rather than dispatching. A re-save re-owns the row and expires it.
+    /// A transferred schedule launches with its owner's login and groups.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_fire_past_the_ttl_parks_and_a_resave_expires_it(pool: PgPool) -> Result<()> {
+    async fn a_transferred_schedule_launches_as_its_owner(pool: PgPool) -> Result<()> {
         register_row(&pool, "survey").await;
         bind_playbook_secret(&pool, "survey").await;
         let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
-        own_schedule(
-            &pool,
-            &row.id,
-            "user:wren",
-            &["/groups/team-x"],
-            "2026-08-01T00:00:00Z",
-        )
-        .await;
+        own_schedule(&pool, &row.id, "user:bob", &["/groups/team-y"]).await;
         let db = Db::new(pool.clone());
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
-        assert!(fired.is_empty(), "a stale snapshot dispatches nothing");
-        let parked: Vec<(String, String)> = sqlx::query_as(
-            "SELECT key, parked_reason FROM issues WHERE status = 'parked' AND input_kind = 'playbook'",
-        )
-        .fetch_all(&pool)
-        .await?;
-        assert_eq!(parked.len(), 1, "the firing's launch parked");
-        assert!(
-            parked[0].1.contains(&row.id) && parked[0].1.contains("stale"),
-            "the park names the schedule and why: {:?}",
-            parked[0].1
-        );
-
-        // A re-save re-owns the row and closes the firings that could never launch under the old
-        // snapshot.
-        let expired = ScheduleStore::new(Db::new(pool.clone()))
-            .expire_stale_owner_parks(&row.id)
-            .await?;
-        assert_eq!(expired, vec![parked[0].0.clone()]);
-        let status: String = sqlx::query_scalar("SELECT status FROM issues WHERE key = $1")
-            .bind(&parked[0].0)
-            .fetch_one(&pool)
-            .await?;
-        assert_eq!(status, Status::Done.as_str());
-        Ok(())
-    }
-
-    /// The offline credential of an owner whose issuer cannot be reached. A real dead endpoint,
-    /// not a stub: the transport failure the sweep has to treat as transient is the genuine one.
-    async fn dead_refresher(
-        pool: &PgPool,
-        login: &str,
-    ) -> Arc<crate::identity::oidc::credentials::OwnerRefresh> {
-        let keys = Arc::new(
-            crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![3u8; 32]])
-                .expect("keys"),
-        );
-        let sub = format!("sub-{login}");
-        crate::identity::oidc::users::record_login(pool, &sub, login, None, Timestamp::now())
-            .await
-            .expect("record login");
-        let mut conn = pool.acquire().await.expect("conn");
-        crate::identity::oidc::credentials::upsert(
-            &mut conn,
-            &keys,
-            &sub,
-            "offline",
-            Timestamp::now(),
-        )
-        .await
-        .expect("store the credential");
-        drop(conn);
-        let provider = Arc::new(
-            crate::identity::oidc::OidcProvider::new(crate::identity::oidc::OidcCfg {
-                issuer: "http://127.0.0.1:1/realms/nobody".to_string(),
-                client_id: "rp".to_string(),
-                client_secret: None,
-                redirect_url: "http://localhost/auth/callback".to_string(),
-                scopes: vec!["openid".to_string()],
-                post_logout_redirect: None,
-            })
-            .expect("provider"),
-        );
-        Arc::new(crate::identity::oidc::credentials::OwnerRefresh::new(
-            pool.clone(),
-            provider,
-            keys,
-        ))
-    }
-
-    async fn schedule_state(
-        pool: &PgPool,
-        id: &str,
-    ) -> (bool, Option<String>, i64, Option<String>) {
-        let row = ScheduleStore::new(Db::new(pool.clone()))
-            .get(id)
-            .await
-            .expect("get")
-            .expect("row");
-        (
-            row.owner_signin_required,
-            row.owner_refresh_error,
-            row.consecutive_failures,
-            row.next_due_at,
-        )
-    }
-
-    /// An issuer that cannot be reached is transient: the firing is left for the next tick, nothing
-    /// counts toward auto-disable, and the schedule stays due exactly where it was.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn an_unreachable_issuer_defers_the_firing_without_a_failure(pool: PgPool) -> Result<()> {
-        register_row(&pool, "survey").await;
-        bind_playbook_secret(&pool, "survey").await;
-        let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
-        own_schedule(
-            &pool,
-            &row.id,
-            "user:wren",
-            &["/groups/team-x"],
-            "2026-08-23T12:00:00Z",
-        )
-        .await;
-        let refresh = dead_refresher(&pool, "wren").await;
-        let db = Db::new(pool.clone());
-        let fired = fire_due_refreshing(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-            Some(&refresh),
-        )
-        .await?;
-        assert!(fired.is_empty(), "nothing fires while the issuer is down");
-        let (signin, error, failures, next_due) = schedule_state(&pool, &row.id).await;
-        assert!(!signin, "an outage is not a reason to demand a sign-in");
-        assert!(error.is_some(), "the view still says why nothing fired");
-        assert_eq!(failures, 0, "a transient failure counts nothing");
-        assert_eq!(
-            next_due.as_deref(),
-            Some("2026-08-23T12:00:00Z"),
-            "the window is still due, so the next tick retries it"
-        );
-        Ok(())
-    }
-
-    /// An owner with no offline credential at all is a definitive refusal. Inside the snapshot's
-    /// TTL the firing still launches under it; the failure is only recorded.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_definitive_failure_falls_back_to_a_snapshot_inside_its_ttl(
-        pool: PgPool,
-    ) -> Result<()> {
-        register_row(&pool, "survey").await;
-        bind_playbook_secret(&pool, "survey").await;
-        let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
-        own_schedule(
-            &pool,
-            &row.id,
-            "user:wren",
-            &["/groups/team-x"],
-            "2026-08-23T12:00:00Z",
-        )
-        .await;
-        // The refresher exists, but this owner never signed in through it.
-        let refresh = dead_refresher(&pool, "someone-else").await;
-        let db = Db::new(pool.clone());
-        let fired = fire_due_refreshing(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-            Some(&refresh),
-        )
-        .await?;
-        assert_eq!(fired.len(), 1, "the fresh snapshot still authorizes it");
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
+        assert_eq!(fired.len(), 1, "the firing launched");
         let launch = crate::launches::store::get_playbook_launch(&pool, &fired[0])
             .await?
             .expect("a launch row");
-        assert_eq!(launch.launcher_groups, vec!["/groups/team-x".to_string()]);
-        let (signin, error, _, _) = schedule_state(&pool, &row.id).await;
-        assert!(
-            !signin,
-            "inside the TTL there is nothing to sign in for yet"
-        );
-        assert!(error.is_some(), "the refusal is still on the record");
+        assert_eq!(launch.created_by.as_deref(), Some("bob"));
+        assert_eq!(launch.launcher_groups, vec!["/groups/team-y".to_string()]);
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT owner FROM playbook_launches WHERE key = $1")
+                .bind(&fired[0])
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(owner.as_deref(), Some("user:bob"));
         Ok(())
     }
 
-    /// The same refusal past the TTL parks the firing and marks the schedule as needing sign-in.
+    /// A schedule on a bound scope keeps firing however long ago it was saved: its authorization
+    /// does not age out.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_definitive_failure_past_the_ttl_parks_and_needs_a_sign_in(
-        pool: PgPool,
-    ) -> Result<()> {
+    async fn a_bound_schedule_fires_months_after_its_save(pool: PgPool) -> Result<()> {
         register_row(&pool, "survey").await;
         bind_playbook_secret(&pool, "survey").await;
         let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
-        own_schedule(
-            &pool,
-            &row.id,
-            "user:wren",
-            &["/groups/team-x"],
-            "2026-08-01T00:00:00Z",
-        )
-        .await;
-        let refresh = dead_refresher(&pool, "someone-else").await;
+        own_schedule(&pool, &row.id, "user:wren", &["/groups/team-x"]).await;
         let db = Db::new(pool.clone());
-        let fired = fire_due_refreshing(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-            Some(&refresh),
-        )
-        .await?;
-        assert!(
-            fired.is_empty(),
-            "nothing dispatches under a dead credential"
-        );
-        let (signin, error, _, _) = schedule_state(&pool, &row.id).await;
-        assert!(signin, "the schedule needs its owner to sign in again");
-        assert!(error.is_some());
-        let parked: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM issues WHERE status = 'parked' AND input_kind = 'playbook'",
-        )
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(parked, 1, "the firing's launch parked");
+        let fired = fire_due(&db, ts("2026-11-23T12:00:30Z"), 8, 5).await?;
+        assert_eq!(fired.len(), 1, "the firing launched");
+        let parked: i64 = sqlx::query_scalar("SELECT count(*) FROM issues WHERE status = 'parked'")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(parked, 0, "nothing parked");
         Ok(())
     }
 
-    /// A revoke does not wait on the TTL: the owner asked for those firings to stop, so the next
-    /// one parks even though the snapshot is minutes old. Signing in again clears it.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_revoke_parks_a_bound_schedule_until_the_owner_signs_in(pool: PgPool) -> Result<()> {
-        register_row(&pool, "survey").await;
-        bind_playbook_secret(&pool, "survey").await;
-        let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
-        own_schedule(
-            &pool,
-            &row.id,
-            "user:wren",
-            &["/groups/team-x"],
-            "2026-08-23T12:00:00Z",
-        )
-        .await;
-        let parked = require_owner_signin(&pool, "wren", "its owner revoked it").await?;
-        assert_eq!(parked, 1, "the one schedule that binds a secret");
-
-        let db = Db::new(pool.clone());
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
-        assert!(fired.is_empty(), "a revoked owner dispatches nothing");
-        assert!(schedule_state(&pool, &row.id).await.0);
-
-        clear_owner_signin(&pool, "Wren").await?;
-        let (signin, error, _, _) = schedule_state(&pool, &row.id).await;
-        assert!(!signin, "signing in again re-arms the schedule");
-        assert_eq!(error, None);
-        Ok(())
-    }
-
-    /// A revoke leaves the schedules that launch nothing credentialed alone: the offline credential
-    /// is only ever the authorization for a bound scope.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_revoke_leaves_an_unbound_schedule_firing(pool: PgPool) -> Result<()> {
-        register_row(&pool, "survey").await;
-        let row = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
-        own_schedule(
-            &pool,
-            &row.id,
-            "user:wren",
-            &["/groups/team-x"],
-            "2026-08-23T12:00:00Z",
-        )
-        .await;
-        assert_eq!(
-            require_owner_signin(&pool, "wren", "revoked").await?,
-            0,
-            "nothing to park: the scope binds no secret"
-        );
-        let db = Db::new(pool.clone());
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
-        assert_eq!(fired.len(), 1);
-        Ok(())
-    }
-
-    /// A scope that binds nothing keeps firing with no snapshot at all: the registry is not a new
-    /// requirement on every schedule that predates it.
+    /// A scope that binds nothing fires with no snapshot at all.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_schedule_on_an_unbound_scope_fires_without_a_snapshot(pool: PgPool) -> Result<()> {
         register_row(&pool, "survey").await;
         schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
         let db = Db::new(pool.clone());
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         assert_eq!(fired.len(), 1);
         Ok(())
     }
 
-    /// A save owns the schedule to the saver and stamps when the snapshot was taken; a save by
-    /// somebody else re-owns it.
+    /// A save owns the schedule to the saver; a save by somebody else re-owns it.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_save_owns_the_schedule_to_the_saver(pool: PgPool) -> Result<()> {
         register_row(&pool, "survey").await;
@@ -2151,7 +1793,7 @@ mod tests {
             .create(&new, Timestamp::now())
             .await?;
         assert_eq!(stored.owner_principal.as_deref(), Some("user:alice"));
-        assert!(stored.owner_groups_at.is_some(), "the snapshot is stamped");
+        assert_eq!(stored.owner_groups, Some(alice_groups.clone()));
 
         let bob_groups = serde_json::Value::from(vec!["/groups/team-y"]);
         new.standing.created_by = Some("bob");
@@ -2243,14 +1885,7 @@ mod tests {
         let scheduled = schedule_with_cursor(&pool, &cursor(), Some("2026-08-23T00:00:00Z")).await;
         assert_eq!(scheduled.cursor.as_ref(), Some(&cursor()));
 
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         assert_eq!(fired.len(), 1, "{fired:?}");
         let launched =
             crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
@@ -2280,14 +1915,7 @@ mod tests {
         register_row(&pool, "survey").await;
         schedule_with_cursor(&pool, &cursor(), None).await;
 
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         let launched =
             crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
                 .await?;
@@ -2313,15 +1941,9 @@ mod tests {
         let scheduled = schedule_with_cursor(&pool, &cursor(), Some("2026-08-23T00:00:00Z")).await;
 
         assert!(
-            fire_due(
-                &db,
-                ts("2026-08-23T12:00:30Z"),
-                8,
-                5,
-                std::time::Duration::from_secs(3600)
-            )
-            .await?
-            .is_empty(),
+            fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5,)
+                .await?
+                .is_empty(),
             "a value the pack refuses launches nothing"
         );
         let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
@@ -2353,14 +1975,7 @@ mod tests {
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         let scheduled = schedule_with_cursor(&pool, &cursor(), None).await;
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
 
         ScheduleStore::new(db.clone())
             .advance_cursor(&fired[0], "run-1", &scan_result("2026-08-23T11:59:00Z"))
@@ -2380,14 +1995,7 @@ mod tests {
             .bind("2026-08-23T13:00:00Z")
             .execute(&pool)
             .await?;
-        let again = fire_due(
-            &db,
-            ts("2026-08-23T13:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let again = fire_due(&db, ts("2026-08-23T13:00:30Z"), 8, 5).await?;
         let launched =
             crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&again[0]), 10)
                 .await?;
@@ -2402,14 +2010,7 @@ mod tests {
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         let scheduled = schedule_with_cursor(&pool, &cursor(), Some("2026-08-01T00:00:00Z")).await;
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
 
         let empty = serde_json::Map::new();
         ScheduleStore::new(db.clone())
@@ -2432,14 +2033,7 @@ mod tests {
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         let scheduled = schedule_with_cursor(&pool, &cursor(), None).await;
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         sqlx::query("UPDATE playbook_launches SET advance_dedupe = FALSE WHERE key = $1")
             .bind(&fired[0])
             .execute(&pool)
@@ -2475,6 +2069,7 @@ mod tests {
                 &pool,
                 key,
                 &NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/packs",
                     title: "reads a paper",
@@ -2487,6 +2082,7 @@ mod tests {
                     origin: LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
+                    owner: None,
                     launcher_groups: None,
                     rerun: None,
                     dispatch: Default::default(),
@@ -2517,12 +2113,10 @@ mod tests {
         let scheduled = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
 
         let now = ts("2026-08-23T12:00:30Z");
-        let fired = fire_due(&db, now, 8, 5, std::time::Duration::from_secs(3600)).await?;
+        let fired = fire_due(&db, now, 8, 5).await?;
         assert_eq!(fired.len(), 1, "{fired:?}");
         assert!(
-            fire_due(&db, now, 8, 5, std::time::Duration::from_secs(3600))
-                .await?
-                .is_empty(),
+            fire_due(&db, now, 8, 5).await?.is_empty(),
             "the window it just fired is not due again"
         );
 
@@ -2565,12 +2159,8 @@ mod tests {
         let b = Db::new(pool.clone());
         let now = ts("2026-08-23T12:00:30Z");
         let (first, second) = tokio::join!(
-            tokio::spawn(async move {
-                fire_due(&a, now, 8, 5, std::time::Duration::from_secs(3600)).await
-            }),
-            tokio::spawn(async move {
-                fire_due(&b, now, 8, 5, std::time::Duration::from_secs(3600)).await
-            }),
+            tokio::spawn(async move { fire_due(&a, now, 8, 5).await }),
+            tokio::spawn(async move { fire_due(&b, now, 8, 5).await }),
         );
         assert_eq!(
             first??.len() + second??.len(),
@@ -2593,7 +2183,7 @@ mod tests {
         let scheduled = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T06:00:00Z")).await;
 
         let now = ts("2026-08-23T12:30:00Z");
-        let fired = fire_due(&db, now, 8, 5, std::time::Duration::from_secs(3600)).await?;
+        let fired = fire_due(&db, now, 8, 5).await?;
         assert_eq!(fired.len(), 1, "one launch, not seven: {fired:?}");
         let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
             .fetch_one(&pool)
@@ -2626,14 +2216,7 @@ mod tests {
         register_row(&pool, "survey").await;
         let scheduled = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
 
-        fire_due(
-            &db,
-            ts("2026-08-23T12:00:05Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        fire_due(&db, ts("2026-08-23T12:00:05Z"), 8, 5).await?;
         assert!(
             events_for(&pool, &Trigger::Schedule.event_key(&scheduled.id))
                 .await
@@ -2654,15 +2237,9 @@ mod tests {
             .await?;
 
         assert!(
-            fire_due(
-                &db,
-                ts("2026-08-23T12:00:00Z"),
-                8,
-                5,
-                std::time::Duration::from_secs(3600)
-            )
-            .await?
-            .is_empty()
+            fire_due(&db, ts("2026-08-23T12:00:00Z"), 8, 5,)
+                .await?
+                .is_empty()
         );
         assert_eq!(
             ScheduleStore::new(Db::new(pool.clone()))
@@ -2695,7 +2272,7 @@ mod tests {
             (2, "2026-08-23T12:01:30Z"),
             (3, "2026-08-23T12:02:30Z"),
         ] {
-            let fired = fire_due(&db, ts(now), 8, 3, std::time::Duration::from_secs(3600)).await?;
+            let fired = fire_due(&db, ts(now), 8, 3).await?;
             assert!(fired.is_empty(), "attempt {attempt}: {fired:?}");
             let row = ScheduleStore::new(Db::new(pool.clone()))
                 .get(&scheduled.id)
@@ -2768,14 +2345,7 @@ mod tests {
             .await;
 
         let db = Db::new(pool.clone());
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:01:00Z"),
-            1,
-            1,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:01:00Z"), 1, 1).await?;
 
         assert!(fired.is_empty(), "{fired:?}");
         let row = ScheduleStore::new(Db::new(pool.clone()))
@@ -2867,14 +2437,7 @@ mod tests {
         set_due(&pool, &stale.id, Some("2026-08-23T12:00:00Z")).await;
 
         let db = Db::new(pool.clone());
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:01:00Z"),
-            1,
-            1,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:01:00Z"), 1, 1).await?;
         assert!(fired.is_empty(), "{fired:?}");
         let row = store.get(&stale.id).await?.expect("row");
         assert_eq!(row.consecutive_failures, 1);
@@ -2900,14 +2463,7 @@ mod tests {
             .create(&saved_onto("cluster-a"), ts("2026-08-23T12:02:00Z"))
             .await?;
         set_due(&pool, &resaved.id, Some("2026-08-23T13:00:00Z")).await;
-        let keys = fire_due(
-            &db,
-            ts("2026-08-23T13:01:00Z"),
-            1,
-            1,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let keys = fire_due(&db, ts("2026-08-23T13:01:00Z"), 1, 1).await?;
         let [key] = keys.as_slice() else {
             panic!("expected one firing, got {keys:?}");
         };
@@ -2936,7 +2492,7 @@ mod tests {
             (1, "2026-08-23T12:00:30Z", "2026-08-23T12:01:00Z"),
             (2, "2026-08-23T12:01:30Z", "2026-08-23T12:02:00Z"),
         ] {
-            let fired = fire_due(&db, ts(now), 8, 3, std::time::Duration::from_secs(3600)).await?;
+            let fired = fire_due(&db, ts(now), 8, 3).await?;
             assert!(fired.is_empty(), "attempt {attempt}: {fired:?}");
             let row = ScheduleStore::new(Db::new(pool.clone()))
                 .get(&scheduled.id)
@@ -2952,15 +2508,9 @@ mod tests {
         }
 
         assert!(
-            fire_due(
-                &db,
-                ts("2026-08-23T12:02:30Z"),
-                8,
-                3,
-                std::time::Duration::from_secs(3600)
-            )
-            .await?
-            .is_empty(),
+            fire_due(&db, ts("2026-08-23T12:02:30Z"), 8, 3,)
+                .await?
+                .is_empty(),
             "the third failure is the threshold"
         );
         let row = ScheduleStore::new(Db::new(pool.clone()))
@@ -2988,15 +2538,9 @@ mod tests {
         assert_eq!(launched, 0, "no half-written launch");
 
         assert!(
-            fire_due(
-                &db,
-                ts("2026-08-23T13:00:00Z"),
-                8,
-                3,
-                std::time::Duration::from_secs(3600)
-            )
-            .await?
-            .is_empty(),
+            fire_due(&db, ts("2026-08-23T13:00:00Z"), 8, 3,)
+                .await?
+                .is_empty(),
             "a disabled schedule is never claimed again"
         );
         Ok(())
@@ -3014,15 +2558,9 @@ mod tests {
             .execute(&pool)
             .await?;
         assert!(
-            fire_due(
-                &db,
-                ts("2026-08-23T12:00:30Z"),
-                8,
-                5,
-                std::time::Duration::from_secs(3600)
-            )
-            .await?
-            .is_empty()
+            fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5,)
+                .await?
+                .is_empty()
         );
         assert_eq!(
             ScheduleStore::new(Db::new(pool.clone()))
@@ -3038,15 +2576,9 @@ mod tests {
             .execute(&pool)
             .await?;
         assert_eq!(
-            fire_due(
-                &db,
-                ts("2026-08-23T12:01:30Z"),
-                8,
-                5,
-                std::time::Duration::from_secs(3600)
-            )
-            .await?
-            .len(),
+            fire_due(&db, ts("2026-08-23T12:01:30Z"), 8, 5,)
+                .await?
+                .len(),
             1
         );
         assert_eq!(
@@ -3072,14 +2604,7 @@ mod tests {
             .await?;
         schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
 
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         assert_eq!(fired.len(), 1, "the healthy one still fired: {fired:?}");
         assert_eq!(
             ScheduleStore::new(Db::new(pool.clone()))
@@ -3106,8 +2631,6 @@ mod tests {
             db.clone(),
             vec![Arc::new(ScheduleTrigger::new(db, None))],
             5,
-            std::time::Duration::from_secs(3600),
-            None,
             None,
         )
         .poll(queue.clone())
@@ -3270,14 +2793,7 @@ mod tests {
             .bind("2026-08-23T13:00:00Z")
             .execute(pool)
             .await?;
-        let again = fire_due(
-            db,
-            ts("2026-08-23T13:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let again = fire_due(db, ts("2026-08-23T13:00:30Z"), 8, 5).await?;
         Ok(again[0].clone())
     }
 
@@ -3293,14 +2809,7 @@ mod tests {
         register_row(&pool, "survey").await;
         let scheduled = schedule_with_cursor(&pool, &file_cursor(), None).await;
         assert_eq!(scheduled.cursor.as_ref(), Some(&file_cursor()));
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         let launched =
             crate::launches::store::list_playbook_runs(&pool, &LaunchFilter::key(&fired[0]), 10)
                 .await?;
@@ -3359,14 +2868,7 @@ mod tests {
         register_row(&pool, "survey").await;
         let scheduled = schedule_with_cursor(&pool, &file_cursor(), Some("{\"seen\": []}")).await;
         let store = ScheduleStore::new(db.clone());
-        let mut fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let mut fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         let huge = vec![b'x'; CURSOR_FILE_MAX_BYTES + 1];
         let cases: Vec<(&str, Option<Vec<u8>>, &str)> = vec![
             ("run-none", None, "not among the run's captured files"),
@@ -3423,14 +2925,7 @@ mod tests {
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         schedule_with_cursor(&pool, &file_cursor(), Some("{\"seen\": []}")).await;
-        let fired = fire_due(
-            &db,
-            ts("2026-08-23T12:00:30Z"),
-            8,
-            5,
-            std::time::Duration::from_secs(3600),
-        )
-        .await?;
+        let fired = fire_due(&db, ts("2026-08-23T12:00:30Z"), 8, 5).await?;
         sqlx::query("UPDATE playbook_launches SET origin = 'manual' WHERE key = $1")
             .bind(&fired[0])
             .execute(&pool)
@@ -3542,9 +3037,8 @@ mod tests {
         let swept = standing::sweep(
             &db,
             &ScheduleTrigger::unpoliced(db.clone()),
-            ScheduleTrigger::sweep_cfg(5, std::time::Duration::from_secs(3600)),
+            ScheduleTrigger::sweep_cfg(5),
             Timestamp::now(),
-            None,
             None,
             std::slice::from_ref(&held.id),
         )

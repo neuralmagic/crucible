@@ -306,10 +306,12 @@ pub(crate) async fn run_issue_repo(
 }
 
 /// Stamp the owner principal of the launch a run was made from (RFC-0003 C-HIERARCHY): the
-/// playbook launch's creator as a user principal, else the platform.
+/// launch's recorded owner, else a legacy login-shaped `created_by`, else the platform.
 pub async fn attribute_run(ex: impl PgExecutor<'_>, run_id: &str) -> Result<()> {
     sqlx::query(
         "UPDATE runs SET attributed_to = COALESCE(
+            (SELECT l.owner FROM playbook_launches l
+              WHERE l.key = runs.issue AND l.owner IS NOT NULL),
             (SELECT 'user:' || lower(trim(l.created_by)) FROM playbook_launches l
               WHERE l.key = runs.issue AND l.created_by IS NOT NULL
                 AND trim(l.created_by) ~ '^[A-Za-z0-9._@-]+$'),
@@ -450,6 +452,11 @@ pub(crate) async fn delete_unstarted_run(tx: &mut sqlx::PgConnection, run_id: &s
     .execute(&mut *tx)
     .await
     .context("restoring a released run's dispatch request")?;
+    sqlx::query("DELETE FROM run_agent_tools WHERE run_id = $1")
+        .bind(run_id)
+        .execute(&mut *tx)
+        .await
+        .context("deleting a released run's agent tools")?;
     sqlx::query("DELETE FROM runs WHERE run_id = $1")
         .bind(run_id)
         .execute(&mut *tx)
@@ -502,6 +509,22 @@ pub(crate) async fn running_local_runs(ex: impl PgExecutor<'_>) -> Result<Vec<(S
     .await
     .context("running_local_runs")?;
     Ok(rows.into_iter().map(|r| (r.key, r.run_id)).collect())
+}
+
+/// The issues of runs still `running` on a pod, each once, oldest run first.
+#[tracing::instrument(name = "db.running_pod_run_issues", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
+pub(crate) async fn running_pod_run_issues(ex: impl PgExecutor<'_>) -> Result<Vec<String>> {
+    sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT issue FROM runs
+        WHERE status = 'running' AND pod IS NOT NULL AND issue IS NOT NULL
+        GROUP BY issue
+        ORDER BY min(seq)
+        "#,
+    )
+    .fetch_all(ex)
+    .await
+    .context("running_pod_run_issues")
 }
 
 /// Flip a run row's status without touching the ingest-owned columns — the completion edge's
@@ -763,6 +786,7 @@ mod tests {
                 &pool,
                 launch_key,
                 &NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/packs",
                     title: "reads a paper",
@@ -775,6 +799,7 @@ mod tests {
                     origin: crate::model::LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
+                    owner: None,
                     launcher_groups: None,
                     rerun: None,
                     dispatch: Default::default(),
@@ -904,6 +929,7 @@ mod tests {
             &pool,
             key,
             &NewPlaybookLaunch {
+                choice_snapshots: None,
                 playbook: "survey",
                 repo: "owner/packs",
                 title: "reads a paper",
@@ -913,6 +939,7 @@ mod tests {
                 max_time: &max_time,
                 advance_dedupe: false,
                 dedupe_schedule: None,
+                owner: None,
                 launcher_groups: None,
                 rerun: None,
                 dispatch: Default::default(),

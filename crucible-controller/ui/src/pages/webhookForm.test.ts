@@ -15,9 +15,9 @@ import {
 } from './webhookForm';
 
 const SPECS: ParamFieldSpec[] = [
-  { name: 'image', valueType: 'string', required: true, defaultValue: null, pattern: '^quay\\.io/', description: null, multiline: false },
-  { name: 'tags', valueType: 'list', required: false, defaultValue: '["latest"]', pattern: null, description: null, multiline: false },
-  { name: 'release', valueType: 'string', required: false, defaultValue: 'main', pattern: null, description: null, multiline: false },
+  { name: 'image', valueType: 'string', required: true, defaultValue: null, pattern: '^quay\\.io/', description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
+  { name: 'tags', valueType: 'list', required: false, defaultValue: '["latest"]', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
+  { name: 'release', valueType: 'string', required: false, defaultValue: 'main', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
 ];
 
 const QUAY: WebhookPresetDto = {
@@ -182,10 +182,6 @@ function stateless(): WebhookDto {
     consecutive_failures: 0,
     created_by: null,
     owner_principal: null,
-    owner_groups_at: null,
-    owner_signin_required: false,
-    owner_refresh_error: null,
-    owner_refresh_at: null,
     dispatch_target: null,
     agent_provider: null,
     agent_model: null,

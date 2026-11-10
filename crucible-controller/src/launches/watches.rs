@@ -69,10 +69,6 @@ pub(crate) struct Watch {
     pub consecutive_failures: i64,
     pub created_by: Option<String>,
     pub owner_principal: Option<String>,
-    pub owner_groups_at: Option<String>,
-    pub owner_signin_required: bool,
-    pub owner_refresh_error: Option<String>,
-    pub owner_refresh_at: Option<String>,
     pub dispatch_target: Option<String>,
     pub agent_provider: Option<String>,
     pub agent_model: Option<String>,
@@ -126,10 +122,6 @@ impl From<WatchRow> for Watch {
             consecutive_failures: c.consecutive_failures,
             created_by: c.created_by,
             owner_principal: c.owner_principal,
-            owner_groups_at: c.owner_groups_at,
-            owner_signin_required: c.owner_signin_required,
-            owner_refresh_error: c.owner_refresh_error,
-            owner_refresh_at: c.owner_refresh_at,
             dispatch_target: c.dispatch_target,
             agent_provider: c.agent_provider,
             agent_model: c.agent_model,
@@ -279,11 +271,6 @@ pub(crate) async fn reset_hit(pool: &PgPool, id: &str, item_id: &str) -> Result<
             .await
             .context("reset watch hit")?;
     Ok(deleted.rows_affected() > 0)
-}
-
-/// The launches a watch parked for a stale owner snapshot, closed. Returns the keys closed.
-pub(crate) async fn expire_stale_owner_parks(pool: &PgPool, id: &str) -> Result<Vec<String>> {
-    standing::expire_stale_owner_parks(pool, Trigger::Watch, id).await
 }
 
 /// A tracker's update-time string as the RFC 3339 UTC instant the watermark stores and compares.
@@ -515,14 +502,12 @@ pub(crate) async fn sweep(
     trackers: &Trackers,
     cfg: SweepCfg,
     now: Timestamp,
-    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
 ) -> Result<Vec<String>> {
     standing::sweep(
         db,
         &WatchTrigger::new(trackers.clone()),
         cfg,
         now,
-        refresh,
         None,
         &[],
     )
@@ -622,7 +607,6 @@ mod tests {
     fn cfg() -> SweepCfg {
         SweepCfg {
             auto_disable_after: 5,
-            owner_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -690,7 +674,7 @@ mod tests {
         ]);
         let trackers = trackers_for(addr);
 
-        let minted = sweep(&db, &trackers, cfg(), Timestamp::now(), None)
+        let minted = sweep(&db, &trackers, cfg(), Timestamp::now())
             .await
             .expect("sweep");
         assert_eq!(minted.len(), 2);
@@ -713,7 +697,7 @@ mod tests {
             .expect("title");
         assert_eq!(title, "Evidence-gated backport: ACME-10192");
 
-        let again = sweep(&db, &trackers, cfg(), Timestamp::now(), None)
+        let again = sweep(&db, &trackers, cfg(), Timestamp::now())
             .await
             .expect("resweep");
         assert!(again.is_empty(), "{again:?}");
@@ -737,8 +721,8 @@ mod tests {
         let a = (Db::new(pool.clone()), trackers.clone());
         let b = (Db::new(pool.clone()), trackers);
         let (first, second) = tokio::join!(
-            tokio::spawn(async move { sweep(&a.0, &a.1, cfg(), Timestamp::now(), None).await }),
-            tokio::spawn(async move { sweep(&b.0, &b.1, cfg(), Timestamp::now(), None).await }),
+            tokio::spawn(async move { sweep(&a.0, &a.1, cfg(), Timestamp::now()).await }),
+            tokio::spawn(async move { sweep(&b.0, &b.1, cfg(), Timestamp::now()).await }),
         );
         let minted = first.expect("join").expect("sweep").len()
             + second.expect("join").expect("sweep").len();
@@ -756,11 +740,11 @@ mod tests {
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
         let addr = spawn_server(vec![all_at(&refs), all_at(&refs)]);
         let trackers = trackers_for(addr);
-        let first = sweep(&db, &trackers, cfg(), Timestamp::now(), None)
+        let first = sweep(&db, &trackers, cfg(), Timestamp::now())
             .await
             .expect("sweep");
         assert_eq!(first.len(), LAUNCH_CAP);
-        let second = sweep(&db, &trackers, cfg(), Timestamp::now(), None)
+        let second = sweep(&db, &trackers, cfg(), Timestamp::now())
             .await
             .expect("sweep");
         assert_eq!(second.len(), 12 - LAUNCH_CAP);
@@ -776,7 +760,7 @@ mod tests {
             ("ACME-1", "2026-08-26T12:00:00.000+0000"),
             ("ACME-2", "2026-08-28T09:30:00.000+0200"),
         ])]);
-        let minted = sweep(&db, &trackers_for(addr), cfg(), Timestamp::now(), None)
+        let minted = sweep(&db, &trackers_for(addr), cfg(), Timestamp::now())
             .await
             .expect("sweep");
         assert_eq!(minted.len(), 1);
@@ -841,7 +825,7 @@ mod tests {
         let watch = watch_since(&pool, "2026-08-01T00:00:00Z").await;
         // lowercase key: the pack's pattern refuses it.
         let addr = spawn_server(vec![all_at(&["bogus-1"])]);
-        let minted = sweep(&db, &trackers_for(addr), cfg(), Timestamp::now(), None)
+        let minted = sweep(&db, &trackers_for(addr), cfg(), Timestamp::now())
             .await
             .expect("sweep");
         assert!(minted.is_empty());
@@ -869,9 +853,8 @@ mod tests {
         let trackers = trackers_for(addr);
         let cfg = SweepCfg {
             auto_disable_after: 2,
-            ..cfg()
         };
-        sweep(&db, &trackers, cfg, Timestamp::now(), None)
+        sweep(&db, &trackers, cfg, Timestamp::now())
             .await
             .expect("first");
         assert!(
@@ -881,7 +864,7 @@ mod tests {
                 .expect("row")
                 .enabled
         );
-        sweep(&db, &trackers, cfg, Timestamp::now(), None)
+        sweep(&db, &trackers, cfg, Timestamp::now())
             .await
             .expect("second");
         let stored = get(&pool, &watch.id).await.expect("get").expect("row");
@@ -901,7 +884,7 @@ mod tests {
             "{reason:?}"
         );
         // Disabled: the sweep reads nothing, so a third body would go unconsumed.
-        let third = sweep(&db, &trackers, cfg, Timestamp::now(), None)
+        let third = sweep(&db, &trackers, cfg, Timestamp::now())
             .await
             .expect("third");
         assert!(third.is_empty());
@@ -915,7 +898,7 @@ mod tests {
         let addr = spawn_server(vec![all_at(&["ACME-7"]), all_at(&["ACME-7"])]);
         let trackers = trackers_for(addr);
         assert_eq!(
-            sweep(&db, &trackers, cfg(), Timestamp::now(), None)
+            sweep(&db, &trackers, cfg(), Timestamp::now())
                 .await
                 .expect("sweep")
                 .len(),
@@ -924,7 +907,7 @@ mod tests {
         assert!(reset_hit(&pool, &watch.id, "ACME-7").await.expect("reset"));
         assert!(!reset_hit(&pool, &watch.id, "ACME-7").await.expect("reset"));
         assert_eq!(
-            sweep(&db, &trackers, cfg(), Timestamp::now(), None)
+            sweep(&db, &trackers, cfg(), Timestamp::now())
                 .await
                 .expect("sweep")
                 .len(),
@@ -938,7 +921,7 @@ mod tests {
         register_backport(&pool).await;
         let db = Db::new(pool.clone());
         let watch = watch_since(&pool, "2026-08-01T00:00:00Z").await;
-        let minted = sweep(&db, &Trackers::default(), cfg(), Timestamp::now(), None)
+        let minted = sweep(&db, &Trackers::default(), cfg(), Timestamp::now())
             .await
             .expect("sweep");
         assert!(minted.is_empty());
@@ -947,7 +930,7 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_watch_on_a_bound_scope_parks_without_an_owner_snapshot(pool: PgPool) {
+    async fn a_watch_on_a_bound_scope_launches_and_parks_nothing(pool: PgPool) {
         use crate::authz::model::Principal;
         use crate::secrets::store::{NewBinding, NewSecret};
         use crate::secrets::{
@@ -995,35 +978,17 @@ mod tests {
         .expect("bind");
         drop(conn);
         let db = Db::new(pool.clone());
-        let watch = watch_since(&pool, "2026-08-01T00:00:00Z").await;
+        watch_since(&pool, "2026-08-01T00:00:00Z").await;
         let addr = spawn_server(vec![all_at(&["ACME-9"])]);
-        let minted = sweep(&db, &trackers_for(addr), cfg(), Timestamp::now(), None)
+        let minted = sweep(&db, &trackers_for(addr), cfg(), Timestamp::now())
             .await
             .expect("sweep");
-        assert!(minted.is_empty(), "a parked launch is not enqueued");
-        let rows = launch_rows(&pool).await;
-        assert_eq!(
-            rows.len(),
-            1,
-            "the launch row exists so the history is honest"
-        );
-        let (status, reason): (String, Option<String>) =
-            sqlx::query_as("SELECT status, parked_reason FROM issues WHERE key = $1")
-                .bind(&rows[0].0)
-                .fetch_one(&pool)
-                .await
-                .expect("issue");
-        assert_eq!(status, "parked");
-        assert!(
-            reason.as_deref().is_some_and(
-                |r| r.starts_with(&format!("watch {} owner snapshot is stale", watch.id))
-            ),
-            "{reason:?}"
-        );
-        let expired = expire_stale_owner_parks(&pool, &watch.id)
+        assert_eq!(minted.len(), 1, "the launch is enqueued");
+        let parked: i64 = sqlx::query_scalar("SELECT count(*) FROM issues WHERE status = 'parked'")
+            .fetch_one(&pool)
             .await
-            .expect("expire");
-        assert_eq!(expired, vec![rows[0].0.clone()]);
+            .expect("count");
+        assert_eq!(parked, 0);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -1096,7 +1061,6 @@ mod tests {
             "kept without since"
         );
         assert_eq!(edited.owner_principal.as_deref(), Some("user:tms"));
-        assert!(edited.owner_groups_at.is_some());
         assert!(delete(&pool, &watch.id).await.expect("delete"));
         assert!(get(&pool, &watch.id).await.expect("get").is_none());
         assert_eq!(hit_count(&pool).await, 0);

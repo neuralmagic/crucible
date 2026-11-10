@@ -11,10 +11,13 @@ use crate::agent_auth::cluster_spire::ClusterSpire;
 use crate::agent_auth::issuer::{IssuerUrl, TOKEN_PATH, parse_list};
 use crate::secrets::deliver::Delivery;
 use anyhow::Context;
-use crucible::deploy::servers::ServerSpec;
+use crucible::deploy::servers::{Hosting, ServerSpec};
 use crucible::openshell::gateway::SANDBOX_SPIFFE_SOCKET_ENV;
 use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS};
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
+use crucible_contract::task_servers::{
+    ENV_RUN_SERVERS, ENV_TASK_SVID_AUDIENCE, ENV_TASK_TOKEN_ENDPOINT, RunServer,
+};
 
 /// Where sandboxes get agent tokens and for what: the controller's issuer identifier (the SVID
 /// audience), the token endpoint supervisors reach (the issuer's own unless an operator routed it
@@ -111,6 +114,66 @@ pub fn access(
             ),
             (ENV_AGENT_SERVERS.to_string(), encoded),
             (SANDBOX_SPIFFE_SOCKET_ENV.to_string(), socket.to_string()),
+        ],
+        ..Delivery::default()
+    }))
+}
+
+/// The endpoint a run's engine exchanges its pod token at for task tokens: the issuer's, unless an
+/// operator routed it elsewhere. `None` when the controller has no issuer.
+pub fn task_endpoint(cfg: &crate::config::ControllerCfg) -> anyhow::Result<Option<TaskEndpoint>> {
+    if !cfg.issues_run_tokens() {
+        return Ok(None);
+    }
+    let issuer = IssuerUrl::parse(cfg.agent_issuer.as_deref().unwrap_or_default())?;
+    Ok(Some(TaskEndpoint {
+        url: cfg
+            .agent_token_endpoint
+            .clone()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| issuer.endpoint(TOKEN_PATH)),
+        svid_audience: issuer.as_str().to_string(),
+    }))
+}
+
+/// Where a run's engine gets task tokens, and the audience it requests its pod's JWT-SVID for
+/// where the cluster gives loop pods one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEndpoint {
+    pub url: String,
+    pub svid_audience: String,
+}
+
+/// The loop pod's env for the servers the command and evaluate tasks of a run on `cluster` may
+/// reach: each server serving it from outside the loop pod, and `endpoint`. `None` when there is
+/// none. A task token is issued for the run's pod token, so this needs no SPIRE.
+pub fn task_access(
+    servers: &[ServerSpec],
+    cluster: &str,
+    endpoint: &TaskEndpoint,
+) -> anyhow::Result<Option<Delivery>> {
+    let reachable: Vec<RunServer> = servers
+        .iter()
+        .filter(|s| s.serves(cluster) && matches!(s.hosting, Hosting::Remote))
+        .map(|s| RunServer {
+            name: s.name.clone(),
+            url: s.url.clone(),
+            scopes: s.scopes.clone(),
+        })
+        .collect();
+    if reachable.is_empty() {
+        return Ok(None);
+    }
+    let encoded = crucible_contract::task_servers::encode_run_servers(&reachable)
+        .context("encoding the run's task servers")?;
+    Ok(Some(Delivery {
+        plain_env: vec![
+            (ENV_TASK_TOKEN_ENDPOINT.to_string(), endpoint.url.clone()),
+            (
+                ENV_TASK_SVID_AUDIENCE.to_string(),
+                endpoint.svid_audience.clone(),
+            ),
+            (ENV_RUN_SERVERS.to_string(), encoded),
         ],
         ..Delivery::default()
     }))
@@ -269,6 +332,45 @@ mod tests {
                 .is_none(),
             "no SPIRE for ocp, so no tokens for its sandboxes"
         );
+    }
+
+    #[test]
+    fn a_runs_tasks_get_the_remote_servers_of_its_cluster_with_no_spire() {
+        const ISSUER: &str = "http://crucible-controller.crucible-system.svc:8080";
+        let endpoint = TaskEndpoint {
+            url: format!("{ISSUER}/oauth/token"),
+            svid_audience: ISSUER.into(),
+        };
+        let all = servers(&format!("{KUEUE}{BUILDIT}"));
+        let delivery = task_access(&all, "ocp", &endpoint)
+            .unwrap()
+            .expect("access");
+        assert!(delivery.env.is_empty(), "nothing secret is delivered");
+        let env = env_of(&delivery);
+        assert_eq!(
+            env.keys().copied().collect::<Vec<_>>(),
+            [
+                ENV_RUN_SERVERS,
+                ENV_TASK_SVID_AUDIENCE,
+                ENV_TASK_TOKEN_ENDPOINT
+            ]
+        );
+        assert_eq!(env[ENV_TASK_TOKEN_ENDPOINT], endpoint.url);
+        assert_eq!(env[ENV_TASK_SVID_AUDIENCE], ISSUER);
+        assert_eq!(
+            crucible_contract::task_servers::decode_run_servers(env[ENV_RUN_SERVERS]).unwrap(),
+            [RunServer {
+                name: crucible_contract::agent_servers::ServerName::parse("kueue").unwrap(),
+                url: KUEUE_URL.into(),
+                scopes: vec!["kueue.read".into(), "kueue.submit".into()],
+            }],
+            "buildit runs in the loop pod and takes tokens from sandboxes only"
+        );
+        assert!(
+            task_access(&all, "k8s", &endpoint).unwrap().is_none(),
+            "only buildit serves k8s"
+        );
+        assert!(task_access(&all, "hub", &endpoint).unwrap().is_none());
     }
 
     /// The loop pod gets the builder pods of the cluster its run was dispatched onto.

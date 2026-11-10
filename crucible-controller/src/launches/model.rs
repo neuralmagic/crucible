@@ -30,7 +30,11 @@ pub(crate) struct NewPlaybookLaunch<'a> {
     pub origin: LaunchOrigin,
     /// The draft version this run froze. `None` = `playbook` names a registered pack.
     pub draft_version: Option<i64>,
+    /// The login a launch's secrets are decided for: its creator, or a standing launch's user
+    /// owner.
     pub created_by: Option<&'a str>,
+    /// The principal the launch's runs belong to: `team:<slug>` or `user:<login>`.
+    pub owner: Option<&'a str>,
     /// The groups the launcher's claims carried, as a JSON array. `created_by` is only half an
     /// identity: a group-owned secret needs the memberships too.
     pub launcher_groups: Option<&'a serde_json::Value>,
@@ -38,6 +42,8 @@ pub(crate) struct NewPlaybookLaunch<'a> {
     pub rerun: Option<&'a RerunOf>,
     /// Where the launch dispatches and with which model, written with the launch row.
     pub dispatch: DispatchPin<'a>,
+    /// The `{param: {run_id, digest}}` choice snapshots admission validated against (ADR-0074).
+    pub choice_snapshots: Option<&'a serde_json::Value>,
 }
 
 /// The cluster and the provider/model a launch dispatches with. Written in the transaction that

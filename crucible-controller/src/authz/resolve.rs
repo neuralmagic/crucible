@@ -181,52 +181,31 @@ pub async fn recorded_principals(
 }
 
 /// A launch's principals at dispatch: the groups it recorded that its launcher still holds, and the
-/// teams those reach now. What the launcher holds is their stored groups, re-read through their
-/// offline credential as a session's are; an issuer that cannot be asked is the inner error. A
-/// launcher with no `users` row keeps the recorded groups only while the launch is younger than the
-/// session group refresh window.
+/// teams those reach now. What the launcher holds is the groups their last sign-in stamped; a
+/// launcher with no `users` row holds none.
 pub async fn dispatch_principals(
     pool: &sqlx::PgPool,
-    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
     login: Option<&str>,
     recorded: &[String],
-    launched_at: &str,
-) -> anyhow::Result<
-    Result<crate::authz::model::Principals, crate::identity::oidc::credentials::GroupsUnavailable>,
-> {
-    use crate::identity::oidc::{credentials, users};
-    let row = match login {
-        Some(login) => users::stamped(pool, login).await?,
-        None => None,
+) -> anyhow::Result<crate::authz::model::Principals> {
+    let current = match login {
+        Some(login) => crate::identity::oidc::users::stamped(pool, login)
+            .await?
+            .map(|(_, groups, _)| groups)
+            .unwrap_or_default(),
+        None => Vec::new(),
     };
-    let current = match row {
-        Some((sub, groups, at)) => {
-            match credentials::current_groups(refresh, &sub, groups, at.as_deref()).await {
-                Ok(groups) => Some(groups),
-                Err(unavailable) => return Ok(Err(unavailable)),
-            }
-        }
-        None => users::stale(
-            launched_at,
-            jiff::Timestamp::now(),
-            users::session_group_refresh_interval(),
-        )
-        .then(Vec::new),
-    };
-    let held = held_groups(recorded, current.as_deref());
-    recorded_principals(pool, login, &held).await.map(Ok)
+    let held = held_groups(recorded, &current);
+    recorded_principals(pool, login, &held).await
 }
 
-/// The recorded groups the current record still holds, in recorded order. No record keeps them all.
-fn held_groups(recorded: &[String], current: Option<&[String]>) -> Vec<String> {
-    match current {
-        Some(current) => recorded
-            .iter()
-            .filter(|g| current.contains(g))
-            .cloned()
-            .collect(),
-        None => recorded.to_vec(),
-    }
+/// The recorded groups the current record still holds, in recorded order.
+fn held_groups(recorded: &[String], current: &[String]) -> Vec<String> {
+    recorded
+        .iter()
+        .filter(|g| current.contains(g))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -296,7 +275,7 @@ mod tests {
         assert!(!held.contains_key(&slug("ops")));
     }
 
-    /// A static token or a downgraded session: only the login counts, and
+    /// A static token: only the login counts, and
     /// nothing a group or rule would have conferred leaks through a nested team.
     #[test]
     fn a_credential_without_groups_holds_only_login_derived_memberships() {
@@ -400,12 +379,11 @@ mod tests {
         let recorded = vec!["/g/a".to_string(), "/g/b".to_string(), "/g/c".to_string()];
         let current = vec!["/g/c".to_string(), "/g/a".to_string(), "/g/new".to_string()];
         assert_eq!(
-            held_groups(&recorded, Some(&current)),
+            held_groups(&recorded, &current),
             vec!["/g/a".to_string(), "/g/c".to_string()],
             "a group gained since the launch is not added, one lost is dropped"
         );
-        assert!(held_groups(&recorded, Some(&[])).is_empty());
-        assert_eq!(held_groups(&recorded, None), recorded);
-        assert!(held_groups(&[], Some(&current)).is_empty());
+        assert!(held_groups(&recorded, &[]).is_empty());
+        assert!(held_groups(&[], &current).is_empty());
     }
 }

@@ -21,9 +21,6 @@ pub struct ServerSpec {
     pub scopes: Vec<String>,
     /// The dispatch clusters whose runs get the server.
     pub clusters: Vec<String>,
-    /// Whether the server authorizes as the token's `kube_user`, so a token without one is
-    /// useless and is refused.
-    pub requires_kube_user: bool,
     /// The namespaces a token for the server names, the first as the default. Empty: none.
     pub namespaces: Vec<String>,
     pub hosting: Hosting,
@@ -172,7 +169,6 @@ impl DeployProfile {
                     .map(String::from)
                     .to_vec(),
                 clusters: k.clusters.clone(),
-                requires_kube_user: true,
                 namespaces,
                 hosting: Hosting::Remote,
                 limits,
@@ -201,7 +197,6 @@ impl DeployProfile {
                     .map(String::from)
                     .to_vec(),
                 clusters: b.clusters.clone(),
-                requires_kube_user: false,
                 namespaces: Vec::new(),
                 hosting: Hosting::Buildit {
                     namespace: b.namespace.to_string(),
@@ -235,7 +230,6 @@ impl DeployProfile {
                 url: g.url(),
                 scopes: Scope::GIT.map(|s| s.as_str().to_string()).to_vec(),
                 clusters: g.clusters.clone(),
-                requires_kube_user: false,
                 namespaces: Vec::new(),
                 hosting: Hosting::Git {
                     run_jwks_uri: g.run_jwks_uri.clone(),
@@ -250,7 +244,6 @@ impl DeployProfile {
                 url: s.url.to_string(),
                 scopes: s.scopes.clone(),
                 clusters: s.clusters.clone(),
-                requires_kube_user: s.requires_kube_user,
                 limits: namespace_limit(&namespaces),
                 namespaces,
                 hosting: Hosting::Remote,
@@ -379,7 +372,7 @@ mod tests {
     }
 
     #[test]
-    fn kueue_needs_a_kube_user_and_names_its_namespaces_and_buildit_runs_in_the_loop_pod() {
+    fn kueue_names_its_namespaces_and_buildit_runs_in_the_loop_pod() {
         let servers = profile(KUEUE_AND_BUILDIT).agent_servers().unwrap();
         assert_eq!(
             servers,
@@ -389,7 +382,6 @@ mod tests {
                     url: "http://crucible-kueue.kueue-server.svc.cluster.local:8850/mcp".into(),
                     scopes: vec!["kueue.read".into(), "kueue.submit".into()],
                     clusters: vec!["ocp".into(), "k8s".into()],
-                    requires_kube_user: true,
                     namespaces: vec!["team-a".into(), "team-b".into()],
                     hosting: Hosting::Remote,
                     limits: BTreeMap::from([
@@ -402,7 +394,6 @@ mod tests {
                     url: crucible_contract::buildit::URL.into(),
                     scopes: vec!["buildit.read".into(), "buildit.build".into()],
                     clusters: vec!["ocp".into()],
-                    requires_kube_user: false,
                     namespaces: vec![],
                     hosting: Hosting::Buildit {
                         namespace: "builds".into(),
@@ -598,7 +589,6 @@ mod tests {
             url = "https://vault-mcp.tools.svc:8443/mcp"
             scopes = ["vault.read"]
             clusters = ["ocp"]
-            requires_kube_user = true
             namespaces = ["team-a"]
             [[agent_servers]]
             name = "docs"
@@ -615,14 +605,13 @@ mod tests {
                 url: "https://vault-mcp.tools.svc:8443/mcp".into(),
                 scopes: vec!["vault.read".into()],
                 clusters: vec!["ocp".into()],
-                requires_kube_user: true,
                 namespaces: vec!["team-a".into()],
                 hosting: Hosting::Remote,
                 limits: BTreeMap::from([("namespace".into(), "team-a".into())]),
             }
         );
         assert_eq!(servers[1].clusters, ["hub"]);
-        assert!(!servers[1].requires_kube_user && servers[1].namespaces.is_empty());
+        assert!(servers[1].namespaces.is_empty());
     }
 
     #[test]

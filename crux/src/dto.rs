@@ -7,7 +7,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A string the list endpoints cut and the detail endpoints send whole.
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -216,10 +216,14 @@ pub struct ScopeDetail {
     pub runs: Vec<RunDetail>,
 }
 
+/// One status transition the controller recorded.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Event {
     #[serde(default)]
     pub ts: String,
+    /// The issue or launch that moved.
+    #[serde(default)]
+    pub key: String,
     #[serde(default)]
     pub from: String,
     #[serde(default)]
@@ -431,12 +435,302 @@ pub struct KeptPr {
     pub pr_url: String,
 }
 
+/// `POST /api/playbook-runs/{key}/cancel`: the launch, who asked, and the reason it is parked under.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct CancelAck {
+    pub key: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+    pub reason: String,
+}
+
+/// An API key's public half. Its secret is shown once, when it is minted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApiKey {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+}
+
+/// `POST /api/keys`: the new key and its secret, which no later response carries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MintedKey {
+    #[serde(flatten)]
+    pub key: ApiKey,
+    pub secret: String,
+    /// Where an MCP client reaches this controller, when it serves one.
+    #[serde(default)]
+    pub mcp_url: Option<String>,
+}
+
+/// Who vouches for an MCP client: the operator, the host publishing its document, or nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpClientKind {
+    Registered,
+    Metadata,
+    Dynamic,
+}
+
+/// One MCP client approval whose refresh token is still live.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpSignIn {
+    pub client_id: String,
+    pub client_name: String,
+    #[serde(default)]
+    pub client_host: Option<String>,
+    pub client_kind: McpClientKind,
+    pub resource: String,
+    pub cluster: String,
+    pub approved_at: String,
+    pub last_used_at: String,
+}
+
+/// Whether the controller signs MCP clients in, and the caller's live approvals when it does.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpSignIns {
+    pub enabled: bool,
+    #[serde(default)]
+    pub sign_ins: Vec<McpSignIn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct McpSignedOut {
+    pub revoked: u64,
+}
+
+/// One controller setting: its effective value and where that came from.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Knob {
+    pub name: String,
+    pub value: serde_json::Value,
+    /// `default`, `env` or `override`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub overridable: bool,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// `GET /api/config`: the controller's settings as they are in effect.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ControllerConfig {
+    #[serde(default)]
+    pub knobs: Vec<Knob>,
+}
+
+/// `GET /api/access`: who administers and operates the controller, and the orgs a repo may be
+/// added from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Access {
+    #[serde(default)]
+    pub admins: Vec<String>,
+    #[serde(default)]
+    pub operators: Vec<String>,
+    #[serde(default)]
+    pub allowed_orgs: Vec<String>,
+}
+
+/// Whether the controller dispatches on its own, and who last changed that.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Autopilot {
+    pub enabled: bool,
+    #[serde(default)]
+    pub changed_by: Option<String>,
+    #[serde(default)]
+    pub changed_at: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A repo discovery sweeps, with how many of its issues sit in each state.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WatchedRepo {
+    pub repo: String,
+    #[serde(default)]
+    pub running: i64,
+    #[serde(default)]
+    pub pr_open: i64,
+    #[serde(default)]
+    pub parked: i64,
+    #[serde(default)]
+    pub done: i64,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub watermark: Option<String>,
+    #[serde(default)]
+    pub watched: bool,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub added_by: Option<String>,
+}
+
+/// One stored authorization policy set. Exactly one is active.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PolicySet {
+    pub digest: String,
+    /// The Cedar source.
+    pub text: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub activated_by: Option<String>,
+    #[serde(default)]
+    pub activated_at: Option<String>,
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// `GET /api/authz/explain`: how the active policy decides one action for one user, and the
+/// rules that decided it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Explanation {
+    pub login: String,
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+    #[serde(default)]
+    pub owner: String,
+    pub allowed: bool,
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
+/// A role in a team, least first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRole {
+    Member,
+    Maintainer,
+    Owner,
+}
+
+/// How a team holds a member: a login, a group claim, another team, or a rule over claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberKind {
+    User,
+    Team,
+    Group,
+    Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TeamMember {
+    pub kind: MemberKind,
+    pub member: String,
+    pub role: TeamRole,
+    #[serde(default)]
+    pub since: String,
+    #[serde(default)]
+    pub added_by: Option<String>,
+    /// Whether a `user` member has ever signed in.
+    #[serde(default)]
+    pub signed_in: bool,
+}
+
+/// A member as a `PUT /api/teams/{slug}/members` body spells it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TeamMemberBody {
+    pub kind: MemberKind,
+    pub member: String,
+    pub role: TeamRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Team {
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub members: Vec<TeamMember>,
+    /// The caller's role in it, when they are in it.
+    #[serde(default)]
+    pub my_role: Option<TeamRole>,
+    /// Whether any user can reach the team through its members.
+    #[serde(default)]
+    pub reachable: bool,
+}
+
+/// One line of a team's audit trail.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TeamAudit {
+    pub id: i64,
+    pub at: String,
+    pub actor: String,
+    pub action: String,
+    #[serde(default)]
+    pub decision: String,
+    #[serde(default)]
+    pub rule: String,
+}
+
+/// A pack import waiting for an operator to register or discard it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PendingImport {
+    pub id: String,
+    pub repo: String,
+    #[serde(default)]
+    pub path: String,
+    pub rev: String,
+    #[serde(default)]
+    pub proposed_by: Option<String>,
+    pub created_at: String,
+    /// The pinned engine extracted a form, so the import can be registered.
+    #[serde(default)]
+    pub compiles: bool,
+    #[serde(default)]
+    pub diagnostics: i64,
+    /// The draft seeded from this import, once one was.
+    #[serde(default)]
+    pub draft_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Approvals {
     #[serde(default)]
     pub awaiting_approval: Vec<AwaitingApproval>,
     #[serde(default)]
+    pub pending_imports: Vec<PendingImport>,
+    #[serde(default)]
     pub kept_prs: Vec<KeptPr>,
+}
+
+impl Approvals {
+    /// What waits on a person: scope packs to approve and imports to settle.
+    pub fn waiting(&self) -> usize {
+        self.awaiting_approval.len() + self.pending_imports.len()
+    }
+}
+
+/// `POST /api/playbooks/imports/{id}/register`: the registry id and description to register as.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisterImport<'a> {
+    pub id: &'a str,
+    pub description: &'a str,
+}
+
+/// What a registration pinned.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Registered {
+    pub id: String,
+    pub rev: String,
+    #[serde(default)]
+    pub schema_changed: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -522,7 +816,7 @@ impl std::fmt::Display for ControllerAuthMode {
 
 /// `GET /api/whoami`: what the controller thinks of the caller after all the headers landed.
 ///
-/// `mode`, `groups` and `downgraded` are what the controller says about its own side of the
+/// `mode` and `groups` are what the controller says about its own side of the
 /// exchange, and are read beside the client's view of the credential so the two can be compared.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Whoami {
@@ -536,8 +830,35 @@ pub struct Whoami {
     pub groups: Vec<String>,
     #[serde(default)]
     pub mode: Option<ControllerAuthMode>,
+    /// The teams the caller belongs to, which it may act and own things as.
     #[serde(default)]
-    pub downgraded: bool,
+    pub teams: Vec<WhoamiTeam>,
+    /// The lanes the caller may use, such as `autoresearch`.
+    #[serde(default)]
+    pub entitlements: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WhoamiTeam {
+    pub team: String,
+    #[serde(default)]
+    pub role: String,
+}
+
+/// Param values as a schedule stores them: every one a string.
+pub fn string_params(
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    params
+        .iter()
+        .map(|(name, value)| {
+            let text = match value {
+                serde_json::Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            (name.clone(), serde_json::Value::String(text))
+        })
+        .collect()
 }
 
 /// `POST /api/playbooks/imports`: a proposal frozen at the commit the fetch resolved to.
@@ -649,6 +970,9 @@ pub struct DraftCompile {
     pub saved_at: String,
     #[serde(default)]
     pub schema_digest: Option<String>,
+    /// The params schema this version's launches are validated against.
+    #[serde(default)]
+    pub params_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub diagnostics: Vec<Diagnostic>,
     #[serde(default)]
@@ -803,14 +1127,47 @@ pub struct PlaybookCaps {
     pub max_time: String,
 }
 
+/// One task a rerun reuses, with what it cost the run that settled it.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ReusedTask {
+    pub task: String,
+    #[serde(default)]
+    pub cost_usd: f64,
+}
+
+/// `GET /api/runs/{id}/rerun`: what a rerun would reuse and dispatch again, against the pack it
+/// would run. A non-empty `changed` means it is refused until those tasks rerun too.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct RerunPreview {
+    pub run_id: String,
+    pub playbook: String,
+    #[serde(default)]
+    pub draft_version: Option<i64>,
+    #[serde(default)]
+    pub reused: Vec<ReusedTask>,
+    #[serde(default)]
+    pub rerun: Vec<String>,
+    #[serde(default)]
+    pub reused_usd: f64,
+    #[serde(default)]
+    pub changed: Vec<String>,
+}
+
 /// An inference provider registration as the admin list returns it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Provider {
     pub id: String,
+    #[serde(default)]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub kind: String,
     #[serde(default)]
     pub default_model: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// What the provider serves: `agent`, and others a launch does not pick.
+    #[serde(default)]
+    pub roles: Vec<String>,
     #[serde(default)]
     pub harness: Option<String>,
     #[serde(default)]
@@ -819,10 +1176,105 @@ pub struct Provider {
     pub enabled: bool,
     #[serde(default)]
     pub owner: String,
+    /// The base URL a `custom` provider is reached at.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<InferenceProtocol>,
+    /// The agent CLI the registration names, when it overrides the kind's default.
+    #[serde(default)]
+    pub harness_override: Option<String>,
+    #[serde(default)]
+    pub secret_name: Option<String>,
+    #[serde(default)]
+    pub secret_owner: Option<String>,
+    /// What the caller may do to it: `update`, `delete` and the like.
+    #[serde(default)]
+    pub actions: Vec<String>,
+}
+
+/// Which service a provider registration talks to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    Openai,
+    Anthropic,
+    Vertex,
+    /// The registration's own endpoint: vLLM, a proxy, a gateway.
+    Custom,
+}
+
+/// The wire protocol a `custom` provider's endpoint speaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+    Messages,
+    Decisions,
+    SystemOne,
+}
+
+/// A provider as `PUT /api/providers/{id}` takes it. Fields a kind has no use for stay off the
+/// wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderBody {
+    pub display_name: String,
+    pub kind: ProviderKind,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<InferenceProtocol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_owner: Option<String>,
+    pub enabled: bool,
+}
+
+/// `POST /api/providers`: a new registration under `id`, owned by `owner`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegisterProvider {
+    pub id: String,
+    pub owner: String,
+    #[serde(flatten)]
+    pub provider: ProviderBody,
+}
+
+/// `GET /api/dispatch-targets`: where the caller may dispatch, default first.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct DispatchTargets {
+    #[serde(default)]
+    pub targets: Vec<DispatchTarget>,
+    /// Why the list is empty, when it is.
+    #[serde(default)]
+    pub refusal: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DispatchTarget {
+    /// What a launch sends back as `dispatch_target`.
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    /// `hub`, `spoke` or `personal`.
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 /// USD per million tokens for each billed bucket.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 pub struct ProviderPrice {
     pub input: f64,
     pub output: f64,
@@ -843,6 +1295,151 @@ pub struct Secret {
     pub visibility: String,
     #[serde(default)]
     pub mode: String,
+    #[serde(default)]
+    pub consumer: String,
+    /// The Vault version a managed secret is at; references and minted secrets have none.
+    #[serde(default)]
+    pub current_version: Option<i64>,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
+}
+
+/// A secret and every scope it is bound at.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecretDetail {
+    #[serde(flatten)]
+    pub secret: Secret,
+    #[serde(default)]
+    pub bindings: Vec<SecretBinding>,
+}
+
+/// One entry of a secret's audit trail.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecretAudit {
+    pub id: i64,
+    pub action: String,
+    #[serde(default)]
+    pub actor: Option<String>,
+    #[serde(default)]
+    pub subject: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub at: String,
+}
+
+/// Who else may use a playbook, draft or provider, at what role, until when.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Share {
+    pub grantee: String,
+    /// `viewer`, `launcher` or `editor`.
+    pub role: String,
+    #[serde(default)]
+    pub not_after: Option<String>,
+    #[serde(default)]
+    pub expired: bool,
+    #[serde(default)]
+    pub created_by: Option<String>,
+}
+
+/// The open decision requests the caller may answer.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Decisions {
+    pub open: Vec<DecisionSummary>,
+}
+
+/// An open decision request, as the queue lists it.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionSummary {
+    pub id: String,
+    pub run_id: String,
+    pub task: String,
+    #[serde(default)]
+    pub launch_key: Option<String>,
+    #[serde(default)]
+    pub questions: Vec<String>,
+    pub opened_at: String,
+    pub expires_at: String,
+}
+
+/// A decision request with the evidence it was opened on.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct Decision {
+    pub id: String,
+    pub run_id: String,
+    pub task: String,
+    #[serde(default)]
+    pub launch_key: Option<String>,
+    /// `open`, `answered`, `expired` or `withdrawn`.
+    pub state: String,
+    pub opened_at: String,
+    pub expires_at: String,
+    pub questions: Vec<DecisionQuestion>,
+    #[serde(default)]
+    pub inputs: Vec<DecisionInput>,
+    #[serde(default)]
+    pub spent_usd: f64,
+    #[serde(default)]
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub max_cost_usd: f64,
+    #[serde(default)]
+    pub max_time_secs: Option<u64>,
+    #[serde(default)]
+    pub gated: Vec<DecisionGated>,
+    /// The rendered review, CommonMark.
+    #[serde(default)]
+    pub review: Option<String>,
+    pub evidence_digest: String,
+    #[serde(default)]
+    pub answer: Option<DecisionAnswer>,
+    #[serde(default)]
+    pub can_answer: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionQuestion {
+    pub id: String,
+    #[serde(default)]
+    pub instructions: Option<String>,
+    /// `noul`, `choice`, `score` or `pick`.
+    pub kind: String,
+    #[serde(default)]
+    pub multiple: bool,
+    pub options: Vec<String>,
+}
+
+/// An upstream task's result the request shows.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionInput {
+    pub task: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
+}
+
+/// A task the answer decides whether to run.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionGated {
+    pub name: String,
+    #[serde(default)]
+    pub kind: String,
+    pub question: String,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct DecisionAnswer {
+    pub labels: std::collections::BTreeMap<String, Vec<String>>,
+    pub decided_by: String,
+    pub decided_at: String,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 /// A secret attached to a scope: what a run at that scope gets, and under which name.
@@ -904,6 +1501,100 @@ pub struct PlaybookRun {
     /// The model pinned alongside it; absent takes the provider's default.
     #[serde(default)]
     pub agent_model: Option<String>,
+    /// What authorized it: `manual`, `schedule`, `draft`, `watch`, `webhook`, `deferred`.
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// One launch whole: what it was launched with, where its engine went, and the runs it
+/// dispatched, newest first.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PlaybookLaunch {
+    pub launch: LaunchRecord,
+    /// Whether the draft or registry row it was launched from still exists.
+    #[serde(default)]
+    pub source_exists: bool,
+    pub dispatch: LaunchDispatch,
+    #[serde(default)]
+    pub runs: Vec<LaunchRun>,
+}
+
+/// The frozen launch: its params and the ceilings and agent it was authorized with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LaunchRecord {
+    #[serde(default)]
+    pub params: serde_json::Value,
+    #[serde(default)]
+    pub schema_digest: String,
+    #[serde(default)]
+    pub current_schema_digest: Option<String>,
+    #[serde(default)]
+    pub schema_drifted: bool,
+    #[serde(default)]
+    pub max_cost: f64,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub origin: String,
+    #[serde(default)]
+    pub draft_version: Option<i64>,
+    #[serde(default)]
+    pub schedule: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
+    #[serde(default)]
+    pub agent_model: Option<String>,
+    #[serde(default)]
+    pub transport_losses: i64,
+    #[serde(default)]
+    pub advance_dedupe: bool,
+}
+
+/// Whether the engine ever started: `pending`, `failed` or `dispatched`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LaunchDispatch {
+    pub state: String,
+    #[serde(default)]
+    pub failure: Option<String>,
+    #[serde(default)]
+    pub failed_at: Option<String>,
+    #[serde(default)]
+    pub failures: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct LaunchRun {
+    pub run_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub status: String,
+    /// `pod` or `local`.
+    #[serde(default)]
+    pub dispatch: String,
+    #[serde(default)]
+    pub cluster: String,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default)]
+    pub pod: Option<String>,
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+}
+
+/// `GET /api/playbooks/{id}`: a registered playbook and its pack at the pinned rev.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlaybookDetail {
+    #[serde(flatten)]
+    pub playbook: Playbook,
+    #[serde(default)]
+    pub files: std::collections::BTreeMap<String, String>,
 }
 
 /// A row of the runs leaderboard.
@@ -948,9 +1639,68 @@ pub struct Schedule {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
-    /// The owner has to sign in again before this can fire.
+    /// `adopted` (a frozen Git revision) or `draft_head` (the latest successful draft save).
     #[serde(default)]
-    pub owner_signin_required: bool,
+    pub target_kind: String,
+    /// The values every firing launches.
+    #[serde(default)]
+    pub params: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    pub schema_digest: String,
+    #[serde(default)]
+    pub max_cost: f64,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub advance_dedupe: bool,
+    /// The recurring-input cursor, when it declares one.
+    #[serde(default)]
+    pub cursor: Option<ScheduleCursor>,
+    /// The IANA zone `cron_expr` is read in.
+    #[serde(default)]
+    pub tz: String,
+    #[serde(default)]
+    pub dispatch_target: Option<String>,
+    #[serde(default)]
+    pub agent_provider: Option<String>,
+    #[serde(default)]
+    pub agent_model: Option<String>,
+}
+
+/// Where a schedule's next firing takes its input from: a result path passed as `param`, or a
+/// run file written at `path`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ScheduleCursor {
+    pub from: String,
+    #[serde(default)]
+    pub param: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+impl Schedule {
+    /// The body that saves this schedule back as it stands, but `enabled`. The controller's PUT
+    /// replaces a schedule whole, so every field it stored goes back with it.
+    pub fn body(&self, enabled: bool) -> serde_json::Value {
+        let params = string_params(&self.params);
+        serde_json::json!({
+            "owner": self.owner_principal,
+            "playbook": self.playbook,
+            "target_kind": self.target_kind,
+            "params": params,
+            "max_cost": self.max_cost,
+            "max_time": self.max_time,
+            "cron_expr": self.cron_expr,
+            "tz": self.tz,
+            "schema_digest": (!self.schema_digest.is_empty()).then_some(&self.schema_digest),
+            "advance_dedupe": self.advance_dedupe,
+            "enabled": enabled,
+            "dispatch_target": self.dispatch_target,
+            "provider": self.agent_provider,
+            "model": self.agent_model,
+            "cursor": self.cursor,
+        })
+    }
 }
 
 /// The provider a scope's unpinned dispatches of one workload class take.
@@ -996,12 +1746,9 @@ pub struct Watch {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
-    /// The owner has to sign in again before this can launch.
-    #[serde(default)]
-    pub owner_signin_required: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Webhook {
     pub id: String,
     #[serde(default)]
@@ -1018,12 +1765,105 @@ pub struct Webhook {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
-    /// The owner has to sign in again before this can launch.
+    /// Where senders deliver, when the controller knows its public address.
     #[serde(default)]
-    pub owner_signin_required: bool,
+    pub delivery_url: Option<String>,
+    /// The CEL a delivery must satisfy to launch.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// The CEL whose value marks two deliveries as the same event.
+    #[serde(default)]
+    pub dedupe: Option<String>,
+    /// Param name to the CEL that derives it from a delivery.
+    #[serde(default)]
+    pub derive: std::collections::BTreeMap<String, String>,
+    /// The fixed values every launch carries.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub max_cost: f64,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub dispatch_target: Option<String>,
+    /// The header an `hmac_sha256` webhook reads the signature from.
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub retention_days: i64,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// How a webhook tells a real delivery from a forged one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookVerifier {
+    /// A secret token in the delivery address.
+    #[default]
+    PathToken,
+    /// An HMAC-SHA256 signature of the body in a header.
+    HmacSha256,
+}
+
+/// A webhook as `POST /api/webhooks` and `PUT /api/webhooks/{id}` take it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WebhookBody {
+    pub playbook: String,
+    pub verifier: WebhookVerifier,
+    pub header: Option<String>,
+    pub filter: String,
+    pub dedupe: String,
+    pub derive: std::collections::BTreeMap<String, String>,
+    pub params: std::collections::BTreeMap<String, String>,
+    pub max_launches_per_hour: i32,
+    pub retention_days: i32,
+    pub max_cost: f64,
+    pub max_time: String,
+    pub dispatch_target: Option<String>,
+}
+
+/// A sender's verifier and transform to start a webhook form from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WebhookPreset {
+    pub id: String,
+    pub title: String,
+    pub verifier: WebhookVerifier,
+    #[serde(default)]
+    pub header: Option<String>,
+    pub filter: String,
+    pub dedupe: String,
+    #[serde(default)]
+    pub derive: std::collections::BTreeMap<String, String>,
+}
+
+/// What one expression of a transform came to on a sample delivery.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PreviewResult {
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `POST /api/webhooks/preview`: a transform run on a sample delivery, nothing stored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WebhookPreview {
+    pub filter: PreviewResult,
+    pub dedupe: PreviewResult,
+    pub derive: PreviewResult,
+}
+
+/// `POST /api/webhooks/{id}/secret`: the webhook with its new secret, which no later response
+/// carries.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WebhookSecret {
+    pub webhook: Webhook,
+    pub secret: String,
+    /// The delivery URL, token included for a `path_token` webhook.
+    #[serde(default)]
+    pub delivery_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WebhookDelivery {
     pub id: String,
     #[serde(default)]
@@ -1036,7 +1876,7 @@ pub struct WebhookDelivery {
     pub launch_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CelDiagnostic {
     pub field: String,
     pub message: String,
@@ -1046,7 +1886,7 @@ pub struct CelDiagnostic {
     pub column: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WebhookCheck {
     #[serde(default)]
     pub diagnostics: Vec<CelDiagnostic>,
@@ -1148,8 +1988,30 @@ impl std::str::FromStr for IssueStatus {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::dto::*;
     use std::str::FromStr;
+
+    /// The controller flattens the playbook into its detail, beside the pinned files.
+    #[test]
+    fn a_playbook_detail_reads_the_flattened_playbook_and_its_files() {
+        let detail: PlaybookDetail = serde_json::from_str(
+            r#"{"id":"triage","description":"issue triage","source":{"kind":"git",
+                "repo":"neuralmagic/crucible","git_ref":"main","path":"examples/triage"},
+                "rev":"091a0089278439d8be1745357278ad44422bd56b","tree_digest":"sha256:aa",
+                "files":{"crucible.toml":"[workflow]\n"}}"#,
+        )
+        .expect("a playbook detail");
+        assert_eq!(detail.playbook.id, "triage");
+        assert_eq!(
+            detail.playbook.rev,
+            "091a0089278439d8be1745357278ad44422bd56b"
+        );
+        assert!(matches!(
+            detail.playbook.source,
+            PlaybookSource::Git { ref path, .. } if path == "examples/triage"
+        ));
+        assert_eq!(detail.files["crucible.toml"], "[workflow]\n");
+    }
 
     /// A pack that compiles and still cannot be dispatched is the case the tag exists for: without
     /// it both kinds read as one undifferentiated list, and an agent cannot tell a pack it must fix
@@ -1196,5 +2058,102 @@ mod tests {
             assert!(msg.contains("awaiting-approval"), "{msg}");
             assert!(msg.contains("pr-open"), "{msg}");
         }
+    }
+
+    #[test]
+    fn a_schedule_saves_back_whole_with_only_enabled_changed() {
+        let stored: Schedule = serde_json::from_str(
+            r#"{"id":"s1","playbook":"report","cron_expr":"0 9 * * MON-FRI","enabled":true,
+                "next_due_at":null,"last_fired_at":null,"consecutive_failures":0,
+                "owner_principal":"team:infra","target_kind":"draft_head",
+                "params":{"repo":"owner/repo","limit":5,"dry":true},"schema_digest":"abc",
+                "max_cost":2.5,"max_time":"45m","advance_dedupe":false,"tz":"America/New_York",
+                "dispatch_target":"wharf","agent_provider":"vertex","agent_model":"m",
+                "cursor":{"from":"result","param":"since","path":null}}"#,
+        )
+        .expect("wire shape");
+        assert_eq!(
+            stored.body(false),
+            serde_json::json!({
+                "owner": "team:infra", "playbook": "report", "target_kind": "draft_head",
+                "params": {"repo": "owner/repo", "limit": "5", "dry": "true"},
+                "max_cost": 2.5, "max_time": "45m", "cron_expr": "0 9 * * MON-FRI",
+                "tz": "America/New_York", "schema_digest": "abc", "advance_dedupe": false,
+                "enabled": false, "dispatch_target": "wharf", "provider": "vertex", "model": "m",
+                "cursor": {"from": "result", "param": "since", "path": null},
+            })
+        );
+    }
+
+    #[test]
+    fn a_schedule_with_no_stored_digest_sends_none() {
+        let stored: Schedule = serde_json::from_str(
+            r#"{"id":"s1","playbook":"report","cron_expr":"0 9 * * *","enabled":false,
+                "next_due_at":null,"last_fired_at":null,"consecutive_failures":0}"#,
+        )
+        .expect("wire shape");
+        let body = stored.body(true);
+        assert_eq!(body["schema_digest"], serde_json::Value::Null);
+        assert_eq!(body["enabled"], serde_json::Value::Bool(true));
+        assert_eq!(body["cursor"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn a_secret_detail_reads_the_flattened_secret_and_its_bindings() {
+        let detail: SecretDetail = serde_json::from_str(
+            r#"{"id":"s1","name":"gh","owner":"user:wren","kind":"opaque",
+                "visibility":"agent_visible","consumer":"run","mode":"managed",
+                "vault_path":"registry/user:wren/gh","current_version":2,"created_by":"wren",
+                "created_at":"2026-08-31T20:15:07Z","updated_at":"2026-09-01T00:00:00Z",
+                "bindings":[{"id":"b1","secret_id":"s1","scope_kind":"playbook",
+                  "scope_id":"triage","projection_kind":"env","projection":"GH_TOKEN",
+                  "declared_name":"gh","created_by":"wren"}]}"#,
+        )
+        .expect("wire shape");
+        assert_eq!(detail.secret.name, "gh");
+        assert_eq!(detail.secret.current_version, Some(2));
+        assert_eq!(detail.bindings[0].projection, "GH_TOKEN");
+    }
+
+    #[test]
+    fn a_decision_request_reads_its_questions_evidence_and_answer() {
+        let decision: Decision = serde_json::from_str(
+            r##"{"id":"d1","run_id":"run-1","task":"review","launch_key":"playbook:triage:3",
+                "state":"answered","opened_at":"2026-11-08T10:00:00Z",
+                "expires_at":"2026-11-09T10:00:00Z",
+                "questions":[{"id":"ship","instructions":"Ship it?","kind":"choice",
+                  "multiple":false,"options":["yes","no"]}],
+                "inputs":[{"task":"build","status":"passed","output":{"ok":true},"files":[]}],
+                "spent_usd":0.5,"elapsed_secs":120,"max_cost_usd":2.0,"max_time_secs":1800,
+                "gated":[{"name":"publish","kind":"command","question":"ship","labels":["yes"]}],
+                "review":"# Review","evidence_digest":"sha256:ab",
+                "answer":{"labels":{"ship":["yes"]},"decided_by":"wren",
+                  "decided_at":"2026-11-08T11:00:00Z","note":null},
+                "can_answer":false}"##,
+        )
+        .expect("wire shape");
+        assert_eq!(decision.questions[0].options, ["yes", "no"]);
+        assert_eq!(decision.gated[0].labels, ["yes"]);
+        assert_eq!(decision.answer.expect("answered").labels["ship"], ["yes"]);
+        let queue: Decisions = serde_json::from_str(
+            r#"{"open":[{"id":"d1","run_id":"run-1","task":"review","launch_key":null,
+                "questions":["ship"],"opened_at":"2026-11-08T10:00:00Z",
+                "expires_at":"2026-11-09T10:00:00Z"}]}"#,
+        )
+        .expect("wire shape");
+        assert_eq!(queue.open[0].questions, ["ship"]);
+    }
+
+    #[test]
+    fn a_share_reads_with_and_without_an_end() {
+        let shares: Vec<Share> = serde_json::from_str(
+            r#"[{"grantee":"team:infra","role":"launcher","not_after":null,"expired":false,
+                 "created_by":"wren","created_at":"x","updated_at":"x"},
+                {"grantee":"user:bo","role":"viewer","not_after":"2026-01-01T23:59:59Z",
+                 "expired":true,"created_by":null,"created_at":"x","updated_at":"x"}]"#,
+        )
+        .expect("wire shape");
+        assert_eq!(shares[0].not_after, None);
+        assert!(shares[1].expired);
     }
 }

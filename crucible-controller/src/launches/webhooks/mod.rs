@@ -2,14 +2,15 @@
 //! requests. [`receive`] verifies and records a delivery; the sidecar row here holds the verifier,
 //! the secret, the transform, and the launch rate bound.
 
+pub mod keys;
 pub mod presets;
 pub mod receive;
 pub mod transform;
 pub mod trigger;
 pub mod verify;
 
-use crate::identity::oidc::credentials::CredentialKeys;
 use crate::launches::standing::{self, NewStanding, Standing};
+use crate::launches::webhooks::keys::WebhookKeys;
 use crate::launches::webhooks::verify::{MintError, Stored, Verifier, VerifierKind};
 use crate::model::Trigger;
 use anyhow::{Context, Result};
@@ -100,7 +101,7 @@ fn secret_columns(stored: &Stored) -> (Option<&str>, Option<&str>, Option<&str>)
 /// Store a webhook and mint its secret.
 pub(crate) async fn create(
     pool: &PgPool,
-    keys: Option<&CredentialKeys>,
+    keys: Option<&WebhookKeys>,
     new: &NewWebhook<'_>,
 ) -> Result<Created, SaveError> {
     let id = uuid::Uuid::now_v7().to_string();
@@ -161,7 +162,7 @@ pub(crate) async fn receivable(pool: &PgPool, id: &str) -> Result<Option<Webhook
 /// Replace a webhook's secret, keeping its verifier. `None` when there is no webhook under `id`.
 pub(crate) async fn rotate_secret(
     pool: &PgPool,
-    keys: Option<&CredentialKeys>,
+    keys: Option<&WebhookKeys>,
     id: &str,
 ) -> Result<Option<String>, SaveError> {
     let Some(webhook) = get(pool, id).await? else {
@@ -263,10 +264,6 @@ pub(crate) async fn update(
     .context("update webhook")?;
     tx.commit().await.context("update webhook: commit")?;
     get(pool, id).await.map_err(SaveError::from)
-}
-
-pub(crate) async fn expire_stale_owner_parks(pool: &PgPool, id: &str) -> Result<Vec<String>> {
-    standing::expire_stale_owner_parks(pool, Trigger::Webhook, id).await
 }
 
 /// One recorded delivery and how it settled; `outcome` is `None` while it is pending.

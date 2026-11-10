@@ -1,7 +1,7 @@
 //! Webhook secrets and delivery verification (RFC-0003:C-WEBHOOK-DELIVERY).
 
 use crate::identity::api_key::constant_time_eq;
-use crate::identity::oidc::credentials::CredentialKeys;
+use crate::launches::webhooks::keys::WebhookKeys;
 use crate::wire_enum::wire_enum;
 use aws_lc_rs::hmac;
 use axum::http::HeaderMap;
@@ -94,7 +94,7 @@ fn seal_subject(webhook_id: &str) -> String {
 pub(crate) fn mint(
     kind: VerifierKind,
     id: &str,
-    keys: Option<&CredentialKeys>,
+    keys: Option<&WebhookKeys>,
 ) -> Result<Minted, MintError> {
     let mut bytes = [0u8; SECRET_BYTES];
     aws_lc_rs::rand::fill(&mut bytes).map_err(|_| MintError::Random)?;
@@ -115,7 +115,7 @@ pub(crate) fn mint(
 pub(crate) fn material(
     id: &str,
     stored: &Stored,
-    keys: Option<&CredentialKeys>,
+    keys: Option<&WebhookKeys>,
 ) -> Result<Material, OpenError> {
     match stored {
         Stored::Digest(digest) => Ok(Material::TokenDigest(digest.clone())),
@@ -203,7 +203,7 @@ pub(crate) fn recorded_headers(
 
 #[cfg(test)]
 mod tests {
-    use crate::identity::oidc::credentials::CredentialKeys;
+    use crate::launches::webhooks::keys::WebhookKeys;
     use crate::launches::webhooks::verify::{
         Material, Presented, Stored, Verifier, VerifierKind, material, mint, recorded_headers,
         verify,
@@ -213,11 +213,11 @@ mod tests {
 
     const BODY: &[u8] = br#"{"repository":"org/img","updated_tags":["latest"]}"#;
 
-    fn keys() -> CredentialKeys {
-        CredentialKeys::new(vec![vec![7u8; 32]]).expect("keys")
+    fn keys() -> WebhookKeys {
+        WebhookKeys::new(vec![vec![7u8; 32]]).expect("keys")
     }
 
-    fn opened(kind: VerifierKind, id: &str, keys: &CredentialKeys) -> (String, Material) {
+    fn opened(kind: VerifierKind, id: &str, keys: &WebhookKeys) -> (String, Material) {
         let minted = mint(kind, id, Some(keys)).expect("mint");
         let material = material(id, &minted.stored, Some(keys)).expect("open");
         (minted.shown, material)

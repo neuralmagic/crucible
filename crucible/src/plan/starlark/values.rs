@@ -21,7 +21,12 @@ use crate::plan::diag;
 use crucible_contract::decision::{CompiledQuestion, QuestionId};
 use crucible_contract::emits::{FieldType, JsonSchema};
 
-use crate::plan::ir::{Declared, Emits, OutputField, OutputRef, Task, TaskKind, TaskName};
+use crate::crucible::Direction;
+use crate::duration::TaskTimeout;
+use crate::knobs::{Harness, ReasoningEffort};
+use crate::plan::ir::{
+    Decider, Declared, Emits, OutputField, OutputRef, Revise, Task, TaskKind, TaskName,
+};
 use crate::plan::starlark::error::CompileError;
 use crate::plan::workflow::WorkflowCfg;
 
@@ -30,9 +35,9 @@ use crate::plan::workflow::WorkflowCfg;
 #[derive(Clone, Debug)]
 pub(crate) struct SessionDecl {
     pub(crate) name: String,
-    pub(crate) harness: Option<String>,
+    pub(crate) harness: Option<Harness>,
     pub(crate) model: Option<String>,
-    pub(crate) effort: Option<String>,
+    pub(crate) effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
@@ -119,25 +124,32 @@ pub(crate) struct OutputRefValue {
 
 impl OutputRefValue {
     pub(crate) fn resolve(&self) -> Result<DeclaredOutput, CompileError> {
-        let ty = match self.declared.field(&self.reference.field.0) {
+        resolve_output(&self.reference, &self.declared)
+    }
+}
+
+/// `reference` checked against what its producer declares.
+pub(crate) fn resolve_output(
+    reference: &OutputRef,
+    declared: &Emits,
+) -> Result<DeclaredOutput, CompileError> {
+    {
+        let ty = match declared.field(&reference.field.0) {
             Declared::Untyped => None,
             Declared::Typed(ty) => Some(ty.clone()),
             Declared::Unchecked | Declared::Omitted => {
-                let declared = self.declared.names();
+                let names = declared.names();
                 return Err(CompileError::UndeclaredOutputField {
-                    task: self.reference.task.0.clone(),
-                    field: self.reference.field.0.clone(),
-                    suggestion: diag::suggest(
-                        &self.reference.field.0,
-                        declared.iter().map(String::as_str),
-                    )
-                    .map(str::to_owned),
-                    declared: declared.join(", "),
+                    task: reference.task.0.clone(),
+                    field: reference.field.0.clone(),
+                    suggestion: diag::suggest(&reference.field.0, names.iter().map(String::as_str))
+                        .map(str::to_owned),
+                    declared: names.join(", "),
                 });
             }
         };
         Ok(DeclaredOutput {
-            reference: self.reference.clone(),
+            reference: reference.clone(),
             ty,
         })
     }
@@ -152,7 +164,18 @@ impl Display for OutputRefValue {
 }
 
 #[starlark_value(type = "output")]
-impl<'v> StarlarkValue<'v> for OutputRefValue {}
+impl<'v> StarlarkValue<'v> for OutputRefValue {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        let method = AnswerMethodKind::named(attribute)?;
+        Some(heap.alloc(AnswerMethod {
+            subject: Subject::Field {
+                reference: self.reference.clone(),
+                declared: self.declared.clone(),
+            },
+            method,
+        }))
+    }
+}
 
 /// A `noul(...)`, `choice(...)`, or `score(...)` declaration, consumed by `route(questions = ...)`.
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
@@ -189,7 +212,222 @@ impl Display for AnswerRefValue {
 }
 
 #[starlark_value(type = "answer")]
-impl<'v> StarlarkValue<'v> for AnswerRefValue {}
+impl<'v> StarlarkValue<'v> for AnswerRefValue {
+    fn get_attr(&self, attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        let method = AnswerMethodKind::named(attribute)?;
+        Some(heap.alloc(AnswerMethod {
+            subject: Subject::Question(self.0.clone()),
+            method,
+        }))
+    }
+}
+
+/// Which answers of a question a `when` runs on.
+#[derive(Clone, Debug)]
+pub(crate) enum Selection {
+    Answers(Vec<String>),
+    Otherwise,
+    /// `.any_of(...)` was handed something other than strings.
+    NotLabels,
+}
+
+/// What a `when` branches on: a route's question, or a typed field a task emits.
+#[derive(Clone, Debug)]
+pub(crate) enum Subject {
+    Question(AnswerRef),
+    Field {
+        reference: OutputRef,
+        declared: Emits,
+    },
+}
+
+impl Display for Subject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Subject::Question(asked) => write!(f, "{}.{}", asked.task, asked.question),
+            Subject::Field { reference, .. } => write!(f, "{reference}"),
+        }
+    }
+}
+
+/// `subject.any_of(...)` or `subject.otherwise()`.
+#[derive(Clone, Debug)]
+pub(crate) struct WhenSpec {
+    pub(crate) subject: Subject,
+    pub(crate) selection: Selection,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct WhenValue(#[allocative(skip)] pub(crate) WhenSpec);
+
+starlark_simple_value!(WhenValue);
+
+impl Display for WhenValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let subject = &self.0.subject;
+        match &self.0.selection {
+            Selection::Answers(labels) => write!(f, "{subject}.any_of({})", labels.join(", ")),
+            Selection::Otherwise => write!(f, "{subject}.otherwise()"),
+            Selection::NotLabels => write!(f, "{subject}.any_of(...)"),
+        }
+    }
+}
+
+#[starlark_value(type = "when")]
+impl<'v> StarlarkValue<'v> for WhenValue {}
+
+#[derive(Clone, Copy, Debug)]
+enum AnswerMethodKind {
+    AnyOf,
+    Otherwise,
+}
+
+impl AnswerMethodKind {
+    fn named(attribute: &str) -> Option<Self> {
+        match attribute {
+            "any_of" => Some(AnswerMethodKind::AnyOf),
+            "otherwise" => Some(AnswerMethodKind::Otherwise),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            AnswerMethodKind::AnyOf => "any_of",
+            AnswerMethodKind::Otherwise => "otherwise",
+        }
+    }
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct AnswerMethod {
+    #[allocative(skip)]
+    subject: Subject,
+    #[allocative(skip)]
+    method: AnswerMethodKind,
+}
+
+starlark_simple_value!(AnswerMethod);
+
+impl Display for AnswerMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.subject, self.method.name())
+    }
+}
+
+#[starlark_value(type = "answer_method")]
+impl<'v> StarlarkValue<'v> for AnswerMethod {
+    fn invoke(
+        &self,
+        _me: Value<'v>,
+        args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let heap = eval.heap();
+        args.no_named_args()?;
+        let selection = match self.method {
+            AnswerMethodKind::Otherwise => {
+                args.no_positional_args(heap)?;
+                Selection::Otherwise
+            }
+            AnswerMethodKind::AnyOf => args
+                .positions(heap)?
+                .map(|label| label.unpack_str().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()
+                .map_or(Selection::NotLabels, Selection::Answers),
+        };
+        Ok(heap.alloc(WhenValue(WhenSpec {
+            subject: self.subject.clone(),
+            selection,
+        })))
+    }
+}
+
+/// `each(producer.field, max = N)`.
+#[derive(Clone, Debug)]
+pub(crate) struct Each {
+    pub(crate) output: DeclaredOutput,
+    pub(crate) max: u32,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct EachValue(#[allocative(skip)] pub(crate) Each);
+
+starlark_simple_value!(EachValue);
+
+impl Display for EachValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "each({}, max = {})", self.0.output.reference, self.0.max)
+    }
+}
+
+#[starlark_value(type = "each")]
+impl<'v> StarlarkValue<'v> for EachValue {}
+
+/// `send_back(tasks, rounds = N)`.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct SendBackValue(#[allocative(skip)] pub(crate) Revise);
+
+starlark_simple_value!(SendBackValue);
+
+impl Display for SendBackValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "send_back(rounds = {})", self.0.max_rounds)
+    }
+}
+
+#[starlark_value(type = "send_back")]
+impl<'v> StarlarkValue<'v> for SendBackValue {}
+
+/// `at_least(n)` or `at_most(n)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Bound {
+    pub(crate) threshold: f64,
+    pub(crate) direction: Direction,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct BoundValue(#[allocative(skip)] pub(crate) Bound);
+
+starlark_simple_value!(BoundValue);
+
+impl Display for BoundValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let function = match self.0.direction {
+            Direction::Higher => "at_least",
+            Direction::Lower => "at_most",
+        };
+        write!(f, "{function}({})", self.0.threshold)
+    }
+}
+
+#[starlark_value(type = "bound")]
+impl<'v> StarlarkValue<'v> for BoundValue {}
+
+/// `model(...)`, `human(...)`, or `output(task)`, with the timeout a human decider carries.
+#[derive(Clone, Debug)]
+pub(crate) struct DeciderSpec {
+    pub(crate) decider: Decider,
+    pub(crate) timeout: Option<TaskTimeout>,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct DeciderValue(#[allocative(skip)] pub(crate) DeciderSpec);
+
+starlark_simple_value!(DeciderValue);
+
+impl Display for DeciderValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0.decider {
+            Decider::Model { .. } => "model(...)",
+            Decider::Human { .. } => "human(...)",
+            Decider::Output { .. } => "output(...)",
+        })
+    }
+}
+
+#[starlark_value(type = "decider")]
+impl<'v> StarlarkValue<'v> for DeciderValue {}
 
 /// Text that carries where each of its spans came from.
 ///
@@ -372,3 +610,38 @@ impl Display for WorkflowValue {
 
 #[starlark_value(type = "workflow")]
 impl<'v> StarlarkValue<'v> for WorkflowValue {}
+
+/// `others()`: an entry of `depends_on` that stands for every other main-graph task.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct OthersValue;
+
+starlark_simple_value!(OthersValue);
+
+impl Display for OthersValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("others()")
+    }
+}
+
+#[starlark_value(type = "others")]
+impl<'v> StarlarkValue<'v> for OthersValue {}
+
+/// `task_defaults(...)`: what a task takes for an argument it does not set.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TaskDefaults {
+    pub(crate) required: Option<bool>,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct TaskDefaultsValue(#[allocative(skip)] pub(crate) TaskDefaults);
+
+starlark_simple_value!(TaskDefaultsValue);
+
+impl Display for TaskDefaultsValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("task_defaults(...)")
+    }
+}
+
+#[starlark_value(type = "task_defaults")]
+impl<'v> StarlarkValue<'v> for TaskDefaultsValue {}

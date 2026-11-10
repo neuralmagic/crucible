@@ -6,7 +6,7 @@
 //! wants to act as somebody mints a key as that somebody.
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// What a key minted in the SPA starts with; the controller's `api_key::PREFIX`.
@@ -63,36 +63,42 @@ pub struct Config {
 }
 
 /// The flags every subcommand shares. Each mirrors an env var and a config-file key.
-#[derive(Debug, clap::Args, Default)]
+#[derive(Debug, Default)]
+#[cfg_attr(feature = "cli", derive(clap::Args))]
 pub struct ConnectArgs {
     /// Config file. Defaults to `config.toml` under `$XDG_CONFIG_HOME/crux` (else
     /// `~/.config/crux`), which may be absent; a path given here must exist. A flag or env var
     /// wins over the file.
-    #[arg(long, env = "CONTROLLER_CONFIG", global = true)]
+    #[cfg_attr(feature = "cli", arg(long, env = "CONTROLLER_CONFIG", global = true))]
     pub config: Option<PathBuf>,
 
     /// Controller base URL: the API route. Defaults to a controller on this machine,
     /// `http://127.0.0.1:8870`.
-    #[arg(long, env = "CONTROLLER_URL", global = true)]
+    #[cfg_attr(feature = "cli", arg(long, env = "CONTROLLER_URL", global = true))]
     pub url: Option<String>,
 
     /// The bearer: a minted `crk_` key, which authenticates as the person who minted it, or the
     /// controller's static token, which authenticates as nobody.
-    #[arg(
-        long,
-        env = "CONTROLLER_API_TOKEN",
-        global = true,
-        hide_env_values = true
+    #[cfg_attr(
+        feature = "cli",
+        arg(
+            long,
+            env = "CONTROLLER_API_TOKEN",
+            global = true,
+            hide_env_values = true
+        )
     )]
     pub api_token: Option<String>,
 }
 
 /// `config.toml`: the settings that describe a deployment rather than one invocation. Every key
 /// is optional. Unknown keys are refused, so a typo is an error and not a silently ignored line.
-#[derive(Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_token: Option<String>,
 }
 
@@ -118,9 +124,53 @@ impl FileConfig {
         };
         toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
     }
+
+    /// Write this config to `path`, or the default location, readable by its owner alone since it
+    /// holds a key. The file is replaced whole, through a sibling written first.
+    pub fn save(&self, path: Option<&Path>) -> Result<PathBuf> {
+        use std::io::Write;
+
+        let path = match path {
+            Some(p) => p.to_path_buf(),
+            None => Self::default_path()?,
+        };
+        let dir = path.parent().context("the config path has no directory")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let text = toml::to_string(self).context("encoding the config")?;
+        let staged = path.with_extension("toml.new");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&staged)
+            .with_context(|| format!("writing {}", staged.display()))?;
+        file.write_all(text.as_bytes())
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("writing {}", staged.display()))?;
+        std::fs::rename(&staged, &path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(path)
+    }
 }
 
 impl ConnectArgs {
+    /// What a program with no flags of its own resolves: the env vars the flags mirror.
+    pub fn from_env() -> Self {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    fn from_vars(var: impl Fn(&str) -> Option<String>) -> Self {
+        let var = |name| var(name).filter(|value: &String| !value.trim().is_empty());
+        ConnectArgs {
+            config: var("CONTROLLER_CONFIG").map(PathBuf::from),
+            url: var("CONTROLLER_URL"),
+            api_token: var("CONTROLLER_API_TOKEN"),
+        }
+    }
+
     /// Flags and env vars over the file.
     pub fn resolve(&self) -> Result<Config> {
         let file = FileConfig::load(self.config.as_deref())?;
@@ -171,8 +221,37 @@ fn config_dir_from(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[test]
+    fn a_saved_config_reads_back_and_only_its_owner_can_read_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/config.toml");
+        let config = crate::config::FileConfig {
+            url: Some("https://crucible.example.com".into()),
+            api_token: Some("crk_a_b".into()),
+        };
+        assert_eq!(config.save(Some(&path)).unwrap(), path);
+        assert_eq!(
+            crate::config::FileConfig::load(Some(&path)).unwrap(),
+            config
+        );
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let replaced = crate::config::FileConfig {
+            url: Some("https://other.example.com".into()),
+            api_token: None,
+        };
+        replaced.save(Some(&path)).unwrap();
+        assert_eq!(
+            crate::config::FileConfig::load(Some(&path)).unwrap(),
+            replaced
+        );
+        assert!(!path.with_extension("toml.new").exists());
+    }
 
+    use crate::config::*;
+
+    #[cfg(feature = "cli")]
     fn args(argv: &[&str]) -> ConnectArgs {
         #[derive(clap::Parser)]
         struct Only {
@@ -281,7 +360,7 @@ mod tests {
             "#,
         )
         .expect("parses");
-        let cfg = args(&[]).resolve_over(file);
+        let cfg = ConnectArgs::default().resolve_over(file);
         assert_eq!(cfg.url, "https://file.example.com");
         assert_eq!(
             cfg.auth,
@@ -293,6 +372,7 @@ mod tests {
 
     /// A shell that exports a token is authenticated as that token and nothing else, whatever the
     /// file says.
+    #[cfg(feature = "cli")]
     #[test]
     fn the_command_line_wins_over_the_file() {
         let file: FileConfig = toml::from_str(
@@ -320,9 +400,46 @@ mod tests {
 
     #[test]
     fn with_nothing_at_all_the_url_is_the_local_controller_and_the_auth_is_none() {
-        let cfg = args(&[]).resolve_over(FileConfig::default());
+        let cfg = ConnectArgs::default().resolve_over(FileConfig::default());
         assert_eq!(cfg.url, "http://127.0.0.1:8870");
         assert_eq!(cfg.auth, Auth::None);
+    }
+
+    #[test]
+    fn the_env_vars_resolve_like_the_flags_they_mirror_and_blank_ones_are_unset() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.to_string())
+            }
+        };
+        let args = ConnectArgs::from_vars(env(&[
+            ("CONTROLLER_URL", "https://env.example.com/"),
+            ("CONTROLLER_API_TOKEN", "crk_env"),
+            ("CONTROLLER_CONFIG", "/etc/crux.toml"),
+        ]));
+        assert_eq!(args.config, Some(PathBuf::from("/etc/crux.toml")));
+        let file: FileConfig =
+            toml::from_str("url = \"https://file.example.com\"\n").expect("parses");
+        let cfg = args.resolve_over(file);
+        assert_eq!(cfg.url, "https://env.example.com");
+        assert_eq!(
+            cfg.auth,
+            Auth::ApiKey {
+                token: "crk_env".into()
+            }
+        );
+
+        let blank = ConnectArgs::from_vars(env(&[
+            ("CONTROLLER_URL", "  "),
+            ("CONTROLLER_API_TOKEN", ""),
+        ]));
+        assert_eq!(
+            (blank.url, blank.api_token, blank.config),
+            (None, None, None)
+        );
     }
 
     #[test]

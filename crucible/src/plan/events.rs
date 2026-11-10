@@ -1,79 +1,19 @@
 //! Session-log events a plan run emits: the admitted graph and each terminal task result.
 
-use crate::plan::ir::{TaskName, ValidPlan};
-
-/// `history_record` is the playbook's record task, which lives on the workflow rather than the
-/// plan; a scored loop has none.
-pub(crate) fn plan_admitted_event(
-    plan: &ValidPlan,
-    history_record: Option<&TaskName>,
-) -> crate::report::session::SessionEvent {
-    let p = plan.plan();
-    let definitions = crate::plan::rerun::definition_digests(plan);
-    crate::report::session::SessionEvent::PlanAdmitted {
-        plan_version: p.version,
-        reason: p.reason.clone().unwrap_or_default(),
-        budget_usd: p.budget.usd,
-        tasks: plan
-            .tasks_topo()
-            .map(|t| crate::report::session::PlanTaskWire {
-                name: t.name.0.clone(),
-                kind: t.task.label().to_string(),
-                depends_on: t.depends_on.iter().map(|d| d.0.clone()).collect(),
-                optional: t.optional.iter().map(|d| d.0.clone()).collect(),
-                session: t.session.clone().unwrap_or_default(),
-                needs: t.needs.clone(),
-                required: t.required,
-                join: t.join.as_str().to_string(),
-                stage: t.stage.as_str().to_string(),
-                over: t
-                    .over
-                    .as_ref()
-                    .map(crate::plan::ir::OutputRef::to_string)
-                    .unwrap_or_default(),
-                max_fanout: t.max_fanout.unwrap_or_default(),
-                when: t.when.as_ref().map(ToString::to_string).unwrap_or_default(),
-                keyed: t.keyed.iter().map(ToString::to_string).collect(),
-                revise: t
-                    .revise
-                    .as_ref()
-                    .map(|r| r.tasks.iter().map(|task| task.0.clone()).collect())
-                    .unwrap_or_default(),
-                max_rounds: t.revise.as_ref().map_or(0, |r| r.max_rounds),
-                emits: t
-                    .emits
-                    .fields()
-                    .into_iter()
-                    .map(|(field, ty)| crucible_contract::emits::EmitWire {
-                        field: field.0.clone(),
-                        ty: ty.cloned(),
-                    })
-                    .collect(),
-                emits_files: t.emits_files.clone(),
-                timeout: t
-                    .timeout
-                    .as_ref()
-                    .map(ToString::to_string)
-                    .unwrap_or_default(),
-                history_depth: t.history.unwrap_or_default(),
-                definition: definitions.get(&t.name).cloned().unwrap_or_default(),
-            })
-            .collect(),
-        history_record: history_record.map(|t| t.0.clone()).unwrap_or_default(),
-    }
-}
+pub(crate) use crucible::plan::admitted::plan_admitted as plan_admitted_event;
 
 /// One terminal task result on the wire. `iter` is the loop round (0 for a standalone
 /// `plan run`); fields belonging to other emitters stay at their defaults. `trace_id`/`span_id`
 /// carry the emitter's current trace context (the iteration's span) so a RESULTS row links
 /// straight to its trace; no active span leaves them empty. `args` carries the run's agent knobs
-/// a task's own are resolved against; None reports no agent.
+/// a task's own are resolved against; None reports no agent. `secs` is the task's wall time.
 pub(crate) fn task_result_event(
     plan_version: u32,
     iter: u32,
     task: &crate::plan::ir::Task,
     r: &crate::plan::exec::TaskResult,
     args: Option<&crate::args::Args>,
+    secs: f64,
 ) -> crate::report::session::SessionEvent {
     let (trace_id, span_id) = crate::agent::engine::current_trace_env()
         .and_then(|(tp, _)| {
@@ -107,7 +47,8 @@ pub(crate) fn task_result_event(
             .as_ref()
             .map(crate::plan::machine::BlockedReason::wire),
         transport: r.transport,
-        secs: 0.0,
+        secs,
+        at: Some(crate::plan::admission::stamp()),
         trace_id,
         span_id,
         agent: args
@@ -125,7 +66,7 @@ pub(crate) fn reused_result_event(
     r: &crate::plan::exec::TaskResult,
     from: &str,
 ) -> crate::report::session::SessionEvent {
-    let mut event = task_result_event(plan_version, 0, task, r, None);
+    let mut event = task_result_event(plan_version, 0, task, r, None, 0.0);
     if let crate::report::session::SessionEvent::TaskResult { reused_from, .. } = &mut event {
         *reused_from = Some(from.to_string());
     }
@@ -360,7 +301,7 @@ mod tests {
             repairs: Vec::new(),
         };
         let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None)
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None, 0.0)
         else {
             panic!("not a task_result event");
         };
@@ -376,7 +317,7 @@ mod tests {
             ..result
         };
         let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none, None)
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none, None, 0.0)
         else {
             panic!("not a task_result event");
         };
@@ -410,7 +351,7 @@ mod tests {
             repairs: vec![repair.clone()],
         };
         let event =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None);
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None, 0.0);
         let SessionEvent::TaskResult { repairs, .. } = &event else {
             panic!("not a task_result event");
         };
@@ -466,7 +407,7 @@ mod tests {
                 task: &Task,
                 attempt: u32,
                 _inputs: &BTreeMap<TaskName, serde_json::Value>,
-                _deadline: Option<crucible::deadline::Deadline>,
+                _lane: Option<&crucible::plan::admission::Lane<'_>>,
             ) -> Attempt {
                 let outcome = match (task.name.0.as_str(), attempt) {
                     ("discover", _) => {
@@ -540,7 +481,7 @@ mod tests {
             |task, result| {
                 log.push('\n');
                 log.push_str(&crucible_contract::session::encode(
-                    &crate::plan::events::task_result_event(1, 0, task, result, None),
+                    &crate::plan::events::task_result_event(1, 0, task, result, None, 0.0),
                 ));
                 written.push((task.name.clone(), result.clone()));
             },

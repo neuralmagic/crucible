@@ -13,14 +13,16 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, Location, MarkupContent, MarkupKind, OneOf,
-    ReferenceParams, SaveOptions, ServerCapabilities, ServerInfo, SignatureHelp,
-    SignatureHelpOptions, SignatureHelpParams, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, TextDocumentSyncSaveOptions, Uri,
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, CodeActionResponse, CompletionOptions, CompletionParams,
+    CompletionResponse, Diagnostic, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, Location,
+    MarkupContent, MarkupKind, OneOf, ReferenceParams, SaveOptions, ServerCapabilities, ServerInfo,
+    SignatureHelp, SignatureHelpOptions, SignatureHelpParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, TextDocumentSyncOptions, TextDocumentSyncSaveOptions, TextEdit, Uri,
+    WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -28,6 +30,7 @@ use crate::analyze::{self, canonical};
 use crate::check::{self, Finding, Origin};
 use crate::complete::Completer;
 use crate::docs::{self, Reference};
+use crate::fix;
 use crate::index::Index;
 use crate::lint;
 use crate::navigate::{self, Navigator};
@@ -307,6 +310,7 @@ impl LanguageServer for Backend {
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
                 ..ServerCapabilities::default()
             },
             server_info: Some(ServerInfo {
@@ -522,6 +526,66 @@ impl LanguageServer for Backend {
             })
             .collect();
         Ok(Some(found))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let state = self.state();
+        let Some((index, text)) = state
+            .docs
+            .get(&uri)
+            .and_then(|doc| doc.parsed.clone().filter(|(_, text)| *text == doc.text))
+        else {
+            return Ok(None);
+        };
+        drop(state);
+        let actions = fix::rewrites(&index, text.as_str(), &self.reference)
+            .into_iter()
+            .filter(|rewrite| {
+                rewrite
+                    .at
+                    .iter()
+                    .any(|at| check::overlaps(&text.range(at.clone()), &params.range))
+            })
+            .map(|rewrite| {
+                let fixes = |diagnostic: &&Diagnostic| {
+                    rewrite
+                        .at
+                        .iter()
+                        .any(|at| text.range(at.clone()) == diagnostic.range)
+                };
+                CodeActionOrCommand::CodeAction(CodeAction {
+                    title: rewrite.title,
+                    kind: Some(CodeActionKind::QUICKFIX),
+                    diagnostics: Some(
+                        params
+                            .context
+                            .diagnostics
+                            .iter()
+                            .filter(fixes)
+                            .cloned()
+                            .collect(),
+                    ),
+                    edit: Some(WorkspaceEdit {
+                        changes: Some(HashMap::from([(
+                            uri.clone(),
+                            rewrite
+                                .edits
+                                .into_iter()
+                                .map(|(at, new_text)| TextEdit {
+                                    range: text.range(at),
+                                    new_text,
+                                })
+                                .collect(),
+                        )])),
+                        ..WorkspaceEdit::default()
+                    }),
+                    is_preferred: Some(true),
+                    ..CodeAction::default()
+                })
+            })
+            .collect();
+        Ok(Some(actions))
     }
 
     async fn document_symbol(

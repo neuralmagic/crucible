@@ -217,39 +217,8 @@ fn cfg_for(base: &str, client_id: &str) -> OidcCfg {
     }
 }
 
-/// The same registration asking for `offline_access`, so the token response carries the offline
-/// refresh token the credential is built from.
-fn cfg_offline(base: &str) -> OidcCfg {
-    let mut cfg = cfg(base);
-    cfg.scopes.push("offline_access".to_string());
-    cfg
-}
-
-/// The human surface exactly as `serve` mounts it, against this issuer, with no
-/// offline credential: the shape a realm that grants no `offline_access` runs in.
+/// The human surface exactly as `serve` mounts it, against this issuer.
 async fn native_router(pool: &PgPool, provider: Arc<OidcProvider>) -> axum::Router {
-    native_router_with(pool, provider, None, DEFAULT_REFRESH_AFTER).await
-}
-
-/// A credential key for the tests. Fixed material, because the point is the round trip through the
-/// row, not the key.
-fn test_keys() -> Arc<crate::identity::oidc::credentials::CredentialKeys> {
-    Arc::new(
-        crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![5u8; 32]]).expect("keys"),
-    )
-}
-
-/// Long enough that a session's groups are not re-read mid-test unless a test asks for it.
-const DEFAULT_REFRESH_AFTER: std::time::Duration = std::time::Duration::from_secs(3600);
-
-/// The same, with the offline credential mounted, so the callback stores one and a live session
-/// re-reads its groups through it.
-async fn native_router_with(
-    pool: &PgPool,
-    provider: Arc<OidcProvider>,
-    keys: Option<Arc<crate::identity::oidc::credentials::CredentialKeys>>,
-    refresh_after: std::time::Duration,
-) -> axum::Router {
     let store = crate::identity::session::store(pool)
         .await
         .expect("session store");
@@ -260,19 +229,12 @@ async fn native_router_with(
         )
         .expect("guard builds");
         guard.oidc = Some(provider.clone());
-        guard.refresh = crate::identity::oidc::credentials::OwnerRefresh::from_parts(
-            pool.clone(),
-            Some(provider.clone()),
-            keys.clone(),
-        );
-        guard.refresh_after = refresh_after;
         Arc::new(guard)
     };
     let state = ApiState {
         roles: crate::identity::auth::Roles::new(vec![], vec![], vec!["platform-devs".to_string()]),
         ..ApiState::test(Db::new(pool.clone()))
-    }
-    .with_oidc(Some(provider.clone()), keys.clone());
+    };
     crate::human_router(
         state,
         store,
@@ -282,7 +244,6 @@ async fn native_router_with(
             routes: crate::identity::oidc::routes::AuthState {
                 oidc: Some(provider),
                 pool: pool.clone(),
-                credential_keys: keys,
             },
             issuer: None,
         },
@@ -454,124 +415,6 @@ fn field<'a>(tokens: &'a serde_json::Value, name: &str) -> &'a str {
         .as_str()
         .unwrap_or_else(|| panic!("the token response carries no {name}"))
 }
-
-/// Drive the whole browser flow and return the session cookie it set. The individual steps are
-/// asserted in [`the_browser_flow_signs_a_user_in_and_the_session_carries_their_groups`]; every
-/// other test needs the cookie, not the walk.
-async fn sign_in(app: &axum::Router) -> String {
-    let start = call(app, get("/auth/login", None)).await;
-    assert_eq!(start.status, StatusCode::SEE_OTHER);
-    let authorize_url = start.location.expect("login redirects to the issuer");
-    let flow_cookie = start.cookie.expect("the login parked its flow");
-    let (code, state) = authenticate(&authorize_url).await;
-    let done = call(
-        app,
-        get(
-            &format!("/auth/callback?code={code}&state={state}"),
-            Some(&flow_cookie),
-        ),
-    )
-    .await;
-    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
-    done.cookie.expect("the callback set a session cookie")
-}
-
-/// A playbook whose scope binds a secret, plus one schedule on it, owned by `login` with a stale
-/// group snapshot — the shape whose firing needs the owner's live groups.
-async fn seed_bound_schedule(pool: &PgPool, login: &str, snapshot_groups: &[&str]) -> String {
-    use crate::authz::model::Principal;
-    use crate::secrets::store::{NewBinding, NewSecret};
-    use crate::secrets::{
-        ConsumerClass, ProjectionKind, ScopeKind, SecretKind, SecretMode, SecretName, Visibility,
-    };
-    sqlx::query(
-        r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz,
-                                  tar_digest, tar_bytes, params_schema, schema_digest,
-                                  core_rev, created_by, created_at, updated_at)
-           VALUES ('survey', 'reads a paper', 'owner/packs', 'main', 'abc123', '', $1,
-                   'sha256:tar', 3, '{"type":"object"}'::jsonb, 'sha256:schema', 'core1',
-                   $2, '2026-08-23T00:00:00Z', '2026-08-23T00:00:00Z')"#,
-    )
-    .bind(vec![1u8, 2, 3])
-    .bind(login)
-    .execute(pool)
-    .await
-    .expect("register the playbook");
-
-    let owner = Principal::parse(&format!("user:{login}")).expect("owner");
-    let name = SecretName::parse("pr_token").expect("name");
-    let secret_id = uuid::Uuid::now_v7().to_string();
-    let mut conn = pool.acquire().await.expect("conn");
-    crate::secrets::store::insert(
-        &mut conn,
-        &NewSecret {
-            id: &secret_id,
-            name: &name,
-            owner: &owner,
-            kind: SecretKind::Opaque,
-            visibility: Visibility::BrokerOnly,
-            consumer: ConsumerClass::Run,
-            mode: SecretMode::Managed,
-            vault_path: "user:alice/pr-token",
-            current_version: Some(1),
-            created_by: Some(login),
-        },
-    )
-    .await
-    .expect("register the secret");
-    crate::secrets::store::insert_binding(
-        &mut conn,
-        &NewBinding {
-            id: &uuid::Uuid::now_v7().to_string(),
-            secret_id: &secret_id,
-            scope_kind: ScopeKind::Playbook,
-            scope_id: "survey",
-            projection_kind: ProjectionKind::Env,
-            projection: "AUTORESEARCH_PR_TOKEN",
-            declared_name: &name,
-            pack_rev: None,
-            schema_digest: None,
-            created_by: Some(login),
-        },
-    )
-    .await
-    .expect("bind");
-    drop(conn);
-
-    let id = uuid::Uuid::now_v7().to_string();
-    sqlx::query(
-        r#"INSERT INTO playbook_standing_launches (id, trigger, playbook, params, schema_digest,
-                                                   max_cost, max_time, advance_dedupe, enabled,
-                                                   created_by, owner_principal, owner_groups,
-                                                   owner_groups_at, created_at, updated_at,
-                                                   adopted_repo, adopted_path, adopted_rev,
-                                                   adopted_tar_gz, adopted_tar_digest,
-                                                   adopted_tar_bytes, adopted_params_schema)
-           VALUES ($1, 'schedule', 'survey', '{}'::jsonb, 'sha256:schema', 3.5, '30m', true, true,
-                   $2, $3, $4, '2026-08-23T12:00:00Z', '2026-08-23T00:00:00Z',
-                   '2026-08-23T00:00:00Z', 'owner/packs', '', 'abc123', $5, 'sha256:tar', 3,
-                   '{"type":"object"}'::jsonb)"#,
-    )
-    .bind(&id)
-    .bind(login)
-    .bind(format!("user:{login}"))
-    .bind(serde_json::Value::from(snapshot_groups.to_vec()))
-    .bind(vec![1u8, 2, 3])
-    .execute(pool)
-    .await
-    .expect("store the standing launch");
-    sqlx::query(
-        "INSERT INTO playbook_schedules (id, cron_expr, tz, next_due_at)
-         VALUES ($1, '0 * * * *', 'UTC', '2026-08-23T12:00:00Z')",
-    )
-    .bind(&id)
-    .execute(pool)
-    .await
-    .expect("store the schedule");
-    id
-}
-
-// --- the tests -----------------------------------------------------------------------------------
 
 /// The whole browser flow: login starts a PKCE code request, keycloak authenticates the user, the
 /// callback validates the ID token it gets back, and the session that comes out carries the login
@@ -759,383 +602,6 @@ async fn a_keycloak_token_is_not_a_bearer(pool: PgPool) {
     }
 }
 
-/// The offline credential, end to end. The browser flow stores it encrypted in the same
-/// transaction as the `users` row; the row is not the token; and signing out leaves it in place,
-/// because a schedule owner who closes their tab must keep firing.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn the_callback_stores_an_encrypted_offline_credential_that_logout_leaves(pool: PgPool) {
-    let Some(base) = keycloak().await else { return };
-    let refresher = Arc::new(OidcProvider::new(cfg_offline(&base)).expect("provider"));
-    let keys = test_keys();
-    let app = native_router_with(
-        &pool,
-        refresher.clone(),
-        Some(keys.clone()),
-        DEFAULT_REFRESH_AFTER,
-    )
-    .await;
-
-    let cookie = sign_in(&app).await;
-    let stored: Vec<(String, String)> =
-        sqlx::query_as("SELECT sub, token_cipher FROM user_credentials")
-            .fetch_all(&pool)
-            .await
-            .expect("credentials");
-    assert_eq!(stored.len(), 1, "one row per user");
-    let (sub, cipher) = &stored[0];
-    assert!(
-        !cipher.contains('.'),
-        "a JWT-shaped refresh token must not be sitting in the row: {cipher}"
-    );
-    // The mounted key opens what the callback sealed, which is the only proof the round trip works.
-    let refresh = crate::identity::oidc::credentials::OwnerRefresh::new(
-        pool.clone(),
-        refresher.clone(),
-        keys.clone(),
-    );
-    assert!(
-        matches!(
-            refresh.refresh(sub).await,
-            Ok(crate::identity::oidc::credentials::RefreshOutcome::Claims(
-                _
-            ))
-        ),
-        "the stored credential must be spendable"
-    );
-
-    // The settings surface sees it.
-    let seen = call(&app, get("/api/credentials/me", Some(&cookie))).await;
-    assert_eq!(seen.status, StatusCode::OK);
-    assert!(seen.body.contains("\"present\":true"), "{}", seen.body);
-
-    // Signing out ends the session and leaves the credential alone.
-    let out = call(&app, get("/auth/logout", Some(&cookie))).await;
-    assert_eq!(out.status, StatusCode::SEE_OTHER);
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM user_credentials")
-        .fetch_one(&pool)
-        .await
-        .expect("count");
-    assert_eq!(rows, 1, "browser logout must not revoke the offline token");
-}
-
-/// Two schedules of one owner firing in the same sweep. Both refreshes run concurrently against a
-/// realm that permits refresh-token reuse; the per-subject advisory lock serializes them, so both
-/// land and whichever token the issuer rotated last is the one stored.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn two_refreshes_of_one_owner_serialize_and_both_land(pool: PgPool) {
-    let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg_offline(&base)).expect("provider"));
-    let keys = test_keys();
-    let app = native_router_with(
-        &pool,
-        provider.clone(),
-        Some(keys.clone()),
-        DEFAULT_REFRESH_AFTER,
-    )
-    .await;
-    sign_in(&app).await;
-    let sub: String = sqlx::query_scalar("SELECT sub FROM user_credentials")
-        .fetch_one(&pool)
-        .await
-        .expect("the login stored one");
-
-    let refresh = Arc::new(crate::identity::oidc::credentials::OwnerRefresh::new(
-        pool.clone(),
-        provider,
-        keys.clone(),
-    ));
-    let (a, b) = tokio::join!(
-        {
-            let refresh = refresh.clone();
-            let sub = sub.clone();
-            async move { refresh.refresh(&sub).await }
-        },
-        {
-            let refresh = refresh.clone();
-            let sub = sub.clone();
-            async move { refresh.refresh(&sub).await }
-        }
-    );
-    for (which, outcome) in [("first", a), ("second", b)] {
-        match outcome.unwrap_or_else(|e| panic!("the {which} refresh failed: {e}")) {
-            crate::identity::oidc::credentials::RefreshOutcome::Claims(claims) => {
-                assert_eq!(claims.login, USER);
-                assert!(
-                    claims.groups.iter().any(|g| g == USER_GROUP),
-                    "the refreshed ID token carries the realm's groups: {:?}",
-                    claims.groups
-                );
-            }
-            other => panic!("the {which} refresh produced {other:?}"),
-        }
-    }
-    // The stored token still works, so the rotation the lock serialized was persisted.
-    assert!(
-        matches!(
-            refresh.refresh(&sub).await,
-            Ok(crate::identity::oidc::credentials::RefreshOutcome::Claims(
-                _
-            ))
-        ),
-        "the persisted token must still be spendable"
-    );
-    let status = crate::identity::oidc::credentials::status(&pool, &sub)
-        .await
-        .expect("status")
-        .expect("present");
-    assert_eq!(status.failures, 0);
-    assert!(status.refreshed_at.is_some(), "the refresh was stamped");
-}
-
-/// A credential refresh stamps the issuer's live groups on the owner's `users` row, which is what
-/// an api key of theirs answers with.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_credential_refresh_restamps_the_groups_an_api_key_answers_with(pool: PgPool) {
-    let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg_offline(&base)).expect("provider"));
-    let keys = test_keys();
-    let app = native_router_with(
-        &pool,
-        provider.clone(),
-        Some(keys.clone()),
-        DEFAULT_REFRESH_AFTER,
-    )
-    .await;
-    sign_in(&app).await;
-    let sub: String = sqlx::query_scalar("SELECT sub FROM user_credentials")
-        .fetch_one(&pool)
-        .await
-        .expect("the login stored one");
-    sqlx::query("UPDATE users SET groups = '[\"/stale-group\"]'::jsonb WHERE sub = $1")
-        .bind(&sub)
-        .execute(&pool)
-        .await
-        .expect("stale groups");
-    let key = crate::identity::api_key::mint(&pool, &sub, "laptop", None)
-        .await
-        .expect("mint");
-    let before = crate::identity::api_key::verify(&pool, None, &key.secret)
-        .await
-        .expect("verify");
-    assert_eq!(before.groups, vec!["/stale-group".to_string()]);
-
-    let refresh =
-        crate::identity::oidc::credentials::OwnerRefresh::new(pool.clone(), provider, keys);
-    assert!(matches!(
-        refresh.refresh(&sub).await,
-        Ok(crate::identity::oidc::credentials::RefreshOutcome::Claims(
-            _
-        ))
-    ));
-    let after = crate::identity::api_key::verify(&pool, None, &key.secret)
-        .await
-        .expect("verify");
-    assert!(
-        after.groups.iter().any(|g| g == USER_GROUP),
-        "{:?}",
-        after.groups
-    );
-    assert!(
-        !after.groups.iter().any(|g| g == "/stale-group"),
-        "{:?}",
-        after.groups
-    );
-}
-
-/// A due schedule's owner groups are re-read from their offline credential before the row is
-/// claimed, so the launch carries what the issuer says NOW and not what the last save recorded.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_fire_time_refresh_puts_live_groups_onto_the_launch(pool: PgPool) {
-    let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg_offline(&base)).expect("provider"));
-    let keys = test_keys();
-    let app = native_router_with(
-        &pool,
-        provider.clone(),
-        Some(keys.clone()),
-        DEFAULT_REFRESH_AFTER,
-    )
-    .await;
-    sign_in(&app).await;
-
-    let schedule = seed_bound_schedule(&pool, USER, &["/stale-group"]).await;
-    let refresh =
-        crate::identity::oidc::credentials::OwnerRefresh::new(pool.clone(), provider, keys);
-    let db = Db::new(pool.clone());
-    let fired = crate::launches::schedules::fire_due_refreshing(
-        &db,
-        "2026-08-23T12:00:30Z".parse().expect("now"),
-        8,
-        5,
-        std::time::Duration::from_secs(3600),
-        Some(&refresh),
-    )
-    .await
-    .expect("fire");
-    assert_eq!(fired.len(), 1, "the firing launched");
-    let launch = crate::launches::store::get_playbook_launch(&pool, &fired[0])
-        .await
-        .expect("launch")
-        .expect("a launch row");
-    assert_eq!(
-        launch.launcher_groups,
-        vec![USER_GROUP.to_string()],
-        "the launch carries the issuer's live groups, not the stale snapshot"
-    );
-    let row = crate::launches::schedules::ScheduleStore::new(crate::client::Db::new(pool.clone()))
-        .get(&schedule)
-        .await
-        .expect("get")
-        .expect("row");
-    assert!(!row.owner_signin_required);
-    assert_eq!(row.owner_refresh_error, None);
-    assert!(row.owner_refresh_at.is_some());
-}
-
-/// A user revokes their credential from settings: the row is gone, and the schedules whose scopes
-/// bind secrets stop firing until they sign in again.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_revoke_drops_the_credential_and_parks_the_owner_s_schedules(pool: PgPool) {
-    let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg_offline(&base)).expect("provider"));
-    let keys = test_keys();
-    let app = native_router_with(
-        &pool,
-        provider.clone(),
-        Some(keys.clone()),
-        DEFAULT_REFRESH_AFTER,
-    )
-    .await;
-    let cookie = sign_in(&app).await;
-    let schedule = seed_bound_schedule(&pool, USER, &[USER_GROUP]).await;
-
-    let revoked = call(
-        &app,
-        Request::delete("/api/credentials/me")
-            .header(header::COOKIE, &cookie)
-            .header("sec-fetch-site", "same-origin")
-            .body(Body::empty())
-            .expect("request"),
-    )
-    .await;
-    assert_eq!(revoked.status, StatusCode::OK, "{}", revoked.body);
-    assert!(
-        revoked.body.contains("\"revoked\":true"),
-        "{}",
-        revoked.body
-    );
-
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM user_credentials")
-        .fetch_one(&pool)
-        .await
-        .expect("count");
-    assert_eq!(rows, 0, "the credential is gone");
-
-    let refresh =
-        crate::identity::oidc::credentials::OwnerRefresh::new(pool.clone(), provider, keys);
-    let db = Db::new(pool.clone());
-    let fired = crate::launches::schedules::fire_due_refreshing(
-        &db,
-        "2026-08-23T12:00:30Z".parse().expect("now"),
-        8,
-        5,
-        std::time::Duration::from_secs(3600),
-        Some(&refresh),
-    )
-    .await
-    .expect("fire");
-    assert!(fired.is_empty(), "a revoked owner dispatches nothing");
-    let row = crate::launches::schedules::ScheduleStore::new(crate::client::Db::new(pool.clone()))
-        .get(&schedule)
-        .await
-        .expect("get")
-        .expect("row");
-    assert!(row.owner_signin_required, "the view says: sign in again");
-
-    // Signing in again stores a fresh credential and re-arms the schedule.
-    sign_in(&app).await;
-    let row = crate::launches::schedules::ScheduleStore::new(crate::client::Db::new(pool.clone()))
-        .get(&schedule)
-        .await
-        .expect("get")
-        .expect("row");
-    assert!(!row.owner_signin_required);
-}
-
-/// A live session re-reads its groups from the offline credential on use, and a definitive refusal
-/// downgrades it: the login stands, every role it carried is gone, and writes are refused until the
-/// user signs in again.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_session_refreshes_its_groups_on_use_and_a_refusal_downgrades_it(pool: PgPool) {
-    let Some(base) = keycloak().await else { return };
-    let provider = Arc::new(OidcProvider::new(cfg_offline(&base)).expect("provider"));
-    let keys = test_keys();
-    // Zero-length staleness window: every request re-reads, which is what makes the refresh
-    // observable inside one test.
-    let app = native_router_with(
-        &pool,
-        provider,
-        Some(keys),
-        std::time::Duration::from_secs(0),
-    )
-    .await;
-    let cookie = sign_in(&app).await;
-
-    // The realm's group mapper puts alice in the operator group, and the refresh keeps her there.
-    let who = call(&app, get("/api/whoami", Some(&cookie))).await;
-    assert_eq!(who.status, StatusCode::OK);
-    assert!(
-        who.body.contains("\"role\":\"operator\"") && who.body.contains(USER_GROUP),
-        "the refreshed session keeps its groups: {}",
-        who.body
-    );
-    assert!(who.body.contains("\"downgraded\":false"), "{}", who.body);
-    let refreshed: Option<String> = sqlx::query_scalar("SELECT refreshed_at FROM user_credentials")
-        .fetch_one(&pool)
-        .await
-        .expect("row");
-    assert!(
-        refreshed.is_some(),
-        "the session refresh spent the credential"
-    );
-
-    // The credential dies under the session. The next request is refused a refresh, so the session
-    // is downgraded rather than left holding a role nobody has confirmed.
-    sqlx::query("DELETE FROM user_credentials")
-        .execute(&pool)
-        .await
-        .expect("revoke");
-    let who = call(&app, get("/api/whoami", Some(&cookie))).await;
-    assert_eq!(who.status, StatusCode::OK);
-    assert!(
-        who.body.contains("\"role\":\"viewer\"") && who.body.contains("\"downgraded\":true"),
-        "a refused refresh downgrades the session to viewer: {}",
-        who.body
-    );
-    assert!(
-        !who.body.contains(USER_GROUP),
-        "and drops its groups: {}",
-        who.body
-    );
-    // The downgrade is not cosmetic: an operator-gated write is refused.
-    let write = call(
-        &app,
-        Request::post("/api/issues/some-key/park")
-            .header(header::COOKIE, &cookie)
-            .header("sec-fetch-site", "same-origin")
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(r#"{"reason":"because"}"#))
-            .expect("request"),
-    )
-    .await;
-    assert_eq!(
-        write.status,
-        StatusCode::FORBIDDEN,
-        "a downgraded session holds no role: {}",
-        write.body
-    );
-}
-
 /// RH SSO puts membership on the access token as realm roles and nothing on the ID token. The
 /// callback must read the exchanged access token, nonce and all, and the session carries the
 /// groups exactly as if the ID token had asserted them.
@@ -1165,4 +631,208 @@ async fn groups_come_from_the_access_token_when_the_id_token_has_none(pool: PgPo
         serde_json::json!([USER_GROUP]),
         "the group came off the access token: {who}"
     );
+}
+
+// --- signing a desktop app in through the browser ------------------------------------------------
+
+fn post(path: &str, cookie: Option<&str>, content_type: &str, body: String) -> Request<Body> {
+    let mut b = Request::post(path).header(header::CONTENT_TYPE, content_type);
+    if let Some(cookie) = cookie {
+        b = b.header(header::COOKIE, cookie);
+    }
+    b.body(Body::from(body)).expect("request")
+}
+
+/// A signed-in session cookie for alice, through Keycloak's real login form.
+async fn signed_in(app: &axum::Router) -> String {
+    let start = call(app, get("/auth/login?rd=/", None)).await;
+    let authorize_url = start.location.expect("login redirects to the issuer");
+    let flow_cookie = start.cookie.expect("flow cookie");
+    let (code, state) = authenticate(&authorize_url).await;
+    let done = call(
+        app,
+        get(
+            &format!("/auth/callback?code={code}&state={state}"),
+            Some(&flow_cookie),
+        ),
+    )
+    .await;
+    assert_eq!(done.status, StatusCode::SEE_OTHER, "{}", done.body);
+    done.cookie.expect("session cookie")
+}
+
+/// The approval page's pending id.
+fn pending_id(html: &str) -> String {
+    let at = html
+        .find("name=\"id\" value=\"")
+        .expect("the page carries a pending id")
+        + 17;
+    html[at..].split('"').next().expect("id").to_string()
+}
+
+fn query_of(location: &str) -> std::collections::HashMap<String, String> {
+    url::Url::parse(location)
+        .expect("a url")
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_desktop_app_signs_in_through_the_browser_and_gets_a_working_key(pool: PgPool) {
+    use base64::Engine;
+    use sha2::Digest;
+
+    let Some(base) = keycloak().await else { return };
+    let provider = Arc::new(OidcProvider::new(cfg(&base)).expect("provider"));
+    let app = native_router(&pool, provider).await;
+    let verifier = "a".repeat(20) + "-verifier-that-only-the-app-holds-0123";
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(sha2::Sha256::digest(verifier.as_bytes()));
+    let redirect = "http://127.0.0.1:53111/callback";
+    let ask = format!(
+        "/auth/native?redirect_uri={}&state=s1&code_challenge={challenge}&code_challenge_method=S256&name=Test%20app",
+        url::form_urlencoded::byte_serialize(redirect.as_bytes()).collect::<String>()
+    );
+
+    let anonymous = call(&app, get(&ask, None)).await;
+    assert_eq!(anonymous.status, StatusCode::SEE_OTHER);
+    assert!(
+        anonymous
+            .location
+            .as_deref()
+            .is_some_and(|l| l.starts_with("/auth/login?rd=%2Fauth%2Fnative%3F")),
+        "a visitor signs in first and comes back: {:?}",
+        anonymous.location
+    );
+
+    let session = signed_in(&app).await;
+    let page = call(&app, get(&ask, Some(&session))).await;
+    assert_eq!(page.status, StatusCode::OK, "{}", page.body);
+    assert!(page.body.contains("Test app"), "{}", page.body);
+    assert!(page.body.contains(USER), "{}", page.body);
+    let session = page.cookie.unwrap_or(session);
+
+    let forged = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            "id=guessed&decision=approve".into(),
+        ),
+    )
+    .await;
+    assert_eq!(
+        forged.status,
+        StatusCode::BAD_REQUEST,
+        "a guessed id approves nothing"
+    );
+
+    let page = call(&app, get(&ask, Some(&session))).await;
+    let approved = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            format!("id={}&decision=approve", pending_id(&page.body)),
+        ),
+    )
+    .await;
+    assert_eq!(approved.status, StatusCode::SEE_OTHER, "{}", approved.body);
+    let back = approved.location.expect("back to the app");
+    assert!(
+        back.starts_with("http://127.0.0.1:53111/callback?"),
+        "{back}"
+    );
+    let params = query_of(&back);
+    assert_eq!(params["state"], "s1");
+    let code = params["code"].clone();
+    assert!(
+        !back.contains("crk_"),
+        "the key never travels through the browser"
+    );
+
+    let redeem = |code: &str, verifier: &str| {
+        post(
+            "/auth/native/token",
+            None,
+            "application/json",
+            serde_json::json!({"code": code, "code_verifier": verifier, "redirect_uri": redirect})
+                .to_string(),
+        )
+    };
+    let issued = call(&app, redeem(&code, &verifier)).await;
+    assert_eq!(issued.status, StatusCode::OK, "{}", issued.body);
+    let issued: serde_json::Value = serde_json::from_str(&issued.body).expect("json");
+    let key = issued["key"].as_str().expect("a key").to_string();
+    assert!(key.starts_with("crk_"), "{issued}");
+    assert_eq!(issued["name"], "Test app");
+    assert!(
+        issued["expires_at"].is_string(),
+        "the key expires: {issued}"
+    );
+
+    let who = call(
+        &app,
+        Request::get("/api/whoami")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .body(Body::empty())
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(who.status, StatusCode::OK, "{}", who.body);
+    let who: serde_json::Value = serde_json::from_str(&who.body).expect("whoami");
+    assert_eq!(
+        who["user"], USER,
+        "the key acts as the person who approved: {who}"
+    );
+
+    let replay = call(&app, redeem(&code, &verifier)).await;
+    assert_eq!(
+        replay.status,
+        StatusCode::BAD_REQUEST,
+        "a code buys one key"
+    );
+
+    let page = call(&app, get(&ask, Some(&session))).await;
+    let second = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            format!("id={}&decision=approve", pending_id(&page.body)),
+        ),
+    )
+    .await;
+    let stolen = query_of(&second.location.expect("back"))["code"].clone();
+    let wrong = call(&app, redeem(&stolen, &format!("{verifier}x"))).await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{}", wrong.body);
+    assert!(wrong.body.contains("does not match"), "{}", wrong.body);
+    let after = call(&app, redeem(&stolen, &verifier)).await;
+    assert_eq!(
+        after.status,
+        StatusCode::BAD_REQUEST,
+        "a wrong verifier burns the code"
+    );
+
+    let page = call(&app, get(&ask, Some(&session))).await;
+    let denied = call(
+        &app,
+        post(
+            "/auth/native",
+            Some(&session),
+            "application/x-www-form-urlencoded",
+            format!("id={}&decision=deny", pending_id(&page.body)),
+        ),
+    )
+    .await;
+    let params = query_of(&denied.location.expect("back"));
+    assert_eq!(
+        params.get("error").map(String::as_str),
+        Some("access_denied")
+    );
+    assert!(!params.contains_key("code"));
 }

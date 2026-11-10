@@ -54,10 +54,10 @@ enum Command {
     /// One run with its candidates, as JSON.
     Run(ops::runs::Run),
 
-    /// Recurrences: what fires when, and what is blocked on an owner signing in.
+    /// Recurrences: what fires when, and whether each is enabled.
     Schedules(ops::launches::Schedules),
 
-    /// Tracker watches: what each sweeps, and what is blocked on an owner signing in.
+    /// Tracker watches: what each sweeps, and whether each is enabled.
     Watches(ops::launches::Watches),
 
     /// One tracker watch, as JSON.
@@ -124,6 +124,8 @@ enum Command {
     /// Adopt a scenario: a controller issue with no upstream.
     Adopt(AdoptArgs),
 
+    /// Cancel a playbook launch: park it and delete its running pods.
+    Cancel(ops::playbooks::Cancel),
     /// Park an issue: stop working it, and record why.
     Park(ops::issues::Park),
 
@@ -157,6 +159,9 @@ enum Command {
 
     /// One window of a run's engine output, resumable by cursor.
     RunLog(ops::runs::RunLog),
+
+    /// A run's engine session as NDJSON, one event per line; -f streams a running one.
+    RunSession(ops::runs::RunSession),
 
     /// The files a run's tasks captured: what the run produced, as opposed to what it narrated.
     RunFiles(ops::runs::RunFiles),
@@ -451,6 +456,7 @@ pub async fn run() -> Result<()> {
         Command::Issues(op) => op.run(&c).await?,
         Command::Issue(op) => op.run(&c).await?,
         Command::Adopt(args) => args.into_op()?.run(&c).await?,
+        Command::Cancel(op) => op.run(&c).await?,
         Command::Park(op) => op.run(&c).await?,
         Command::Unpark(op) => op.run(&c).await?,
         Command::Bump(op) => op.run(&c).await?,
@@ -466,6 +472,11 @@ pub async fn run() -> Result<()> {
                 .await?
         }
         Command::RunLog(op) => op.run(&c).await?,
+        Command::RunSession(op) if op.follow => {
+            op.follow(&c, &mut std::io::stdout()).await?;
+            String::new()
+        }
+        Command::RunSession(op) => op.run(&c).await?,
         Command::RunFiles(op) => op.run(&c).await?,
         Command::RunFile(op) => op.run(&c).await?,
         Command::Contracts(op) => op.run(&c).await?,

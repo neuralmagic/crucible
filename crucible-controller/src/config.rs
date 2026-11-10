@@ -170,10 +170,6 @@ fn default_playbook_max_cost_cap() -> f64 {
 /// Consecutive failed firings after which a playbook schedule disables itself.
 const DEFAULT_SCHEDULE_AUTO_DISABLE_FAILURES: i64 = 5;
 
-/// How long a schedule's snapshot of its owner's groups stays usable. Past it a firing whose scope
-/// binds secrets parks until an owner re-saves the schedule.
-const DEFAULT_SCHEDULE_OWNER_TTL_SECS: u64 = 7 * 24 * 3600;
-
 /// The default playbook wall-clock cap, in hours. Spelled once: clap renders it into
 /// `--playbook-max-time-cap`'s default and [`PlaybookCaps::default`] builds the same value.
 const DEFAULT_PLAYBOOK_MAX_TIME_HOURS: u64 = 4;
@@ -244,11 +240,6 @@ pub struct ControllerCfg {
     /// without what it declared.
     #[arg(skip)]
     pub secret_provider: Option<std::sync::Arc<dyn crate::secrets::provider::SecretProvider>>,
-    /// The offline credential a launcher's stale groups are re-read through at dispatch, and the
-    /// launch triggers' fire-time refresh. Installed by the binary like
-    /// [`ControllerCfg::secret_provider`]; `None` leaves a launcher on their stored groups.
-    #[arg(skip)]
-    pub owner_refresh: Option<std::sync::Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
     /// The boundaries the daemon assembled: the pod dispatcher, the contract gate, the build
     /// backend, and the reconcile queue, threaded here like [`ControllerCfg::secret_provider`].
     #[arg(skip)]
@@ -709,13 +700,6 @@ pub struct ControllerCfg {
         default_value_t = DEFAULT_SCHEDULE_AUTO_DISABLE_FAILURES
     )]
     pub schedule_auto_disable_failures: i64,
-    /// How long a schedule's snapshot of its owner's groups stays usable at fire time.
-    #[arg(
-        long = "schedule-owner-ttl-secs",
-        env = "CONTROLLER_SCHEDULE_OWNER_TTL_SECS",
-        default_value_t = DEFAULT_SCHEDULE_OWNER_TTL_SECS
-    )]
-    pub schedule_owner_ttl_secs: u64,
     /// The environment variables a local-mode run may inherit from the controller's own
     /// environment, beyond `PATH` and the run's `CRUCIBLE_*` set. Local mode has no registry, so
     /// this is the operator's whole say over what a subprocess can read.
@@ -859,6 +843,14 @@ impl ControllerCfg {
     pub fn issues_agent_tokens(&self) -> bool {
         let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
         set(&self.agent_issuer) && (set(&self.agent_spire) || self.spire.enabled())
+    }
+
+    /// Whether the issuer mints tokens that name who a run acts for: an issuer is configured. A
+    /// run's tasks get tokens with no SPIRE; its sandboxes need [`Self::issues_agent_tokens`].
+    pub fn issues_run_tokens(&self) -> bool {
+        self.agent_issuer
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
     }
 
     /// How a pod render pins its image tags: the registry, unless `render_no_pin` is set.

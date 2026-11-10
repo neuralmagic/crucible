@@ -120,22 +120,27 @@ pub async fn assemble(
         let cfg = rec_cfg.clone();
         let store = overrides.clone();
         Box::pin(async move {
-            crate::daemon::overrides::apply_pending(&db, &store, &key.0, cfg.issues_agent_tokens())
-                .await?;
+            let applied = crate::daemon::overrides::apply_pending(
+                &db,
+                &store,
+                &key.0,
+                cfg.issues_run_tokens(),
+            )
+            .await?;
+            if let Some(ov) = applied
+                && ov.kind == crate::daemon::queue::OverrideKind::Cancel
+            {
+                crate::runs::cancel::cancel_runs(&db, &cfg, &key.0, ov.actor.as_deref()).await?;
+            }
             crate::issues::reconcile::reconcile(&db, &cfg, &key.0).await
         })
     });
 
-    // The fire-time group refresh's credential. A deployment with no issuer or no mounted key runs
-    // the sweep on the schedule-row snapshot alone, and dispatch on the launcher's stored groups.
-    let owner_refresh = cfg.owner_refresh.clone();
     let trigger_sweep = |triggers: Vec<Arc<dyn crate::launches::standing::LaunchTrigger>>| {
         crate::launches::standing::TriggerSweep::new(
             db.clone(),
             triggers,
             cfg.schedule_auto_disable_failures,
-            std::time::Duration::from_secs(cfg.schedule_owner_ttl_secs),
-            owner_refresh.clone(),
             Some(policy.clone()),
         )
     };

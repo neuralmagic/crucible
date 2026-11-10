@@ -37,6 +37,8 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zvariant via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0371", reason = "zbus_names via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0319", reason = "anymap2 via kingfisher-rules -> liquid-core (rule templating); unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2020-0163", reason = "term_size via kingfisher-core -> tokei; unmaintained, not vulnerable" },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils via postgresql_embedded -> reqwest-retry -> wasmtimer, a wasm32-only dependency never built for our targets; unmaintained, not vulnerable" },
 ]
 
@@ -62,6 +64,11 @@ allow = [
     # postgresql_embedded (the controller's `embedded-db` feature). OSI-approved, permissive.
     "PostgreSQL",
 ]
+
+# kingfisher-rules: CC-BY-SA-4.0 covers its bundled rule data.
+[[licenses.exceptions]]
+crate = "kingfisher-rules"
+allow = ["CC-BY-SA-4.0"]
 
 # ring's license file is the historical OpenSSL/ISC/MIT aggregate; declare it so the checker
 # doesn't have to guess.

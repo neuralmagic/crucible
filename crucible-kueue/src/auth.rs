@@ -3,10 +3,10 @@
 //! [`Principal`] (what the guard's rules see) in its extensions.
 //!
 //! A token stands for a run (from a run issuer, carrying `run_id`) or a person (from a people
-//! issuer), and either way names the Kubernetes user it acts as (`kube_user`): the launcher for a
-//! run, the person themselves otherwise. That user's RBAC decides every call; the token's
-//! `namespace` claim is only a default. Which of the token's claims play those parts is a
-//! [`ClaimMap`], applied before anything else reads the claims.
+//! issuer), and either way names the Kubernetes user it acts as (`kube_user`): the run's own pod
+//! user for a run, the person themselves otherwise. That user's RBAC decides every call; the
+//! token's `namespace` claim is only a default. Which of a person's claims play those parts is a
+//! [`ClaimMap`], applied before anything else reads them; a run's claims are used as issued.
 
 use crate::caller::{Identity, NameError, Namespace};
 use crate::config::{self, ClaimMap, NAMESPACE_CLAIM, NAMESPACES_CLAIM, RUN_ID_CLAIM};
@@ -141,7 +141,9 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
             return auth.oidc.challenge(headers, &error);
         }
     };
-    auth.claims.canonicalize(&mut principal);
+    if principal.callers == Callers::People {
+        auth.claims.canonicalize(&mut principal);
+    }
     default_namespace(&mut principal, &auth.namespaces).await;
     let identity = match Identity::from_principal(&principal, auth.people) {
         Ok(identity) => identity,
@@ -337,6 +339,81 @@ mod tests {
             id.launched_by.as_str()
         );
         assert_eq!(id.run_id.as_str(), id.launched_by.as_str());
+    }
+
+    /// A configured claim map leaves a run's claims unchanged.
+    #[tokio::test]
+    async fn a_run_token_passes_through_a_configured_claim_map_unchanged() {
+        let jwks =
+            crucible_mcp_auth::testing::JwksServer::start(vec![crucible_mcp_auth::testing::jwk(
+                "a",
+            )])
+            .await;
+        let oidc = crucible_mcp_auth::testing::resource_server(
+            &jwks,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(1),
+        );
+        let auth = Auth {
+            oidc: Arc::new(oidc),
+            people: false,
+            claims: ClaimMap {
+                user: "preferred_username".into(),
+                user_prefix: "oidc:".into(),
+                groups: "groups".into(),
+                run_id: None,
+                namespace: "namespace".into(),
+                namespaces: "namespaces".into(),
+            },
+            namespaces: Arc::new(served(&[])),
+        };
+        let app = axum::Router::new()
+            .route(
+                "/mcp",
+                axum::routing::post(|req: Request| async move {
+                    let identity = req.extensions().get::<Identity>().unwrap();
+                    let principal = req.extensions().get::<Principal>().unwrap();
+                    format!(
+                        "{} {} {} {}",
+                        identity.run_id,
+                        identity.kube_user,
+                        principal
+                            .claims
+                            .get("kube_groups")
+                            .cloned()
+                            .unwrap_or_default(),
+                        principal
+                            .claims
+                            .get("namespace")
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::new(auth),
+                authenticate,
+            ));
+        let mut claims = crucible_mcp_auth::testing::run_claims();
+        claims["kube_user"] = json!("crucible:run:crucible-run-x");
+        claims["kube_groups"] = json!(["crucible:runs", "crucible:team:ml"]);
+        claims["namespace"] = json!("team-e2e");
+        let token = crucible_mcp_auth::testing::sign("a", &claims);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(axum::http::header::HOST, "kueue.apps.example")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let expected = format!(
+            "auth-spike crucible:run:crucible-run-x {} {}",
+            r#"["crucible:runs","crucible:team:ml"]"#, r#""team-e2e""#
+        );
+        assert_eq!(String::from_utf8(body.to_vec()).unwrap(), expected);
     }
 
     #[test]

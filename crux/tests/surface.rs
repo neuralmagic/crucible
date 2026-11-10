@@ -34,7 +34,7 @@ fn sorted_keys(value: serde_json::Value) -> serde_json::Value {
 }
 
 fn help_listing() -> String {
-    let mut cmd = crux::cli::command();
+    let mut cmd = crux::cli::command().term_width(100);
     cmd.build();
     let mut out = String::new();
     let mut section = |name: &str, cmd: &mut clap::Command| {

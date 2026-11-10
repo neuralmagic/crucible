@@ -16,7 +16,6 @@
 //! failure is a 503 for that one request, never a failed startup.
 
 pub mod claims_probe;
-pub mod credentials;
 pub mod routes;
 pub mod users;
 
@@ -98,14 +97,11 @@ impl GroupClaims {
 }
 
 /// The provider metadata outside what the core type models: RP-initiated logout's endpoint, so
-/// `/auth/logout` ends the session at the issuer and not only here, and the revocation endpoint a
-/// revoked offline credential is reported dead to.
+/// `/auth/logout` ends the session at the issuer and not only here.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExtraMetadata {
     #[serde(default)]
     end_session_endpoint: Option<String>,
-    #[serde(default)]
-    revocation_endpoint: Option<String>,
 }
 
 impl AdditionalProviderMetadata for ExtraMetadata {}
@@ -166,17 +162,16 @@ pub struct OidcCfg {
     /// The callback URL registered with the issuer. Must be this controller's own
     /// `<external base>/auth/callback`.
     pub redirect_url: String,
-    /// The scopes the authorization request asks for, verbatim. `offline_access` belongs here so the
-    /// refresh credential a scheduled launch needs survives logout; `groups` does NOT unless the
-    /// realm registered it as a scope, because an unregistered scope is `invalid_scope` and breaks
-    /// login outright.
+    /// The scopes the authorization request asks for, verbatim. `groups` does NOT belong here unless
+    /// the realm registered it as a scope, because an unregistered scope is `invalid_scope` and
+    /// breaks login outright.
     pub scopes: Vec<String>,
     /// Where the issuer sends the browser after RP-initiated logout.
     pub post_logout_redirect: Option<String>,
 }
 
 /// The default scope set: what the relying party asks for when the deploy names none.
-const DEFAULT_SCOPES: [&str; 4] = ["openid", "email", "profile", "offline_access"];
+const DEFAULT_SCOPES: [&str; 3] = ["openid", "email", "profile"];
 
 fn env_value(name: &str) -> Option<String> {
     std::env::var(name)
@@ -219,9 +214,7 @@ impl OidcCfg {
     }
 }
 
-/// What a validated credential says about the caller: the one shape the browser callback and the
-/// offline credential refresh both produce, so a session and a refresh can never disagree about
-/// what identity is.
+/// What a validated credential says about the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedClaims {
     pub sub: String,
@@ -252,9 +245,6 @@ struct Discovered {
     client: RelyingParty,
     end_session_endpoint: Option<String>,
     userinfo_endpoint: Option<String>,
-    /// Where a revoked offline credential is told it is dead. `None` when the issuer publishes
-    /// none, which makes a revoke local-only.
-    revocation_endpoint: Option<String>,
     jwks_uri: String,
     issuer: String,
 }
@@ -359,8 +349,6 @@ impl OidcProvider {
                     .map_err(|e| OidcError::Unavailable(format!("discovery: {e}")))?;
                 let end_session_endpoint =
                     metadata.additional_metadata().end_session_endpoint.clone();
-                let revocation_endpoint =
-                    metadata.additional_metadata().revocation_endpoint.clone();
                 let jwks_uri = metadata.jwks_uri().to_string();
                 let issuer = metadata.issuer().to_string();
                 let userinfo_endpoint = metadata.userinfo_endpoint().map(|u| u.to_string());
@@ -377,7 +365,6 @@ impl OidcProvider {
                     client,
                     end_session_endpoint,
                     userinfo_endpoint,
-                    revocation_endpoint,
                     jwks_uri,
                     issuer,
                 }))
@@ -569,10 +556,6 @@ impl OidcProvider {
     /// Finish the flow: exchange the code (proving the PKCE verifier) and validate the ID token that
     /// comes back — issuer, audience, expiry, signature, and the nonce this browser's request
     /// carried.
-    ///
-    /// The refresh token rides back with the claims. It is an OFFLINE token when the authorization
-    /// request asked for `offline_access` and the realm granted it; `None` when it did not, which
-    /// is the degraded shape where scheduled launches fall back to the schedule-row snapshot.
     pub async fn exchange(
         &self,
         code: String,
@@ -599,7 +582,6 @@ impl OidcProvider {
         let claims = self.supplement_groups(&discovered, &response, claims).await;
         Ok(Exchanged {
             claims,
-            refresh_token: refresh_token_of(&response),
             id_token: id_token_of(&response),
         })
     }
@@ -665,100 +647,14 @@ impl OidcProvider {
             .await
             .map_err(|e| OidcError::rejected(format!("userinfo: {e}")))
     }
-
-    /// Spend a stored refresh token: a fresh ID token, validated the same way the callback's is,
-    /// plus whatever refresh token the issuer rotated back.
-    ///
-    /// The error split is the whole point. Only an OAuth error document naming a dead grant is
-    /// [`OidcError::Rejected`], which costs the user a re-login; an issuer that could not be
-    /// reached, including one whose router answered for it, is [`OidcError::Unavailable`] and the
-    /// caller retries. See [`token_endpoint_failure`].
-    pub async fn refresh(&self, refresh_token: &str) -> Result<Refreshed, OidcError> {
-        let discovered = self.discovered().await?;
-        let response = discovered
-            .client
-            .exchange_refresh_token(&openidconnect::RefreshToken::new(refresh_token.to_string()))
-            .map_err(|e| {
-                OidcError::rejected(format!("the issuer publishes no token endpoint: {e}"))
-            })?
-            .request_async(&bridge(self.http.clone()))
-            .await
-            .map_err(|e| token_endpoint_failure("the refresh", e))?;
-        // A refresh response's ID token carries no nonce: no browser request started it.
-        let claims = claims_from(
-            &discovered,
-            &response,
-            |_: Option<&openidconnect::Nonce>| Ok(()),
-        )?;
-        let claims = self.supplement_groups(&discovered, &response, claims).await;
-        Ok(Refreshed {
-            claims,
-            refresh_token: refresh_token_of(&response),
-        })
-    }
-
-    /// Tell the issuer a refresh token is dead, best effort. A user revoking their credential has
-    /// already had the row deleted locally; an issuer that refuses or cannot be reached must not
-    /// turn that into a failed revoke.
-    pub async fn revoke(&self, refresh_token: &str) {
-        let Ok(discovered) = self.discovered().await else {
-            return;
-        };
-        let Some(endpoint) = discovered.revocation_endpoint.clone() else {
-            return;
-        };
-        let mut form = vec![
-            ("token", refresh_token),
-            ("token_type_hint", "refresh_token"),
-            ("client_id", self.cfg.client_id.as_str()),
-        ];
-        if let Some(secret) = self.cfg.client_secret.as_deref() {
-            form.push(("client_secret", secret));
-        }
-        let body = form
-            .iter()
-            .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    percent_encoding::utf8_percent_encode(k, percent_encoding::NON_ALPHANUMERIC),
-                    percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("&");
-        if let Err(e) = self
-            .http
-            .post(&endpoint)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/x-www-form-urlencoded",
-            )
-            .body(body)
-            .send()
-            .await
-        {
-            tracing::warn!(error = %e, "revoking the offline credential at the issuer");
-        }
-    }
 }
 
 /// What one authorization code produced.
 #[derive(Debug, Clone)]
 pub struct Exchanged {
     pub claims: VerifiedClaims,
-    /// The offline credential, when the realm granted one.
-    pub refresh_token: Option<String>,
     /// The serialized ID token, which RP-initiated logout sends back as `id_token_hint`.
     pub id_token: String,
-}
-
-/// What one spent refresh token produced.
-#[derive(Debug, Clone)]
-pub struct Refreshed {
-    pub claims: VerifiedClaims,
-    /// The token to store for next time. `None` means the issuer rotated nothing and the stored
-    /// token stands.
-    pub refresh_token: Option<String>,
 }
 
 /// Validate a token response's ID token and read the identity out of it.
@@ -835,18 +731,10 @@ fn id_token_of(response: &TokenResponse) -> String {
         .unwrap_or_default()
 }
 
-fn refresh_token_of(response: &TokenResponse) -> Option<String> {
-    use openidconnect::OAuth2TokenResponse;
-    response
-        .refresh_token()
-        .map(|t| t.secret().clone())
-        .filter(|t| !t.is_empty())
-}
-
 /// Which side a token-endpoint failure belongs to.
 ///
-/// Definitive means the credential is dead and only a fresh sign-in brings it back, so the bar is
-/// an OAuth error document the ISSUER authored, naming a code about the grant or the registration.
+/// Definitive means the grant is dead, so the bar is an OAuth error document the ISSUER authored,
+/// naming a code about the grant or the registration.
 /// Everything else is the issuer being unreachable and retries: a transport failure, a non-200 with
 /// an empty or non-JSON body (a router answering for a restarting issuer), a body that does not
 /// parse, and any error code that may heal (`server_error`, `temporarily_unavailable`).

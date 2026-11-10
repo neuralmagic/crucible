@@ -11,7 +11,7 @@
 # PUSH_REPO, and runs it as a Job. The script then checks the cluster and the controller, not the
 # agent's word alone:
 #   - the controller issued buildit and crucible-kueue tokens to a supervisor SPIFFE ID under this
-#     cluster's gateway prefix, for the launcher's kube_user and the run;
+#     cluster's gateway prefix, for the run's own kube_user and the run;
 #   - the Job exists in the workload namespace, carries that run, launcher and queue, runs an
 #     image pushed to PUSH_REPO by digest, succeeded, and its log carries the nonce;
 #   - the agent's whoami reported the same run and kube_user;
@@ -64,8 +64,15 @@
 # and whoami checks are the smoke pack's. Any other pack passes when its run left at least one Job
 # in the workload namespace and the plan's RESULT_TASK (default verify) ended pass; that task's
 # output is printed either way. Every pack gets the token, isolation and leak checks.
+# TASKS=1 runs a pack whose command tasks reach crucible-kueue with task tokens and that has no
+# agent turn (default pack e2e/kueue/task-pack). It needs no Anthropic endpoint or key. Loop pods
+# then get an SVID of their own (cluster.loop_svid and a ClusterSPIFFEID for LOOP_NS), a second
+# LocalQueue crucible-e2e-b200 points at CLUSTER_QUEUE_B200 (default crucible-b200), and the
+# script checks that the task token was issued to the run with that SVID and to no sandbox, that
+# RESULT_TASK (default gpu) passed, and that its Jobs carry the run.
 # KEEP=1 leaves everything behind.
 set -euo pipefail
+TASKS=${TASKS:-0}
 
 : "${CONTEXT:?set CONTEXT to the kube context of the cluster under test}"
 : "${LOOP_IMAGE:?set LOOP_IMAGE to a runtime image built from this checkout}"
@@ -73,10 +80,13 @@ set -euo pipefail
 : "${CONTROLLER_IMAGE:?set CONTROLLER_IMAGE to a controller image built from this checkout}"
 : "${PULL_SECRET:?set PULL_SECRET to the crucible-system pull Secret for those images}"
 : "${PUSH_REPO:?set PUSH_REPO to the repository the pack pushes its build to, which PULL_SECRET may push to}"
-: "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to the Anthropic Messages API endpoint the agent uses}"
-: "${ANTHROPIC_KEY_SECRET:=}" "${ANTHROPIC_KEY_FILE:=}"
-[ -n "$ANTHROPIC_KEY_SECRET$ANTHROPIC_KEY_FILE" ] \
-    || { echo "set ANTHROPIC_KEY_SECRET (a crucible-system Secret with api-key) or ANTHROPIC_KEY_FILE" >&2; exit 1; }
+: "${ANTHROPIC_BASE_URL:=}" "${ANTHROPIC_KEY_SECRET:=}" "${ANTHROPIC_KEY_FILE:=}"
+if [ "$TASKS" != 1 ]; then
+    [ -n "$ANTHROPIC_BASE_URL" ] \
+        || { echo "set ANTHROPIC_BASE_URL to the Anthropic Messages API endpoint the agent uses" >&2; exit 1; }
+    [ -n "$ANTHROPIC_KEY_SECRET$ANTHROPIC_KEY_FILE" ] \
+        || { echo "set ANTHROPIC_KEY_SECRET (a crucible-system Secret with api-key) or ANTHROPIC_KEY_FILE" >&2; exit 1; }
+fi
 [ -z "$ANTHROPIC_KEY_FILE" ] || ANTHROPIC_KEY_SECRET=crucible-kueue-e2e-anthropic
 CTL_NS=crucible-kueue-e2e-ctl
 LOOP_NS=crucible-kueue-e2e-loops
@@ -86,10 +96,11 @@ SANDBOX_NS=${SANDBOX_NS:-crucible-kueue-e2e-sandboxes}
 WORKLOAD_NS=crucible-kueue-e2e-workloads
 E2E_LABEL=crucible.dev/e2e=kueue
 CLUSTER_QUEUE=${CLUSTER_QUEUE:-crucible}
+CLUSTER_QUEUE_B200=${CLUSTER_QUEUE_B200:-crucible-b200}
 MAX_COST=${MAX_COST:-3}
 MAX_TIME=${MAX_TIME:-30m}
 PARAMS=${PARAMS:-}
-RESULT_TASK=${RESULT_TASK:-verify}
+RESULT_TASK=${RESULT_TASK:-$([ "$TASKS" = 1 ] && echo gpu || echo verify)}
 CTL_PSA=${CTL_PSA:-baseline}
 KUEUE_PSA=${KUEUE_PSA:-restricted}
 LOOP_PSA=${LOOP_PSA:-baseline}
@@ -100,6 +111,7 @@ JOB=crucible-smoke-${NONCE:0:8}
 TIMEOUT_SECS=${TIMEOUT_SECS:-1800}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+[ "$TASKS" != 1 ] || : "${PACK:=$ROOT/e2e/kueue/task-pack}"
 PACK=$(cd "${PACK:-$ROOT/e2e/kueue/pack}" && pwd)
 SMOKE=0
 [ "$PACK" = "$ROOT/e2e/kueue/pack" ] && SMOKE=1
@@ -217,6 +229,7 @@ fill() {
         -e "s|@SANDBOX_NS@|$SANDBOX_NS|g" -e "s|@WORKLOAD_NS@|$WORKLOAD_NS|g" -e "s|@KUEUE_NS@|$KUEUE_NS|g" \
         -e "s|@BUILD_NS@|$BUILD_NS|g" -e "s|@PLATFORM@|$PLATFORM|g" -e "s|@SPIRE_CLASS@|$SPIRE_CLASS|g" \
         -e "s|@CLUSTER_QUEUE@|$CLUSTER_QUEUE|g" -e "s|@KUEUE_API@|$KUEUE_API|g" \
+        -e "s|@CLUSTER_QUEUE_B200@|$CLUSTER_QUEUE_B200|g" -e "s|@IMAGE@|$LOOP_IMAGE|g" \
         -e "s|@SPIRE_NS@|$SPIRE_NS|g" -e "s|@ISSUER@|$ISSUER|g" -e "s|@KUEUE_URL@|$KUEUE_URL|g" \
         -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
         -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@ANTHROPIC_BASE_URL@|$ANTHROPIC_BASE_URL|g" \
@@ -224,6 +237,17 @@ fill() {
         "$1"
 }
 fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
+if [ "$TASKS" = 1 ]; then
+    # No agent turn: drop the model endpoint and key, and give loop pods an SVID.
+    awk '/^\[env\]$/ || /^\[\[secret_env\]\]$/ { skip = 1 }
+         /^\[kueue\]$/ { skip = 0 }
+         skip { next }
+         { print }
+         /^\[cluster\]$/ { print "loop_svid = true" }' "$WORK/profile.toml" > "$WORK/profile.tasks.toml"
+    mv "$WORK/profile.tasks.toml" "$WORK/profile.toml"
+    kc get clusterqueue "$CLUSTER_QUEUE_B200" >/dev/null 2>&1 \
+        || fail "no ClusterQueue $CLUSTER_QUEUE_B200; set CLUSTER_QUEUE_B200"
+fi
 
 log "clearing what an earlier run left"
 teardown --timeout=300s
@@ -245,6 +269,7 @@ fi
 log "deploying the controller, the namespaces and their RBAC"
 fill "$ROOT/e2e/kueue/controller.yaml.in" | kc apply -f - >/dev/null
 fill "$ROOT/e2e/kueue/cluster.yaml.in" | kc apply -f - >/dev/null
+[ "$TASKS" != 1 ] || fill "$ROOT/e2e/kueue/tasks.yaml.in" | kc apply -f - >/dev/null
 case $PLATFORM in
     openshift) kc label namespace "$WORKLOAD_NS" kueue.openshift.io/managed=true --overwrite >/dev/null ;;
     kubernetes) kc label namespace "$WORKLOAD_NS" pod-security.kubernetes.io/enforce="$WORKLOAD_PSA" --overwrite >/dev/null ;;
@@ -254,7 +279,9 @@ for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
         | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.managedFields)' \
         | kc -n "$ns" apply -f - >/dev/null
 done
-if [ -n "$ANTHROPIC_KEY_FILE" ]; then
+if [ "$TASKS" = 1 ]; then
+    :
+elif [ -n "$ANTHROPIC_KEY_FILE" ]; then
     (umask 077; tr -d '\n' < "$ANTHROPIC_KEY_FILE" > "$WORK/api-key")
     kc -n "$LOOP_NS" create secret generic "$ANTHROPIC_KEY_SECRET" --from-file=api-key="$WORK/api-key" \
         --dry-run=client -o yaml | kc apply -f - >/dev/null
@@ -346,7 +373,7 @@ for _ in $(seq 30); do
 done
 [ -n "$PORT" ] || fail "the port-forward to the controller never listened: $(cat "$WORK/forward.log")"
 printf 'url = "http://127.0.0.1:%s"\n' "$PORT" > "$WORK/crux.toml"
-# The launcher as a person the controller knows, linked to their username on the hub, with an api
+# The launcher as a person the controller knows, with no linked Kubernetes username, and an api
 # key of their own for crux.
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 KEY_ID=$(openssl rand -hex 16)
@@ -356,9 +383,6 @@ KEY="crk_${KEY_ID}_${KEY_SECRET}"
 kc -n "$CTL_NS" exec deploy/postgres -- psql -q -U crucible -d crucible -v ON_ERROR_STOP=1 -c \
     "INSERT INTO users (sub, login, last_login, created_at, updated_at)
      VALUES ('e2e:$LAUNCHER', '$LAUNCHER', '$NOW', '$NOW', '$NOW') ON CONFLICT (login) DO NOTHING;
-     INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
-     SELECT sub, 'hub', '$LAUNCHER', 'token-review', '$NOW' FROM users WHERE login = '$LAUNCHER'
-     ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user;
      INSERT INTO api_keys (id, sub, name, secret_hash, created_at)
      SELECT '$KEY_ID', sub, 'kueue-e2e', '$KEY_HASH', '$NOW' FROM users WHERE login = '$LAUNCHER'" >/dev/null
 crux() { env -u CONTROLLER_URL CONTROLLER_API_TOKEN="$KEY" "$BIN/crux" "$@" --config "$WORK/crux.toml"; }
@@ -373,6 +397,11 @@ cp -R "$PACK" "$WORK/pack"
 if [ -d "$PACK/prompts" ]; then
     for prompt in "$PACK"/prompts/*; do
         [ -f "$prompt" ] && fill "$prompt" > "$WORK/pack/prompts/$(basename "$prompt")"
+    done
+fi
+if [ "$TASKS" = 1 ]; then
+    for script in "$PACK"/*.py; do
+        fill "$script" > "$WORK/pack/$(basename "$script")"
     done
 fi
 crux draft-create kueue-e2e --description "kueue e2e: $(basename "$PACK")" >/dev/null
@@ -390,6 +419,63 @@ launch_ended() {
     crux playbook-runs --json 2>/dev/null \
         | jq -r '.[0] | select(.status | IN("done", "parked", "failed", "finished", "cancelled")) | "\(.status)\t\(.parked_reason // "")"'
 }
+
+if [ "$TASKS" = 1 ]; then
+    log "waiting for the run's loop pod"
+    deadline=$((SECONDS + TIMEOUT_SECS))
+    until POD=$(loop_pod) && [ -n "$POD" ]; do
+        ended=$(launch_ended) || ended=
+        [ -z "$ended" ] || fail "the run ended (${ended%%$'\t'*}) before its loop pod ran: ${ended#*$'\t'}"
+        [ $SECONDS -lt $deadline ] || fail "no loop pod ran within ${TIMEOUT_SECS}s"
+        sleep 10
+    done
+    kc -n "$LOOP_NS" get pod "$POD" -o json > "$WORK/loop-pod.json"
+    jq -e '[.spec.volumes[] | select(.csi.driver == "csi.spiffe.io")] | length == 1' "$WORK/loop-pod.json" >/dev/null \
+        || fail "loop pod $POD mounts no SPIFFE Workload API"
+    jq -e '[.spec.containers[].env[]?.name] | index("CRUCIBLE_RUN_SERVERS") != null' "$WORK/loop-pod.json" >/dev/null \
+        || fail "loop pod $POD carries no servers for its tasks"
+    log "loop pod $POD mounts the Workload API; waiting for the run to finish"
+    until ended=$(launch_ended) && [ -n "$ended" ]; do
+        [ $SECONDS -lt $deadline ] || fail "the run did not finish within ${TIMEOUT_SECS}s"
+        sleep 10
+    done
+    CRUN=$(crux runs --json | jq -r '.[0].run_id')
+    crux run-log "$CRUN" > "$WORK/run-log.json"
+    kc -n "$CTL_NS" logs deploy/crucible-controller | sed 's/\x1b\[[0-9;]*m//g' > "$WORK/controller.log"
+    crux graph "$CRUN" --json > "$WORK/graph.json"
+    last=$(jq -c --arg t "$RESULT_TASK" '[.results[]? | select(.task == $t)] | last // {}' "$WORK/graph.json")
+    log "$RESULT_TASK output: $(jq -c '.output // "none"' <<<"$last")"
+    [ "$(jq -r '.status // empty' <<<"$last")" = pass ] \
+        || fail "the run ended ${ended%%$'\t'*} with $RESULT_TASK $(jq -r '.status // "never run"' <<<"$last"): $(jq -r '.note // ""' <<<"$last"); see $WORK/graph.json and $WORK/run-log.json"
+
+    issued=$(grep 'task token issued' "$WORK/controller.log" | grep -F "crucible:run:$POD" | head -1)
+    [ -n "$issued" ] || fail "the controller issued no task token to run $POD"
+    grep -qF "spiffe://$TRUST_DOMAIN/crucible/run/$POD" <<<"$issued" \
+        || fail "the task token was issued without the loop pod's SVID: $issued"
+    grep -qF "aud=\"$KUEUE_URL\"" <<<"$issued" || fail "the task token was not for $KUEUE_URL: $issued"
+    ! grep -q 'agent token issued' "$WORK/controller.log" || fail "a sandbox was issued a token in a run with no agent"
+    log "issued: $issued"
+
+    kc -n "$WORKLOAD_NS" get jobs -l "crucible.dev/run-id=$POD" -o json > "$WORK/jobs.json"
+    jq -e --arg actor "crucible:run:$POD:task:$RESULT_TASK" --arg launcher "$(label_safe "$LAUNCHER")" '
+        (.items | length) >= 3
+        and all(.items[]; .metadata.annotations["crucible.dev/actor"] == $actor
+            and .metadata.labels["crucible.dev/launched-by"] == $launcher and .status.succeeded == 1)
+        and ([.items[].metadata.labels["kueue.x-k8s.io/queue-name"]] | unique) == ["crucible-e2e", "crucible-e2e-b200"]' \
+        "$WORK/jobs.json" >/dev/null \
+        || fail "the run's Jobs are not its own on both queues: $(jq -c '[.items[] | {name: .metadata.name, queue: .metadata.labels["kueue.x-k8s.io/queue-name"], actor: .metadata.annotations["crucible.dev/actor"], status}]' "$WORK/jobs.json")"
+    log "$(jq '.items | length' "$WORK/jobs.json") Jobs ran as the run's task on crucible-e2e and crucible-e2e-b200"
+    left=$(kc -n "$WORKLOAD_NS" get leaderworkersets,services -o name 2>/dev/null | wc -l | tr -d ' ')
+    [ "$left" = 0 ] || fail "a served workload or its Service outlived the task: $(kc -n "$WORKLOAD_NS" get leaderworkersets,services -o name | tr '\n' ' ')"
+    log "the LeaderWorkerSet and its Service were deleted with the task"
+
+    kc -n "$LOOP_NS" logs "$POD" --all-containers > "$WORK/loop.log" 2>/dev/null || true
+    if grep -lE 'eyJ[A-Za-z0-9_-]{10,}\.eyJ' "$WORK/controller.log" "$WORK/run-log.json" "$WORK/loop.log" "$WORK/loop-pod.json"; then
+        fail "a token appears in a log or the pod spec"
+    fi
+    log "PASS"
+    exit 0
+fi
 
 if [ "$SMOKE" = 1 ]; then
 log "waiting for Job $WORKLOAD_NS/$JOB to succeed"
@@ -461,7 +547,7 @@ for aud in "$KUEUE_URL" "http://host.openshell.internal:8848/mcp"; do
     issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" \
         | grep -F "aud=\"$aud\"" | head -1)
     [ -n "$issued" ] || fail "the controller issued no token for $aud to run $RUN"
-    grep -qE "kube_user=\"?$LAUNCHER\"?( |$)" <<<"$issued" || fail "the token was not for kube_user $LAUNCHER: $issued"
+    grep -qF "kube_user=crucible:run:$RUN" <<<"$issued" || fail "the token was not for the run's own kube_user: $issued"
     grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}$RUN/sandbox/" <<<"$issued" \
         || fail "the token went to no supervisor under $GATEWAY_PREFIX: $issued"
     log "issued: $issued"
@@ -489,7 +575,7 @@ EOF
 )
 [ -n "$whoami" ] || fail "the agent printed no WHOAMI line; see $WORK/run-log.json"
 [ "$(jq -r .run_id <<<"$whoami")" = "$RUN" ] || fail "whoami names another run: $whoami"
-[ "$(jq -r .kube_user <<<"$whoami")" = "$LAUNCHER" ] || fail "whoami names another kube_user: $whoami"
+[ "$(jq -r .kube_user <<<"$whoami")" = "crucible:run:$RUN" ] || fail "whoami names another kube_user: $whoami"
 log "whoami: $whoami"
 else
     crux graph "$CRUN" --json > "$WORK/graph.json"

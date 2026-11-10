@@ -45,6 +45,10 @@ pub(crate) async fn insert_playbook_launch_with(
     let origin = launch.origin.as_str();
     let rerun_of = launch.rerun.map(|r| r.run.as_str());
     let rerun_from = serde_json::json!(launch.rerun.map(|r| r.from.as_slice()).unwrap_or_default());
+    let choice_snapshots = launch
+        .choice_snapshots
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     sqlx::query!(
         "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) \
          VALUES ($1, $2, $3, 'new', 0, 'playbook', $4, $5)",
@@ -68,8 +72,9 @@ pub(crate) async fn insert_playbook_launch_with(
     sqlx::query!(
         "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, \
          advance_dedupe, dedupe_schedule, origin, draft_version, created_by, launcher_groups, \
-         created_at, exposure, exposure_digest, rerun_of, rerun_from) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+         owner, created_at, exposure, exposure_digest, rerun_of, rerun_from, choice_snapshots) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, \
+         $19)",
         key,
         launch.playbook,
         launch.params,
@@ -82,11 +87,13 @@ pub(crate) async fn insert_playbook_launch_with(
         launch.draft_version,
         launch.created_by,
         launch.launcher_groups,
+        launch.owner,
         now,
         exposure_json,
         exposure_digest,
         rerun_of,
         rerun_from,
+        choice_snapshots,
     )
     .execute(&mut **tx)
     .await

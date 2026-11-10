@@ -84,14 +84,11 @@ impl<S: Send + Sync> FromRequestParts<S> for Groups {
 /// Two distinctions matter. Only the paths [`AuthPath::carries_groups`] names hold validated group
 /// claims, so a route that acts on group membership refuses the others outright instead of silently
 /// seeing an empty group list. And only the paths [`AuthPath::may_own`] names stand for a person
-/// whose standing is confirmed, so a downgraded or impersonated session owns nothing.
+/// acting as themselves, so an impersonated session owns nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthPath {
     /// A session this controller minted at `/auth/callback`.
     Session,
-    /// The same session after a definitively refused group refresh. The login stands; the groups
-    /// are gone and so is every role they or the login carried, until the user signs in again.
-    DowngradedSession,
     /// `CONTROLLER_API_TOKEN`: a machine caller, with at most a configured identity and no groups.
     StaticToken,
     /// An opaque `crk_…` key its owner minted, carrying their login and the groups their `users`
@@ -117,26 +114,18 @@ impl AuthPath {
 
     /// Whether this credential may own a secret or a schedule at all.
     pub fn may_own(self) -> bool {
-        !matches!(self, AuthPath::DowngradedSession | AuthPath::Impersonated)
+        self != AuthPath::Impersonated
     }
 
     /// The path's name as an audit row spells it.
     pub fn as_str(self) -> &'static str {
         match self {
             AuthPath::Session => "session",
-            AuthPath::DowngradedSession => "downgraded_session",
             AuthPath::StaticToken => "static_token",
             AuthPath::ApiKey => "api_key",
             AuthPath::Open => "open",
             AuthPath::Impersonated => "impersonated",
         }
-    }
-
-    /// Whether the caller holds any role beyond read. False on a downgraded session whatever the
-    /// admin and operator lists say: the point of the downgrade is that nothing about this caller's
-    /// standing has been confirmed since the refresh was refused.
-    pub fn holds_roles(self) -> bool {
-        self != AuthPath::DowngradedSession
     }
 }
 
@@ -179,30 +168,13 @@ pub(crate) fn expected_token() -> Option<SharedToken> {
 
 /// What the auth middleware checks against: the static machine token, its configured identity,
 /// the dev identity an open guard lands everyone as, and the issuer sessions are proved against.
+#[derive(Default)]
 pub(crate) struct BearerGuard {
     pub(crate) expected: Option<SharedToken>,
     pub(crate) static_identity: Option<HeaderValue>,
     /// `CONTROLLER_DEV_IDENTITY`: the login every request lands as while the guard is open.
     pub(crate) dev_identity: Option<HeaderValue>,
     pub(crate) oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
-    /// The offline credential a live session's groups are re-read through. `None` — no issuer, no
-    /// mounted key — leaves a session's groups exactly as its login stamped them.
-    pub(crate) refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
-    /// How stale a session's groups may get before the next request re-reads them.
-    pub(crate) refresh_after: std::time::Duration,
-}
-
-impl Default for BearerGuard {
-    fn default() -> Self {
-        BearerGuard {
-            expected: None,
-            static_identity: None,
-            dev_identity: None,
-            oidc: None,
-            refresh: None,
-            refresh_after: crate::identity::oidc::users::DEFAULT_SESSION_GROUP_REFRESH,
-        }
-    }
 }
 
 impl BearerGuard {
@@ -211,18 +183,12 @@ impl BearerGuard {
     /// closed rather than starting open.
     pub(crate) fn from_env(
         oidc: Option<Arc<crate::identity::oidc::OidcProvider>>,
-        users: Option<sqlx::PgPool>,
     ) -> anyhow::Result<Self> {
         let mut guard = BearerGuard::new(
             expected_token(),
             std::env::var("CONTROLLER_API_TOKEN_IDENTITY").ok(),
         )?;
-        guard.oidc = oidc.clone();
-        let keys = crate::identity::oidc::credentials::CredentialKeys::from_env()?;
-        guard.refresh = users.and_then(|pool| {
-            crate::identity::oidc::credentials::OwnerRefresh::from_parts(pool, oidc, keys)
-        });
-        guard.refresh_after = crate::identity::oidc::users::session_group_refresh_interval();
+        guard.oidc = oidc;
         if guard.oidc.is_none()
             && std::env::var("CONTROLLER_AUTH_MODE")
                 .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("native"))
@@ -304,8 +270,7 @@ impl BearerGuard {
 /// is `SameSite=Lax` and every tenant on the cluster's apps wildcard is same-site), and the static
 /// token, which gets the configured `CONTROLLER_API_TOKEN_IDENTITY` (no identity configured =
 /// anonymous). An api key is checked by [`require_api_key`] before this guard sees it. A session
-/// store that cannot answer is 500, and an unreachable issuer during a group refresh keeps the
-/// groups the session had.
+/// store that cannot answer is 500.
 pub(crate) async fn require_auth(
     State(guard): State<Arc<BearerGuard>>,
     mut req: Request,
@@ -346,13 +311,7 @@ pub(crate) async fn require_auth(
                 if !is_safe(req.method()) && !same_origin(&req) {
                     return cross_origin();
                 }
-                let claims = match &session {
-                    Some(session) => refresh_session_groups(&guard, session, claims).await,
-                    None => claims,
-                };
-                if !claims.downgraded
-                    && let Some(session) = &session
-                {
+                if let Some(session) = &session {
                     match viewing_as(session, &claims.login).await {
                         Ok(Some(view)) => {
                             if !is_safe(req.method()) && !stops_viewing(&req) {
@@ -371,17 +330,12 @@ pub(crate) async fn require_auth(
                         Err(e) => return session_error(&e),
                     }
                 }
-                let path = if claims.downgraded {
-                    AuthPath::DowngradedSession
-                } else {
-                    AuthPath::Session
-                };
                 let resolved = Resolved {
                     user: Some(claims.login),
                     groups: claims.groups,
                     sub: Some(claims.sub),
                 };
-                admit(&mut req, path, resolved);
+                admit(&mut req, AuthPath::Session, resolved);
                 next.run(req).await
             }
             Ok(None) if wants_page(&req) => login_redirect(&req),
@@ -432,10 +386,7 @@ pub(crate) async fn require_auth_or_api_key(
         return key_refused("a pod token authenticates only its own evidence routes");
     }
     if presented_bearer(req.headers()).is_some_and(crate::identity::api_key::looks_like_key) {
-        let keys = KeyGuard {
-            pool: both.pool,
-            refresh: both.guard.refresh.clone(),
-        };
+        let keys = KeyGuard { pool: both.pool };
         return require_api_key(State(keys), req, next).await;
     }
     require_auth(State(both.guard), req, next).await
@@ -450,12 +401,10 @@ fn presented_bearer(headers: &header::HeaderMap) -> Option<&str> {
         .and_then(|h| h.strip_prefix("Bearer "))
 }
 
-/// What [`require_api_key`] checks a key against: the pool it is stored in, and the offline
-/// credential its owner's stale groups are re-read through.
+/// What [`require_api_key`] checks a key against: the pool it is stored in.
 #[derive(Clone)]
 pub struct KeyGuard {
     pub(crate) pool: sqlx::PgPool,
-    pub(crate) refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
 }
 
 /// Middleware: admit a request only on an API key its owner minted.
@@ -470,7 +419,7 @@ pub struct KeyGuard {
 /// What it stamps is what every handler already reads, so nothing downstream needs to know an API
 /// key was involved: the owner's login, their subject, and the groups their `users` row holds.
 pub async fn require_api_key(
-    State(KeyGuard { pool, refresh }): State<KeyGuard>,
+    State(KeyGuard { pool }): State<KeyGuard>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -483,14 +432,13 @@ pub async fn require_api_key(
     let Some(presented) = presented else {
         return key_refused("this surface needs an api key as its bearer");
     };
-    let authenticated =
-        match crate::identity::api_key::verify(&pool, refresh.as_deref(), presented).await {
-            Ok(authenticated) => authenticated,
-            Err(refusal) => {
-                tracing::debug!(reason = %refusal, "api key refused");
-                return key_refused(&refusal.to_string());
-            }
-        };
+    let authenticated = match crate::identity::api_key::verify(&pool, presented).await {
+        Ok(authenticated) => authenticated,
+        Err(refusal) => {
+            tracing::debug!(reason = %refusal, "api key refused");
+            return key_refused(&refusal.to_string());
+        }
+    };
 
     // The client wrote no identity that survives: every X-Auth-Request-* header goes, exactly as
     // `require_auth` drops them, so the key is the only thing naming this caller.
@@ -528,57 +476,6 @@ fn key_refused(why: &str) -> Response {
 fn admit(req: &mut Request, path: AuthPath, resolved: Resolved) {
     req.extensions_mut().insert(path);
     req.extensions_mut().insert(resolved);
-}
-
-/// Re-read a live session's groups from its owner's offline credential, at most once per
-/// [`BearerGuard::refresh_after`].
-///
-/// Three answers, and they are deliberately not symmetric:
-/// * the issuer answered — the session takes the groups it just asserted;
-/// * the issuer could not be reached — the session keeps the groups it had, and the attempt is
-///   stamped so an outage costs one round trip per interval and not one per request;
-/// * the issuer refused, or there is no credential to spend — the session is downgraded: its
-///   groups are dropped and every role it carried is gone until the user signs in again.
-async fn refresh_session_groups(
-    guard: &BearerGuard,
-    session: &tower_sessions::Session,
-    claims: crate::identity::session::NativeClaims,
-) -> crate::identity::session::NativeClaims {
-    use crate::identity::oidc::credentials::RefreshOutcome;
-    let Some(refresh) = &guard.refresh else {
-        return claims;
-    };
-    if claims.downgraded {
-        return claims;
-    }
-    let now = jiff::Timestamp::now();
-    if !crate::identity::oidc::users::stale(&claims.groups_at, now, guard.refresh_after) {
-        return claims;
-    }
-    let mut next = claims.clone();
-    next.groups_at = now.to_string();
-    match refresh.refresh(&claims.sub).await {
-        Ok(RefreshOutcome::Claims(fresh)) => next.groups = fresh.groups,
-        Ok(RefreshOutcome::Absent) => {
-            tracing::info!(login = %claims.login, "session downgraded: no offline credential to re-read groups from");
-            next.groups = Vec::new();
-            next.downgraded = true;
-        }
-        Err(crate::identity::oidc::OidcError::Unavailable(why)) => {
-            tracing::warn!(login = %claims.login, error = %why, "session group refresh deferred");
-        }
-        Err(crate::identity::oidc::OidcError::Rejected(why)) => {
-            tracing::warn!(login = %claims.login, reason = %why, "session downgraded: the group refresh was refused");
-            next.groups = Vec::new();
-            next.downgraded = true;
-        }
-    }
-    if let Err(e) = crate::identity::session::restamp_native(session, &next).await {
-        // The session row is unchanged, so the next request tries again. What this request sees is
-        // still the fresher answer.
-        tracing::error!(error = %e, "restamping the refreshed session claims");
-    }
-    next
 }
 
 /// The native claims on the request's session. A store that cannot answer is a 500, never a 401:
@@ -1396,8 +1293,6 @@ mod tests {
                                 login: "alice".to_string(),
                                 email: Some("alice@example.com".to_string()),
                                 groups: vec!["/groups/team-x".to_string()],
-                                groups_at: jiff::Timestamp::now().to_string(),
-                                downgraded: false,
                             },
                             None,
                         )

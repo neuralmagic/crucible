@@ -46,22 +46,15 @@ impl ControllerDirectory {
 }
 
 impl ControllerDirectory {
-    /// A subject whose row exists and whose stored credential the identity provider has not
-    /// refused: the condition that downgrades a browser session. `None` when the subject is gone
-    /// or their identity provider refused them.
+    /// A subject whose row exists. `None` when the subject is gone.
     pub async fn allowed(&self, sub: &str) -> anyhow::Result<Option<Allowed>> {
-        let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT u.login, u.email, c.last_error FROM users u
-               LEFT JOIN user_credentials c ON c.sub = u.sub
-              WHERE u.sub = $1",
-        )
-        .bind(sub)
-        .fetch_optional(&self.pool)
-        .await
-        .context("reading the person behind an approval")?;
-        Ok(row
-            .filter(|(_, _, refused)| refused.is_none())
-            .map(|(login, email, _)| Allowed { login, email }))
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT login, email FROM users WHERE sub = $1")
+                .bind(sub)
+                .fetch_optional(&self.pool)
+                .await
+                .context("reading the person behind an approval")?;
+        Ok(row.map(|(login, email)| Allowed { login, email }))
     }
 
     /// The username `approved` acts as on its cluster, read fresh on every call.

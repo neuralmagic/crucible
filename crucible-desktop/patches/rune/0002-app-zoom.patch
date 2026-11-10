@@ -1,0 +1,136 @@
+diff --git a/crates/rune/src/lib.rs b/crates/rune/src/lib.rs
+index 753542a..7c20ebc 100644
+--- a/crates/rune/src/lib.rs
++++ b/crates/rune/src/lib.rs
+@@ -57,6 +57,7 @@ pub mod tok;
+ pub mod tooling;
+ pub mod tray;
+ pub mod windows;
++pub mod zoom;
+ 
+ /// AccessKit's types, for [`Runtime::accessibility_tree`] and [`Runtime::accessibility_action`].
+ pub use a11y::AccessibilityLink;
+diff --git a/crates/rune/src/window.rs b/crates/rune/src/window.rs
+index c942850..8d1d732 100644
+--- a/crates/rune/src/window.rs
++++ b/crates/rune/src/window.rs
+@@ -873,7 +873,7 @@ impl<S: 'static> Host<S> {
+         let alpha = (self.options.transparent && config.alpha_mode == wgpu::CompositeAlphaMode::PostMultiplied
+             && gpu.adapter.get_info().backend != wgpu::Backend::Metal)
+             .then(|| crate::render::surface_alpha::AlphaSurface::new(&gpu.device, target_format, (config.width, config.height)));
+-        let scale = window.scale_factor() as f32;
++        let scale = crate::zoom::content_scale(&window);
+         self.rt.set_system_dark(crate::platform::preferences::window_dark(&window, self.args.theme.as_deref()));
+         self.rt.set_viewport((phys.width as f32 / scale, phys.height as f32 / scale), scale);
+         if (self.shown || launcher) && !built {
+@@ -956,7 +956,7 @@ impl<S: 'static> Host<S> {
+             #[cfg(target_os = "macos")]
+             if let Some(pacing) = &mut w.native.pacing { pacing.update_display(&w.window); }
+             let size = w.window.inner_size();
+-            let scale = w.window.scale_factor() as f32;
++            let scale = crate::zoom::content_scale(&w.window);
+             if size.width > 0 && size.height > 0 {
+                 w.resize_surface(&gpu.device, size);
+                 self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
+diff --git a/crates/rune/src/window/events.rs b/crates/rune/src/window/events.rs
+index 7487961..8990e2e 100644
+--- a/crates/rune/src/window/events.rs
++++ b/crates/rune/src/window/events.rs
+@@ -214,6 +214,13 @@ impl<S: 'static> Host<S> {
+                 if let Some(l) = self.win.as_ref().filter(|l| l.native.full_screen.take()) {
+                     self.rt.set_titlebar_inset(place_chrome(&l.window, self.chrome));
+                 }
++                if let Some(l) = self.win.as_ref() {
++                    let size = l.window.inner_size();
++                    let scale = crate::zoom::content_scale(&l.window);
++                    if size.width > 0 && size.height > 0 {
++                        self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
++                    }
++                }
+                 self.redraw();
+                 self.shell(event_loop);
+                 return;
+@@ -230,7 +237,7 @@ impl<S: 'static> Host<S> {
+         if matches!(event, WindowEvent::Moved(_) | WindowEvent::ScaleFactorChanged { .. }) { self.sync_origin(); }
+         let (Some(l), Some((gpu, ..))) = (self.win.as_mut(), self.gpu.as_ref()) else { return };
+         let rt = &mut self.rt;
+-        let scale = l.window.scale_factor() as f32;
++        let scale = crate::zoom::content_scale(&l.window);
+         let chrome = self.chrome;
+         // A finger presses through `WindowEvent::Touch`; the mouse events a system makes up
+         // from it (Windows promotes touches) would press a second time.
+diff --git a/crates/rune/src/window/lifecycle.rs b/crates/rune/src/window/lifecycle.rs
+index b3b884b..7a2bcd9 100644
+--- a/crates/rune/src/window/lifecycle.rs
++++ b/crates/rune/src/window/lifecycle.rs
+@@ -64,7 +64,7 @@ impl<S: 'static> Host<S> {
+         if let (Some(w), Some((gpu, ..))) = (self.win.as_mut(), self.gpu.as_ref()) {
+             let size = w.window.inner_size();
+             w.resize_surface(&gpu.device, size);
+-            let scale = w.window.scale_factor() as f32;
++            let scale = crate::zoom::content_scale(&w.window);
+             self.rt.set_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
+         }
+         true
+diff --git a/crates/rune/src/window/stepping.rs b/crates/rune/src/window/stepping.rs
+index 20eacd0..c32ea06 100644
+--- a/crates/rune/src/window/stepping.rs
++++ b/crates/rune/src/window/stepping.rs
+@@ -190,7 +190,7 @@ impl<S: 'static> Host<S> {
+             self.rt.set_titlebar_inset(place_chrome(&w.window, self.chrome));
+             let size = w.window.inner_size();
+             w.resize_surface(&gpu.device, size);
+-            let scale = w.window.scale_factor() as f32;
++            let scale = crate::zoom::content_scale(&w.window);
+             self.rt.step_viewport((size.width as f32 / scale, size.height as f32 / scale), scale);
+             // In this frame's layout, not the next one when `Moved` arrives.
+             if let Some(origin) = screen_origin(&w.window) {
+diff --git a/crates/rune/src/zoom.rs b/crates/rune/src/zoom.rs
+new file mode 100644
+index 0000000..fa372d4
+--- /dev/null
++++ b/crates/rune/src/zoom.rs
+@@ -0,0 +1,43 @@
++//! An app-wide zoom: how many display points one layout point covers. Below 1 fits more of the
++//! app on screen, above 1 enlarges it. Layout, drawing and pointer input all go through it, so a
++//! zoomed window lays out at its zoomed size rather than scaling a bitmap.
++
++use std::sync::atomic::{AtomicU32, Ordering};
++
++static ZOOM: AtomicU32 = AtomicU32::new(0x3F80_0000);
++
++/// The smallest and largest zoom `set` keeps.
++pub const RANGE: (f32, f32) = (0.5, 2.0);
++
++/// Zoom every window to `zoom`, clamped to [`RANGE`]; windows take it on their next frame.
++pub fn set(zoom: f32) {
++    let zoom = if zoom.is_finite() { zoom.clamp(RANGE.0, RANGE.1) } else { 1.0 };
++    ZOOM.store(zoom.to_bits(), Ordering::Relaxed);
++}
++
++/// The zoom windows lay out at.
++pub fn get() -> f32 {
++    f32::from_bits(ZOOM.load(Ordering::Relaxed))
++}
++
++/// The scale a window lays out and takes input at: its display's, times the zoom.
++pub(crate) fn content_scale(window: &winit::window::Window) -> f32 {
++    window.scale_factor() as f32 * get()
++}
++
++#[cfg(test)]
++mod tests {
++    use crate::zoom::{RANGE, get, set};
++
++    #[test]
++    fn zoom_clamps_to_its_range_and_refuses_nonsense() {
++        set(0.8);
++        assert_eq!(get(), 0.8);
++        set(0.1);
++        assert_eq!(get(), RANGE.0);
++        set(9.0);
++        assert_eq!(get(), RANGE.1);
++        set(f32::NAN);
++        assert_eq!(get(), 1.0);
++    }
++}

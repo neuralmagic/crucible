@@ -1,0 +1,30 @@
+# The Kueue queue `buildit mcp`'s Jobs wait in (`--queue builds`): a ClusterQueue of its own that
+# covers CPU and memory alone, so builds count against their own quota and never against the
+# quota GPU workloads queue for, and a build that asks for a GPU is never admitted. Apply it as a
+# cluster admin; the LocalQueue goes in the builder namespace.
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: buildit-builds
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: crucible-builds
+  queueingStrategy: BestEffortFIFO
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: cpu
+              nominalQuota: 256
+            - name: memory
+              nominalQuota: 1Ti
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: builds
+  namespace: crucible-builds
+spec:
+  clusterQueue: buildit-builds

@@ -37,6 +37,24 @@ pub const SCOPE_PACK_MARKER: &str = "CRUCIBLE_SCOPE_PACK:";
 /// `cat` of the run's `state/session.jsonl`.
 pub const RUN_SESSION_DELIMITER: &str = "SESSION (rc=";
 
+/// The prefix the loop-run wrapper puts on each `state/session.jsonl` line it echoes into the pod
+/// log while the run is live: `CRUCIBLE_SESSION_LINE <n> <line>`, where `n` is the line's 1-based
+/// index in the file, the same seq the post-delimiter dump and the control bridge give it.
+pub const RUN_SESSION_ECHO_MARKER: &str = "CRUCIBLE_SESSION_LINE ";
+
+/// The longest session line the wrapper echoes live, in bytes: room for a large plan's
+/// `plan_admitted`, which a viewer needs to show any task. A longer line keeps its index and
+/// reaches the viewer with the stored session instead.
+pub const RUN_SESSION_ECHO_MAX: usize = 1024 * 1024;
+
+/// A [`RUN_SESSION_ECHO_MARKER`] line's index and session line.
+pub fn parse_session_echo(line: &str) -> Option<(u64, &str)> {
+    let rest = line.strip_prefix(RUN_SESSION_ECHO_MARKER)?;
+    let (seq, session) = rest.split_once(' ').unwrap_or((rest, ""));
+    let seq: u64 = seq.parse().ok().filter(|seq| *seq > 0)?;
+    Some((seq, session))
+}
+
 /// The file under a run's state directory that marks its session log as not uploaded, so the
 /// loop-run wrapper prints the log after the session delimiter for the controller to scrape.
 pub const RUN_SESSION_UNDELIVERED: &str = "session.undelivered";
@@ -76,3 +94,33 @@ pub const ENV_POD_TOKEN: &str = "CRUCIBLE_POD_TOKEN";
 /// Env var carrying the turn pod's own name (downward API `metadata.name`), the `{pod}` path
 /// segment its pack and transcript upload under.
 pub const ENV_POD_NAME: &str = "CRUCIBLE_POD_NAME";
+
+#[cfg(test)]
+mod tests {
+    use crate::markers::{RUN_SESSION_ECHO_MARKER, parse_session_echo};
+
+    #[test]
+    fn an_echoed_session_line_reads_back_as_its_index_and_line() {
+        let line = format!("{RUN_SESSION_ECHO_MARKER}12 {{\"v\":1,\"kind\":\"task_started\"}}");
+        assert_eq!(
+            parse_session_echo(&line),
+            Some((12, r#"{"v":1,"kind":"task_started"}"#))
+        );
+        assert_eq!(
+            parse_session_echo(&format!("{RUN_SESSION_ECHO_MARKER}3 ")),
+            Some((3, ""))
+        );
+        assert_eq!(
+            parse_session_echo(&format!("{RUN_SESSION_ECHO_MARKER}3")),
+            Some((3, ""))
+        );
+        for other in [
+            "plan v1: completed",
+            "CRUCIBLE_SESSION_LINE x {}",
+            "CRUCIBLE_SESSION_LINE 0 {}",
+            " CRUCIBLE_SESSION_LINE 1 {}",
+        ] {
+            assert_eq!(parse_session_echo(other), None, "{other}");
+        }
+    }
+}

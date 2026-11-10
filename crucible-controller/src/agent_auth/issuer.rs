@@ -61,8 +61,9 @@ pub enum ConfigError {
     #[error("CONTROLLER_AGENT_SPIRE names no cluster's SPIRE")]
     NoSpire,
     #[error(
-        "CONTROLLER_AGENT_ISSUER is set but neither CONTROLLER_AGENT_SPIRE (agent tokens) nor \
-         a deploy profile server with `people = true` (people's tokens) says whom it issues to"
+        "CONTROLLER_AGENT_ISSUER is set but nothing says whom it issues to: \
+         CONTROLLER_AGENT_SPIRE (sandboxes), a deploy profile server outside the loop pod (runs' \
+         tasks), or one with `people = true` (people)"
     )]
     NoRecipients,
     #[error("CONTROLLER_AGENT_SPIRE names {0:?} twice; each cluster and each SVID issuer once")]
@@ -155,17 +156,19 @@ impl fmt::Debug for SigningKey {
 /// An MCP resource a token may be minted for, and the scopes a token for it may carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audience {
+    /// The server's name, as a pack names it in `[workflow].servers`.
+    pub server: String,
     /// The resource URL, compared to the requested `audience` as an exact string.
     pub resource: String,
     /// The cluster whose runs get tokens for it. The same URL on another cluster is another
     /// audience.
     pub cluster: String,
     pub scopes: Vec<String>,
-    /// Whether the server authorizes as the token's `kube_user`, so no token is minted without
-    /// one.
-    pub requires_kube_user: bool,
     /// The namespaces a token names, the first as the default.
     pub namespaces: Vec<String>,
+    /// Whether its tokens need no sandbox, so a task may hold one: the server runs outside the
+    /// loop pod.
+    pub remote: bool,
 }
 
 impl Audience {
@@ -173,11 +176,12 @@ impl Audience {
     /// needs, as the deploy profile describes it.
     pub fn of(server: &ServerSpec) -> impl Iterator<Item = Audience> + '_ {
         server.clusters.iter().map(|cluster| Audience {
+            server: server.name.to_string(),
             resource: server.url.clone(),
             cluster: cluster.clone(),
             scopes: server.scopes.clone(),
-            requires_kube_user: server.requires_kube_user,
             namespaces: server.namespaces.clone(),
+            remote: matches!(server.hosting, crucible::deploy::servers::Hosting::Remote),
         })
     }
 
@@ -353,6 +357,15 @@ pub struct Sandbox {
     pub id: SandboxId,
 }
 
+/// A loop pod a verified JWT-SVID names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPodId {
+    /// The cluster whose SPIRE issued the SVID.
+    pub cluster: String,
+    pub pod: String,
+    pub spiffe_id: String,
+}
+
 /// An OpenShell gateway id: a DNS-1123 label, the `openshell.ai/gateway-id` label value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayId(String);
@@ -403,6 +416,8 @@ pub enum AssertionError {
     Audience { expected: String, got: Value },
     #[error("assertion sub {sub:?} is not <gateway>/sandbox/<id> under {prefix}")]
     NotASandbox { sub: String, prefix: String },
+    #[error("assertion sub {sub:?} is not {prefix}<pod name>")]
+    NotARunPod { sub: String, prefix: String },
     #[error(transparent)]
     GatewayId(#[from] GatewayIdError),
     #[error("assertion has no numeric iat")]
@@ -434,16 +449,6 @@ pub enum GrantError {
         grantable: Vec<String>,
     },
     #[error(
-        "launcher {launcher} has no known kubernetes username on cluster {cluster}, which {audience} \
-         requires ({why}); link it under Settings > Cluster identities"
-    )]
-    NoKubeUser {
-        launcher: String,
-        cluster: String,
-        audience: String,
-        why: String,
-    },
-    #[error(
         "the SVID comes from cluster {spire}'s SPIRE, but sandbox {sandbox} is bound to a run on \
          {run}"
     )]
@@ -452,27 +457,37 @@ pub enum GrantError {
         spire: String,
         run: String,
     },
+    #[error("run {run_id} records nobody it was dispatched for")]
+    NoLauncher { run_id: String },
+    #[error("audience {audience:?} runs in the loop pod and takes tokens from sandboxes only")]
+    NotForTasks { audience: String },
     #[error(
-        "run {run_id} was dispatched for {dispatched_by:?}, not a person, so it has no launcher"
+        "run {run_id}'s pack does not name {server} in [workflow].servers, so its tasks get no \
+         token for it"
     )]
-    NoLauncher {
-        run_id: String,
-        dispatched_by: Option<String>,
+    NotDeclared { run_id: String, server: String },
+    #[error(
+        "the SVID names pod {svid_pod} on cluster {svid_cluster}, not the run's pod {pod} on \
+         {cluster}"
+    )]
+    NotTheRunsPod {
+        svid_pod: String,
+        svid_cluster: String,
+        pod: String,
+        cluster: String,
     },
-    #[error("{0}")]
-    NoUsername(String),
 }
 
-/// The launcher a run's token acts for: the login of the person the run was dispatched for.
+/// The `sub` of a run's token: whoever asked for the dispatch, else the launch's owner, without a
+/// `user:` prefix.
 pub fn launcher(run: &BoundRun) -> Result<String, GrantError> {
     run.dispatched_by
         .as_deref()
-        .and_then(|p| p.strip_prefix("user:"))
-        .filter(|login| !login.is_empty())
+        .or(run.owner.as_deref())
+        .map(|principal| principal.strip_prefix("user:").unwrap_or(principal))
         .map(str::to_string)
         .ok_or_else(|| GrantError::NoLauncher {
             run_id: run.run_id.clone(),
-            dispatched_by: run.dispatched_by.clone(),
         })
 }
 
@@ -502,13 +517,60 @@ pub fn granted_scopes(
     Ok(granted)
 }
 
+/// A run's Kubernetes user and groups, for the `kube_user` and `kube_groups` claims.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIdentity {
+    pub user: String,
+    pub groups: Vec<String>,
+}
+
+impl RunIdentity {
+    /// The identity of the run in pod `pod_name` owned by `owner`. A run with no recorded owner
+    /// gets only `crucible:runs`.
+    pub fn of(pod_name: &str, owner: Option<&str>) -> Self {
+        let scope = owner
+            .and_then(|owner| crate::authz::model::Principal::parse(owner).ok())
+            .map(|owner| match owner {
+                crate::authz::model::Principal::Team(team) => {
+                    format!("crucible:team:{team}")
+                }
+                crate::authz::model::Principal::User(login) => format!("crucible:user:{login}"),
+                _ => String::new(),
+            })
+            .filter(|group| !group.is_empty());
+        let mut groups = vec!["crucible:runs".to_string()];
+        if let Some(scope) = scope
+            && !groups.contains(&scope)
+        {
+            groups.push(scope);
+        }
+        Self {
+            user: Self::user_of(pod_name),
+            groups,
+        }
+    }
+
+    /// The Kubernetes user of the run whose pod is `pod_name`.
+    pub fn user_of(pod_name: &str) -> String {
+        format!("crucible:run:{pod_name}")
+    }
+}
+
+/// Who presents a run's token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Actor {
+    Sandbox(Sandbox),
+    /// A command or evaluate task in the run's pod, as the engine named it.
+    Task(String),
+}
+
 /// Everything a minted token says.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentGrant {
-    pub sandbox: Sandbox,
+    pub actor: Actor,
     pub launcher: String,
-    /// The launcher's Kubernetes username, for the `kube_user` claim.
-    pub kube_user: Option<String>,
+    /// The run's Kubernetes identity, for the `kube_user` and `kube_groups` claims.
+    pub kube: RunIdentity,
     pub run: BoundRun,
     pub audience: String,
     pub scopes: Vec<String>,
@@ -682,16 +744,15 @@ impl AgentIssuer {
         Some(fresh)
     }
 
-    /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against the keys
-    /// of the cluster SPIRE its `iss` names, carry exactly one `aud` equal to this issuer, and
-    /// name a SPIFFE ID `<that cluster's gateway prefix><gateway id>/sandbox/<sandbox id>`.
-    pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
+    /// The SPIRE that signed the JWT-SVID `assertion`, and its subject. The SVID must verify
+    /// against the keys of the cluster SPIRE its `iss` names, carry exactly one `aud` equal to
+    /// this issuer, and live no longer than [`MAX_SVID_LIFETIME_SECS`].
+    async fn svid(&self, assertion: &str) -> Result<(Arc<TrustedSpire>, String), AssertionError> {
         let issuer = self.issuer.as_str();
         let claimed = unverified_issuer(assertion)?;
         let trusted = self
             .spire_of(&claimed)
             .ok_or(AssertionError::UnknownSpire(claimed))?;
-        let spire = &trusted.spire;
         let claims = trusted.svids.verify(assertion, &[issuer]).await?;
         let aud = claims.get("aud").cloned().unwrap_or(Value::Null);
         let single = match &aud {
@@ -725,7 +786,17 @@ impl AgentIssuer {
         let sub = claims
             .get("sub")
             .and_then(Value::as_str)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
+        Ok((trusted, sub))
+    }
+
+    /// The sandbox a JWT-SVID client assertion identifies: one naming a SPIFFE ID
+    /// `<its cluster's gateway prefix><gateway id>/sandbox/<sandbox id>`.
+    pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
+        let (trusted, sub) = self.svid(assertion).await?;
+        let spire = &trusted.spire;
+        let sub = sub.as_str();
         let not_a_sandbox = || AssertionError::NotASandbox {
             sub: sub.to_string(),
             prefix: spire.gateway_prefix.as_str().to_string(),
@@ -739,6 +810,26 @@ impl AgentIssuer {
             gateway: GatewayId::parse(gateway)?,
             id: SandboxId::parse(id)?,
         })
+    }
+
+    /// The cluster and name of the loop pod a JWT-SVID identifies: one naming a SPIFFE ID
+    /// `spiffe://<its cluster's trust domain>/crucible/run/<pod name>`.
+    pub async fn run_pod(&self, assertion: &str) -> Result<RunPodId, AssertionError> {
+        let (trusted, sub) = self.svid(assertion).await?;
+        let spire = &trusted.spire;
+        let prefix = format!(
+            "spiffe://{}/{}",
+            spire.gateway_prefix.trust_domain(),
+            crucible_contract::task_servers::RUN_SPIFFE_PATH
+        );
+        match sub.strip_prefix(prefix.as_str()) {
+            Some(pod) if !pod.is_empty() && !pod.contains('/') => Ok(RunPodId {
+                cluster: spire.cluster.clone(),
+                pod: pod.to_string(),
+                spiffe_id: sub.clone(),
+            }),
+            _ => Err(AssertionError::NotARunPod { sub, prefix }),
+        }
     }
 
     /// The requested audience, when it is an MCP resource allowlisted for runs on `cluster`.
@@ -773,6 +864,12 @@ impl AgentIssuer {
     pub fn mint(&self, grant: &AgentGrant, now: u64) -> Result<Minted, MintError> {
         let jti = token_id()?;
         let scope = grant.scopes.join(" ");
+        let actor = match &grant.actor {
+            Actor::Sandbox(sandbox) => sandbox.spiffe_id.clone(),
+            Actor::Task(task) => {
+                crucible_contract::task_servers::task_actor(&grant.run.pod_name, task)
+            }
+        };
         let mut claims = json!({
             "iss": self.issuer.as_str(),
             "sub": grant.launcher,
@@ -781,7 +878,7 @@ impl AgentIssuer {
             "nbf": now,
             "exp": now.saturating_add(self.ttl.secs()),
             "jti": jti,
-            "act": {"sub": grant.sandbox.spiffe_id},
+            "act": {"sub": actor},
             "run_id": grant.run.pod_name,
             "kube_cluster": grant.run.cluster,
             "scope": scope,
@@ -790,9 +887,8 @@ impl AgentIssuer {
             if let Some(name) = &grant.run.sandbox_name {
                 map.insert("sandbox".into(), json!(name));
             }
-            if let Some(kube_user) = &grant.kube_user {
-                map.insert("kube_user".into(), json!(kube_user));
-            }
+            map.insert("kube_user".into(), json!(grant.kube.user));
+            map.insert("kube_groups".into(), json!(grant.kube.groups));
             if let Some(workdir) = &grant.run.workdir {
                 map.insert("workdir".into(), json!(workdir));
             }
@@ -856,6 +952,11 @@ impl AgentIssuer {
                 .push("private_key_jwt");
             metadata.token_endpoint_auth_signing_alg_values_supported =
                 crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec();
+        }
+        if self.audiences.iter().any(|a| a.remote) {
+            metadata
+                .grant_types_supported
+                .push(crucible_contract::task_servers::TOKEN_EXCHANGE_GRANT);
         }
         if let Some(people) = people {
             metadata.client_id_metadata_document_supported = people.client_id_metadata_documents;
@@ -1257,7 +1358,6 @@ mod tests {
         for cluster in ["spoke-a", "spoke-b"] {
             let kueue = on(cluster).unwrap_or_else(|| panic!("no kueue audience on {cluster}"));
             assert_eq!(kueue.scopes, [SCOPE_READ, SCOPE_SUBMIT]);
-            assert!(kueue.requires_kube_user);
             assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);
         }
         assert!(on("spoke-c").is_none());
@@ -1267,7 +1367,7 @@ mod tests {
             .find(|a| a.resource == BUILDIT)
             .unwrap();
         assert_eq!(buildit.scopes, ["buildit.read", "buildit.build"]);
-        assert!(!buildit.requires_kube_user && buildit.namespaces.is_empty());
+        assert!(buildit.namespaces.is_empty());
     }
 
     /// SPIRE entries and the deploy profile accept the same cluster names.
@@ -1327,48 +1427,80 @@ mod tests {
         assert!(granted_scopes(None, &bare).unwrap().is_empty());
     }
 
-    fn run(dispatched_by: Option<&str>) -> BoundRun {
+    fn run(dispatched_by: Option<&str>, owner: Option<&str>) -> BoundRun {
         BoundRun {
             run_id: "playbook_kueue-e2e_01a1-1791474738".into(),
             pod_name: "crucible-run-brave-otter".into(),
             cluster: CLUSTER.into(),
             dispatched_by: dispatched_by.map(str::to_string),
+            owner: owner.map(str::to_string),
             sandbox_name: Some("ci-0123abcd".into()),
             workdir: Some("/sandbox/repo".into()),
         }
     }
 
     #[test]
-    fn the_launcher_is_the_person_the_run_was_dispatched_for() {
-        assert_eq!(launcher(&run(Some("user:alice"))).unwrap(), "alice");
-        for unattributed in [
-            None,
-            Some("team:platform-administrators"),
-            Some("user:"),
-            Some("alice"),
-        ] {
-            assert!(
-                matches!(
-                    launcher(&run(unattributed)),
-                    Err(GrantError::NoLauncher { .. })
-                ),
-                "{unattributed:?}"
-            );
-        }
+    fn the_subject_is_whoever_asked_for_the_dispatch_else_the_owner() {
+        assert_eq!(
+            launcher(&run(Some("user:alice"), None)).unwrap(),
+            "alice",
+            "a user: prefix comes off so the login-shaped subject keeps its value"
+        );
+        assert_eq!(
+            launcher(&run(Some("team:ml"), None)).unwrap(),
+            "team:ml",
+            "a team stays spelled as one"
+        );
+        assert_eq!(
+            launcher(&run(None, Some("team:ml"))).unwrap(),
+            "team:ml",
+            "no dispatcher: the launch's owner"
+        );
+        assert_eq!(launcher(&run(None, Some("user:bob"))).unwrap(), "bob");
+        assert!(matches!(
+            launcher(&run(None, None)),
+            Err(GrantError::NoLauncher { .. })
+        ));
+    }
+
+    #[test]
+    fn a_runs_kubernetes_identity_is_its_pod_and_its_owners_scope() {
+        assert_eq!(
+            RunIdentity::of("crucible-run-brave-otter", Some("team:ml")),
+            RunIdentity {
+                user: "crucible:run:crucible-run-brave-otter".into(),
+                groups: vec!["crucible:runs".into(), "crucible:team:ml".into()],
+            }
+        );
+        assert_eq!(
+            RunIdentity::of("crucible-run-brave-otter", Some("user:alice")),
+            RunIdentity {
+                user: "crucible:run:crucible-run-brave-otter".into(),
+                groups: vec!["crucible:runs".into(), "crucible:user:alice".into()],
+            }
+        );
+        assert_eq!(
+            RunIdentity::of("crucible-run-brave-otter", None),
+            RunIdentity {
+                user: "crucible:run:crucible-run-brave-otter".into(),
+                groups: vec!["crucible:runs".into()],
+            },
+            "an owner recorded before owners existed leaves the run's own group alone"
+        );
     }
 
     fn grant(namespaces: &[&str]) -> AgentGrant {
         AgentGrant {
-            sandbox: Sandbox {
+            actor: Actor::Sandbox(Sandbox {
                 spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
                 cluster: CLUSTER.into(),
                 tenant: None,
                 gateway: GatewayId::of_run_pod(POD),
                 id: crate::agent_auth::sandbox::SandboxId::parse("sbx-1").unwrap(),
-            },
+            }),
             launcher: "alice".into(),
-            kube_user: Some("alice-k8s".into()),
-            run: run(Some("user:alice")),
+            kube: RunIdentity::of(POD, Some("team:ml")),
+            run: run(Some("user:alice"), Some("team:ml")),
             audience: KUEUE.into(),
             scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
             namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
@@ -1410,7 +1542,8 @@ mod tests {
             json!({
                 "iss": ISSUER,
                 "sub": "alice",
-                "kube_user": "alice-k8s",
+                "kube_user": format!("crucible:run:{POD}"),
+                "kube_groups": ["crucible:runs", "crucible:team:ml"],
                 "aud": KUEUE,
                 "iat": at,
                 "nbf": at,
@@ -1437,16 +1570,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_token_gets_its_own_id_and_omits_the_namespace_and_kube_user_it_lacks() {
+    async fn every_token_gets_its_own_id_and_omits_the_namespace_it_lacks() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
-        let unlinked = AgentGrant {
-            kube_user: None,
-            ..grant(&[])
-        };
         let a = verified(
             &issuer,
-            &issuer.mint(&unlinked, now()).unwrap().access_token,
+            &issuer.mint(&grant(&[]), now()).unwrap().access_token,
         )
         .await;
         let b = verified(
@@ -1455,7 +1584,7 @@ mod tests {
         )
         .await;
         assert_ne!(a["jti"], b["jti"]);
-        for key in ["namespace", "namespaces", "queues", "role", "kube_user"] {
+        for key in ["namespace", "namespaces", "queues", "role"] {
             assert!(!a.contains_key(key), "{key}");
         }
     }
@@ -1541,7 +1670,14 @@ mod tests {
         assert_eq!(doc["issuer"], ISSUER);
         assert_eq!(doc["token_endpoint"], format!("{ISSUER}/oauth/token"));
         assert_eq!(doc["jwks_uri"], format!("{ISSUER}/.well-known/jwks.json"));
-        assert_eq!(doc["grant_types_supported"], json!(["client_credentials"]));
+        assert_eq!(
+            doc["grant_types_supported"],
+            json!([
+                "client_credentials",
+                "urn:ietf:params:oauth:grant-type:token-exchange"
+            ]),
+            "sandboxes by their SVIDs, and runs' tasks by their pod tokens"
+        );
         assert_eq!(
             doc["scopes_supported"],
             json!([

@@ -47,7 +47,7 @@ test.describe('the playbook runs list', () => {
     await ready(page, '/playbook-runs');
 
     const filters = page.locator('dl[aria-label="Filters"]');
-    await filters.getByRole('button', { name: /^parked/ }).click();
+    await filters.getByRole('button', { name: /^error/ }).click();
 
     await expect(page).toHaveURL(/status=parked/);
     await expect(run(page, 'playbook:survey:0197')).toBeVisible();

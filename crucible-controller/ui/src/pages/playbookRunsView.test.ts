@@ -61,7 +61,7 @@ describe('runsView', () => {
     const view = runsView(RUNS, { ...DEFAULT_FILTERS, playbook: 'triage' });
     expect(view.status).toEqual([
       { value: '', label: 'All', count: 2 },
-      { value: 'parked', label: 'parked', count: 1 },
+      { value: 'parked', label: 'error', count: 1 },
       { value: 'running', label: 'running', count: 1 },
     ]);
     expect(view.playbook).toEqual([

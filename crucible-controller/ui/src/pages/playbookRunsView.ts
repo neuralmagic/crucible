@@ -1,7 +1,7 @@
 import type { components } from '../api/schema';
 import { ALL } from '../ownerContext';
 import type { FacetOption } from '../ui';
-import { originLabel } from './launchView';
+import { originLabel, launchStatusLabel } from './launchView';
 
 type PlaybookRunDto = components['schemas']['PlaybookRunDto'];
 
@@ -110,7 +110,7 @@ export function runsView<T extends RunRow>(runs: readonly T[], filters: RunFilte
     rows.filter(isDraftRun).length;
   return {
     rows,
-    status: options(along('status'), 'status', filters.status, (v) => v),
+    status: options(along('status'), 'status', filters.status, launchStatusLabel),
     playbook: options(along('playbook'), 'playbook', filters.playbook, (v) => v),
     origin: options(along('origin'), 'origin', filters.origin, originLabel),
     hiddenDrafts,

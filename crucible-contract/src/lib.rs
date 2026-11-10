@@ -11,6 +11,7 @@ pub mod artifact;
 pub mod ask;
 pub mod buildit;
 pub mod cluster_link;
+pub mod console;
 pub mod decision;
 pub mod decision_request;
 pub mod distress;
@@ -34,6 +35,7 @@ pub mod report;
 pub mod sandbox;
 pub mod scope;
 pub mod session;
+pub mod task_servers;
 pub mod tier;
 pub mod verdict;
 
@@ -43,7 +45,7 @@ pub mod verdict;
 /// `crucible --contract-version` and the runtime image carries it as the
 /// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
 /// controller it talks to without a probe.
-pub const CONTRACT_VERSION: &str = "1.23.0";
+pub const CONTRACT_VERSION: &str = "1.24.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
@@ -62,8 +64,9 @@ pub use link::{
 pub use markers::{
     ENV_CONTROLLER_URL, ENV_POD_NAME, ENV_POD_TOKEN, ENV_RUN_DISPLAY_NAME, ENV_RUN_NAME,
     ENV_UI_BASE_URL, MANAGED_BY_KEY, MANAGED_BY_SELECTOR, MANAGED_BY_VALUE, RANK_ACTIVITY_MARKER,
-    RUN_SESSION_DELIMITER, RUN_SESSION_UNDELIVERED, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER,
-    SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
+    RUN_SESSION_DELIMITER, RUN_SESSION_ECHO_MARKER, RUN_SESSION_ECHO_MAX, RUN_SESSION_UNDELIVERED,
+    SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER, SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER,
+    SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER, parse_session_echo,
 };
 pub use outputs::{
     BoundSource, BoundViolation, ENV_OUTPUT_PARAMS, ENV_OUTPUTS, ENV_SESSION_LOG,

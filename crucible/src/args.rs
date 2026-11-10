@@ -37,6 +37,9 @@ pub(crate) struct Args {
     /// (the openshell turn, the S3 publish and fetch) run on it.
     #[arg(skip)]
     pub engine: Option<tokio::runtime::Handle>,
+    /// The secret rules every turn of this process scrubs its stream with.
+    #[arg(skip)]
+    pub secret_rules: crucible_harness::redact::SecretRules,
     /// The domain manifest: the engine reads it, builds a World + Judge, and works in its
     /// workspace. Required (every run is a manifest run).
     #[arg(long)]
@@ -139,7 +142,7 @@ pub(crate) struct Args {
     /// Overrides the manifest's `[agent].harness`; when neither is set the engine defaults to
     /// claude (see `apply_agent_cfg`).
     #[arg(long, value_enum)]
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// Codex-harness tuning (from `[agent.codex]`). No CLI flag.
     #[arg(skip)]
     pub codex: manifest::CodexCfg,
@@ -150,7 +153,7 @@ pub(crate) struct Args {
     /// `[agent].reasoning_effort`; when neither is set the engine defaults to `medium` (see
     /// `apply_agent_cfg`).
     #[arg(long = "effort", value_enum)]
-    pub reasoning_effort: Option<crate::manifest::ReasoningEffort>,
+    pub reasoning_effort: Option<crate::knobs::ReasoningEffort>,
     /// Backend for the agent turn: `local` (default) runs it here; `openshell` runs
     /// it in an OpenShell sandbox (what an in-pod loop uses). Needs `--sandbox-image`.
     #[arg(long, value_enum, default_value_t = manifest::AgentBackend::Local)]
@@ -224,6 +227,9 @@ pub(crate) struct Args {
     /// What `[workflow].env` passes to `command` and `evaluate` tasks.
     #[arg(skip)]
     pub workflow_env: crucible::host_env::HostEnv,
+    /// The run's MCP servers `[workflow].servers` gives `command` and `evaluate` tasks.
+    #[arg(skip)]
+    pub workflow_servers: Vec<crucible_contract::agent_servers::ServerName>,
     /// Where the run's buildit serves the run's own command and evaluate tasks, fixed from the
     /// run's top-level paths so every task and turn starts it the same way.
     #[arg(skip)]
@@ -262,7 +268,7 @@ impl Args {
     /// The resolved agent harness: CLI `--harness` > manifest `[agent].harness` (folded on by
     /// `apply_agent_cfg`) > claude. Paths that never see a manifest (rank-grounded, scope) get
     /// the claude default.
-    pub(crate) fn harness(&self) -> crate::manifest::Harness {
+    pub(crate) fn harness(&self) -> crate::knobs::Harness {
         self.harness.unwrap_or_default()
     }
 
@@ -299,6 +305,15 @@ impl Args {
         }
     }
 
+    /// Compile the secret rules now, outside any turn's deadline.
+    pub(crate) fn compile_secret_rules(&self) {
+        if !self.secret_rules.ready() {
+            tracing::warn!(
+                "the builtin secret rules did not compile; agent output is masked whole"
+            );
+        }
+    }
+
     /// The slice the openshell turn reads.
     pub(crate) fn sandbox_turn(&self) -> SandboxTurn<'_> {
         SandboxTurn {
@@ -318,6 +333,7 @@ impl Args {
             run_id: self.sandbox_run_id.as_ref(),
             gateway_boot: &self.gateway_boot,
             engine: self.engine.as_ref(),
+            secret_rules: &self.secret_rules,
             tool_plugins: self.tool_plugins.as_deref(),
             buildit_socket: self.buildit_socket.as_ref(),
         }
@@ -337,9 +353,9 @@ pub(crate) struct EngineUninitialized;
 /// the agent knobs, and the manifest `[agent].env`.
 #[derive(Clone, Copy)]
 pub(crate) struct TurnAgent<'a> {
-    pub harness: manifest::Harness,
+    pub harness: crate::knobs::Harness,
     pub model: &'a str,
-    pub reasoning_effort: Option<manifest::ReasoningEffort>,
+    pub reasoning_effort: Option<crate::knobs::ReasoningEffort>,
     pub disallowed_tools: &'a [String],
     pub codex: &'a manifest::CodexCfg,
     pub env: &'a [(String, String)],
@@ -367,6 +383,7 @@ pub(crate) struct SandboxTurn<'a> {
     pub gateway_boot: &'a crucible::openshell::gateway::BootLock,
     /// The engine runtime the turn runs on; `None` fails the turn as an orchestration error.
     pub engine: Option<&'a tokio::runtime::Handle>,
+    pub secret_rules: &'a crucible_harness::redact::SecretRules,
     /// The declared tool plugin chain; `None` runs the default chain.
     pub tool_plugins: Option<&'a [manifest::ToolPluginSpec]>,
     pub buildit_socket: Option<&'a crate::openshell::buildit::RunSocket>,
@@ -487,6 +504,6 @@ pub(crate) struct Prepared {
 /// supplied.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct AgentOverride {
-    pub harness: Option<manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     pub model: Option<String>,
 }

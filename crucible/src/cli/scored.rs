@@ -191,6 +191,11 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         .map(crate::plan::workflow::WorkflowCfg::host_env)
         .transpose()?
         .unwrap_or_default();
+    args.workflow_servers = m
+        .workflow
+        .as_ref()
+        .map(|w| w.servers.clone())
+        .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
     let world = m.build_world(workspace.clone())?;
     let judge = m.build_judge(workspace, frozen_injects)?;
@@ -317,6 +322,11 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
         .as_ref()
         .map(crate::plan::workflow::WorkflowCfg::host_env)
         .transpose()?
+        .unwrap_or_default();
+    args.workflow_servers = m
+        .workflow
+        .as_ref()
+        .map(|w| w.servers.clone())
         .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
     let world = m.build_world(&manifest_dir)?;

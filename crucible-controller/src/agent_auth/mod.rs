@@ -27,12 +27,15 @@ pub mod spire;
 #[cfg(test)]
 mod testing;
 
-use crate::agent_auth::issuer::{AgentGrant, AgentIssuer, AssertionError, GrantError};
+use crate::agent_auth::issuer::{Actor, AgentGrant, AgentIssuer, AssertionError, GrantError};
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::FormRejection;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use crucible_contract::task_servers::{
+    ACCESS_TOKEN_TYPE, JWT_TOKEN_TYPE, POD_TOKEN_TYPE, TOKEN_EXCHANGE_GRANT,
+};
 use serde::Deserialize;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -101,7 +104,10 @@ impl AgentAuth {
                 Some(people)
             }
         };
-        if !agents && issuer_cfg.spire.is_empty() && people.is_none() {
+        let tasks = servers
+            .iter()
+            .any(|s| matches!(s.hosting, crucible::deploy::servers::Hosting::Remote));
+        if !agents && !tasks && issuer_cfg.spire.is_empty() && people.is_none() {
             return Err(issuer::ConfigError::NoRecipients.into());
         }
         let mut discovering: Vec<String> = servers
@@ -122,7 +128,7 @@ impl AgentAuth {
             kid = issuer_cfg.signing_key.kid(),
             spire = ?issuer_cfg.spire.iter().map(|s| (s.cluster.as_str(), s.svid_issuer.as_str())).collect::<Vec<_>>(),
             discovering = ?discovering,
-            audiences = ?issuer_cfg.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str(), a.requires_kube_user)).collect::<Vec<_>>(),
+            audiences = ?issuer_cfg.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
             "issuing agent access tokens"
         );
         let proxy_keys = |clusters: Arc<crate::runs::clusters::ClusterClients>| {
@@ -182,6 +188,23 @@ struct TokenRequest {
     scope: Option<String>,
 }
 
+/// A run's request for a token one of its command or evaluate tasks presents: RFC 8693 token
+/// exchange with the run's pod token as the subject token.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskTokenRequest {
+    #[serde(rename = "grant_type")]
+    _grant_type: String,
+    subject_token: String,
+    subject_token_type: String,
+    /// The loop pod's JWT-SVID, on a cluster that gives loop pods one.
+    actor_token: Option<String>,
+    actor_token_type: Option<String>,
+    audience: Option<String>,
+    scope: Option<String>,
+    task: String,
+}
+
 /// RFC 6749 §5.2 and RFC 8707 §2 token endpoint errors. The detail each carries is logged, never
 /// returned: a caller holding a stolen or forged assertion learns only the error code.
 #[derive(Debug)]
@@ -227,7 +250,7 @@ impl IntoResponse for OAuthError {
             Self::InvalidGrant(_) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "no token can be issued for this sandbox",
+                "no token can be issued for this caller",
             ),
             Self::UnauthorizedClient(_) => (
                 StatusCode::BAD_REQUEST,
@@ -237,7 +260,7 @@ impl IntoResponse for OAuthError {
             Self::UnsupportedGrantType(_) => (
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
-                "only client_credentials is supported",
+                "this grant type is not supported",
             ),
             Self::InvalidScope(_) => (
                 StatusCode::BAD_REQUEST,
@@ -273,14 +296,14 @@ pub(crate) fn oauth_error(status: StatusCode, code: &str, description: &str) -> 
 impl From<GrantError> for OAuthError {
     fn from(e: GrantError) -> Self {
         match e {
-            GrantError::NoAudience { .. } | GrantError::Audience { .. } => {
-                Self::InvalidTarget(e.to_string())
-            }
+            GrantError::NoAudience { .. }
+            | GrantError::Audience { .. }
+            | GrantError::NotForTasks { .. }
+            | GrantError::NotDeclared { .. } => Self::InvalidTarget(e.to_string()),
             GrantError::Scope { .. } => Self::InvalidScope(e.to_string()),
             GrantError::NoLauncher { .. }
-            | GrantError::NoUsername(_)
-            | GrantError::NoKubeUser { .. }
-            | GrantError::WrongCluster { .. } => Self::InvalidGrant(e.to_string()),
+            | GrantError::WrongCluster { .. }
+            | GrantError::NotTheRunsPod { .. } => Self::InvalidGrant(e.to_string()),
         }
     }
 }
@@ -323,6 +346,15 @@ async fn token(
             Ok(response) => response,
             Err(error) => {
                 tracing::info!(reason = error.detail(), "person token refused");
+                error.into_response()
+            }
+        };
+    }
+    if grant_type == Some(TOKEN_EXCHANGE_GRANT) {
+        return match issue_task(&state, fields).await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::info!(reason = error.detail(), "task token refused");
                 error.into_response()
             }
         };
@@ -404,50 +436,11 @@ async fn issue(
         .audience(req.audience.as_deref(), &run.cluster)?;
     let launcher = issuer::launcher(&run)?;
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
-    let principal = crate::authz::model::Principal::User(launcher.clone());
-    let resolved = crate::identity::cluster_identity::for_principal(
-        &state.pool,
-        profile,
-        &run.cluster,
-        &principal,
-    )
-    .await
-    .map_err(|e| match e {
-        crate::identity::cluster_identity::PrincipalError::Db(e) => {
-            OAuthError::Server(format!("{e:#}"))
-        }
-        e => GrantError::NoUsername(e.to_string()).into(),
-    })?;
-    let kube_user = match resolved {
-        crate::identity::cluster_identity::Resolution::Known { user, .. } => Some(user),
-        unknown => {
-            let why = match unknown {
-                crate::identity::cluster_identity::Resolution::Unavailable(why) => why,
-                _ => format!("{launcher} has not linked a username on {}", run.cluster),
-            };
-            if audience.requires_kube_user {
-                return Err(GrantError::NoKubeUser {
-                    launcher: launcher.clone(),
-                    cluster: run.cluster.clone(),
-                    audience: audience.resource.clone(),
-                    why,
-                }
-                .into());
-            }
-            tracing::warn!(
-                launcher,
-                sandbox = %sandbox.id,
-                cluster = run.cluster,
-                reason = why,
-                "agent token minted without kube_user"
-            );
-            None
-        }
-    };
+    let kube = issuer::RunIdentity::of(&run.pod_name, run.owner.as_deref());
     let grant = AgentGrant {
-        sandbox,
+        actor: Actor::Sandbox(sandbox.clone()),
         launcher,
-        kube_user: kube_user.map(|k| k.as_str().to_string()),
+        kube,
         run,
         audience: audience.resource.clone(),
         scopes,
@@ -458,12 +451,12 @@ async fn issue(
         .mint(&grant, crate::clock::unix_secs())
         .map_err(|e| OAuthError::Server(e.to_string()))?;
     tracing::info!(
-        sandbox = %grant.sandbox.id,
-        spiffe_id = grant.sandbox.spiffe_id,
-        tenant = grant.sandbox.tenant.as_deref(),
+        sandbox = %sandbox.id,
+        spiffe_id = sandbox.spiffe_id,
+        tenant = sandbox.tenant.as_deref(),
         run_id = grant.run.run_id,
         sub = grant.launcher,
-        kube_user = grant.kube_user.as_deref(),
+        kube_user = grant.kube.user,
         aud = grant.audience,
         scope = minted.scope,
         "agent token issued"
@@ -477,6 +470,168 @@ async fn issue(
         }))
         .into_response(),
     ))
+}
+
+async fn issue_task(
+    state: &AgentAuth,
+    fields: serde_json::Map<String, serde_json::Value>,
+) -> Result<Response, OAuthError> {
+    let req: TaskTokenRequest = serde_json::from_value(serde_json::Value::Object(fields))
+        .map_err(|e| OAuthError::InvalidRequest(e.to_string()))?;
+    if req.subject_token_type != POD_TOKEN_TYPE {
+        return Err(OAuthError::InvalidRequest(format!(
+            "subject_token_type {:?} is not {POD_TOKEN_TYPE}",
+            req.subject_token_type
+        )));
+    }
+    if !crucible_contract::task_servers::is_task_name(&req.task) {
+        return Err(OAuthError::InvalidRequest(format!(
+            "task {:?} is not a task name",
+            req.task
+        )));
+    }
+    if !crate::runs::pod_token::looks_like_token(&req.subject_token) {
+        return Err(OAuthError::InvalidGrant(
+            "the subject token is not a pod token".into(),
+        ));
+    }
+    let run_id = match crate::runs::pod_token::verify(&state.pool, &req.subject_token).await {
+        Ok(crate::runs::pod_token::Grant {
+            subject: crate::runs::pod_token::Subject::Run(run_id),
+            ..
+        }) => run_id,
+        Ok(_) => {
+            return Err(OAuthError::InvalidGrant(
+                "a turn's pod token gets no task tokens".into(),
+            ));
+        }
+        Err(e) => return Err(OAuthError::InvalidGrant(e.to_string())),
+    };
+    let run = bindings::running(&state.pool, &run_id)
+        .await
+        .map_err(|e| match e {
+            bindings::ResolveError::Db(_) => OAuthError::Server(format!("{e:#}")),
+            e => OAuthError::InvalidGrant(e.to_string()),
+        })?;
+    let svid = match (state.profile.cluster.loop_svid, req.actor_token.as_deref()) {
+        (true, Some(assertion)) => {
+            if req.actor_token_type.as_deref() != Some(JWT_TOKEN_TYPE) {
+                return Err(OAuthError::InvalidRequest(format!(
+                    "actor_token_type {:?} is not {JWT_TOKEN_TYPE}",
+                    req.actor_token_type
+                )));
+            }
+            let svid = state.issuer.run_pod(assertion).await.map_err(|e| match e {
+                AssertionError::Token(crucible_mcp_auth::verify::TokenError::Key(
+                    crucible_mcp_auth::jwks::JwksError::Fetch { .. },
+                )) => OAuthError::Server(format!("SPIRE keys unavailable: {e}")),
+                e => OAuthError::InvalidGrant(e.to_string()),
+            })?;
+            if svid.pod != run.pod_name || svid.cluster != run.cluster {
+                return Err(GrantError::NotTheRunsPod {
+                    svid_pod: svid.pod,
+                    svid_cluster: svid.cluster,
+                    pod: run.pod_name.clone(),
+                    cluster: run.cluster.clone(),
+                }
+                .into());
+            }
+            Some(svid.spiffe_id)
+        }
+        (true, None) => {
+            return Err(OAuthError::InvalidGrant(
+                "this deployment's loop pods carry an SVID; a task token needs it as actor_token"
+                    .into(),
+            ));
+        }
+        (false, Some(_)) => {
+            return Err(OAuthError::InvalidRequest(
+                "actor_token given, but cluster.loop_svid is off: no SVID is checked here".into(),
+            ));
+        }
+        (false, None) => None,
+    };
+    let audience = state
+        .issuer
+        .audience(req.audience.as_deref(), &run.cluster)?;
+    if !audience.remote {
+        return Err(GrantError::NotForTasks {
+            audience: audience.resource.clone(),
+        }
+        .into());
+    }
+    if !declares_task_server(&state.pool, &run.run_id, &audience.server).await? {
+        return Err(GrantError::NotDeclared {
+            run_id: run.run_id.clone(),
+            server: audience.server.clone(),
+        }
+        .into());
+    }
+    let launcher = issuer::launcher(&run)?;
+    let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
+    let kube = issuer::RunIdentity::of(&run.pod_name, run.owner.as_deref());
+    let grant = AgentGrant {
+        actor: Actor::Task(req.task),
+        launcher,
+        kube,
+        run,
+        audience: audience.resource.clone(),
+        scopes,
+        namespaces: audience.namespaces.clone(),
+    };
+    let minted = state
+        .issuer
+        .mint(&grant, crate::clock::unix_secs())
+        .map_err(|e| OAuthError::Server(e.to_string()))?;
+    tracing::info!(
+        actor = ?grant.actor,
+        svid = svid.as_deref(),
+        run_id = grant.run.run_id,
+        sub = grant.launcher,
+        kube_user = grant.kube.user,
+        aud = grant.audience,
+        scope = minted.scope,
+        "task token issued"
+    );
+    Ok(no_store(
+        Json(serde_json::json!({
+            "access_token": minted.access_token,
+            "issued_token_type": ACCESS_TOKEN_TYPE,
+            "token_type": "Bearer",
+            "expires_in": minted.expires_in,
+            "scope": minted.scope,
+        }))
+        .into_response(),
+    ))
+}
+
+/// Whether the pack run `run_id` executes discloses that its tasks reach `server`: the manifest
+/// named it in `[workflow].servers`. A run with no recorded disclosure declares nothing.
+async fn declares_task_server(
+    pool: &PgPool,
+    run_id: &str,
+    server: &str,
+) -> Result<bool, OAuthError> {
+    let failed = |e: String| OAuthError::Server(format!("reading run {run_id}'s disclosure: {e}"));
+    let issue: Option<String> =
+        sqlx::query_scalar::<_, Option<String>>("SELECT issue FROM runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| failed(e.to_string()))?
+            .flatten();
+    let Some(issue) = issue else {
+        return Ok(false);
+    };
+    let exposure = crate::launches::store::exposure_for_issue(pool, &issue)
+        .await
+        .map_err(|e| failed(format!("{e:#}")))?
+        .map_err(|e| failed(e.to_string()))?;
+    Ok(exposure.is_some_and(|e| {
+        e.capabilities
+            .iter()
+            .any(|capability| capability.grants_task_server(server))
+    }))
 }
 
 async fn jwks(State(state): State<Arc<AgentAuth>>) -> Response {
@@ -690,98 +845,52 @@ mod tests {
         .unwrap();
     }
 
+    /// A run's token carries the run's own Kubernetes identity, whether or not its launcher
+    /// linked a username.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_launcher_with_a_known_kubernetes_username_gets_kube_user(pool: PgPool) {
-        bound(&pool, "sbx-1").await;
-        link(&pool, "alice-k8s").await;
+    async fn a_runs_token_carries_its_own_identity_whoever_launched_it(pool: PgPool) {
+        bound_unlinked(&pool, "sbx-1").await;
         let h = harness(pool).await;
         let svid = h.spire.svid(&Spire::claims("sbx-1"));
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let claims = claims_of(&body);
+        assert_eq!(claims["sub"].as_str(), Some("alice"));
         assert_eq!(
-            (claims["sub"].as_str(), claims["kube_user"].as_str()),
-            (Some("alice"), Some("alice-k8s"))
+            claims["kube_user"].as_str(),
+            Some("crucible:run:crucible-run-brave-otter")
+        );
+        assert_eq!(
+            claims["kube_groups"],
+            json!(["crucible:runs", "crucible:user:alice"])
         );
     }
 
+    /// A team-owned run carries the team's group, so a RoleBinding for the team admits its runs.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn an_unknown_kubernetes_username_refuses_kueue_tokens_and_only_kueue_tokens(
-        pool: PgPool,
-    ) {
-        bound_unlinked(&pool, "sbx-1").await;
-        let strict = harness(pool.clone()).await;
-        let svid = strict.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
-        assert_eq!(
-            (status, body["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
-            "{body}"
-        );
-        let (status, _, body) =
-            post(&strict.app, &form(&svid, &[("audience", testing::BUILDIT)])).await;
-        assert_eq!(
-            status,
-            StatusCode::OK,
-            "a buildit token runs no SubjectAccessReview: {body}"
-        );
-        assert!(claims_of(&body).get("kube_user").is_none());
-
-        link(&pool, "alice-k8s").await;
-        let svid = strict.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(claims_of(&body)["kube_user"], "alice-k8s");
-    }
-
-    /// A spoke checks RBAC as the launcher's username there; the hub's is no stand-in for it.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_token_carries_the_launchers_username_on_the_runs_cluster(pool: PgPool) {
-        bound_unlinked(&pool, "sbx-1").await;
-        crate::identity::oidc::users::record_login(
+    async fn a_team_owned_run_carries_its_teams_group(pool: PgPool) {
+        testing::running_run(&pool, "crucible-run-brave-otter", "run-1", Some("team:ml")).await;
+        sqlx::query("UPDATE runs SET dispatched_by = 'team:ml' WHERE run_id = 'run-1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        bindings::bind(
             &pool,
-            "sub-alice",
-            "alice",
-            Some("alice@example.com"),
-            jiff::Timestamp::now(),
+            &bindings::run_pod(&pool, "run-1").await.unwrap(),
+            &testing::binding("sbx-1"),
         )
         .await
         .unwrap();
-        crate::identity::kube_identity::set_override(
-            &pool,
-            "alice",
-            Some(&crate::identity::kube_identity::KubeUser::parse("alice-hub").unwrap()),
-        )
-        .await
-        .unwrap();
-        let h = harness(pool.clone()).await;
+        let h = harness(pool).await;
         let svid = h.spire.svid(&Spire::claims("sbx-1"));
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = claims_of(&body);
+        assert_eq!(claims["sub"].as_str(), Some("team:ml"));
         assert_eq!(
-            (status, body["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
-            "alice's hub username is not hers on the run's cluster: {body}"
+            claims["kube_groups"],
+            json!(["crucible:runs", "crucible:team:ml"])
         );
-
-        let claim = harness_with(
-            pool.clone(),
-            &format!(
-                "{PROFILE}[clusters.{}]\nkubeconfig_secret = \"dev-kubeconfig\"\n\
-                 identity = {{ claim = \"email\", prefix = \"oidc:\" }}\n",
-                testing::CLUSTER
-            ),
-        )
-        .await;
-        let svid = claim.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&claim.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(claims_of(&body)["kube_user"], "oidc:alice@example.com");
-
-        link(&pool, "alice-dev").await;
-        let svid = h.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(claims_of(&body)["kube_user"], "alice-dev");
     }
 
     /// alice launched the issue; bob unparks it. The run that follows was dispatched for bob, so
@@ -882,9 +991,11 @@ mod tests {
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let claims = claims_of(&body);
+        assert_eq!(claims["sub"].as_str(), Some("bob"));
         assert_eq!(
-            (claims["sub"].as_str(), claims["kube_user"].as_str()),
-            (Some("bob"), Some("bob-k8s"))
+            claims["kube_user"].as_str(),
+            Some("crucible:run:crucible-run-again"),
+            "the run's own identity, not bob's username"
         );
     }
 
@@ -920,7 +1031,7 @@ mod tests {
         let (_, _, body) = post(&h.app, &form(&unbound, &[])).await;
         assert_eq!(
             body,
-            json!({"error": "invalid_grant", "error_description": "no token can be issued for this sandbox"})
+            json!({"error": "invalid_grant", "error_description": "no token can be issued for this caller"})
         );
     }
 
@@ -1060,16 +1171,6 @@ mod tests {
             (
                 "an unbound sandbox",
                 form(&h.spire.svid(&Spire::claims("sbx-unbound")), &[]),
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-            ),
-            (
-                "a run with no person behind it",
-                form(
-                    &h.spire
-                        .svid(&Spire::claims_from("crucible-run-team", "sbx-team")),
-                    &[],
-                ),
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
             ),
@@ -1220,5 +1321,372 @@ mod tests {
             get(issuer::METADATA_PATH).await,
             serde_json::to_value(h.state.issuer.metadata(None)).unwrap()
         );
+    }
+
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Launch the registered playbook as `run-1`'s issue, with a pack whose tasks reach `servers`.
+    async fn declare_task_servers(pool: &PgPool, servers: &[&str]) {
+        let capabilities = match servers {
+            [] => json!([]),
+            names => json!([{"kind": "task-servers", "names": names}]),
+        };
+        crate::testing::pin_playbook(
+            pool,
+            crucible_contract::pack_tree::PackTree::from_pairs(&[(
+                "crucible.toml",
+                servers.join(",").as_bytes(),
+            )])
+            .unwrap(),
+            &json!({"version": 1, "outputs": [], "capabilities": capabilities}),
+        )
+        .await;
+        let key = format!("survey-{}", servers.join("-"));
+        crate::testing::launch_playbook(pool, &key).await;
+        sqlx::query("UPDATE runs SET issue = $1 WHERE run_id = 'run-1'")
+            .bind(&key)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A running run launched by alice whose pack names kueue for its tasks, and its pod token.
+    async fn run_with_pod_token(pool: &PgPool) -> String {
+        running_run(pool, POD, "run-1", Some("user:alice")).await;
+        declare_task_servers(pool, &["kueue"]).await;
+        crate::runs::pod_token::mint(
+            pool,
+            &crate::runs::pod_token::Subject::Run("run-1".into()),
+            None,
+            HOUR,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn task_form(pod_token: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+        let mut fields = vec![
+            ("grant_type".to_string(), TOKEN_EXCHANGE_GRANT.to_string()),
+            ("subject_token".to_string(), pod_token.to_string()),
+            ("subject_token_type".to_string(), POD_TOKEN_TYPE.to_string()),
+            ("audience".to_string(), KUEUE.to_string()),
+            ("task".to_string(), "probe".to_string()),
+        ];
+        for (k, v) in extra {
+            fields.retain(|(key, _)| key != k);
+            if !v.is_empty() {
+                fields.push((k.to_string(), v.to_string()));
+            }
+        }
+        fields
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_runs_pod_token_is_exchanged_for_a_task_token(pool: PgPool) {
+        let pod_token = run_with_pod_token(&pool).await;
+        let h = harness(pool).await;
+        let (status, cache, body) = post(&h.app, &task_form(&pod_token, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(cache.as_deref(), Some("no-store"));
+        assert_eq!(body["token_type"], "Bearer");
+        assert_eq!(body["issued_token_type"], ACCESS_TOKEN_TYPE);
+        assert_eq!(body["expires_in"], issuer::MIN_TOKEN_TTL_SECS);
+        assert_eq!(body["scope"], "kueue.read kueue.submit");
+
+        let jwks = serve_jwks(h.state.issuer.jwks()).await;
+        let rs = crucible_mcp_auth::server::ResourceServer::with_jwks(
+            crucible_mcp_auth::server::ResourceServerConfig {
+                issuers: vec![crucible_mcp_auth::server::TrustedIssuer {
+                    issuer: ISSUER.into(),
+                    jwks_uri: jwks,
+                    callers: crucible_mcp_auth::principal::Callers::Runs,
+                }],
+                resources: vec![url::Url::parse(KUEUE).unwrap()],
+                required_scopes: vec!["kueue.read".into()],
+                scopes_supported: Vec::new(),
+                resource_name: None,
+                cluster: None,
+            },
+            |t| crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), t.jwks_uri.clone()),
+        );
+        let principal = rs
+            .validate(body["access_token"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(principal.subject, "alice");
+        assert_eq!(
+            principal.presenter(),
+            format!("crucible:run:{POD}:task:probe")
+        );
+        assert_eq!(principal.namespace.as_deref(), Some("crucible-kueue-e2e"));
+        assert_eq!(principal.claims["run_id"], POD);
+        assert_eq!(principal.claims["kube_user"], format!("crucible:run:{POD}"));
+        assert_eq!(
+            principal.claims["kube_groups"],
+            json!(["crucible:runs", "crucible:user:alice"])
+        );
+        for absent in ["sandbox", "workdir"] {
+            assert!(principal.claims.get(absent).is_none(), "{absent}");
+        }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_task_token_is_scoped_as_requested(pool: PgPool) {
+        let pod_token = run_with_pod_token(&pool).await;
+        let h = harness(pool).await;
+        let (status, _, body) =
+            post(&h.app, &task_form(&pod_token, &[("scope", "kueue.read")])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(claims_of(&body)["scope"], "kueue.read");
+        let (status, _, body) = post(
+            &h.app,
+            &task_form(&pod_token, &[("scope", "buildit.build")]),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_scope"))
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_task_token_request_is_refused_by_its_oauth_error_code(pool: PgPool) {
+        let pod_token = run_with_pod_token(&pool).await;
+        let turn = crate::runs::pod_token::mint(
+            &pool,
+            &crate::runs::pod_token::Subject::Turn("crucible-turn-1".into()),
+            None,
+            HOUR,
+        )
+        .await
+        .unwrap();
+        let h = harness(pool.clone()).await;
+        let forged = format!("{}x", pod_token);
+        let long = "a".repeat(crucible_contract::task_servers::MAX_TASK_NAME_BYTES + 1);
+        let cases = [
+            (
+                "another token type",
+                task_form(&pod_token, &[("subject_token_type", ACCESS_TOKEN_TYPE)]),
+                "invalid_request",
+            ),
+            (
+                "no task",
+                task_form(&pod_token, &[("task", "")]),
+                "invalid_request",
+            ),
+            (
+                "a task name with a space",
+                task_form(&pod_token, &[("task", "two words")]),
+                "invalid_request",
+            ),
+            (
+                "a task name too long",
+                task_form(&pod_token, &[("task", &long)]),
+                "invalid_request",
+            ),
+            (
+                "a field of another grant",
+                task_form(&pod_token, &[("client_assertion", "x")]),
+                "invalid_request",
+            ),
+            (
+                "a bearer that is no pod token",
+                task_form("not-a-pod-token", &[]),
+                "invalid_grant",
+            ),
+            (
+                "a pod token with a wrong secret",
+                task_form(&forged, &[]),
+                "invalid_grant",
+            ),
+            ("a turn's pod token", task_form(&turn, &[]), "invalid_grant"),
+            (
+                "no audience",
+                task_form(&pod_token, &[("audience", "")]),
+                "invalid_target",
+            ),
+            (
+                "an audience the run was not granted",
+                task_form(&pod_token, &[("audience", "http://other.example/mcp")]),
+                "invalid_target",
+            ),
+            (
+                "an SVID where loop pods carry none",
+                task_form(
+                    &pod_token,
+                    &[("actor_token", "x"), ("actor_token_type", JWT_TOKEN_TYPE)],
+                ),
+                "invalid_request",
+            ),
+            (
+                "a server in the loop pod, whose tokens name a sandbox",
+                task_form(&pod_token, &[("audience", testing::BUILDIT)]),
+                "invalid_target",
+            ),
+        ];
+        for (what, fields, code) in cases {
+            let (status, cache, body) = post(&h.app, &fields).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some(code)),
+                "{what}: {body}"
+            );
+            assert_eq!(cache.as_deref(), Some("no-store"), "{what}");
+            assert!(body.get("access_token").is_none(), "{what}");
+        }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_task_token_is_issued_only_for_a_server_the_runs_pack_declared(pool: PgPool) {
+        running_run(&pool, POD, "run-1", Some("user:alice")).await;
+        let pod_token = crate::runs::pod_token::mint(
+            &pool,
+            &crate::runs::pod_token::Subject::Run("run-1".into()),
+            None,
+            HOUR,
+        )
+        .await
+        .unwrap();
+        let h = harness(pool.clone()).await;
+        let refused = |body: &Value| body["error"].as_str().map(str::to_string);
+
+        let (status, _, body) = post(&h.app, &task_form(&pod_token, &[])).await;
+        assert_eq!(
+            (status, refused(&body).as_deref()),
+            (StatusCode::BAD_REQUEST, Some("invalid_target")),
+            "a run of no launch has no disclosure"
+        );
+
+        declare_task_servers(&pool, &[]).await;
+        let (status, _, body) = post(&h.app, &task_form(&pod_token, &[])).await;
+        assert_eq!(
+            (status, refused(&body).as_deref()),
+            (StatusCode::BAD_REQUEST, Some("invalid_target")),
+            "a pack that names no servers, as every edition-1 pack must"
+        );
+
+        declare_task_servers(&pool, &["notes"]).await;
+        let (status, _, body) = post(&h.app, &task_form(&pod_token, &[])).await;
+        assert_eq!(
+            (status, refused(&body).as_deref()),
+            (StatusCode::BAD_REQUEST, Some("invalid_target")),
+            "a pack that names another server"
+        );
+
+        declare_task_servers(&pool, &["notes", "kueue"]).await;
+        let (status, _, body) = post(&h.app, &task_form(&pod_token, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_collected_or_revoked_run_gets_no_task_token(pool: PgPool) {
+        let pod_token = run_with_pod_token(&pool).await;
+        let h = harness(pool.clone()).await;
+        assert_eq!(
+            post(&h.app, &task_form(&pod_token, &[])).await.0,
+            StatusCode::OK
+        );
+        set_pod_state(&pool, POD, WorkPodState::Collected).await;
+        let (status, _, body) = post(&h.app, &task_form(&pod_token, &[])).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            "a collected run"
+        );
+        set_pod_state(&pool, POD, WorkPodState::Running).await;
+        crate::runs::pod_token::revoke(
+            &pool,
+            &crate::runs::pod_token::Subject::Run("run-1".into()),
+        )
+        .await
+        .unwrap();
+        let (status, _, body) = post(&h.app, &task_form(&pod_token, &[])).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            "a revoked pod token"
+        );
+    }
+
+    /// [`PROFILE`] on a cluster whose SPIRE gives loop pods an SVID.
+    fn loop_svid_profile() -> String {
+        PROFILE.replace("sandbox_driver", "loop_svid = true\nsandbox_driver")
+    }
+
+    /// The JWT-SVID claims of the loop pod `pod`.
+    fn run_pod_claims(pod: &str) -> Value {
+        let mut claims = Spire::claims("unused");
+        claims["sub"] = json!(format!("spiffe://example.crucible/crucible/run/{pod}"));
+        claims
+    }
+
+    fn with_svid(pod_token: &str, svid: &str) -> Vec<(String, String)> {
+        task_form(
+            pod_token,
+            &[("actor_token", svid), ("actor_token_type", JWT_TOKEN_TYPE)],
+        )
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn where_loop_pods_carry_an_svid_a_task_token_needs_the_runs_own(pool: PgPool) {
+        let pod_token = run_with_pod_token(&pool).await;
+        let h = harness_with(pool, &loop_svid_profile()).await;
+        let own = h.spire.svid(&run_pod_claims(POD));
+        let (status, _, body) = post(&h.app, &with_svid(&pod_token, &own)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = claims_of(&body);
+        assert_eq!(
+            claims["act"]["sub"],
+            format!("crucible:run:{POD}:task:probe")
+        );
+        assert_eq!(claims["kube_user"], format!("crucible:run:{POD}"));
+
+        let mut wrong_type = with_svid(&pod_token, &own);
+        wrong_type.retain(|(k, _)| k != "actor_token_type");
+        let other_pod = h.spire.svid(&run_pod_claims("crucible-run-other"));
+        let nested = h.spire.svid(&run_pod_claims(&format!("{POD}/x")));
+        let sandbox = h.spire.svid(&Spire::claims("sbx-1"));
+        let mut stale = run_pod_claims(POD);
+        stale["exp"] = json!(now() - 3600);
+        stale["iat"] = json!(now() - 3900);
+        let stale = h.spire.svid(&stale);
+        let cases = [
+            ("no SVID", task_form(&pod_token, &[]), "invalid_grant"),
+            ("no actor_token_type", wrong_type, "invalid_request"),
+            (
+                "another pod's SVID",
+                with_svid(&pod_token, &other_pod),
+                "invalid_grant",
+            ),
+            (
+                "an ID with a segment after the pod",
+                with_svid(&pod_token, &nested),
+                "invalid_grant",
+            ),
+            (
+                "a sandbox's SVID",
+                with_svid(&pod_token, &sandbox),
+                "invalid_grant",
+            ),
+            (
+                "an expired SVID",
+                with_svid(&pod_token, &stale),
+                "invalid_grant",
+            ),
+            (
+                "something that is no JWT",
+                with_svid(&pod_token, "not-a-jwt"),
+                "invalid_grant",
+            ),
+        ];
+        for (what, fields, code) in cases {
+            let (status, _, body) = post(&h.app, &fields).await;
+            assert_eq!(
+                (status, body["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some(code)),
+                "{what}: {body}"
+            );
+            assert!(body.get("access_token").is_none(), "{what}");
+        }
     }
 }

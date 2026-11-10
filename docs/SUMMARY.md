@@ -121,3 +121,7 @@
   - [ADR-0069: A launch sets agent settings per task and the checkout ref, within bounds the manifest declares](./adr/ADR-0069.md)
   - [ADR-0070: A dynamic choice reads its options from a dependency field, bounded and recorded](./adr/ADR-0070.md)
   - [ADR-0071: A pack edition gates contract changes, and edition 2 gives host commands only declared env](./adr/ADR-0071.md)
+  - [ADR-0072: Standing launches fire on their save snapshot, with no offline credential](./adr/ADR-0072.md)
+  - [ADR-0073: A run acts as its own scope to Kubernetes, not as its launcher](./adr/ADR-0073.md)
+  - [ADR-0074: A launch-form choice reads its options from a recorded task output](./adr/ADR-0074.md)
+  - [ADR-0075: Workflow tasks reach the run's MCP servers with controller-minted task tokens](./adr/ADR-0075.md)

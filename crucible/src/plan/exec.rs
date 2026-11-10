@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
-use crate::plan::admission::{Admission, Refusal};
+use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::attempt::{Attempt, AttemptOutcome, BatchItem, TransportFailure};
 use crate::plan::files::CapturedFiles;
 use crate::plan::history::SeriesHistory;
@@ -68,12 +68,17 @@ impl Substrate {
 /// [`Deadline::note`], never a transport failure: rerunning an attempt that exceeded its limit
 /// would repeat the cost.
 pub trait TaskRunner {
+    /// Called once before the plan's clock starts, so no attempt's deadline pays for setup.
+    fn prepare(&mut self) {}
+
+    /// Run one attempt of `task` in `lane`, which carries its deadline and takes its spend and
+    /// transcript; `None` runs it outside any admission.
     fn run(
         &mut self,
         task: &Task,
         attempt: u32,
         inputs: &BTreeMap<TaskName, Value>,
-        deadline: Option<Deadline>,
+        lane: Option<&Lane<'_>>,
     ) -> Attempt;
 
     /// Stage every declared file produced by the tasks named, into the workspace this task is
@@ -104,11 +109,7 @@ pub trait TaskRunner {
     ) -> Vec<Result<Attempt, Refusal>> {
         batch
             .iter()
-            .map(|b| {
-                admission.run(b, |lane| {
-                    self.run(b.task, b.attempt, &b.inputs, lane.deadline())
-                })
-            })
+            .map(|b| admission.run(b, |lane| self.run(b.task, b.attempt, &b.inputs, Some(lane))))
             .collect()
     }
 }
@@ -136,6 +137,8 @@ pub struct ExecCfg<'a> {
     /// The session log each attempt is recorded in before it runs. `None` records nothing, which
     /// a run that cannot resume wants.
     pub journal: Option<&'a std::fs::File>,
+    /// Where each task's first start is noted, for its result's wall time.
+    pub clock: Option<&'a crate::plan::admission::TaskClock>,
     /// The declared files this run's tasks captured. `None` is a run with no state directory:
     /// nothing is staged and nothing is dropped.
     pub files: Option<&'a CapturedFiles>,
@@ -155,6 +158,7 @@ impl Default for ExecCfg<'_> {
             decisions: None,
             width: crate::plan::admission::DEFAULT_WIDTH,
             journal: None,
+            clock: None,
             files: None,
             run_inputs: None,
         }
@@ -484,6 +488,7 @@ pub fn execute(
     runner: &mut dyn TaskRunner,
     mut on_result: impl FnMut(&Task, &TaskResult),
 ) -> Result<PlanOutcome, IllegalTransition> {
+    runner.prepare();
     let runnable = runnable_set(plan, substrate);
     let clock = Clock {
         started: Instant::now(),
@@ -2351,10 +2356,11 @@ fn run_batch_with_retries<'a>(
             .collect();
         runner.budget_left(ledger.budget - ledger.spent);
         let admission = Admission::new(ledger.budget, ledger.spent, ledger.run_ceiling, cfg.width)
-            .journaled(cfg.journal);
+            .journaled(cfg.journal)
+            .clocked(cfg.clock);
         let attempts = match items.as_slice() {
             [only] if single => vec![admission.run(only, |lane| {
-                runner.run(only.task, only.attempt, &only.inputs, lane.deadline())
+                runner.run(only.task, only.attempt, &only.inputs, Some(lane))
             })],
             _ => runner.run_many(&items, &admission),
         };
@@ -3269,8 +3275,9 @@ mod tests {
             task: &Task,
             attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
-            deadline: Option<Deadline>,
+            lane: Option<&Lane<'_>>,
         ) -> Attempt {
+            let deadline = lane.and_then(Lane::deadline);
             self.dispatched.push((task.name.0.clone(), attempt));
             self.deadlines.push((task.name.0.clone(), deadline));
             self.seen_inputs.insert(
@@ -3449,6 +3456,8 @@ mod tests {
     struct Sleeper {
         takes: BTreeMap<String, Duration>,
         dispatched: Vec<String>,
+        setup: Duration,
+        prepared: bool,
     }
 
     impl Sleeper {
@@ -3459,18 +3468,27 @@ mod tests {
                     .map(|(task, took)| ((*task).to_string(), *took))
                     .collect(),
                 dispatched: Vec::new(),
+                setup: Duration::ZERO,
+                prepared: false,
             }
         }
     }
 
     impl TaskRunner for Sleeper {
+        fn prepare(&mut self) {
+            assert!(self.dispatched.is_empty(), "prepared after a dispatch");
+            std::thread::sleep(self.setup);
+            self.prepared = true;
+        }
+
         fn run(
             &mut self,
             task: &Task,
             _: u32,
             _: &BTreeMap<TaskName, Value>,
-            deadline: Option<Deadline>,
+            lane: Option<&Lane<'_>>,
         ) -> Attempt {
+            let deadline = lane.and_then(Lane::deadline);
             self.dispatched.push(task.name.0.clone());
             let takes = self.takes.get(&task.name.0).copied().unwrap_or_default();
             let done = Instant::now() + takes;
@@ -3494,6 +3512,24 @@ mod tests {
     fn limited(mut task: Task, limit: &str) -> Task {
         task.timeout = Some(limit.parse().expect("a timeout"));
         task
+    }
+
+    #[test]
+    fn a_runners_setup_is_not_charged_to_any_attempts_limit() {
+        let plan = valid(vec![limited(task("quick", &[], "any", true), "0.2s")], 10.0);
+        let mut r = Sleeper::new(&[("quick", Duration::from_millis(50))]);
+        r.setup = Duration::from_millis(400);
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let quick = &out.results[&"quick".into()];
+        assert!(r.prepared);
+        assert_eq!(quick.status, TaskStatus::Pass, "{:?}", quick.note);
+        assert!(out.valid);
     }
 
     #[test]
@@ -4276,7 +4312,7 @@ mod tests {
                 task: &Task,
                 _: u32,
                 _: &BTreeMap<TaskName, Value>,
-                _: Option<Deadline>,
+                _: Option<&Lane<'_>>,
             ) -> Attempt {
                 self.batches.push(vec![task.name.0.clone()]);
                 Attempt {
@@ -4559,7 +4595,7 @@ mod tests {
                 _: &Task,
                 _: u32,
                 _: &BTreeMap<TaskName, Value>,
-                _: Option<Deadline>,
+                _: Option<&Lane<'_>>,
             ) -> Attempt {
                 unreachable!("batchable plan must go through run_many");
             }
@@ -6243,7 +6279,7 @@ mod tests {
             task: &Task,
             _attempt: u32,
             inputs: &BTreeMap<TaskName, Value>,
-            _deadline: Option<Deadline>,
+            _lane: Option<&Lane<'_>>,
         ) -> Attempt {
             self.log.push(format!("run {}", task.name));
             self.seen_inputs.insert(task.name.0.clone(), inputs.clone());
@@ -6282,9 +6318,7 @@ mod tests {
             batch
                 .iter()
                 .map(|b| {
-                    admission.run(b, |lane| {
-                        self.run(b.task, b.attempt, &b.inputs, lane.deadline())
-                    })
+                    admission.run(b, |lane| self.run(b.task, b.attempt, &b.inputs, Some(lane)))
                 })
                 .collect()
         }
@@ -6501,7 +6535,7 @@ mod tests {
             task: &Task,
             _attempt: u32,
             _inputs: &BTreeMap<TaskName, Value>,
-            _deadline: Option<Deadline>,
+            _lane: Option<&Lane<'_>>,
         ) -> Attempt {
             self.ran.push(task.name.0.clone());
             let output = match task.name.0.as_str() {
@@ -9354,8 +9388,9 @@ mod tests {
             task: &Task,
             _attempt: u32,
             _inputs: &BTreeMap<TaskName, Value>,
-            deadline: Option<Deadline>,
+            lane: Option<&Lane<'_>>,
         ) -> Attempt {
+            let deadline = lane.and_then(Lane::deadline);
             assert_eq!(
                 deadline.map(|d| d.bound),
                 task.timeout.map(Bound::Task),

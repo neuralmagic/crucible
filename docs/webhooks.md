@@ -252,8 +252,7 @@ the signature header).
 The listener uses a different port from the API, so a deployment can publish only the
 listener. In the Helm chart, `webhooks.enabled` adds the `hooks` container, the Service port,
 and a Route on the external host for the `/hooks` path only. `webhooks.key.existingSecret`
-mounts the webhook key. The webhook key is separate from `CONTROLLER_CREDENTIAL_KEY`, which
-also enables offline credentials at sign-in.
+mounts the webhook key.
 
 Generate a key with `head -c 32 /dev/urandom | base64`. To rotate the key, put the new key
 first. Keep the old key after it until you rotate every secret that it sealed.
@@ -320,7 +319,7 @@ curl -X POST -H "X-GitHub-Event: release" -H "X-Hub-Signature-256: $sig" --data 
 | The sender sees `404` | Wrong id or token, a changed or rotated secret, a paused webhook, a signature over a different body, or a body over 512 KiB. |
 | The sender sees `503` | The controller could not record the delivery, or it is rejecting load. The sender retries. |
 | `filtered` | The filter was false. Load the delivery into the preview of the edit form to find the cause. |
-| Stays `queued` | The owner of the webhook must sign in again, or the controller is not running its launch loop. |
+| Stays `queued` | The controller is not running its launch loop. |
 | `failed` with `no key "x"` | An expression read a key that the payload does not have. Guard a field with `has(body.x)` and a header with `"x" in headers` before the expression reads it. |
 | `duplicate` | The dedupe key already launched a run. Use `delivery` if each delivery is a separate event. |
 | The save rejects `hmac_sha256` | The controller has no webhook key. |

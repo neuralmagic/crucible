@@ -2,7 +2,7 @@
 //! trigger that fires it. A schedule (a cron window) and a watch (a tracker query hit) are 1:1
 //! sidecars on one `playbook_standing_launches` row, keyed by the same id. Everything a firing
 //! needs that is not the trigger lives here: the adopted pack snapshot, the stored params, the
-//! ceilings, the owner principal and group snapshot with its refresh state, the dispatch target,
+//! ceilings, the owner principal and group snapshot, the dispatch target,
 //! the agent pin, the enabled flag, and the failure count.
 //!
 //! A trigger claims its own sidecar row, then hands this module the id, a per-firing param overlay
@@ -16,7 +16,6 @@ use crate::launches::model::NewPlaybookLaunch;
 use crate::model::LaunchOrigin;
 use crate::model::MaxTime;
 use crate::model::Trigger;
-use crate::model::{ParkReason, ParkedBy, Status};
 use crate::playbooks::registry::PackRevision;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
@@ -130,18 +129,9 @@ pub(crate) struct Standing {
     pub enabled: bool,
     pub consecutive_failures: i64,
     pub created_by: Option<String>,
-    /// Who the last save owned this row to, the groups their claims carried, and when the snapshot
-    /// was taken. A row saved before snapshots existed carries none and parks any firing whose
-    /// scope binds secrets.
+    /// Who the last save owned this row to, and the groups their claims carried.
     pub owner_principal: Option<String>,
     pub owner_groups: Option<serde_json::Value>,
-    pub owner_groups_at: Option<String>,
-    /// The fire-time group refresh's state. `owner_signin_required` is what a definitive refresh
-    /// refusal past the snapshot TTL and an explicit revoke both set, and what a fresh login and a
-    /// successful refresh both clear; `owner_refresh_error` says why, transient failures included.
-    pub owner_signin_required: bool,
-    pub owner_refresh_error: Option<String>,
-    pub owner_refresh_at: Option<String>,
     pub dispatch_target: Option<String>,
     pub agent_provider: Option<String>,
     pub agent_model: Option<String>,
@@ -188,8 +178,7 @@ pub(crate) fn adopted_label(rev: Option<&str>, tree: Option<&str>) -> String {
 pub(crate) const COLUMNS: &str = "c.id, c.playbook, c.target_kind, c.adopted_repo, c.adopted_path, \
     c.adopted_rev, c.adopted_tar_digest, c.adopted_tree_digest, c.adopted_variant, c.eligible_draft_version, c.params, c.schema_digest, c.max_cost, c.max_time, \
     c.advance_dedupe, c.enabled, c.consecutive_failures, c.created_by, c.owner_principal, \
-    c.owner_groups, c.owner_groups_at, c.owner_signin_required, c.owner_refresh_error, \
-    c.owner_refresh_at, c.dispatch_target, c.agent_provider, c.agent_model, c.created_at, \
+    c.owner_groups, c.dispatch_target, c.agent_provider, c.agent_model, c.created_at, \
     c.updated_at";
 
 /// Store the core row under `id`. The adopted snapshot is copied from the registry row held by
@@ -207,12 +196,12 @@ pub(crate) async fn insert(
         INSERT INTO playbook_standing_launches (
             id, trigger, playbook, target_kind, eligible_draft_version, params, schema_digest,
             max_cost, max_time, advance_dedupe, enabled, created_by, owner_principal,
-            owner_groups, owner_groups_at, dispatch_target, agent_provider, agent_model,
+            owner_groups, dispatch_target, agent_provider, agent_model,
             created_at, updated_at,
             adopted_repo, adopted_path, adopted_rev, adopted_tar_gz, adopted_tar_digest,
             adopted_tar_bytes, adopted_params_schema, adopted_tree_digest, adopted_variant)
         SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-               CASE WHEN $13::text IS NULL THEN NULL ELSE $18 END, $15, $16, $17, $18, $18,
+               $15, $16, $17, $18, $18,
                p.repo, p.path, p.rev, p.tar_gz, p.tar_digest, p.tar_bytes, p.params_schema,
                p.tree_digest, p.variant
         FROM (VALUES (1)) one
@@ -243,9 +232,8 @@ pub(crate) async fn insert(
     Ok(())
 }
 
-/// Replace the authorization under `id`. The failure count starts over and the owner flags clear:
-/// an edited row is not still N failures deep into the run it used to be, and the re-save is a
-/// fresh snapshot. `false` when there is no row under that id.
+/// Replace the authorization under `id`. The failure count starts over: an edited row is not still
+/// N failures deep into the run it used to be. `false` when there is no row under that id.
 pub(crate) async fn replace(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
@@ -259,8 +247,6 @@ pub(crate) async fn replace(
         SET playbook = $2, target_kind = $3, eligible_draft_version = $4, params = $5,
             schema_digest = $6, max_cost = $7, max_time = $8, advance_dedupe = $9, enabled = $10,
             created_by = $11, owner_principal = $12, owner_groups = $13,
-            owner_groups_at = CASE WHEN $12::text IS NULL THEN NULL ELSE $17 END,
-            owner_signin_required = false, owner_refresh_error = NULL,
             dispatch_target = $14, agent_provider = $15, agent_model = $16,
             consecutive_failures = 0, updated_at = $17,
             adopted_repo = p.repo, adopted_path = p.path, adopted_rev = p.rev,
@@ -390,10 +376,6 @@ pub(crate) struct Firing<'a> {
     pub title: Option<&'a str>,
 }
 
-/// Why a firing that minted its launch must park instead of dispatching: the owner snapshot does
-/// not authorize it. The trigger wraps this in its own park reason.
-pub(crate) type StaleOwner = Option<String>;
-
 /// Why a firing did not launch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureCause {
@@ -423,7 +405,7 @@ impl From<String> for FireError {
 /// Mint the launch for a locked core row on the trigger's transaction: the launch row, its
 /// dispatch and agent columns, and the adopted tarball copy. `exposure` is the disclosure the
 /// launch row records: a draft-head firing's recomputed one, absent otherwise. An adopted pack's
-/// launch records none, since the registry row's need not be that pack's. Returns how the owner snapshot stands; an `Err` is what the
+/// launch records none, since the registry row's need not be that pack's. An `Err` is what the
 /// trigger records as a firing failure.
 pub(crate) async fn fire(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -432,8 +414,7 @@ pub(crate) async fn fire(
     exposure: &crate::playbooks::exposure::Extraction,
     key: &str,
     now: Timestamp,
-    owner_ttl: std::time::Duration,
-) -> Result<StaleOwner, FireError> {
+) -> Result<(), FireError> {
     let core = &row.core;
     let noun = format!("standing launch {}", core.id);
     let (Some(description), Some(schema)) = (row.description.as_deref(), &row.params_schema) else {
@@ -470,6 +451,7 @@ pub(crate) async fn fire(
         MaxTime::parse(&core.max_time).map_err(|e| format!("{noun} stored max_time: {e}"))?;
     let params = overlaid_params(core, schema, firing.overlay)?;
     let launch = NewPlaybookLaunch {
+        choice_snapshots: None,
         playbook: &core.playbook,
         repo: &row.repo,
         title: firing.title.unwrap_or(description),
@@ -484,8 +466,9 @@ pub(crate) async fn fire(
         created_by: core
             .owner_principal
             .as_deref()
-            .map(strip_user_prefix)
+            .and_then(|owner| owner.strip_prefix("user:"))
             .or(core.created_by.as_deref()),
+        owner: core.owner_principal.as_deref(),
         launcher_groups: core.owner_groups.as_ref(),
         rerun: None,
         dispatch: crate::launches::model::DispatchPin {
@@ -549,12 +532,7 @@ pub(crate) async fn fire(
     .execute(&mut **tx)
     .await
     .map_err(|e| format!("{noun} reset failures: {e}"))?;
-    // Only a scope that actually binds secrets needs an owner snapshot: a row that launches
-    // nothing credentialed keeps firing exactly as it did before the registry.
-    let binds = scope_binds_secrets(&mut **tx, &core.playbook)
-        .await
-        .map_err(|e| format!("{noun} binding lookup: {e:#}"))?;
-    Ok(binds.then(|| owner_stale(core, now, owner_ttl)).flatten())
+    Ok(())
 }
 
 /// The `[dispatch]` pin of the draft version a draft-head firing launches. An adopted pack was
@@ -602,201 +580,6 @@ fn overlaid_params(
     })
 }
 
-/// Whether the playbook scope this row fires binds any secret.
-async fn scope_binds_secrets(ex: impl sqlx::PgExecutor<'_>, playbook: &str) -> Result<bool> {
-    let bound: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM secret_bindings WHERE scope_kind = $1 AND scope_id = $2",
-    )
-    .bind(crate::secrets::ScopeKind::Playbook.as_str())
-    .bind(playbook)
-    .fetch_one(ex)
-    .await
-    .context("count a playbook scope's bindings")?;
-    Ok(bound > 0)
-}
-
-/// The principal spelling a launch row stores. `playbook_launches.created_by` is a login, and the
-/// snapshot is a full principal, so the prefix comes off on the way in.
-pub(crate) fn strip_user_prefix(principal: &str) -> &str {
-    principal.strip_prefix("user:").unwrap_or(principal)
-}
-
-/// Why this firing's owner snapshot does not authorize a launch, or `None` when it does. A row
-/// saved before snapshots existed has none; one saved longer ago than `ttl` is past the staleness
-/// window the TTL bounds. Either way the firing parks and waits for an owner to re-save.
-fn owner_stale(core: &Standing, now: Timestamp, ttl: std::time::Duration) -> StaleOwner {
-    if core.owner_signin_required {
-        return Some("its owner has to sign in again".to_string());
-    }
-    let (Some(_), Some(at)) = (
-        core.owner_principal.as_deref(),
-        core.owner_groups_at.as_deref(),
-    ) else {
-        return Some("the row was saved before it recorded one".to_string());
-    };
-    let Ok(taken) = at.parse::<Timestamp>() else {
-        return Some(format!(
-            "its snapshot carries an unreadable timestamp {at:?}"
-        ));
-    };
-    let Ok(span) = jiff::SignedDuration::try_from(ttl) else {
-        return Some(format!("the configured TTL {ttl:?} is unusable"));
-    };
-    match taken.checked_add(span) {
-        Ok(expires) if expires > now => None,
-        _ => Some(format!("its snapshot was taken at {at}")),
-    }
-}
-
-/// What the fire-time refresh decided about one row that is about to fire.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum OwnerCheck {
-    /// Claim it. Either the refresh landed and the snapshot is now the issuer's live word, or there
-    /// was nothing to refresh and the snapshot stands on its own TTL.
-    Proceed,
-    /// The issuer could not be reached. Nothing is recorded and nothing counts toward auto-disable;
-    /// the row is left where it was and the next tick tries again.
-    Defer,
-}
-
-/// Re-read a row's owner groups from their offline credential before the trigger claims it.
-///
-/// Runs outside any transaction: the refresh takes its own per-subject lock, and a claim held
-/// across an issuer round trip would hold the row for the length of that call. A second sweep can
-/// take the row between this and the claim; that costs one wasted refresh and nothing else.
-///
-/// A successful refresh rewrites the row's own snapshot, which is what makes the launch
-/// authorization live rather than as-old-as-the-last-save. A definitive refusal (revoked, expired,
-/// no credential at all) records the reason and, once the snapshot is outside its TTL, marks the
-/// row as needing sign-in so the firing parks.
-pub(crate) async fn refresh_owner(
-    pool: &PgPool,
-    refresh: &crate::identity::oidc::credentials::OwnerRefresh,
-    id: &str,
-    now: Timestamp,
-    owner_ttl: std::time::Duration,
-) -> Result<OwnerCheck> {
-    use crate::identity::oidc::OidcError;
-    use crate::identity::oidc::credentials::RefreshOutcome;
-
-    let Some((owner_principal, binds_secrets)) = sqlx::query_as::<_, (Option<String>, bool)>(
-        "SELECT c.owner_principal,
-                EXISTS (SELECT 1 FROM secret_bindings b
-                        WHERE b.scope_kind = 'playbook' AND b.scope_id = c.playbook)
-         FROM playbook_standing_launches c WHERE c.id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await
-    .context("read the owner about to fire")?
-    else {
-        return Ok(OwnerCheck::Proceed);
-    };
-    if !binds_secrets {
-        return Ok(OwnerCheck::Proceed);
-    }
-    let Some(principal) = owner_principal.as_deref() else {
-        return Ok(OwnerCheck::Proceed);
-    };
-    if !principal.starts_with("user:") {
-        return Ok(OwnerCheck::Proceed);
-    }
-    let login = strip_user_prefix(principal);
-    let Some(sub) = crate::identity::oidc::users::sub_for_login(pool, login).await? else {
-        record_owner_refusal(
-            pool,
-            id,
-            &format!("{login} has never signed in through the issuer"),
-            now,
-            owner_ttl,
-        )
-        .await?;
-        return Ok(OwnerCheck::Proceed);
-    };
-    match refresh.refresh(&sub).await {
-        Ok(RefreshOutcome::Claims(claims)) => {
-            let groups = serde_json::to_value(&claims.groups).context("encode refreshed groups")?;
-            sqlx::query(
-                "UPDATE playbook_standing_launches
-                 SET owner_groups = $2, owner_groups_at = $3, owner_refresh_at = $3,
-                     owner_refresh_error = NULL, owner_signin_required = false
-                 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(groups)
-            .bind(now.to_string())
-            .execute(pool)
-            .await
-            .context("store the refreshed owner groups")?;
-            Ok(OwnerCheck::Proceed)
-        }
-        Ok(RefreshOutcome::Absent) => {
-            record_owner_refusal(
-                pool,
-                id,
-                &format!("{login} has no offline credential stored"),
-                now,
-                owner_ttl,
-            )
-            .await?;
-            Ok(OwnerCheck::Proceed)
-        }
-        Err(OidcError::Unavailable(why)) => {
-            tracing::warn!(standing = %id, error = %why, "standing: owner group refresh deferred");
-            sqlx::query(
-                "UPDATE playbook_standing_launches SET owner_refresh_error = $2, owner_refresh_at = $3
-                 WHERE id = $1",
-            )
-            .bind(id)
-            .bind(&why)
-            .bind(now.to_string())
-            .execute(pool)
-            .await
-            .context("note a deferred owner refresh")?;
-            Ok(OwnerCheck::Defer)
-        }
-        Err(OidcError::Rejected(why)) => {
-            record_owner_refusal(pool, id, &why, now, owner_ttl).await?;
-            Ok(OwnerCheck::Proceed)
-        }
-    }
-}
-
-/// Record a definitive refresh refusal. The snapshot is left alone: inside its TTL it is still the
-/// authorization the launch runs under, and only once it has aged out does the row need a sign-in.
-async fn record_owner_refusal(
-    pool: &PgPool,
-    id: &str,
-    why: &str,
-    now: Timestamp,
-    owner_ttl: std::time::Duration,
-) -> Result<()> {
-    let deadline = jiff::SignedDuration::try_from(owner_ttl)
-        .ok()
-        .and_then(|span| now.checked_sub(span).ok())
-        .map(|t| t.to_string());
-    // Inside the TTL the snapshot still stands; a NULL deadline (an unusable TTL) needs sign-in
-    // outright, and so does a row that never took a snapshot. A refusal only ever adds the demand:
-    // a revoke already set it deliberately, and nothing but a fresh credential takes it back off.
-    sqlx::query(
-        "UPDATE playbook_standing_launches
-         SET owner_refresh_error = $2, owner_refresh_at = $3,
-             owner_signin_required = owner_signin_required
-                                     OR $4::text IS NULL
-                                     OR owner_groups_at IS NULL
-                                     OR owner_groups_at <= $4
-         WHERE id = $1",
-    )
-    .bind(id)
-    .bind(why)
-    .bind(now.to_string())
-    .bind(deadline)
-    .execute(pool)
-    .await
-    .context("record an owner refresh refusal")?;
-    Ok(())
-}
-
 /// The owner principal and group snapshot a standing launch carries, for an update that must keep
 /// the row owned as it was.
 pub(crate) struct OwnerSnapshot {
@@ -813,40 +596,6 @@ pub(crate) async fn owner_snapshot(pool: &PgPool, id: &str) -> Result<Option<Own
     .await
     .context("read a standing launch's owner snapshot")
     .map(|row| row.map(|(principal, groups)| OwnerSnapshot { principal, groups }))
-}
-
-/// Clear the sign-in demand a failed refresh left on a user's rows. Signing in again stores a
-/// fresh credential, so the reason those rows were parked is gone.
-pub(crate) async fn clear_owner_signin(pool: &PgPool, login: &str) -> Result<()> {
-    let principal = format!("user:{}", login.trim().to_lowercase());
-    sqlx::query(
-        "UPDATE playbook_standing_launches
-         SET owner_signin_required = false, owner_refresh_error = NULL
-         WHERE owner_principal = $1 AND (owner_signin_required OR owner_refresh_error IS NOT NULL)",
-    )
-    .bind(&principal)
-    .execute(pool)
-    .await
-    .context("clear a signed-in owner's standing launches")?;
-    Ok(())
-}
-
-/// Mark every row a revoked credential leaves unauthorized. Revocation is deliberate, so the
-/// snapshot TTL does not get a say: the owner asked for those firings to stop.
-pub(crate) async fn require_owner_signin(pool: &PgPool, login: &str, why: &str) -> Result<u64> {
-    let principal = format!("user:{}", login.trim().to_lowercase());
-    let updated = sqlx::query(
-        "UPDATE playbook_standing_launches SET owner_signin_required = true, owner_refresh_error = $2
-         WHERE owner_principal = $1
-               AND EXISTS (SELECT 1 FROM secret_bindings b
-                           WHERE b.scope_kind = 'playbook' AND b.scope_id = playbook)",
-    )
-    .bind(&principal)
-    .bind(why)
-    .execute(pool)
-    .await
-    .context("park a revoking owner's standing launches")?;
-    Ok(updated.rows_affected())
 }
 
 /// Where a row's failure count landed after one more.
@@ -910,51 +659,6 @@ pub(crate) async fn record_failure(
         consecutive_failures,
         enabled,
     }))
-}
-
-/// Close the launches a standing row parked for a stale owner snapshot. A re-save re-owns the
-/// row, so the firings that could not launch under the old snapshot will never launch: they close
-/// rather than sit parked forever. Returns the keys closed.
-pub(crate) async fn expire_stale_owner_parks(
-    pool: &PgPool,
-    trigger: Trigger,
-    id: &str,
-) -> Result<Vec<String>> {
-    let now = crate::clock::now_rfc3339();
-    let prefix = ParkReason::OwnerStale {
-        trigger,
-        id: id.to_string(),
-        detail: String::new(),
-    }
-    .to_string();
-    let prefix = prefix.trim_end().to_string();
-    const EXPIRE: &str = "UPDATE issues SET status = 'done', parked_reason = NULL, parked_by = NULL, \
-         updated_at = $3 WHERE status = 'parked' AND parked_reason LIKE $1 || '%' AND key IN";
-    let sql = match trigger {
-        Trigger::Schedule => const_format::concatcp!(
-            EXPIRE,
-            " (SELECT key FROM playbook_launches WHERE dedupe_schedule = $2) RETURNING key"
-        ),
-        Trigger::Deferred => const_format::concatcp!(
-            EXPIRE,
-            " (SELECT fired_key FROM playbook_one_shots WHERE id = $2) RETURNING key"
-        ),
-        Trigger::Watch => const_format::concatcp!(
-            EXPIRE,
-            " (SELECT launch_key FROM playbook_watch_hits WHERE watch_id = $2) RETURNING key"
-        ),
-        Trigger::Webhook => const_format::concatcp!(
-            EXPIRE,
-            " (SELECT launch_key FROM playbook_webhook_keys WHERE webhook_id = $2) RETURNING key"
-        ),
-    };
-    sqlx::query_scalar(sql)
-        .bind(&prefix)
-        .bind(id)
-        .bind(&now)
-        .fetch_all(pool)
-        .await
-        .context("expire a standing launch's stale-owner parks")
 }
 
 /// An event a trigger records beside the launch's own, owned because the trigger builds it on a
@@ -1047,8 +751,7 @@ pub type TriggerFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output
 
 /// A trigger: the sidecar that knows when a core row is due, how to claim one firing of it, and
 /// what to write on the sidecar once the firing landed or failed. The generic [`sweep`] owns
-/// everything else: the pre-claim owner refresh, the fire builder, parking, failure accounting,
-/// and enqueueing.
+/// everything else: the fire builder, failure accounting, and enqueueing.
 pub trait LaunchTrigger: Send + Sync {
     fn trigger(&self) -> Trigger;
 
@@ -1110,46 +813,30 @@ pub trait LaunchTrigger: Send + Sync {
 #[derive(Debug, Clone, Copy)]
 pub struct SweepCfg {
     pub auto_disable_after: i64,
-    pub owner_ttl: std::time::Duration,
 }
 
 /// Fire everything one trigger has due at `now`. Returns the keys of the launches that may
-/// dispatch; a launch whose owner snapshot is stale is minted, parked, and left out.
+/// dispatch.
 ///
 /// A firing that fails is recorded against its core row and the sweep moves on to the next claim,
 /// skipping the rest of that row's claims this pass: one broken row must not starve the others,
 /// and at `auto_disable_after` consecutive failures it takes itself out of the rotation.
 ///
-/// `refresh` is the offline credential the owner's live groups are re-read through before a
-/// row's first claim of the pass; `None` leaves every firing on the stored snapshot alone.
 /// Core rows in `held` are left out of the pass.
 pub(crate) async fn sweep(
     db: &Db,
     trigger: &dyn LaunchTrigger,
     cfg: SweepCfg,
     now: Timestamp,
-    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
     policy: Option<&crate::authz::policy::ActivePolicy>,
     held: &[String],
 ) -> Result<Swept> {
     let kind = trigger.trigger();
     let mut fired = Vec::new();
     let mut claimed = 0;
-    let mut refreshed: BTreeSet<String> = BTreeSet::new();
     let mut skipped: BTreeSet<String> = BTreeSet::new();
     for mut claim in trigger.due(db, cfg, now, held).await? {
         if skipped.contains(&claim.id) {
-            continue;
-        }
-        // The owner's live groups are re-read BEFORE the row is claimed, outside any transaction:
-        // the refresh takes its own per-subject lock, and a claim held across an issuer round trip
-        // would hold the row for the length of that call.
-        if let Some(refresh) = refresh
-            && refreshed.insert(claim.id.clone())
-            && refresh_owner(db.pool(), refresh, &claim.id, now, cfg.owner_ttl).await?
-                == OwnerCheck::Defer
-        {
-            skipped.insert(claim.id.clone());
             continue;
         }
         let mut tx = db.pool().begin().await.context("sweep: begin")?;
@@ -1172,17 +859,7 @@ pub(crate) async fn sweep(
                 continue;
             }
         }
-        match fire_claim(
-            &mut tx,
-            db.pool(),
-            trigger,
-            &claim,
-            now,
-            cfg.owner_ttl,
-            policy,
-        )
-        .await
-        {
+        match fire_claim(&mut tx, db.pool(), trigger, &claim, now, policy).await {
             Ok(outcome) => {
                 tx.commit().await.context("sweep: commit")?;
                 for event in &outcome.events {
@@ -1194,26 +871,7 @@ pub(crate) async fn sweep(
                     standing = %claim.id,
                     "standing: firing launched"
                 );
-                // The launch row exists either way; a firing with no usable owner snapshot parks
-                // rather than dispatching under an authorization nobody can vouch for.
-                match outcome.stale {
-                    Some(detail) => {
-                        crate::issues::transitions::park(
-                            db.pool(),
-                            db.events(),
-                            &outcome.key,
-                            Status::New,
-                            &ParkReason::OwnerStale {
-                                trigger: kind,
-                                id: claim.id.clone(),
-                                detail,
-                            },
-                            ParkedBy::Machine,
-                        )
-                        .await?;
-                    }
-                    None => fired.push(outcome.key),
-                }
+                fired.push(outcome.key);
             }
             Err(error) => {
                 tx.rollback().await.context("sweep: rollback")?;
@@ -1268,7 +926,6 @@ pub(crate) struct Swept {
 
 struct Fired {
     key: String,
-    stale: StaleOwner,
     events: Vec<Recorded>,
 }
 
@@ -1280,7 +937,6 @@ async fn fire_claim(
     trigger: &dyn LaunchTrigger,
     claim: &Claim,
     now: Timestamp,
-    owner_ttl: std::time::Duration,
     policy: Option<&crate::authz::policy::ActivePolicy>,
 ) -> Result<Fired, FireError> {
     let kind = trigger.trigger();
@@ -1343,7 +999,7 @@ async fn fire_claim(
         }
         None => crate::playbooks::exposure::Extraction::Absent,
     };
-    let stale = fire(tx, &authorized, &firing, &exposure, &key, now, owner_ttl).await?;
+    fire(tx, &authorized, &firing, &exposure, &key, now).await?;
     let mut events = vec![Recorded {
         key: key.clone(),
         from: "new",
@@ -1363,7 +1019,7 @@ async fn fire_claim(
             .await
             .map_err(|e| format!("{noun} event: {e:#}"))?;
     }
-    Ok(Fired { key, stale, events })
+    Ok(Fired { key, events })
 }
 
 /// A sweep over a set of triggers, in order. The daemon runs two: the due-time triggers on the
@@ -1372,9 +1028,6 @@ pub struct TriggerSweep {
     db: Db,
     triggers: Vec<Arc<dyn LaunchTrigger>>,
     cfg: SweepCfg,
-    /// The offline credential the owner's live groups are re-read through. `None` — no issuer, no
-    /// mounted key — leaves every firing on the stored snapshot alone.
-    refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
     /// The policy set every firing is decided under. `None` only in harnesses that predate the
     /// decision.
     policy: Option<crate::authz::policy::ActivePolicy>,
@@ -1385,18 +1038,12 @@ impl TriggerSweep {
         db: Db,
         triggers: Vec<Arc<dyn LaunchTrigger>>,
         auto_disable_after: i64,
-        owner_ttl: std::time::Duration,
-        refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
         policy: Option<crate::authz::policy::ActivePolicy>,
     ) -> Self {
         TriggerSweep {
             db,
             triggers,
-            cfg: SweepCfg {
-                auto_disable_after,
-                owner_ttl,
-            },
-            refresh,
+            cfg: SweepCfg { auto_disable_after },
             policy,
         }
     }
@@ -1407,23 +1054,12 @@ impl TriggerSweep {
         let db = self.db.clone();
         let triggers = self.triggers.clone();
         let cfg = self.cfg;
-        let refresh = self.refresh.clone();
         let policy = self.policy.clone();
         Box::pin(async move {
             let now = Timestamp::now();
             let mut pass = Pass::default();
             for trigger in &triggers {
-                match sweep(
-                    &db,
-                    trigger.as_ref(),
-                    cfg,
-                    now,
-                    refresh.as_deref(),
-                    policy.as_ref(),
-                    &held,
-                )
-                .await
-                {
+                match sweep(&db, trigger.as_ref(), cfg, now, policy.as_ref(), &held).await {
                     Ok(swept) => {
                         for key in swept.fired {
                             queue.enqueue_urgent(IssueKey(key));
@@ -1660,7 +1296,6 @@ mod tests {
     fn cfg() -> SweepCfg {
         SweepCfg {
             auto_disable_after: 5,
-            owner_ttl: std::time::Duration::from_secs(3600),
         }
     }
 
@@ -1670,7 +1305,6 @@ mod tests {
             trigger,
             cfg(),
             Timestamp::now(),
-            None,
             None,
             &[],
         )
@@ -1880,8 +1514,6 @@ mod tests {
                 std::sync::Arc::new(Probe(Some(Ok(early)))),
             ],
             5,
-            std::time::Duration::from_secs(3600),
-            None,
             None,
         );
 

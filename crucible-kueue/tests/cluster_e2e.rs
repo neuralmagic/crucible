@@ -4,14 +4,16 @@
 //! Run with:
 //!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=<ns> \
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> cargo test --test cluster_e2e -- --ignored --nocapture
-//!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<user the tokens act as>
+//!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<person's user, in tenant mode only>
 //!   CRUCIBLE_KUEUE_E2E_KUBE_GROUPS=<comma-separated groups of that user, optional>
 //!   CRUCIBLE_KUEUE_E2E_MODE=crucible|tenant (default crucible)
-//! `crucible` serves crucible's defaults to run tokens carrying kube_user. `tenant` serves the
+//! `crucible` serves crucible's defaults to run tokens carrying the run's own identity
+//! (`crucible:run:<pod>` in Group `crucible:runs`). `tenant` serves the
 //! generic setup: a people issuer whose tokens name the user in preferred_username and groups in
 //! groups with no run claim, the tenant allowlist, rbac ownership and its own label domain.
 //! The namespace must carry the label Kueue's ClusterQueue selects on and hold the LocalQueue. The
-//! tokens act as CRUCIBLE_KUEUE_E2E_KUBE_USER, decided by SubjectAccessReview: it needs `use` on the
+//! tokens carry the run's own identity (`crucible:run:<pod>` in Group `crucible:runs`), decided by
+//! SubjectAccessReview: they need `use` on the
 //! LocalQueue and the workload verbs the tests exercise in the namespace, and the context's identity
 //! needs `create` on subjectaccessreviews.
 
@@ -103,33 +105,53 @@ fn env() -> Env {
     let var = |k: &str| {
         std::env::var(k).unwrap_or_else(|_| panic!("{k} must be set for the cluster e2e"))
     };
+    let mode = match std::env::var("CRUCIBLE_KUEUE_E2E_MODE").as_deref() {
+        Ok("tenant") => Mode::Tenant,
+        Ok("crucible") | Err(_) => Mode::Crucible,
+        Ok(other) => panic!("CRUCIBLE_KUEUE_E2E_MODE {other:?} is not crucible or tenant"),
+    };
     Env {
         context: var("CRUCIBLE_KUEUE_E2E_CONTEXT"),
         namespace: var("CRUCIBLE_KUEUE_E2E_NAMESPACE"),
         queue: var("CRUCIBLE_KUEUE_E2E_QUEUE"),
-        kube_user: var("CRUCIBLE_KUEUE_E2E_KUBE_USER"),
+        kube_user: match mode {
+            Mode::Tenant => var("CRUCIBLE_KUEUE_E2E_KUBE_USER"),
+            Mode::Crucible => std::env::var("CRUCIBLE_KUEUE_E2E_KUBE_USER").unwrap_or_default(),
+        },
         kube_groups: std::env::var("CRUCIBLE_KUEUE_E2E_KUBE_GROUPS")
             .unwrap_or_default()
             .split(',')
             .filter(|g| !g.is_empty())
             .map(str::to_string)
             .collect(),
-        mode: match std::env::var("CRUCIBLE_KUEUE_E2E_MODE").as_deref() {
-            Ok("tenant") => Mode::Tenant,
-            Ok("crucible") | Err(_) => Mode::Crucible,
-            Ok(other) => panic!("CRUCIBLE_KUEUE_E2E_MODE {other:?} is not crucible or tenant"),
-        },
+        mode,
     }
 }
 
 /// The server on loopback, trusting a loopback issuer whose run tokens [`submitter`] and
 /// [`viewer`] mint.
 async fn serve(env: &Env) -> String {
+    serve_namespaces(env, std::slice::from_ref(&env.namespace)).await
+}
+
+/// The server on loopback serving `namespaces`, which need not be only the e2e namespace.
+async fn serve_namespaces(env: &Env, namespaces: &[String]) -> String {
+    let callers = match env.mode {
+        Mode::Crucible => crucible_mcp_auth::principal::Callers::Runs,
+        Mode::Tenant => crucible_mcp_auth::principal::Callers::People,
+    };
+    serve_as(env, namespaces, callers).await
+}
+
+/// The server on loopback serving `namespaces`, trusting one issuer for `callers`.
+async fn serve_as(
+    env: &Env,
+    namespaces: &[String],
+    callers: crucible_mcp_auth::principal::Callers,
+) -> String {
     let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
     let mut rs = testing::config(jwks.url.clone());
-    if env.mode == Mode::Tenant {
-        rs.issuers[0].callers = crucible_mcp_auth::principal::Callers::People;
-    }
+    rs.issuers[0].callers = callers;
     let oidc = crucible_mcp_auth::server::ResourceServer::with_jwks(rs, |t| {
         crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
             .with_timing(Duration::from_secs(300), Duration::from_secs(1))
@@ -149,8 +171,10 @@ async fn serve(env: &Env) -> String {
         client.clone(),
         crucible_mcp_auth::kube::GroupSource::Token,
     ));
+    let mut config = env.config();
+    config.namespaces = namespaces.to_vec();
     let app = crucible_kueue::router(
-        client,
+        client.clone(),
         crucible_kueue::Options {
             oidc: Arc::new(oidc),
             policy: crucible_mcp_auth::policy::ToolPolicy::default(),
@@ -158,7 +182,7 @@ async fn serve(env: &Env) -> String {
             kueue: kueue_version,
             allowed_hosts: Vec::new(),
             kinds,
-            config: env.config(),
+            config,
         },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -180,10 +204,10 @@ fn token_claims(env: &Env, run: &str, scope: &str) -> Value {
     match env.mode {
         Mode::Crucible => {
             map.insert("run_id".into(), json!(run));
-            map.insert("kube_user".into(), json!(env.kube_user));
-            if !env.kube_groups.is_empty() {
-                map.insert("kube_groups".into(), json!(env.kube_groups));
-            }
+            map.insert("kube_user".into(), json!(format!("crucible:run:{run}")));
+            let mut groups = vec!["crucible:runs".to_string()];
+            groups.extend(env.kube_groups.iter().cloned());
+            map.insert("kube_groups".into(), json!(groups));
         }
         Mode::Tenant => {
             for key in ["run_id", "kube_user", "kube_groups", "role", "queues"] {
@@ -520,7 +544,7 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
     let me = call(&agent, "whoami", json!({})).await;
     assert_eq!(me["namespace"], env.namespace.as_str());
     assert_eq!(me["run_id"], env.run_id(&run).as_str());
-    assert_eq!(me["kube_user"], env.kube_user.as_str());
+    assert_eq!(me["kube_user"], format!("crucible:run:{run}"));
     assert!(
         me["submittable_kinds"]
             .as_array()
@@ -1318,7 +1342,9 @@ async fn the_profile_decides_tolerations_and_secrets_and_the_domain_labels_what_
     let pod = &mut manifest["spec"]["template"]["spec"];
     pod["tolerations"] =
         json!([{"key": "example.com/dedicated", "operator": "Exists", "effect": "NoSchedule"}]);
-    pod["containers"][0]["env"] = json!([{"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "e2e-token", "key": "t", "optional": true}}}]);
+    if env.mode == Mode::Tenant {
+        pod["containers"][0]["env"] = json!([{"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "e2e-token", "key": "t", "optional": true}}}]);
+    }
     let plan = call(
         &agent,
         "workload_plan",
@@ -1430,7 +1456,10 @@ async fn a_reader_without_pod_rbac_gets_the_status_without_pods() {
     )
     .await;
 
-    let user = format!("{run}-reader");
+    let user = match env.mode {
+        Mode::Crucible => format!("crucible:run:{run}-reader"),
+        Mode::Tenant => format!("{run}-reader"),
+    };
     let kube = kube_client(&env).await;
     let rule = |group: &str, resource: &str, verbs: &[&str]| PolicyRule {
         api_groups: Some(vec![group.into()]),
@@ -1570,7 +1599,10 @@ async fn a_submitter_without_node_rbac_discovers_the_queues_hardware() {
     let env = env();
     let run = unique("e2e-hw");
     let url = serve(&env).await;
-    let user = format!("{run}-submitter");
+    let user = match env.mode {
+        Mode::Crucible => format!("crucible:run:{run}-submitter"),
+        Mode::Tenant => format!("{run}-submitter"),
+    };
     let kube = kube_client(&env).await;
     let rule = |group: &str, resource: &str, verb: &str| PolicyRule {
         api_groups: Some(vec![group.into()]),
@@ -1654,4 +1686,184 @@ async fn a_submitter_without_node_rbac_discovers_the_queues_hardware() {
         .await
         .unwrap();
     roles.delete(&user, &DeleteParams::default()).await.unwrap();
+}
+
+/// A run's token is refused in a namespace its team owns until a RoleBinding grants the team's
+/// group, then allowed: entitlements are RoleBindings, nothing else.
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_run_token_needs_its_teams_rolebinding_in_a_team_namespace() {
+    use k8s_openapi::api::core::v1 as core;
+    use k8s_openapi::api::rbac::v1::{ClusterRole, RoleBinding, RoleRef, Subject};
+    use kube::api::{Api, DeleteParams, PostParams};
+
+    let env = env();
+    let kube = kube_client(&env).await;
+    let team_ns = format!("{}-team", env.namespace);
+    let namespace: Api<core::Namespace> = Api::all(kube.clone());
+    let _ = namespace.delete(&team_ns, &DeleteParams::default()).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while namespace.get_opt(&team_ns).await.unwrap().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{team_ns} is still terminating"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let shared = namespace.get(&env.namespace).await.unwrap();
+    namespace
+        .create(
+            &PostParams::default(),
+            &core::Namespace {
+                metadata: kube::api::ObjectMeta {
+                    name: Some(team_ns.clone()),
+                    labels: shared.metadata.labels,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (localqueues, _) = kube::discovery::oneshot::group(&kube, "kueue.x-k8s.io")
+        .await
+        .unwrap()
+        .recommended_kind("LocalQueue")
+        .unwrap();
+    let queue = Api::<kube::api::DynamicObject>::namespaced_with(
+        kube.clone(),
+        &env.namespace,
+        &localqueues,
+    )
+    .get(&env.queue)
+    .await
+    .unwrap();
+    let mut team_queue = kube::api::DynamicObject::new(&env.queue, &localqueues).within(&team_ns);
+    team_queue.data = json!({"spec": {"clusterQueue": queue.data["spec"]["clusterQueue"]}});
+    Api::<kube::api::DynamicObject>::namespaced_with(kube.clone(), &team_ns, &localqueues)
+        .create(&PostParams::default(), &team_queue)
+        .await
+        .unwrap();
+    let url = serve_namespaces(&env, &[env.namespace.clone(), team_ns.clone()]).await;
+    let run = unique("e2e-team");
+    let mut claims = token_claims(&env, &run, "kueue.read kueue.submit");
+    claims["namespace"] = json!(team_ns);
+    claims["kube_groups"] = json!(["crucible:runs", "crucible:team:e2e-team"]);
+    let token = testing::sign("a", &claims);
+    let agent = connect(&url, &token).await.unwrap();
+
+    let plan = call(
+        &agent,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": job(&run, "true")}),
+    )
+    .await;
+    assert_eq!(plan["status"], "refused", "{plan:#}");
+    assert!(
+        plan["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("queue-use")),
+        "the refusal names the check: {plan:#}"
+    );
+
+    let role: Api<ClusterRole> = Api::all(kube.clone());
+    let bindings: Api<RoleBinding> = Api::namespaced(kube.clone(), &team_ns);
+    let caller = format!("crucible-kueue-caller-{}", std::process::id());
+    role.create(
+        &PostParams::default(),
+        &ClusterRole {
+            metadata: kube::api::ObjectMeta {
+                name: Some(caller.clone()),
+                ..Default::default()
+            },
+            rules: Some(vec![
+                k8s_openapi::api::rbac::v1::PolicyRule {
+                    api_groups: Some(vec!["kueue.x-k8s.io".into()]),
+                    resources: Some(vec!["localqueues".into()]),
+                    verbs: vec!["get".into(), "list".into(), "use".into()],
+                    ..Default::default()
+                },
+                k8s_openapi::api::rbac::v1::PolicyRule {
+                    api_groups: Some(vec!["batch".into()]),
+                    resources: Some(vec!["jobs".into()]),
+                    verbs: vec!["create".into(), "get".into()],
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    bindings
+        .create(
+            &PostParams::default(),
+            &RoleBinding {
+                metadata: kube::api::ObjectMeta {
+                    name: Some("crucible-kueue-runs".into()),
+                    ..Default::default()
+                },
+                role_ref: RoleRef {
+                    api_group: "rbac.authorization.k8s.io".into(),
+                    kind: "ClusterRole".into(),
+                    name: caller.clone(),
+                },
+                subjects: Some(vec![Subject {
+                    kind: "Group".into(),
+                    name: "crucible:team:e2e-team".into(),
+                    ..Default::default()
+                }]),
+            },
+        )
+        .await
+        .unwrap();
+    let planned = call(
+        &agent,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": job(&run, "true")}),
+    )
+    .await;
+    assert_eq!(planned["status"], "ok", "{planned:#}");
+    assert!(planned["plan_hash"].is_string(), "{planned:#}");
+
+    bindings
+        .delete("crucible-kueue-runs", &DeleteParams::default())
+        .await
+        .unwrap();
+    role.delete(&caller, &DeleteParams::default())
+        .await
+        .unwrap();
+    let _ = namespace.delete(&team_ns, &DeleteParams::default()).await;
+}
+
+/// A person's token claiming a `crucible:` identity is refused.
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_person_token_claiming_a_crucible_identity_is_refused() {
+    let env = env();
+    let url = serve_as(
+        &env,
+        std::slice::from_ref(&env.namespace),
+        crucible_mcp_auth::principal::Callers::People,
+    )
+    .await;
+    let mut claims = testing::run_claims();
+    claims.as_object_mut().unwrap().remove("run_id");
+    claims["kube_user"] = json!("crucible:run:someone-elses-run");
+    claims["namespace"] = json!(env.namespace);
+    claims["scope"] = json!("kueue.read");
+    let smuggler = connect(&url, &testing::sign("a", &claims)).await.unwrap();
+    let refused = call(
+        &smuggler,
+        "queues_list",
+        json!({"namespace": env.namespace}),
+    )
+    .await;
+    assert_eq!(refused["status"], "refused", "{refused:#}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("reserved")),
+        "the refusal names the reserved prefix: {refused:#}"
+    );
 }

@@ -5,9 +5,6 @@ function row(over: Partial<WebhookRow> = {}): WebhookRow {
   return {
     enabled: true,
     consecutive_failures: 0,
-    owner_signin_required: false,
-    owner_refresh_error: null,
-    owner_refresh_at: null,
     last_delivery_at: null,
     ...over,
   };
@@ -26,22 +23,12 @@ describe('webhookView', () => {
     });
   });
 
-  it('puts a needed sign-in ahead of being paused', () => {
-    expect(webhookView(row({ owner_signin_required: true, enabled: false })).state).toBe('signin');
-  });
-
   it('says why it is paused', () => {
     const view = webhookView(row({ enabled: false, consecutive_failures: 3 }));
     expect(view.state).toBe('paused');
     expect(view.detail).toBe('Paused after 3 failed launches.');
     expect(webhookView(row({ enabled: false, consecutive_failures: 1 })).detail).toBe('Paused after 1 failed launch.');
     expect(webhookView(row({ enabled: false })).detail).toBe('Paused.');
-  });
-
-  it('surfaces a failing owner refresh', () => {
-    const view = webhookView(row({ owner_refresh_error: 'issuer said no', owner_refresh_at: null }));
-    expect(view).toMatchObject({ state: 'failing', headline: 'REFRESH FAILING' });
-    expect(view.detail).toContain('issuer said no');
   });
 });
 

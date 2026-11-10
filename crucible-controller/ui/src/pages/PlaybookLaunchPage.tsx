@@ -8,6 +8,7 @@ import {
   Breadcrumb,
   Button,
   Empty,
+  InfoTip,
   LoadingBlock,
   Mono,
   PageHeader,
@@ -27,6 +28,7 @@ import {
   TextField,
 } from './formControls';
 import { PlaybookParamFields } from './PlaybookParamFields';
+import { relativeTime } from './journeyView';
 import { PackDispatchNotice } from './PackDispatchNotice';
 import { DispatchTargetField } from './DispatchTargetField';
 import {
@@ -35,8 +37,11 @@ import {
   initialValues,
   launchBody,
   mapServerRejection,
+  optionSources,
   parseParamsSchema,
   previewMatches,
+  refreshBody,
+  refreshable,
   runSnapshot,
   scheduleBody,
   validateCronExpr,
@@ -187,7 +192,7 @@ export function PlaybookLaunchPage() {
   const checkField = (name: string) => {
     const spec = specs.find((s) => s.name === name);
     if (spec === undefined) return;
-    const message = validateParam(spec, values[name] ?? '');
+    const message = validateParam(spec, values[name] ?? '', values);
     setFieldErrors((previous) => {
       const next = new Map(previous);
       if (message === null) next.delete(name);
@@ -211,7 +216,7 @@ export function PlaybookLaunchPage() {
   const checkValues = (): boolean => {
     const clientErrors = new Map<string, string>();
     for (const spec of specs) {
-      const message = validateParam(spec, values[spec.name] ?? '');
+      const message = validateParam(spec, values[spec.name] ?? '', values);
       if (message !== null) clientErrors.set(spec.name, message);
     }
     setFieldErrors(clientErrors);
@@ -287,6 +292,26 @@ export function PlaybookLaunchPage() {
     }
   };
 
+  /// Launch only the tasks the form's options come from, with no params, so the next visit offers
+  /// fresh lists. The ceilings in the form bound it like any launch.
+  const handleRefresh = async () => {
+    setSubmitError(null);
+    const time = validateMaxTime(maxTime, timeCap);
+    if (time !== null) {
+      setCeilingErrors(new Map([['max_time', time]]));
+      return;
+    }
+    try {
+      const ack = await launch.mutateAsync({
+        params: { path: { id } },
+        body: refreshBody({ maxCost, maxTime, schemaDigest: pack?.schema_digest ?? '', dispatchTarget }),
+      });
+      void navigate(`/issues/${encodeURIComponent(ack.key)}`);
+    } catch (err: unknown) {
+      applyRejection(err);
+    }
+  };
+
   const handleSchedule = async () => {
     setSubmitError(null);
     setScheduled(null);
@@ -351,9 +376,29 @@ export function PlaybookLaunchPage() {
           title="Parameters"
           actions={
             pack === undefined ? undefined : (
-              <Mono size="data" tone="ink-3">
-                {pack.schema_digest}
-              </Mono>
+              <span className="flex items-center gap-3">
+                {refreshable(specs) ? (
+                  <>
+                    <InfoTip label="About the options">
+                      {optionSources(specs).map((source) => (
+                        <div key={source.task}>
+                          {source.task} · {source.passed ? (relativeTime(source.capturedAt) ?? 'run') : 'not run'}
+                        </div>
+                      ))}
+                    </InfoTip>
+                    <Button
+                      className="border border-rule-hard uppercase"
+                      onClick={() => void handleRefresh()}
+                      disabled={launch.isPending}
+                    >
+                      Refresh options
+                    </Button>
+                  </>
+                ) : null}
+                <Mono size="data" tone="ink-3">
+                  {pack.schema_digest}
+                </Mono>
+              </span>
             )
           }
         />
