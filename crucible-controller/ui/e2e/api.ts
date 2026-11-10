@@ -275,6 +275,12 @@ const ROUTE_GRAPH = {
   ],
 };
 
+/** A run from before the work-graph executor: the detail says it never admitted a plan, and the
+ * artifacts listing — db-backed, so exact — carries no flow.html. The page must settle both
+ * questions from what it already fetched; the graph and flow endpoints' 404s are the same
+ * answers, but console-noisy ones. */
+export const PLANLESS_RUN = 'RUN-0407';
+
 const TRIAGE_MD = [
   '# 1027: [RFC]: Checkpoint and restore RNG state so a resumed run reproduces the uninterrupted run',
   '',
@@ -325,6 +331,26 @@ const TRIAGE_LOG = {
 const RUN_DETAIL = {
   run: RUNS[0],
   candidates: [],
+  has_plan: true,
+};
+
+/** A run whose three iteration costs each round up on their own, so the raw cells miss the row
+ * total by a cent ($0.13 + $0.21 + $0.31 against $0.64): the cost table has to reconcile its
+ * line items to the total it prints beside them. */
+export const COST_DRIFT_RUN = 'RUN-0640';
+
+const COST_DRIFT_GRAPH = {
+  plan_version: 1,
+  tasks: [
+    { name: 'propose', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+  ],
+  fanout: [],
+  decisions: [],
+  results: [
+    { iter: 1, task: 'propose', status: 'pass', note: '', cost_usd: 0.1268564, secs: 20, links: [], repairs: [] },
+    { iter: 2, task: 'propose', status: 'pass', note: '', cost_usd: 0.2094645, secs: 30, links: [], repairs: [] },
+    { iter: 3, task: 'propose', status: 'pass', note: '', cost_usd: 0.3084733, secs: 45, links: [], repairs: [] },
+  ],
 };
 
 /** The compiled plan the preview surfaces draw: one of every card the graph has to say
@@ -732,15 +758,36 @@ export const ROUTES: Record<string, Json> = {
     files: [],
     running: false,
   },
-  [`/api/runs/${RETRY_RUN}`]: { run: { ...RUNS[0], run_id: RETRY_RUN }, candidates: [] },
+  [`/api/runs/${RETRY_RUN}`]: { run: { ...RUNS[0], run_id: RETRY_RUN }, candidates: [], has_plan: true },
   [`/api/runs/${RETRY_RUN}/iterations`]: [],
   [`/api/runs/${RETRY_RUN}/graph`]: RETRY_GRAPH,
-  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38, agent_provider: 'pricetag-glm', agent_model: 'glm-5.3' }, candidates: [] },
+  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38, agent_provider: 'pricetag-glm', agent_model: 'glm-5.3' }, candidates: [], has_plan: true },
   [`/api/runs/${TRIAGE_RUN}/iterations`]: [],
   [`/api/runs/${TRIAGE_RUN}/graph`]: TRIAGE_GRAPH,
-  [`/api/runs/${ROUTE_RUN}`]: { run: { ...RUNS[0], run_id: ROUTE_RUN }, candidates: [] },
+  [`/api/runs/${ROUTE_RUN}`]: { run: { ...RUNS[0], run_id: ROUTE_RUN }, candidates: [], has_plan: true },
   [`/api/runs/${ROUTE_RUN}/iterations`]: [],
   [`/api/runs/${ROUTE_RUN}/graph`]: ROUTE_GRAPH,
+  [`/api/runs/${PLANLESS_RUN}`]: {
+    run: { ...RUNS[1], run_id: PLANLESS_RUN, pod: null },
+    candidates: [],
+    has_plan: false,
+  },
+  [`/api/runs/${PLANLESS_RUN}/iterations`]: [],
+  [`/api/runs/${PLANLESS_RUN}/artifacts`]: {
+    run_id: PLANLESS_RUN,
+    entries: [{ path: 'session.jsonl', size_bytes: 2048 }],
+  },
+  [`/api/runs/${COST_DRIFT_RUN}`]: {
+    run: { ...RUNS[1], run_id: COST_DRIFT_RUN, pod: null, status: 'succeeded', cost_usd: 0.6447942 },
+    candidates: [],
+    has_plan: true,
+  },
+  [`/api/runs/${COST_DRIFT_RUN}/iterations`]: [],
+  [`/api/runs/${COST_DRIFT_RUN}/graph`]: COST_DRIFT_GRAPH,
+  [`/api/runs/${COST_DRIFT_RUN}/artifacts`]: {
+    run_id: COST_DRIFT_RUN,
+    entries: [],
+  },
   [`/api/runs/${TRIAGE_RUN}/log`]: TRIAGE_LOG,
   [`/api/runs/${TRIAGE_RUN}/tasks/triage[1027]/evidence`]: TRIAGE_EVIDENCE,
   [`/api/runs/${TRIAGE_RUN}/tasks/scan/evidence`]: SCAN_EVIDENCE,
@@ -1316,8 +1363,12 @@ export async function stubApi(page: Page): Promise<void> {
       // fixture map is keyed by the path the endpoint answers on.
       const path = decodeURIComponent(new URL(route.request().url()).pathname);
 
-      if (path === '/api/events') {
-        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: '' });
+      // The real stream stays open and quiet; a finite body would EOF and EventSource would
+      // reconnect every few seconds, with every reopen invalidating the live queries and making
+      // the design baselines nondeterministic. A day-long retry holds that off for a test's
+      // lifetime, which is the same quiet-open the real endpoint gives.
+      if (path === '/api/events/stream') {
+        return route.fulfill({ status: 200, contentType: 'text/event-stream', body: 'retry: 86400000\n\n' });
       }
       // Acting as a team: whoami answers for the team the header names, and a team the caller
       // does not hold is refused with the marker the client recovers from.

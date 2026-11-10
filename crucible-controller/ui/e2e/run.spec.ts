@@ -1,5 +1,12 @@
 import { expect, test, type Page } from '@playwright/test';
-import { RETRY_RUN, ROUTE_RUN, stubApi, TRIAGE_RUN } from './api';
+import {
+  COST_DRIFT_RUN,
+  PLANLESS_RUN,
+  RETRY_RUN,
+  ROUTE_RUN,
+  stubApi,
+  TRIAGE_RUN,
+} from './api';
 
 const RUN = '/runs/RUN-0412';
 
@@ -531,5 +538,84 @@ test.describe('external results', () => {
     const graph = page.getByTestId('workflow-graph');
     await expect(graph.locator('[data-node-links="read"]')).toHaveCount(0);
     await expect(graph.locator('[data-node-links="file"]')).toHaveCount(0);
+  });
+});
+
+test.describe('a plan-less run', () => {
+  /// Every run from before the work-graph executor: the detail says it never admitted a plan and
+  /// the artifacts listing carries no flow.html. The page answers both from what it already
+  /// fetched — the graph and flow endpoints' 404s are the same answers, but console-noisy ones,
+  /// so neither may be requested at all.
+  test('draws its score surface without probing the graph or flow endpoints', async ({ page }) => {
+    await stubApi(page);
+    // Registered after the stub, so these win: the real controller's answers, planted to make a
+    // probe loud in the console rather than silently absorbed.
+    for (const suffix of ['graph', 'artifacts/flow.html']) {
+      await page.route(`**/api/runs/${PLANLESS_RUN}/${suffix}`, (route) =>
+        route.fulfill({ status: 404, body: 'not there' }),
+      );
+    }
+    const consoleErrors: string[] = [];
+    page.on('console', (message) => {
+      if (message.type() === 'error') consoleErrors.push(message.text());
+    });
+    const probes: string[] = [];
+    page.on('request', (request) => {
+      const url = request.url();
+      if (url.endsWith(`/api/runs/${PLANLESS_RUN}/graph`) || url.endsWith(`/${PLANLESS_RUN}/artifacts/flow.html`)) {
+        probes.push(url);
+      }
+    });
+
+    await ready(page, `/runs/${PLANLESS_RUN}`);
+
+    await expect(page.getByTestId('workflow-graph')).toHaveCount(0);
+    await expect(page.getByText('No visual report for this run.')).toBeVisible();
+    await expect(page.getByText('No measured iterations to chart.')).toBeVisible();
+    expect(probes, 'the page asked an endpoint it could have answered locally').toEqual([]);
+    expect(consoleErrors, 'console errors on a plan-less run').toEqual([]);
+  });
+});
+
+test.describe('a run whose iteration costs drift under rounding', () => {
+  /// Each of the three iteration costs rounds up on its own, so the raw cells miss the row total
+  /// by a cent ($0.13 + $0.21 + $0.31 against $0.64). The table prints line items that reach
+  /// the total beside them, and the run total under them.
+  test('reconciles cost line items with the total they report', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(COST_DRIFT_RUN)}`);
+
+    const section = page.locator('section[data-ui="section"]', {
+      has: page.locator('[data-ui="section-header"]', { hasText: 'Cost' }),
+    });
+    const row = section.getByRole('row', { name: /propose/ });
+    await expect(row).toBeVisible();
+    await expect(row.locator('td')).toHaveText(['propose', '$0.12', '$0.21', '$0.31', '$0.64', '']);
+    await expect(section.getByText('run total $0.64')).toBeVisible();
+  });
+});
+
+test.describe('the cost table beside the artifacts table', () => {
+  /// The section's border-r divides the cost table from the artifacts table beside it; the
+  /// table's own right edge would paint a second line against it. Below the wide breakpoint the
+  /// panels stack, the section drops its border, and the table's edge returns.
+  test('draws one rule between the cost and artifacts tables', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(COST_DRIFT_RUN)}`);
+
+    const section = page.locator('section[data-ui="section"]', {
+      has: page.locator('[data-ui="section-header"]', { hasText: 'Cost' }),
+    });
+    const shareHeader = section.getByRole('columnheader', { name: 'Share' });
+    await expect(shareHeader).toHaveCSS('border-right-width', '0px');
+    await expect(section.getByRole('row', { name: /propose/ }).locator('td').last()).toHaveCSS(
+      'border-right-width',
+      '0px',
+    );
+    await expect(section).toHaveCSS('border-right-width', '1px');
+
+    await page.setViewportSize({ width: 900, height: 1000 });
+    await expect(shareHeader).toHaveCSS('border-right-width', '1px');
+    await expect(section).toHaveCSS('border-right-width', '0px');
   });
 });

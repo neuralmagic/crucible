@@ -110,6 +110,19 @@ pub(crate) async fn latest_run_plan(
     }))
 }
 
+/// Whether the run ever admitted a plan — the run page's probe-free answer to "is there a graph".
+#[tracing::instrument(name = "db.has_run_plan", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
+pub(crate) async fn has_run_plan(ex: impl PgExecutor<'_>, run_id: &str) -> Result<bool> {
+    let row = sqlx::query!(
+        r#"SELECT EXISTS(SELECT 1 FROM run_plans WHERE run_id = $1) AS "has!: bool""#,
+        run_id,
+    )
+    .fetch_one(ex)
+    .await
+    .context("has_run_plan")?;
+    Ok(row.has)
+}
+
 /// Every task attempt the run recorded, oldest iteration first.
 #[tracing::instrument(name = "db.list_task_results", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run_id), err)]
 pub(crate) async fn list_task_results(

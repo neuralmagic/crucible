@@ -9,6 +9,7 @@ import {
   fetchRunFile,
   fetchRunFileBlob,
 } from '../api/client';
+import { useRunGraph } from '../api/useRunGraph';
 import { flowEnrichedMessage, validTraceId } from './flowEnriched';
 import { MarkdownView } from './MarkdownView';
 import { flowThemeStyle, injectFlowTheme } from './flowTheme';
@@ -68,11 +69,11 @@ import {
 } from './runReport';
 import { runStatusColor } from './runStatus';
 import { runLabel } from './runLabel';
-import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
+import { buildCostBreakdown, iterDisplayCosts, type TaskCostRow } from './costBreakdown';
 import { RunTaskGraph, type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
 import { RunTaskGrid } from './RunTaskGrid';
-import { logBody, logPath, logSectionNote } from './taskEvidenceView';
+import { EngineLogSection } from './EngineLogSection';
 import { planOrder } from './runGrid';
 import { absoluteTime, relativeTime } from './journeyView';
 import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView';
@@ -121,21 +122,42 @@ export function RunDetailPage() {
   const isPlaybook = runId.startsWith('playbook_');
 
   const agentTools = useAgentTools() === true;
-  const runDetail = $api.useQuery('get', '/api/runs/{run_id}', {
-    params: { path: { run_id: runId } },
-  });
+  // While the engine runs the run's own row moves: status, cost, and `has_plan` — the local
+  // executor folds the session-so-far, so `has_plan` can flip mid-run and turn the graph panels on.
+  const runDetail = $api.useQuery(
+    'get',
+    '/api/runs/{run_id}',
+    { params: { path: { run_id: runId } } },
+    { refetchInterval: (query) => (query.state.data?.run.status === 'running' ? 5000 : false) },
+  );
   const iterations = $api.useQuery(
     'get',
     '/api/runs/{run_id}/iterations',
     { params: { path: { run_id: runId } } },
     { enabled: !isPlaybook },
   );
-  // Same key FlowSection uses, so this costs no extra fetch. The score curve and iterations
-  // table only render when the run has no flow report — the report subsumes both (all that's
-  // lost is inline diff hunks, still served at artifacts/diffs/iter-N.patch).
+  // The artifact listing is the exact record of what the run published — same key ArtifactsPanel
+  // uses, so this costs no extra fetch. db:// and local prefixes are walked, so a listing without
+  // flow.html settles the flow section without the fetch, whose 404 is the same answer but a
+  // console-noisy one; an s3 prefix always lists the derived names, so s3-backed runs keep
+  // probing, and so does a listing that outright failed. The score curve and iterations table
+  // only render when the run has no flow report — the report subsumes both (all that's lost is
+  // inline diff hunks, still served at artifacts/diffs/iter-N.patch).
   const isLiveRun = runDetail.data?.run.status === 'running';
-  const flowProbe = useFlowArtifact(runId, runDetail.data !== undefined && !isLiveRun && !isPlaybook);
-  const flowAbsent = isLiveRun || flowProbe.isError || flowProbe.data === null;
+  const artifacts = $api.useQuery('get', '/api/runs/{run_id}/artifacts', {
+    params: { path: { run_id: runId } },
+  });
+  const flowListed = artifacts.isError
+    ? true
+    : artifacts.data === undefined
+      ? null
+      : artifactEntries(artifacts.data).some((e) => e.path === 'flow.html');
+  const flowProbe = useFlowArtifact(
+    runId,
+    runDetail.data !== undefined && !isLiveRun && !isPlaybook && flowListed === true,
+  );
+  const flowAbsent =
+    isLiveRun || flowListed === false || flowProbe.isError || flowProbe.data === null;
   const launchKeyOfRun = runDetail.data?.run.issue_key ?? '';
   const launch = $api.useQuery(
     'get',
@@ -297,7 +319,7 @@ export function RunDetailPage() {
 
       <EngineLogSection runId={runId} live={isLiveRun} />
 
-      {!isPlaybook && !isLiveRun && <FlowSection runId={runId} />}
+      {!isPlaybook && !isLiveRun && <FlowSection runId={runId} listed={flowListed} />}
 
       {!isPlaybook && flowAbsent && (
         <ScoreSection
@@ -382,9 +404,11 @@ function useFlowArtifact(runId: string, enabled: boolean) {
 // The engine publishes a self-contained flow.html (time-proportional swimlane of the run) next to
 // summary.json on keep. It renders in a sandboxed iframe: srcDoc + sandbox keep it opaque-origin,
 // so its inline scripts run without access to controller cookies or the API. Runs published before
-// the flow report existed have no flow.html; that is a normal state, not an error.
-function FlowSection({ runId }: { runId: string }) {
-  const flow = useFlowArtifact(runId, true);
+// the flow report existed have no flow.html; that is a normal state, not an error. `listed` is the
+// artifacts listing's verdict on that: `null` while it loads, `false` renders the quiet message
+// without ever fetching.
+function FlowSection({ runId, listed }: { runId: string; listed: boolean | null }) {
+  const flow = useFlowArtifact(runId, listed === true);
 
   // Span enrichment: the trace id is user-supplied (it isn't recorded at ingest yet), and both
   // inputs are immutable, so a fetched render never goes stale.
@@ -400,7 +424,11 @@ function FlowSection({ runId }: { runId: string }) {
   const theme = useAppTheme();
   const brand = useAppBrand();
 
-  if (flow.isPending) {
+  // The fetched report, or null while it is unfetched — a disabled query's `data` is undefined,
+  // which must read as "no report" everywhere below, never as a string in hand.
+  const html = flow.data ?? null;
+
+  if (flow.isPending && listed !== false) {
     return (
       <Section>
         <SectionHeader title="Flow" />
@@ -414,7 +442,7 @@ function FlowSection({ runId }: { runId: string }) {
   // error without parsing `crucible fetch` stderr (artifacts.rs declines to). Old runs are the
   // common case, so any failure degrades to the same quiet message; the controller logs the
   // fetch failure server-side.
-  if (flow.isError || flow.data === null) {
+  if (listed === false || flow.isError || html === null) {
     return (
       <Section>
         <SectionHeader title="Flow" />
@@ -443,7 +471,7 @@ function FlowSection({ runId }: { runId: string }) {
   // Read the SPA's tokens now, after the toggle has repainted <html>.
   const tokens = getComputedStyle(document.documentElement);
   const themedHtml = injectFlowTheme(
-    enrichedHtml ?? flow.data,
+    enrichedHtml ?? html,
     flowThemeStyle(theme, (token) => tokens.getPropertyValue(token)),
   );
 
@@ -523,7 +551,7 @@ const AXIS_L = 54;
 const AXIS_R = 18;
 const AXIS_T = 16;
 const AXIS_B = 30;
-const PLOT_W = CHART_W - AXIS_L - AXIS_R;
+const plotWidth = (chartWidth: number) => chartWidth - AXIS_L - AXIS_R;
 const PLOT_H = CHART_H - AXIS_T - AXIS_B;
 const TICKS = 5;
 
@@ -544,19 +572,34 @@ interface RunChart {
   label: string;
 }
 
-/// Every measured candidate plotted with a bigger metric value higher, the baseline measurement
-/// seeding the band, and the trail walking best-so-far in the gate's improving direction.
-function buildRunChart(candidates: Candidate[], lowerIsBetter: boolean): RunChart | null {
-  const measured: { iter: number; score: number; tone: DecisionTone }[] = [];
+/// The candidates that carry a score — the chart's existence question, answerable before its
+/// width is known.
+function scoredCandidates(
+  candidates: Candidate[],
+): { iter: number; score: number; tone: DecisionTone }[] {
+  const scored: { iter: number; score: number; tone: DecisionTone }[] = [];
   for (const c of candidates) {
     const score = c.score;
     if (score === null || score === undefined) continue;
-    measured.push({
+    scored.push({
       iter: c.iter ?? 0,
       score,
       tone: isBaseline(c) ? 'baseline' : decisionTone(c.decision),
     });
   }
+  return scored;
+}
+
+/// Every measured candidate plotted with a bigger metric value higher, the baseline measurement
+/// seeding the band, and the trail walking best-so-far in the gate's improving direction. The
+/// geometry is laid out at `width` viewBox units — the width the section renders — so a unit is
+/// a pixel and no glyph stretches.
+function buildRunChart(
+  candidates: Candidate[],
+  lowerIsBetter: boolean,
+  width: number,
+): RunChart | null {
+  const measured = scoredCandidates(candidates);
   if (measured.length === 0) return null;
 
   const scores = measured.map((m) => m.score);
@@ -569,8 +612,9 @@ function buildRunChart(candidates: Candidate[], lowerIsBetter: boolean): RunChar
   const digits = rawHi - rawLo < 10 ? 1 : 0;
 
   const yOf = (v: number) => AXIS_T + ((hi - v) / span) * PLOT_H;
+  const plotW = plotWidth(width);
   const xOf = (i: number) =>
-    measured.length === 1 ? AXIS_L + PLOT_W / 2 : AXIS_L + (i / (measured.length - 1)) * PLOT_W;
+    measured.length === 1 ? AXIS_L + plotW / 2 : AXIS_L + (i / (measured.length - 1)) * plotW;
 
   const marks: ChartMark[] = measured.map((m, i) => ({
     x: xOf(i),
@@ -619,7 +663,7 @@ function ScoreSection({
   pending: boolean;
   lowerIsBetter: boolean;
 }) {
-  const chart = pending ? null : buildRunChart(candidates, lowerIsBetter);
+  const chartable = scoredCandidates(candidates).length > 0;
   return (
     <Section>
       <SectionHeader
@@ -630,14 +674,14 @@ function ScoreSection({
         <SectionBody>
           <Spinner label="Loading iterations" />
         </SectionBody>
-      ) : chart === null ? (
+      ) : !chartable ? (
         <SectionBody>
           <Mono tone="ink-3">No measured iterations to chart.</Mono>
         </SectionBody>
       ) : (
         <>
           <SectionBody padded={false} className="px-4.5 pt-3.5 pb-1">
-            <ScoreChart chart={chart} />
+            <ScoreChart candidates={candidates} lowerIsBetter={lowerIsBetter} />
           </SectionBody>
           <div className="flex gap-4.5 bg-surface px-4.5 pb-3 font-mono text-label uppercase tracking-label text-ink-3">
             <span className="flex items-center gap-1.5">
@@ -670,19 +714,39 @@ const MARK_CLASS: Record<DecisionTone, string> = {
   neutral: 'fill-ink-2',
 };
 
-function ScoreChart({ chart }: { chart: RunChart }) {
+/// The curve drawn at the width the section gives it. Every coordinate is a viewBox unit, so a
+/// viewBox wider than the rendered box stretches each glyph under `preserveAspectRatio="none"`;
+/// measured to the box, a unit is a pixel and nothing distorts. `CHART_W` stands in until the
+/// observer's first answer, which arrives before the first paint.
+function ScoreChart({ candidates, lowerIsBetter }: { candidates: Candidate[]; lowerIsBetter: boolean }) {
+  const holder = useRef<HTMLDivElement | null>(null);
+  const [width, setWidth] = useState(CHART_W);
+  useEffect(() => {
+    const element = holder.current;
+    if (element === null) return;
+    const observer = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (w !== undefined) setWidth(w);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+  const chart = buildRunChart(candidates, lowerIsBetter, width);
+  if (chart === null) return null;
+  const plotW = plotWidth(width);
   return (
-    <svg
-      viewBox={`0 0 ${CHART_W} ${CHART_H}`}
-      preserveAspectRatio="none"
-      className="block h-[260px] w-full"
-      role="img"
-      aria-label={chart.label}
-    >
+    <div ref={holder}>
+      <svg
+        viewBox={`0 0 ${width} ${CHART_H}`}
+        preserveAspectRatio="none"
+        className="block h-[260px] w-full"
+        role="img"
+        aria-label={chart.label}
+      >
       <rect
         x={AXIS_L}
         y={AXIS_T}
-        width={PLOT_W}
+        width={plotW}
         height={PLOT_H}
         className="fill-none stroke-rule-hard"
         strokeWidth={1}
@@ -692,7 +756,7 @@ function ScoreChart({ chart }: { chart: RunChart }) {
           key={tick.label}
           x1={AXIS_L}
           y1={tick.y}
-          x2={AXIS_L + PLOT_W}
+          x2={AXIS_L + plotW}
           y2={tick.y}
           className="stroke-rule"
           strokeWidth={1}
@@ -703,14 +767,14 @@ function ScoreChart({ chart }: { chart: RunChart }) {
           <line
             x1={AXIS_L}
             y1={chart.baseline.y}
-            x2={AXIS_L + PLOT_W}
+            x2={AXIS_L + plotW}
             y2={chart.baseline.y}
             className="stroke-ink-3"
             strokeWidth={1}
             strokeDasharray="4 3"
           />
           <text
-            x={AXIS_L + PLOT_W - 6}
+            x={AXIS_L + plotW - 6}
             y={chart.baseline.y - 6}
             textAnchor="end"
             className="fill-ink-3 font-mono text-micro uppercase tracking-group"
@@ -771,7 +835,8 @@ function ScoreChart({ chart }: { chart: RunChart }) {
           {mark.iter}
         </text>
       ))}
-    </svg>
+      </svg>
+    </div>
   );
 }
 
@@ -1014,12 +1079,7 @@ const costHelper = createDataColumnHelper<TaskCostRow>();
 /// task recorded a nonzero cost — otherwise there is nothing to break down and the section is
 /// simply absent (same quiet treatment as the task graph itself).
 function CostSection({ runId, runCost }: { runId: string; runCost: number | null | undefined }) {
-  const query = $api.useQuery(
-    'get',
-    '/api/runs/{run_id}/graph',
-    { params: { path: { run_id: runId } } },
-    { retry: 2 },
-  );
+  const query = useRunGraph(runId);
   const graph: RunGraph | undefined = query.data;
 
   const breakdown = useMemo(
@@ -1045,7 +1105,7 @@ function CostSection({ runId, runCost }: { runId: string; runCost: number | null
               id: `iter-${i}`,
               header: `iter ${i}`,
               meta: { align: 'end', shrink: true, className: 'font-mono text-data' },
-              cell: ({ row }) => formatCost(row.original.byIter.get(i)),
+              cell: ({ row }) => formatCost(iterDisplayCosts(row.original).get(i)),
             }),
           )
         : []),
@@ -1058,7 +1118,14 @@ function CostSection({ runId, runCost }: { runId: string; runCost: number | null
       costHelper.display({
         id: 'share',
         header: 'Share',
-        meta: { width: '30%' },
+        meta: {
+          width: '30%',
+          // The section's border-r is the divider to the panel beside it; the cell's own
+          // border-r would paint a second line against it. Below the wide breakpoint the
+          // section drops its border, so the table's edge returns.
+          className: 'border-r-0 max-wide:border-r',
+          headerClassName: 'border-r-0 max-wide:border-r',
+        },
         cell: ({ row }) => (
           <span
             className="block h-2 bg-green"
@@ -1206,7 +1273,10 @@ function ArtifactsPanel({ runId }: { runId: string }) {
 
   return (
     <Section>
-      <SectionHeader title="Artifacts" note={`${entries.length} files`} />
+      <SectionHeader
+        title="Artifacts"
+        note={entries.length === 1 ? '1 file' : `${entries.length} files`}
+      />
       <DataTable
         table={table}
         renderSubRow={(row) => {
@@ -1247,50 +1317,6 @@ function CopyLinkButton({ route, className }: { route: RunFileRoute; className?:
   );
 }
 
-/// The run's engine output on the run page itself, refreshed while the run is still working: the
-/// supervised subprocess for a local run, the work pod's output for a pod run. A run whose output
-/// this deployment cannot reach says where it lives instead.
-function EngineLogSection({ runId, live }: { runId: string; live: boolean }) {
-  const log = $api.useQuery(
-    'get',
-    '/api/runs/{run_id}/log',
-    { params: { path: { run_id: runId } } },
-    { retry: false, refetchInterval: live ? 5_000 : false },
-  );
-  if (log.isPending) {
-    return (
-      <Section>
-        <SectionHeader title="Engine log" />
-        <SectionBody>
-          <Spinner label="Loading the engine log" />
-        </SectionBody>
-      </Section>
-    );
-  }
-  if (log.isError) {
-    return (
-      <Section>
-        <SectionHeader title="Engine log" />
-        <SectionBody>
-          <Mono tone="ink-3">The engine log could not be loaded: {formatError(log.error)}</Mono>
-        </SectionBody>
-      </Section>
-    );
-  }
-  return (
-    <Section>
-      <SectionHeader title="Engine log" note={logSectionNote(log.data)} />
-      <SectionBody className="flex h-[24rem] flex-col overflow-hidden">
-        {logPath(log.data) === null ? (
-          <Mono tone="ink-3">{logBody(log.data)}</Mono>
-        ) : (
-          <LogView text={logBody(log.data)} testId="run-engine-log" />
-        )}
-      </SectionBody>
-    </Section>
-  );
-}
-
 function FilesPanel({
   runId,
   launchKey,
@@ -1307,12 +1333,7 @@ function FilesPanel({
     { params: { path: { run_id: runId } } },
     { retry: 2 },
   );
-  const graph = $api.useQuery(
-    'get',
-    '/api/runs/{run_id}/graph',
-    { params: { path: { run_id: runId } } },
-    { retry: 2 },
-  );
+  const graph = useRunGraph(runId);
   // A file captured from a task that did not pass is evidence of the failure, and must not read
   // as the output of a task that succeeded.
   const failed = useMemo(() => {
