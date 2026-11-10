@@ -72,5 +72,10 @@ percent-encoding = "2"
 # CEL for MCP tool policy, at the controller's pin.
 cel = { git = "https://github.com/cel-rust/cel-rust", rev = "92f4376e200124e8dbafe5323a69cbe6bc3765c6" }
 
+[profile.dev]
+# Line tables keep backtraces with file:line while skipping the var/type info
+# that dominates debuginfo codegen and link time.
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 2
