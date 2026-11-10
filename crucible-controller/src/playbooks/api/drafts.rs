@@ -262,6 +262,17 @@ impl DraftCompileDto {
             dispatch,
         }
     }
+
+    pub(crate) async fn with_choices(
+        mut self,
+        pool: &sqlx::PgPool,
+        id: &str,
+    ) -> anyhow::Result<Self> {
+        if let Some(schema) = &self.params_schema {
+            self.params_schema = Some(crate::playbooks::choices::attach(pool, id, schema).await?.0);
+        }
+        Ok(self)
+    }
 }
 
 dto! {
@@ -589,9 +600,12 @@ pub(crate) async fn get_playbook_draft_preview(
     }
     let catalog = crate::images::store::list_images(state.db.pool()).await?;
     match crate::playbooks::drafts::preview(state.db.pool(), &id, query.version).await? {
-        Some(saved) => {
-            Ok(Json(DraftCompileDto::from_saved(saved, &state, &catalog)).into_response())
-        }
+        Some(saved) => Ok(Json(
+            DraftCompileDto::from_saved(saved, &state, &catalog)
+                .with_choices(state.db.pool(), &id)
+                .await?,
+        )
+        .into_response()),
         None => Ok(not_found(format!("no draft {id:?} at that version"))),
     }
 }
@@ -773,7 +787,13 @@ pub(crate) async fn save_playbook_draft(
     )
     .await
     {
-        Ok(saved) => Json(DraftCompileDto::from_saved(saved, &state, &catalog)).into_response(),
+        Ok(saved) => match DraftCompileDto::from_saved(saved, &state, &catalog)
+            .with_choices(state.db.pool(), &id)
+            .await
+        {
+            Ok(dto) => Json(dto).into_response(),
+            Err(e) => ApiError::from(e).into_response(),
+        },
         Err(e) => draft_refusal(e),
     }
 }
