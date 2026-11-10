@@ -217,10 +217,12 @@ kube_authz = "openshift"
             .unwrap(),
         ],
         audiences: vec![Audience {
+            server: "kueue".to_string(),
             resource: RESOURCE.to_string(),
             cluster: "dev".to_string(),
             scopes: vec!["kueue.read".into(), "kueue.submit".into()],
             namespaces: Vec::new(),
+            remote: true,
         }],
     };
     let jwks_uri = Url::parse(&format!("{}/keys", cluster::spire())).unwrap();

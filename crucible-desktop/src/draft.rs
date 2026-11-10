@@ -9,9 +9,20 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crucible_contract::pack_tree::walk_dir;
+use rune::Waker;
 use serde::{Deserialize, Serialize};
+use tokio::runtime::Handle;
+use tokio::sync::watch;
+
+use crate::pack::PackFiles;
+use crate::preview::Preview;
+
+/// How often a watched working copy is re-read for edits made in the editor.
+const REREAD: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Working {
@@ -158,11 +169,249 @@ impl Working {
     }
 }
 
+/// A working copy as last read from disk: its files, whether they are edited, and how they
+/// compile.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WorkingCopy {
+    pub working: Working,
+    pub pack: PackFiles,
+    pub preview: Preview,
+    pub edited: bool,
+}
+
+impl WorkingCopy {
+    /// Read `draft`'s working copy under `root`, when there is one. `before` is the last read:
+    /// its compile is kept while the files are the same, and it is returned as is when nothing
+    /// moved. Blocking: it reads every file and may compile the pack.
+    fn read(
+        root: &Path,
+        draft: &str,
+        before: Option<Arc<WorkingCopy>>,
+    ) -> Option<Arc<WorkingCopy>> {
+        let working = Working::open(root, draft)?;
+        let edited = working.edited();
+        let pack = PackFiles {
+            origin: format!(
+                "working copy of draft {} at version {}{}",
+                working.draft,
+                working.base,
+                if edited { ", edited" } else { "" }
+            ),
+            ..PackFiles::read_dir(&working.dir)
+        };
+        let preview = match &before {
+            Some(before)
+                if before.working.dir == working.dir && before.pack.files == pack.files =>
+            {
+                before.preview.clone()
+            }
+            _ => crate::preview::compile(&working.dir),
+        };
+        let copy = WorkingCopy {
+            working,
+            pack,
+            preview,
+            edited,
+        };
+        match before {
+            Some(before) if *before == copy => Some(before),
+            _ => Some(Arc::new(copy)),
+        }
+    }
+}
+
+type Published = Arc<Mutex<(u64, Option<Arc<WorkingCopy>>, Option<Waker>)>>;
+
+/// Keeps one draft's working copy read, on the shared runtime. Dropping it ends the task.
+pub struct Watcher {
+    /// The draft to read, and a count that moves to ask for a read now.
+    want: watch::Sender<(Option<String>, u64)>,
+    published: Published,
+}
+
+impl Watcher {
+    /// Read working copies under `root`. With no runtime or no root, nothing is ever read.
+    pub fn start(runtime: Result<Handle, String>, root: Option<PathBuf>) -> Watcher {
+        let (want, wanted) = watch::channel((None, 0));
+        let published = Published::default();
+        if let (Ok(runtime), Some(root)) = (runtime, root) {
+            runtime.spawn(watch_copy(root, wanted, Arc::clone(&published)));
+        }
+        Watcher { want, published }
+    }
+
+    pub fn set_waker(&self, waker: Waker) {
+        if let Ok(mut published) = self.published.lock() {
+            published.2 = Some(waker);
+        }
+    }
+
+    /// Read `draft`'s working copy from now on; `None` stops.
+    pub fn watch(&self, draft: Option<&str>) {
+        self.want.send_modify(|(wanted, asks)| {
+            *wanted = draft.map(str::to_string);
+            *asks += 1;
+        });
+    }
+
+    /// Read the watched copy again now.
+    pub fn reread(&self) {
+        self.want.send_modify(|(_, asks)| *asks += 1);
+    }
+
+    pub fn take(&self, seen: u64) -> Option<(u64, Option<Arc<WorkingCopy>>)> {
+        let published = self.published.lock().ok()?;
+        (published.0 > seen).then(|| (published.0, published.1.clone()))
+    }
+}
+
+async fn watch_copy(
+    root: PathBuf,
+    mut wanted: watch::Receiver<(Option<String>, u64)>,
+    published: Published,
+) {
+    let mut last: Option<Arc<WorkingCopy>> = None;
+    loop {
+        let (draft, _) = wanted.borrow_and_update().clone();
+        let next = match draft {
+            Some(draft) => {
+                let (root, before) = (root.clone(), last.clone());
+                tokio::task::spawn_blocking(move || WorkingCopy::read(&root, &draft, before))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            None => None,
+        };
+        let same = match (&last, &next) {
+            (Some(last), Some(next)) => Arc::ptr_eq(last, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            last = next;
+            let waker = match published.lock() {
+                Ok(mut published) => {
+                    published.0 += 1;
+                    published.1 = last.clone();
+                    published.2.clone()
+                }
+                Err(_) => return,
+            };
+            if let Some(waker) = waker {
+                waker();
+            }
+        }
+        tokio::select! {
+            changed = wanted.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(REREAD) => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
-    use crate::draft::{Working, read};
+    use crate::draft::{Watcher, Working, WorkingCopy, read};
+
+    /// The first publish after `seen` that `ready` accepts, within ten seconds.
+    fn published(
+        watcher: &Watcher,
+        seen: &mut u64,
+        ready: impl Fn(&Option<Arc<WorkingCopy>>) -> bool,
+    ) -> Option<Arc<WorkingCopy>> {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some((version, copy)) = watcher.take(*seen) {
+                *seen = version;
+                if ready(&copy) {
+                    return copy;
+                }
+            }
+            assert!(Instant::now() < until, "no such read was published");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_watched_copy_is_read_off_the_callers_thread_and_follows_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let written = Working::write(root.path(), "triage-me", 4, &pack()).unwrap();
+        Working::write(root.path(), "other", 1, &pack()).unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let watcher = Watcher::start(net.handle(), Some(root.path().to_path_buf()));
+        let mut seen = 0;
+        assert!(watcher.take(seen).is_none(), "nothing is read until asked");
+
+        watcher.watch(Some("triage-me"));
+        let first = published(&watcher, &mut seen, Option::is_some).unwrap();
+        assert_eq!(first.working, written);
+        assert!(!first.edited);
+        assert_eq!(first.pack.files.len(), 3);
+        assert!(
+            first.pack.origin.ends_with("at version 4"),
+            "{}",
+            first.pack.origin
+        );
+
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            watcher.take(seen).is_none(),
+            "an unchanged copy is not published again"
+        );
+
+        std::fs::write(written.dir.join("workflow.star"), "x = 2\n").unwrap();
+        let edited = published(&watcher, &mut seen, |c| {
+            c.as_ref().is_some_and(|c| c.edited)
+        });
+        let edited = edited.unwrap();
+        assert!(edited.pack.origin.ends_with(", edited"));
+        assert_eq!(
+            edited.pack.file("workflow.star").unwrap().text.as_deref(),
+            Some("x = 2\n")
+        );
+
+        watcher.watch(Some("other"));
+        let other = published(&watcher, &mut seen, |c| {
+            c.as_ref().is_some_and(|c| c.working.draft == "other")
+        });
+        assert!(!other.unwrap().edited);
+
+        watcher.watch(Some("never-pulled"));
+        assert!(published(&watcher, &mut seen, Option::is_none).is_none());
+    }
+
+    #[test]
+    fn a_reread_picks_up_a_save_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut working = Working::write(root.path(), "triage-me", 4, &pack()).unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let watcher = Watcher::start(net.handle(), Some(root.path().to_path_buf()));
+        let mut seen = 0;
+        watcher.watch(Some("triage-me"));
+        published(&watcher, &mut seen, Option::is_some);
+
+        let (_, digest) = read(&working.dir).unwrap();
+        working.saved(root.path(), 5, digest).unwrap();
+        let asked = Instant::now();
+        watcher.reread();
+        let saved = published(&watcher, &mut seen, |c| {
+            c.as_ref().is_some_and(|c| c.working.base == 5)
+        });
+        assert!(
+            asked.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            asked.elapsed()
+        );
+        assert!(saved.unwrap().pack.origin.ends_with("at version 5"));
+    }
 
     fn pack() -> BTreeMap<String, String> {
         BTreeMap::from([
@@ -212,7 +461,7 @@ mod tests {
             root.path(),
             "triage-me",
             2,
-            &BTreeMap::from([("crucible.toml".to_string(), "".to_string())]),
+            &BTreeMap::from([("crucible.toml".to_string(), String::new())]),
         )
         .unwrap();
         assert!(!again.dir.join("stray.txt").exists());

@@ -32,9 +32,7 @@ scan = skill(
 check = command(
     name = "check",
     run = "python3 check_workflow.py",
-    depends_on = [scan],
-    over = scan.workflows,
-    max_fanout = 64,
+    over = each(scan.workflows, max = 64),
     isolated = True,
     required = False,
     emits = ["unpinned", "checked"],

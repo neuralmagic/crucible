@@ -7,19 +7,41 @@
 //!   POST /auth/native/token {code, code_verifier} ──▶ key ──▶ the profile's key file
 //! ```
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
+use tokio::runtime::Handle;
 
 use crate::profile::Target;
 
 /// How long the browser has to come back.
 const WAIT: Duration = Duration::from_secs(300);
 const NAME: &str = "Crucible Playbooks";
+/// The longest request line the listener reads.
+const REQUEST_LINE: u64 = 8 * 1024;
+
+/// Stops a sign-in that is waiting on the browser, when dropped.
+pub struct Cancel(Arc<AtomicBool>);
+
+impl Cancel {
+    /// A handle for the window, and the flag the waiting sign-in reads.
+    pub fn new() -> (Cancel, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        (Cancel(Arc::clone(&stop)), stop)
+    }
+}
+
+impl Drop for Cancel {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
 
 /// A PKCE verifier and its S256 challenge.
 pub struct Pkce {
@@ -60,7 +82,8 @@ pub enum Callback {
     Code(String),
     /// The browser came back without a code: the person denied, or the controller refused.
     Refused(String),
-    /// Something else asked the listener, such as the browser's favicon.
+    /// Something else asked the listener, such as the browser's favicon, or a callback that is
+    /// not this sign-in's. The listener keeps waiting.
     Other,
 }
 
@@ -75,7 +98,7 @@ pub fn parse_callback(request_line: &str, state: &str) -> Callback {
             .into_owned()
             .collect();
     if params.get("state").map(String::as_str) != Some(state) {
-        return Callback::Refused("the browser answered a different sign-in".into());
+        return Callback::Other;
     }
     match (params.get("code"), params.get("error")) {
         (Some(code), None) if !code.is_empty() => Callback::Code(code.clone()),
@@ -90,7 +113,8 @@ pub fn parse_callback(request_line: &str, state: &str) -> Callback {
 fn answer(stream: &mut TcpStream, status: &str, message: &str) {
     let body = format!(
         "<!doctype html><meta charset=\"utf-8\"><title>{NAME}</title>\
-         <body style=\"font:15px system-ui;margin:4rem auto;max-width:32rem\"><p>{message}</p>"
+         <body style=\"font:15px system-ui;margin:4rem auto;max-width:32rem\"><p>{}</p>",
+        escaped(message)
     );
     let _ = write!(
         stream,
@@ -100,13 +124,25 @@ fn answer(stream: &mut TcpStream, status: &str, message: &str) {
     );
 }
 
-/// Wait on `listener` until the browser brings back a code for `state`, or `WAIT` passes.
-fn await_code(listener: &TcpListener, state: &str) -> Result<String, String> {
+/// `text` as HTML text.
+fn escaped(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Wait on `listener` until the browser brings back a code for `state`, `WAIT` passes, or `stop`
+/// is set.
+fn await_code(listener: &TcpListener, state: &str, stop: &AtomicBool) -> Result<String, String> {
     listener
         .set_nonblocking(true)
         .map_err(|e| format!("listening for the browser: {e}"))?;
     let until = Instant::now() + WAIT;
     while Instant::now() < until {
+        if stop.load(Ordering::Relaxed) {
+            return Err("the sign-in was cancelled".into());
+        }
         let mut stream = match listener.accept() {
             Ok((stream, _)) => stream,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -118,7 +154,7 @@ fn await_code(listener: &TcpListener, state: &str) -> Result<String, String> {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
         let mut line = String::new();
-        let _ = BufReader::new(&stream).read_line(&mut line);
+        let _ = BufReader::new((&stream).take(REQUEST_LINE)).read_line(&mut line);
         match parse_callback(&line, state) {
             Callback::Code(code) => {
                 answer(
@@ -144,7 +180,14 @@ struct Issued {
 }
 
 /// Trade the code for a key at `target`, the way its other requests go.
-fn redeem(target: &Target, code: &str, verifier: &str, port: u16) -> Result<String, String> {
+fn redeem(
+    target: &Target,
+    runtime: Result<Handle, String>,
+    code: &str,
+    verifier: &str,
+    port: u16,
+) -> Result<String, String> {
+    let runtime = runtime?;
     let config = crux::config::Config {
         url: target.url(),
         auth: crux::config::Auth::None,
@@ -152,24 +195,25 @@ fn redeem(target: &Target, code: &str, verifier: &str, port: u16) -> Result<Stri
     let wire = crux::client::HttpTransport::with_client(&config, target.http()?)
         .map_err(|e| format!("{e:#}"))?;
     let client = crux::Client::new(std::sync::Arc::new(wire));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| format!("starting the sign-in client: {e}"))?;
     let body = serde_json::json!({
         "code": code,
         "code_verifier": verifier,
         "redirect_uri": redirect_uri(port),
     });
-    let issued: Issued = runtime
-        .block_on(client.post("/auth/native/token", Some(&body)))
-        .map_err(|e| format!("{e:#}"))?;
+    let issued: Issued = runtime.block_on(crate::net::within(
+        "the sign-in",
+        client.post("/auth/native/token", Some(&body)),
+    ))?;
     Ok(issued.key)
 }
 
 /// Sign in to `target`'s controller through the browser, and keep the key where the profile keeps
-/// it. Blocks until the browser comes back.
-pub fn sign_in(target: &Target) -> Result<(), String> {
+/// it. Blocks until the browser comes back or `stop` is set, so not for a thread of `runtime`.
+pub fn sign_in(
+    target: &Target,
+    runtime: Result<Handle, String>,
+    stop: &AtomicBool,
+) -> Result<(), String> {
     let base = target.url();
     let listener =
         TcpListener::bind("127.0.0.1:0").map_err(|e| format!("listening for the browser: {e}"))?;
@@ -180,8 +224,8 @@ pub fn sign_in(target: &Target) -> Result<(), String> {
     let pkce = Pkce::new();
     let state = URL_SAFE_NO_PAD.encode(rand::random::<[u8; 16]>());
     crate::editor::open_url(&authorize_url(&base, port, &state, &pkce.challenge))?;
-    let code = await_code(&listener, &state)?;
-    let key = redeem(target, &code, &pkce.verifier, port)?;
+    let code = await_code(&listener, &state, stop)?;
+    let key = redeem(target, runtime, &code, &pkce.verifier, port)?;
     target.save_key(key)
 }
 
@@ -190,7 +234,79 @@ mod tests {
     use base64::Engine;
     use sha2::Digest;
 
-    use crate::signin::{Callback, Pkce, authorize_url, parse_callback};
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    use crate::signin::{
+        Callback, Cancel, Pkce, authorize_url, await_code, escaped, parse_callback,
+    };
+
+    /// What the listener at `port` answers `GET path`.
+    fn get(port: u16, path: &str) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        write!(stream, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n").unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).unwrap();
+        answer
+    }
+
+    #[test]
+    fn the_listener_waits_through_strays_for_its_own_callback() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (_cancel, stop) = Cancel::new();
+        let waiting = std::thread::spawn(move || await_code(&listener, "s1", &stop));
+
+        assert!(get(port, "/favicon.ico").starts_with("HTTP/1.1 404"));
+        assert!(get(port, "/callback?code=evil&state=guess").starts_with("HTTP/1.1 404"));
+        assert!(!waiting.is_finished(), "neither ends the sign-in");
+
+        let answer = get(port, "/callback?code=abc&state=s1");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(waiting.join().unwrap(), Ok("abc".to_string()));
+    }
+
+    #[test]
+    fn a_refusal_is_shown_as_text_and_ends_the_sign_in() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (_cancel, stop) = Cancel::new();
+        let waiting = std::thread::spawn(move || await_code(&listener, "s1", &stop));
+        let answer = get(
+            port,
+            "/callback?state=s1&error=%3Cscript%3Ealert(1)%3C/script%3E",
+        );
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+        assert!(
+            answer.contains("&lt;script&gt;alert(1)&lt;/script&gt;"),
+            "{answer}"
+        );
+        assert!(!answer.contains("<script>"));
+        assert!(waiting.join().unwrap().is_err());
+        assert_eq!(escaped("a<b & \"c\""), "a&lt;b &amp; &quot;c&quot;");
+    }
+
+    #[test]
+    fn dropping_the_cancel_handle_stops_the_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let (cancel, stop) = Cancel::new();
+        let waiting = std::thread::spawn(move || await_code(&listener, "s1", &stop));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!waiting.is_finished());
+        let dropped = Instant::now();
+        drop(cancel);
+        assert_eq!(
+            waiting.join().unwrap(),
+            Err("the sign-in was cancelled".to_string())
+        );
+        assert!(dropped.elapsed() < Duration::from_secs(1));
+        let (cancel, stop) = Cancel::new();
+        assert!(!stop.load(Ordering::Relaxed));
+        drop(cancel);
+        assert!(stop.load(Ordering::Relaxed));
+    }
 
     #[test]
     fn the_challenge_is_the_verifiers_s256() {
@@ -221,10 +337,11 @@ mod tests {
             parse_callback("GET /favicon.ico HTTP/1.1", "s1"),
             Callback::Other
         );
-        assert!(matches!(
+        assert_eq!(
             parse_callback("GET /callback?code=abc&state=other HTTP/1.1", "s1"),
-            Callback::Refused(_)
-        ));
+            Callback::Other,
+            "a callback for another sign-in is not this one's answer"
+        );
         assert_eq!(
             parse_callback("GET /callback?error=access_denied&state=s1 HTTP/1.1", "s1"),
             Callback::Refused("the sign-in was denied in the browser".into())

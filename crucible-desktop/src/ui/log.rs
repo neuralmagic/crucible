@@ -40,7 +40,10 @@ pub(crate) fn log_pane(
     };
     let query = app.log_search.text.trim().to_ascii_lowercase();
     let in_scope = |line: &&LogLine| {
-        app.log_task.as_deref().is_none_or(|task| line.is_for(task))
+        app.run
+            .log_task
+            .as_deref()
+            .is_none_or(|task| line.is_for(task))
             && (query.is_empty() || line.raw.to_ascii_lowercase().contains(&query))
     };
     let scoped: Vec<&LogLine> = log.iter().filter(in_scope).collect();
@@ -63,7 +66,7 @@ pub(crate) fn log_pane(
         .px(10.0)
         .py(8.0)
         .scroll(ScrollSpec {
-            stick_bottom: app.log_task.is_none() && query.is_empty() && mode == LogMode::Stream,
+            stick_bottom: app.run.log_task.is_none() && query.is_empty() && mode == LogMode::Stream,
         })
         .scroll_edge_fade(8.0);
     if matched.is_empty() {
@@ -81,7 +84,7 @@ pub(crate) fn log_pane(
     match mode {
         LogMode::Stream => {
             for line in matched.iter().skip(matched.len().saturating_sub(SHOWN)) {
-                lines = lines.child(line_row(line, style, app.log_task.is_some(), p));
+                lines = lines.child(line_row(line, style, app.run.log_task.is_some(), p));
             }
         }
         LogMode::ByTask => {
@@ -171,7 +174,7 @@ impl Blocks<'_> {
 
     /// A running task shows its tail, a failed one opens, the rest fold.
     fn fold(&self, block: &Block) -> Fold {
-        if let Some(open) = self.app.log_folds.get(&block.name) {
+        if let Some(open) = self.app.run.log_folds.get(&block.name) {
             return if *open { Fold::Open } else { Fold::Folded };
         }
         match self.state(&block.name) {
@@ -240,7 +243,7 @@ impl Blocks<'_> {
             .hover(p.c.hover)
             .focusable(true)
             .on_press(move |app: &mut App| {
-                app.log_folds.insert(name.clone(), !open);
+                app.run.log_folds.insert(name.clone(), !open);
             })
             .child(
                 icon(
@@ -346,7 +349,7 @@ fn views(scoped: &[&LogLine], app: &App, p: &Paint) -> El {
 
 fn scope_row(app: &App, p: &Paint) -> El {
     let mut bar = row().w_full().gap(6.0).center_y();
-    if let Some(task) = &app.log_task {
+    if let Some(task) = &app.run.log_task {
         bar = bar.child(
             row()
                 .key("log-task")

@@ -9,7 +9,7 @@ use crate::ui::{Paint, Tone, flag, tag};
 use crate::{App, Selection};
 
 pub(crate) fn page(app: &App, p: &Paint) -> El {
-    let note = match &app.admin.schedules {
+    let note = match &app.remote.admin.schedules {
         Some(Ok(list)) => {
             let on = list.iter().filter(|s| s.enabled).count();
             format!("{} \u{b7} {on} enabled", list.len())
@@ -17,7 +17,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         _ => String::new(),
     };
     let page = frame("schedules", "Schedules", note, None, app, p);
-    let schedules = match landed(&app.admin.schedules, "the schedules", p) {
+    let schedules = match landed(&app.remote.admin.schedules, "the schedules", p) {
         Err(standin) => return page.child(*standin),
         Ok(schedules) => schedules,
     };
@@ -49,7 +49,7 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
     let switch = Switch::new(enabled)
         .label(format!("{} enabled", schedule.playbook))
         .hide_label()
-        .disabled(app.desk.busy())
+        .disabled(app.remote.desk.busy())
         .on_toggle(move |app: &mut App| {
             app.act(Action::Enable {
                 schedule: Box::new(toggled.clone()),
@@ -88,7 +88,8 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
         ));
     }
 
-    let mut when = vec![schedule.cron_expr.clone()];
+    let mut when =
+        vec![crate::cron::words(&schedule.cron_expr).unwrap_or_else(|| schedule.cron_expr.clone())];
     if !schedule.tz.is_empty() && schedule.tz != "UTC" {
         when.push(schedule.tz.clone());
     }
@@ -117,7 +118,7 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
     let editing = schedule.clone();
     let edit = Button::new("Edit")
         .variant(ButtonVariant::GhostMuted)
-        .disabled(app.desk.busy())
+        .disabled(app.remote.desk.busy())
         .on_press(move |app: &mut App| app.edit_schedule(&editing))
         .build(p.k)
         .key(format!("schedule-edit-{}", schedule.id));
@@ -133,7 +134,8 @@ fn schedule_row(schedule: &crux::dto::Schedule, app: &App, now: i64, p: &Paint) 
                 text(when.join(" \u{b7} "))
                     .font(p.mono(12.0, 420.0))
                     .color(p.c.text_muted)
-                    .truncate(),
+                    .truncate()
+                    .help(schedule.cron_expr.clone()),
             ),
         )
         .child(

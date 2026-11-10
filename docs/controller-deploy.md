@@ -230,6 +230,31 @@ Supervisors of runs that get agent servers mount the SPIFFE Workload API (the `c
 driver) at `/spiffe-workload-api/spire-agent.sock`; `[cluster] sandbox_spiffe_socket` names another
 path. Runs without agent servers mount none, so a cluster without SPIRE still starts sandboxes.
 
+Task tokens (the tokens a pack's `command` and `evaluate` tasks get for `[workflow] servers`) need
+no SPIRE: the engine exchanges the run's pod token for them. Where the cluster has SPIRE, set
+`[cluster] loop_svid = true` to also require the loop pod's own JWT-SVID, so a pod token copied
+out of the pod mints nothing. The loop pod then mounts the Workload API socket through
+`csi.spiffe.io` at the same path, which the loop namespace's pod security must admit, and the
+cluster needs a ClusterSPIFFEID for loop pods:
+
+```yaml
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: crucible-loop
+spec:
+  jwtTtl: 5m
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: <loop namespace>
+  podSelector:
+    matchLabels:
+      crucible.io/work-kind: run
+  spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/crucible/run/{{ .PodMeta.Name }}'
+```
+
+The controller refuses a task token whose SVID names another pod or another cluster's SPIRE.
+
 With `[cluster] aws_sandbox_role_arn`, the gateway pod assumes that role with an STS-audienced
 token for its own service account, as the in-pod gateway does with the loop pod's, so the role's
 trust policy must allow `system:serviceaccount:<sandbox namespace>:crucible-openshell-gateway`.

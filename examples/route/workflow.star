@@ -3,7 +3,7 @@ read = command(name = "read", run = "./read.sh", emits = ["ticket"])
 gate = route(
     name = "gate",
     depends_on = [read],
-    min_confidence = 0.8,
+    decider = model(min_confidence = 0.8),
     questions = {
         "bucket": choice(
             ask = "Which queue owns this ticket?",
@@ -20,18 +20,16 @@ gate = route(
     },
 )
 
-page = command(name = "page", run = "./act.sh page", depends_on = [gate], when = gate.urgent)
+page = command(name = "page", run = "./act.sh page", when = gate.urgent)
 
-oncall = command(name = "oncall", run = "./act.sh oncall", depends_on = [gate], when = gate.bucket, answers = "outage")
+oncall = command(name = "oncall", run = "./act.sh oncall", when = gate.bucket.any_of("outage"))
 
-finance = command(name = "finance", run = "./act.sh finance", depends_on = [gate], when = gate.bucket, answers = "billing")
+finance = command(name = "finance", run = "./act.sh finance", when = gate.bucket.any_of("billing"))
 
 backlog = command(
     name = "backlog",
     run = "./act.sh backlog",
-    depends_on = [gate],
-    when = gate.bucket,
-    otherwise = True,
+    when = gate.bucket.otherwise(),
 )
 
 filed = command(

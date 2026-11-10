@@ -81,8 +81,11 @@ A tunnel (or, for a loopback profile, the local controller) starts the first tim
 used, unless something already answers at its proxy or URL, and the profile waits until it does.
 It runs under the app's own binary (`crucible-playbooks --keep`) as a supervisor, which kills the
 tunnel's process group when the app's end of a pipe closes, so it stops with the app however the
-app stops, crash included. A profile that fails to read is shown with why in Settings and left as
-written in the file.
+app stops, crash included. A tunnel that stops after it has answered is started again, after 2s
+and then twice as long each time up to a minute; one that never answered is left stopped, with
+`Retry` on its profile in Settings. A profile that fails to read is shown with why in Settings and
+left as written in the file. A `config.toml` that does not read as a whole is shown the same way,
+and nothing is saved over it until it reads.
 
 With no working credential, the sidebar offers `Sign in with browser`: the app opens the
 controller's `/auth/native` page, you sign in and approve, and the controller hands the app a
@@ -92,20 +95,29 @@ controller's `/auth/native` page, you sign in and approve, and the controller ha
 browser cannot reach, paste a `crk_` key instead. Keys can be revoked in the controller's Settings
 like any other key.
 
+Settings' `Keys in keychain` switch (`keychain = true` in the config) keeps those keys in the
+system credential store instead: the macOS Keychain, or the Secret Service on Linux, under the
+service `crucible-playbooks` and the profile's name. Turning it on or off moves the keys kept so
+far. The app is ad-hoc signed, so macOS asks for the login password once per profile after each
+new build. Removing a profile drops its key, and renaming one keeps it.
+
 The account row at the bottom of the sidebar names the user `crux whoami` reports for that
 credential (its tooltip adds the role and endpoint), so the list can be read against the principal
 it came from.
 
 The same sidebar narrows the launches: a search over name, status, creator, agent and origin; an
 owner switch (`All` / `Just mine`, matched against the `whoami` user); an origin switch (`All` /
-`Schedules` / `Drafts`); and a landing window (`All` / `1h` / `24h` / `7d`). Each row carries
-the launch's status, its origin and how long ago it landed; the title's tooltip adds the launch key,
+`Schedules` / `Drafts`); and a landing window (`All` / `1h` / `24h` / `7d`). The three switches
+open from the button beside the search field, which is highlighted while any of them narrows the
+list. Each row carries the launch's origin, its status unless it is done, and how long ago it
+landed; the title's tooltip adds the launch key,
 the run count and the landing stamp.
 
 The list is each playbook's newest launch the filters keep, running first. Selecting a playbook
 with one launch opens it. A playbook with more than one opens its runs page: the pass rate, spend
-and last run, every launch as a dot on a time axis, twelve weeks of days coloured by how they
-ended, and the full list. Picking a launch there pins it until it leaves the controller's
+and last run, every launch as a dot on a time axis that runs from the first launch to the last,
+up to twelve weeks of days coloured by the share of launches that failed, and the full list,
+which says why a launch failed when the controller gave a reason. Times and days are local. Picking a launch there pins it until it leaves the controller's
 200-launch window; the breadcrumb goes back. The detail shows the launch's newest run (from
 `crux playbook-run`): the launch status, spend against its cap, who launched it and why it stopped,
 plus the task graph from `crux graph` with each task's latest status. Every fetch has a hard deadline; the live
@@ -263,10 +275,19 @@ all of them passed, the run is shown as valid.
 
 ## Nothing blocks the window
 
-Two worker threads, one per backend. The local worker owns discovery, log reads, `try_wait` and
-spawning the engine; the live worker owns every `crux` call. Each publishes an immutable snapshot
-into a shared slot and wakes the UI. `poll` takes whichever snapshot version moved and returns; no
-frame ever waits on a disk, a child, a subprocess or the network. While a local run is live the
+The local worker owns discovery, log reads, `try_wait` and spawning the engine. Everything that
+talks to a controller shares one tokio runtime, one response cache and one connection per profile
+(`src/net.rs`), and runs as tasks on it: the live, admin, finder and fleet loops, each session
+stream, and the reader of a draft's working copy. A launch, a save, a launch form's reads and a
+file fetch each run as a task of their own, so none waits behind a slow poll, and reads that do
+not depend on each other go out together. Anything that blocks (the response cache's queries,
+opening a connection, reading and compiling a working copy) runs on the runtime's blocking pool.
+Each publishes into a shared snapshot and wakes the UI. `poll` takes whichever snapshot version
+moved and returns; no frame waits on a disk read of a pack, a child, a subprocess or the network.
+A task ends when the handle the window holds for it is dropped.
+
+What the window holds for the profile in use is one value (`src/remote.rs`), replaced whole when
+the profile changes. While a local run is live the
 local worker republishes once a second so the elapsed time moves, and only when that second's text
 actually changed.
 

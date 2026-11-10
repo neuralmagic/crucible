@@ -17,7 +17,8 @@
 //! See [`resolve_endpoints`] for the full rule. `deny_binaries` stays exact-string, a binary path
 //! has no domain structure.
 
-use crate::manifest::{Harness, OpenshellCfg};
+use crate::knobs::Harness;
+use crate::manifest::OpenshellCfg;
 use crate::openshell::endpoint::Endpoint;
 
 /// Built-in egress endpoints in openshell's `host:port:access[:proto[:enforcement]]` form.

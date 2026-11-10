@@ -1,0 +1,124 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0075"
+title = "Workflow tasks reach the run's MCP servers with controller-minted task tokens"
+status = "proposed"
+date = "2026-11-10"
+refs = [
+    "RFC-0001:C-COMMANDS",
+    "RFC-0001:C-CAPABILITY-DISCLOSURE",
+    "ADR-0068",
+    "ADR-0071",
+    "ADR-0073",
+]
+
+[content]
+context = """
+A workflow's `command` and `evaluate` tasks run in the loop pod, not in a sandbox. Some need cluster work: submit a GPU Job against a built image, wait for it, read its result. Agents already do this through crucible-kueue with tokens the controller mints ([[ADR-0068]]) for the run's own Kubernetes identity ([[ADR-0073]]). Tasks cannot: the issuer accepts only a sandbox supervisor's JWT-SVID, and a task has no supervisor.
+
+Without a path for tasks, each need becomes a new tool on the run's broker, reached with the broker's static bearer and executed under the broker's service account. That is a second way into the cluster with no subject, no actor, no scopes and no SubjectAccessReview, so access is governed in two places.
+
+Constraints:
+
+- One issuer, one token model and one set of access rules per resource server. A task's call is checked exactly as an agent's.
+- Pack code in the loop pod does not choose who it is. Every claim comes from the controller's record of the run.
+- The loop pod's pod token is withheld from task environments from edition 2 ([[ADR-0071]]). An edition-1 pack's commands inherit it with the rest of the engine's environment.
+- Access tokens live 15 to 30 minutes; a task waiting on a GPU Job can run for hours.
+- Tasks are scripts. They need a client they can import, not an MCP harness.
+- A task's command is written by the pack's author and reviewed with the pack, so it is trusted more than an agent's output. A command that runs a script from the workspace runs whatever an agent left there.
+"""
+decision = """
+The engine exchanges the run's pod token for a task token at the controller's token endpoint and hands the task the server's URL and a file holding the token.
+
+- The grant is RFC 8693 token exchange: `subject_token` is the pod token, `audience` is one of the run's granted servers, `task` names the task. The pod token already proves the run to the controller, so no new credential exists.
+- The token carries what an agent's does (`sub` the launcher, `run_id`, `kube_user`, `kube_groups`, `namespace`, scopes for that audience) and `act.sub` `crucible:run:<pod>:task:<task>`. It carries no `sandbox` or `workdir`, so it is issued only for servers that need neither.
+- The engine fetches a token per task and server before the task starts, writes it to a file only the task's user reads, and rewrites it before it expires for as long as the task runs. The task sees `CRUCIBLE_TASK_SERVERS`, a JSON list of name, URL and token file.
+- Resource servers change nothing. crucible-kueue verifies the token, runs its declared access checks and tool policy, and stamps the actor on what it creates.
+- The client is one Rust crate that calls the server's existing MCP endpoint over HTTP (`tools/call`), with Python bindings built from it. It reads the token file on every request.
+
+- The controller issues a task token only for a server the run's pack names in `[workflow].servers`, read from the capability disclosure it recorded for the launch. A pack that names none gets none, whatever its commands hold.
+- Where the deploy profile says the cluster's SPIRE gives loop pods an SVID (`spiffe://<trust domain>/crucible/run/<pod name>`), the engine sends it as the exchange's `actor_token` and the controller issues only when it names the run's own pod on the run's cluster. Elsewhere the pod token alone is the proof. Packs and clients see no difference.
+
+The pod token is the proof because it is the only credential the controller already ties to one running run, and because the engine, not pack code, holds it.
+"""
+consequences = """
+Cluster access by tasks and by agents is one path: the same issuer, RBAC subject, access rules, tool policy and labels. A cluster administrator reads one RoleBinding to know what a run can do, whichever of its steps does it.
+
+On a cluster with loop-pod SVIDs a pod token copied out of the pod mints nothing, since the SVID comes only from that pod's Workload API. Two live pods cannot share a name, so a pod that pack code creates gets another ID. The cost is a ClusterSPIFFEID for loop pods and the SPIFFE CSI volume in every loop pod, which a namespace's pod security has to admit; that is why it is a profile setting and not inferred.
+
+A task holds a bearer for its lifetime, where a sandboxed agent never holds one. The token is bound to one audience and one run, expires within 30 minutes, and grants nothing the run's agents lack, since they act as the same Kubernetes user. A task that prints its token leaks at most that.
+
+The grant is a pack's to ask for, per server, and the capability disclosure lists it. A pack whose tasks run workspace scripts gives the servers it names to code its agents wrote, so its reviewer weighs that at the same line.
+
+An edition-1 pack's command holds the pod token, so it can ask for a task token itself, with any task name. It still gets one only for a server its manifest names, which is reach the pack disclosed. Requiring edition 2 was considered and dropped: with the controller's check it bought no further bound and cost every existing pack a manifest migration.
+
+The task name in `act.sub` is the engine's statement, not proof: the controller verifies the run, not which task asked. It is an audit label.
+
+A scenario can no longer freeze the command a GPU check runs, as a broker tool could. The bound moves to the server's allowlist profile and tool policy, which apply to agents too.
+
+The controller hands the loop pod two lists: the servers its sandboxes can get tokens for, which needs the cluster's SPIRE, and the servers its tasks may reach, which needs only the issuer. A cluster without SPIRE runs tasks against its servers and gives its agents none, as before.
+
+[[RFC-0001]] does not yet say that tasks receive these variables or that the capability disclosure lists them; that text is owed before this ships. The Python bindings add a wheel to build and install in the loop image.
+"""
+
+[[content.alternatives]]
+text = "Exchange the pod token for a task token at the controller; the engine fetches and refreshes it"
+status = "accepted"
+pros = [
+    "No new credential, issuer, or resource-server code",
+    "Works on a cluster with no SPIRE",
+    "Pack code never holds the pod token, so it cannot mint for itself",
+]
+cons = [
+    "The task holds a short-lived bearer",
+    "The task name in the token is unverified",
+]
+
+[[content.alternatives]]
+text = "Hand tasks the broker's URL and static token and add a broker tool per need"
+status = "rejected"
+pros = [
+    "No controller change",
+    "The scenario fixes the command a GPU job runs",
+]
+cons = [
+    "A shared bearer with no subject, actor, scopes or expiry",
+    "Jobs run under the broker's service account, not the run's Kubernetes user",
+    "Every new need is a new broker tool and a new access rule outside the resource servers",
+]
+rejection_reason = "It is a second path into the cluster that RBAC and the servers' access rules do not see."
+
+[[content.alternatives]]
+text = "Give the loop pod a SPIFFE ID and use the supervisors' client_credentials grant"
+status = "rejected"
+pros = [
+    "The same grant and assertion type as sandboxes",
+    "The cluster, not the controller, attests the pod",
+]
+cons = [
+    "A SPIRE registration and Workload API mount for loop pods on every cluster",
+    "Any process in the loop pod can fetch the SVID, so pack code can mint its own tokens",
+    "The SVID proves the same fact the pod token already does",
+]
+rejection_reason = "As the only proof it sits where pack code can reach it. Beside the pod token it is kept: neither mints alone."
+
+[[content.alternatives]]
+text = "A proxy in the loop pod that injects the bearer, as the supervisor does for a sandbox"
+status = "rejected"
+pros = ["The task holds no token"]
+cons = [
+    "An HTTP proxy to run and supervise in every loop pod",
+    "A task that reaches the proxy can already make every call the token allows",
+]
+rejection_reason = "Hiding the bearer removes nothing a task can do and costs a proxy."
+
+[[content.alternatives]]
+text = "A REST API on crucible-kueue for scripts, beside the MCP endpoint"
+status = "rejected"
+pros = ["Plain HTTP verbs for callers with no MCP client"]
+cons = [
+    "Two route tables to declare access rules for",
+    "Tool policy and argument schemas written for MCP calls would not cover it",
+]
+rejection_reason = "The MCP endpoint is already stateless HTTP; a typed client over it keeps one declaration of what each call needs."

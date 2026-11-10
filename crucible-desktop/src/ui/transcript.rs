@@ -30,10 +30,10 @@ pub(crate) fn transcript_view(pane: &Pane, app: &App, p: &Paint) -> El {
             .scroll_edge_fade(8.0)
             .child(body.padding(14.0))
     };
-    let Some(task) = app.expanded.as_deref() else {
+    let Some(task) = app.run.expanded.as_deref() else {
         return shell(col().child(faint("No task selected", p)));
     };
-    let mut all = turns(&pane.agent_events, task);
+    let mut all = turns(pane.agent_events, task);
     if all.is_empty() {
         all = turns_from_log(pane.agent_lines(), task);
     }
@@ -42,7 +42,7 @@ pub(crate) fn transcript_view(pane: &Pane, app: &App, p: &Paint) -> El {
     }
     let mut speakers: Vec<&str> = all.iter().map(|t| t.task).collect();
     speakers.dedup();
-    let picked = match &app.inspect.pick {
+    let picked = match &app.run.inspect.pick {
         Some(Pick::Instance(key)) => speakers.iter().copied().find(|s| {
             s.strip_prefix(task)
                 .is_some_and(|rest| rest == format!("[{key}]"))
@@ -84,7 +84,7 @@ fn instance_chips(task: &str, speakers: &[&str], picked: &str, p: &Paint) -> El 
                 .hover(p.c.hover)
                 .focusable(true)
                 .on_press(move |app: &mut App| {
-                    app.inspect.pick = key.clone().map(Pick::Instance);
+                    app.run.inspect.pick = key.clone().map(Pick::Instance);
                 })
                 .child(text(label).font(p.mono(10.0, 500.0)).color(if on {
                     p.c.text_base
@@ -149,14 +149,14 @@ fn turn_view(turn: &Turn, app: &App, p: &Paint) -> El {
 }
 
 fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
-    let open = app.inspect.is_open(path, 1, 1);
+    let open = app.run.inspect.is_open(path, 1, 1);
     let toggle = |head: El, path: &str| {
         let path = path.to_string();
         head.role("button")
             .label(if open { "Fold" } else { "Open" })
             .radius(p.k.radius.sm)
             .hover(p.c.hover)
-            .on_press(move |app: &mut App| app.inspect.flip(&path))
+            .on_press(move |app: &mut App| app.run.inspect.flip(&path))
             .child(
                 icon(
                     if open {
@@ -267,7 +267,7 @@ fn step_view(step: &Step, path: &str, app: &App, p: &Paint) -> El {
                 }
                 if let Some(input) = input {
                     detail = detail.child(json_box(
-                        tree(input, &format!("{path}:in"), DATA_OPEN, &app.inspect, p),
+                        tree(input, &format!("{path}:in"), DATA_OPEN, &app.run.inspect, p),
                         p,
                     ));
                 }

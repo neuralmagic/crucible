@@ -19,7 +19,7 @@ pub(crate) fn files_view(pane: &Pane, app: &App, p: &Paint) -> El {
     let files = match &pane.files {
         None => return note("Listing the captured files\u{2026}", "", p),
         Some(Err(error)) => return note("Could not list the captured files.", error, p),
-        Some(Ok(files)) if files.is_empty() => {
+        Some(Ok([])) => {
             return note("No task in this run captured files.", "", p);
         }
         Some(Ok(files)) => files,
@@ -110,6 +110,7 @@ fn file_row(file: &Captured, selected: bool, p: &Paint) -> El {
 fn viewer(file: &Captured, run: Option<&str>, app: &App, p: &Paint) -> El {
     let kind = Kind::of(&file.path);
     let opened = app
+        .remote
         .opened_file
         .as_ref()
         .filter(|opened| opened.key == file.key && Some(opened.run.as_str()) == run);
@@ -215,8 +216,8 @@ fn content(kind: Kind, key: &str, body: &str, app: &App, p: &Paint) -> El {
     match kind {
         Kind::Patch => frame().child(
             DiffView::new(
-                |app: &App| &app.file_diff,
-                |app: &mut App| &mut app.file_diff,
+                |app: &App| &app.remote.file_diff,
+                |app: &mut App| &mut app.remote.file_diff,
             )
             .key("files-diff")
             .build(app, p.k),

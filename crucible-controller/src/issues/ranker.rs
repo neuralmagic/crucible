@@ -1232,7 +1232,7 @@ mod tests {
                 price: None,
             },
             model: "m".to_string(),
-            harness: crucible::manifest::Harness::Claude,
+            harness: crucible::knobs::Harness::Claude,
         };
         let route = |protocol, url| {
             keyed_route(&dispatch(protocol, url))

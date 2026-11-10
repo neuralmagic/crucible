@@ -177,6 +177,8 @@ pub struct Settings {
     pub zoom: f32,
     /// Draw charts through the CRT pass.
     pub crt: bool,
+    /// Keep profile keys in the system credential store, not in files.
+    pub keychain: bool,
     /// Announce the signed-in user's runs as they finish.
     pub notify: bool,
     /// Announce decision requests the signed-in user may answer as they open.
@@ -198,6 +200,8 @@ pub struct Settings {
     /// The cost and time ceilings a pack folder dropped on the app is test-fired under.
     pub drop_max_cost: f64,
     pub drop_max_time: String,
+    /// Why the file on disk did not read. While set, nothing is saved over it.
+    pub unreadable: Option<String>,
     path: PathBuf,
 }
 
@@ -215,6 +219,7 @@ struct Config {
     text_size: TextSize,
     zoom: Option<f32>,
     crt: Option<bool>,
+    keychain: Option<bool>,
     notify: Option<bool>,
     notify_decisions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -240,11 +245,12 @@ impl Settings {
     }
 
     fn load_from(path: PathBuf) -> Self {
-        let mut config: Config = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default();
-        if config.profiles.is_empty()
+        let (mut config, unreadable) = match read(&path) {
+            Ok(config) => (config, None),
+            Err(why) => (Config::default(), Some(why)),
+        };
+        if unreadable.is_none()
+            && config.profiles.is_empty()
             && let Some(dir) = path.parent().and_then(Path::parent)
             && let Ok(text) = fs::read_to_string(crate::profile::tauri_config(dir))
         {
@@ -276,6 +282,7 @@ impl Settings {
                 .filter(|z| ZOOMS.iter().any(|known| (known - z).abs() < 0.01))
                 .unwrap_or(1.0),
             crt: config.crt.unwrap_or(true),
+            keychain: config.keychain.unwrap_or(false),
             notify: config.notify.unwrap_or(true),
             ask: config.notify_decisions.unwrap_or(true),
             editor: config.editor,
@@ -293,6 +300,7 @@ impl Settings {
                 .drop_max_time
                 .filter(|t| crate::form::minutes(t).is_some())
                 .unwrap_or_else(|| "30m".to_string()),
+            unreadable,
             path,
         }
     }
@@ -356,7 +364,20 @@ impl Settings {
     }
 
     /// Where profiles keep their own keys.
-    pub fn keys_dir(&self) -> PathBuf {
+    pub fn keys(&self) -> crate::keys::Store {
+        self.keys_in(self.keychain)
+    }
+
+    /// The system credential store when `keychain`, else the key files.
+    pub fn keys_in(&self, keychain: bool) -> crate::keys::Store {
+        if keychain {
+            crate::keys::Store::Keychain
+        } else {
+            crate::keys::Store::Dir(self.keys_dir())
+        }
+    }
+
+    fn keys_dir(&self) -> PathBuf {
         self.path
             .parent()
             .map_or_else(|| PathBuf::from("profiles"), |dir| dir.join("profiles"))
@@ -388,6 +409,11 @@ impl Settings {
 
     pub fn set_crt(&mut self, on: bool) {
         self.crt = on;
+        self.save();
+    }
+
+    pub fn set_keychain(&mut self, on: bool) {
+        self.keychain = on;
         self.save();
     }
 
@@ -443,6 +469,9 @@ impl Settings {
     }
 
     fn save(&self) {
+        if self.unreadable.is_some() {
+            return;
+        }
         let config = Config {
             log_font: Some(self.log_font),
             tx02_path: None,
@@ -452,6 +481,7 @@ impl Settings {
             text_size: self.text_size,
             zoom: Some(self.zoom),
             crt: Some(self.crt),
+            keychain: Some(self.keychain),
             notify: Some(self.notify),
             notify_decisions: Some(self.ask),
             editor: self.editor,
@@ -470,8 +500,27 @@ impl Settings {
         if let Some(parent) = self.path.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let _ = fs::write(&self.path, text);
+        let file = fs::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let partial = file.with_extension("toml.partial");
+        if fs::write(&partial, text).is_ok() && fs::rename(&partial, &file).is_err() {
+            let _ = fs::remove_file(&partial);
+        }
     }
+}
+
+/// The config at `path`, the default when there is no file, or why the file does not read.
+fn read(path: &Path) -> Result<Config, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(e) => return Err(e.to_string()),
+    };
+    toml::from_str(&text).map_err(|e| {
+        let line = e
+            .span()
+            .map_or(1, |span| text[..span.start].matches('\n').count() + 1);
+        format!("line {line}: {}", e.message())
+    })
 }
 
 /// The fonts registered with Rune: the theme's faces, plus TX-02 read from this machine when
@@ -694,6 +743,95 @@ proxxy = "socks5://127.0.0.1:1080"
             "removing the profile in use forgets it"
         );
         assert!(!after.profiles().contains_key("jump"));
+    }
+
+    #[test]
+    fn a_file_that_does_not_read_is_reported_and_never_saved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let tauri = crate::profile::tauri_config(dir.path());
+        fs::create_dir_all(tauri.parent().unwrap()).unwrap();
+        fs::write(&tauri, "[profiles.old]\nurl = \"http://127.0.0.1:8870\"\n").unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let written = "profile = \"mine\"\ntheme = \"mauve\"\n\n[profiles.mine]\nurl = \"https://mine.example.com\"\n";
+        fs::write(&path, written).unwrap();
+
+        let mut settings = Settings::load_from(path.clone());
+        let why = settings.unreadable.clone().expect("the file does not read");
+        assert!(why.starts_with("line 2: "), "{why}");
+        assert!(why.contains("mauve"), "{why}");
+        assert!(
+            settings.profiles().is_empty(),
+            "the Tauri app's profiles do not stand in for a file that is there"
+        );
+
+        settings.set_theme(Theme::Ember);
+        settings.set_zoom(1.25);
+        settings.use_profile("other");
+        settings
+            .set_profile_def(
+                "new",
+                &Profile {
+                    url: "https://new.example.com".into(),
+                    ..Profile::default()
+                },
+            )
+            .unwrap();
+        settings.remove_profile("new");
+        settings.set_drop("2", "1h").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), written);
+        assert_eq!(
+            fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1,
+            "nothing is left beside it"
+        );
+
+        fs::write(&path, written.replace("mauve", "moss")).unwrap();
+        let mut fixed = Settings::load_from(path.clone());
+        assert_eq!(fixed.unreadable, None);
+        assert_eq!(fixed.theme, Theme::Moss);
+        fixed.set_theme(Theme::Ember);
+        let again = Settings::load_from(path);
+        assert_eq!(again.theme, Theme::Ember);
+        assert!(again.profiles()["mine"].is_ok());
+    }
+
+    #[test]
+    fn no_file_is_not_an_unreadable_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.unreadable, None);
+        settings.set_theme(Theme::Midnight);
+        assert_eq!(Settings::load_from(path).theme, Theme::Midnight);
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_whole_and_writes_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("dotfiles").join("playbooks.toml");
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::write(&real, "theme = \"moss\"\n").unwrap();
+        let path = dir.path().join("config").join("config.toml");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&real, &path).unwrap();
+
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.theme, Theme::Moss);
+        settings.set_theme(Theme::Ember);
+        assert!(
+            fs::symlink_metadata(&path).unwrap().is_symlink(),
+            "the link stays a link"
+        );
+        assert!(fs::read_to_string(&real).unwrap().contains("ember"));
+        for folder in [real.parent().unwrap(), path.parent().unwrap()] {
+            assert_eq!(
+                fs::read_dir(folder).unwrap().count(),
+                1,
+                "no partial file is left in {}",
+                folder.display()
+            );
+        }
     }
 
     #[test]

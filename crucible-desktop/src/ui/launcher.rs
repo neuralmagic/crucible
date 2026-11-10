@@ -32,7 +32,7 @@ enum Slot {
 
 /// The form's edit for `slot`, or a scratch edit once the form has closed.
 fn edit(app: &mut App, slot: Slot) -> &mut TextEdit {
-    if let Some(launcher) = app.launcher.as_mut() {
+    if let Some(launcher) = app.remote.launcher.as_mut() {
         let found = match slot {
             Slot::Answer(i) => launcher.answers.get_mut(i),
             Slot::Cost => Some(&mut launcher.cost),
@@ -62,7 +62,7 @@ pub(crate) fn launch_button(app: &App, playbook: &str, p: &Paint) -> Option<El> 
 pub(crate) fn fix_button(app: &App, p: &Paint) -> Option<El> {
     let launch = app.selected_live()?;
     let detail = app.selected_detail()?;
-    if launch.status == "running" || detail.verdict == crate::model::Verdict::Valid {
+    if launch.status.is_running() || detail.verdict == crate::model::Verdict::Valid {
         return None;
     }
     app.draft_target()?;
@@ -98,7 +98,7 @@ pub(crate) fn rerun_button(app: &App, p: &Paint) -> Option<El> {
 
 /// The sheet, mounted as an overlay while a form is open.
 pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
-    let Some(launcher) = &app.launcher else {
+    let Some(launcher) = &app.remote.launcher else {
         return;
     };
     let body = match &launcher.stage {
@@ -163,7 +163,7 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
         .open(true)
         .fit()
         .width(SHEET)
-        .on_close(|app: &mut App| app.launcher = None)
+        .on_close(|app: &mut App| app.remote.launcher = None)
         .child(p.k.scroll_bar(body).w_full())
         .child(
             col()
@@ -188,7 +188,7 @@ pub(crate) fn sheet(app: &App, p: &Paint, layer: &mut Vec<El>) {
                 .child(
                     Button::new("Cancel")
                         .variant(ButtonVariant::Neutral)
-                        .on_press(|app: &mut App| app.launcher = None)
+                        .on_press(|app: &mut App| app.remote.launcher = None)
                         .build(p.k)
                         .key("launcher-cancel"),
                 )
@@ -326,7 +326,7 @@ fn fact(name: &str, value: String, p: &Paint) -> El {
 }
 
 fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
-    let Some(launcher) = &app.launcher else {
+    let Some(launcher) = &app.remote.launcher else {
         return el();
     };
     if let Some(rerun) = &launcher.rerun {
@@ -419,13 +419,17 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
 
 /// Launch now, or save a schedule that launches on a cron.
 fn when(app: &App, p: &Paint) -> El {
-    let scheduled = app.launcher.as_ref().is_some_and(|l| l.schedule.is_some());
+    let scheduled = app
+        .remote
+        .launcher
+        .as_ref()
+        .is_some_and(|l| l.schedule.is_some());
     SegmentedControl::new(&["Run now", "On a schedule"], Some(scheduled as usize))
         .label("When")
         .width(Some(INNER))
         .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
             let owner = app.owners().into_iter().next().unwrap_or_default();
-            if let Some(launcher) = &mut app.launcher {
+            if let Some(launcher) = &mut app.remote.launcher {
                 launcher.schedule = (i == 1).then(|| crate::admin::ScheduleForm::new(&owner));
                 launcher.refusal = None;
             }
@@ -455,7 +459,12 @@ fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> E
                         .placeholder("0 9 * * MON-FRI")
                         .width(Some((INNER - 12.0) / 2.0))
                         .on_edit(|app: &mut App| {
-                            match app.launcher.as_mut().and_then(|l| l.schedule.as_mut()) {
+                            match app
+                                .remote
+                                .launcher
+                                .as_mut()
+                                .and_then(|l| l.schedule.as_mut())
+                            {
                                 Some(form) => &mut form.cron,
                                 None => &mut app.scratch,
                             }
@@ -470,7 +479,12 @@ fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> E
                         .placeholder("UTC")
                         .width(Some((INNER - 12.0) / 2.0))
                         .on_edit(|app: &mut App| {
-                            match app.launcher.as_mut().and_then(|l| l.schedule.as_mut()) {
+                            match app
+                                .remote
+                                .launcher
+                                .as_mut()
+                                .and_then(|l| l.schedule.as_mut())
+                            {
                                 Some(form) => &mut form.tz,
                                 None => &mut app.scratch,
                             }
@@ -487,7 +501,12 @@ fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> E
                 &owners,
                 Some(&form.owner),
                 |app: &mut App, owner: &str| {
-                    if let Some(form) = app.launcher.as_mut().and_then(|l| l.schedule.as_mut()) {
+                    if let Some(form) = app
+                        .remote
+                        .launcher
+                        .as_mut()
+                        .and_then(|l| l.schedule.as_mut())
+                    {
                         form.owner = owner.to_string();
                     }
                 },
@@ -500,7 +519,7 @@ fn schedule_fields(form: &crate::admin::ScheduleForm, app: &App, p: &Paint) -> E
 /// Where the launch runs: one line naming the target, provider and model, or, opened, the
 /// pickers for each.
 fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
-    let Some(launcher) = &app.launcher else {
+    let Some(launcher) = &app.remote.launcher else {
         return el();
     };
     let form = &launcher.runs_on;
@@ -520,7 +539,7 @@ fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
             Button::new(if form.open { "Done" } else { "Change" })
                 .variant(ButtonVariant::Neutral)
                 .on_press(|app: &mut App| {
-                    if let Some(launcher) = app.launcher.as_mut() {
+                    if let Some(launcher) = app.remote.launcher.as_mut() {
                         launcher.runs_on.open = !launcher.runs_on.open;
                     }
                 })
@@ -544,7 +563,7 @@ fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                         ButtonVariant::Outline
                     })
                     .on_press(move |app: &mut App| {
-                        if let Some(launcher) = app.launcher.as_mut() {
+                        if let Some(launcher) = app.remote.launcher.as_mut() {
                             launcher.runs_on.target = Some(value.clone());
                         }
                     })
@@ -569,7 +588,7 @@ fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         "launch-provider",
         &form.search,
         &options,
-        |app: &mut App| match app.launcher.as_mut() {
+        |app: &mut App| match app.remote.launcher.as_mut() {
             Some(launcher) => &mut launcher.runs_on.search,
             None => &mut app.provider_scratch,
         },
@@ -580,7 +599,7 @@ fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     .width(INNER)
     .max_height(240.0)
     .on_choose(|app: &mut App, id: &str, _: &mut Tx| {
-        if let Some(launcher) = app.launcher.as_mut() {
+        if let Some(launcher) = app.remote.launcher.as_mut() {
             launcher.runs_on.provider = id.to_string();
             launcher.runs_on.search.close();
         }
@@ -604,7 +623,7 @@ fn runs_on(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
 }
 
 fn ceilings(app: &App, p: &Paint) -> El {
-    let Some(launcher) = &app.launcher else {
+    let Some(launcher) = &app.remote.launcher else {
         return el();
     };
     let (cap_cost, cap_time) = &launcher.caps;
@@ -693,14 +712,14 @@ fn capped(slider: El, cap: String, p: &Paint) -> El {
 }
 
 fn set_cost(app: &mut App, frac: f32) {
-    if let Some(launcher) = app.launcher.as_mut() {
+    if let Some(launcher) = app.remote.launcher.as_mut() {
         let cost = Scale::dollars(launcher.caps.0).at(frac);
         launcher.cost = TextEdit::new(format!("{cost:.2}"));
     }
 }
 
 fn set_time(app: &mut App, frac: f32) {
-    if let Some(launcher) = app.launcher.as_mut()
+    if let Some(launcher) = app.remote.launcher.as_mut()
         && let Some(cap) = minutes(&launcher.caps.1)
     {
         let time = Scale::minutes(cap).at(frac).round() as u64;

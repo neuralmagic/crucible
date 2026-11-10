@@ -1,7 +1,7 @@
 //! The files a run's tasks captured (their `emits_files`), as the controller lists and serves
 //! them, and how each is shown.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The largest file the Files pane fetches and draws.
 pub const SHOWN_BYTES: u64 = 8 * 1024 * 1024;
@@ -117,15 +117,18 @@ pub struct Opened {
     pub disk: Option<PathBuf>,
 }
 
-/// Where a run's fetched file is kept: the user's cache directory, by run and key.
-pub fn cache_path(run: &str, key: &str) -> Option<PathBuf> {
-    let mut path = crate::httpcache::cache_root()?
-        .join("run-files")
-        .join(safe(run));
+/// Where fetched files are kept: the user's cache directory.
+pub fn cache_dir() -> Option<PathBuf> {
+    Some(crate::httpcache::cache_root()?.join("run-files"))
+}
+
+/// Where a run's fetched file is kept under `dir`, by run and key.
+pub fn cache_path(dir: &Path, run: &str, key: &str) -> PathBuf {
+    let mut path = dir.join(safe(run));
     for segment in key.split('/').filter(|s| !s.is_empty() && *s != "..") {
         path.push(safe(segment));
     }
-    Some(path)
+    path
 }
 
 fn safe(segment: &str) -> String {
@@ -361,10 +364,10 @@ mod tests {
 
     #[test]
     fn a_cache_path_cannot_leave_the_runs_directory() {
-        let path = cache_path("run/1", "../../etc/passwd").unwrap();
-        let root = crate::httpcache::cache_root().unwrap().join("run-files");
+        let root = std::path::Path::new("/c/run-files");
+        let path = cache_path(root, "run/1", "../../etc/passwd");
         assert_eq!(path, root.join("run_1").join("etc").join("passwd"));
-        let path = cache_path("r", "climb[kern1]/best.patch").unwrap();
+        let path = cache_path(root, "r", "climb[kern1]/best.patch");
         assert!(path.ends_with("r/climb[kern1]/best.patch"));
     }
 }

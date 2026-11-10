@@ -83,9 +83,18 @@
 #   J  a failed draft run reruns on the local executor from its edited last task: upstream tasks
 #      are reused with their commits and files, reused rows name the parent, and an edit upstream
 #      of the selection is refused
+#   KQ a command task of a pack that names kueue in [workflow] servers submits a Job through
+#      crucible-kueue with the crucible_kueue Python client and a task token the engine got for
+#      the run's pod token: the Job runs on Kueue as the run's own Kubernetes user, labelled with
+#      the run, its launcher and the task; the token is in no pod spec, Secret or log; a pack
+#      naming a server the run was not granted fails its task naming the servers it was; a task
+#      serves an image as a Deployment with a port exposed, reaches it by the Service host the
+#      server reports from itself and from a Job, and the Service is deleted with the Deployment
 # The scenarios run in three shards at once, each on its own kind cluster, database, and controller
 # ports, sharing one registry and loop image: store (A P U F C B D L T I W E X Q V M), pods
 # (H R S K Y JP JT), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
+# The kueue shard (KQ) runs only when named: it installs Kueue KUEUE_VERSION on its cluster and
+# builds crucible-kueue and the crucible_kueue Python extension from this checkout.
 # Needs docker, kind, kubectl, jq, curl, git, shasum, openssl. Uses $DATABASE_URL and $PG_CONTAINER when
 # set (the CI postgres action), else starts its own Postgres. KEEP=1 leaves everything up;
 # ARTIFACT_DIR collects logs on failure.
@@ -106,6 +115,7 @@ PEERHOOKPORT="${PEERHOOKPORT:-$((28000 + RANDOM % 2000))}"
 NS=crucible-e2e
 DRAFT=e2e
 SKOPEO=quay.io/skopeo/stable:v1.20
+KUEUE_VERSION="${KUEUE_VERSION:-v0.20.5}"
 SHARDS=("$@")
 [ ${#SHARDS[@]} -gt 0 ] || SHARDS=(store pods lease)
 mkdir -p "$ROOT/target"
@@ -133,6 +143,15 @@ done
 log() { echo "==> $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
+
+# has_shard <name>: whether this run includes the shard.
+has_shard() {
+    local shard
+    for shard in "${SHARDS[@]}"; do
+        [ "$shard" = "$1" ] && return 0
+    done
+    return 1
+}
 
 if [ -r /proc/sys/net/ipv4/ip_local_port_range ]; then
     read -r EPHEMERAL_LOW EPHEMERAL_HIGH </proc/sys/net/ipv4/ip_local_port_range
@@ -226,6 +245,15 @@ wait_for() {
         sleep 1
     done
     fail "timed out after ${secs}s waiting for $what"
+}
+
+# host_address: the address pods in the shard's cluster reach the host on: the one its node
+# resolves the host alias to, else the kind network's gateway.
+host_address() {
+    local host
+    host=$(docker exec "$CLUSTER-control-plane" getent ahostsv4 host.docker.internal host.containers.internal 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+    [ -n "$host" ] || host=$(docker network inspect kind --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}' | tr ' ' '\n' | grep -m1 '\.' || true)
+    [ -n "$host" ] && echo "$host"
 }
 
 # ---- controller ----------------------------------------------------------------------------
@@ -900,6 +928,32 @@ fi
 CONTRACT_VERSION=$("$AUTORESEARCH_ENGINE" --contract-version)
 cp "$ROOT/tools/fake-agent.py" "$TOP/image/fake-agent.py"
 cp "$FIX/openshell-gateway" "$FIX/openshell" "$TOP/image/"
+mkdir -p "$TOP/image/python"
+
+# crucible-kueue and the crucible_kueue Python package for the node, into $OUT.
+KUEUE_BUILD='set -e
+cargo build --locked -q -p crucible-kueue --bin crucible-kueue
+cp "$CARGO_TARGET_DIR/debug/crucible-kueue" "$OUT/crucible-kueue"
+PROFILE=dev CRUCIBLE_KUEUE_PY_TARGET="$CARGO_TARGET_DIR/py" scripts/crucible-kueue-py-stage.sh "$OUT/python"'
+if has_shard kueue; then
+    mkdir -p "$TOP/kueue-image"
+    if [ "$(uname -s)" = Linux ] && [ "$HOST_ARCH" = "$NODE_ARCH" ]; then
+        log "building crucible-kueue and crucible_kueue for the host"
+        (cd "$ROOT" && CARGO_TARGET_DIR="$ROOT/target" OUT="$TOP/kueue-image" SQLX_OFFLINE=true sh -c "$KUEUE_BUILD")
+    else
+        log "building crucible-kueue and crucible_kueue for linux/$NODE_ARCH in rust:1-bookworm"
+        docker run --rm --platform "linux/$NODE_ARCH" \
+            -v "$ROOT":/src -w /src \
+            -v kind-e2e-cargo:/usr/local/cargo/registry \
+            -v "kind-e2e-target-$NODE_ARCH-$(printf %s "$ROOT" | shasum -a 256 | cut -c1-12)":/ctarget \
+            -v "$TOP/kueue-image":/out \
+            -e CARGO_TARGET_DIR=/ctarget -e OUT=/out -e SQLX_OFFLINE=true -e CARGO_PROFILE_DEV_DEBUG=0 \
+            rust:1-bookworm sh -c "$KUEUE_BUILD"
+    fi
+    cp -R "$TOP/image" "$TOP/image-kueue"
+    mv "$TOP/kueue-image/python/crucible_kueue" "$TOP/image-kueue/python/crucible_kueue"
+    rmdir "$TOP/kueue-image/python"
+fi
 
 for i in "${!CREATE_PIDS[@]}"; do
     shard=${SHARDS[$i]}
@@ -916,23 +970,38 @@ log "starting registry $REG on localhost:$REGPORT"
 docker run -d -q --name "$REG" --network kind -p "127.0.0.1:$REGPORT:5000" registry:2 >/dev/null
 
 # ---- loop images ---------------------------------------------------------------------------
-# push_loop_image <tag> <contract label>: build the loop image and push it to the registry.
+# push_image <name:tag>: push a locally built image to the registry and drop the local copy.
+push_image() {
+    docker save -o "$TOP/push.tar" "$1"
+    docker run --rm -q --network kind -v "$TOP":/w "$SKOPEO" copy -q --dest-tls-verify=false \
+        "docker-archive:/w/push.tar" "docker://$REG:5000/$1"
+    rm "$TOP/push.tar"
+    docker rmi "$1" >/dev/null 2>&1 || true
+}
+
+# push_loop_image <tag> <contract label> [context]: build the loop image and push it to the
+# registry.
 push_loop_image() {
     docker build -q --load --platform "linux/$NODE_ARCH" \
         --build-arg "BASE=$LOOP_BASE" --build-arg "CONTRACT_VERSION=$CONTRACT_VERSION" \
         --build-arg "CONTRACT_LABEL=$2" \
-        -f "$FIX/Containerfile.loop" -t "crucible-e2e-loop:$1" "$TOP/image" >/dev/null
-    docker save -o "$TOP/loop.tar" "crucible-e2e-loop:$1"
-    docker run --rm -q --network kind -v "$TOP":/w "$SKOPEO" copy -q --dest-tls-verify=false \
-        "docker-archive:/w/loop.tar" "docker://$REG:5000/crucible-e2e-loop:$1"
-    rm "$TOP/loop.tar"
-    docker rmi "crucible-e2e-loop:$1" >/dev/null 2>&1 || true
+        -f "$FIX/Containerfile.loop" -t "crucible-e2e-loop:$1" "${3:-$TOP/image}" >/dev/null
+    push_image "crucible-e2e-loop:$1"
 }
 LOOP_IMAGE="localhost:$REGPORT/crucible-e2e-loop:$ID"
 MISMATCH_IMAGE="localhost:$REGPORT/crucible-e2e-loop:$ID-mismatch"
 log "building loop images on $LOOP_BASE (contract $CONTRACT_VERSION)"
 push_loop_image "$ID" "$CONTRACT_VERSION"
 push_loop_image "$ID-mismatch" 0.0.0
+if has_shard kueue; then
+    log "building the crucible-kueue image and the loop image with crucible_kueue"
+    KUEUE_LOOP_IMAGE="localhost:$REGPORT/crucible-e2e-loop:$ID-kueue"
+    KUEUE_IMAGE="localhost:$REGPORT/crucible-e2e-kueue:$ID"
+    push_loop_image "$ID-kueue" "$CONTRACT_VERSION" "$TOP/image-kueue"
+    docker build -q --load --platform "linux/$NODE_ARCH" --build-arg "BASE=$LOOP_BASE" \
+        -f "$FIX/Containerfile.kueue" -t "crucible-e2e-kueue:$ID" "$TOP/kueue-image" >/dev/null
+    push_image "crucible-e2e-kueue:$ID"
+fi
 sed "s|@LOOP_IMAGE@|$LOOP_IMAGE|g" "$FIX/profile.toml.in" >"$TOP/profile.toml"
 sed "s|@LOOP_IMAGE@|$MISMATCH_IMAGE|g" "$FIX/profile.toml.in" >"$TOP/profile-mismatch.toml"
 awk '{ print } /^\[cluster\]$/ { print "state_pvc = \"crucible-e2e-state\"" }' "$TOP/profile.toml" >"$TOP/profile-state.toml"

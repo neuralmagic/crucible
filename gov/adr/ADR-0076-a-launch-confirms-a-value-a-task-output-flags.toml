@@ -1,7 +1,7 @@
 #:schema ../schema/adr.schema.json
 
 [govctl]
-id = "ADR-0075"
+id = "ADR-0076"
 title = "A launch confirms a value a task output flags"
 status = "proposed"
 date = "2026-11-10"

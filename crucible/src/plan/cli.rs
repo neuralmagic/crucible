@@ -1,6 +1,7 @@
 //! The `crucible plan` CLI: `show` compiles and prints a plan; `run` executes one.
 
 use crate::args::AgentOverride;
+use crate::knobs::Harness;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -68,8 +69,6 @@ pub fn load(path: &Path) -> Result<ValidPlan> {
     } else {
         Plan::from_json_str(&src)?
     };
-    crate::manifest::launch::check_agent_knobs(&plan.tasks)
-        .with_context(|| format!("validating plan {}", path.display()))?;
     plan.validate()
         .with_context(|| format!("validating plan {}", path.display()))
 }
@@ -102,7 +101,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
         let mut detail = match &t.task {
             TaskKind::Agent { model, harness, .. } => format!(
                 "agent[{}/{}]",
-                harness.as_deref().unwrap_or("default"),
+                harness.map_or("default", Harness::as_str),
                 model.as_deref().unwrap_or("default")
             ),
             TaskKind::Command { command } => format!("command[{command}]"),
@@ -248,7 +247,7 @@ fn render_mermaid_styled(
         let mut detail = match &t.task {
             TaskKind::Agent { harness, model, .. } => format!(
                 "<br/>{}/{}",
-                mermaid_label(harness.as_deref().unwrap_or("default")),
+                mermaid_label(harness.map_or("default", Harness::as_str)),
                 mermaid_label(model.as_deref().unwrap_or("default"))
             ),
             TaskKind::Command { command } if metadata == Metadata::Preview => {
@@ -803,6 +802,7 @@ pub fn run(
                         agent_cmd,
                         env: crucible::host_env::HostEnv::inherited(),
                         buildit_socket: None,
+                        task_servers: Vec::new(),
                         github: false,
                     }),
                     None,
@@ -1114,7 +1114,7 @@ mod tests {
         .unwrap();
         let err = load(&file).map(|_| ()).expect_err("refused");
         assert!(
-            format!("{err:#}").contains("sets harness \"gpt\""),
+            format!("{err:#}").contains("harness \"gpt\" is not claude, codex, opencode or pi"),
             "{err:#}"
         );
         std::fs::write(&file, SRC).unwrap();

@@ -4,6 +4,7 @@ pub mod analyze;
 pub mod check;
 pub mod complete;
 pub mod docs;
+pub mod fix;
 pub mod index;
 pub mod lint;
 pub mod navigate;

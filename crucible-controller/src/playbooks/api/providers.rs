@@ -374,7 +374,7 @@ struct CheckedProvider {
     default_model: Option<String>,
     secret: Option<ProviderSecretRef>,
     endpoint: Option<Endpoint>,
-    harness: Option<crucible::manifest::Harness>,
+    harness: Option<crucible::knobs::Harness>,
     price: Option<TokenPrice>,
     enabled: bool,
 }
@@ -386,7 +386,7 @@ fn check_harness(
     kind: ProviderKind,
     protocol: Option<InferenceProtocol>,
     raw: Option<&str>,
-) -> Result<Option<crucible::manifest::Harness>, String> {
+) -> Result<Option<crucible::knobs::Harness>, String> {
     let Some(raw) = raw.map(str::trim).filter(|h| !h.is_empty()) else {
         return Ok(None);
     };
