@@ -134,6 +134,39 @@ Other tools depend on what you run:
 
 ## Installation
 
+### The desktop app
+
+Crucible Playbooks, the desktop app, tracks what each playbook did and is doing, read from a
+controller or local packs. Each [release](https://github.com/neuralmagic/crucible/releases)
+carries it for Apple silicon Macs and for Fedora, with `crucible-lsp` included.
+
+On macOS:
+
+```bash
+v=0.6.1
+curl -LO "https://github.com/neuralmagic/crucible/releases/download/v$v/Crucible-Playbooks-v$v-aarch64-apple-darwin.zip"
+ditto -x -k "Crucible-Playbooks-v$v-aarch64-apple-darwin.zip" /Applications
+xattr -d com.apple.quarantine "/Applications/Crucible Playbooks.app"
+open "/Applications/Crucible Playbooks.app"
+```
+
+The app is signed ad hoc, so without the `xattr` step macOS blocks its first launch; System
+Settings, Privacy & Security, Open Anyway allows it too.
+
+On Fedora (x86_64 or aarch64):
+
+```bash
+v=0.6.1
+sudo dnf install "https://github.com/neuralmagic/crucible/releases/download/v$v/crucible-playbooks-$v-1.fc45.$(uname -m).rpm"
+```
+
+From a checkout, `just desktop-install` builds and installs the macOS app into `~/Applications`,
+and `just desktop-linux` builds the RPM in a Fedora container. The app signs in to a controller
+from its sidebar. [crucible-desktop/README.md](crucible-desktop/README.md) covers profiles,
+tunnels and the rest.
+
+### The crucible binary
+
 Build and install from source:
 
 ```bash

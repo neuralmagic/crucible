@@ -312,9 +312,9 @@ printf '%s\n' "$rec" > /buildit-out/build.exit
 /// the run number, the number of paths, the paths, then the command.
 const RUN: &str = r#"B=/buildit-tools/busybox; secs=$1; n=$2; np=$3; shift 3
 trap '$B kill -TERM -1 2> /dev/null; exit 143' TERM
-: > /tmp/buildit-paths
+: > /tmp/buildit-want
 while [ "$np" -gt 0 ]; do
-  if [ -e "/$1" ]; then printf '%s\n' "$1" >> /tmp/buildit-paths; fi
+  printf '%s\n' "$1" >> /tmp/buildit-want
   shift; np=$((np - 1))
 done
 log=/buildit-out/run-$n.log
@@ -324,6 +324,10 @@ wait $!
 c=$?
 t=
 if [ "$c" -ne 0 ] && [ $(($($B date +%s) - s)) -ge "$secs" ]; then c=124; t=" timeout"; fi
+: > /tmp/buildit-paths
+while IFS= read -r p; do
+  if [ -e "/$p" ]; then printf '%s\n' "$p" >> /tmp/buildit-paths; fi
+done < /tmp/buildit-want
 if [ -s /tmp/buildit-paths ]; then
   (cd / && $B tar -cf "/buildit-out/run-$n.tar" -T /tmp/buildit-paths) 2> "/buildit-out/run-$n.fetch-err" \
     || $B rm -f "/buildit-out/run-$n.tar"

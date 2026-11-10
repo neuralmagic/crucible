@@ -300,6 +300,7 @@ args = ["mcp"]
 env = { BUILDIT_NAMESPACE = "builds" }        # set on the server
 inherit = ["KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"]  # copied from the loop pod
 tools = ["build", "run", "logs"]              # passed as MCP_TOOLS
+log = "warn"                                  # its stderr lines crucible passes on (default)
 
 [agent]
 mcp = ["buildit"]                             # turns without a named sandbox
@@ -310,8 +311,13 @@ A turn can reach only the servers that its scope names. The scope is `[agent].mc
 configuration of the turn lists only those servers.
 
 Each server runs as a separate process on a separate port. Ports start at 8850 and follow key
-order. A server gets only these environment variables: `PATH`, `HOME`, its `env` and `inherit`
-names, `MCP_NAME`, `MCP_BIND`, `MCP_TOKENS_FILE`, and `MCP_TOOLS`. Every turn gets a new token
+order. A server gets only these environment variables: `PATH`, `HOME`, `NO_COLOR=1`, its `env`
+and `inherit` names, `MCP_NAME`, `MCP_BIND`, `MCP_TOKENS_FILE`, and `MCP_TOOLS`.
+
+The engine copies a server's stderr into its own log at the `log` level: `tracing` lines at that
+level or more severe, plus every line that is not a `tracing` line, such as a panic. The levels
+are `off`, `error`, `warn` (the default), `info`, `debug`, and `trace`. A server that fails to
+start reports its last 50 stderr lines whatever the level. Every turn gets a new token
 for each server. The engine writes the token to `MCP_TOKENS_FILE` with the sandbox and workdir
 of the turn ([format](crucible-contract.md#62-mcp-token-file-mcp_tokens_file)). The engine
 revokes the token when it deletes the sandbox. The server identifies the caller from the token
