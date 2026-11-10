@@ -5,6 +5,7 @@
 mod admin;
 mod captured;
 mod commands;
+mod cron;
 mod diff;
 mod draft;
 mod editor;
@@ -20,17 +21,20 @@ mod inspect;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod instance;
 mod keymap;
+mod keys;
 mod link;
 mod live;
 mod logline;
 mod lsp;
 mod model;
+mod net;
 mod notify;
 mod opened;
 mod pack;
 mod palette;
 mod preview;
 mod profile;
+mod remote;
 mod runs;
 mod runs_on;
 mod search;
@@ -39,6 +43,8 @@ mod settings;
 mod signin;
 mod studio;
 mod syntax;
+#[cfg(test)]
+mod testserver;
 mod timeline;
 mod transcript;
 mod tray;
@@ -53,7 +59,6 @@ use std::sync::OnceLock;
 
 use rune::{AppSpec, TextEdit, Tx, Waker};
 
-use crate::draft::Working;
 use crate::editor::Editor;
 use crate::filter::{LandedFilter, LaunchFilter, OriginFilter, OwnerFilter};
 use crate::link::Link;
@@ -76,6 +81,18 @@ static SETTINGS: OnceLock<Settings> = OnceLock::new();
 pub enum GraphSource {
     Run,
     Preview,
+}
+
+impl GraphSource {
+    /// Whether the run views draw the compiled pack's tasks in place of the run's: when
+    /// `picked` says so, and with nothing picked, when only the compiled pack has any.
+    pub fn previews(picked: Option<GraphSource>, ran: bool, compiles: bool) -> bool {
+        match picked {
+            Some(GraphSource::Preview) => true,
+            Some(GraphSource::Run) => false,
+            None => !ran && compiles,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,19 +225,60 @@ pub enum PackSource {
     Working,
 }
 
+/// `$VISUAL` or `$EDITOR` as the user's shell sets them, read once when first needed.
+enum LoginEditor {
+    Unasked,
+    Asking(std::sync::mpsc::Receiver<Option<String>>),
+    Known(Option<String>),
+}
+
+/// Something to open in the user's editor.
+enum Open {
+    Path {
+        path: PathBuf,
+        line: usize,
+    },
+    /// A file of the pack on screen.
+    PackFile {
+        file: String,
+        line: usize,
+    },
+    /// The captured file the Files tab last fetched.
+    Captured,
+}
+
+/// What the window shows of the selected run; picking another run starts it afresh.
+#[derive(Default)]
+pub struct RunView {
+    /// The task card shown open, and the task the Data pane shows.
+    pub expanded: Option<String>,
+    pub inspect: inspect::Inspect,
+    /// Fan-outs the graph draws with their instances.
+    pub unfolded: HashSet<String>,
+    /// The launch picked to compare against; `None` takes the one before.
+    pub compare_to: Option<String>,
+    /// Only lines from this task or fan-out instance.
+    pub log_task: Option<String>,
+    /// Log blocks opened or folded by hand, by task or instance name.
+    pub log_folds: HashMap<String, bool>,
+    /// The pack file the Pack tab shows; the manifest when none is picked.
+    pub pack_file: Option<String>,
+    /// The pack the user picked to show; `None` shows a draft run's working copy.
+    pub pack_source: Option<PackSource>,
+    /// What the last pull or save said.
+    pub draft_note: Option<Result<String, String>>,
+    /// Where the last brief for an agent was written, or why it was not.
+    pub handoff_note: Option<Result<PathBuf, String>>,
+}
+
 pub struct App {
     pub repo: String,
+    net: net::Net,
+    /// The profile in use and everything read from it.
+    pub remote: remote::Remote,
+    pub run: RunView,
     local: Client,
     local_seen: u64,
-    live_client: live::Client,
-    live_seen: u64,
-    admin_client: admin::Client,
-    admin_seen: u64,
-    admin_sent: Option<admin::Watch>,
-    /// Schedules, secrets, shares and decision requests as last read.
-    pub admin: admin::AdminView,
-    /// The management pages' picks and half-filled forms.
-    pub desk: admin::Desk,
     lsp: lsp::Lsp,
     lsp_seen: u64,
     /// What `crucible-lsp` last said about the packs on screen.
@@ -229,22 +287,14 @@ pub struct App {
     lsp_sent: Option<(PathBuf, u64)>,
     /// Why the last hand-off to the editor failed.
     pub editor_error: Option<String>,
-    /// The launch key the live worker was last told to read.
-    live_sent: Option<String>,
-    /// The launch the Compare pane reads against, as last asked of the worker.
-    compare_sent: Option<String>,
-    /// The launch picked to compare against; `None` takes the one before.
-    pub compare_to: Option<String>,
-    /// That launch's run, once read.
-    pub live_base: Option<live::Base>,
     pub backend: Backend,
     pub packs: Vec<PackView>,
     pub playbook_search: TextEdit,
     pub owner_filter: OwnerFilter,
     pub origin_filter: OriginFilter,
     pub landed_filter: LandedFilter,
-    pub live: LiveView,
-    pub live_detail: Option<LiveDetail>,
+    /// Whether the sidebar shows the owner, origin and landed filters.
+    pub filters_open: bool,
     pub selection: Option<Selection>,
     /// The log pane's search field; its text filters the log lines shown.
     pub log_search: TextEdit,
@@ -252,24 +302,11 @@ pub struct App {
     pub log_source: LogSource,
     /// Show library `tracing` lines below WARN.
     pub log_chatter: bool,
-    /// Only lines from this task or fan-out instance.
-    pub log_task: Option<String>,
     /// The log's layout when picked; `None` takes the one the log suits.
     pub log_mode: Option<unfurl::LogMode>,
-    /// Log blocks opened or folded by hand, by task or instance name.
-    pub log_folds: HashMap<String, bool>,
-    /// The task card shown open, and the task the Data pane shows.
-    pub expanded: Option<String>,
-    pub inspect: inspect::Inspect,
-    /// Fan-outs the graph draws with their instances.
-    pub unfolded: HashSet<String>,
     /// Which keys run which commands, and the bindings in the config file it could not use.
     pub keymap: keymap::Keymap,
     pub keys_refused: Vec<keymap::Refused>,
-    /// The run finder, while open.
-    pub finder: Option<finder::Finder>,
-    finder_client: finder::Client,
-    finder_seen: u64,
     /// The command palette, while open.
     pub palette: Option<palette::Palette>,
     /// The pane keyboard navigation starts from.
@@ -282,16 +319,8 @@ pub struct App {
     pub recorders: HashMap<keymap::Command, rune_kit::ShortcutRecorderState>,
     /// Where the provider picker's state goes once the launch sheet has closed.
     pub provider_scratch: rune_kit::ComboboxState,
-    /// The pack file the Pack tab shows; the manifest when none is picked.
-    pub pack_file: Option<String>,
     /// The captured file the Files tab shows, by key; the first listed when none is picked.
     pub run_file: Option<String>,
-    /// The captured file last asked of the live worker, by run and key.
-    file_sent: Option<(String, String)>,
-    /// The captured file the live worker last fetched.
-    pub opened_file: Option<captured::Opened>,
-    /// The fetched file read as a patch, when it is one.
-    pub file_diff: rune_kit::diff::DiffState,
     pub files_md_source: bool,
     /// The workspace the user arranged; `None` lays each run out by its graph's depth.
     pub layout: Option<Workspace>,
@@ -305,35 +334,14 @@ pub struct App {
     pub logo_clicks: u32,
     /// The logo's top-left on screen, in points; a window move sloshes it.
     pub logo_screen: [f32; 2],
-    /// The newest finished launch already announced.
-    notified: u64,
-    /// The working copy of the draft the shown pack edits, and its files as last read.
-    pub working: Option<Working>,
-    pub working_pack: Option<PackFiles>,
-    /// The working copy as it compiles now.
-    pub working_preview: Option<preview::Preview>,
-    /// Whether the run views show the run or the pack as it compiles now; `None` shows the run
-    /// when there is one.
-    pub graph_source: Option<GraphSource>,
-    pub working_edited: bool,
-    working_read: Option<std::time::Instant>,
-    /// The pack the user picked to show; `None` shows a draft run's working copy.
-    pub pack_source: Option<PackSource>,
-    /// What the last pull or save said, and whether one is on its way.
-    pub draft_note: Option<Result<String, String>>,
-    pub draft_busy: bool,
-    draft_after: u64,
-    /// Where the last brief for an agent was written, or why it was not.
-    pub handoff_note: Option<Result<PathBuf, String>>,
-    /// The profile in use, and every profile started so far with what it keeps running.
-    pub target: profile::Target,
+    /// Every profile started so far, with what it keeps running.
     targets: HashMap<String, (profile::Target, Option<profile::Keeper>)>,
     /// The profile being added or edited in Settings.
     pub profile_form: Option<profile::Form>,
+    /// Why the last move of keys between the key files and the keychain failed.
+    pub keys_error: Option<String>,
     /// The account row's menu of profiles and local packs, while open.
     pub source_menu: bool,
-    /// The launch whose budget the Dock icon shows.
-    pub pinned: Option<String>,
     /// What the Dock and the menu bar were last told to show.
     tray: Option<tray::Shown>,
     /// The profiles not in use, as the background worker last read them, and which it reads.
@@ -348,30 +356,17 @@ pub struct App {
     /// Folders the system opened with the app, to launch, and the loop's waker once it runs.
     opened: Option<std::sync::mpsc::Receiver<Vec<PathBuf>>>,
     open_wake: std::sync::Arc<std::sync::Mutex<Option<Waker>>>,
-    /// The newest drop reply taken.
-    dropped_seen: u64,
     /// The places the window showed, to go back and forward through.
     history: history::History,
-    /// A key pasted for the profile in use, for one the browser cannot reach.
-    pub key_paste: TextEdit,
-    /// How the last browser sign-in went.
-    pub signing_in: bool,
-    pub sign_in_error: Option<String>,
-    sign_in_done: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
     waker: Option<Waker>,
-    /// Playbooks the controller has registered: the ones a launch form can start.
-    pub registered: Vec<String>,
-    /// The open launch form, when there is one.
-    pub launcher: Option<Launcher>,
-    /// The newest worker reply a launch form has taken.
-    replies: u64,
     /// Where a text field's edits land once its form has closed.
     pub scratch: TextEdit,
     pub settings: Settings,
     /// The Pack tab shows a Markdown file's source rather than its rendering.
     pub pack_md_source: bool,
-    /// `$VISUAL` or `$EDITOR` as the user's shell sets them, read once when first needed.
-    login_editor: std::cell::OnceCell<Option<String>>,
+    login_editor: LoginEditor,
+    /// What waits to open until the login shell has named the editor.
+    opening: Option<Open>,
     /// The editor command field in Settings.
     pub editor_command: TextEdit,
     /// The drop ceilings as typed in Settings, and why the last pair did not take.
@@ -422,7 +417,7 @@ impl App {
 
     /// The sidebar's live rows: each playbook's newest launch the filters keep.
     pub fn visible_playbooks(&self) -> Vec<&LivePlaybook> {
-        self.live.playbooks(&self.launch_filter())
+        self.remote.live.playbooks(&self.launch_filter())
     }
 
     /// Whether the sidebar is showing a subset of the active backend's list.
@@ -450,7 +445,8 @@ impl App {
         let Some(Selection::Live { playbook, launch }) = &self.selection else {
             return None;
         };
-        self.live
+        self.remote
+            .live
             .resolve(playbook, launch.as_deref(), &self.launch_filter())
     }
 
@@ -466,10 +462,32 @@ impl App {
         }
     }
 
-    /// The workspace to draw: the user's own, or one fitted to the selected run's graph.
+    /// The tasks the run views draw: the selected run's, or its pack's as it compiles now.
+    pub fn shown_tasks(&self) -> &[TaskView] {
+        let run = self.run_tasks();
+        let preview = match &self.selection {
+            Some(Selection::Local(_)) => self.selected_pack().map(|pack| &pack.preview),
+            Some(Selection::Live { .. }) => self.remote.working_preview.as_ref(),
+            None => None,
+        };
+        match preview {
+            Some(preview)
+                if GraphSource::previews(
+                    self.remote.graph_source,
+                    !run.is_empty(),
+                    !preview.fold.tasks.is_empty(),
+                ) =>
+            {
+                &preview.fold.tasks
+            }
+            _ => run,
+        }
+    }
+
+    /// The workspace to draw: the user's own, or one fitted to the graph on screen.
     pub fn workspace(&self) -> Workspace {
         self.layout.clone().unwrap_or_else(|| {
-            let tasks = self.run_tasks();
+            let tasks = self.shown_tasks();
             let mut fitted = Workspace::for_depth(workspace::depth(
                 tasks
                     .iter()
@@ -515,8 +533,9 @@ impl App {
 
     pub fn selected_detail(&self) -> Option<&LiveDetail> {
         let launch = self.selected_live()?;
-        self.live_detail
-            .as_ref()
+        self.remote
+            .live_detail
+            .as_deref()
             .filter(|detail| detail.key == launch.key)
     }
 
@@ -524,7 +543,9 @@ impl App {
     pub fn shown_pack(&self) -> Option<&PackFiles> {
         match &self.selection {
             Some(Selection::Local(_)) => self.selected_pack().map(|pack| &pack.pack),
-            Some(Selection::Live { .. }) if self.showing_working() => self.working_pack.as_ref(),
+            Some(Selection::Live { .. }) if self.showing_working() => {
+                self.remote.working_pack.as_ref()
+            }
             Some(Selection::Live { .. }) => self.selected_detail()?.pack.as_ref().ok(),
             None => None,
         }
@@ -534,6 +555,7 @@ impl App {
     pub fn shown_file(&self) -> Option<(&PackFiles, &PackFile)> {
         let pack = self.shown_pack()?;
         let file = self
+            .run
             .pack_file
             .as_deref()
             .and_then(|path| pack.file(path))
@@ -570,83 +592,162 @@ impl App {
         }
     }
 
-    /// The command the user set, or the editor app to open files in.
-    fn editor(&self) -> Result<Result<Editor, String>, String> {
+    /// The command the user set, or the editor app to open files in. `None` while the login
+    /// shell is still being asked which editor it names.
+    fn editor(&mut self) -> Option<Result<Result<Editor, String>, String>> {
         let command = self.settings.editor_command.trim();
         if self.settings.editor_custom && !command.is_empty() {
-            return Ok(Err(command.to_string()));
+            return Some(Ok(Err(command.to_string())));
         }
         if self.settings.editor_custom {
-            return Err(format!(
+            return Some(Err(format!(
                 "Set the editor command in Settings, like `{}`",
                 editor::EXAMPLE
-            ));
+            )));
         }
         match self.settings.editor {
-            Some(app) => Ok(Ok(app)),
-            None => Editor::detect(
-                self.login_editor
-                    .get_or_init(editor::login_editor)
-                    .as_deref(),
-            ),
+            Some(app) => Some(Ok(Ok(app))),
+            None => {
+                let named = self.login_editor()?;
+                Some(Editor::detect(named.as_deref()))
+            }
+        }
+    }
+
+    /// The editor the user's shell names, asked of a login shell on a thread of its own the
+    /// first time. `None` until that answers.
+    fn login_editor(&mut self) -> Option<Option<String>> {
+        match &self.login_editor {
+            LoginEditor::Known(named) => return Some(named.clone()),
+            LoginEditor::Asking(_) => return None,
+            LoginEditor::Unasked => {}
+        }
+        if let Some(own) = editor::env_editor() {
+            self.login_editor = LoginEditor::Known(Some(own.clone()));
+            return Some(Some(own));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waker = self.waker.clone();
+        let asked = std::thread::Builder::new()
+            .name("crucible-playbooks-login-editor".into())
+            .spawn(move || {
+                let _ = tx.send(editor::shell_editor());
+                if let Some(waker) = waker {
+                    waker();
+                }
+            });
+        match asked {
+            Ok(_) => {
+                self.login_editor = LoginEditor::Asking(rx);
+                None
+            }
+            Err(_) => {
+                self.login_editor = LoginEditor::Known(None);
+                Some(None)
+            }
+        }
+    }
+
+    /// Take the login shell's answer, and open what was waiting on it.
+    fn finish_login_editor(&mut self) -> bool {
+        let LoginEditor::Asking(rx) = &self.login_editor else {
+            return false;
+        };
+        let named = match rx.try_recv() {
+            Ok(named) => named,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.login_editor = LoginEditor::Known(named);
+        if let Some(what) = self.opening.take() {
+            self.open(what);
+        }
+        true
+    }
+
+    /// Open `what` in the user's editor, once it is known which that is.
+    fn open(&mut self, what: Open) {
+        let Some(editor) = self.editor() else {
+            self.opening = Some(what);
+            return;
+        };
+        self.editor_error = match editor {
+            Ok(editor) => self.open_with(editor, &what).err(),
+            Err(why) => Some(why),
+        };
+    }
+
+    fn open_with(&self, editor: Result<Editor, String>, what: &Open) -> Result<(), String> {
+        let root = std::path::Path::new("/");
+        match what {
+            Open::Path { path, line } => match editor {
+                Ok(app) => editor::open_file(app, path, *line),
+                Err(command) => {
+                    editor::run_command(&command, path, *line, path.parent().unwrap_or(root))
+                }
+            },
+            Open::PackFile { file, line } => {
+                let Some(pack) = self.shown_pack() else {
+                    return Ok(());
+                };
+                match (&pack.disk, pack.file(file), editor) {
+                    (Some(Disk::Checkout(dir)), _, Ok(app)) => {
+                        editor::open_file(app, &dir.join(file), *line)
+                    }
+                    (Some(Disk::Checkout(dir)), _, Err(command)) => {
+                        editor::run_command(&command, &dir.join(file), *line, dir)
+                    }
+                    (
+                        _,
+                        Some(PackFile {
+                            text: Some(text), ..
+                        }),
+                        Ok(app),
+                    ) => editor::open_text(app, text),
+                    (
+                        _,
+                        Some(PackFile {
+                            text: Some(text), ..
+                        }),
+                        Err(command),
+                    ) => editor::scratch(file, text).and_then(|path| {
+                        editor::run_command(&command, &path, *line, path.parent().unwrap_or(root))
+                    }),
+                    _ => Err(format!("{file} has no text to open")),
+                }
+            }
+            Open::Captured => {
+                let path = self
+                    .remote
+                    .opened_file
+                    .as_ref()
+                    .and_then(|file| file.disk.clone())
+                    .ok_or("The file has no copy on disk to open")?;
+                match editor {
+                    Ok(app) => editor::open_file(app, &path, 1),
+                    Err(command) => {
+                        editor::run_command(&command, &path, 1, path.parent().unwrap_or(root))
+                    }
+                }
+            }
         }
     }
 
     /// Open line `line` (1-based) of the file at `path` in the user's editor.
     pub fn open_path_in_editor(&mut self, path: &std::path::Path, line: usize) {
-        self.editor_error = match self.editor() {
-            Ok(Ok(app)) => editor::open_file(app, path, line),
-            Ok(Err(command)) => editor::run_command(
-                &command,
-                path,
-                line,
-                path.parent().unwrap_or(std::path::Path::new("/")),
-            ),
-            Err(why) => Err(why),
-        }
-        .err();
+        self.open(Open::Path {
+            path: path.to_path_buf(),
+            line,
+        });
     }
 
     /// Open line `line` (1-based) of pack file `file` in the user's editor: the file itself from
     /// a checkout, or its text as a scratch buffer from a controller's copy.
     pub fn open_in_editor(&mut self, file: &str, line: usize) {
-        let editor = match self.editor() {
-            Ok(editor) => editor,
-            Err(why) => {
-                self.editor_error = Some(why);
-                return;
-            }
-        };
-        let Some(pack) = self.shown_pack() else {
-            return;
-        };
-        let result = match (&pack.disk, pack.file(file), editor) {
-            (Some(Disk::Checkout(dir)), _, Ok(app)) => {
-                editor::open_file(app, &dir.join(file), line)
-            }
-            (Some(Disk::Checkout(dir)), _, Err(command)) => {
-                editor::run_command(&command, &dir.join(file), line, dir)
-            }
-            (
-                _,
-                Some(PackFile {
-                    text: Some(text), ..
-                }),
-                Ok(app),
-            ) => editor::open_text(app, text),
-            (
-                _,
-                Some(PackFile {
-                    text: Some(text), ..
-                }),
-                Err(command),
-            ) => editor::scratch(file, text).and_then(|path| {
-                let dir = path.parent().unwrap_or(std::path::Path::new("/"));
-                editor::run_command(&command, &path, line, dir)
-            }),
-            _ => Err(format!("{file} has no text to open")),
-        };
-        self.editor_error = result.err();
+        self.open(Open::PackFile {
+            file: file.to_string(),
+            line,
+        });
     }
 
     fn apply_local(&mut self, snapshot: Snapshot) {
@@ -657,18 +758,18 @@ impl App {
 
     /// Announces launches by the signed-in user that finished since the last snapshot.
     fn announce(&mut self, finished: &[live::Finished]) {
-        let me = match &self.live {
+        let me = match &*self.remote.live {
             LiveView::Ready { identity, .. } => identity.user.clone(),
             _ => String::new(),
         };
-        let seen = self.notified;
+        let seen = self.remote.notified;
         for done in finished.iter().filter(|done| done.seq > seen) {
-            self.notified = done.seq;
+            self.remote.notified = done.seq;
             let looking = notify::app_focused()
                 && self
                     .selected_live()
                     .is_some_and(|live| live.key == done.key);
-            let pinned = self.pinned.as_deref() == Some(done.key.as_str());
+            let pinned = self.remote.pinned.as_deref() == Some(done.key.as_str());
             if self.settings.notify
                 && ((!me.is_empty() && done.by == me) || pinned)
                 && !looking
@@ -681,7 +782,7 @@ impl App {
 
     /// Opens a launch form for `target` and asks for its schema.
     pub fn open_launcher(&mut self, target: Target) {
-        self.launcher = Some(Launcher {
+        self.remote.launcher = Some(Launcher {
             target: target.clone(),
             stage: Stage::Reading,
             fields: Vec::new(),
@@ -695,10 +796,10 @@ impl App {
             digest: None,
             rerun: None,
             schedule: None,
-            after: self.replies,
+            after: self.remote.replies,
             filled: 0,
         });
-        self.live_client.prepare(target);
+        self.remote.live_client.prepare(target);
     }
 
     /// Opens the launch sheet on `schedule`'s playbook, to edit when and how it fires.
@@ -709,14 +810,14 @@ impl App {
             Target::Playbook(schedule.playbook.clone())
         };
         self.open_launcher(target);
-        if let Some(launcher) = &mut self.launcher {
+        if let Some(launcher) = &mut self.remote.launcher {
             launcher.schedule = Some(admin::ScheduleForm::editing(schedule));
         }
     }
 
     /// Sends the form, or marks what has to change first.
     pub fn submit_launch(&mut self) {
-        let Some(launcher) = &mut self.launcher else {
+        let Some(launcher) = &mut self.remote.launcher else {
             return;
         };
         let answers: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
@@ -768,13 +869,16 @@ impl App {
         );
         runs_on.pin(&mut body);
         launcher.stage = Stage::Sending;
-        launcher.after = self.replies;
-        self.live_client.launch(launcher.target.clone(), body);
+        launcher.after = self.remote.replies;
+        self.remote
+            .live_client
+            .launch(launcher.target.clone(), body);
     }
 
     /// The newest launch of `playbook` the list shows, to prefill a form from.
     fn newest_launch(&self, playbook: &str) -> Option<&LivePlaybook> {
-        self.live
+        self.remote
+            .live
             .launches_of(playbook)
             .max_by_key(|launch| launch.landed)
     }
@@ -785,14 +889,14 @@ impl App {
         prepared: Option<live::Prepared>,
         launched: Option<live::Launched>,
     ) {
-        let Some(after) = self.launcher.as_ref().map(|l| l.after) else {
+        let Some(after) = self.remote.launcher.as_ref().map(|l| l.after) else {
             return;
         };
         if let Some(launched) = launched.filter(|l| l.seq > after) {
-            self.replies = self.replies.max(launched.seq);
+            self.remote.replies = self.remote.replies.max(launched.seq);
             match launched.result {
                 Ok(key) => {
-                    self.launcher = None;
+                    self.remote.launcher = None;
                     self.backend = Backend::Controller;
                     self.select(Selection::Live {
                         playbook: launched.playbook,
@@ -800,7 +904,7 @@ impl App {
                     });
                 }
                 Err(error) => {
-                    if let Some(launcher) = &mut self.launcher {
+                    if let Some(launcher) = &mut self.remote.launcher {
                         launcher.stage = Stage::Ready;
                         launcher.refusal = Some(form::Refusal::from(error.as_str()).0);
                     }
@@ -808,13 +912,17 @@ impl App {
             }
             return;
         }
-        let filled = self.launcher.as_ref().map_or(0, |l| l.filled);
-        let Some(prepared) = prepared.filter(|p| p.seq > after && p.seq > filled) else {
+        let filled = self.remote.launcher.as_ref().map_or(0, |l| l.filled);
+        let wanted = self.remote.launcher.as_ref().map(|l| l.target.clone());
+        let Some(prepared) = prepared
+            .filter(|p| p.seq > after && p.seq > filled && Some(&p.target) == wanted.as_ref())
+        else {
             return;
         };
-        self.replies = self.replies.max(prepared.seq);
+        self.remote.replies = self.remote.replies.max(prepared.seq);
         let newest = self.newest_launch(prepared.target.id()).cloned();
         let stored = self
+            .remote
             .launcher
             .as_ref()
             .and_then(|l| l.schedule.as_ref())
@@ -835,7 +943,7 @@ impl App {
                 .and_then(|record| runs_on::RunsOn::try_from(record).ok())
                 .unwrap_or_default(),
         };
-        let Some(launcher) = &mut self.launcher else {
+        let Some(launcher) = &mut self.remote.launcher else {
             return;
         };
         launcher.filled = prepared.seq;
@@ -887,10 +995,10 @@ impl App {
     }
 
     fn apply_live(&mut self, snapshot: live::Snapshot) {
-        self.live = snapshot.view;
-        self.live_detail = snapshot.detail;
-        self.live_base = snapshot.base;
-        self.registered = snapshot.registered;
+        self.remote.live = snapshot.view;
+        self.remote.live_detail = snapshot.detail;
+        self.remote.live_base = snapshot.base;
+        self.remote.registered = snapshot.registered;
         self.answer_rerun(snapshot.reran);
         self.answer_launcher(snapshot.prepared, snapshot.launched);
         self.answer_draft(snapshot.synced);
@@ -906,8 +1014,11 @@ impl App {
             (Backend::Local, Some(Selection::Local(name))) => {
                 self.visible_packs().any(|pack| &pack.name == name)
             }
-            (Backend::Controller, Some(Selection::Live { playbook, .. })) => match &self.live {
-                LiveView::Ready { .. } => self.live.launches_of(playbook).next().is_some(),
+            (Backend::Controller, Some(Selection::Live { playbook, .. })) => match &*self
+                .remote
+                .live
+            {
+                LiveView::Ready { .. } => self.remote.live.launches_of(playbook).next().is_some(),
                 LiveView::Loading | LiveView::Unavailable(_) => true,
             },
             _ => false,
@@ -915,10 +1026,10 @@ impl App {
         if !valid {
             self.selection = self.initial_selection();
         } else if let (LiveView::Ready { .. }, Some(Selection::Live { launch, .. })) =
-            (&self.live, &mut self.selection)
+            (&*self.remote.live, &mut self.selection)
             && launch
                 .as_deref()
-                .is_some_and(|key| self.live.launch(key).is_none())
+                .is_some_and(|key| self.remote.live.launch(key).is_none())
         {
             *launch = None;
         }
@@ -948,9 +1059,9 @@ impl App {
     /// and the filters all move it, so this runs once per frame.
     fn sync_live(&mut self) {
         let key = self.selected_live().map(|launch| launch.key.clone());
-        if key != self.live_sent {
-            self.live_client.select(key.as_deref());
-            self.live_sent = key;
+        if key != self.remote.live_sent {
+            self.remote.live_client.select(key.as_deref());
+            self.remote.live_sent = key;
         }
         let base = self
             .workspace()
@@ -958,22 +1069,25 @@ impl App {
             .then(|| self.compare_base())
             .flatten()
             .map(|launch| launch.key.clone());
-        if base != self.compare_sent {
-            self.live_client.compare(base.as_deref());
-            self.compare_sent = base;
+        if base != self.remote.compare_sent {
+            self.remote.live_client.compare(base.as_deref());
+            self.remote.compare_sent = base;
         }
         let file = self.wanted_file();
-        if file != self.file_sent {
-            if let Some((run, key)) = &file {
-                self.live_client.file(run, key);
+        if file != self.remote.file_sent {
+            if let Some((run, key, size)) = &file {
+                let settled = self
+                    .selected_live()
+                    .is_some_and(|launch| !launch.status.is_running());
+                self.remote.live_client.file(run, key, *size, settled);
             }
-            self.file_sent = file;
+            self.remote.file_sent = file;
         }
     }
 
-    /// The run and key of the captured file the Files tab shows, while it is open and the file
-    /// is small enough to draw.
-    fn wanted_file(&self) -> Option<(String, String)> {
+    /// The run, key and listed size of the captured file the Files tab shows, while it is open
+    /// and the file is small enough to draw. A size that moves fetches the file again.
+    fn wanted_file(&self) -> Option<(String, String, u64)> {
         if !self.workspace().showing(PaneKind::Files) {
             return None;
         }
@@ -981,17 +1095,17 @@ impl App {
         let run = detail.run_id.clone()?;
         let files = detail.files.as_ref()?.as_ref().ok()?;
         let file = captured::pick(files, self.run_file.as_deref())?;
-        file.shown().then(|| (run, file.key.clone()))
+        file.shown().then(|| (run, file.key.clone(), file.size))
     }
 
     /// Show the captured file under `key`, fetching it again if it is the one already asked for.
     pub fn pick_file(&mut self, key: &str) {
         self.run_file = Some(key.to_string());
-        self.file_sent = None;
+        self.remote.file_sent = None;
     }
 
     fn answer_file(&mut self, file: Option<captured::Opened>) {
-        if file == self.opened_file {
+        if file == self.remote.opened_file {
             return;
         }
         if let Some(captured::Opened {
@@ -1001,32 +1115,14 @@ impl App {
         }) = &file
             && captured::Kind::of(key) == captured::Kind::Patch
         {
-            self.file_diff.set_files(rune_kit::diff::parse(text));
+            self.remote.file_diff.set_files(rune_kit::diff::parse(text));
         }
-        self.opened_file = file;
+        self.remote.opened_file = file;
     }
 
     /// Open the fetched captured file's copy on disk in the user's editor.
     pub fn open_captured(&mut self) {
-        let editor = match self.editor() {
-            Ok(editor) => editor,
-            Err(why) => {
-                self.editor_error = Some(why);
-                return;
-            }
-        };
-        let Some(path) = self.opened_file.as_ref().and_then(|file| file.disk.clone()) else {
-            self.editor_error = Some("The file has no copy on disk to open".to_string());
-            return;
-        };
-        let result = match editor {
-            Ok(app) => editor::open_file(app, &path, 1),
-            Err(command) => {
-                let dir = path.parent().unwrap_or(std::path::Path::new("/"));
-                editor::run_command(&command, &path, 1, dir)
-            }
-        };
-        self.editor_error = result.err();
+        self.open(Open::Captured);
     }
 
     /// Earlier launches of the selected one's playbook that ran, newest first.
@@ -1035,6 +1131,7 @@ impl App {
             return Vec::new();
         };
         let mut earlier: Vec<&live::LivePlaybook> = self
+            .remote
             .live
             .launches_of(&selected.id)
             .filter(|launch| launch.key != selected.key && launch.runs > 0)
@@ -1050,7 +1147,7 @@ impl App {
         let candidates = self.compare_candidates();
         candidates
             .iter()
-            .find(|launch| Some(&launch.key) == self.compare_to.as_ref())
+            .find(|launch| Some(&launch.key) == self.run.compare_to.as_ref())
             .or_else(|| {
                 candidates
                     .iter()
@@ -1062,63 +1159,76 @@ impl App {
     /// Sign in to the profile in use through the browser, on a thread of its own since it waits
     /// for the person.
     pub fn sign_in(&mut self) {
-        if self.signing_in {
+        if self.remote.signing_in {
             return;
         }
-        let target = self.target.clone();
+        let target = self.remote.target.clone();
         let waker = self.waker.clone();
+        let runtime = self.net.handle();
         let (tx, rx) = std::sync::mpsc::channel();
-        self.signing_in = true;
-        self.sign_in_error = None;
-        self.sign_in_done = Some(rx);
+        let (cancel, stop) = signin::Cancel::new();
+        self.remote.signing_in = true;
+        self.remote.sign_in_error = None;
+        self.remote.sign_in_done = Some(rx);
+        self.remote.sign_in_cancel = Some(cancel);
         let spawned = std::thread::Builder::new()
             .name("crucible-playbooks-sign-in".into())
             .spawn(move || {
-                let _ = tx.send(signin::sign_in(&target));
+                let _ = tx.send(signin::sign_in(&target, runtime, &stop));
                 if let Some(waker) = waker {
                     waker();
                 }
             });
         if let Err(e) = spawned {
-            self.signing_in = false;
-            self.sign_in_done = None;
-            self.sign_in_error = Some(format!("starting the sign-in: {e}"));
+            self.cancel_sign_in();
+            self.remote.sign_in_error = Some(format!("starting the sign-in: {e}"));
         }
+    }
+
+    /// Stop waiting on the browser.
+    pub fn cancel_sign_in(&mut self) {
+        self.remote.signing_in = false;
+        self.remote.sign_in_done = None;
+        self.remote.sign_in_cancel = None;
     }
 
     /// Take a finished sign-in's answer; a new key means connecting again.
     fn finish_sign_in(&mut self) -> bool {
-        let Some(answer) = self.sign_in_done.as_ref().and_then(|rx| rx.try_recv().ok()) else {
+        let Some(answer) = self
+            .remote
+            .sign_in_done
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        else {
             return false;
         };
-        self.sign_in_done = None;
-        self.signing_in = false;
+        self.cancel_sign_in();
         match answer {
             Ok(()) => self.reconnect(),
-            Err(why) => self.sign_in_error = Some(why),
+            Err(why) => self.remote.sign_in_error = Some(why),
         }
         true
     }
 
     /// Keep the pasted key as the profile's, and connect with it.
     pub fn save_pasted_key(&mut self) {
-        let key = self.key_paste.text.trim().to_string();
+        let key = self.remote.key_paste.text.trim().to_string();
         if key.is_empty() {
             return;
         }
-        match self.target.save_key(key) {
+        match self.remote.target.save_key(key) {
             Ok(()) => {
-                self.key_paste = TextEdit::new("");
-                self.sign_in_error = None;
+                self.remote.key_paste = TextEdit::new("");
+                self.remote.sign_in_error = None;
                 self.reconnect();
             }
-            Err(why) => self.sign_in_error = Some(why),
+            Err(why) => self.remote.sign_in_error = Some(why),
         }
     }
 
     fn reconnect(&mut self) {
-        self.live_client.reconnect();
-        self.admin_client.reconnect();
+        self.remote.live_client.reconnect();
+        self.remote.admin_client.reconnect();
     }
 
     /// Open what `link` names: a playbook, one of its launches with a task open, or a local pack.
@@ -1129,7 +1239,7 @@ impl App {
             Link::Decision { id } => {
                 self.backend = Backend::Controller;
                 self.page = Page::Decisions;
-                self.desk.pick_decision(id);
+                self.remote.desk.pick_decision(id);
             }
             Link::Playbook { id } => {
                 self.backend = Backend::Controller;
@@ -1146,7 +1256,7 @@ impl App {
                     launch: Some(key.clone()),
                 });
                 if let Some(task) = task {
-                    self.expanded = Some(task.clone());
+                    self.run.expanded = Some(task.clone());
                     self.show_pane(PaneKind::Tasks);
                 }
             }
@@ -1183,38 +1293,29 @@ impl App {
     }
 
     fn forget_run_view(&mut self) {
-        self.expanded = None;
-        self.inspect = inspect::Inspect::default();
-        self.unfolded.clear();
-        self.compare_to = None;
-        self.log_task = None;
-        self.log_folds.clear();
-        self.pack_file = None;
-        self.pack_source = None;
-        self.draft_note = None;
-        self.handoff_note = None;
+        self.run = RunView::default();
     }
 
     /// Selects instance `key` of fan-out `task` from the graph and shows its output in Data.
     pub fn pick_instance(&mut self, task: &str, key: &str) {
-        self.expanded = Some(task.to_string());
-        self.inspect.from = None;
-        self.inspect.pick = Some(inspect::Pick::Instance(key.to_string()));
+        self.run.expanded = Some(task.to_string());
+        self.run.inspect.from = None;
+        self.run.inspect.pick = Some(inspect::Pick::Instance(key.to_string()));
         self.show_pane(PaneKind::Data);
     }
 
     pub fn toggle_unfolded(&mut self, task: &str) {
-        if !self.unfolded.remove(task) {
-            self.unfolded.insert(task.to_string());
+        if !self.run.unfolded.remove(task) {
+            self.run.unfolded.insert(task.to_string());
         }
     }
 
     /// Selects `task` from the graph, with `from` when its edge from that dependency was picked:
     /// the Data pane shows it when in front, else the edge opens Data and a node opens Tasks.
     pub fn pick_task(&mut self, task: &str, from: Option<&str>) {
-        self.expanded = Some(task.to_string());
-        self.inspect.from = from.map(ToString::to_string);
-        self.inspect.pick = None;
+        self.run.expanded = Some(task.to_string());
+        self.run.inspect.from = from.map(ToString::to_string);
+        self.run.inspect.pick = None;
         if !self.workspace().showing(PaneKind::Data) {
             self.show_pane(if from.is_some() {
                 PaneKind::Data
@@ -1225,7 +1326,7 @@ impl App {
     }
 
     pub fn toggle_task(&mut self, name: &str) {
-        self.expanded = match self.expanded.take() {
+        self.run.expanded = match self.run.expanded.take() {
             Some(open) if open == name => None,
             _ => Some(name.to_string()),
         };
@@ -1234,12 +1335,12 @@ impl App {
     /// Show only `task`'s lines, its block opened, or every line again.
     pub fn filter_log(&mut self, task: Option<&str>) {
         if let Some(task) = task {
-            self.log_folds.insert(task.to_string(), true);
+            self.run.log_folds.insert(task.to_string(), true);
             if let Some((parent, _)) = task.split_once('[') {
-                self.log_folds.insert(parent.to_string(), true);
+                self.run.log_folds.insert(parent.to_string(), true);
             }
         }
-        self.log_task = task.map(ToString::to_string);
+        self.run.log_task = task.map(ToString::to_string);
     }
 
     pub fn set_log_font(&mut self, font: LogFont) {
@@ -1256,7 +1357,7 @@ impl App {
 
     /// What the signed-in user may own things as, themself first.
     pub fn owners(&self) -> Vec<String> {
-        match &self.live {
+        match &*self.remote.live {
             LiveView::Ready { identity, .. } if !identity.owners.is_empty() => {
                 identity.owners.clone()
             }
@@ -1328,59 +1429,42 @@ fn init() -> App {
         }
     });
     let (name, chosen) = profile::pick(&settings);
-    let target = profile::Target::new(&name, chosen, &settings.keys_dir());
-    let keeper = target.start(&repo, profile::supervisor());
+    let target = profile::Target::new(&name, chosen, &settings.keys());
+    let keeper = target.start(&repo, profile::supervisor);
+    let net = net::Net::start();
+    let remote = remote::Remote::new(target.clone(), &net, None);
     App {
         repo: repo.display().to_string(),
+        remote,
+        run: RunView::default(),
         local: Client::spawn(repo),
         local_seen: 0,
-        live_client: live::Client::spawn(target.clone()),
-        live_seen: 0,
-        admin_client: admin::Client::spawn(target.clone()),
-        admin_seen: 0,
-        admin_sent: None,
-        admin: admin::AdminView::default(),
-        desk: admin::Desk::default(),
         lsp: lsp::Lsp::spawn(),
         lsp_seen: 0,
         checks: lsp::View::default(),
         lsp_sent: None,
         editor_error: None,
-        live_sent: None,
-        compare_sent: None,
-        compare_to: None,
-        live_base: None,
         backend: Backend::Controller,
         packs: Vec::new(),
         playbook_search: TextEdit::new(""),
         owner_filter: OwnerFilter::All,
         origin_filter: OriginFilter::All,
         landed_filter: LandedFilter::Any,
-        live: LiveView::Loading,
-        live_detail: None,
+        filters_open: false,
         selection: None,
         log_search: TextEdit::new(""),
         log_view: LogView::All,
         log_source: LogSource::Transcript,
         log_chatter: false,
-        log_task: None,
         log_mode: None,
-        log_folds: HashMap::new(),
-        expanded: None,
-        inspect: inspect::Inspect::default(),
-        unfolded: HashSet::new(),
         keymap,
         keys_refused,
         palette: None,
-        finder: None,
-        finder_client: finder::Client::spawn(target.clone()),
-        finder_seen: 0,
         pane_focus: None,
         notifier: None,
         clicks: None,
         recorders: HashMap::new(),
         provider_scratch: rune_kit::ComboboxState::default(),
-        pack_file: None,
         layout: settings.layout.clone(),
         shown: Vec::new(),
         pane_drag: None,
@@ -1388,42 +1472,22 @@ fn init() -> App {
         geometry: Geometry::default(),
         logo_clicks: 0,
         logo_screen: [0.0; 2],
-        notified: 0,
-        handoff_note: None,
-        targets: HashMap::from([(name, (target.clone(), keeper))]),
-        target,
+        targets: HashMap::from([(name, (target, keeper))]),
         profile_form: None,
+        keys_error: None,
         source_menu: false,
-        pinned: None,
         tray: None,
         fleet: Vec::new(),
-        fleet_client: fleet::Client::spawn(),
+        fleet_client: fleet::Client::spawn(net.handle()),
+        net,
         fleet_seen: 0,
         fleet_sent: Vec::new(),
         approvals_known: HashMap::new(),
         picks: None,
         opened: Some(opened),
         open_wake,
-        dropped_seen: 0,
         history: history::History::default(),
-        key_paste: TextEdit::new(""),
-        signing_in: false,
-        sign_in_error: None,
-        sign_in_done: None,
         waker: None,
-        working: None,
-        working_pack: None,
-        working_preview: None,
-        graph_source: None,
-        working_edited: false,
-        working_read: None,
-        pack_source: None,
-        draft_note: None,
-        draft_busy: false,
-        draft_after: 0,
-        registered: Vec::new(),
-        launcher: None,
-        replies: 0,
         scratch: TextEdit::new(""),
         settings,
         editor_command,
@@ -1431,12 +1495,10 @@ fn init() -> App {
         drop_time,
         drop_error: None,
         drop_failed: None,
-        login_editor: std::cell::OnceCell::new(),
+        login_editor: LoginEditor::Unasked,
+        opening: None,
         pack_md_source: false,
         run_file: None,
-        file_sent: None,
-        opened_file: None,
-        file_diff: rune_kit::diff::DiffState::default(),
         files_md_source: false,
         knobs: rune_knobs::Knobs::default(),
         page: Page::Runs,
@@ -1469,9 +1531,7 @@ fn setup(app: &mut App, waker: Waker) {
         *wake = Some(waker.clone());
     }
     app.local.set_waker(waker.clone());
-    app.live_client.set_waker(waker.clone());
-    app.admin_client.set_waker(waker.clone());
-    app.finder_client.set_waker(waker.clone());
+    app.remote.set_waker(&waker);
     app.fleet_client.set_waker(waker.clone());
     app.lsp.set_waker(waker);
 }
@@ -1485,18 +1545,18 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         app.apply_local(snapshot);
         changed = true;
     }
-    if let Some((version, snapshot)) = app.live_client.take(app.live_seen) {
-        app.live_seen = version;
+    if let Some((version, snapshot)) = app.remote.live_client.take(app.remote.live_seen) {
+        app.remote.live_seen = version;
         app.apply_live(snapshot);
         changed = true;
     }
-    if let Some((version, found)) = app.finder_client.take(app.finder_seen) {
-        app.finder_seen = version;
+    if let Some((version, found)) = app.remote.finder_client.take(app.remote.finder_seen) {
+        app.remote.finder_seen = version;
         app.apply_found(found);
         changed = true;
     }
-    if let Some((version, view)) = app.admin_client.take(app.admin_seen) {
-        app.admin_seen = version;
+    if let Some((version, view)) = app.remote.admin_client.take(app.remote.admin_seen) {
+        app.remote.admin_seen = version;
         app.apply_admin(view);
         changed = true;
     }
@@ -1535,6 +1595,7 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
     app.history.saw(place);
     changed |= app.refresh_working();
     changed |= app.finish_sign_in();
+    changed |= app.finish_login_editor();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
         app.lsp_seen = version;
         app.checks = view;
@@ -1611,7 +1672,7 @@ fn main() {
             ("local", |app: &mut App| {
                 app.backend = Backend::Local;
                 app.select(Selection::Local("playbook".into()));
-                app.expanded = std::env::var("CRUCIBLE_PICK").ok();
+                app.run.expanded = std::env::var("CRUCIBLE_PICK").ok();
                 scene_tab(app);
             }),
             ("settings", |app: &mut App| {
@@ -1636,8 +1697,8 @@ fn main() {
                 }
                 if let Ok(id) = std::env::var("CRUCIBLE_PICK") {
                     match app.page {
-                        Page::Secrets => app.desk.secret = Some(id),
-                        Page::Decisions => app.desk.pick_decision(&id),
+                        Page::Secrets => app.remote.desk.secret = Some(id),
+                        Page::Decisions => app.remote.desk.pick_decision(&id),
                         _ => {}
                     }
                 }
@@ -1682,7 +1743,18 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use crate::GraphSource;
     use crate::model::default_repo;
+
+    #[test]
+    fn the_compiled_pack_is_drawn_when_picked_or_when_nothing_ran() {
+        let previews = GraphSource::previews;
+        assert!(previews(None, false, true));
+        assert!(!previews(None, true, true));
+        assert!(!previews(None, false, false));
+        assert!(previews(Some(GraphSource::Preview), true, false));
+        assert!(!previews(Some(GraphSource::Run), false, true));
+    }
 
     #[test]
     fn the_default_repo_resolves_from_the_crate_directory() {

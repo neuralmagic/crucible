@@ -35,9 +35,10 @@ use rune_theme_opencode::icons as oc;
 
 use crate::editor::Editor;
 use crate::filter::{LandedFilter, OriginFilter, OwnerFilter};
-use crate::live::{LiveDetail, LivePlaybook, LiveView};
+use crate::live::{LaunchStatus, LiveDetail, LivePlaybook, LiveView};
 use crate::logline::{LogLine, activity};
 use crate::model::{PackView, Verdict};
+use crate::net::Down;
 use crate::pack::PackFiles;
 use crate::session::{TaskState, TaskView};
 use crate::settings::{Appearance, LogFont, TextSize, Theme};
@@ -53,6 +54,7 @@ const SIDEBAR_PAD: f32 = 12.0;
 const ROW: f32 = 40.0;
 /// The width of a sidebar filter's label beside its control.
 const FILTER_LABEL: f32 = 40.0;
+const FILTER_TOGGLE: f32 = 28.0;
 
 const TITLE: TextStyle = TextStyle::new(20.0, 640.0).lh(26.0).tracking(-0.2);
 const BRAND: TextStyle = TextStyle::new(15.0, 640.0).lh(20.0);
@@ -316,7 +318,7 @@ pub fn view(app: &App, cx: &mut Cx<App>) -> El {
 }
 
 /// One run, from whichever source, in the shape the detail pane draws.
-struct Pane {
+struct Pane<'a> {
     title: String,
     subtitle: String,
     path: String,
@@ -325,7 +327,7 @@ struct Pane {
     cap: f64,
     passed: usize,
     failed: usize,
-    tasks: Vec<TaskView>,
+    tasks: &'a [TaskView],
     time: String,
     time_note: Option<String>,
     meta: Option<String>,
@@ -333,41 +335,36 @@ struct Pane {
     problem: Option<String>,
     /// Its session is streaming in as the engine writes it.
     streaming: bool,
-    log: Vec<LogLine>,
+    log: &'a [LogLine],
     /// The agents' session transcript; empty for a run whose engine did not record one.
-    transcript: Vec<LogLine>,
+    transcript: &'a [LogLine],
     /// The same, event by event, for reading a turn.
-    agent_events: Vec<crate::session::AgentStep>,
+    agent_events: &'a [crate::session::AgentStep],
     /// Why there is no task list, when there is none.
     empty: (&'static str, String),
-    pack: Result<PackFiles, String>,
+    pack: Result<&'a PackFiles, String>,
     /// The launch record, for the Launch tab; local packs have none.
-    launch: Option<crux::dto::PlaybookLaunch>,
+    launch: Option<&'a crux::dto::PlaybookLaunch>,
     /// The run shown, and the files its tasks captured; `None` until listed.
     run_id: Option<String>,
-    files: Option<Result<Vec<crate::captured::Captured>, String>>,
+    files: Option<Result<&'a [crate::captured::Captured], String>>,
     log_font: LogFont,
     launchable: bool,
     /// The pack as it compiles now: a local pack's, or the run's draft working copy's.
-    preview: Option<crate::preview::Preview>,
+    preview: Option<&'a crate::preview::Preview>,
     /// `tasks` are the preview's, not the run's.
     previewing: bool,
     /// The run's tasks while the preview's are shown, for marking what the edit changed.
-    run_tasks: Vec<TaskView>,
+    run_tasks: &'a [TaskView],
 }
 
-impl Pane {
+impl<'a> Pane<'a> {
     /// Show the compiled pack's tasks when they are picked, or when there is no run to show.
-    fn previewed(mut self, source: Option<crate::GraphSource>) -> Pane {
-        let Some(compiled) = self.preview.as_ref().map(|p| p.fold.tasks.clone()) else {
+    fn previewed(mut self, source: Option<crate::GraphSource>) -> Pane<'a> {
+        let Some(compiled) = self.preview.map(|p| p.fold.tasks.as_slice()) else {
             return self;
         };
-        let show = match source {
-            Some(crate::GraphSource::Preview) => true,
-            Some(crate::GraphSource::Run) => false,
-            None => self.tasks.is_empty() && !compiled.is_empty(),
-        };
-        if show {
+        if crate::GraphSource::previews(source, !self.tasks.is_empty(), !compiled.is_empty()) {
             self.run_tasks = std::mem::replace(&mut self.tasks, compiled);
             self.previewing = true;
         }
@@ -376,16 +373,16 @@ impl Pane {
 
     /// What the agents did: the session transcript when the engine recorded one, otherwise the
     /// console's sampled progress lines.
-    fn agent_lines(&self) -> &[LogLine] {
+    fn agent_lines(&self) -> &'a [LogLine] {
         if self.transcript.is_empty() {
-            &self.log
+            self.log
         } else {
-            &self.transcript
+            self.transcript
         }
     }
 }
 
-fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
+fn local_pane(pack: &PackView, log_font: LogFont) -> Pane<'_> {
     Pane {
         title: pack.name.clone(),
         subtitle: if pack.goal.is_empty() {
@@ -399,7 +396,7 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
         cap: pack.budget_usd,
         passed: pack.passed,
         failed: pack.failed,
-        tasks: pack.tasks.clone(),
+        tasks: &pack.tasks,
         time: pack
             .elapsed
             .clone()
@@ -411,15 +408,15 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
         problem: matches!(pack.verdict, Verdict::Invalid | Verdict::Error)
             .then(|| pack.detail.clone())
             .flatten(),
-        log: pack.log.clone(),
-        transcript: pack.transcript.clone(),
-        agent_events: pack.agent_events.clone(),
+        log: &pack.log,
+        transcript: &pack.transcript,
+        agent_events: &pack.agent_events,
         log_font,
         launchable: true,
-        preview: Some(pack.preview.clone()),
+        preview: Some(&pack.preview),
         previewing: false,
-        run_tasks: Vec::new(),
-        pack: Ok(pack.pack.clone()),
+        run_tasks: &[],
+        pack: Ok(&pack.pack),
         launch: None,
         run_id: None,
         files: Some(Err(
@@ -433,12 +430,12 @@ fn local_pane(pack: &PackView, log_font: LogFont) -> Pane {
 }
 
 /// `pinned` is a launch opened from the runs page, which the breadcrumb already names.
-fn live_pane(
+fn live_pane<'a>(
     launch: &LivePlaybook,
-    detail: Option<&LiveDetail>,
+    detail: Option<&'a LiveDetail>,
     log_font: LogFont,
     pinned: bool,
-) -> Pane {
+) -> Pane<'a> {
     let byline = format!(
         "{} · by {}{}",
         launch.status,
@@ -462,9 +459,7 @@ fn live_pane(
         cap: launch.cap,
         passed: detail.map_or(0, |detail| detail.passed),
         failed: detail.map_or(0, |detail| detail.failed),
-        tasks: detail
-            .map(|detail| detail.fold.tasks.clone())
-            .unwrap_or_default(),
+        tasks: detail.map_or(&[], |detail| &detail.fold.tasks),
         time: format!("at {}", launch.created),
         time_note: Some(cap_note(&launch.max_time)),
         meta: Some(live_meta(&launch.origin, launch.runs, &launch.landed_at)),
@@ -478,26 +473,27 @@ fn live_pane(
                 })
             })?
         }),
-        log: detail.map(|detail| detail.log.clone()).unwrap_or_default(),
-        transcript: detail
-            .map(|detail| detail.fold.transcript.clone())
-            .unwrap_or_default(),
-        agent_events: detail
-            .map(|detail| detail.fold.agent_events.clone())
-            .unwrap_or_default(),
+        log: detail.map_or(&[], |detail| &detail.log),
+        transcript: detail.map_or(&[], |detail| &detail.fold.transcript),
+        agent_events: detail.map_or(&[], |detail| &detail.fold.agent_events),
         log_font,
         launchable: false,
         preview: None,
         previewing: false,
-        run_tasks: Vec::new(),
+        run_tasks: &[],
         empty: live_empty(launch, detail),
         pack: detail.map_or_else(
             || Err("Reading the pack\u{2026}".to_string()),
-            |detail| detail.pack.clone(),
+            |detail| detail.pack.as_ref().map_err(Clone::clone),
         ),
-        launch: detail.and_then(|detail| detail.launch.clone()),
+        launch: detail.and_then(|detail| detail.launch.as_ref()),
         run_id: detail.and_then(|detail| detail.run_id.clone()),
-        files: detail.and_then(|detail| detail.files.clone()),
+        files: detail.and_then(|detail| {
+            detail
+                .files
+                .as_ref()
+                .map(|files| files.as_ref().map(Vec::as_slice).map_err(Clone::clone))
+        }),
     }
 }
 
@@ -524,10 +520,12 @@ fn live_empty(launch: &LivePlaybook, detail: Option<&LiveDetail>) -> (&'static s
 
 fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let source = match app.backend {
-        Backend::Controller => match &app.live {
-            LiveView::Ready { endpoint, .. } => format!("{} \u{b7} {endpoint}", app.target.name),
-            LiveView::Loading => app.target.name.clone(),
-            LiveView::Unavailable(_) => format!("{} \u{b7} not connected", app.target.name),
+        Backend::Controller => match &*app.remote.live {
+            LiveView::Ready { endpoint, .. } => {
+                format!("{} \u{b7} {endpoint}", app.remote.target.name)
+            }
+            LiveView::Loading => app.remote.target.name.clone(),
+            LiveView::Unavailable(_) => format!("{} \u{b7} not connected", app.remote.target.name),
         },
         Backend::Local => app.repo.clone(),
     };
@@ -563,7 +561,7 @@ fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         LiveView::Ready {
             stale: Some(error), ..
         },
-    ) = (app.backend, &app.live)
+    ) = (app.backend, &*app.remote.live)
     {
         head = head.child(
             text(error.clone())
@@ -598,7 +596,7 @@ fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                 ),
         );
     }
-    if app.backend == Backend::Controller {
+    if app.backend == Backend::Controller && app.filters_open {
         head = head.child(filters(app, p));
     }
 
@@ -640,12 +638,12 @@ fn pages_nav(app: &App, p: &Paint) -> El {
         .child(rule("pages-nav-rule", false, p).mb(6.0))
         .child(entry(
             crate::Page::Decisions,
-            &oc::CHECKLIST,
+            &oc::HELP,
             (waiting > 0).then(|| waiting.to_string()),
         ))
         .child(entry(
             crate::Page::Approvals,
-            &oc::CHECKLIST,
+            &oc::CIRCLE_CHECK,
             (app.approvals_waiting() > 0).then(|| app.approvals_waiting().to_string()),
         ))
         .child(entry(crate::Page::Schedules, &oc::STATUS, None))
@@ -655,7 +653,7 @@ fn pages_nav(app: &App, p: &Paint) -> El {
 /// Who is signed in, bottom left, with the settings button beside it. Pressing it opens a menu of
 /// the profiles and the local packs, to switch between them.
 fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
-    let (name, about) = match (app.backend, &app.live) {
+    let (name, about) = match (app.backend, &*app.remote.live) {
         (Backend::Local, _) => ("Local packs".to_string(), source),
         (Backend::Controller, LiveView::Ready { identity, .. }) if !identity.user.is_empty() => {
             let role = if identity.role.is_empty() {
@@ -677,7 +675,7 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
         .map_or("?".to_string(), |c| c.to_uppercase().to_string());
     let place = match app.backend {
         Backend::Local => "Local".to_string(),
-        Backend::Controller => app.target.name.clone(),
+        Backend::Controller => app.remote.target.name.clone(),
     };
     let trigger = row()
         .key("source-menu-button")
@@ -730,7 +728,7 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
         .into_keys()
         .enumerate()
     {
-        let current = app.backend == Backend::Controller && app.target.name == name;
+        let current = app.backend == Backend::Controller && app.remote.target.name == name;
         let mut item = rune_kit::MenuItem::new(name.clone()).checked(current);
         if i < 9 {
             item = item.shortcut(format!("\u{2318}\u{2325}{}", i + 1));
@@ -790,15 +788,38 @@ fn search(app: &App, p: &Paint) -> El {
         Backend::Controller => "Filter playbooks",
         Backend::Local => "Filter packs",
     };
+    let filterable = app.backend == Backend::Controller;
+    let toggle = if filterable { FILTER_TOGGLE + 6.0 } else { 0.0 };
     let mut input = TextInput::new(&app.playbook_search)
         .placeholder(placeholder)
         .leading_icon(&oc::MAGNIFYING_GLASS)
-        .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD))
+        .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD - toggle))
         .on_edit(|app: &mut App| &mut app.playbook_search);
     if !app.playbook_search.text.is_empty() {
         input = input.clear_button();
     }
-    input.build(p.k).key("playbook-search")
+    let filtered = app.owner_filter != OwnerFilter::All
+        || app.origin_filter != OriginFilter::All
+        || app.landed_filter != LandedFilter::Any;
+    row()
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .child(input.build(p.k).key("playbook-search"))
+        .children(filterable.then(|| {
+            IconButton::new(&oc::OUTLINE_DOTS)
+                .variant(if filtered {
+                    IconButtonVariant::Contrast
+                } else if app.filters_open {
+                    IconButtonVariant::Neutral
+                } else {
+                    IconButtonVariant::GhostMuted
+                })
+                .label("Filters")
+                .on_press(|app: &mut App| app.filters_open = !app.filters_open)
+                .build(p.k)
+                .key("filters-toggle")
+        }))
 }
 
 fn filters(app: &App, p: &Paint) -> El {
@@ -883,7 +904,7 @@ fn pack_list(app: &App, p: &Paint) -> El {
         .scroll_edge_fade(10.0);
 
     match app.backend {
-        Backend::Controller => match &app.live {
+        Backend::Controller => match &*app.remote.live {
             LiveView::Ready { now, .. } => {
                 let playbooks = app.visible_playbooks();
                 if playbooks.is_empty() {
@@ -948,8 +969,8 @@ fn note(label: &str, p: &Paint) -> El {
         .py(8.0)
 }
 
-fn unavailable(error: &str, app: &App, p: &Paint) -> El {
-    if let crate::profile::Readiness::Starting(what) = app.target.readiness() {
+fn unavailable(error: &Down, app: &App, p: &Paint) -> El {
+    if let crate::profile::Readiness::Starting(what) = app.remote.target.readiness() {
         return row()
             .key("live-starting")
             .w_full()
@@ -965,7 +986,8 @@ fn unavailable(error: &str, app: &App, p: &Paint) -> El {
             );
     }
     let s = p.tone(Tone::Danger);
-    let action = if app.signing_in {
+    let refused = matches!(error, Down::Refused(_));
+    let action = if app.remote.signing_in {
         row()
             .gap(8.0)
             .center_y()
@@ -974,6 +996,15 @@ fn unavailable(error: &str, app: &App, p: &Paint) -> El {
                 text("Waiting for the browser\u{2026}")
                     .font(p.k.ty.ui)
                     .color(p.c.text_muted),
+            )
+            .child(el().grow(1.0))
+            .child(
+                Button::new("Cancel")
+                    .variant(ButtonVariant::Ghost)
+                    .control_size(rune_kit::ControlSize::Small)
+                    .on_press(|app: &mut App| app.cancel_sign_in())
+                    .build(p.k)
+                    .key("sign-in-cancel"),
             )
     } else {
         row().child(
@@ -1000,31 +1031,36 @@ fn unavailable(error: &str, app: &App, p: &Paint) -> El {
                 .child(text("Not connected").font(p.k.ty.ui_medium).color(s.fg)),
         )
         .child(
-            text(error.to_string())
+            text(error.why().to_string())
                 .font(p.mono(11.0, 400.0))
                 .color(s.fg)
                 .max_lines(4)
                 .wrap(),
         )
         .child(
-            text(format!("{} \u{b7} {}", app.target.name, app.target.url()))
-                .font(p.mono(11.0, 400.0))
-                .color(p.c.text_muted)
-                .truncate(),
+            text(format!(
+                "{} \u{b7} {}",
+                app.remote.target.name,
+                app.remote.target.url()
+            ))
+            .font(p.mono(11.0, 400.0))
+            .color(p.c.text_muted)
+            .truncate(),
         )
-        .child(action)
-        .child(
-            TextInput::new(&app.key_paste)
+        .children(refused.then_some(action))
+        .children(refused.then(|| {
+            TextInput::new(&app.remote.key_paste)
                 .placeholder("or paste a crk_ key")
                 .secure()
                 .width(Some(p.tune.sidebar - 2.0 * SIDEBAR_PAD - 20.0))
-                .on_edit(|app: &mut App| &mut app.key_paste)
+                .on_edit(|app: &mut App| &mut app.remote.key_paste)
                 .on_submit(|app: &mut App, _: &mut Tx| app.save_pasted_key())
                 .build(p.k)
-                .key("sign-in-key"),
-        )
+                .key("sign-in-key")
+        }))
         .children(
-            app.sign_in_error
+            app.remote
+                .sign_in_error
                 .as_ref()
                 .map(|why| text(why.clone()).font(p.k.ty.small).color(s.fg).wrap()),
         )
@@ -1057,7 +1093,10 @@ fn row_meta(playbook: &LivePlaybook) -> String {
     } else {
         playbook.origin.as_str()
     };
-    format!("{} \u{b7} {origin}", playbook.status)
+    match playbook.status {
+        LaunchStatus::Done => origin.to_string(),
+        _ => format!("{} \u{b7} {origin}", playbook.status),
+    }
 }
 
 fn age(landed: i64, now: i64) -> String {
@@ -1115,6 +1154,7 @@ fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec
 fn playbook_launches(app: &App) -> Option<(&str, Vec<&LivePlaybook>)> {
     let playbook = app.selected_playbook()?;
     let launches: Vec<&LivePlaybook> = app
+        .remote
         .live
         .kept(&app.launch_filter())
         .into_iter()
@@ -1146,15 +1186,17 @@ fn verdict_color(verdict: Verdict, p: &Paint) -> Color {
         Verdict::Valid => p.pass,
         Verdict::Invalid | Verdict::Error => p.fail,
         Verdict::Running => p.live,
+        Verdict::Cancelled => p.c.text_muted,
         Verdict::Unfinished | Verdict::NotRun => p.c.text_faint,
     }
 }
 
-fn verdict_tone(verdict: Verdict) -> Option<(Tone, &'static Icon)> {
+fn verdict_icon(verdict: Verdict) -> Option<&'static Icon> {
     match verdict {
-        Verdict::Valid => Some((Tone::Success, &oc::CIRCLE_CHECK)),
-        Verdict::Invalid | Verdict::Error => Some((Tone::Danger, &oc::CIRCLE_X)),
-        Verdict::Running => Some((Tone::Warning, &oc::STATUS)),
+        Verdict::Valid => Some(&oc::CIRCLE_CHECK),
+        Verdict::Invalid | Verdict::Error => Some(&oc::CIRCLE_X),
+        Verdict::Cancelled => Some(&oc::CIRCLE_BAN_SIGN),
+        Verdict::Running => Some(&oc::STATUS),
         Verdict::Unfinished | Verdict::NotRun => None,
     }
 }
@@ -1172,7 +1214,7 @@ fn detail(app: &App, p: &Paint) -> El {
         Some(Selection::Live { launch: None, .. }),
         Some((playbook, launches)),
         LiveView::Ready { now, .. },
-    ) = (&app.selection, playbook_launches(app), &app.live)
+    ) = (&app.selection, playbook_launches(app), &*app.remote.live)
     {
         return runs::runs_page(
             launcher::launch_button(app, playbook, p),
@@ -1189,13 +1231,13 @@ fn detail(app: &App, p: &Paint) -> El {
         Some(Selection::Live { launch, .. }) => {
             let pinned = launch.is_some() && playbook_launches(app).is_some();
             app.selected_live().map(|live| Pane {
-                preview: app.working_preview.clone(),
+                preview: app.remote.working_preview.as_ref(),
                 ..live_pane(live, app.selected_detail(), font, pinned)
             })
         }
         None => None,
     }
-    .map(|pane| pane.previewed(app.graph_source));
+    .map(|pane| pane.previewed(app.remote.graph_source));
 
     let Some(pane) = pane else {
         return col()
@@ -1238,7 +1280,7 @@ fn detail(app: &App, p: &Paint) -> El {
     if let Some(note) = cancel_note(app, p) {
         body = body.child(note);
     }
-    if let Some(note) = &app.handoff_note {
+    if let Some(note) = &app.run.handoff_note {
         let (line, color) = match note {
             Ok(path) => (
                 format!("Brief copied \u{b7} {}", path.display()),
@@ -1278,7 +1320,7 @@ fn cancel_button(app: &App, p: &Paint) -> Option<El> {
         .filter(|l| l.verdict() == crate::model::Verdict::Running)?;
     let key = launch.key.clone();
     let armed_key = format!("cancel:{key}");
-    let armed = app.desk.armed.as_deref() == Some(armed_key.as_str());
+    let armed = app.remote.desk.armed.as_deref() == Some(armed_key.as_str());
     Some(
         Button::new(if armed { "Confirm cancel" } else { "Cancel" })
             .variant(if armed {
@@ -1286,12 +1328,12 @@ fn cancel_button(app: &App, p: &Paint) -> Option<El> {
             } else {
                 ButtonVariant::Ghost
             })
-            .disabled(app.desk.busy())
+            .disabled(app.remote.desk.busy())
             .on_press(move |app: &mut App| {
-                if app.desk.armed.as_deref() == Some(armed_key.as_str()) {
+                if app.remote.desk.armed.as_deref() == Some(armed_key.as_str()) {
                     app.act(crate::admin::Action::CancelLaunch { key: key.clone() });
                 } else {
-                    app.desk.armed = Some(armed_key.clone());
+                    app.remote.desk.armed = Some(armed_key.clone());
                 }
             })
             .build(p.k)
@@ -1301,11 +1343,11 @@ fn cancel_button(app: &App, p: &Paint) -> Option<El> {
 
 /// What the last cancel came to, under the run header.
 fn cancel_note(app: &App, p: &Paint) -> Option<El> {
-    let acted = app.admin.acted.as_ref()?;
+    let acted = app.remote.admin.acted.as_ref()?;
     if acted.did != crate::admin::Did::CancelLaunch {
         return None;
     }
-    let (line, color) = match (&acted.result, app.desk.busy()) {
+    let (line, color) = match (&acted.result, app.remote.desk.busy()) {
         (_, true) => ("Cancelling\u{2026}".to_string(), p.c.text_muted),
         (Ok(_), false) => (
             "Cancel queued: the launch is parked and its pods are being deleted".to_string(),
@@ -1497,7 +1539,7 @@ fn stat_sub(sub: &str, p: &Paint) -> El {
 
 fn status_stat(pane: &Pane, p: &Paint) -> El {
     let ink = verdict_color(pane.verdict, p);
-    let glyph = verdict_tone(pane.verdict).map(|(_, glyph)| glyph);
+    let glyph = verdict_icon(pane.verdict);
     stat_card("status", p).child(
         row()
             .w_full()
@@ -1555,7 +1597,7 @@ fn stat(
 fn tasks_stat(pane: &Pane, p: &Paint) -> El {
     let total = pane.tasks.len().max(1) as f32;
     let mut counts = [0usize; 4];
-    for task in &pane.tasks {
+    for task in pane.tasks {
         let slot = match task.state() {
             TaskState::Settled(status) if status.passed() => 0,
             TaskState::Settled(TaskStatus::Skipped | TaskStatus::NotTaken) => 3,

@@ -2,7 +2,7 @@
 //! add or edit one.
 
 use rune::{El, TextEdit, Tx, col, el, row, text};
-use rune_kit::{Button, ButtonVariant, ControlSize, SegmentedControl, TextInput};
+use rune_kit::{Button, ButtonVariant, ControlSize, SegmentedControl, Switch, TextInput};
 
 use crate::App;
 use crate::profile::{Auth, Form, Readiness};
@@ -23,6 +23,20 @@ pub(crate) fn rows(app: &App, p: &Paint) -> Vec<El> {
             .collect();
     }
     let mut rows = Vec::new();
+    if let Some(why) = &app.settings.unreadable {
+        rows.push(
+            text(format!(
+                "{} {why}. Not saving.",
+                app.settings.config_path().display()
+            ))
+            .key("config-unreadable")
+            .font(p.k.ty.small)
+            .color(p.fail)
+            .wrap()
+            .py(10.0),
+        );
+        rows.push(rule("config-unreadable-sep", false, p));
+    }
     for (i, (name, profile, configured)) in listed.into_iter().enumerate() {
         if i > 0 {
             rows.push(rule(&format!("profile-sep-{i}"), false, p));
@@ -43,6 +57,30 @@ pub(crate) fn rows(app: &App, p: &Paint) -> Vec<El> {
             ),
         ),
     }
+    rows.push(rule("keychain-sep", false, p));
+    rows.push(setting_row(
+        "Keys in keychain",
+        Switch::new(app.settings.keychain)
+            .label("Keys in keychain")
+            .hide_label()
+            .on_toggle(|app: &mut App| {
+                let on = !app.settings.keychain;
+                app.set_keychain(on);
+            })
+            .build(p.k)
+            .key("keychain-switch"),
+        p,
+    ));
+    if let Some(why) = &app.keys_error {
+        rows.push(
+            text(why.clone())
+                .key("keys-error")
+                .font(p.k.ty.small)
+                .color(p.fail)
+                .wrap()
+                .pb(6.0),
+        );
+    }
     rows
 }
 
@@ -54,7 +92,7 @@ fn profile_row(
     place: usize,
     p: &Paint,
 ) -> El {
-    let current = app.target.name == name;
+    let current = app.remote.target.name == name;
     let mut about = col().gap(3.0).grow(1.0).min_w(0.0).child(
         row()
             .gap(8.0)
@@ -90,6 +128,16 @@ fn profile_row(
                         .font(p.mono(10.5, 400.0))
                         .color(p.c.text_faint)
                         .truncate(),
+                );
+            }
+            if current && matches!(app.remote.target.readiness(), Readiness::Failed(_)) {
+                actions = actions.child(
+                    Button::new("Retry")
+                        .variant(ButtonVariant::Neutral)
+                        .control_size(ControlSize::Small)
+                        .on_press(|app: &mut App| app.retry_profile())
+                        .build(p.k)
+                        .key(format!("profile-retry-{name}")),
                 );
             }
             if !current {
@@ -149,10 +197,10 @@ fn profile_row(
 }
 
 fn status(app: &App, p: &Paint) -> El {
-    let (label, color) = match app.target.readiness() {
+    let (label, color) = match app.remote.target.readiness() {
         Readiness::Starting(what) => (what, p.c.text_muted),
         Readiness::Failed(_) => ("tunnel failed".to_string(), p.fail),
-        Readiness::Ready => match &app.live {
+        Readiness::Ready => match &*app.remote.live {
             crate::live::LiveView::Ready { .. } => ("in use".to_string(), p.pass),
             crate::live::LiveView::Loading => ("connecting".to_string(), p.c.text_muted),
             crate::live::LiveView::Unavailable(_) => ("not connected".to_string(), p.fail),

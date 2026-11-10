@@ -2,13 +2,15 @@
 //! is running, and how many decisions and approvals wait on it. Their tunnels are not started; a
 //! profile that does not answer is reported so.
 
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures_util::future::join_all;
 use rune::Waker;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::live::Connection;
+use crate::net::{Connector, Task, within};
 use crate::profile::Target;
 use crate::tray::Running;
 
@@ -33,21 +35,26 @@ impl Status {
 
 type Shared = Arc<Mutex<(u64, Vec<Status>, Option<Waker>)>>;
 
-/// The UI-side handle to the worker. Dropping it stops the thread.
+/// The UI-side handle to the worker. Dropping it ends its task.
 pub struct Client {
-    tx: Sender<Vec<Target>>,
+    tx: UnboundedSender<Vec<Connector>>,
     shared: Shared,
+    _task: Option<Task>,
 }
 
 impl Client {
-    pub fn spawn() -> Self {
-        let (tx, rx) = mpsc::channel();
+    /// With no runtime nothing is read, and the profiles in use say why themselves.
+    pub fn spawn(runtime: Result<Handle, String>) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
         let shared: Shared = Arc::new(Mutex::new((0, Vec::new(), None)));
-        let worker = Arc::clone(&shared);
-        let _ = std::thread::Builder::new()
-            .name("crucible-playbooks-fleet".into())
-            .spawn(move || run(rx, worker));
-        Client { tx, shared }
+        let task = runtime
+            .ok()
+            .map(|runtime| Task::spawn(&runtime, run(rx, Arc::clone(&shared))));
+        Client {
+            tx,
+            shared,
+            _task: task,
+        }
     }
 
     pub fn set_waker(&self, waker: Waker) {
@@ -57,7 +64,7 @@ impl Client {
     }
 
     /// Read these profiles from now on.
-    pub fn watch(&self, targets: Vec<Target>) {
+    pub fn watch(&self, targets: Vec<Connector>) {
         let _ = self.tx.send(targets);
     }
 
@@ -67,22 +74,22 @@ impl Client {
     }
 }
 
-fn run(rx: Receiver<Vec<Target>>, shared: Shared) {
-    let mut targets: Vec<Target> = Vec::new();
+async fn run(mut rx: UnboundedReceiver<Vec<Connector>>, shared: Shared) {
+    let mut targets: Vec<Connector> = Vec::new();
     let mut next = Instant::now() + EVERY;
     loop {
         let wait = next.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(wait) {
-            Ok(now) => {
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(Some(now)) => {
                 targets = now;
                 while let Ok(newer) = rx.try_recv() {
                     targets = newer;
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(None) => return,
+            Err(_) => {}
         }
-        let statuses: Vec<Status> = targets.iter().map(status).collect();
+        let statuses: Vec<Status> = join_all(targets.iter().map(status)).await;
         next = Instant::now() + EVERY;
         let waker = match shared.lock() {
             Ok(mut shared) => {
@@ -98,40 +105,41 @@ fn run(rx: Receiver<Vec<Target>>, shared: Shared) {
     }
 }
 
-fn status(target: &Target) -> Status {
+/// One profile's launches, decisions and approvals, read at once.
+async fn status(connector: &Connector) -> Status {
     let mut status = Status {
-        name: target.name.clone(),
+        name: connector.target().name.clone(),
         ..Status::default()
     };
-    let read = Connection::open(target, None).and_then(|c| {
-        let now = jiff::Timestamp::now().as_second();
-        let launches: Vec<crux::dto::PlaybookRun> = c.call(
+    let c = match connector.connect().await {
+        Ok(c) => c,
+        Err(why) => {
+            status.error = Some(why);
+            return status;
+        }
+    };
+    let (launches, decisions, approvals) = tokio::join!(
+        within(
             "the launch list",
-            c.client.playbook_runs(Some("running"), None),
-        )?;
-        let running = launches
-            .iter()
-            .filter(|l| l.status == "running")
-            .map(|l| running(l, now))
-            .collect();
-        let decisions = c
-            .call("the decision queue", c.client.decisions())
-            .map(|q| q.open.len())
-            .unwrap_or(0);
-        let approvals = c
-            .call(
-                "the approval queue",
-                c.client.approvals::<crux::dto::Approvals>(),
-            )
-            .map(|q| q.waiting())
-            .unwrap_or(0);
-        Ok((running, decisions, approvals))
-    });
-    match read {
-        Ok((running, decisions, approvals)) => {
-            status.running = running;
-            status.decisions = decisions;
-            status.approvals = approvals;
+            c.client
+                .playbook_runs::<Vec<crux::dto::PlaybookRun>>(Some("running"), None),
+        ),
+        within("the decision queue", c.client.decisions()),
+        within(
+            "the approval queue",
+            c.client.approvals::<crux::dto::Approvals>(),
+        ),
+    );
+    match launches {
+        Ok(launches) => {
+            let now = jiff::Timestamp::now().as_second();
+            status.running = launches
+                .iter()
+                .filter(|l| l.status == "running")
+                .map(|l| running(l, now))
+                .collect();
+            status.decisions = decisions.map(|q| q.open.len()).unwrap_or(0);
+            status.approvals = approvals.map(|q| q.waiting()).unwrap_or(0);
         }
         Err(why) => status.error = Some(why),
     }
@@ -162,7 +170,7 @@ impl crate::App {
         }
         let others: Vec<(String, crate::profile::Profile)> = crate::profile::usable(&self.settings)
             .into_iter()
-            .filter(|(name, _)| *name != self.target.name)
+            .filter(|(name, _)| *name != self.remote.target.name)
             .collect();
         if others == self.fleet_sent {
             return;
@@ -171,8 +179,9 @@ impl crate::App {
             .iter()
             .map(|(name, profile)| match self.targets.get(name) {
                 Some((target, _)) if target.profile == *profile => target.clone(),
-                _ => Target::new(name, profile.clone(), &self.settings.keys_dir()),
+                _ => Target::new(name, profile.clone(), &self.settings.keys()),
             })
+            .map(|target| self.net.uncached(target))
             .collect();
         self.fleet
             .retain(|s| others.iter().any(|(name, _)| *name == s.name));
@@ -183,7 +192,61 @@ impl crate::App {
 
 #[cfg(test)]
 mod tests {
-    use crate::fleet::running;
+    use std::time::{Duration, Instant};
+
+    use crate::fleet::{Client, running};
+
+    #[test]
+    fn the_other_profiles_are_read_at_once() {
+        let slow = Duration::from_secs(1);
+        let (url, _) = crate::testserver::serve(move |request| {
+            std::thread::sleep(slow);
+            match request.split_whitespace().nth(1) {
+                Some("/api/decisions") => r#"{"open":[]}"#.into(),
+                Some("/api/approvals") => {
+                    r#"{"pending_imports":[{"id":"i1","repo":"o/r","rev":"abc","created_at":"2026-11-09T01:00:00Z"}]}"#.into()
+                }
+                _ => r#"[{"key":"playbook:triage:1","playbook":"triage","status":"running",
+                    "runs":1,"max_cost":2.0,"max_time":"30m","created_at":"2026-11-09T01:00:00Z"}]"#
+                    .into(),
+            }
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn(net.handle());
+        let asked = Instant::now();
+        client.watch(
+            ["a", "b", "c"]
+                .into_iter()
+                .map(|name| net.uncached(crate::testserver::target(name, &url, keys.path())))
+                .collect(),
+        );
+        let statuses = loop {
+            if let Some((_, statuses)) = client.take(0) {
+                break statuses;
+            }
+            assert!(
+                asked.elapsed() < Duration::from_secs(15),
+                "nothing was read"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            asked.elapsed() < slow * 3,
+            "nine reads of {slow:?} each took {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(
+            statuses.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        for status in &statuses {
+            assert_eq!(status.error, None);
+            assert_eq!(status.running.len(), 1);
+            assert_eq!(status.running[0].playbook, "triage");
+            assert_eq!((status.decisions, status.approvals), (0, 1));
+        }
+    }
 
     #[test]
     fn a_listed_launch_reads_as_running_with_its_caps() {

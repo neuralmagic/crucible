@@ -1,7 +1,7 @@
 //! Who else may use the playbook on screen, and a form to share it with one more.
 
 use rune::{El, Tx, col, row, text};
-use rune_kit::{Button, ButtonVariant, SegmentedControl, TextInput};
+use rune_kit::{Button, ButtonVariant, ControlSize, SegmentedControl, TextInput};
 
 use crate::App;
 use crate::admin::{Action, ROLES, not_after, valid_grantee};
@@ -12,7 +12,7 @@ const WIDTH: f32 = 268.0;
 
 pub(crate) fn section(app: &App, p: &Paint) -> Option<El> {
     let of = app.shared_here()?;
-    let loaded = match &app.admin.shares {
+    let loaded = match &app.remote.admin.shares {
         Some((read, loaded)) if *read == of => loaded,
         _ => &None,
     };
@@ -33,7 +33,18 @@ pub(crate) fn section(app: &App, p: &Paint) -> Option<El> {
     for share in sorted {
         column = column.child(share_row(share, &of, app, p));
     }
-    Some(column.child(form(of, app, p)))
+    Some(column.child(if app.remote.desk.sharing {
+        form(of, app, p)
+    } else {
+        row().child(
+            Button::new("Share")
+                .variant(ButtonVariant::Neutral)
+                .control_size(ControlSize::Small)
+                .on_press(|app: &mut App| app.remote.desk.sharing = true)
+                .build(p.k)
+                .key("share-open"),
+        )
+    }))
 }
 
 fn share_row(share: &crux::dto::Share, of: &crux::client::Shared, app: &App, p: &Paint) -> El {
@@ -43,7 +54,7 @@ fn share_row(share: &crux::dto::Share, of: &crux::client::Shared, app: &App, p: 
         (None, false) => String::new(),
     };
     let key = format!("share:{}", share.grantee);
-    let armed = app.desk.armed.as_deref() == Some(key.as_str());
+    let armed = app.remote.desk.armed.as_deref() == Some(key.as_str());
     let (of, grantee) = (of.clone(), share.grantee.clone());
     row()
         .key(format!("share-{}", share.grantee))
@@ -78,15 +89,15 @@ fn share_row(share: &crux::dto::Share, of: &crux::client::Shared, app: &App, p: 
                 } else {
                     ButtonVariant::GhostMuted
                 })
-                .disabled(app.desk.busy())
+                .disabled(app.remote.desk.busy())
                 .on_press(move |app: &mut App| {
-                    if app.desk.armed.as_deref() == Some(key.as_str()) {
+                    if app.remote.desk.armed.as_deref() == Some(key.as_str()) {
                         app.act(Action::Revoke {
                             of: of.clone(),
                             grantee: grantee.clone(),
                         })
                     } else {
-                        app.desk.armed = Some(key.clone());
+                        app.remote.desk.armed = Some(key.clone());
                     }
                 })
                 .build(p.k)
@@ -95,12 +106,12 @@ fn share_row(share: &crux::dto::Share, of: &crux::client::Shared, app: &App, p: 
 }
 
 fn form(of: crux::client::Shared, app: &App, p: &Paint) -> El {
-    let grantee = app.desk.grantee.text.trim().to_string();
-    let until = not_after(&app.desk.until.text);
-    let ready = valid_grantee(&grantee) && until.is_ok() && !app.desk.busy();
+    let grantee = app.remote.desk.grantee.text.trim().to_string();
+    let until = not_after(&app.remote.desk.until.text);
+    let ready = valid_grantee(&grantee) && until.is_ok() && !app.remote.desk.busy();
     let share = move |app: &mut App| {
-        let grantee = app.desk.grantee.text.trim().to_string();
-        let Ok(not_after) = not_after(&app.desk.until.text) else {
+        let grantee = app.remote.desk.grantee.text.trim().to_string();
+        let Ok(not_after) = not_after(&app.remote.desk.until.text) else {
             return;
         };
         if !valid_grantee(&grantee) {
@@ -109,7 +120,7 @@ fn form(of: crux::client::Shared, app: &App, p: &Paint) -> El {
         app.act(Action::Grant {
             of: of.clone(),
             grantee,
-            role: ROLES[app.desk.role.min(ROLES.len() - 1)].to_string(),
+            role: ROLES[app.remote.desk.role.min(ROLES.len() - 1)].to_string(),
             not_after,
         });
     };
@@ -121,20 +132,20 @@ fn form(of: crux::client::Shared, app: &App, p: &Paint) -> El {
         .pt(6.0)
         .child(heading("Share with", p))
         .child(
-            TextInput::new(&app.desk.grantee)
+            TextInput::new(&app.remote.desk.grantee)
                 .placeholder("user:login or team:slug")
                 .width(Some(WIDTH))
                 .invalid(!grantee.is_empty() && !valid_grantee(&grantee))
-                .on_edit(|app: &mut App| &mut app.desk.grantee)
+                .on_edit(|app: &mut App| &mut app.remote.desk.grantee)
                 .on_submit(move |app: &mut App, _: &mut Tx| submit(app))
                 .build(p.k)
                 .key("share-grantee"),
         )
         .child(
-            SegmentedControl::new(&ROLES, Some(app.desk.role))
+            SegmentedControl::new(&ROLES, Some(app.remote.desk.role))
                 .label("Role")
                 .width(Some(WIDTH))
-                .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.desk.role = i)
+                .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.remote.desk.role = i)
                 .build(p.k)
                 .key("share-role"),
         )
@@ -144,14 +155,21 @@ fn form(of: crux::client::Shared, app: &App, p: &Paint) -> El {
                 .gap(8.0)
                 .center_y()
                 .child(
-                    TextInput::new(&app.desk.until)
+                    TextInput::new(&app.remote.desk.until)
                         .placeholder("Until YYYY-MM-DD")
                         .invalid(until.is_err())
-                        .on_edit(|app: &mut App| &mut app.desk.until)
+                        .on_edit(|app: &mut App| &mut app.remote.desk.until)
                         .build(p.k)
                         .key("share-until")
                         .grow(1.0)
                         .min_w(0.0),
+                )
+                .child(
+                    Button::new("Cancel")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(|app: &mut App| app.remote.desk.sharing = false)
+                        .build(p.k)
+                        .key("share-cancel"),
                 )
                 .child(
                     Button::new("Share")

@@ -72,7 +72,7 @@ pub(crate) fn task_list(
     let rerunnable = app.rerunnable().is_some();
     let editable = app.shown_preview().is_some_and(|p| p.source.is_some());
     for task in tasks {
-        let open = app.expanded.as_deref() == Some(task.name.as_str());
+        let open = app.run.expanded.as_deref() == Some(task.name.as_str());
         let tail: Vec<&LogLine> = if task.state().is_running() {
             let mut recent: Vec<&LogLine> = log
                 .iter()
@@ -763,7 +763,7 @@ fn expanded(
             .children((task.kind == "agent").then(|| {
                 let name = task.name.clone();
                 button("Transcript", p, move |app: &mut App| {
-                    app.expanded = Some(name.clone());
+                    app.run.expanded = Some(name.clone());
                     app.show_pane(crate::workspace::PaneKind::Transcript);
                 })
                 .key(format!("transcript-{}", task.name))

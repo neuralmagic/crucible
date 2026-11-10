@@ -30,17 +30,25 @@ use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::keys::Store;
+
 /// How long a tunnel has to start answering.
 const TUNNEL_WAIT: Duration = Duration::from_secs(60);
 /// How long the local controller has to build and bind.
-const LOCAL_WAIT: Duration = Duration::from_secs(900);
+const LOCAL_WAIT: Duration = Duration::from_mins(15);
 const PROBE: Duration = Duration::from_millis(800);
+/// How often a kept command is looked at.
+const POLL: Duration = Duration::from_millis(400);
+/// How long a command that stopped rests before it is started again, doubling to the longest.
+const RESTART: Duration = Duration::from_secs(2);
+const RESTART_MAX: Duration = Duration::from_secs(60);
 /// Lines of a tunnel's output kept to say why it stopped.
 const TAIL: usize = 6;
 
@@ -201,21 +209,22 @@ pub enum Readiness {
 pub struct Target {
     pub name: String,
     pub profile: Profile,
-    key_file: Option<PathBuf>,
+    /// Where its own key is kept; `None` uses the one in crux's config.
+    keys: Option<Store>,
     ready: Arc<Mutex<Readiness>>,
 }
 
 impl Target {
     /// `name`'s target, its key in `keys` unless the profile uses crux's.
-    pub fn new(name: &str, profile: Profile, keys: &Path) -> Target {
-        let key_file = match profile.auth {
-            Auth::Own => Some(keys.join(format!("{name}.toml"))),
+    pub fn new(name: &str, profile: Profile, keys: &Store) -> Target {
+        let keys = match profile.auth {
+            Auth::Own => Some(keys.clone()),
             Auth::Crux => None,
         };
         Target {
             name: name.to_string(),
             profile,
-            key_file,
+            keys,
             ready: Arc::new(Mutex::new(Readiness::Ready)),
         }
     }
@@ -227,7 +236,7 @@ impl Target {
             url: "http://127.0.0.1:9".into(),
             ..Profile::default()
         };
-        Target::new("test", profile, "/nonexistent".as_ref())
+        Target::new("test", profile, &Store::Dir("/nonexistent".into()))
     }
 
     pub fn url(&self) -> String {
@@ -249,23 +258,26 @@ impl Target {
 
     /// The key requests carry, read now so a sign-in takes effect on the next connection.
     pub fn key(&self) -> Result<Option<String>, String> {
-        let file = match &self.key_file {
-            Some(file) if !file.exists() => return Ok(None),
-            Some(file) => crux::config::FileConfig::load(Some(file)),
-            None => crux::config::FileConfig::load(None),
-        };
-        file.map(|f| f.api_token).map_err(|e| format!("{e:#}"))
+        match &self.keys {
+            Some(keys) => keys.key(&self.name),
+            None => crux::config::FileConfig::load(None)
+                .map(|config| config.api_token)
+                .map_err(|e| format!("{e:#}")),
+        }
     }
 
     /// Keep `key` as this profile's.
     pub fn save_key(&self, key: String) -> Result<(), String> {
-        crux::config::FileConfig {
-            url: Some(self.url()),
-            api_token: Some(key),
+        match &self.keys {
+            Some(keys) => keys.save(&self.name, &self.url(), key),
+            None => crux::config::FileConfig {
+                url: Some(self.url()),
+                api_token: Some(key),
+            }
+            .save(None)
+            .map(drop)
+            .map_err(|e| format!("{e:#}")),
         }
-        .save(self.key_file.as_deref())
-        .map(drop)
-        .map_err(|e| format!("{e:#}"))
     }
 
     /// The crux config requests are made with.
@@ -337,55 +349,194 @@ impl Target {
     }
 
     /// Start what the profile keeps running, unless something already answers in its place, and
-    /// mark the target ready once it answers. The keeper stops it when dropped.
-    pub fn start(&self, repo: &Path, supervisor: std::io::Result<Command>) -> Option<Keeper> {
+    /// mark the target ready once it answers. Once it has answered, a command that stops is
+    /// started again. The keeper stops it when dropped. Returns at once: the probe and the
+    /// command run on the watch thread.
+    pub fn start(&self, repo: &Path, supervisor: Supervisor) -> Option<Keeper> {
         let (command, wait, what) = self.kept()?;
         let addr = self.probe_addr()?;
-        if answers(&addr) {
-            self.set(Readiness::Ready);
+        self.set(Readiness::Starting(what.to_string()));
+        let watch = Watch {
+            target: self.clone(),
+            command,
+            shell: self.profile.shell.as_deref().map(|s| s.trim().to_string()),
+            dir: repo.to_path_buf(),
+            addr,
+            wait,
+            what,
+            supervisor,
+            kept: Arc::default(),
+            stop: Arc::default(),
+        };
+        let keeper = Keeper {
+            kept: Arc::clone(&watch.kept),
+            stop: Arc::clone(&watch.stop),
+        };
+        let started = std::thread::Builder::new()
+            .name("crucible-playbooks-tunnel".into())
+            .spawn(move || watch.run());
+        if let Err(why) = started {
+            self.set(Readiness::Failed(format!(
+                "starting the tunnel's watch: {why}"
+            )));
             return None;
         }
-        self.set(Readiness::Starting(what.to_string()));
-        let shell = self.profile.shell.as_deref().map(str::trim);
-        let keeper = match supervisor.and_then(|s| Keeper::spawn(s, &command, shell, repo)) {
-            Ok(keeper) => keeper,
-            Err(why) => {
-                self.set(Readiness::Failed(format!("starting `{command}`: {why}")));
+        Some(keeper)
+    }
+}
+
+/// Builds the command that supervises a kept one: [`supervisor`], outside tests.
+pub type Supervisor = fn() -> std::io::Result<Command>;
+
+/// One profile's kept command, watched on a thread of its own for as long as its keeper lives.
+///
+/// ```text
+/// answers already? ──yes──▶ Ready, done
+///   │ no
+///   ▼
+/// spawn ──▶ answers? ──yes──▶ Ready ──▶ exits ──▶ Failed ──▶ rest, doubling ──▶ spawn
+///              │ exits or runs out of time
+///              ▼
+///           Failed: never answered ──▶ done        answered before ──▶ rest ──▶ spawn
+/// ```
+struct Watch {
+    target: Target,
+    command: String,
+    shell: Option<String>,
+    dir: PathBuf,
+    addr: String,
+    wait: Duration,
+    what: &'static str,
+    supervisor: Supervisor,
+    kept: Arc<Mutex<Option<Kept>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Watch {
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    fn spawn(&self) -> Result<(), String> {
+        let kept = (self.supervisor)()
+            .and_then(|s| Kept::spawn(s, &self.command, self.shell.as_deref(), &self.dir))
+            .map_err(|why| format!("starting `{}`: {why}", self.command))?;
+        match self.kept.lock() {
+            Ok(mut slot) if !self.stopped() => *slot = Some(kept),
+            _ => kept.end(),
+        }
+        Ok(())
+    }
+
+    fn end(&self) {
+        if let Some(kept) = self.kept.lock().ok().and_then(|mut slot| slot.take()) {
+            kept.end();
+        }
+    }
+
+    /// Why the command stopped, once it has.
+    fn exited(&self) -> Option<String> {
+        let mut slot = self.kept.lock().ok()?;
+        let kept = slot.as_mut()?;
+        let status = kept.child.try_wait().ok().flatten()?;
+        let said = kept.tail.lock().map(|t| t.join("\n")).unwrap_or_default();
+        Some(stopped(&self.command, status, &said))
+    }
+
+    /// Wait for the command to answer, or say why it will not. `None` once the keeper is gone.
+    fn up(&self) -> Option<Result<(), String>> {
+        let until = Instant::now() + self.wait;
+        loop {
+            if self.stopped() {
                 return None;
             }
-        };
-        let target = self.clone();
-        let child = Arc::clone(&keeper.child);
-        let tail = Arc::clone(&keeper.tail);
-        let _ = std::thread::Builder::new()
-            .name("crucible-playbooks-tunnel".into())
-            .spawn(move || {
-                let until = Instant::now() + wait;
-                loop {
-                    if answers(&addr) {
-                        target.set(Readiness::Ready);
-                        return;
-                    }
-                    let exited = child
-                        .lock()
-                        .ok()
-                        .and_then(|mut c| c.try_wait().ok().flatten());
-                    if let Some(status) = exited {
-                        let said = tail.lock().map(|t| t.join("\n")).unwrap_or_default();
-                        target.set(Readiness::Failed(stopped(&command, status, &said)));
-                        return;
-                    }
-                    if Instant::now() > until {
-                        target.set(Readiness::Failed(format!(
-                            "`{command}` did not answer on {addr} within {}s",
-                            wait.as_secs()
-                        )));
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(400));
+            if answers(&self.addr) {
+                return Some(Ok(()));
+            }
+            if let Some(why) = self.exited() {
+                return Some(Err(why));
+            }
+            if Instant::now() > until {
+                self.end();
+                return Some(Err(format!(
+                    "`{}` did not answer on {} within {}s",
+                    self.command,
+                    self.addr,
+                    self.wait.as_secs()
+                )));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Sleep `long`, or return false as soon as the keeper is gone.
+    fn rest(&self, long: Duration) -> bool {
+        let until = Instant::now() + long;
+        while Instant::now() < until {
+            if self.stopped() {
+                return false;
+            }
+            std::thread::sleep(POLL);
+        }
+        !self.stopped()
+    }
+
+    fn run(self) {
+        if answers(&self.addr) {
+            self.target.set(Readiness::Ready);
+            return;
+        }
+        if let Err(why) = self.spawn() {
+            self.target.set(Readiness::Failed(why));
+            return;
+        }
+        let mut answered = false;
+        let mut pause = RESTART;
+        loop {
+            match self.up() {
+                None => return,
+                Some(Ok(())) => {
+                    self.target.set(Readiness::Ready);
+                    answered = true;
+                    pause = RESTART;
+                    let why = loop {
+                        if self.stopped() {
+                            return;
+                        }
+                        if let Some(why) = self.exited() {
+                            break why;
+                        }
+                        std::thread::sleep(POLL);
+                    };
+                    self.target.set(Readiness::Failed(why));
                 }
-            });
-        Some(keeper)
+                Some(Err(why)) => {
+                    self.target.set(Readiness::Failed(why));
+                    if !answered {
+                        return;
+                    }
+                }
+            }
+            loop {
+                if !self.rest(pause) {
+                    return;
+                }
+                self.end();
+                if answers(&self.addr) {
+                    self.target.set(Readiness::Ready);
+                    pause = RESTART;
+                    continue;
+                }
+                pause = (pause * 2).min(RESTART_MAX);
+                match self.spawn() {
+                    Ok(()) => {
+                        self.target.set(Readiness::Starting(self.what.to_string()));
+                        break;
+                    }
+                    Err(why) => self.target.set(Readiness::Failed(why)),
+                }
+            }
+        }
     }
 }
 
@@ -422,22 +573,36 @@ fn answers(addr: &str) -> bool {
         .any(|a| TcpStream::connect_timeout(&a, PROBE).is_ok())
 }
 
-/// A command kept running for a profile. Dropping it closes the pipe its supervisor reads, which
-/// then kills the command's process group.
+/// A command kept running for a profile. Dropping it stops the command and its restarts.
 pub struct Keeper {
-    child: Arc<Mutex<Child>>,
+    kept: Arc<Mutex<Option<Kept>>>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(kept) = self.kept.lock().ok().and_then(|mut slot| slot.take()) {
+            kept.end();
+        }
+    }
+}
+
+/// One run of a kept command under its supervisor.
+struct Kept {
+    child: Child,
     stdin: Option<ChildStdin>,
     tail: Arc<Mutex<Vec<String>>>,
 }
 
-impl Keeper {
+impl Kept {
     /// Run `command` under `supervisor`, which [`keep`]s it in `shell`, else `$SHELL`.
     fn spawn(
         mut supervisor: Command,
         command: &str,
         shell: Option<&str>,
         dir: &Path,
-    ) -> std::io::Result<Keeper> {
+    ) -> std::io::Result<Kept> {
         match shell {
             Some(shell) => supervisor.env(KEEP_SHELL, shell),
             None => supervisor.env_remove(KEEP_SHELL),
@@ -465,24 +630,17 @@ impl Keeper {
                     }
                 });
         }
-        Ok(Keeper {
-            child: Arc::new(Mutex::new(child)),
-            stdin,
-            tail,
-        })
+        Ok(Kept { child, stdin, tail })
     }
-}
 
-impl Drop for Keeper {
-    fn drop(&mut self) {
+    /// Close the pipe the supervisor reads, which then kills the command's process group, and
+    /// reap it.
+    fn end(mut self) {
         drop(self.stdin.take());
-        let child = Arc::clone(&self.child);
         let _ = std::thread::Builder::new()
             .name("crucible-playbooks-tunnel-reap".into())
             .spawn(move || {
-                if let Ok(mut child) = child.lock() {
-                    let _ = child.wait();
-                }
+                let _ = self.child.wait();
             });
     }
 }
@@ -736,20 +894,54 @@ impl crate::App {
         let Some(profile) = usable(&self.settings).remove(name) else {
             return;
         };
-        if self.target.name == name && self.target.profile == profile {
+        if self.remote.target.name == name && self.remote.target.profile == profile {
             return;
         }
         let target = match self.targets.get(name) {
             Some((target, _)) if target.profile == profile => target.clone(),
-            _ => {
-                let target = Target::new(name, profile, &self.settings.keys_dir());
-                let keeper = target.start(Path::new(&self.repo), supervisor());
-                self.targets
-                    .insert(name.to_string(), (target.clone(), keeper));
-                target
-            }
+            _ => self.start_target(name, profile),
         };
         self.settings.use_profile(name);
+        self.connect(target);
+    }
+
+    /// A fresh target for `name`, with what it keeps running started in place of the last one.
+    fn start_target(&mut self, name: &str, profile: Profile) -> Target {
+        self.targets.remove(name);
+        let target = Target::new(name, profile, &self.settings.keys());
+        let keeper = target.start(Path::new(&self.repo), supervisor);
+        self.targets
+            .insert(name.to_string(), (target.clone(), keeper));
+        target
+    }
+
+    /// Keep profile keys in the system credential store (`on`) or in key files, moving the ones
+    /// kept so far.
+    pub fn set_keychain(&mut self, on: bool) {
+        let owned: Vec<(String, String)> = self
+            .settings
+            .profiles()
+            .into_iter()
+            .filter_map(|(name, profile)| Some((name, profile.ok()?)))
+            .filter(|(_, profile)| profile.auth == Auth::Own)
+            .map(|(name, profile)| (name, profile.url))
+            .collect();
+        let (from, to) = (self.settings.keys(), self.settings.keys_in(on));
+        self.keys_error = from.move_to(&to, &owned).err();
+        if self.keys_error.is_some() {
+            return;
+        }
+        self.settings.set_keychain(on);
+        self.targets.clear();
+        self.retry_profile();
+    }
+
+    /// Start again what the profile in use keeps running.
+    pub fn retry_profile(&mut self) {
+        let target = self.start_target(
+            &self.remote.target.name.clone(),
+            self.remote.target.profile.clone(),
+        );
         self.connect(target);
     }
 
@@ -761,41 +953,7 @@ impl crate::App {
     }
 
     fn connect(&mut self, target: Target) {
-        self.target = target.clone();
-        self.live_client = crate::live::Client::spawn(target.clone());
-        self.admin_client = crate::admin::Client::spawn(target.clone());
-        self.finder_client = crate::finder::Client::spawn(target);
-        if let Some(waker) = &self.waker {
-            self.live_client.set_waker(waker.clone());
-            self.admin_client.set_waker(waker.clone());
-            self.finder_client.set_waker(waker.clone());
-        }
-        self.live_seen = 0;
-        self.admin_seen = 0;
-        self.finder_seen = 0;
-        self.admin_sent = None;
-        self.admin = crate::admin::AdminView::default();
-        self.desk = crate::admin::Desk::default();
-        self.live = crate::live::LiveView::Loading;
-        self.live_detail = None;
-        self.live_base = None;
-        self.live_sent = None;
-        self.compare_sent = None;
-        self.finder = None;
-        self.registered.clear();
-        self.launcher = None;
-        self.notified = 0;
-        self.pinned = None;
-        self.dropped_seen = 0;
-        self.working = None;
-        self.working_pack = None;
-        self.working_preview = None;
-        self.working_edited = false;
-        self.working_read = None;
-        self.graph_source = None;
-        self.draft_busy = false;
-        self.sign_in_error = None;
-        self.key_paste = rune::TextEdit::new("");
+        self.remote = crate::remote::Remote::new(target, &self.net, self.waker.as_ref());
         if matches!(self.selection, Some(crate::Selection::Live { .. })) {
             self.selection = None;
         }
@@ -819,24 +977,28 @@ impl crate::App {
             form.error = Some(why);
             return;
         }
-        let was_current = form.editing.as_deref() == Some(self.target.name.as_str());
+        let was_current = form.editing.as_deref() == Some(self.remote.target.name.as_str());
         if let Some(old) = renamed {
+            if profile.auth == Auth::Own {
+                self.keys_error = self.settings.keys().rename(&old, &name, &profile.url).err();
+            }
             self.settings.remove_profile(&old);
             if let Some((_, keeper)) = self.targets.remove(&old) {
                 drop(keeper);
             }
         }
         self.profile_form = None;
-        if was_current || self.target.name == name || self.settings.profile.is_none() {
+        if was_current || self.remote.target.name == name || self.settings.profile.is_none() {
             self.use_profile(&name);
         }
     }
 
     /// Forget profile `name`, stopping what it kept running. The profile in use moves to another.
     pub fn remove_profile(&mut self, name: &str) {
+        self.keys_error = self.settings.keys().forget(name).err();
         self.settings.remove_profile(name);
         self.targets.remove(name);
-        if self.target.name == name {
+        if self.remote.target.name == name {
             let (next, _) = pick(&self.settings);
             self.use_profile(&next);
         }
@@ -849,6 +1011,7 @@ mod tests {
     use std::net::TcpListener;
     use std::time::{Duration, Instant};
 
+    use crate::keys::Store;
     use crate::profile::{Auth, Profile, Readiness, Target, addresses, answers, keep};
 
     const AS_SUPERVISOR: &str = "CRUCIBLE_PLAYBOOKS_TEST_SUPERVISOR";
@@ -1008,14 +1171,22 @@ url = "https://crucible.ext.wdc.example.com"
 
     #[test]
     fn loopback_profiles_start_the_local_controller() {
-        let local = Target::new("local", profile("http://127.0.0.1:8870"), "/k".as_ref());
+        let local = Target::new(
+            "local",
+            profile("http://127.0.0.1:8870"),
+            &Store::Dir("/k".into()),
+        );
         assert_eq!(
             local.kept().map(|k| k.0),
             Some("just controller-local 8870".to_string())
         );
         assert!(profile("http://localhost:9000").loopback());
         assert!(profile("http://[::1]:9000").loopback());
-        let remote = Target::new("r", profile("https://api.example.com"), "/k".as_ref());
+        let remote = Target::new(
+            "r",
+            profile("https://api.example.com"),
+            &Store::Dir("/k".into()),
+        );
         assert_eq!(remote.kept(), None);
     }
 
@@ -1024,14 +1195,14 @@ url = "https://crucible.ext.wdc.example.com"
         let mut p = profile("https://api.example.com");
         p.tunnel = Some("ssh -N -D 1080 j".into());
         p.proxy = Some("socks5h://127.0.0.1:1081".into());
-        let t = Target::new("j", p.clone(), "/k".as_ref());
+        let t = Target::new("j", p.clone(), &Store::Dir("/k".into()));
         assert_eq!(t.probe_addr().as_deref(), Some("127.0.0.1:1081"));
         p.proxy = Some("socks5://127.0.0.1".into());
-        let t = Target::new("j", p.clone(), "/k".as_ref());
+        let t = Target::new("j", p.clone(), &Store::Dir("/k".into()));
         assert_eq!(t.probe_addr().as_deref(), Some("127.0.0.1:1080"));
         p.proxy = None;
         p.url = "http://127.0.0.1:18870".into();
-        let t = Target::new("j", p, "/k".as_ref());
+        let t = Target::new("j", p, &Store::Dir("/k".into()));
         assert_eq!(t.probe_addr().as_deref(), Some("127.0.0.1:18870"));
     }
 
@@ -1048,8 +1219,16 @@ url = "https://crucible.ext.wdc.example.com"
     #[test]
     fn each_profile_keeps_its_own_key() {
         let dir = tempfile::tempdir().unwrap();
-        let a = Target::new("a", profile("https://a.example.com/"), dir.path());
-        let b = Target::new("b", profile("https://b.example.com"), dir.path());
+        let a = Target::new(
+            "a",
+            profile("https://a.example.com/"),
+            &Store::Dir(dir.path().into()),
+        );
+        let b = Target::new(
+            "b",
+            profile("https://b.example.com"),
+            &Store::Dir(dir.path().into()),
+        );
         assert_eq!(a.key().unwrap(), None, "no file yet is no key");
         a.save_key("crk_a".into()).unwrap();
         assert_eq!(a.key().unwrap().as_deref(), Some("crk_a"));
@@ -1077,10 +1256,8 @@ url = "https://crucible.ext.wdc.example.com"
             "exec python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\", {port})); s.listen(); time.sleep(60)'"
         ));
         let dir = tempfile::tempdir().unwrap();
-        let target = Target::new("t", p, dir.path());
-        let keeper = target
-            .start(dir.path(), test_supervisor())
-            .expect("a keeper");
+        let target = Target::new("t", p, &Store::Dir(dir.path().into()));
+        let keeper = target.start(dir.path(), test_supervisor).expect("a keeper");
         assert!(matches!(target.readiness(), Readiness::Starting(_)));
         assert_eq!(
             wait_for(&target, |r| *r
@@ -1100,6 +1277,80 @@ url = "https://crucible.ext.wdc.example.com"
     }
 
     #[test]
+    fn a_tunnel_that_stops_after_answering_is_started_again_until_its_keeper_goes() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr = format!("127.0.0.1:{port}");
+        let dir = tempfile::tempdir().unwrap();
+        let starts = dir.path().join("starts");
+        let mut p = profile(&format!("http://{addr}"));
+        p.tunnel = Some(format!(
+            "echo start >> '{}'; exec python3 -c 'import socket,sys,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind((\"127.0.0.1\", {port})); s.listen(); time.sleep(1.5); sys.stderr.write(\"connection reset\\n\"); sys.exit(255)'",
+            starts.display()
+        ));
+        let started = || {
+            std::fs::read_to_string(&starts)
+                .unwrap_or_default()
+                .lines()
+                .count()
+        };
+        let target = Target::new("t", p, &Store::Dir(dir.path().into()));
+        let keeper = target.start(dir.path(), test_supervisor).expect("a keeper");
+        assert_eq!(
+            wait_for(&target, |r| !matches!(r, Readiness::Starting(_))),
+            Readiness::Ready
+        );
+        assert_eq!(started(), 1);
+
+        let down = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
+        let Readiness::Failed(why) = down else {
+            panic!("{down:?}");
+        };
+        assert!(why.contains("connection reset"), "{why}");
+        assert!(target.ready().is_err(), "requests wait while it is down");
+
+        assert_eq!(
+            wait_for(&target, |r| *r == Readiness::Ready),
+            Readiness::Ready
+        );
+        assert_eq!(started(), 2);
+        assert!(target.ready().is_ok());
+
+        drop(keeper);
+        let seen = started();
+        let until = Instant::now() + Duration::from_secs(10);
+        while answers(&addr) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        std::thread::sleep(Duration::from_secs(5));
+        assert!(!answers(&addr), "dropping the keeper ends the tunnel");
+        assert_eq!(started(), seen, "and nothing starts it again");
+    }
+
+    #[test]
+    fn a_tunnel_that_never_answers_is_not_started_again() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let dir = tempfile::tempdir().unwrap();
+        let starts = dir.path().join("starts");
+        let mut p = profile(&format!("http://127.0.0.1:{port}"));
+        p.tunnel = Some(format!("echo start >> '{}'; exit 255", starts.display()));
+        let target = Target::new("t", p, &Store::Dir(dir.path().into()));
+        let _keeper = target.start(dir.path(), test_supervisor);
+        let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
+        assert!(matches!(failed, Readiness::Failed(_)), "{failed:?}");
+        std::thread::sleep(Duration::from_secs(5));
+        assert_eq!(std::fs::read_to_string(&starts).unwrap(), "start\n");
+        assert!(matches!(target.readiness(), Readiness::Failed(_)));
+    }
+
+    #[test]
     fn a_tunnel_runs_under_the_profiles_shell() {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -1110,8 +1361,8 @@ url = "https://crucible.ext.wdc.example.com"
         p.tunnel = Some("echo \"ran under $0\" >&2; exit 3".into());
         p.shell = Some("/bin/sh".into());
         let dir = tempfile::tempdir().unwrap();
-        let target = Target::new("t", p.clone(), dir.path());
-        let _keeper = target.start(dir.path(), test_supervisor());
+        let target = Target::new("t", p.clone(), &Store::Dir(dir.path().into()));
+        let _keeper = target.start(dir.path(), test_supervisor);
         let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
         let Readiness::Failed(why) = failed else {
             panic!("{failed:?}");
@@ -1119,8 +1370,8 @@ url = "https://crucible.ext.wdc.example.com"
         assert!(why.contains("ran under /bin/sh"), "{why}");
 
         p.shell = Some("/no/such/shell".into());
-        let target = Target::new("t", p, dir.path());
-        let _keeper = target.start(dir.path(), test_supervisor());
+        let target = Target::new("t", p, &Store::Dir(dir.path().into()));
+        let _keeper = target.start(dir.path(), test_supervisor);
         let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
         let Readiness::Failed(why) = failed else {
             panic!("{failed:?}");
@@ -1138,8 +1389,8 @@ url = "https://crucible.ext.wdc.example.com"
         let mut p = profile(&format!("http://127.0.0.1:{port}"));
         p.tunnel = Some("echo 'ssh: Could not resolve hostname jumpbox' >&2; exit 255".into());
         let dir = tempfile::tempdir().unwrap();
-        let target = Target::new("t", p, dir.path());
-        let _keeper = target.start(dir.path(), test_supervisor());
+        let target = Target::new("t", p, &Store::Dir(dir.path().into()));
+        let _keeper = target.start(dir.path(), test_supervisor);
         let failed = wait_for(&target, |r| matches!(r, Readiness::Failed(_)));
         let Readiness::Failed(why) = failed else {
             panic!("{failed:?}");
@@ -1241,7 +1492,7 @@ url = "https://crucible.ext.wdc.example.com"
         let socks = socks_server(server, asked.clone());
         let mut p = profile(&format!("http://controller.internal.invalid:{server}"));
         p.proxy = Some(format!("socks5h://127.0.0.1:{socks}"));
-        let target = Target::new("jump", p, "/k".as_ref());
+        let target = Target::new("jump", p, &Store::Dir("/k".into()));
         assert_eq!(get(&target).unwrap(), "through the proxy");
         assert_eq!(
             *asked.lock().unwrap(),
@@ -1256,10 +1507,10 @@ url = "https://crucible.ext.wdc.example.com"
         let mut p = profile(&format!("http://api.wdc.invalid:{server}"));
         p.resolve
             .insert("api.wdc.invalid".into(), "127.0.0.1".into());
-        let pinned = Target::new("wdc", p.clone(), "/k".as_ref());
+        let pinned = Target::new("wdc", p.clone(), &Store::Dir("/k".into()));
         assert_eq!(get(&pinned).unwrap(), "pinned");
         p.resolve.clear();
-        assert!(get(&Target::new("wdc", p, "/k".as_ref())).is_err());
+        assert!(get(&Target::new("wdc", p, &Store::Dir("/k".into()))).is_err());
     }
 
     #[test]
@@ -1267,10 +1518,17 @@ url = "https://crucible.ext.wdc.example.com"
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let mut p = profile(&format!("http://127.0.0.1:{port}"));
-        p.tunnel = Some("exit 1".into());
         let dir = tempfile::tempdir().unwrap();
-        let target = Target::new("t", p, dir.path());
-        assert!(target.start(dir.path(), test_supervisor()).is_none());
+        let starts = dir.path().join("starts");
+        p.tunnel = Some(format!("echo start >> '{}'; exit 1", starts.display()));
+        let target = Target::new("t", p, &Store::Dir(dir.path().into()));
+        let _keeper = target.start(dir.path(), test_supervisor);
+        assert_eq!(
+            wait_for(&target, |r| !matches!(r, Readiness::Starting(_))),
+            Readiness::Ready
+        );
+        std::thread::sleep(Duration::from_secs(1));
+        assert!(!starts.exists(), "the command never ran");
         assert_eq!(target.readiness(), Readiness::Ready);
     }
 }
