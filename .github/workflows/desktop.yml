@@ -75,6 +75,8 @@ jobs:
 
       # The browser build: the library, and the crux client under it, linted for wasm32.
       - name: web
+        env:
+          RUSTFLAGS: ""
         run: |
           rustup target add wasm32-unknown-unknown
           cargo clippy -p crux --no-default-features --locked --target wasm32-unknown-unknown -- -D warnings

@@ -1616,6 +1616,15 @@ pub fn encode(s: &str) -> String {
 mod tests {
     use crate::client::*;
 
+    /// A JSON object body with its keys in order, so a test reads the same whichever way
+    /// serde_json orders a map; anything else as it came.
+    fn sorted(body: &str) -> String {
+        serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(body)
+            .ok()
+            .and_then(|object| serde_json::to_string(&object).ok())
+            .unwrap_or_else(|| body.to_string())
+    }
+
     /// The bug this prevents: `GET /api/issues/owner/repo#12` reaches a route that doesn't exist
     /// and 404s, which reads exactly like "no such issue".
     #[test]
@@ -1890,7 +1899,7 @@ mod tests {
         type Seen = Arc<Mutex<Vec<String>>>;
 
         async fn mint(State(seen): State<Seen>, body: String) -> String {
-            seen.lock().unwrap().push(format!("mint {body}"));
+            seen.lock().unwrap().push(format!("mint {}", sorted(&body)));
             r#"{"id":"k2","name":"ci","created_at":"2026-11-10T00:00:00Z","expires_at":null,
                 "last_used_at":null,"revoked_at":null,"secret":"crk_once",
                 "mcp_url":"https://mcp.example/mcp"}"#
@@ -2006,7 +2015,9 @@ mod tests {
             body: String,
         ) -> (StatusCode, String) {
             let slug = path.map_or_else(String::new, |Path(slug)| slug);
-            seen.lock().unwrap().push(format!("{method} {slug} {body}"));
+            seen.lock()
+                .unwrap()
+                .push(format!("{method} {slug} {}", sorted(&body)));
             if method == Method::DELETE {
                 return (StatusCode::NO_CONTENT, String::new());
             }
@@ -2184,7 +2195,9 @@ mod tests {
             Path(id): Path<String>,
             body: String,
         ) -> (StatusCode, String) {
-            seen.lock().unwrap().push(format!("{method} {id} {body}"));
+            seen.lock()
+                .unwrap()
+                .push(format!("{method} {id} {}", sorted(&body)));
             if method == Method::DELETE {
                 return (StatusCode::NO_CONTENT, String::new());
             }
