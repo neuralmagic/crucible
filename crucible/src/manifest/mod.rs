@@ -705,6 +705,15 @@ pub struct AgentCfg {
     /// the one that counts iterations.
     #[serde(default)]
     pub disallowed_tools: Vec<String>,
+    /// Tools the agent may call, passed to Claude Code as `--allowed-tools`. Names match
+    /// Claude Code's own (`Read`, `Edit`, `Write`, `Bash`, `mcp__<server>__<tool>`).
+    ///
+    /// A turn runs unattended — on the host (`local` backend) or inside its sandbox
+    /// (`openshell`), no one can approve a tool call mid-flight — so every claude-harness pack
+    /// declares its agent's surface here, and a pack without this list is refused at launch.
+    /// The sandbox still bounds the blast radius; this list is the declared surface inside it.
+    #[serde(default)]
+    pub allowed_tools: Vec<String>,
     #[serde(default)]
     pub method_prompt: Option<String>,
     #[serde(default)]

@@ -2309,6 +2309,7 @@ mod tests {
             model,
             reasoning_effort: None,
             disallowed_tools: &[],
+            allowed_tools: &[],
             codex,
             env: &[],
         }

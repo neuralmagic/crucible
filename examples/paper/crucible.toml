@@ -12,6 +12,7 @@ setup_cmd = "test -d workspace/.git || git clone --depth 1 https://github.com/vl
 backend = "local"
 harness = "claude"
 model = "claude-opus-4-6"
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash"]
 goal = "Read the paper and produce an implementation spec for the speculators codebase."
 
 [workflow]

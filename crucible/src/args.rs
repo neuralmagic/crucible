@@ -149,6 +149,10 @@ pub(crate) struct Args {
     /// Tools the agent must not call (from `[agent].disallowed_tools`). No CLI flag.
     #[arg(skip)]
     pub disallowed_tools: Vec<String>,
+    /// Tools the agent may call (from `[agent].allowed_tools`); a `local`-backend turn is
+    /// scoped to this list. No CLI flag.
+    #[arg(skip)]
+    pub allowed_tools: Vec<String>,
     /// Reasoning-effort tier for the agent, passed to Claude Code as `--effort <level>`. Overrides
     /// `[agent].reasoning_effort`; when neither is set the engine defaults to `medium` (see
     /// `apply_agent_cfg`).
@@ -300,6 +304,7 @@ impl Args {
             model: self.model(),
             reasoning_effort: self.reasoning_effort,
             disallowed_tools: &self.disallowed_tools,
+            allowed_tools: &self.allowed_tools,
             codex: &self.codex,
             env: &self.env,
         }
@@ -357,6 +362,7 @@ pub(crate) struct TurnAgent<'a> {
     pub model: &'a str,
     pub reasoning_effort: Option<crate::knobs::ReasoningEffort>,
     pub disallowed_tools: &'a [String],
+    pub allowed_tools: &'a [String],
     pub codex: &'a manifest::CodexCfg,
     pub env: &'a [(String, String)],
 }

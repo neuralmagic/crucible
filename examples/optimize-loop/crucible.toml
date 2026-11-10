@@ -17,6 +17,7 @@ inject = [
 backend       = "openshell"
 harness       = "claude"
 model         = "claude-sonnet-5"
+allowed_tools = ["Read", "Edit", "Write", "Glob", "Grep", "Bash", "mcp__buildit"]
 sandbox_image = "ghcr.io/neuralmagic/sandbox-go-cgo-cc@sha256:33cc058e97a0f9fded61d6c2a4584cc189854a0c6e0576215e8f6c0ba2a44628"
 goal          = "Make the program faster without changing its answer, measured on Kueue."
 
