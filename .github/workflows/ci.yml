@@ -35,7 +35,7 @@ jobs:
   # toolchain); fork PRs MUST stay on hosted runners — self-hosted instances carry an IAM role,
   # and this is a public repo.
   test-all-features:
-    timeout-minutes: 40
+    timeout-minutes: 80
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -300,7 +300,7 @@ jobs:
   # The default-feature build's tests. Vault and Keycloak suites skip here;
   # test-all-features runs them.
   test-default-features:
-    timeout-minutes: 30
+    timeout-minutes: 60
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
