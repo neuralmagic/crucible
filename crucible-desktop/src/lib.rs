@@ -253,6 +253,66 @@ impl Page {
     }
 }
 
+/// Pages shown as tabs of one another, behind one entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Group {
+    Inbox,
+    Activity,
+    Settings,
+}
+
+impl Group {
+    pub fn id(self) -> &'static str {
+        match self {
+            Group::Inbox => "inbox",
+            Group::Activity => "activity",
+            Group::Settings => "settings",
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Inbox => "Inbox",
+            Group::Activity => "Activity",
+            Group::Settings => "Settings",
+        }
+    }
+
+    /// Its pages, in tab order.
+    pub fn pages(self) -> &'static [Page] {
+        match self {
+            Group::Inbox => &[Page::Decisions, Page::Approvals],
+            Group::Activity => &[Page::Activity, Page::Issues],
+            Group::Settings => &[
+                Page::Settings,
+                Page::Secrets,
+                Page::Teams,
+                Page::Providers,
+                Page::Keys,
+                Page::Admin,
+            ],
+        }
+    }
+}
+
+impl Page {
+    /// The group whose tabs this page is one of.
+    pub fn group(self) -> Option<Group> {
+        [Group::Inbox, Group::Activity, Group::Settings]
+            .into_iter()
+            .find(|group| group.pages().contains(&self))
+    }
+
+    /// What the page's tab reads.
+    pub fn tab(self) -> &'static str {
+        match self {
+            Page::Settings => "General",
+            Page::Activity => "Events",
+            page => page.title(),
+        }
+    }
+}
+
 /// Which pack the Pack tab shows when there is a working copy beside the run's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PackSource {
@@ -1435,6 +1495,44 @@ impl App {
         self.page = if self.page == page { Page::Runs } else { page };
     }
 
+    /// Whether `page` is offered to this caller on this backend.
+    pub fn offers(&self, page: Page) -> bool {
+        let controller = self.backend == Backend::Controller;
+        match page {
+            Page::Runs | Page::Settings => true,
+            Page::Issues => controller && self.has_autoresearch(),
+            Page::Admin => controller && self.is_admin(),
+            Page::Keys => controller && SESSION_AUTH,
+            _ => controller,
+        }
+    }
+
+    /// The pages of `group` offered to this caller, in tab order.
+    pub fn tabs(&self, group: Group) -> Vec<Page> {
+        group
+            .pages()
+            .iter()
+            .copied()
+            .filter(|page| self.offers(*page))
+            .collect()
+    }
+
+    /// Open `group` on its first page, or close it when one of its pages is shown. The inbox
+    /// opens on approvals when only those wait.
+    pub fn toggle_group(&mut self, group: Group) {
+        if self.page.group() == Some(group) {
+            self.page = Page::Runs;
+            return;
+        }
+        let approvals_only =
+            group == Group::Inbox && self.waiting() == 0 && self.approvals_waiting() > 0;
+        self.page = if approvals_only {
+            Page::Approvals
+        } else {
+            self.tabs(group).first().copied().unwrap_or(Page::Runs)
+        };
+    }
+
     pub fn switch(&mut self, backend: Backend) {
         if backend == self.backend || (backend == Backend::Local && !LOCAL_PACKS) {
             return;
@@ -1832,6 +1930,30 @@ pub fn run() {
 mod tests {
     use crate::GraphSource;
     use crate::model::default_repo;
+    use crate::{Group, Page};
+
+    #[test]
+    fn a_page_is_a_tab_of_at_most_one_group_and_the_rest_stand_alone() {
+        let groups = [Group::Inbox, Group::Activity, Group::Settings];
+        for group in groups {
+            for page in group.pages() {
+                assert_eq!(page.group(), Some(group), "{page:?}");
+                let elsewhere = groups
+                    .iter()
+                    .filter(|other| other.pages().contains(page))
+                    .count();
+                assert_eq!(elsewhere, 1, "{page:?} is in one group");
+            }
+        }
+        for alone in [Page::Runs, Page::Triggers, Page::Blueprints] {
+            assert_eq!(alone.group(), None, "{alone:?}");
+        }
+        assert_eq!(Group::Settings.pages()[0], Page::Settings);
+        assert_eq!(
+            (Page::Settings.tab(), Page::Activity.tab(), Page::Keys.tab()),
+            ("General", "Events", "API keys")
+        );
+    }
 
     #[test]
     fn the_compiled_pack_is_drawn_when_picked_or_when_nothing_ran() {

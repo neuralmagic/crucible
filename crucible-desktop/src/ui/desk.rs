@@ -34,9 +34,14 @@ pub(crate) fn frame(
                 .center_y()
                 .window_drag()
                 .child(
-                    text(title.to_string())
-                        .font(p.sized(TITLE))
-                        .color(p.c.text_base),
+                    text(
+                        app.page
+                            .group()
+                            .map_or(title, |group| group.title())
+                            .to_string(),
+                    )
+                    .font(p.sized(TITLE))
+                    .color(p.c.text_base),
                 )
                 .child(
                     text(note)
@@ -47,7 +52,31 @@ pub(crate) fn frame(
                 )
                 .children(action),
         )
+        .children(group_tabs(app, p))
         .children(outcome(app, p))
+}
+
+/// The shown page's group as tabs, when it has more than one to offer.
+pub(crate) fn group_tabs(app: &App, p: &Paint) -> Option<El> {
+    let tabs = app.tabs(app.page.group()?);
+    if tabs.len() < 2 {
+        return None;
+    }
+    let options: Vec<(String, String)> = tabs
+        .iter()
+        .map(|page| (page.id().to_string(), page.tab().to_string()))
+        .collect();
+    Some(pills(
+        "group-tabs",
+        &options,
+        Some(app.page.id()),
+        move |app: &mut App, id: &str| {
+            if let Some(page) = tabs.iter().find(|page| page.id() == id) {
+                app.page = *page;
+            }
+        },
+        p,
+    ))
 }
 
 /// The newest action's outcome, or a spinner while one is on its way.

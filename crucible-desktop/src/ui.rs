@@ -636,19 +636,29 @@ fn sidebar(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(account(app, source, p, layer))
 }
 
-/// The controller's management pages, under the playbooks.
+/// The controller's pages, under the playbooks. Setup pages are behind the gear.
 fn pages_nav(app: &App, p: &Paint) -> El {
-    let waiting = app.waiting();
-    let entry = |page: crate::Page, glyph: &'static Icon, badge: Option<String>| {
-        let mut entry = SidebarRow::new(page.title())
-            .icon(glyph)
-            .height(28.0)
-            .selected(app.page == page)
-            .on_select(move |app: &mut App, _: &mut Tx| app.toggle_page(page));
-        if let Some(badge) = badge {
-            entry = entry.badge(badge);
+    let row_ = |key: &str, title: &str, glyph: &'static Icon, on: bool, badge: usize| {
+        let mut entry = SidebarRow::new(title).icon(glyph).height(28.0).selected(on);
+        if badge > 0 {
+            entry = entry.badge(badge.to_string());
         }
-        entry.build(p.k).key(format!("nav-{}", page.id()))
+        (entry, format!("nav-{key}"))
+    };
+    let group = |group: crate::Group, glyph: &'static Icon, badge: usize| {
+        let on = app.page.group() == Some(group);
+        let (entry, key) = row_(group.id(), group.title(), glyph, on, badge);
+        entry
+            .on_select(move |app: &mut App, _: &mut Tx| app.toggle_group(group))
+            .build(p.k)
+            .key(key)
+    };
+    let page = |page: crate::Page, glyph: &'static Icon| {
+        let (entry, key) = row_(page.id(), page.title(), glyph, app.page == page, 0);
+        entry
+            .on_select(move |app: &mut App, _: &mut Tx| app.toggle_page(page))
+            .build(p.k)
+            .key(key)
     };
     col()
         .key("pages-nav")
@@ -657,31 +667,14 @@ fn pages_nav(app: &App, p: &Paint) -> El {
         .pb(6.0)
         .gap(2.0)
         .child(rule("pages-nav-rule", false, p).mb(6.0))
-        .child(entry(
-            crate::Page::Decisions,
-            &oc::HELP,
-            (waiting > 0).then(|| waiting.to_string()),
-        ))
-        .child(entry(
-            crate::Page::Approvals,
+        .child(group(
+            crate::Group::Inbox,
             &oc::CIRCLE_CHECK,
-            (app.approvals_waiting() > 0).then(|| app.approvals_waiting().to_string()),
+            app.waiting() + app.approvals_waiting(),
         ))
-        .child(entry(crate::Page::Triggers, &oc::STATUS, None))
-        .child(entry(crate::Page::Secrets, &rune_kit::glyphs::LOCK, None))
-        .child(entry(crate::Page::Teams, &oc::SUBAGENT, None))
-        .child(entry(crate::Page::Providers, &oc::BRAIN, None))
-        .child(entry(crate::Page::Blueprints, &oc::GRID_PLUS, None))
-        .child(entry(crate::Page::Activity, &oc::CHECKLIST, None))
-        .children(
-            app.has_autoresearch()
-                .then(|| entry(crate::Page::Issues, &oc::BRAIN, None)),
-        )
-        .children(
-            app.is_admin()
-                .then(|| entry(crate::Page::Admin, &oc::SETTINGS_GEAR, None)),
-        )
-        .children(crate::SESSION_AUTH.then(|| entry(crate::Page::Keys, &oc::KEYBOARD, None)))
+        .child(page(crate::Page::Triggers, &oc::STATUS))
+        .child(page(crate::Page::Blueprints, &oc::GRID_PLUS))
+        .child(group(crate::Group::Activity, &oc::CHECKLIST, 0))
 }
 
 /// Who is signed in, bottom left, with the settings button beside it. Pressing it opens a menu of
@@ -841,13 +834,13 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
         .child(el().grow(1.0))
         .child(
             IconButton::new(&oc::SETTINGS_GEAR)
-                .variant(if app.page == crate::Page::Settings {
+                .variant(if app.page.group() == Some(crate::Group::Settings) {
                     IconButtonVariant::Neutral
                 } else {
                     IconButtonVariant::GhostMuted
                 })
                 .label("Settings")
-                .on_press(|app: &mut App| app.toggle_page(crate::Page::Settings))
+                .on_press(|app: &mut App| app.toggle_group(crate::Group::Settings))
                 .build(p.k)
                 .key("settings-open"),
         )
@@ -1776,6 +1769,7 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                         .key("settings-done"),
                 ),
         )
+        .children(desk::group_tabs(app, p))
         .child(settings_section(
             "profiles",
             "Profiles",
