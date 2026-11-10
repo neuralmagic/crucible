@@ -370,7 +370,6 @@ pub fn render(
     }
     let r = Renderer {
         input,
-        manifest_dir,
         domain,
         manifest_file,
         profile,
@@ -492,8 +491,6 @@ fn pack_configmap(
 /// threading the same six values through their signatures.
 struct Renderer<'a> {
     input: RenderInput<'a>,
-    /// The pack's directory, which `[measure]` file references resolve against.
-    manifest_dir: &'a Path,
     /// The domain pack's directory name (where the loop image baked it).
     domain: &'a str,
     /// The manifest's file name (the wrapper passes it to the nested `crucible --manifest`).
@@ -980,10 +977,7 @@ impl Renderer<'_> {
         // deploy profile's [measure] substrate becomes the BROKER_CODEGEN_* facts. Absent [measure]
         // => none of this is emitted.
         if let Some(measure) = self.input.measure {
-            for (k, v) in measure
-                .broker_env(self.manifest_dir)
-                .map_err(anyhow::Error::msg)?
-            {
+            for (k, v) in measure.broker_env().map_err(anyhow::Error::msg)? {
                 env.push(env_var(&k, v));
             }
             if let Some(sub) = &self.profile.measure {

@@ -51,8 +51,6 @@ reqwest = { version = "0.13", default-features = false, features = [
 # A profile trace is a binary (gzip) artifact; it leaves the GPU pod base64'd on the job log and is
 # handed back to the agent base64'd by `fetch_trace` (the text `fetch_log` would corrupt it).
 base64 = "0.23"
-# A probe document is memoized by its sha256, the same crate forge already builds.
-sha2 = "0.11.0"
 # Server observability: rmcp emits `tracing` events for each MCP request; a subscriber turns
 # them into pod-log lines (set RUST_LOG to tune). Without this the broker is a black box.
 tracing = "0.1"

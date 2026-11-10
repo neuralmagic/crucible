@@ -153,10 +153,6 @@ enum Cached {
         trace: String,
         logs: Vec<String>,
     },
-    Probe {
-        result: Value,
-        logs: Vec<String>,
-    },
 }
 
 impl CodegenState {
@@ -286,12 +282,6 @@ pub enum CodegenReply {
     },
     Profiled {
         trace: String,
-        logs: Vec<String>,
-        cached: bool,
-    },
-    /// A probe job's JSON result, as the frozen probe command wrote it.
-    Probed {
-        result: Value,
         logs: Vec<String>,
         cached: bool,
     },
@@ -567,10 +557,6 @@ pub(crate) fn lm_eval(state: &Arc<CodegenState>, digest: &str, limit: Option<u32
 
 pub(crate) fn profile(state: &Arc<CodegenState>, digest: &str) -> String {
     guard(|cfg| run_profile(state, cfg, digest))
-}
-
-pub(crate) fn probe(state: &Arc<CodegenState>, digest: &str, document: &Value) -> String {
-    guard(|cfg| run_probe(state, cfg, digest, document))
 }
 
 pub(crate) fn fetch_log(state: &CodegenState, handle: &str, offset: usize) -> String {
@@ -1125,46 +1111,6 @@ fn run_lm_eval(
     }
 }
 
-/// The largest probe document a call may pass. It rides the job's environment.
-const MAX_PROBE_BYTES: usize = 64 * 1024;
-
-/// The env var the frozen probe command reads the caller's document from.
-const PROBE_ENV: &str = "CRUCIBLE_PROBE";
-
-/// The env var the pack's probe script rides in, when `[probe]` names one.
-const PROBE_SCRIPT_ENV: &str = "CRUCIBLE_PROBE_SCRIPT";
-
-fn run_probe(
-    state: &Arc<CodegenState>,
-    cfg: &ToolsConfig,
-    digest: &str,
-    document: &Value,
-) -> CodegenReply {
-    if cfg.probe.is_none() {
-        return CodegenReply::Unconfigured {
-            reason: "this scenario declares no [probe] command".into(),
-        };
-    }
-    if !document.is_object() {
-        return CodegenReply::RejectedKwarg {
-            reason: "probe must be a JSON object".into(),
-        };
-    }
-    let text = document.to_string();
-    if text.len() > MAX_PROBE_BYTES {
-        return CodegenReply::RejectedKwarg {
-            reason: format!(
-                "probe is {} bytes, over the {MAX_PROBE_BYTES}-byte limit",
-                text.len()
-            ),
-        };
-    }
-    match measure(state, cfg, digest, MeasureKind::Probe { document: text }) {
-        Ok(r) => r,
-        Err(e) => CodegenReply::Error { error: e },
-    }
-}
-
 fn run_profile(state: &Arc<CodegenState>, cfg: &ToolsConfig, digest: &str) -> CodegenReply {
     let Some(pcfg) = &cfg.profile else {
         return CodegenReply::Unconfigured {
@@ -1368,9 +1314,6 @@ enum MeasureKind {
     LmEval {
         limit: Option<u32>,
     },
-    Probe {
-        document: String,
-    },
 }
 
 impl MeasureKind {
@@ -1378,7 +1321,6 @@ impl MeasureKind {
         match self {
             MeasureKind::Benchmark { .. } => "bench",
             MeasureKind::LmEval { .. } => "lmeval",
-            MeasureKind::Probe { .. } => "probe",
         }
     }
 }
@@ -1644,38 +1586,12 @@ fn measure(
                 env,
             )
         }
-        MeasureKind::Probe { document } => {
-            let probe = cfg
-                .probe
-                .as_ref()
-                .ok_or("this scenario declares no [probe] command")?;
-            let mut env = vec![(PROBE_ENV.to_string(), document.clone())];
-            if let Some(script) = &probe.script {
-                env.push((PROBE_SCRIPT_ENV.to_string(), script.clone()));
-            }
-            (
-                probe.command.clone(),
-                Objective {
-                    key: "pass".to_string(),
-                    direction: config::Direction::Higher,
-                },
-                probe_key(digest, &env),
-                env,
-            )
-        }
     };
 
     // Attach BEFORE the memo check: the worker memoizes before its entry leaves the map, so this
     // lookup order can't lose a result that lands between the two.
     if let Some(entry) = state.inflight_get(&key) {
         return Ok(entry.wait(call_wait_budget()));
-    }
-    if let Some(Cached::Probe { result, logs }) = state.get(&key) {
-        return Ok(CodegenReply::Probed {
-            result,
-            logs,
-            cached: true,
-        });
     }
     if let Some(Cached::Measure { metrics, logs }) = state.get(&key) {
         return Ok(CodegenReply::Measured {
@@ -1812,20 +1728,6 @@ fn collect_measure(
         MeasureKind::LmEval { .. } => {
             let score = extract_score(&value, &tail.objective.key)?;
             BTreeMap::from([(tail.objective.key.clone(), score)])
-        }
-        MeasureKind::Probe { .. } => {
-            state.put(
-                tail.key,
-                Cached::Probe {
-                    result: value.clone(),
-                    logs: vec![tail.log_handle.clone()],
-                },
-            );
-            return Ok(CodegenReply::Probed {
-                result: value,
-                logs: vec![tail.log_handle],
-                cached: false,
-            });
         }
     };
 
@@ -2205,22 +2107,6 @@ fn build_key(tree_hash: &str, mode: BuildMode, build: &config::BuildCfg) -> Stri
     let mut h = std::collections::hash_map::DefaultHasher::new();
     build.hash(&mut h);
     format!("build|{tree_hash}|{}|{:016x}", mode.as_str(), h.finish())
-}
-
-/// A probe's memo key: the document and the script by hash, so the key stays short.
-fn probe_key(digest: &str, env: &[(String, String)]) -> String {
-    use sha2::Digest as _;
-    let hashed: Vec<(String, String)> = env
-        .iter()
-        .map(|(k, v)| {
-            let hex: String = sha2::Sha256::digest(v.as_bytes())
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            (format!("{k}_sha256"), hex)
-        })
-        .collect();
-    measure_key(digest, "probe", &hashed)
 }
 
 /// Sorted kwarg pairs so argument order doesn't split the memo.
@@ -2817,7 +2703,6 @@ mod tests {
         assert!(benchmark(&st, "repo@sha256:x", &[], None).contains(r#""status":"disabled""#));
         assert!(lm_eval(&st, "repo@sha256:x", None).contains(r#""status":"disabled""#));
         assert!(profile(&st, "repo@sha256:x").contains(r#""status":"disabled""#));
-        assert!(probe(&st, "repo@sha256:x", &json!({})).contains(r#""status":"disabled""#));
     }
 
     #[test]
@@ -2945,77 +2830,6 @@ mod tests {
         assert!(st.is_built("ghcr.io/ok/img@sha256:cafe"));
         assert!(!st.is_built("ghcr.io/evil/img@sha256:beef"));
     }
-
-    fn probe_cfg() -> ToolsConfig {
-        let mut cfg = bench_cfg();
-        cfg.probe = Some(config::ProbeCfg {
-            command: "python3 /probe.py".into(),
-            script: None,
-        });
-        cfg
-    }
-
-    /// A probe needs a declared command, an object document within the bound, and an image this
-    /// broker built; a settled probe replays from the memo without a job.
-    #[test]
-    fn a_probe_is_bounded_needs_a_built_image_and_replays_from_the_memo() {
-        let st = test_state();
-        let digest = "ghcr.io/ok/img@sha256:cafe";
-        let doc = json!({"model": "m", "requests": [{"prompt": "hi"}]});
-        assert!(matches!(
-            run_probe(&st, &bench_cfg(), digest, &doc),
-            CodegenReply::Unconfigured { .. }
-        ));
-        let cfg = probe_cfg();
-        assert!(matches!(
-            run_probe(&st, &cfg, digest, &json!(["not", "an", "object"])),
-            CodegenReply::RejectedKwarg { .. }
-        ));
-        let huge = json!({"pad": "x".repeat(MAX_PROBE_BYTES)});
-        assert!(matches!(
-            run_probe(&st, &cfg, digest, &huge),
-            CodegenReply::RejectedKwarg { .. }
-        ));
-        match run_probe(&st, &cfg, digest, &doc) {
-            CodegenReply::Error { error } => {
-                assert!(error.contains("not produced by codegen_build"))
-            }
-            other => panic!("expected the unbuilt digest refused, got {other:?}"),
-        }
-
-        st.mark_built(digest);
-        let result = json!({"pass": false, "observed": "garbled output"});
-        st.put(
-            probe_key(digest, &[(PROBE_ENV.into(), doc.to_string())]),
-            Cached::Probe {
-                result: result.clone(),
-                logs: vec!["probe-1.log".into()],
-            },
-        );
-        match run_probe(&st, &cfg, digest, &doc) {
-            CodegenReply::Probed {
-                result: got,
-                cached,
-                ..
-            } => {
-                assert_eq!(got, result);
-                assert!(cached);
-            }
-            other => panic!("expected a memoized probe, got {other:?}"),
-        }
-        assert_ne!(
-            probe_key(digest, &[(PROBE_ENV.into(), doc.to_string())]),
-            probe_key(
-                digest,
-                &[
-                    (PROBE_ENV.into(), doc.to_string()),
-                    (PROBE_SCRIPT_ENV.into(), "print(1)".into())
-                ]
-            ),
-            "a changed script must re-run the probe"
-        );
-    }
-
     /// `base` picks one of the scenario's allowed images, and a different base is a different
     /// build.
     #[test]
