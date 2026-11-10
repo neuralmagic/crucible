@@ -41,3 +41,10 @@ formal/.lake/
 
 # Per-cluster e2e values (just kueue-e2e-cluster); the *.env.example files are committed.
 e2e/kueue/clusters/*.env
+
+# Ad-hoc UI drive scripts against a live controller, their recordings, and Playwright run output.
+crucible-controller/ui/drive-*.mjs
+crucible-controller/ui/dump-panel.mjs
+crucible-controller/ui/verify-launch-log.mjs
+crucible-controller/ui/recordings/
+test-results/
