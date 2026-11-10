@@ -1,12 +1,12 @@
 import { useState } from 'react';
 import { Mono } from '../ui';
+import { relativeTime } from './journeyView';
 import { CheckField, FormGrid, SelectField, TextAreaField, TextField } from './formControls';
 import {
   isEnabled,
   offeredChoices,
   paramBlocks,
   placeholderFor,
-  snapshotAge,
   spellingOf,
   type ParamFieldSpec,
 } from './playbookLaunchForm';
@@ -23,7 +23,7 @@ function sourceHint(spec: ParamFieldSpec, values: Readonly<Record<string, string
   const key = from.keyedBy;
   const keyValue = key === null ? '' : (values[key] ?? '').trim();
   if (key !== null && keyValue === '') return `Pick ${key} to see options`;
-  const age = snapshotAge(spec.choicesSnapshot.capturedAt);
+  const age = relativeTime(spec.choicesSnapshot.capturedAt);
   const scope = key === null ? '' : ` for ${key} ${keyValue}`;
   return `Options${scope} from ${from.task}${age === null ? '' : `, ${age}`}`;
 }

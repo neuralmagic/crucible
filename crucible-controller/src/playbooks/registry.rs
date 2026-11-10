@@ -17,6 +17,7 @@
 use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::packs::{Deliverable, MaterializedPack};
 use anyhow::{Context, Result};
+use crucible::manifest::launch::{CHOICES_REFRESH, is_refresh};
 use crucible::manifest::variant::VariantName;
 use crucible::plan::starlark::declared_params;
 use crucible::plan::starlark::params::ParamType;
@@ -1367,7 +1368,11 @@ pub fn validate_params(
             .map(|(k, v)| {
                 let value = match schema.pointer(&format!("/properties/{}", pointer_token(k))) {
                     Some(property)
-                        if crate::playbooks::choices::outside_snapshot(property, v, params) =>
+                        if crate::playbooks::choices::outside_snapshot(
+                            property,
+                            v,
+                            crate::playbooks::choices::key_value(schema, property, params),
+                        ) =>
                     {
                         errors.push(FieldError {
                             field: k.clone(),
@@ -1435,17 +1440,8 @@ pub fn validate_params(
     }
 }
 
-use crucible::manifest::launch::CHOICES_REFRESH;
-
-/// Whether `params` launch a choices refresh ([ADR-0074]) rather than the playbook's graph.
-///
-/// [ADR-0074]: ../../../docs/adr/ADR-0074.md
-pub(crate) fn is_refresh(params: &std::collections::BTreeMap<String, String>) -> bool {
-    params.get(CHOICES_REFRESH).map(String::as_str) == Some("true")
-}
-
 /// A choices refresh carries `choices.refresh = true` alone, and only a playbook that declares
-/// choices_from has anything to refresh. The declared params' schema does not apply: a refresh
+/// choices_from or placeholder_from has anything to refresh. The declared params' schema does not apply: a refresh
 /// compiles without them.
 fn validate_refresh(
     schema: &serde_json::Value,
@@ -1469,11 +1465,15 @@ fn validate_refresh(
     let declares = schema
         .get("properties")
         .and_then(serde_json::Value::as_object)
-        .is_some_and(|p| p.values().any(|v| v.get("x-choices-from").is_some()));
+        .is_some_and(|p| {
+            p.values()
+                .any(|v| v.get("x-choices-from").is_some() || v.get("x-placeholder-from").is_some())
+        });
     if !declares {
         return refuse(
             CHOICES_REFRESH,
-            "this playbook declares no choices_from parameter, so there is nothing to refresh",
+            "this playbook declares no choices_from or placeholder_from parameter, so there is \
+             nothing to refresh",
         );
     }
     Ok(serde_json::json!({ CHOICES_REFRESH: "true" }))

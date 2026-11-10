@@ -229,6 +229,14 @@ pub enum CompileError {
     )]
     ChoiceProducerReadsParams { param: String, task: String },
     #[error(
+        "a source that declares choices_from must compile without launch values, so a choices \
+         refresh can run, but it failed with placeholder values bound: {inner}"
+    )]
+    ChoiceProbeFailed {
+        #[source]
+        inner: Box<CompileError>,
+    },
+    #[error(
         "a choices refresh needs a parameter that declares choices_from, and this source has none"
     )]
     RefreshWithoutProducers,

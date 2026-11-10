@@ -91,11 +91,11 @@ function valueTypeOf(property: Record<string, unknown>): ParamValueType | null {
   }
 }
 
-function choicesSource(raw: unknown): ChoicesSource | null | 'invalid' {
-  if (raw === undefined || raw === null) return null;
-  if (!isRecord(raw) || typeof raw.task !== 'string' || typeof raw.field !== 'string') return 'invalid';
-  if (raw.keyed_by !== undefined && typeof raw.keyed_by !== 'string') return 'invalid';
-  return { task: raw.task, field: raw.field, keyedBy: raw.keyed_by ?? null };
+function choicesSource(raw: unknown): { ok: true; value: ChoicesSource | null } | { ok: false } {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  if (!isRecord(raw) || typeof raw.task !== 'string' || typeof raw.field !== 'string') return { ok: false };
+  if (raw.keyed_by !== undefined && typeof raw.keyed_by !== 'string') return { ok: false };
+  return { ok: true, value: { task: raw.task, field: raw.field, keyedBy: raw.keyed_by ?? null } };
 }
 
 const isStringList = (value: unknown): value is string[] =>
@@ -242,8 +242,9 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       return { kind: 'unrenderable', reason: `param ${name} is multiline but not a string` };
     }
     let choices: string[] | null = valueType === 'boolean' ? ['true', 'false'] : null;
-    if (raw.enum !== undefined) {
-      const spelled = Array.isArray(raw.enum) && valueType !== 'list' ? raw.enum.map((item) => defaultText(item, valueType)) : [];
+    const listed: unknown = raw.enum ?? raw['x-choices'];
+    if (listed !== undefined) {
+      const spelled = Array.isArray(listed) && valueType !== 'list' ? listed.map((item) => defaultText(item, valueType)) : [];
       if (spelled.length === 0 || spelled.some((item) => !item.ok || item.value === null)) {
         return { kind: 'unrenderable', reason: `param ${name} has choices that are not a nonempty list of its type` };
       }
@@ -257,11 +258,13 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     if (enabledBy.value !== null && !(isRecord(gate) && gate.type === 'boolean')) {
       return { kind: 'unrenderable', reason: `param ${name} is enabled by ${enabledBy.value}, which is not a declared bool` };
     }
-    const choicesFrom = choicesSource(raw['x-choices-from']);
-    const placeholderFrom = choicesSource(raw['x-placeholder-from']);
-    if (choicesFrom === 'invalid' || placeholderFrom === 'invalid') {
+    const choicesSpec = choicesSource(raw['x-choices-from']);
+    const placeholderSpec = choicesSource(raw['x-placeholder-from']);
+    if (!choicesSpec.ok || !placeholderSpec.ok) {
       return { kind: 'unrenderable', reason: `param ${name} names its options' task output in a shape this form does not read` };
     }
+    const choicesFrom = choicesSpec.value;
+    const placeholderFrom = placeholderSpec.value;
     for (const source of [choicesFrom, placeholderFrom]) {
       const key = source?.keyedBy;
       if (key !== undefined && key !== null && !(isRecord(properties[key]) && valueTypeOf(properties[key]) === 'string')) {
@@ -314,10 +317,6 @@ export function initialValues(
   return values;
 }
 
-/// Client-side convenience only. An unanchored `new RegExp` matches JSON Schema semantics, and a
-/// pattern the browser cannot compile (Rust-regex syntax the engine accepts) checks nothing here
-/// rather than failing a value the endpoint would have taken.
-/// Whether a gated param's switch is on, so its value is taken; an ungated param always is.
 /// One block of the rendered form: a lone field, or a boolean gate with the fields it enables.
 export type ParamBlock =
   | { kind: 'field'; spec: ParamFieldSpec }
@@ -374,28 +373,19 @@ export function placeholderFor(spec: ParamFieldSpec, values: Readonly<Record<str
   return spec.placeholderSnapshot.value[(values[key] ?? '').trim()] ?? null;
 }
 
-/// How long ago a snapshot was captured, coarsely: the form shows it so a stale list is noticed.
-export function snapshotAge(capturedAt: string | null, now: Date = new Date()): string | null {
-  if (capturedAt === null) return null;
-  const at = new Date(capturedAt).getTime();
-  if (Number.isNaN(at)) return null;
-  const minutes = Math.max(0, Math.floor((now.getTime() - at) / 60000));
-  if (minutes < 1) return 'just now';
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 48) return `${hours} h ago`;
-  return `${Math.floor(hours / 24)} days ago`;
-}
-
 /// Whether the pack has options computed by a task, which a refresh launch recomputes.
 export function refreshable(specs: readonly ParamFieldSpec[]): boolean {
   return specs.some((spec) => spec.choicesFrom !== null || spec.placeholderFrom !== null);
 }
 
+/// Whether a gated param's switch is on, so its value is taken; an ungated param always is.
 export function isEnabled(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): boolean {
   return spec.enabledBy === null || (values[spec.enabledBy] ?? '').trim().toLowerCase() === 'true';
 }
 
+/// Client-side convenience only. An unanchored `new RegExp` matches JSON Schema semantics, and a
+/// pattern the browser cannot compile (Rust-regex syntax the engine accepts) checks nothing here
+/// rather than failing a value the endpoint would have taken.
 export function validateParam(
   spec: ParamFieldSpec,
   value: string,
@@ -454,22 +444,18 @@ export function launchBody(
   values: Readonly<Record<string, string>>,
   ceilings: LaunchCeilings
 ): LaunchPlaybookBody {
-  const params = trimmedParams(specs, values);
-  const target = (ceilings.dispatchTarget ?? '').trim();
-  return {
-    params,
-    max_cost: ceilings.maxCost,
-    max_time: ceilings.maxTime.trim(),
-    schema_digest: ceilings.schemaDigest,
-    ...(target === '' ? {} : { dispatch_target: target }),
-  };
+  return bodyOf(trimmedParams(specs, values), ceilings);
 }
 
 /// The launch POST body of a refresh: no params, only the setting that runs the option tasks.
 export function refreshBody(ceilings: LaunchCeilings): LaunchPlaybookBody {
+  return bodyOf({ [CHOICES_REFRESH]: 'true' }, ceilings);
+}
+
+function bodyOf(params: Record<string, string>, ceilings: LaunchCeilings): LaunchPlaybookBody {
   const target = (ceilings.dispatchTarget ?? '').trim();
   return {
-    params: { [CHOICES_REFRESH]: 'true' },
+    params,
     max_cost: ceilings.maxCost,
     max_time: ceilings.maxTime.trim(),
     schema_digest: ceilings.schemaDigest,

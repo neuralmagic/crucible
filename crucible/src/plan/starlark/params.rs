@@ -155,13 +155,52 @@ pub struct ChoicesFrom {
     pub keyed_by: Option<String>,
 }
 
-impl ChoicesFrom {
-    fn schema(&self) -> serde_json::Value {
-        let mut out = serde_json::json!({"task": self.task, "field": self.field});
-        if let Some(key) = &self.keyed_by {
-            out["keyed_by"] = serde_json::json!(key);
+impl ParamSpec {
+    /// The task outputs this parameter's form reads: its choices and its placeholder.
+    pub fn sources(&self) -> impl Iterator<Item = &ChoicesFrom> {
+        self.choices_from.iter().chain(&self.placeholder_from)
+    }
+
+    /// A value the declaration admits, for a compile that has no launch values. The two probes
+    /// differ wherever the declaration admits two values that can be named without a launcher:
+    /// a pattern-constrained string is its default under both.
+    pub fn probe(&self, second: bool) -> ParamValue {
+        let text = || format!("crucible-probe-{}", u8::from(second));
+        let number = |whole: bool| {
+            let low = match (self.min, self.max) {
+                (Some(min), _) if whole => min.ceil(),
+                (Some(min), _) => min,
+                (None, Some(max)) if whole => max.min(0.0).floor(),
+                (None, Some(max)) => max.min(0.0),
+                (None, None) => 0.0,
+            };
+            let next = low + 1.0;
+            if second && self.max.is_none_or(|max| next <= max) {
+                next
+            } else {
+                low
+            }
+        };
+        match self.ty {
+            ParamType::String => {
+                let choice = if second {
+                    self.choices.last()
+                } else {
+                    self.choices.first()
+                };
+                ParamValue::String(match (choice, &self.pattern, &self.default) {
+                    (Some(choice), _, _) => choice.clone(),
+                    (None, Some(_), Some(ParamValue::String(default))) => default.clone(),
+                    _ => text(),
+                })
+            }
+            ParamType::Int => ParamValue::Int(number(true) as i32),
+            ParamType::Number => ParamValue::Number(number(false)),
+            ParamType::Bool => ParamValue::Bool(second),
+            ParamType::StringList => {
+                ParamValue::StringList(if second { vec![text()] } else { Vec::new() })
+            }
         }
-        out
     }
 }
 
@@ -231,10 +270,7 @@ impl Params {
             specs.push(spec(&name, &value.node)?);
         }
         for spec in &specs {
-            for from in [&spec.choices_from, &spec.placeholder_from]
-                .into_iter()
-                .flatten()
-            {
+            for from in spec.sources() {
                 let Some(key) = &from.keyed_by else { continue };
                 let keyed = specs.iter().find(|s| &s.name == key);
                 let detail = match keyed {
@@ -375,10 +411,10 @@ impl Params {
                 property.insert(key.into(), serde_json::json!(spec.choices));
             }
             if let Some(from) = &spec.choices_from {
-                property.insert("x-choices-from".into(), from.schema());
+                property.insert("x-choices-from".into(), serde_json::json!(from));
             }
             if let Some(from) = &spec.placeholder_from {
-                property.insert("x-placeholder-from".into(), from.schema());
+                property.insert("x-placeholder-from".into(), serde_json::json!(from));
             }
             if spec.allow_other {
                 property.insert("x-allow-other".into(), serde_json::json!(true));

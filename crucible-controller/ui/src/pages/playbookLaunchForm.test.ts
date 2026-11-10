@@ -10,7 +10,6 @@ import {
   parseParamsSchema,
   placeholderFor,
   refreshBody,
-  snapshotAge,
   parseMaxTime,
   previewMatches,
   runSnapshot,
@@ -205,6 +204,17 @@ describe('parseParamsSchema', () => {
     expect(validateParam(component, 'triton', {})).toBeNull();
   });
 
+  it('offers a written list that is open as suggestions', () => {
+    const [size] = specsOf({
+      type: 'object',
+      properties: { size: { type: 'string', default: 's', 'x-allow-other': true, 'x-choices': ['s', 'm'] } },
+    });
+    if (!size) throw new Error('one spec');
+    expect(size.choices).toEqual(['s', 'm']);
+    expect(size.allowOther).toBe(true);
+    expect(validateParam(size, 'xl', {})).toBeNull();
+  });
+
   it('drops a snapshot of the wrong shape and refuses a key that is not a declared string', () => {
     const [flat] = specsOf({
       type: 'object',
@@ -225,15 +235,6 @@ describe('parseParamsSchema', () => {
       },
     });
     expect(keyedByBool.kind).toBe('unrenderable');
-  });
-
-  it('says how old a snapshot is, coarsely', () => {
-    const now = new Date('2026-11-09T12:00:00Z');
-    expect(snapshotAge('2026-11-09T11:59:40Z', now)).toBe('just now');
-    expect(snapshotAge('2026-11-09T11:15:00Z', now)).toBe('45 min ago');
-    expect(snapshotAge('2026-11-08T12:00:00Z', now)).toBe('24 h ago');
-    expect(snapshotAge('2026-11-01T12:00:00Z', now)).toBe('8 days ago');
-    expect(snapshotAge(null, now)).toBeNull();
   });
 
   it('refreshes with the refresh setting alone', () => {

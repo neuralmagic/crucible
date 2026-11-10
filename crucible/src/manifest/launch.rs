@@ -108,6 +108,11 @@ pub const REPO_REF: &str = "repo.ref";
 /// [ADR-0074]: ../../../docs/adr/ADR-0074.md
 pub const CHOICES_REFRESH: &str = "choices.refresh";
 
+/// Whether the supplied launch values ask for a choices refresh.
+pub fn is_refresh(supplied: &BTreeMap<String, String>) -> bool {
+    supplied.get(CHOICES_REFRESH).map(String::as_str) == Some("true")
+}
+
 /// What one launch set: agent settings by target, and the ref to check out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LaunchSettings {
@@ -264,17 +269,14 @@ impl LaunchSettings {
         let mut refresh = false;
         for (address, raw) in addressed {
             if address == CHOICES_REFRESH {
-                refresh = match raw.trim().to_ascii_lowercase().as_str() {
-                    "true" => true,
-                    "false" => false,
-                    _ => {
-                        return Err(SettingsError::BadValue {
-                            address: address.clone(),
-                            got: raw.clone(),
-                            expected: "true or false",
-                        });
-                    }
-                };
+                if raw != "true" {
+                    return Err(SettingsError::BadValue {
+                        address: address.clone(),
+                        got: raw.clone(),
+                        expected: "true",
+                    });
+                }
+                refresh = true;
                 continue;
             }
             if address == REPO_REF {
