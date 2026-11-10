@@ -702,6 +702,8 @@ enum Value {
     Others,
     /// `task_defaults(...)`.
     Defaults(TaskDefaults),
+    /// What a constructor returns after recording its own errors.
+    Poison,
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -1070,8 +1072,7 @@ fn constructor(
             env: crate::host_env::DeclaredEnv::default(),
             history_record,
         };
-        workflow.validate()?;
-        return Ok(Value::Workflow(workflow));
+        return validated(workflow, state);
     }
     if function == "session" {
         let name = take_string(&mut named, "name")?;
@@ -2063,6 +2064,23 @@ fn field_question(output: DeclaredOutput, state: &CompileState) -> Result<Answer
     })
 }
 
+/// The workflow, validated. Several graph errors are each recorded at the task they were found
+/// on; one is returned for the caller to locate at the `workflow()` call.
+fn validated(workflow: WorkflowCfg, state: &CompileState) -> Result<Value> {
+    use crate::plan::ir::PlanError;
+    use crate::plan::workflow::WorkflowError;
+    let errors = match workflow.validate() {
+        Ok(()) => return Ok(Value::Workflow(workflow)),
+        Err(WorkflowError::Plan(PlanError::Many { errors })) => errors,
+        Err(error) => return Err(error.into()),
+    };
+    for (task, error) in errors {
+        let error = CompileError::Workflow(WorkflowError::Plan(error));
+        state.record(at_task(state, &task, error));
+    }
+    Ok(Value::Poison)
+}
+
 /// Everything `workflow()` does to the listed tasks before the graph is validated.
 pub(crate) fn assemble(
     mut tasks: Vec<Task>,
@@ -2098,9 +2116,15 @@ fn apply_defaults(tasks: &mut [Task], defaults: TaskDefaults, state: &CompileSta
     }
 }
 
-/// An error at the site `task` was constructed at.
+/// An error at the site `task` was constructed at, or at the call being evaluated when the
+/// task was not constructed by this source.
 fn at_task(state: &CompileState, task: &TaskName, error: CompileError) -> CompileError {
-    match state.context_mut().constructed_tasks.get(&task.0) {
+    let context = state.context_mut();
+    match context
+        .constructed_tasks
+        .get(&task.0)
+        .or(context.call.as_ref())
+    {
         Some(site) => CompileError::At {
             at: site.clone(),
             inner: Box::new(error),
@@ -10475,5 +10499,60 @@ workflow(type = "playbook", tasks = [scan, fan, sum, go])
             .map(|task| (task.name.0.as_str(), dependencies(task)))
             .collect();
         assert_eq!(drawn, [("a", vec!["b"]), ("b", vec!["a"])]);
+    }
+
+    #[test]
+    fn every_graph_error_is_reported_at_the_task_it_was_found_on() {
+        let found = errors(
+            "graph-errors",
+            &[],
+            r#"a = command(name = "a", run = "true", join = "passed")
+b = command(name = "b", run = "true")
+c = command(name = "c", run = "true", depends_on = ["nope"])
+gate = route(name = "gate", decider = output(b), questions = {"q": noul(ask = "q?")})
+d = command(name = "d", run = "true", when = gate.q)
+workflow(type = "playbook", tasks = [a, b, c, gate, d])
+"#,
+        );
+        let lines: Vec<u32> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(
+            lines,
+            [1, 3],
+            "what a route's answers reach is checked once each task stands alone: {found:#?}"
+        );
+        assert!(
+            found[0].1.contains("needs at least one dependency"),
+            "{found:#?}"
+        );
+        assert!(found[1].1.contains("unknown task \"nope\""), "{found:#?}");
+
+        let found = errors(
+            "graph-errors-routes",
+            &[],
+            r#"one = route(name = "one", decider = model(min_confidence = 0.5), questions = {"q": noul(ask = "q?")})
+two = route(name = "two", decider = model(min_confidence = 0.5), questions = {"q": noul(ask = "q?")})
+a = command(name = "a", run = "true", when = one.q)
+b = command(name = "b", run = "true", when = two.q)
+workflow(type = "playbook", tasks = [one, two, a, b])
+"#,
+        );
+        let lines: Vec<u32> = found.iter().map(|(line, _)| *line).collect();
+        assert_eq!(lines, [1, 2], "{found:#?}");
+        assert!(
+            found.iter().all(|(_, said)| said.contains("uncertain")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn one_graph_error_is_still_reported_at_the_workflow_call() {
+        let found = errors(
+            "graph-error",
+            &[],
+            "a = command(name = \"a\", run = \"true\", join = \"passed\")\n\
+             workflow(type = \"playbook\", tasks = [a])\n",
+        );
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].0, 2);
     }
 }

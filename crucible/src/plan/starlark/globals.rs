@@ -472,8 +472,7 @@ fn call<'v>(
                         env: crate::host_env::DeclaredEnv::default(),
                         history_record: None,
                     };
-                    workflow.validate()?;
-                    Ok(dsl::Value::Workflow(workflow))
+                    dsl::validated(workflow, state)
                 }),
             ("default_autoresearch", dsl::Value::List(tasks)) => {
                 dsl::task_list("default_autoresearch", tasks)
@@ -712,5 +711,6 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Decider(decider) => heap.alloc(DeciderValue(decider)),
         dsl::Value::Others => heap.alloc(OthersValue),
         dsl::Value::Defaults(defaults) => heap.alloc(TaskDefaultsValue(defaults)),
+        dsl::Value::Poison => heap.alloc(PoisonValue),
     }
 }
