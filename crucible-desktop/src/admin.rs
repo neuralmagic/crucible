@@ -1256,7 +1256,7 @@ impl crate::App {
                 .filter(|_| on(crate::Page::Triggers))
                 .map(|form| form.playbook.clone()),
             providers: on(crate::Page::Providers),
-            teams: on(crate::Page::Teams),
+            teams: controller,
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
         if self.remote.admin_sent.as_ref() != Some(&watch) {

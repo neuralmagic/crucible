@@ -216,6 +216,36 @@ pub(crate) fn field(label: &str, control: El, p: &Paint) -> El {
         .child(control)
 }
 
+/// What the app knows that completes `typed`, as buttons that fill the field. Nothing when there
+/// is nothing to offer.
+pub(crate) fn suggestions(
+    key: &str,
+    typed: &str,
+    want: crate::principals::Want,
+    fill: fn(&mut App, &str),
+    app: &App,
+    p: &Paint,
+) -> Option<El> {
+    let offered = app.known_principals().suggest(typed, want, 6);
+    if offered.is_empty() {
+        return None;
+    }
+    let mut chips = row().key(key.to_string()).gap(6.0).flex_wrap();
+    for value in offered {
+        let chip = format!("{key}-{value}");
+        let label = value.clone();
+        chips = chips.child(
+            Button::new(label)
+                .variant(ButtonVariant::Outline)
+                .control_size(rune_kit::ControlSize::Small)
+                .on_press(move |app: &mut App| fill(app, &value))
+                .build(p.k)
+                .key(chip),
+        );
+    }
+    Some(chips)
+}
+
 /// A small muted heading over a group of rows.
 pub(crate) fn heading(label: &str, p: &Paint) -> El {
     text(label.to_string())

@@ -39,6 +39,7 @@ mod opened;
 mod pack;
 mod palette;
 mod preview;
+mod principals;
 mod profile;
 mod provider;
 mod remote;

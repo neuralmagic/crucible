@@ -431,6 +431,16 @@ fn add_member(team: &Team, app: &App, p: &Paint) -> El {
                 .build(p.k)
                 .key("member-name"),
         )
+        .children(crate::ui::desk::suggestions(
+            "member-name-suggest",
+            &form.member.text,
+            crate::principals::Want::Member(form.kind),
+            |app: &mut App, picked: &str| {
+                app.remote.desk.add_member.member = rune::TextEdit::new(picked);
+            },
+            app,
+            p,
+        ))
         .child(pills(
             "member-add-role",
             &roles,

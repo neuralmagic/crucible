@@ -420,6 +420,16 @@ fn provider_form(form: &ProviderForm, app: &App, p: &Paint) -> El {
                 "user:login or team:slug",
                 |form| &mut form.secret_owner,
                 p,
+            ))
+            .children(crate::ui::desk::suggestions(
+                "provider-secret-owner-suggest",
+                &form.secret_owner.text,
+                crate::principals::Want::Principal,
+                |app: &mut App, picked: &str| {
+                    change(app, |form| form.secret_owner = TextEdit::new(picked));
+                },
+                app,
+                p,
             ));
     }
     let asked = form.register();
