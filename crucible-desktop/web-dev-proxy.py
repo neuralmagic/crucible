@@ -5,7 +5,8 @@
 
 The page talks to its own origin, so this stands in for the controller serving it: files come
 from --dir, and /api and /auth go to the controller in crux's config (or CONTROLLER_URL) with
-crux's key (or CONTROLLER_API_TOKEN). Only GET and HEAD are forwarded unless --write is given.
+crux's key (or CONTROLLER_API_TOKEN). Unless --write is given, only GET, HEAD and the POSTs that
+store nothing (webhook check and preview) are forwarded.
 Listens on 127.0.0.1 alone: anything that can reach the port acts as the key's owner.
 """
 
@@ -18,6 +19,8 @@ import tomllib
 import urllib.parse
 
 FORWARDED = ("/api/", "/auth/")
+# POSTs that only evaluate what they are sent, forwarded even when read-only.
+STORES_NOTHING = ("/api/webhooks/check", "/api/webhooks/preview")
 FORWARDED_HEADERS = ("accept", "content-type", "last-event-id", "x-crucible-act-as")
 HOP_BY_HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
               "proxy-authenticate", "proxy-authorization", "content-length", "set-cookie"}
@@ -47,7 +50,10 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             super().do_HEAD()
 
     def do_POST(self):
-        self.mutate()
+        if self.path in STORES_NOTHING:
+            self.forward()
+        else:
+            self.mutate()
 
     def do_PUT(self):
         self.mutate()

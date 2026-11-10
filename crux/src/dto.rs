@@ -1607,6 +1607,70 @@ pub struct Webhook {
     pub max_time: String,
     #[serde(default)]
     pub dispatch_target: Option<String>,
+    /// The header an `hmac_sha256` webhook reads the signature from.
+    #[serde(default)]
+    pub header: Option<String>,
+    #[serde(default)]
+    pub retention_days: i64,
+}
+
+/// How a webhook tells a real delivery from a forged one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebhookVerifier {
+    /// A secret token in the delivery address.
+    #[default]
+    PathToken,
+    /// An HMAC-SHA256 signature of the body in a header.
+    HmacSha256,
+}
+
+/// A webhook as `POST /api/webhooks` and `PUT /api/webhooks/{id}` take it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WebhookBody {
+    pub playbook: String,
+    pub verifier: WebhookVerifier,
+    pub header: Option<String>,
+    pub filter: String,
+    pub dedupe: String,
+    pub derive: std::collections::BTreeMap<String, String>,
+    pub params: std::collections::BTreeMap<String, String>,
+    pub max_launches_per_hour: i32,
+    pub retention_days: i32,
+    pub max_cost: f64,
+    pub max_time: String,
+    pub dispatch_target: Option<String>,
+}
+
+/// A sender's verifier and transform to start a webhook form from.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WebhookPreset {
+    pub id: String,
+    pub title: String,
+    pub verifier: WebhookVerifier,
+    #[serde(default)]
+    pub header: Option<String>,
+    pub filter: String,
+    pub dedupe: String,
+    #[serde(default)]
+    pub derive: std::collections::BTreeMap<String, String>,
+}
+
+/// What one expression of a transform came to on a sample delivery.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PreviewResult {
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `POST /api/webhooks/preview`: a transform run on a sample delivery, nothing stored.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WebhookPreview {
+    pub filter: PreviewResult,
+    pub dedupe: PreviewResult,
+    pub derive: PreviewResult,
 }
 
 /// `POST /api/webhooks/{id}/secret`: the webhook with its new secret, which no later response
@@ -1633,7 +1697,7 @@ pub struct WebhookDelivery {
     pub launch_key: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct CelDiagnostic {
     pub field: String,
     pub message: String,
@@ -1643,7 +1707,7 @@ pub struct CelDiagnostic {
     pub column: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WebhookCheck {
     #[serde(default)]
     pub diagnostics: Vec<CelDiagnostic>,

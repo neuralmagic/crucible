@@ -8,7 +8,8 @@ use rune_kit::{Button, ButtonVariant, Switch};
 
 use crate::admin::{Action, relative};
 use crate::ui::desk::{card, frame, heading, landed, none, now, reading, scrolled, stacked};
-use crate::ui::{Paint, Tone, flag, schedules, tag};
+use crate::ui::{Paint, Tone, flag, schedules, tag, webhook_form};
+use crate::webhook::WebhookForm;
 use crate::{App, Selection};
 
 pub(crate) fn page(app: &App, p: &Paint) -> El {
@@ -25,7 +26,32 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
     .into_iter()
     .flatten()
     .collect();
-    frame("triggers", "Triggers", note.join(" \u{b7} "), None, app, p).child(scrolled(
+    let create = Button::new("New webhook")
+        .variant(ButtonVariant::Neutral)
+        .disabled(app.remote.desk.webhook_form.is_some() || app.remote.registered.is_empty())
+        .on_press(|app: &mut App| {
+            if let Some(first) = app.remote.registered.first() {
+                app.remote.desk.webhook_form = Some(WebhookForm::new(first));
+            }
+        })
+        .build(p.k)
+        .key("webhook-new");
+    let page = frame(
+        "triggers",
+        "Triggers",
+        note.join(" \u{b7} "),
+        Some(create),
+        app,
+        p,
+    );
+    if let Some(form) = &app.remote.desk.webhook_form {
+        return page.child(scrolled(
+            "webhook-form-scroll",
+            webhook_form::form(form, app, p),
+            p,
+        ));
+    }
+    page.child(scrolled(
         "triggers-scroll",
         col()
             .key("triggers-body")
@@ -386,8 +412,19 @@ fn controls(hook: &Webhook, app: &App, p: &Paint) -> El {
             .build(p.k)
             .key(test_key)
     };
+    let editing = hook.clone();
     row()
         .gap(8.0)
+        .child(
+            Button::new("Edit")
+                .variant(ButtonVariant::Ghost)
+                .disabled(app.remote.desk.busy())
+                .on_press(move |app: &mut App| {
+                    app.remote.desk.webhook_form = Some(WebhookForm::editing(&editing));
+                })
+                .build(p.k)
+                .key(format!("webhook-edit-{}", hook.id)),
+        )
         .child(button(
             "Rotate secret",
             "Confirm rotate",

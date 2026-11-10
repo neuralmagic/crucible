@@ -59,6 +59,7 @@ mod tray;
 mod tune;
 mod ui;
 mod unfurl;
+mod webhook;
 mod workspace;
 
 use std::collections::{HashMap, HashSet};

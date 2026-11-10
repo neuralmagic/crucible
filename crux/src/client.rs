@@ -911,6 +911,48 @@ impl Client {
         self.get(&format!("/api/webhooks/{}", encode(id))).await
     }
 
+    /// Create a webhook. Its secret is in this answer and nowhere else.
+    pub async fn create_webhook(&self, body: &dto::WebhookBody) -> Result<dto::WebhookSecret> {
+        self.post("/api/webhooks", Some(body)).await
+    }
+
+    /// Replace a webhook. Its verifier and secret stay as created.
+    pub async fn update_webhook(&self, id: &str, body: &dto::WebhookBody) -> Result<dto::Webhook> {
+        self.put(&format!("/api/webhooks/{}", encode(id)), body)
+            .await
+    }
+
+    pub async fn webhook_presets(&self) -> Result<Vec<dto::WebhookPreset>> {
+        self.get("/api/webhooks/presets").await
+    }
+
+    /// Check a transform's CEL the way a save does.
+    pub async fn check_webhook(&self, body: &dto::WebhookBody) -> Result<dto::WebhookCheck> {
+        let transform = serde_json::json!({
+            "filter": body.filter,
+            "dedupe": body.dedupe,
+            "derive": body.derive,
+        });
+        self.post("/api/webhooks/check", Some(&transform)).await
+    }
+
+    /// Run a transform on `sample`, delivered with `headers`. Nothing is stored.
+    pub async fn preview_webhook(
+        &self,
+        body: &dto::WebhookBody,
+        sample: &serde_json::Value,
+        headers: &std::collections::BTreeMap<String, String>,
+    ) -> Result<dto::WebhookPreview> {
+        let asked = serde_json::json!({
+            "filter": body.filter,
+            "dedupe": body.dedupe,
+            "derive": body.derive,
+            "sample": sample,
+            "headers": headers,
+        });
+        self.post("/api/webhooks/preview", Some(&asked)).await
+    }
+
     /// Pause a webhook (its address answers not found) or resume it.
     pub async fn set_webhook_enabled(&self, id: &str, enabled: bool) -> Result<dto::Webhook> {
         let body = serde_json::json!({ "enabled": enabled });
@@ -2069,6 +2111,140 @@ mod tests {
         assert_eq!(
             *seen.lock().unwrap(),
             [r#"POST w1 {"enabled":false}"#, "DELETE w1 "]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_webhook_form_saves_checks_and_previews_what_it_holds() {
+        use axum::extract::State;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::routing::{get, post, put};
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+        const HOOK: &str = r#"{"id":"w9","playbook":"triage","verifier":"hmac_sha256",
+            "header":"x-hub-signature-256","retention_days":7,"enabled":true}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            uri: Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            let sent = serde_json::from_str(&body).expect("a JSON body");
+            seen.lock()
+                .unwrap()
+                .push((format!("{method} {}", uri.path()), sent));
+            let answer = match (method.as_str(), uri.path()) {
+                ("POST", "/api/webhooks") => {
+                    format!(r#"{{"webhook":{HOOK},"secret":"whsec_new","delivery_url":null}}"#)
+                }
+                ("POST", "/api/webhooks/check") => r#"{"diagnostics":[{"field":"filter",
+                    "message":"undeclared reference to 'bod'","line":1,"column":0}]}"#
+                    .to_string(),
+                ("POST", "/api/webhooks/preview") => r#"{"filter":{"value":true,"error":null},
+                    "dedupe":{"value":"42","error":null},
+                    "derive":{"value":null,"error":"no such key: repository"}}"#
+                    .to_string(),
+                _ => HOOK.to_string(),
+            };
+            (StatusCode::OK, answer)
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route("/api/webhooks", post(note))
+            .route("/api/webhooks/{id}", put(note))
+            .route("/api/webhooks/check", post(note))
+            .route("/api/webhooks/preview", post(note))
+            .route(
+                "/api/webhooks/presets",
+                get(|| async {
+                    r#"[{"id":"github-issues","title":"GitHub issues","verifier":"hmac_sha256",
+                        "header":"x-hub-signature-256","filter":"body.action == \"opened\"",
+                        "dedupe":"string(body.issue.id)",
+                        "derive":{"repo":"body.repository.full_name"}}]"#
+                }),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let presets = client.webhook_presets().await.expect("presets");
+        assert_eq!(presets[0].verifier, dto::WebhookVerifier::HmacSha256);
+        assert_eq!(presets[0].derive["repo"], "body.repository.full_name");
+
+        let body = dto::WebhookBody {
+            playbook: "triage".into(),
+            verifier: dto::WebhookVerifier::HmacSha256,
+            header: Some("x-hub-signature-256".into()),
+            filter: "body.action == \"opened\"".into(),
+            dedupe: "string(body.issue.id)".into(),
+            derive: BTreeMap::from([("repo".into(), "body.repository.full_name".into())]),
+            params: BTreeMap::from([("limit".into(), "1".into())]),
+            max_launches_per_hour: 3,
+            retention_days: 7,
+            max_cost: 3.0,
+            max_time: "25m".into(),
+            dispatch_target: None,
+        };
+        let created = client.create_webhook(&body).await.expect("create");
+        assert_eq!(created.secret, "whsec_new");
+        assert_eq!(
+            created.webhook.header.as_deref(),
+            Some("x-hub-signature-256")
+        );
+        assert_eq!(created.webhook.retention_days, 7);
+        client.update_webhook("w9", &body).await.expect("update");
+
+        let check = client.check_webhook(&body).await.expect("check");
+        assert_eq!(check.diagnostics[0].field, "filter");
+        let sample = serde_json::json!({ "action": "opened" });
+        let headers = BTreeMap::from([("x-github-event".to_string(), "issues".to_string())]);
+        let preview = client
+            .preview_webhook(&body, &sample, &headers)
+            .await
+            .expect("preview");
+        assert_eq!(preview.filter.value, Some(serde_json::json!(true)));
+        assert_eq!(
+            preview.derive.error.as_deref(),
+            Some("no such key: repository")
+        );
+
+        let sent = seen.lock().unwrap().clone();
+        let whole = serde_json::json!({
+            "playbook": "triage", "verifier": "hmac_sha256", "header": "x-hub-signature-256",
+            "filter": "body.action == \"opened\"", "dedupe": "string(body.issue.id)",
+            "derive": { "repo": "body.repository.full_name" }, "params": { "limit": "1" },
+            "max_launches_per_hour": 3, "retention_days": 7, "max_cost": 3.0,
+            "max_time": "25m", "dispatch_target": null,
+        });
+        let transform = serde_json::json!({
+            "filter": "body.action == \"opened\"", "dedupe": "string(body.issue.id)",
+            "derive": { "repo": "body.repository.full_name" },
+        });
+        let mut previewed = transform.clone();
+        previewed["sample"] = sample;
+        previewed["headers"] = serde_json::json!({ "x-github-event": "issues" });
+        assert_eq!(
+            sent,
+            [
+                ("POST /api/webhooks".to_string(), whole.clone()),
+                ("PUT /api/webhooks/w9".to_string(), whole),
+                ("POST /api/webhooks/check".to_string(), transform),
+                ("POST /api/webhooks/preview".to_string(), previewed),
+            ]
         );
     }
 }

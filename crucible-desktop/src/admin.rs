@@ -42,6 +42,8 @@ pub struct Watch {
     pub webhooks: bool,
     /// The webhook whose deliveries the Triggers page shows.
     pub webhook: Option<String>,
+    /// The playbook the open webhook form launches.
+    pub webhook_form: Option<String>,
 }
 
 /// A change to make on the controller.
@@ -139,6 +141,20 @@ pub enum Action {
     DeleteWebhook {
         id: String,
     },
+    /// Create a webhook, or replace webhook `id`.
+    SaveWebhook {
+        id: Option<String>,
+        body: Box<dto::WebhookBody>,
+    },
+    CheckWebhook {
+        body: Box<dto::WebhookBody>,
+    },
+    /// Run the form's transform on a sample delivery.
+    PreviewWebhook {
+        body: Box<dto::WebhookBody>,
+        sample: serde_json::Value,
+        headers: BTreeMap<String, String>,
+    },
 }
 
 /// Which kind of action an outcome answers.
@@ -166,6 +182,9 @@ pub enum Did {
     EnableWebhook,
     RotateWebhook,
     DeleteWebhook,
+    SaveWebhook,
+    CheckWebhook,
+    PreviewWebhook,
 }
 
 impl Action {
@@ -193,6 +212,9 @@ impl Action {
             Action::EnableWebhook { .. } => Did::EnableWebhook,
             Action::RotateWebhook { .. } => Did::RotateWebhook,
             Action::DeleteWebhook { .. } => Did::DeleteWebhook,
+            Action::SaveWebhook { .. } => Did::SaveWebhook,
+            Action::CheckWebhook { .. } => Did::CheckWebhook,
+            Action::PreviewWebhook { .. } => Did::PreviewWebhook,
         }
     }
 
@@ -228,6 +250,10 @@ impl Action {
             Action::EnableWebhook { .. } => "Paused the webhook".to_string(),
             Action::RotateWebhook { .. } => "Rotated the secret".to_string(),
             Action::DeleteWebhook { .. } => "Deleted the webhook".to_string(),
+            Action::SaveWebhook { id: None, .. } => "Created the webhook".to_string(),
+            Action::SaveWebhook { id: Some(_), .. } => "Saved the webhook".to_string(),
+            Action::CheckWebhook { .. } => "Checked".to_string(),
+            Action::PreviewWebhook { .. } => "Previewed".to_string(),
         }
     }
 }
@@ -264,8 +290,15 @@ pub struct AdminView {
     pub team_audit: Option<(String, Loaded<Vec<dto::TeamAudit>>)>,
     pub webhooks: Loaded<Vec<dto::Webhook>>,
     pub deliveries: Option<(String, Loaded<Vec<dto::WebhookDelivery>>)>,
-    /// The webhook secret just rotated in, for as long as its webhook stays picked.
+    /// The secret of the webhook just created or rotated, until another webhook is opened or
+    /// the Triggers page is left.
     pub rotated: Option<dto::WebhookSecret>,
+    /// The open webhook form's playbook and its params schema.
+    pub webhook_schema: Option<(String, Loaded<serde_json::Value>)>,
+    pub presets: Loaded<Vec<dto::WebhookPreset>>,
+    /// What the last check and preview of the open webhook form came to.
+    pub webhook_check: Option<dto::WebhookCheck>,
+    pub webhook_preview: Option<dto::WebhookPreview>,
     /// The key just minted, with its secret, for as long as the API keys page stays open.
     pub minted: Option<dto::MintedKey>,
     pub acted: Option<Acted>,
@@ -394,9 +427,21 @@ impl Worker {
             self.view.webhooks = Some(webhooks);
         }
         self.view.deliveries = read.deliveries.map(|(id, list)| (id, Some(list)));
-        let shown = watch.webhook.as_deref();
-        if self.view.rotated.as_ref().map(|r| r.webhook.id.as_str()) != shown {
+        let rotated = self.view.rotated.as_ref().map(|r| r.webhook.id.as_str());
+        let elsewhere = watch
+            .webhook
+            .as_deref()
+            .is_some_and(|shown| Some(shown) != rotated);
+        if !watch.webhooks || elsewhere {
             self.view.rotated = None;
+        }
+        self.view.webhook_schema = read.webhook_schema.map(|(id, schema)| (id, Some(schema)));
+        if let Some(presets) = read.presets {
+            self.view.presets = Some(presets);
+        }
+        if watch.webhook_form.is_none() {
+            self.view.webhook_check = None;
+            self.view.webhook_preview = None;
         }
     }
 
@@ -430,6 +475,8 @@ struct Read {
     team_audit: Option<(String, Result<Vec<dto::TeamAudit>, String>)>,
     webhooks: Option<Result<Vec<dto::Webhook>, String>>,
     deliveries: Option<(String, Result<Vec<dto::WebhookDelivery>, String>)>,
+    webhook_schema: Option<(String, Result<serde_json::Value, String>)>,
+    presets: Option<Result<Vec<dto::WebhookPreset>, String>>,
 }
 
 impl Read {
@@ -452,6 +499,8 @@ impl Read {
                 .map(|slug| (slug, Err(why.clone()))),
             webhooks: watch.webhooks.then(|| Err(why.clone())),
             deliveries: watch.webhook.clone().map(|id| (id, Err(why.clone()))),
+            webhook_schema: watch.webhook_form.clone().map(|id| (id, Err(why.clone()))),
+            presets: watch.webhook_form.is_some().then(|| Err(why.clone())),
         }
     }
 }
@@ -499,6 +548,11 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         .await;
         Some((id.clone(), list))
     };
+    let webhook_schema = async {
+        let playbook = watch.webhook_form.as_ref()?;
+        let schema = within("the params schema", client.playbook_schema(playbook)).await;
+        Some((playbook.clone(), schema))
+    };
     let (
         decisions,
         approvals,
@@ -513,6 +567,8 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         team_audit,
         webhooks,
         deliveries,
+        webhook_schema,
+        presets,
     ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
@@ -527,6 +583,11 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         team_audit,
         when(watch.webhooks, within("the webhooks", client.webhooks())),
         deliveries,
+        webhook_schema,
+        when(
+            watch.webhook_form.is_some(),
+            within("the presets", client.webhook_presets()),
+        ),
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -542,6 +603,8 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         team_audit,
         webhooks,
         deliveries,
+        webhook_schema,
+        presets,
     }
 }
 
@@ -656,6 +719,26 @@ async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<()
             .await
             .map(|rotated| view.rotated = Some(rotated)),
         Action::DeleteWebhook { id } => within("the delete", client.delete_webhook(id)).await,
+        Action::SaveWebhook { id: None, body } => {
+            within("the new webhook", client.create_webhook(body))
+                .await
+                .map(|created| view.rotated = Some(created))
+        }
+        Action::SaveWebhook { id: Some(id), body } => {
+            within("the webhook", client.update_webhook(id, body))
+                .await
+                .map(drop)
+        }
+        Action::CheckWebhook { body } => within("the check", client.check_webhook(body))
+            .await
+            .map(|check| view.webhook_check = Some(check)),
+        Action::PreviewWebhook {
+            body,
+            sample,
+            headers,
+        } => within("the preview", client.preview_webhook(body, sample, headers))
+            .await
+            .map(|preview| view.webhook_preview = Some(preview)),
     }
 }
 
@@ -709,7 +792,8 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.decision.is_some()
             || watch.keys
             || watch.teams
-            || watch.webhooks;
+            || watch.webhooks
+            || watch.webhook_form.is_some();
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -747,6 +831,8 @@ pub struct Desk {
     pub register: Option<(String, TextEdit, TextEdit)>,
     /// The webhook the Triggers page shows in full.
     pub webhook: Option<String>,
+    /// The webhook form, while open.
+    pub webhook_form: Option<crate::webhook::WebhookForm>,
     /// The team the Teams page shows.
     pub team: Option<String>,
     /// The new-team form, while open.
@@ -780,6 +866,7 @@ impl Default for Desk {
             register: None,
             new_key: crate::apikeys::KeyForm::default(),
             webhook: None,
+            webhook_form: None,
             team: None,
             new_team: None,
             add_member: crate::teams::MemberForm::default(),
@@ -1115,6 +1202,13 @@ impl crate::App {
                 .webhook
                 .clone()
                 .filter(|_| on(crate::Page::Triggers)),
+            webhook_form: self
+                .remote
+                .desk
+                .webhook_form
+                .as_ref()
+                .filter(|_| on(crate::Page::Triggers))
+                .map(|form| form.playbook.clone()),
             teams: on(crate::Page::Teams),
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
@@ -1197,6 +1291,16 @@ impl crate::App {
                     Did::RenameTeam => self.remote.desk.rename_team = None,
                     Did::DeleteTeam => self.remote.desk.team = None,
                     Did::DeleteWebhook => self.remote.desk.webhook = None,
+                    Did::SaveWebhook => {
+                        let saved = self
+                            .remote
+                            .desk
+                            .webhook_form
+                            .take()
+                            .and_then(|form| form.editing);
+                        let created = view.rotated.as_ref().map(|r| r.webhook.id.clone());
+                        self.remote.desk.webhook = saved.or(created);
+                    }
                     Did::PutMembers => {
                         self.remote.desk.add_member = crate::teams::MemberForm::default();
                     }
@@ -1213,7 +1317,9 @@ impl crate::App {
                     | Did::RevokeKey
                     | Did::SignOutMcp
                     | Did::EnableWebhook
-                    | Did::RotateWebhook => {}
+                    | Did::RotateWebhook
+                    | Did::CheckWebhook
+                    | Did::PreviewWebhook => {}
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =
@@ -1234,6 +1340,11 @@ impl crate::App {
                     notifier.post(&note(decision));
                 }
             }
+        }
+        if let (Some(form), Some((playbook, Some(Ok(schema))))) =
+            (&mut self.remote.desk.webhook_form, &view.webhook_schema)
+        {
+            form.lay_out(playbook, &crate::form::fields(schema));
         }
         self.remote.admin = view;
     }
@@ -1672,9 +1783,129 @@ mod tests {
         }
 
         client.watch(listed);
-        until(&client, |view| {
-            view.rotated.is_none() && view.deliveries.is_none()
+        let view = until(&client, |view| view.deliveries.is_none());
+        assert!(
+            view.rotated.is_some(),
+            "closing the details dropped the secret"
+        );
+        client.watch(Watch {
+            controller: true,
+            ..Watch::default()
         });
+        until(&client, |view| view.rotated.is_none());
+    }
+
+    #[test]
+    fn a_webhook_form_reads_its_schema_and_presets_and_a_created_secret_is_kept() {
+        const HOOK: &str = r#"{"id":"w2","playbook":"triage","verifier":"path_token"}"#;
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requests);
+        let (url, _) = crate::testserver::serve(move |request| {
+            let line: Vec<&str> = request.split_whitespace().take(2).collect();
+            seen.lock().unwrap().push(line.join(" "));
+            match line[..] {
+                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+                ["GET", "/api/approvals"] => "{}".into(),
+                ["GET", "/api/playbooks/triage/schema"] => {
+                    r#"{"properties":{"repo":{"type":"string"}},"required":["repo"]}"#.into()
+                }
+                ["GET", "/api/webhooks/presets"] => r#"[{"id":"quay-push","title":"quay.io push",
+                    "verifier":"path_token","header":null,"filter":"true","dedupe":"delivery",
+                    "derive":{}}]"#
+                    .into(),
+                ["POST", "/api/webhooks"] => {
+                    format!(r#"{{"webhook":{HOOK},"secret":"whsec_new","delivery_url":null}}"#)
+                }
+                ["PUT", "/api/webhooks/w2"] => HOOK.into(),
+                ["POST", "/api/webhooks/check"] => r#"{"diagnostics":[]}"#.into(),
+                ["POST", "/api/webhooks/preview"] => r#"{"filter":{"value":true},
+                    "dedupe":{"value":"d1"},"derive":{"error":"no such key"}}"#
+                    .into(),
+                _ => "[]".into(),
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
+        let listed = Watch {
+            controller: true,
+            webhooks: true,
+            ..Watch::default()
+        };
+        let filling = Watch {
+            webhook_form: Some("triage".into()),
+            ..listed.clone()
+        };
+        let mut form = crate::webhook::WebhookForm::new("triage");
+
+        client.watch(listed.clone());
+        let view = until(&client, |view| view.webhooks.is_some());
+        assert!(view.webhook_schema.is_none() && view.presets.is_none());
+
+        client.watch(filling);
+        let view = until(&client, |view| {
+            view.webhook_schema.is_some() && view.presets.is_some()
+        });
+        let (playbook, schema) = view.webhook_schema.unwrap();
+        form.lay_out(&playbook, &crate::form::fields(&schema.unwrap().unwrap()));
+        assert_eq!(form.choices[0].name, "repo");
+        assert_eq!(view.presets.unwrap().unwrap()[0].id, "quay-push");
+        let body = Box::new(form.body().unwrap());
+
+        client.act(Action::CheckWebhook { body: body.clone() });
+        let view = until(&client, |view| view.webhook_check.is_some());
+        assert!(view.webhook_check.unwrap().diagnostics.is_empty());
+        client.act(Action::PreviewWebhook {
+            body: body.clone(),
+            sample: serde_json::json!({}),
+            headers: BTreeMap::new(),
+        });
+        let view = until(&client, |view| view.webhook_preview.is_some());
+        let preview = view.webhook_preview.unwrap();
+        assert_eq!(preview.filter.value, Some(serde_json::json!(true)));
+        assert_eq!(preview.derive.error.as_deref(), Some("no such key"));
+
+        client.act(Action::SaveWebhook {
+            id: None,
+            body: body.clone(),
+        });
+        let view = until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::SaveWebhook)
+        });
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Created the webhook".to_string()))
+        );
+        assert_eq!(
+            view.rotated.map(|r| r.secret),
+            Some("whsec_new".to_string())
+        );
+        client.act(Action::SaveWebhook {
+            id: Some("w2".into()),
+            body,
+        });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.result == Ok("Saved the webhook".to_string()))
+        });
+        let sent = requests.lock().unwrap().clone();
+        for change in ["POST /api/webhooks", "PUT /api/webhooks/w2"] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(listed);
+        let view = until(&client, |view| {
+            view.webhook_check.is_none() && view.webhook_preview.is_none()
+        });
+        assert!(view.webhook_schema.is_none());
+        assert_eq!(
+            view.rotated.map(|r| r.secret),
+            Some("whsec_new".to_string()),
+            "closing the form dropped the new webhook's secret"
+        );
     }
 
     fn summary(id: &str) -> dto::DecisionSummary {

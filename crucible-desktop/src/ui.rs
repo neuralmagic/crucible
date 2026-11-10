@@ -27,6 +27,7 @@ mod theme;
 mod timeline;
 mod transcript;
 mod triggers;
+mod webhook_form;
 
 use rune::{Color, Cx, El, Icon, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::RowStatus;
