@@ -480,9 +480,12 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
                     .push(format!("component `{}` [repo] needs url or path", c.name));
                 continue;
             };
-            if let Err(e) =
-                crate::cli::workspace::clone_repo(&src, repo.git_ref.as_ref(), &c.workspace)
-            {
+            if let Err(e) = crate::cli::workspace::clone_repo(
+                &src,
+                repo.git_ref.as_ref(),
+                repo.filter,
+                &c.workspace,
+            ) {
                 out.findings
                     .push(format!("cloning component `{}` failed: {e:#}", c.name));
                 continue;

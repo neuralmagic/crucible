@@ -27,6 +27,7 @@ edition = 2                                   # pack contract edition; absent = 
 url  = "https://github.com/owner/name.git"   # OR
 path = "."                                    # local path, relative to manifest dir
 ref  = "main"                                 # optional; default: clone default branch
+filter = "blob:none"                          # optional: a partial clone, every commit, file contents on demand
 
 [workspace]
 dir       = "workspace"                       # checkout dir, relative to manifest dir. default "workspace"
