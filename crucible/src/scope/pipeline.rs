@@ -224,6 +224,9 @@ pub struct ProposeOpts {
     pub authoritative: bool,
     /// The engine runtime an openshell turn runs on.
     pub engine: Option<tokio::runtime::Handle>,
+    /// The engine's compiled secret rules, shared by every turn. A fresh default per turn would
+    /// recompile the rules database inside the turn.
+    pub secret_rules: crucible_harness::redact::SecretRules,
 }
 
 /// Stage 2 (`--propose` only): one agent turn drafts the pack into `ctx.pack`. Runs after
@@ -922,6 +925,7 @@ fn turn_args(opts: &ProposeOpts) -> crate::args::Args {
     args.sandbox_image = opts.sandbox_image.clone();
     args.compute_driver = opts.compute_driver;
     args.engine = opts.engine.clone();
+    args.secret_rules = opts.secret_rules.clone();
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead.
     let mut env = SandboxEnv::default();
@@ -1585,6 +1589,7 @@ mod tests {
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
             authoritative: false,
             engine: None,
+            secret_rules: crate::testing::secret_rules(),
         }
     }
 
