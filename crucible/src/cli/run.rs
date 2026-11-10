@@ -151,6 +151,13 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         return crate::scope::rank_grounded::run(args, engine.handle());
     }
 
+    // The intent-to-pack drafting turn the controller's draft studio shells.
+    #[cfg(feature = "autoresearch")]
+    if let Some(Cmd::Draft(args)) = cli.command {
+        let engine = crate::agent::engine::EngineCtx::new()?;
+        return crate::draft::run(args, engine.handle());
+    }
+
     if let Some(Cmd::Plan { action }) = &cli.command {
         return match action {
             crate::cli::PlanAction::CompileWorkflow {

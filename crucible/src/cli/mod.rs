@@ -170,6 +170,14 @@ pub(crate) enum Cmd {
     /// clones or mutates it.
     #[cfg(feature = "autoresearch")]
     RankGrounded(rank_grounded::RankGroundedArgs),
+    /// Draft a playbook pack from a natural-language intent: one agent turn authors the pack
+    /// (`crucible.toml`, `workflow.star`, every file they reference) into `--out`, the engine
+    /// checks it with the compile-only slice of `crucible check`, and failed findings seed refine
+    /// rounds. Prints a `{ok,cost_usd,rounds,findings}` report; exits nonzero when the final
+    /// round still fails. The controller's draft studio shells this — a draft is a proposal a
+    /// human reviews, never a running thing.
+    #[cfg(feature = "autoresearch")]
+    Draft(crate::draft::DraftArgs),
     /// Dispatch a named `[build.<name>]` from the domain manifest, wait for it, and print the
     /// digest-pinned ref. The cluster backend renders a detached rootless-buildah Job; the
     /// `github-actions` backend dispatches a `workflow_dispatch`, correlates + polls the run, and pins

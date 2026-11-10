@@ -247,35 +247,9 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
     let manifest_dir = crate::manifest::manifest_dir(manifest_path);
     let workspace = manifest_dir.join(&m.workspace.dir);
 
-    let mut out = CheckOutcome {
-        exposure: crate::exposure::render(&crate::exposure::compute(&m, None)),
-        ..CheckOutcome::default()
-    };
-    match history_limit_line(&m, operator_history_limit().as_deref()) {
-        Ok(line) => out.exposure.extend(line),
-        Err(finding) => out.findings.push(finding),
-    }
-    out.warnings.extend(inherited_env_warning(&m));
-    out.warnings.extend(undeclared_credential_warnings(&m));
-    out.warnings.extend(shadowed_deny_warnings(&m.agent));
-    check_referenced_files(&m, &manifest_dir, &mut out);
-    if !out.ok() {
-        // Missing goal/prompt/inject files means the run would fail before ever measuring,
-        // no point spending a workspace setup + measure_cmd exec on top.
-        return Ok(out);
-    }
-    // A parameterised graph has no values here; the lint then has no tasks to read.
-    match m.resolve_workflow(&manifest_dir) {
-        Ok(()) => out
-            .warnings
-            .extend(uninjected_script_warnings(&m, &manifest_dir)),
-        Err(e) => out.findings.extend(sandbox_finding(&e)),
-    }
-    out.findings.extend(other_variant_findings(
-        manifest_path,
-        &manifest_dir,
-        variant,
-    ));
+    let mut out = CheckOutcome::default();
+    header_findings(&m, &mut out);
+    compile_findings(&mut m, manifest_path, &manifest_dir, variant, &mut out);
 
     if !workspace.exists() {
         if let Err(e) = crate::cli::workspace::manifest_setup(&m, &manifest_dir, &workspace) {
@@ -349,6 +323,67 @@ fn check_single(manifest_path: &Path, variant: Option<&VariantName>) -> Result<C
         }
     }
     Ok(out)
+}
+
+/// The parse-and-compile slice of [`check_single`]: manifest parse, referenced-file resolution,
+/// graph compilation, the other variants' graphs. Executes no pack content — no workspace
+/// bootstrap, no injects, no `setup_cmd` — which is the contract the drafting loop
+/// (`crucible draft`) relies on: it checks an agent-authored pack before any human has signed
+/// off, and a draft is inert until launch.
+pub fn run_compile_only(
+    manifest_path: &Path,
+    variant: Option<&VariantName>,
+) -> Result<CheckOutcome> {
+    let mut m = match Manifest::load_frozen_variant(manifest_path, variant) {
+        Ok(m) => m,
+        Err(e) => return Ok(CheckOutcome::fail(format!("manifest parse failed: {e:#}"))),
+    };
+    let manifest_dir = crate::manifest::manifest_dir(manifest_path);
+    let mut out = CheckOutcome::default();
+    header_findings(&m, &mut out);
+    compile_findings(&mut m, manifest_path, &manifest_dir, variant, &mut out);
+    Ok(out)
+}
+
+/// Everything the check computes from the parsed manifest alone: exposure, the history-limit
+/// line, and the credential/env/shadowed-deny warnings.
+fn header_findings(m: &Manifest, out: &mut CheckOutcome) {
+    out.exposure = crate::exposure::render(&crate::exposure::compute(m, None));
+    match history_limit_line(m, operator_history_limit().as_deref()) {
+        Ok(line) => out.exposure.extend(line),
+        Err(finding) => out.findings.push(finding),
+    }
+    out.warnings.extend(inherited_env_warning(m));
+    out.warnings.extend(undeclared_credential_warnings(m));
+    out.warnings.extend(shadowed_deny_warnings(&m.agent));
+}
+
+/// Referenced-file resolution and graph compilation, for the selected variant and every other
+/// declared one. Stops at missing referenced files: a graph cannot be compiled against files
+/// that are not there.
+fn compile_findings(
+    m: &mut Manifest,
+    manifest_path: &Path,
+    manifest_dir: &Path,
+    selected: Option<&VariantName>,
+    out: &mut CheckOutcome,
+) {
+    check_referenced_files(m, manifest_dir, out);
+    if !out.ok() {
+        return;
+    }
+    // A parameterised graph has no values here; the lint then has no tasks to read.
+    match m.resolve_workflow(manifest_dir) {
+        Ok(()) => out
+            .warnings
+            .extend(uninjected_script_warnings(m, manifest_dir)),
+        Err(e) => out.findings.extend(sandbox_finding(&e)),
+    }
+    out.findings.extend(other_variant_findings(
+        manifest_path,
+        manifest_dir,
+        selected,
+    ));
 }
 
 /// One warning per `[agent.openshell].deny_endpoints` entry the resolved allowlist still admits:
