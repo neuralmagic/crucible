@@ -187,7 +187,7 @@ export function PlaybookLaunchPage() {
   const checkField = (name: string) => {
     const spec = specs.find((s) => s.name === name);
     if (spec === undefined) return;
-    const message = validateParam(spec, values[name] ?? '');
+    const message = validateParam(spec, values[name] ?? '', values);
     setFieldErrors((previous) => {
       const next = new Map(previous);
       if (message === null) next.delete(name);
@@ -211,7 +211,7 @@ export function PlaybookLaunchPage() {
   const checkValues = (): boolean => {
     const clientErrors = new Map<string, string>();
     for (const spec of specs) {
-      const message = validateParam(spec, values[spec.name] ?? '');
+      const message = validateParam(spec, values[spec.name] ?? '', values);
       if (message !== null) clientErrors.set(spec.name, message);
     }
     setFieldErrors(clientErrors);

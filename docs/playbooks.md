@@ -348,6 +348,17 @@ crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max
 A string parameter that sets `"multiline": True` takes its value in a text area on the control
 plane's launch, schedule and ask forms. The value is still one string.
 
+An optional parameter that sets `"enabled_by": "<bool param>"` is only taken while that boolean
+is true. The forms grey it out until then, and a launch that supplies it with the boolean false is
+refused before anything compiles:
+
+```python
+params = {
+    "override_branch": {"type": "bool", "default": False, "doc": "replace the branch picked from the release"},
+    "target_branch": {"type": "string", "default": "", "enabled_by": "override_branch"},
+}
+```
+
 Parameters go into prompts and skill arguments. They do not go into a command line. If you
 put a parameter into `run`, the compiler rejects the pack:
 

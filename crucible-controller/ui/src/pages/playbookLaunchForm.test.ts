@@ -2,7 +2,9 @@ import { describe, expect, it } from 'vitest';
 import {
   clampCeiling,
   initialValues,
+  isEnabled,
   launchBody,
+  paramBlocks,
   mapServerRejection,
   parseParamsSchema,
   parseMaxTime,
@@ -11,6 +13,7 @@ import {
   scheduleBody,
   validateCronExpr,
   validateMaxTime,
+  trimmedParams,
   validateParam,
   type ParamFieldSpec,
 } from './playbookLaunchForm';
@@ -47,8 +50,9 @@ describe('parseParamsSchema', () => {
         description: 'What the survey covers.',
         multiline: false,
         choices: null,
+        enabledBy: null,
       },
-      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
       {
         name: 'since',
         valueType: 'string',
@@ -58,8 +62,9 @@ describe('parseParamsSchema', () => {
         description: null,
         multiline: false,
         choices: null,
+        enabledBy: null,
       },
-      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
     ]);
   });
 
@@ -71,7 +76,7 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
     ]);
   });
 
@@ -130,6 +135,32 @@ describe('parseParamsSchema', () => {
   it('refuses choices that are not a nonempty list of the param type', () => {
     for (const choices of [[], [1, 2], 'a', ['a', null]]) {
       expect(parseParamsSchema({ type: 'object', properties: { p: { type: 'string', enum: choices } } }).kind).toBe('unrenderable');
+    }
+  });
+
+  it('takes a gated param only while its switch is on', () => {
+    const [override, branch] = specsOf({
+      type: 'object',
+      properties: {
+        override_branch: { type: 'boolean', default: false },
+        branch: { type: 'string', default: '', pattern: '^[a-z/.0-9-]+$', 'x-enabled-by': 'override_branch' },
+      },
+    });
+    if (!override || !branch) throw new Error('two specs');
+    expect(branch.enabledBy).toBe('override_branch');
+    const off = { override_branch: 'false', branch: 'NOT A BRANCH' };
+    const on = { override_branch: 'True', branch: 'main' };
+    expect([isEnabled(branch, off), isEnabled(branch, on), isEnabled(override, off)]).toEqual([false, true, true]);
+    expect(validateParam(branch, off.branch, off)).toBeNull();
+    expect(validateParam(branch, 'NOT A BRANCH', { override_branch: 'true' })).not.toBeNull();
+    expect(trimmedParams([override, branch], off)).toEqual({ override_branch: 'false' });
+    expect(trimmedParams([override, branch], on)).toEqual({ override_branch: 'True', branch: 'main' });
+  });
+
+  it('refuses a gate that is not a declared bool', () => {
+    for (const gate of ['missing', 'note', 7]) {
+      const schema = { type: 'object', properties: { note: { type: 'string' }, branch: { type: 'string', 'x-enabled-by': gate } } };
+      expect(parseParamsSchema(schema).kind).toBe('unrenderable');
     }
   });
 
@@ -242,6 +273,7 @@ describe('validateParam', () => {
       description: null,
       multiline: false,
       choices: null,
+      enabledBy: null,
     };
     expect(validateParam(rustOnly, 'whatever')).toBeNull();
   });
@@ -469,5 +501,27 @@ describe('runSnapshot', () => {
       max_time: '2h',
       schema_digest: 'sha256:beef',
     });
+  });
+});
+
+describe('paramBlocks', () => {
+  const spec = (name: string, valueType: ParamFieldSpec['valueType'], enabledBy: string | null = null): ParamFieldSpec => ({
+    name, valueType, required: false, defaultValue: null, pattern: null, description: null, multiline: false,
+    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy,
+  });
+
+  it('moves a gate to the head of a group at its first gated field and leaves other booleans alone', () => {
+    const specs = [
+      spec('release', 'string'),
+      spec('override', 'boolean'),
+      spec('branch', 'string', 'override'),
+      spec('tentative', 'boolean'),
+      spec('remote', 'string', 'override'),
+    ];
+    expect(paramBlocks(specs).map((b) => (b.kind === 'field' ? b.spec.name : `${b.gate.name}[${b.fields.map((f) => f.name).join(',')}]`))).toEqual([
+      'release',
+      'override[branch,remote]',
+      'tentative',
+    ]);
   });
 });

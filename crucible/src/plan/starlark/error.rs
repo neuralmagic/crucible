@@ -205,6 +205,16 @@ pub enum CompileError {
     },
     #[error("parameter {param:?} pattern does not compile: {detail}")]
     ParamBadPattern { param: String, detail: String },
+    #[error("parameter {param:?} is enabled_by {gate:?}, which {detail}")]
+    ParamBadEnabledBy {
+        param: String,
+        gate: String,
+        detail: &'static str,
+    },
+    #[error(
+        "parameter {name:?} was supplied while {gate:?} is false; set {gate} to true to use it"
+    )]
+    ParamNotEnabled { name: String, gate: String },
     #[error(
         "no value for required parameter {name:?}{}",
         if doc.is_empty() { String::new() } else { format!(" ({doc})") }

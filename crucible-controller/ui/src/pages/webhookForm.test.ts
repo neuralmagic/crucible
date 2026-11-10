@@ -15,9 +15,9 @@ import {
 } from './webhookForm';
 
 const SPECS: ParamFieldSpec[] = [
-  { name: 'image', valueType: 'string', required: true, defaultValue: null, pattern: '^quay\\.io/', description: null, multiline: false, choices: null },
-  { name: 'tags', valueType: 'list', required: false, defaultValue: '["latest"]', pattern: null, description: null, multiline: false, choices: null },
-  { name: 'release', valueType: 'string', required: false, defaultValue: 'main', pattern: null, description: null, multiline: false, choices: null },
+  { name: 'image', valueType: 'string', required: true, defaultValue: null, pattern: '^quay\\.io/', description: null, multiline: false, choices: null, enabledBy: null },
+  { name: 'tags', valueType: 'list', required: false, defaultValue: '["latest"]', pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
+  { name: 'release', valueType: 'string', required: false, defaultValue: 'main', pattern: null, description: null, multiline: false, choices: null, enabledBy: null },
 ];
 
 const QUAY: WebhookPresetDto = {
