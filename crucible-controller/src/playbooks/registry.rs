@@ -1434,13 +1434,13 @@ pub fn validate_params(
         .get("properties")
         .and_then(serde_json::Value::as_object);
     for (name, property) in properties.into_iter().flatten() {
-        if let Some((key, value)) =
+        if let Some(message) =
             crate::playbooks::choices::confirmation_needed(schema, property, params)
             && typed.get(name) != Some(&serde_json::Value::Bool(true))
         {
             errors.push(FieldError {
                 field: name.clone(),
-                message: format!("{key} {value:?} needs confirming: set {name} to true"),
+                message: format!("set {name} to true to launch with this value: {message}"),
             });
         }
     }

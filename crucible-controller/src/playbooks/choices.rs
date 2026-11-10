@@ -33,8 +33,6 @@ pub enum Shape {
     KeyedLists,
     /// An object from another parameter's values to one string each.
     KeyedText,
-    /// An object from another parameter's values to whether a launch must confirm it.
-    KeyedFlags,
 }
 
 impl Shape {
@@ -43,7 +41,7 @@ impl Shape {
     pub fn bounded(self, value: &serde_json::Value) -> Option<serde_json::Value> {
         match self {
             Shape::List => bounded(value).map(|c| serde_json::json!(c)),
-            Shape::KeyedLists | Shape::KeyedText | Shape::KeyedFlags => {
+            Shape::KeyedLists | Shape::KeyedText => {
                 let entries = value.as_object()?;
                 if entries.len() > MAX_CHOICES {
                     return None;
@@ -55,7 +53,6 @@ impl Shape {
                     }
                     let item = match self {
                         Shape::KeyedLists => serde_json::json!(bounded(item)?),
-                        Shape::KeyedFlags => serde_json::json!(item.as_bool()?),
                         _ => serde_json::json!(text(item)?),
                     };
                     out.insert(key.clone(), item);
@@ -186,8 +183,7 @@ pub async fn attach(
             };
             let placeholder = into == PLACEHOLDER_KEY;
             let shape = match into {
-                PLACEHOLDER_KEY => Shape::KeyedText,
-                CONFIRM_KEY => Shape::KeyedFlags,
+                PLACEHOLDER_KEY | CONFIRM_KEY => Shape::KeyedText,
                 _ if keyed => Shape::KeyedLists,
                 _ => Shape::List,
             };
@@ -226,17 +222,20 @@ pub fn key_value<'a>(
         .or_else(|| schema.get("properties")?.get(key)?.get("default")?.as_str())
 }
 
-/// The key parameter and its value when `property`'s confirmation snapshot flags the value a
-/// launch binds for it, so the launch must set the property true.
+/// What a launch must confirm by setting `property` true: the message `property`'s confirmation
+/// snapshot holds for the value the launch binds to its key parameter. A value with no message,
+/// or an empty one, needs no confirmation.
 pub fn confirmation_needed<'a>(
     schema: &'a serde_json::Value,
     property: &'a serde_json::Value,
     params: &'a std::collections::BTreeMap<String, String>,
-) -> Option<(&'a str, &'a str)> {
-    let flags = property.get(CONFIRM_KEY)?.get("value")?;
-    let key = property.pointer("/x-confirm-from/keyed_by")?.as_str()?;
+) -> Option<&'a str> {
+    let messages = property.get(CONFIRM_KEY)?.get("value")?;
     let value = key_value(schema, property, "x-confirm-from", params)?;
-    (flags.get(value) == Some(&serde_json::Value::Bool(true))).then_some((key, value))
+    messages
+        .get(value)?
+        .as_str()
+        .filter(|message| !message.trim().is_empty())
 }
 
 /// The supplied value is outside a closed snapshot. A keyed snapshot offers the list for `key`,
@@ -356,7 +355,7 @@ mod tests {
             serde_json::json!({
                 "releases": ["3.6", "3.7"],
                 "branch": {"3.7": "sync-v0.33.0"},
-                "tentative": {"3.6": false, "3.7": true},
+                "tentative": {"3.6": "", "3.7": "vLLM \"0.33.0?\" is tentative."},
             }),
         )
         .await;
@@ -426,6 +425,10 @@ mod tests {
         let validate = |p| crate::playbooks::registry::validate_params(&served, &p);
         assert!(validate(params(&[("release", "3.6")])).is_ok());
         assert!(validate(params(&[("release", "3.9")])).is_err());
+        assert_eq!(
+            served["properties"]["accept"][CONFIRM_KEY]["value"]["3.7"],
+            "vLLM \"0.33.0?\" is tentative."
+        );
         let unconfirmed = validate(params(&[("release", "3.7")])).unwrap_err();
         assert_eq!(
             unconfirmed
@@ -578,14 +581,6 @@ workflow(type = "playbook", tasks = [options, work])
             .collect();
         assert_eq!(
             Shape::KeyedText.bounded(&serde_json::Value::Object(wide)),
-            None
-        );
-        assert_eq!(
-            Shape::KeyedFlags.bounded(&serde_json::json!({"3.7": true, "3.6": false})),
-            Some(serde_json::json!({"3.6": false, "3.7": true}))
-        );
-        assert_eq!(
-            Shape::KeyedFlags.bounded(&serde_json::json!({"3.7": "true"})),
             None
         );
     }

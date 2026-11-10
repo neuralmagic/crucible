@@ -140,8 +140,8 @@ pub struct ParamSpec {
     /// a launch form shows greyed out in this parameter's empty input.
     #[serde(default)]
     pub placeholder_from: Option<ChoicesFrom>,
-    /// The producer task output, keyed by another parameter's value, that flags the values a
-    /// launcher must confirm by setting this boolean true.
+    /// The producer task output, keyed by another parameter's value, whose message for that value
+    /// a launcher must confirm by setting this boolean true.
     #[serde(default)]
     pub confirm_from: Option<ChoicesFrom>,
     /// The boolean parameter that must be true for this one to be supplied.

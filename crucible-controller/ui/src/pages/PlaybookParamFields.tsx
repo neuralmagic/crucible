@@ -66,19 +66,19 @@ export function PlaybookParamFields({
         (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined)),
     };
     const confirm = confirmation(spec, values);
-    if (confirm === 'hidden') return null;
+    if (confirm?.kind === 'hidden') return null;
     if (confirm !== null) {
       return (
         <CheckField
           key={spec.name}
           id={field.id}
           label={field.label}
-          required={confirm === 'needed'}
+          required={confirm.kind === 'needed'}
           checked={field.value.trim().toLowerCase() === 'true'}
           onChange={(checked) => {
             onChange(spec.name, checked ? 'true' : 'false');
           }}
-          description={spec.description ?? undefined}
+          description={confirm.kind === 'needed' ? confirm.message : (spec.description ?? undefined)}
           error={field.error}
         />
       );

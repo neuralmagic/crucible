@@ -270,7 +270,7 @@ describe('parseParamsSchema', () => {
           type: 'boolean',
           default: false,
           'x-confirm-from': tentative,
-          'x-confirm-snapshot': { value: { '3.7': true, '3.6': false } },
+          'x-confirm-snapshot': { value: { '3.7': 'vLLM "0.33.0?" is tentative.', '3.6': '' } },
         },
         unrun: { type: 'boolean', default: false, 'x-confirm-from': tentative },
       },
@@ -278,13 +278,14 @@ describe('parseParamsSchema', () => {
     const [, accept, unrun] = specs;
     if (!accept || !unrun) throw new Error('three specs');
     const values = { release: '3.7', accept: 'false', unrun: 'false' };
-    expect(confirmation(accept, values)).toBe('needed');
-    expect(validateParam(accept, 'false', values)).toBe('Check accept to launch with release 3.7');
+    expect(confirmation(accept, values)).toEqual({ kind: 'needed', message: 'vLLM "0.33.0?" is tentative.' });
+    expect(validateParam(accept, 'false', values)).toBe('Check this box to launch');
     expect(validateParam(accept, 'true', values)).toBeNull();
     const settled = { ...values, release: '3.6', accept: 'true' };
-    expect(confirmation(accept, settled)).toBe('hidden');
+    expect(confirmation(accept, settled)).toEqual({ kind: 'hidden' });
+    expect(confirmation(accept, { ...settled, release: '3.9' })).toEqual({ kind: 'hidden' });
     expect(trimmedParams(specs, settled)).toEqual({ release: '3.6', unrun: 'false' });
-    expect(confirmation(unrun, values)).toBe('optional');
+    expect(confirmation(unrun, values)).toEqual({ kind: 'optional' });
     expect(validateParam(unrun, 'false', values)).toBeNull();
     expect(refreshable([unrun])).toBe(true);
 

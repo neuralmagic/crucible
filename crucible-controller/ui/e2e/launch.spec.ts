@@ -213,7 +213,12 @@ test.describe('playbook launch form', () => {
               type: 'boolean',
               default: false,
               'x-confirm-from': { task: 'release_options', field: 'tentative', keyed_by: 'release' },
-              'x-confirm-snapshot': { value: { '3.6.0 GA': false, '3.7 Fast-2': true }, run_id: 'r1', digest: 'd', captured_at: null },
+              'x-confirm-snapshot': {
+                value: { '3.6.0 GA': '', '3.7 Fast-2': 'vLLM "0.33.0?" may still change. Launch anyway?' },
+                run_id: 'r1',
+                digest: 'd',
+                captured_at: null,
+              },
             },
           },
           required: ['release'],
@@ -232,9 +237,10 @@ test.describe('playbook launch form', () => {
     await expect(confirm).toHaveCount(0);
     await page.locator('#launch-param-release').selectOption('3.7 Fast-2');
     await expect(confirm).toBeVisible();
+    await expect(page.getByText('vLLM "0.33.0?" may still change. Launch anyway?')).toBeVisible();
 
     await page.getByRole('button', { name: 'Launch' }).click();
-    await expect(page.getByRole('alert').filter({ hasText: 'Check accept_tentative to launch with release 3.7 Fast-2' })).toBeVisible();
+    await expect(page.getByRole('alert').filter({ hasText: 'Check this box to launch' })).toBeVisible();
     expect(sent).toBeNull();
 
     await page.locator('label[for="launch-param-accept_tentative"]').click();

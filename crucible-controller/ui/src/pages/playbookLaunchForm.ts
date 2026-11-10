@@ -33,9 +33,9 @@ export interface ParamFieldSpec {
   /// The task output whose value for the key param shows greyed out in the empty input.
   placeholderFrom: ChoicesSource | null;
   placeholderSnapshot: Snapshot<Record<string, string>> | null;
-  /// The task output that flags the key param's values this bool must confirm.
+  /// The task output whose message for the key param's value this bool must confirm.
   confirmFrom: ChoicesSource | null;
-  confirmSnapshot: Snapshot<Record<string, boolean>> | null;
+  confirmSnapshot: Snapshot<Record<string, string>> | null;
 }
 
 export interface ChoicesSource {
@@ -126,7 +126,6 @@ function choicesShape(keyed: boolean) {
 
 const isKeyedText = keyedOf((value: unknown): value is string => typeof value === 'string');
 
-const isKeyedFlags = keyedOf((value: unknown): value is boolean => typeof value === 'boolean');
 
 function boolField(
   property: Record<string, unknown>,
@@ -304,7 +303,7 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       placeholderFrom,
       placeholderSnapshot: placeholderFrom === null ? null : snapshot(raw['x-placeholder-snapshot'], isKeyedText),
       confirmFrom,
-      confirmSnapshot: confirmFrom === null ? null : snapshot(raw['x-confirm-snapshot'], isKeyedFlags),
+      confirmSnapshot: confirmFrom === null ? null : snapshot(raw['x-confirm-snapshot'], isKeyedText),
     });
   }
   if (orderRaw !== undefined) {
@@ -385,16 +384,17 @@ export function placeholderFor(spec: ParamFieldSpec, values: Readonly<Record<str
   return spec.placeholderSnapshot.value[(values[key] ?? '').trim()] ?? null;
 }
 
-/// Whether a confirming bool is asked for: `needed` when the snapshot flags the key param's value,
-/// `hidden` when it does not, and `optional` before the task has passed. Null for any other param.
-export function confirmation(
-  spec: ParamFieldSpec,
-  values: Readonly<Record<string, string>>
-): 'needed' | 'hidden' | 'optional' | null {
+export type Confirmation = { kind: 'needed'; message: string } | { kind: 'hidden' } | { kind: 'optional' };
+
+/// Whether a confirming bool is asked for: `needed`, with the message to confirm, when the snapshot
+/// holds one for the key param's value; `hidden` when it does not; `optional` before the task has
+/// passed. Null for any other param.
+export function confirmation(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): Confirmation | null {
   const key = spec.confirmFrom?.keyedBy;
   if (key === undefined || key === null) return null;
-  if (spec.confirmSnapshot === null) return 'optional';
-  return spec.confirmSnapshot.value[(values[key] ?? '').trim()] === true ? 'needed' : 'hidden';
+  if (spec.confirmSnapshot === null) return { kind: 'optional' };
+  const message = (spec.confirmSnapshot.value[(values[key] ?? '').trim()] ?? '').trim();
+  return message === '' ? { kind: 'hidden' } : { kind: 'needed', message };
 }
 
 /// Each task the form's options come from, with the capture time of its snapshot, or `passed`
@@ -439,11 +439,10 @@ export function validateParam(
 ): string | null {
   if (values !== undefined && !isEnabled(spec, values)) return null;
   const confirm = values === undefined ? null : confirmation(spec, values);
-  if (confirm === 'hidden') return null;
+  if (confirm?.kind === 'hidden') return null;
   const trimmed = value.trim();
-  if (confirm === 'needed' && trimmed.toLowerCase() !== 'true') {
-    const key = spec.confirmFrom?.keyedBy ?? '';
-    return `Check ${spec.name} to launch with ${key} ${(values?.[key] ?? '').trim()}`;
+  if (confirm?.kind === 'needed' && trimmed.toLowerCase() !== 'true') {
+    return 'Check this box to launch';
   }
   if (trimmed.length === 0) {
     return spec.required ? `${spec.name} is required` : null;
@@ -484,7 +483,7 @@ export function trimmedParams(
   const params: Record<string, string> = {};
   for (const spec of specs) {
     const value = (values[spec.name] ?? '').trim();
-    const hidden = confirmation(spec, values) === 'hidden';
+    const hidden = confirmation(spec, values)?.kind === 'hidden';
     if (!isEnabled(spec, values) || hidden || (value.length === 0 && !spec.required)) continue;
     params[spec.name] = value;
   }

@@ -16,10 +16,10 @@ Some launch values are valid but need the launcher's explicit assent. The backpo
 
 [[ADR-0074]] already gives the form a recorded producer output keyed by another parameter's value; whether a release is tentative is the same kind of data."""
 decision = """
-An optional bool parameter MAY declare confirm_from = {"task", "field", "keyed_by"}. The field is an object from the keyed parameter's values to booleans, read from the same snapshot, producer closure, refresh and bounds as [[ADR-0074]].
+An optional bool parameter MAY declare confirm_from = {"task", "field", "keyed_by"}. The field is an object from the keyed parameter's values to a message saying what the launcher is asked to accept, such as the tentative version itself. An empty or missing message means nothing to confirm. It is read from the same snapshot, producer closure, refresh and bounds as [[ADR-0074]]; the message is bounded like a placeholder.
 
-- **Form.** The schema emits x-confirm-from and the controller attaches x-confirm-snapshot. The form shows the bool as a checkbox only when the snapshot maps the key's current value to true, and then requires it checked. For any other value the input is hidden and not submitted. Before the producer has passed, the checkbox is shown and optional.
-- **Validation.** Launch validation refuses a launch whose bound key value the snapshot flags unless the bool binds to true, and records the snapshot's run and digest as it does for choices.
+- **Form.** The schema emits x-confirm-from and the controller attaches x-confirm-snapshot. The form shows the bool as a checkbox only when the snapshot has a message for the key's current value, shows that message beside it, and requires it checked. For any other value the input is hidden and not submitted. Before the producer has passed, the checkbox is shown and optional.
+- **Validation.** Launch validation refuses a launch whose bound key value has a message unless the bool binds to true, quoting the message, and records the snapshot's run and digest as it does for choices.
 - **Declaration.** The engine refuses confirm_from on a non-bool, on a required parameter, which is always supplied, and with a default of true, which would confirm every flagged value without asking.
 - **Run time.** The pack keeps its own check: the snapshot can be older than the data the run reads."""
 consequences = """
@@ -28,11 +28,11 @@ consequences = """
 - The CLI and ask validation have no snapshot, so there the pack's check is the only one."""
 
 [[content.alternatives]]
-text = "confirm_from on a bool reads a keyed object of flags from the choices snapshot"
+text = "confirm_from on a bool reads a keyed object of messages from the choices snapshot"
 status = "accepted"
 pros = [
     "Reuses [[ADR-0074]]'s producer, refresh, bounds and record.",
-    "The form asks only when the answer matters.",
+    "The form asks only when the answer matters, and says why in the pack's words with the data that triggered it.",
 ]
 cons = ["One more declaration field."]
 
