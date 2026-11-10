@@ -53,6 +53,10 @@ pub struct Watch {
     pub admin: bool,
     /// The Admin page's policy tab is shown.
     pub policy: bool,
+    /// The Issues page is shown, listing this status or every one.
+    pub issues: Option<InStatus>,
+    /// The issue the Issues page shows in full.
+    pub issue: Option<String>,
 }
 
 /// A change to make on the controller.
@@ -213,6 +217,13 @@ pub enum Action {
         sample: serde_json::Value,
         headers: BTreeMap<String, String>,
     },
+    ParkIssue {
+        key: String,
+        reason: String,
+    },
+    UnparkIssue {
+        key: String,
+    },
 }
 
 /// Which kind of action an outcome answers.
@@ -255,6 +266,8 @@ pub enum Did {
     CreatePolicy,
     ActivatePolicy,
     Explain,
+    ParkIssue,
+    UnparkIssue,
 }
 
 impl Action {
@@ -297,6 +310,8 @@ impl Action {
             Action::CreatePolicy { .. } => Did::CreatePolicy,
             Action::ActivatePolicy { .. } => Did::ActivatePolicy,
             Action::Explain { .. } => Did::Explain,
+            Action::ParkIssue { .. } => Did::ParkIssue,
+            Action::UnparkIssue { .. } => Did::UnparkIssue,
         }
     }
 
@@ -351,6 +366,8 @@ impl Action {
             Action::CreatePolicy { .. } => "Stored the policy set".to_string(),
             Action::ActivatePolicy { .. } => "Activated the policy set".to_string(),
             Action::Explain { .. } => "Explained".to_string(),
+            Action::ParkIssue { key, .. } => format!("Parked {key}"),
+            Action::UnparkIssue { key } => format!("Unparked {key}"),
         }
     }
 }
@@ -395,6 +412,9 @@ pub struct AdminView {
     pub presets: Loaded<Vec<dto::WebhookPreset>>,
     pub providers: Loaded<Vec<dto::Provider>>,
     pub blueprints: Loaded<Vec<dto::Blueprint>>,
+    /// The issues in the status they were asked for.
+    pub issues: Option<(InStatus, Loaded<Vec<dto::Issue>>)>,
+    pub issue: Option<(String, Loaded<dto::IssueDetail>)>,
     /// The draft the last blueprint use started, while the Blueprints page stays open.
     pub used: Option<dto::BlueprintUsed>,
     pub events: Loaded<Vec<dto::Event>>,
@@ -555,6 +575,8 @@ impl Worker {
         if let Some(blueprints) = read.blueprints {
             self.view.blueprints = Some(blueprints);
         }
+        self.view.issues = read.issues.map(|(status, issues)| (status, Some(issues)));
+        self.view.issue = read.issue.map(|(key, issue)| (key, Some(issue)));
         if !watch.blueprints {
             self.view.used = None;
         }
@@ -617,7 +639,12 @@ struct Read {
     events: Option<Result<Vec<dto::Event>, String>>,
     admin: Option<Controller>,
     policy_sets: Option<Result<Vec<dto::PolicySet>, String>>,
+    issues: Option<(InStatus, Result<Vec<dto::Issue>, String>)>,
+    issue: Option<(String, Result<dto::IssueDetail, String>)>,
 }
+
+/// The status an issue list is asked for; none is every status.
+pub type InStatus = Option<String>;
 
 /// What the Admin page reads: settings, access lists, the autopilot flag and the watched repos.
 type Controller = (
@@ -653,6 +680,11 @@ impl Read {
             blueprints: watch.blueprints.then(|| Err(why.clone())),
             events: watch.activity.then(|| Err(why.clone())),
             policy_sets: watch.policy.then(|| Err(why.clone())),
+            issues: watch
+                .issues
+                .clone()
+                .map(|status| (status, Err(why.clone()))),
+            issue: watch.issue.clone().map(|key| (key, Err(why.clone()))),
             admin: watch.admin.then(|| {
                 (
                     Err(why.clone()),
@@ -713,6 +745,16 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         let schema = within("the params schema", client.playbook_schema(playbook)).await;
         Some((playbook.clone(), schema))
     };
+    let issues = async {
+        let status = watch.issues.as_ref()?;
+        let list = within("the issues", client.lane_issues(status.as_deref())).await;
+        Some((status.clone(), list))
+    };
+    let issue = async {
+        let key = watch.issue.as_ref()?;
+        let detail = within("the issue", client.issue::<dto::IssueDetail>(key)).await;
+        Some((key.clone(), detail))
+    };
     let (
         decisions,
         approvals,
@@ -734,6 +776,8 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         events,
         admin,
         policy_sets,
+        issues,
+        issue,
     ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
@@ -774,6 +818,8 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
             watch.policy,
             within("the policy sets", client.policy_sets()),
         ),
+        issues,
+        issue,
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -796,6 +842,8 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         events,
         admin,
         policy_sets,
+        issues,
+        issue,
     }
 }
 
@@ -938,6 +986,16 @@ async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<()
         Action::CreatePolicy { text } => within("the policy set", client.create_policy_set(text))
             .await
             .map(|stored| view.stored_policy = Some(stored.digest)),
+        Action::ParkIssue { key, reason } => {
+            within("the park", client.park::<serde_json::Value>(key, reason))
+                .await
+                .map(drop)
+        }
+        Action::UnparkIssue { key } => {
+            within("the unpark", client.unpark::<serde_json::Value>(key, None))
+                .await
+                .map(drop)
+        }
         Action::ActivatePolicy { digest } => {
             within("the activation", client.activate_policy_set(digest)).await
         }
@@ -1058,7 +1116,8 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.blueprints
             || watch.activity
             || watch.admin
-            || watch.policy;
+            || watch.policy
+            || watch.issues.is_some();
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -1102,6 +1161,12 @@ pub struct Desk {
     pub policy: Option<String>,
     /// A new policy set's text, while its editor is open.
     pub policy_draft: Option<TextEdit>,
+    /// The status the Issues page lists; none lists every one.
+    pub issue_status: InStatus,
+    /// The issue picked on the Issues page.
+    pub issue: Option<String>,
+    /// The scratch copy of a policy set open in the user's own editor.
+    pub policy_file: Option<std::path::PathBuf>,
     /// The login, action and resource to explain a decision for.
     pub explain: (TextEdit, TextEdit, TextEdit),
     /// The setting being overridden on the Admin page, and the value typed for it.
@@ -1152,6 +1217,9 @@ impl Default for Desk {
             policy_tab: false,
             policy: None,
             policy_draft: None,
+            policy_file: None,
+            issue_status: Some(crate::issues::FIRST.to_string()),
+            issue: None,
             explain: (TextEdit::new(""), TextEdit::new(""), TextEdit::new("")),
             knob: None,
             why: TextEdit::new(""),
@@ -1508,12 +1576,50 @@ impl crate::App {
             activity: on(crate::Page::Activity),
             admin: on(crate::Page::Admin) && !self.remote.desk.policy_tab,
             policy: on(crate::Page::Admin) && self.remote.desk.policy_tab,
+            issues: on(crate::Page::Issues).then(|| self.remote.desk.issue_status.clone()),
+            issue: self
+                .remote
+                .desk
+                .issue
+                .clone()
+                .filter(|_| on(crate::Page::Issues)),
             teams: controller,
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
         if self.remote.admin_sent.as_ref() != Some(&watch) {
             self.remote.admin_client.watch(watch.clone());
             self.remote.admin_sent = Some(watch);
+        }
+    }
+
+    /// Start a new policy set from `text`: in the user's own editor on a scratch copy, or in the
+    /// page where there is no editor to hand it to.
+    pub fn edit_policy(&mut self, digest: &str, text: &str) {
+        if cfg!(target_arch = "wasm32") {
+            self.remote.desk.policy_draft = Some(TextEdit::new(text));
+            return;
+        }
+        let name = format!("policy-{}.cedar", digest.get(..12).unwrap_or(digest));
+        match crate::editor::scratch(&name, text) {
+            Ok(path) => {
+                self.open_path_in_editor(&path, 1);
+                self.remote.desk.policy_file = Some(path);
+                self.remote.desk.outcome = self.editor_error.clone().map(Err);
+            }
+            Err(why) => self.remote.desk.outcome = Some(Err(why)),
+        }
+    }
+
+    /// Store the scratch copy as it is on disk now.
+    pub fn store_policy_file(&mut self) {
+        let Some(path) = &self.remote.desk.policy_file else {
+            return;
+        };
+        match std::fs::read_to_string(path) {
+            Ok(text) => self.act(Action::CreatePolicy { text }),
+            Err(why) => {
+                self.remote.desk.outcome = Some(Err(format!("reading {}: {why}", path.display())));
+            }
         }
     }
 
@@ -1596,8 +1702,10 @@ impl crate::App {
                         }
                     }
                     Did::UseBlueprint => self.remote.desk.use_blueprint = None,
+                    Did::ParkIssue => self.remote.desk.why = TextEdit::new(""),
                     Did::CreatePolicy => {
                         self.remote.desk.policy_draft = None;
+                        self.remote.desk.policy_file = None;
                         self.remote.desk.policy = view.stored_policy.clone();
                     }
                     Did::SetOverrides => {
@@ -1643,6 +1751,7 @@ impl crate::App {
                     | Did::CheckWebhook
                     | Did::PreviewWebhook
                     | Did::Reconcile
+                    | Did::UnparkIssue
                     | Did::PauseRepo
                     | Did::UnwatchRepo
                     | Did::ActivatePolicy
@@ -2284,6 +2393,89 @@ mod tests {
                 .iter()
                 .any(|r| r == "DELETE /api/providers/lab")
         );
+    }
+
+    #[test]
+    fn issues_are_read_in_the_status_shown_and_one_is_parked_and_unparked() {
+        const ISSUE: &str = r#"{"key":"github:acme/engine#7","repo":"acme/engine",
+            "kind":{"type":"github","owner":"acme","repo":"engine","number":7},
+            "status":"running","title":"Slow start","updated_at":"2026-11-10T18:01:39Z"}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/issues?exclude_kind=playbook&status=running"] => format!("[{ISSUE}]"),
+            ["GET", "/api/issues?exclude_kind=playbook"] => format!("[{ISSUE},{ISSUE}]"),
+            ["GET", "/api/issues/github%3Aacme%2Fengine%237"] => format!(
+                r#"{{"issue":{ISSUE},"body":"It is slow","events":[{{"ts":"2026-11-10T18:00:00Z",
+                "key":"github:acme/engine#7","from":"scoped","to":"running"}}]}}"#
+            ),
+            ["POST", _] => "{}".into(),
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.issues.is_none() && view.issue.is_none());
+
+        let running = Some("running".to_string());
+        client.watch(Watch {
+            issues: Some(running.clone()),
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.issues.is_some());
+        let (status, issues) = view.issues.unwrap();
+        assert_eq!(status, running);
+        assert_eq!(
+            issues.unwrap().unwrap()[0].title.as_deref(),
+            Some("Slow start")
+        );
+
+        client.watch(Watch {
+            issues: Some(None),
+            issue: Some("github:acme/engine#7".into()),
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| {
+            view.issue.is_some() && matches!(&view.issues, Some((None, _)))
+        });
+        assert_eq!(view.issues.unwrap().1.unwrap().unwrap().len(), 2);
+        let (key, detail) = view.issue.unwrap();
+        let detail = detail.unwrap().unwrap();
+        assert_eq!(key, "github:acme/engine#7");
+        assert_eq!(detail.body.as_deref(), Some("It is slow"));
+        assert_eq!(detail.events[0].to, "running");
+
+        client.act(Action::ParkIssue {
+            key: key.clone(),
+            reason: "needs a repro".into(),
+        });
+        let view = until(&client, |view| view.acted.is_some());
+        assert_eq!(
+            view.acted.map(|a| a.result),
+            Some(Ok("Parked github:acme/engine#7".to_string()))
+        );
+        client.act(Action::UnparkIssue { key });
+        until(&client, |view| {
+            view.acted.as_ref().map(|a| &a.result)
+                == Some(&Ok("Unparked github:acme/engine#7".to_string()))
+        });
+        let asked = requests.lock().unwrap();
+        for post in [
+            "POST /api/issues/github%3Aacme%2Fengine%237/park",
+            "POST /api/issues/github%3Aacme%2Fengine%237/unpark",
+        ] {
+            assert!(asked.iter().any(|r| r == post), "{post} in {asked:?}");
+        }
+        drop(asked);
+
+        client.watch(elsewhere);
+        until(&client, |view| {
+            view.issues.is_none() && view.issue.is_none()
+        });
     }
 
     #[test]

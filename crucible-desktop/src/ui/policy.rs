@@ -59,6 +59,13 @@ pub(crate) fn tab(app: &App, p: &Paint) -> El {
         .w_full()
         .gap(16.0)
         .child(card("policy-explain-card", explain(app, p), p))
+        .children(
+            app.remote
+                .desk
+                .policy_file
+                .as_ref()
+                .map(|path| external(path, app, p)),
+        )
         .child(match (&app.remote.desk.policy_draft, picked) {
             (Some(draft), _) => editor(draft, app, p),
             (None, Some(set)) => detail(set, app, p),
@@ -68,7 +75,7 @@ pub(crate) fn tab(app: &App, p: &Paint) -> El {
 }
 
 fn detail(set: &PolicySet, app: &App, p: &Paint) -> El {
-    let source = set.text.clone();
+    let (digest, source) = (set.digest.clone(), set.text.clone());
     let mut head = row()
         .w_full()
         .gap(10.0)
@@ -85,9 +92,7 @@ fn detail(set: &PolicySet, app: &App, p: &Paint) -> El {
             Button::new("Edit as new")
                 .variant(ButtonVariant::Ghost)
                 .disabled(app.remote.desk.busy())
-                .on_press(move |app: &mut App| {
-                    app.remote.desk.policy_draft = Some(rune::TextEdit::new(&source));
-                })
+                .on_press(move |app: &mut App| app.edit_policy(&digest, &source))
                 .build(p.k)
                 .key("policy-edit"),
         );
@@ -112,6 +117,47 @@ fn detail(set: &PolicySet, app: &App, p: &Paint) -> El {
             .gap(12.0)
             .child(head)
             .child(mono("policy-text", set.text.clone(), p)),
+        p,
+    )
+}
+
+/// The scratch copy open in the user's editor, to store once they have saved it there.
+fn external(path: &std::path::Path, app: &App, p: &Paint) -> El {
+    let reopen = path.to_path_buf();
+    card(
+        "policy-file-card",
+        col()
+            .key("policy-file")
+            .w_full()
+            .gap(10.0)
+            .child(heading("New policy set, in your editor", p))
+            .child(mono("policy-file-path", path.display().to_string(), p))
+            .child(
+                row()
+                    .gap(8.0)
+                    .child(
+                        Button::new("Store")
+                            .variant(ButtonVariant::Submit)
+                            .disabled(app.remote.desk.busy())
+                            .on_press(|app: &mut App| app.store_policy_file())
+                            .build(p.k)
+                            .key("policy-file-store"),
+                    )
+                    .child(
+                        Button::new("Reopen")
+                            .variant(ButtonVariant::Ghost)
+                            .on_press(move |app: &mut App| app.open_path_in_editor(&reopen, 1))
+                            .build(p.k)
+                            .key("policy-file-reopen"),
+                    )
+                    .child(
+                        Button::new("Cancel")
+                            .variant(ButtonVariant::Ghost)
+                            .on_press(|app: &mut App| app.remote.desk.policy_file = None)
+                            .build(p.k)
+                            .key("policy-file-cancel"),
+                    ),
+            ),
         p,
     )
 }

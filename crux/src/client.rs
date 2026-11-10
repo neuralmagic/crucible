@@ -485,6 +485,15 @@ impl Client {
         self.get(&format!("/api/issues{}", q.finish())).await
     }
 
+    /// The issues the controller works for itself, playbook launches left out, in `status`
+    /// when one is named.
+    pub async fn lane_issues(&self, status: Option<&str>) -> Result<Vec<dto::Issue>> {
+        let mut q = Query::new();
+        q.push("exclude_kind", Some("playbook"));
+        q.push("status", status);
+        self.get(&format!("/api/issues{}", q.finish())).await
+    }
+
     pub async fn issue<T: DeserializeOwned>(&self, key: &str) -> Result<T> {
         self.get(&format!("/api/issues/{}", encode(key))).await
     }
@@ -2715,6 +2724,53 @@ mod tests {
                 r#"explain {"action": "team:read", "login": "wynn"}"#,
                 r#"explain {"action": "playbook:launch", "login": "wynn", "resource": "playbook:triage"}"#,
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_issues_leave_playbook_launches_out_and_whoami_names_entitlements() {
+        use axum::extract::RawQuery;
+        use axum::routing::get;
+
+        let app = axum::Router::new()
+            .route(
+                "/api/issues",
+                get(|RawQuery(query): RawQuery| async move {
+                    let status = match query.as_deref() {
+                        Some("exclude_kind=playbook&status=parked") => "parked",
+                        Some("exclude_kind=playbook") => "running",
+                        other => panic!("unexpected query {other:?}"),
+                    };
+                    format!(
+                        r#"[{{"key":"scenario:cold","kind":{{"type":"scenario","id":"cold"}},
+                        "status":"{status}"}}]"#
+                    )
+                }),
+            )
+            .route(
+                "/api/whoami",
+                get(|| async { r#"{"user":"wynn","entitlements":["autoresearch"]}"# }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let parked = client.lane_issues(Some("parked")).await.expect("parked");
+        assert_eq!(parked[0].status, "parked");
+        let all = client.lane_issues(None).await.expect("all");
+        assert_eq!(all[0].status, "running");
+        assert_eq!(
+            client.whoami().await.expect("whoami").entitlements,
+            ["autoresearch"]
         );
     }
 }

@@ -833,6 +833,9 @@ pub struct Whoami {
     /// The teams the caller belongs to, which it may act and own things as.
     #[serde(default)]
     pub teams: Vec<WhoamiTeam>,
+    /// The lanes the caller may use, such as `autoresearch`.
+    #[serde(default)]
+    pub entitlements: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

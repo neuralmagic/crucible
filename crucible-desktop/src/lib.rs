@@ -27,6 +27,7 @@ mod inspect;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[cfg(not(target_arch = "wasm32"))]
 mod instance;
+mod issues;
 mod keymap;
 mod keys;
 mod link;
@@ -208,6 +209,7 @@ pub enum Page {
     Providers,
     Blueprints,
     Activity,
+    Issues,
     Admin,
     Keys,
     Settings,
@@ -225,6 +227,7 @@ impl Page {
             Page::Providers => "providers",
             Page::Blueprints => "blueprints",
             Page::Activity => "activity",
+            Page::Issues => "issues",
             Page::Admin => "admin",
             Page::Keys => "keys",
             Page::Settings => "settings",
@@ -242,6 +245,7 @@ impl Page {
             Page::Providers => "Providers",
             Page::Blueprints => "Blueprints",
             Page::Activity => "Activity",
+            Page::Issues => "Issues",
             Page::Admin => "Admin",
             Page::Keys => "API keys",
             Page::Settings => "Settings",
@@ -1406,6 +1410,11 @@ impl App {
         matches!(&*self.remote.live, LiveView::Ready { identity, .. } if identity.role == "admin")
     }
 
+    /// Whether the signed-in caller may use the controller's own issue lane.
+    pub fn has_autoresearch(&self) -> bool {
+        matches!(&*self.remote.live, LiveView::Ready { identity, .. } if identity.autoresearch)
+    }
+
     pub fn owners(&self) -> Vec<String> {
         match &*self.remote.live {
             LiveView::Ready { identity, .. } if !identity.owners.is_empty() => {
@@ -1748,7 +1757,7 @@ pub fn run() {
                 scene_tab(app);
                 app.page = Page::Settings;
             }),
-            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams, providers, blueprints, activity, admin or keys) against the
+            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams, providers, blueprints, activity, issues, admin or keys) against the
             // controller crux's config names.
             ("page", |app: &mut App| {
                 app.backend = Backend::Controller;
@@ -1762,6 +1771,7 @@ pub fn run() {
                     Page::Providers,
                     Page::Blueprints,
                     Page::Activity,
+                    Page::Issues,
                     Page::Admin,
                     Page::Keys,
                 ]

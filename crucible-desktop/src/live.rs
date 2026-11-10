@@ -137,6 +137,8 @@ pub struct Identity {
     pub role: String,
     /// What the user may own things as: themself, then each of their teams.
     pub owners: Vec<String>,
+    /// The controller's own issue lane is open to the user.
+    pub autoresearch: bool,
 }
 
 impl Identity {
@@ -1534,6 +1536,7 @@ fn identity(whoami: crux::dto::Whoami) -> Identity {
         user,
         role: whoami.role,
         owners,
+        autoresearch: whoami.entitlements.iter().any(|e| e == "autoresearch"),
     }
 }
 
@@ -2030,6 +2033,7 @@ mod tests {
                 user: "wren".into(),
                 role: String::new(),
                 owners: vec!["user:wren".into()],
+                autoresearch: false,
             },
             now: NOW,
             launches,

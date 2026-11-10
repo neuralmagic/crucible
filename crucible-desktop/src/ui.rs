@@ -12,6 +12,7 @@ mod dock;
 mod files;
 mod finder;
 mod graph;
+mod issues;
 mod keys;
 mod launch;
 mod launcher;
@@ -673,6 +674,10 @@ fn pages_nav(app: &App, p: &Paint) -> El {
         .child(entry(crate::Page::Blueprints, &oc::GRID_PLUS, None))
         .child(entry(crate::Page::Activity, &oc::CHECKLIST, None))
         .children(
+            app.has_autoresearch()
+                .then(|| entry(crate::Page::Issues, &oc::BRAIN, None)),
+        )
+        .children(
             app.is_admin()
                 .then(|| entry(crate::Page::Admin, &oc::SETTINGS_GEAR, None)),
         )
@@ -1277,6 +1282,7 @@ fn detail(app: &App, p: &Paint) -> El {
         crate::Page::Providers => return providers::page(app, p),
         crate::Page::Blueprints => return blueprints::page(app, p),
         crate::Page::Activity => return activity::page(app, p),
+        crate::Page::Issues => return issues::page(app, p),
         crate::Page::Admin => return admin::page(app, p),
         crate::Page::Keys => return keys::page(app, p),
         crate::Page::Runs => {}
