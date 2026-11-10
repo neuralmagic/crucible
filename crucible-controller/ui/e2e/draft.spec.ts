@@ -627,7 +627,7 @@ test.describe('draft authoring studio', () => {
 
     await expect(page.getByLabel('Playbook')).toHaveValue('mlr-pack');
     await page.getByRole('button', { name: 'Publish', exact: true }).click();
-    await expect(page.getByRole('link', { name: 'mlr-pack @ sha256:0123456789ab' })).toHaveAttribute(
+    await expect(page.getByRole('link', { name: 'mlr-pack @ tree1:0123456789abc' })).toHaveAttribute(
       'href',
       '/playbooks/mlr-pack',
     );
