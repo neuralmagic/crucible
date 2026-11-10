@@ -40,6 +40,7 @@ mod pack;
 mod palette;
 mod preview;
 mod profile;
+mod provider;
 mod remote;
 mod runs;
 mod runs_on;
@@ -201,6 +202,7 @@ pub enum Page {
     Decisions,
     Approvals,
     Teams,
+    Providers,
     Keys,
     Settings,
 }
@@ -214,6 +216,7 @@ impl Page {
             Page::Decisions => "decisions",
             Page::Approvals => "approvals",
             Page::Teams => "teams",
+            Page::Providers => "providers",
             Page::Keys => "keys",
             Page::Settings => "settings",
         }
@@ -227,6 +230,7 @@ impl Page {
             Page::Decisions => "Decisions",
             Page::Approvals => "Approvals",
             Page::Teams => "Teams",
+            Page::Providers => "Providers",
             Page::Keys => "API keys",
             Page::Settings => "Settings",
         }
@@ -1727,7 +1731,7 @@ pub fn run() {
                 scene_tab(app);
                 app.page = Page::Settings;
             }),
-            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams or keys) against the
+            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams, providers or keys) against the
             // controller crux's config names.
             ("page", |app: &mut App| {
                 app.backend = Backend::Controller;
@@ -1738,6 +1742,7 @@ pub fn run() {
                     Page::Decisions,
                     Page::Approvals,
                     Page::Teams,
+                    Page::Providers,
                     Page::Keys,
                 ]
                 .into_iter()

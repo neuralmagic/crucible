@@ -69,6 +69,7 @@ impl Route {
             | ["teams", _, "schedules" | "webhooks"] => Route::Page(crate::Page::Triggers),
             ["secrets"] | ["teams", _, "secrets"] => Route::Page(crate::Page::Secrets),
             ["teams"] | ["teams", _] | ["teams", _, "members"] => Route::Page(crate::Page::Teams),
+            ["providers"] | ["teams", _, "providers"] => Route::Page(crate::Page::Providers),
             _ => Route::Home,
         }
     }

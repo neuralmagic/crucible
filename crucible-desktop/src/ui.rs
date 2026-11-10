@@ -16,6 +16,7 @@ mod log;
 mod pack;
 mod palette;
 mod profiles;
+mod providers;
 mod runs;
 mod schedules;
 mod secrets;
@@ -664,6 +665,7 @@ fn pages_nav(app: &App, p: &Paint) -> El {
         .child(entry(crate::Page::Triggers, &oc::STATUS, None))
         .child(entry(crate::Page::Secrets, &rune_kit::glyphs::LOCK, None))
         .child(entry(crate::Page::Teams, &oc::SUBAGENT, None))
+        .child(entry(crate::Page::Providers, &oc::BRAIN, None))
         .children(crate::SESSION_AUTH.then(|| entry(crate::Page::Keys, &oc::KEYBOARD, None)))
 }
 
@@ -1262,6 +1264,7 @@ fn detail(app: &App, p: &Paint) -> El {
         crate::Page::Decisions => return decisions::page(app, p),
         crate::Page::Approvals => return approvals::page(app, p),
         crate::Page::Teams => return teams::page(app, p),
+        crate::Page::Providers => return providers::page(app, p),
         crate::Page::Keys => return keys::page(app, p),
         crate::Page::Runs => {}
     }

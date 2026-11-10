@@ -44,6 +44,7 @@ pub struct Watch {
     pub webhook: Option<String>,
     /// The playbook the open webhook form launches.
     pub webhook_form: Option<String>,
+    pub providers: bool,
 }
 
 /// A change to make on the controller.
@@ -149,6 +150,14 @@ pub enum Action {
     CheckWebhook {
         body: Box<dto::WebhookBody>,
     },
+    /// Register a provider, or replace registration `id`.
+    SaveProvider {
+        id: Option<String>,
+        register: Box<dto::RegisterProvider>,
+    },
+    DeleteProvider {
+        id: String,
+    },
     /// Run the form's transform on a sample delivery.
     PreviewWebhook {
         body: Box<dto::WebhookBody>,
@@ -185,6 +194,8 @@ pub enum Did {
     SaveWebhook,
     CheckWebhook,
     PreviewWebhook,
+    SaveProvider,
+    DeleteProvider,
 }
 
 impl Action {
@@ -215,6 +226,8 @@ impl Action {
             Action::SaveWebhook { .. } => Did::SaveWebhook,
             Action::CheckWebhook { .. } => Did::CheckWebhook,
             Action::PreviewWebhook { .. } => Did::PreviewWebhook,
+            Action::SaveProvider { .. } => Did::SaveProvider,
+            Action::DeleteProvider { .. } => Did::DeleteProvider,
         }
     }
 
@@ -254,6 +267,9 @@ impl Action {
             Action::SaveWebhook { id: Some(_), .. } => "Saved the webhook".to_string(),
             Action::CheckWebhook { .. } => "Checked".to_string(),
             Action::PreviewWebhook { .. } => "Previewed".to_string(),
+            Action::SaveProvider { id: None, register } => format!("Registered {}", register.id),
+            Action::SaveProvider { id: Some(_), .. } => "Saved the provider".to_string(),
+            Action::DeleteProvider { id } => format!("Deregistered {id}"),
         }
     }
 }
@@ -296,6 +312,7 @@ pub struct AdminView {
     /// The open webhook form's playbook and its params schema.
     pub webhook_schema: Option<(String, Loaded<serde_json::Value>)>,
     pub presets: Loaded<Vec<dto::WebhookPreset>>,
+    pub providers: Loaded<Vec<dto::Provider>>,
     /// What the last check and preview of the open webhook form came to.
     pub webhook_check: Option<dto::WebhookCheck>,
     pub webhook_preview: Option<dto::WebhookPreview>,
@@ -439,6 +456,9 @@ impl Worker {
         if let Some(presets) = read.presets {
             self.view.presets = Some(presets);
         }
+        if let Some(providers) = read.providers {
+            self.view.providers = Some(providers);
+        }
         if watch.webhook_form.is_none() {
             self.view.webhook_check = None;
             self.view.webhook_preview = None;
@@ -477,6 +497,7 @@ struct Read {
     deliveries: Option<(String, Result<Vec<dto::WebhookDelivery>, String>)>,
     webhook_schema: Option<(String, Result<serde_json::Value, String>)>,
     presets: Option<Result<Vec<dto::WebhookPreset>, String>>,
+    providers: Option<Result<Vec<dto::Provider>, String>>,
 }
 
 impl Read {
@@ -501,6 +522,7 @@ impl Read {
             deliveries: watch.webhook.clone().map(|id| (id, Err(why.clone()))),
             webhook_schema: watch.webhook_form.clone().map(|id| (id, Err(why.clone()))),
             presets: watch.webhook_form.is_some().then(|| Err(why.clone())),
+            providers: watch.providers.then(|| Err(why.clone())),
         }
     }
 }
@@ -569,6 +591,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         deliveries,
         webhook_schema,
         presets,
+        providers,
     ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
@@ -588,6 +611,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
             watch.webhook_form.is_some(),
             within("the presets", client.webhook_presets()),
         ),
+        when(watch.providers, within("the providers", client.providers())),
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -605,6 +629,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         deliveries,
         webhook_schema,
         presets,
+        providers,
     }
 }
 
@@ -729,6 +754,21 @@ async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<()
                 .await
                 .map(drop)
         }
+        Action::SaveProvider { id: None, register } => {
+            within("the registration", client.register_provider(register))
+                .await
+                .map(drop)
+        }
+        Action::SaveProvider {
+            id: Some(id),
+            register,
+        } => within(
+            "the provider",
+            client.update_provider(id, &register.provider),
+        )
+        .await
+        .map(drop),
+        Action::DeleteProvider { id } => within("the delete", client.delete_provider(id)).await,
         Action::CheckWebhook { body } => within("the check", client.check_webhook(body))
             .await
             .map(|check| view.webhook_check = Some(check)),
@@ -793,7 +833,8 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.keys
             || watch.teams
             || watch.webhooks
-            || watch.webhook_form.is_some();
+            || watch.webhook_form.is_some()
+            || watch.providers;
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -831,6 +872,9 @@ pub struct Desk {
     pub register: Option<(String, TextEdit, TextEdit)>,
     /// The webhook the Triggers page shows in full.
     pub webhook: Option<String>,
+    /// The provider the Providers page shows, and its form while open.
+    pub provider: Option<String>,
+    pub provider_form: Option<crate::provider::ProviderForm>,
     /// The webhook form, while open.
     pub webhook_form: Option<crate::webhook::WebhookForm>,
     /// The team the Teams page shows.
@@ -865,6 +909,8 @@ impl Default for Desk {
             move_to: None,
             register: None,
             new_key: crate::apikeys::KeyForm::default(),
+            provider: None,
+            provider_form: None,
             webhook: None,
             webhook_form: None,
             team: None,
@@ -1209,6 +1255,7 @@ impl crate::App {
                 .as_ref()
                 .filter(|_| on(crate::Page::Triggers))
                 .map(|form| form.playbook.clone()),
+            providers: on(crate::Page::Providers),
             teams: on(crate::Page::Teams),
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
@@ -1291,6 +1338,15 @@ impl crate::App {
                     Did::RenameTeam => self.remote.desk.rename_team = None,
                     Did::DeleteTeam => self.remote.desk.team = None,
                     Did::DeleteWebhook => self.remote.desk.webhook = None,
+                    Did::SaveProvider => {
+                        if let Some(form) = self.remote.desk.provider_form.take() {
+                            self.remote.desk.provider = Some(form.id.text.trim().to_string());
+                        }
+                    }
+                    Did::DeleteProvider => {
+                        self.remote.desk.provider = None;
+                        self.remote.desk.provider_form = None;
+                    }
                     Did::SaveWebhook => {
                         let saved = self
                             .remote
@@ -1905,6 +1961,83 @@ mod tests {
             view.rotated.map(|r| r.secret),
             Some("whsec_new".to_string()),
             "closing the form dropped the new webhook's secret"
+        );
+    }
+
+    #[test]
+    fn providers_are_read_on_their_page_and_a_save_registers_or_replaces() {
+        const PROVIDER: &str = r#"{"id":"lab","display_name":"Lab","kind":"openai",
+            "default_model":"gpt-5","enabled":true,"owner":"user:wynn","actions":["update"]}"#;
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&requests);
+        let (url, _) = crate::testserver::serve(move |request| {
+            let line: Vec<&str> = request.split_whitespace().take(2).collect();
+            seen.lock().unwrap().push(line.join(" "));
+            match line[..] {
+                ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+                ["GET", "/api/approvals"] => "{}".into(),
+                ["GET", "/api/providers"] => format!("[{PROVIDER}]"),
+                ["POST", "/api/providers"] | ["PUT", "/api/providers/lab"] => PROVIDER.into(),
+                _ => "[]".into(),
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn(net.connector(crate::testserver::target("t", &url, dir.path())));
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.providers.is_none());
+        client.watch(Watch {
+            providers: true,
+            ..elsewhere
+        });
+        let view = until(&client, |view| view.providers.is_some());
+        let stored = view.providers.unwrap().unwrap().remove(0);
+        assert!(crate::provider::may(&stored, "update"));
+
+        let mut form = crate::provider::ProviderForm::editing(&stored);
+        form.enabled = false;
+        let register = Box::new(form.register().unwrap());
+        let steps = [
+            (None, "Registered lab", "POST /api/providers"),
+            (
+                Some("lab".to_string()),
+                "Saved the provider",
+                "PUT /api/providers/lab",
+            ),
+        ];
+        for (id, said, sent) in steps {
+            client.act(Action::SaveProvider {
+                id,
+                register: register.clone(),
+            });
+            until(&client, |view| {
+                view.acted
+                    .as_ref()
+                    .is_some_and(|a| a.result == Ok(said.to_string()))
+            });
+            assert!(
+                requests.lock().unwrap().iter().any(|r| r == sent),
+                "{sent} was not sent"
+            );
+        }
+        client.act(Action::DeleteProvider { id: "lab".into() });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::DeleteProvider)
+        });
+        assert!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r == "DELETE /api/providers/lab")
         );
     }
 

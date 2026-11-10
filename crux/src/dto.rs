@@ -1067,6 +1067,76 @@ pub struct Provider {
     pub enabled: bool,
     #[serde(default)]
     pub owner: String,
+    /// The base URL a `custom` provider is reached at.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<InferenceProtocol>,
+    /// The agent CLI the registration names, when it overrides the kind's default.
+    #[serde(default)]
+    pub harness_override: Option<String>,
+    #[serde(default)]
+    pub secret_name: Option<String>,
+    #[serde(default)]
+    pub secret_owner: Option<String>,
+    /// What the caller may do to it: `update`, `delete` and the like.
+    #[serde(default)]
+    pub actions: Vec<String>,
+}
+
+/// Which service a provider registration talks to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderKind {
+    #[default]
+    Openai,
+    Anthropic,
+    Vertex,
+    /// The registration's own endpoint: vLLM, a proxy, a gateway.
+    Custom,
+}
+
+/// The wire protocol a `custom` provider's endpoint speaks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceProtocol {
+    #[default]
+    ChatCompletions,
+    Responses,
+    Messages,
+    Decisions,
+    SystemOne,
+}
+
+/// A provider as `PUT /api/providers/{id}` takes it. Fields a kind has no use for stay off the
+/// wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProviderBody {
+    pub display_name: String,
+    pub kind: ProviderKind,
+    pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<InferenceProtocol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_owner: Option<String>,
+    pub enabled: bool,
+}
+
+/// `POST /api/providers`: a new registration under `id`, owned by `owner`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RegisterProvider {
+    pub id: String,
+    pub owner: String,
+    #[serde(flatten)]
+    pub provider: ProviderBody,
 }
 
 /// `GET /api/dispatch-targets`: where the caller may dispatch, default first.

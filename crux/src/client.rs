@@ -613,6 +613,24 @@ impl Client {
     }
 
     /// Every provider registration the caller may read, disabled ones included.
+    pub async fn register_provider(&self, body: &dto::RegisterProvider) -> Result<dto::Provider> {
+        self.post("/api/providers", Some(body)).await
+    }
+
+    pub async fn update_provider(
+        &self,
+        id: &str,
+        body: &dto::ProviderBody,
+    ) -> Result<dto::Provider> {
+        self.put(&format!("/api/providers/{}", encode(id)), body)
+            .await
+    }
+
+    /// Refused while issues or schedules still pin the provider.
+    pub async fn delete_provider(&self, id: &str) -> Result<()> {
+        self.delete(&format!("/api/providers/{}", encode(id))).await
+    }
+
     pub async fn providers<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/providers").await
     }
@@ -2244,6 +2262,135 @@ mod tests {
                 ("PUT /api/webhooks/w9".to_string(), whole),
                 ("POST /api/webhooks/check".to_string(), transform),
                 ("POST /api/webhooks/preview".to_string(), previewed),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_calls_send_only_the_fields_a_kind_uses() {
+        use axum::extract::State;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::routing::{get, put};
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+        const PROVIDER: &str = r#"{"id":"lab","display_name":"Lab vLLM","kind":"custom",
+            "models":["glm-5-3"],"default_model":"glm-5-3","roles":["agent"],
+            "harness":"opencode","harness_override":null,"endpoint":"https://vllm.example/v1",
+            "protocol":"chat_completions","secret_name":"lab-key","secret_owner":"team:infra",
+            "price":null,"enabled":true,"owner":"team:infra","actions":["read","update","delete"]}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            uri: Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            let sent = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            seen.lock()
+                .unwrap()
+                .push((format!("{method} {}", uri.path()), sent));
+            if method == Method::DELETE {
+                return (StatusCode::NO_CONTENT, String::new());
+            }
+            (StatusCode::OK, PROVIDER.to_string())
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/providers",
+                get(|| async { format!("[{PROVIDER}]") }).post(note),
+            )
+            .route("/api/providers/{id}", put(note).delete(note))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let listed: Vec<dto::Provider> = client.providers().await.expect("providers");
+        assert_eq!(
+            listed[0].protocol,
+            Some(dto::InferenceProtocol::ChatCompletions)
+        );
+        assert_eq!(
+            listed[0].endpoint.as_deref(),
+            Some("https://vllm.example/v1")
+        );
+        assert_eq!(listed[0].secret_owner.as_deref(), Some("team:infra"));
+        assert_eq!(listed[0].actions, ["read", "update", "delete"]);
+
+        let hosted = dto::ProviderBody {
+            display_name: "OpenAI".into(),
+            kind: dto::ProviderKind::Openai,
+            models: Vec::new(),
+            default_model: None,
+            endpoint: None,
+            protocol: None,
+            harness: None,
+            secret_name: None,
+            secret_owner: None,
+            enabled: true,
+        };
+        client
+            .register_provider(&dto::RegisterProvider {
+                id: "openai".into(),
+                owner: "user:wynn".into(),
+                provider: hosted,
+            })
+            .await
+            .expect("register");
+        let custom = dto::ProviderBody {
+            display_name: "Lab vLLM".into(),
+            kind: dto::ProviderKind::Custom,
+            models: vec!["glm-5-3".into()],
+            default_model: Some("glm-5-3".into()),
+            endpoint: Some("https://vllm.example/v1".into()),
+            protocol: Some(dto::InferenceProtocol::SystemOne),
+            harness: Some("opencode".into()),
+            secret_name: Some("lab-key".into()),
+            secret_owner: Some("team:infra".into()),
+            enabled: false,
+        };
+        client
+            .update_provider("lab", &custom)
+            .await
+            .expect("update");
+        client.delete_provider("lab").await.expect("delete");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (
+                    "POST /api/providers".to_string(),
+                    serde_json::json!({
+                        "id": "openai", "owner": "user:wynn", "display_name": "OpenAI",
+                        "kind": "openai", "models": [], "enabled": true,
+                    })
+                ),
+                (
+                    "PUT /api/providers/lab".to_string(),
+                    serde_json::json!({
+                        "display_name": "Lab vLLM", "kind": "custom", "models": ["glm-5-3"],
+                        "default_model": "glm-5-3", "endpoint": "https://vllm.example/v1",
+                        "protocol": "system_one", "harness": "opencode",
+                        "secret_name": "lab-key", "secret_owner": "team:infra",
+                        "enabled": false,
+                    })
+                ),
+                (
+                    "DELETE /api/providers/lab".to_string(),
+                    serde_json::Value::Null
+                ),
             ]
         );
     }
