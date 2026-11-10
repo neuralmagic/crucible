@@ -73,6 +73,18 @@ pub struct CompiledWorkflow {
 pub struct Checked {
     pub outcome: Result<CompiledWorkflow>,
     pub warnings: Vec<Warning>,
+    /// What a failed compile built before it failed, when it built any task.
+    pub sketch: Option<Sketch>,
+}
+
+/// The graph of a pack that does not compile, for showing where it stands: every task a
+/// constructor built, and a stand-in for each one whose constructor failed. It is not validated
+/// and cannot run.
+#[derive(Debug, Clone)]
+pub struct Sketch {
+    pub tasks: Vec<Task>,
+    /// The stand-ins, by name.
+    pub broken: Vec<TaskName>,
 }
 
 #[derive(Debug)]
@@ -110,6 +122,10 @@ struct CompileContext {
     thrown: Option<CompileError>,
     /// Every error a constructor raised and evaluation went on past.
     errors: Vec<CompileError>,
+    /// Every task built so far, in the order written, with a stand-in for each named in
+    /// `broken`.
+    sketch: Vec<Task>,
+    broken: Vec<TaskName>,
     /// The constructor call being evaluated, which a warning is located at.
     call: Option<FileSpan>,
     /// Every warning a constructor raised, at its call.
@@ -463,6 +479,8 @@ impl CompileState {
                 string_session_refs: BTreeMap::new(),
                 thrown: None,
                 errors: Vec::new(),
+                sketch: Vec::new(),
+                broken: Vec::new(),
                 call: None,
                 warnings: Vec::new(),
             }),
@@ -528,6 +546,49 @@ impl CompileState {
                 kind,
             })
             .collect()
+    }
+
+    /// Keep a stand-in for the task `name`, whose constructor failed, with the dependencies it
+    /// was written with.
+    fn sketch_broken(&self, name: &TaskName, depends_on: Vec<TaskName>) {
+        let mut context = self.inner.borrow_mut();
+        if context.sketch.len() < MAX_CONSTRUCTED_TASKS {
+            context.sketch.push(Task {
+                depends_on,
+                ..placeholder(name)
+            });
+            context.broken.push(name.clone());
+        }
+    }
+
+    /// The tasks built so far as a graph that can be drawn: one task per name, the routes
+    /// behind each `when` on a field, and no dependency on a task that is not there.
+    fn take_sketch(&self) -> Option<Sketch> {
+        let (mut tasks, broken) = {
+            let mut context = self.inner.borrow_mut();
+            (
+                std::mem::take(&mut context.sketch),
+                std::mem::take(&mut context.broken),
+            )
+        };
+        let mut seen = BTreeSet::new();
+        tasks.retain(|task| seen.insert(task.name.clone()));
+        if tasks.is_empty() {
+            return None;
+        }
+        if let Err(error) = add_field_routes(&mut tasks, self) {
+            tracing::debug!(%error, "sketch drawn without its field routes");
+        }
+        let known: BTreeSet<TaskName> = tasks.iter().map(|task| task.name.clone()).collect();
+        for task in &mut tasks {
+            task.depends_on.retain(|d| known.contains(d));
+            task.optional.retain(|d| known.contains(d));
+        }
+        let broken = broken
+            .into_iter()
+            .filter(|name| seen.contains(name))
+            .collect();
+        Some(Sketch { tasks, broken })
     }
 
     fn has_errors(&self) -> bool {
@@ -1357,6 +1418,9 @@ fn constructor(
         context
             .constructed_tasks
             .insert(task.name.0.clone(), at.clone());
+        if context.sketch.len() < MAX_CONSTRUCTED_TASKS {
+            context.sketch.push(task.clone());
+        }
         context.constructed_tasks.len()
     };
     if constructed > MAX_CONSTRUCTED_TASKS {
@@ -3343,6 +3407,22 @@ pub fn compile_source_with(
     check_source_with(source, filename, pack_dir, supplied).outcome
 }
 
+/// [`check_source_with`] for a file.
+pub fn check_file_with(
+    path: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Checked {
+    match std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path)) {
+        Ok(source) => check_source_with(&source, path, pack_dir, supplied),
+        Err(error) => Checked {
+            outcome: Err(error.into()),
+            warnings: Vec::new(),
+            sketch: None,
+        },
+    }
+}
+
 /// Compile, and say what was noticed whether or not the compile succeeded.
 pub fn check_source_with(
     source: &str,
@@ -3361,6 +3441,7 @@ pub fn check_source_with(
     .unwrap_or_else(|error| Checked {
         outcome: Err(error),
         warnings: Vec::new(),
+        sketch: None,
     })
 }
 
@@ -3369,12 +3450,14 @@ fn check_bound(source: &str, filename: &Path, pack_dir: &Path, binding: Binding<
     let state = CompileState::new(pack_dir, filename);
     let outcome = compile_source_here(&state, source, filename, pack_dir, binding);
     let warnings = state.take_warnings();
+    let sketch = outcome.is_err().then(|| state.take_sketch()).flatten();
     Checked {
         outcome: outcome.map(|compiled| CompiledWorkflow {
             warnings: warnings.clone(),
             ..compiled
         }),
         warnings,
+        sketch,
     }
 }
 
@@ -10301,4 +10384,96 @@ fan = command(name = "fan", run = "true", over = each(scan.items, max = 4), when
 read = command(name = "read", run = "true", depends_on = [scan], when = scan.ok)
 workflow(type = "playbook", tasks = [scan, gate, fan, read])
 "#;
+
+    const SKETCHED: &str = r#"scan = command(name = "scan", run = "true", emits = {"items": "list", "ok": "boolean"})
+fan = command(name = "fan", run = "true", depends_on = [scan], over = each(scan.items, max = 4), bogus = 1)
+sum = command(name = "sum", run = "true", depends_on = [fan], join = "passed")
+go = command(name = "go", run = "true", when = scan.ok, depends_on = [sum])
+lost = command(run = "true")
+workflow(type = "playbook", tasks = [scan, fan, sum, go])
+"#;
+
+    #[test]
+    fn a_failed_compile_sketches_the_graph_it_got_to() {
+        let checked = checked("sketch", &[], SKETCHED);
+        assert!(checked.outcome.is_err());
+        let sketch = checked.sketch.expect("tasks were built");
+        let drawn: Vec<(&str, Vec<&str>)> = sketch
+            .tasks
+            .iter()
+            .map(|task| (task.name.0.as_str(), dependencies(task)))
+            .collect();
+        assert_eq!(
+            drawn,
+            [
+                ("scan", vec![]),
+                ("scan-ok", vec!["scan"]),
+                ("fan", vec!["scan"]),
+                ("sum", vec!["fan"]),
+                ("go", vec!["sum", "scan-ok"]),
+            ],
+            "the failed task keeps its place and its dependencies, a field's route is drawn, \
+             and a task with no usable name is left out"
+        );
+        let broken: Vec<&str> = sketch.broken.iter().map(TaskName::as_str).collect();
+        assert_eq!(broken, ["fan"]);
+        let fan = &sketch.tasks[2];
+        assert!(matches!(&fan.task, TaskKind::Command { command } if command.is_empty()));
+
+        let event = crate::plan::admitted::plan_sketched(&sketch.tasks);
+        let crucible_contract::session::SessionEvent::PlanAdmitted { tasks, .. } = event else {
+            panic!("not a plan event");
+        };
+        let wired: Vec<(&str, &str)> = tasks
+            .iter()
+            .map(|task| (task.name.as_str(), task.kind.as_str()))
+            .collect();
+        assert_eq!(
+            wired,
+            [
+                ("scan", "command"),
+                ("scan-ok", "route"),
+                ("fan", "command"),
+                ("sum", "command"),
+                ("go", "command")
+            ]
+        );
+        assert_eq!(tasks[4].when, "scan-ok.ok in yes");
+    }
+
+    #[test]
+    fn a_compile_that_succeeds_or_builds_nothing_has_no_sketch() {
+        assert!(
+            checked("sketch-none", &[], VALUE_FORMS_WHOLE)
+                .sketch
+                .is_none()
+        );
+        let nothing = checked(
+            "sketch-empty",
+            &[],
+            "workflow(type = \"playbook\", tasks = [])\n",
+        );
+        assert!(nothing.outcome.is_err());
+        assert!(nothing.sketch.is_none());
+    }
+
+    #[test]
+    fn a_graph_that_fails_validation_is_sketched_whole() {
+        let checked = checked(
+            "sketch-invalid",
+            &[],
+            "a = command(name = \"a\", run = \"true\", depends_on = [\"b\"])\n\
+             b = command(name = \"b\", run = \"true\", depends_on = [a])\n\
+             workflow(type = \"playbook\", tasks = [a, b])\n",
+        );
+        assert!(checked.outcome.is_err(), "a cycle");
+        let sketch = checked.sketch.expect("both tasks were built");
+        assert!(sketch.broken.is_empty());
+        let drawn: Vec<(&str, Vec<&str>)> = sketch
+            .tasks
+            .iter()
+            .map(|task| (task.name.0.as_str(), dependencies(task)))
+            .collect();
+        assert_eq!(drawn, [("a", vec!["b"]), ("b", vec!["a"])]);
+    }
 }

@@ -22,11 +22,21 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
             .children(head)
             .child(empty_run(pane, p));
     }
-    let marks = if pane.previewing && !pane.run_tasks.is_empty() {
+    let mut marks = if pane.previewing && !pane.run_tasks.is_empty() {
         edits(&pane.run_tasks, &pane.tasks)
     } else {
         HashMap::new()
     };
+    if pane.previewing
+        && let Some(preview) = &pane.preview
+    {
+        marks.extend(
+            preview
+                .broken
+                .iter()
+                .map(|name| (name.clone(), Edit::Broken)),
+        );
+    }
     let shown = Shown {
         open: app.expanded.as_deref(),
         unfolded: &app.unfolded,
@@ -137,6 +147,8 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
 enum Edit {
     Added,
     Changed,
+    /// The pack does not compile here.
+    Broken,
 }
 
 /// What a task is, apart from how it ran.
@@ -386,7 +398,7 @@ struct Shown<'a> {
     open: Option<&'a str>,
     /// Fan-outs drawn with their instances.
     unfolded: &'a HashSet<String>,
-    /// Tasks the compiled pack adds or redefines, outlined.
+    /// Tasks the compiled pack adds, redefines, or could not build, outlined.
     marks: &'a HashMap<String, Edit>,
 }
 
@@ -581,6 +593,7 @@ fn mermaid_source(tasks: &[TaskView], shown: &Shown, ink: &Ink) -> String {
         let ink = match shown.marks.get(&task.name) {
             Some(Edit::Added) => ink.added,
             Some(Edit::Changed) => ink.changed,
+            Some(Edit::Broken) => ink.fail.stroke,
             None => continue,
         };
         source.push_str(&format!("  style t{i} stroke:{}\n", ink.hex()));
@@ -803,6 +816,34 @@ mod tests {
             source.contains(&format!("style t{b} stroke:#000000ff")),
             "{source}"
         );
+    }
+
+    #[test]
+    fn a_task_the_pack_could_not_build_is_outlined_as_failing() {
+        let compiled: Vec<TaskView> = fold(TIMED)
+            .into_iter()
+            .map(|mut task| {
+                task.result = None;
+                task
+            })
+            .collect();
+        let marks = std::collections::HashMap::from([("b".to_owned(), Edit::Broken)]);
+        let unfolded = HashSet::new();
+        let source = mermaid_source(
+            &compiled,
+            &Shown {
+                open: None,
+                unfolded: &unfolded,
+                marks: &marks,
+            },
+            &ink(),
+        );
+        let b = compiled.iter().position(|t| t.name == "b").unwrap();
+        assert!(
+            source.contains(&format!("style t{b} stroke:#ffffffff")),
+            "{source}"
+        );
+        assert_eq!(source.matches("  style t").count(), 1, "{source}");
     }
 
     #[test]
