@@ -574,6 +574,39 @@ pub struct WatchedRepo {
     pub added_by: Option<String>,
 }
 
+/// One stored authorization policy set. Exactly one is active.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PolicySet {
+    pub digest: String,
+    /// The Cedar source.
+    pub text: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub activated_by: Option<String>,
+    #[serde(default)]
+    pub activated_at: Option<String>,
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// `GET /api/authz/explain`: how the active policy decides one action for one user, and the
+/// rules that decided it.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Explanation {
+    pub login: String,
+    pub action: String,
+    #[serde(default)]
+    pub resource: String,
+    #[serde(default)]
+    pub owner: String,
+    pub allowed: bool,
+    #[serde(default)]
+    pub rules: Vec<String>,
+}
+
 /// A role in a team, least first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]

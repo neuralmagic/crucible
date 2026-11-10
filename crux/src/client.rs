@@ -728,6 +728,46 @@ impl Client {
             .await
     }
 
+    /// Every stored policy set, the active one marked.
+    pub async fn policy_sets(&self) -> Result<Vec<dto::PolicySet>> {
+        self.get("/api/authz/policy-sets").await
+    }
+
+    /// Store `text` as a policy set. Refused, naming the failing policy, when it does not
+    /// validate. Storing does not activate it.
+    pub async fn create_policy_set(&self, text: &str) -> Result<dto::PolicySet> {
+        let body = serde_json::json!({ "text": text });
+        self.post("/api/authz/policy-sets", Some(&body)).await
+    }
+
+    /// Make the stored set `digest` the one every decision uses.
+    pub async fn activate_policy_set(&self, digest: &str) -> Result<()> {
+        self.post::<serde_json::Value>(
+            &format!("/api/authz/policy-sets/{}/activate", encode(digest)),
+            None::<&serde_json::Value>,
+        )
+        .await
+        .map(drop)
+    }
+
+    /// How the active policy decides `action` for `login`, on `resource` when one is named.
+    pub async fn explain(
+        &self,
+        login: &str,
+        action: &str,
+        resource: Option<&str>,
+    ) -> Result<dto::Explanation> {
+        let mut path = format!(
+            "/api/authz/explain?login={}&action={}",
+            encode(login),
+            encode(action)
+        );
+        if let Some(resource) = resource {
+            path.push_str(&format!("&resource={}", encode(resource)));
+        }
+        self.get(&path).await
+    }
+
     pub async fn config(&self) -> Result<dto::ControllerConfig> {
         self.get("/api/config").await
     }
@@ -2583,6 +2623,97 @@ mod tests {
                     serde_json::json!({})
                 ),
                 ("DELETE /api/repos/llm-d%2Fllm-d".to_string(), null),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_calls_store_activate_and_explain() {
+        use axum::extract::{Path, Query, State};
+        use axum::routing::{get, post};
+        use std::collections::BTreeMap;
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<String>>>;
+        const SET: &str = r#"{"digest":"abc123","text":"permit(principal, action, resource);",
+            "owner":"team:platform-administrators","schema_version":1,"created_by":"user:wynn",
+            "created_at":"2026-11-04T21:28:21Z","activated_by":null,"activated_at":null,
+            "active":false}"#;
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route(
+                "/api/authz/policy-sets",
+                get(|| async { format!("[{SET}]") }).post(
+                    |State(seen): State<Seen>, body: String| async move {
+                        seen.lock().unwrap().push(format!("store {body}"));
+                        SET
+                    },
+                ),
+            )
+            .route(
+                "/api/authz/policy-sets/{digest}/activate",
+                post(|State(seen): State<Seen>, Path(digest): Path<String>| async move {
+                    seen.lock().unwrap().push(format!("activate {digest}"));
+                    r#"{"prior":null,"active":"abc123"}"#
+                }),
+            )
+            .route(
+                "/api/authz/explain",
+                get(
+                    |State(seen): State<Seen>, Query(q): Query<BTreeMap<String, String>>| async move {
+                        seen.lock().unwrap().push(format!("explain {q:?}"));
+                        r#"{"login":"wynn","action":"team:read","resource":"team","owner":"",
+                            "allowed":true,"rules":["everyone-read-platform"],"policy":"abc123",
+                            "groups":[],"groups_at":null,"teams":[]}"#
+                    },
+                ),
+            )
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let sets = client.policy_sets().await.expect("sets");
+        assert_eq!((sets[0].digest.as_str(), sets[0].active), ("abc123", false));
+        let stored = client
+            .create_policy_set("permit(principal, action, resource);")
+            .await;
+        assert_eq!(
+            stored.expect("store").created_by.as_deref(),
+            Some("user:wynn")
+        );
+        client
+            .activate_policy_set("abc123")
+            .await
+            .expect("activate");
+        let all = client
+            .explain("wynn", "team:read", None)
+            .await
+            .expect("explain");
+        assert!(all.allowed);
+        assert_eq!(all.rules, ["everyone-read-platform"]);
+        client
+            .explain("wynn", "playbook:launch", Some("playbook:triage"))
+            .await
+            .expect("explain");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                r#"store {"text":"permit(principal, action, resource);"}"#,
+                "activate abc123",
+                r#"explain {"action": "team:read", "login": "wynn"}"#,
+                r#"explain {"action": "playbook:launch", "login": "wynn", "resource": "playbook:triage"}"#,
             ]
         );
     }

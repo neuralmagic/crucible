@@ -9,11 +9,29 @@ use crate::App;
 use crate::admin::{Action, relative};
 use crate::overrides::{parse, shown, with, without};
 use crate::ui::desk::{
-    card, confirm, fact, field, frame, heading, landed, none, now, scrolled, stacked,
+    card, confirm, fact, field, frame, heading, landed, none, now, pills, scrolled, stacked,
 };
 use crate::ui::{Paint, tag};
 
 pub(crate) fn page(app: &App, p: &Paint) -> El {
+    let on_policy = app.remote.desk.policy_tab;
+    let tabs = pills(
+        "admin-tab",
+        &[
+            ("controller".to_string(), "Controller".to_string()),
+            ("policy".to_string(), "Policy".to_string()),
+        ],
+        Some(if on_policy { "policy" } else { "controller" }),
+        |app: &mut App, picked: &str| {
+            app.remote.desk.armed = None;
+            app.remote.desk.policy_tab = picked == "policy";
+        },
+        p,
+    );
+    let page = frame("admin", "Admin", String::new(), Some(tabs), app, p);
+    if on_policy {
+        return page.child(crate::ui::policy::tab(app, p));
+    }
     let admin = &app.remote.admin;
     let reason = card(
         "admin-why-card",
@@ -83,7 +101,7 @@ pub(crate) fn page(app: &App, p: &Paint) -> El {
         Ok(repos) => repos_list(repos, app, p),
         Err(standin) => *standin,
     };
-    frame("admin", "Admin", String::new(), None, app, p).child(scrolled(
+    page.child(scrolled(
         "admin-scroll",
         col()
             .key("admin-body")

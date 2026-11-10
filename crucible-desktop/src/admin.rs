@@ -51,6 +51,8 @@ pub struct Watch {
     pub activity: bool,
     /// The Admin page is shown.
     pub admin: bool,
+    /// The Admin page's policy tab is shown.
+    pub policy: bool,
 }
 
 /// A change to make on the controller.
@@ -164,6 +166,19 @@ pub enum Action {
     DeleteProvider {
         id: String,
     },
+    /// Store a policy set. It is not activated.
+    CreatePolicy {
+        text: String,
+    },
+    ActivatePolicy {
+        digest: String,
+    },
+    /// Ask how the active policy decides `action` for `login`.
+    Explain {
+        login: String,
+        action: String,
+        resource: Option<String>,
+    },
     /// Replace the controller's whole override set.
     SetOverrides {
         overrides: serde_json::Map<String, serde_json::Value>,
@@ -237,6 +252,9 @@ pub enum Did {
     AddRepo,
     PauseRepo,
     UnwatchRepo,
+    CreatePolicy,
+    ActivatePolicy,
+    Explain,
 }
 
 impl Action {
@@ -276,6 +294,9 @@ impl Action {
             Action::AddRepo { .. } => Did::AddRepo,
             Action::PauseRepo { .. } => Did::PauseRepo,
             Action::UnwatchRepo { .. } => Did::UnwatchRepo,
+            Action::CreatePolicy { .. } => Did::CreatePolicy,
+            Action::ActivatePolicy { .. } => Did::ActivatePolicy,
+            Action::Explain { .. } => Did::Explain,
         }
     }
 
@@ -327,6 +348,9 @@ impl Action {
             Action::PauseRepo { repo, paused: true } => format!("Paused {repo}"),
             Action::PauseRepo { repo, .. } => format!("Resumed {repo}"),
             Action::UnwatchRepo { repo } => format!("Stopped watching {repo}"),
+            Action::CreatePolicy { .. } => "Stored the policy set".to_string(),
+            Action::ActivatePolicy { .. } => "Activated the policy set".to_string(),
+            Action::Explain { .. } => "Explained".to_string(),
         }
     }
 }
@@ -378,6 +402,10 @@ pub struct AdminView {
     pub access: Loaded<dto::Access>,
     pub autopilot: Loaded<dto::Autopilot>,
     pub repos: Loaded<Vec<dto::WatchedRepo>>,
+    pub policy_sets: Loaded<Vec<dto::PolicySet>>,
+    /// The set just stored, to show it once the list has it.
+    pub stored_policy: Option<String>,
+    pub explained: Option<dto::Explanation>,
     /// What the last check and preview of the open webhook form came to.
     pub webhook_check: Option<dto::WebhookCheck>,
     pub webhook_preview: Option<dto::WebhookPreview>,
@@ -533,6 +561,13 @@ impl Worker {
         if let Some(events) = read.events {
             self.view.events = Some(events);
         }
+        if let Some(sets) = read.policy_sets {
+            self.view.policy_sets = Some(sets);
+        }
+        if !watch.policy {
+            self.view.stored_policy = None;
+            self.view.explained = None;
+        }
         if let Some((config, access, autopilot, repos)) = read.admin {
             self.view.config = Some(config);
             self.view.access = Some(access);
@@ -581,6 +616,7 @@ struct Read {
     blueprints: Option<Result<Vec<dto::Blueprint>, String>>,
     events: Option<Result<Vec<dto::Event>, String>>,
     admin: Option<Controller>,
+    policy_sets: Option<Result<Vec<dto::PolicySet>, String>>,
 }
 
 /// What the Admin page reads: settings, access lists, the autopilot flag and the watched repos.
@@ -616,6 +652,7 @@ impl Read {
             providers: watch.providers.then(|| Err(why.clone())),
             blueprints: watch.blueprints.then(|| Err(why.clone())),
             events: watch.activity.then(|| Err(why.clone())),
+            policy_sets: watch.policy.then(|| Err(why.clone())),
             admin: watch.admin.then(|| {
                 (
                     Err(why.clone()),
@@ -696,6 +733,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         blueprints,
         events,
         admin,
+        policy_sets,
     ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
@@ -732,6 +770,10 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
                 within("the repos", client.repos()),
             )
         }),
+        when(
+            watch.policy,
+            within("the policy sets", client.policy_sets()),
+        ),
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -753,6 +795,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         blueprints,
         events,
         admin,
+        policy_sets,
     }
 }
 
@@ -892,6 +935,25 @@ async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<()
         .await
         .map(drop),
         Action::DeleteProvider { id } => within("the delete", client.delete_provider(id)).await,
+        Action::CreatePolicy { text } => within("the policy set", client.create_policy_set(text))
+            .await
+            .map(|stored| view.stored_policy = Some(stored.digest)),
+        Action::ActivatePolicy { digest } => {
+            within("the activation", client.activate_policy_set(digest)).await
+        }
+        Action::Explain {
+            login,
+            action,
+            resource,
+        } => {
+            view.explained = None;
+            within(
+                "the explanation",
+                client.explain(login, action, resource.as_deref()),
+            )
+            .await
+            .map(|explained| view.explained = Some(explained))
+        }
         Action::SetOverrides {
             overrides,
             justification,
@@ -995,7 +1057,8 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.providers
             || watch.blueprints
             || watch.activity
-            || watch.admin;
+            || watch.admin
+            || watch.policy;
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -1033,6 +1096,14 @@ pub struct Desk {
     pub register: Option<(String, TextEdit, TextEdit)>,
     /// The webhook the Triggers page shows in full.
     pub webhook: Option<String>,
+    /// Whether the Admin page shows its policy tab.
+    pub policy_tab: bool,
+    /// The policy set shown, by digest; the active one when none is picked.
+    pub policy: Option<String>,
+    /// A new policy set's text, while its editor is open.
+    pub policy_draft: Option<TextEdit>,
+    /// The login, action and resource to explain a decision for.
+    pub explain: (TextEdit, TextEdit, TextEdit),
     /// The setting being overridden on the Admin page, and the value typed for it.
     pub knob: Option<(String, TextEdit)>,
     /// Why an admin change is made, which the controller records.
@@ -1078,6 +1149,10 @@ impl Default for Desk {
             move_to: None,
             register: None,
             new_key: crate::apikeys::KeyForm::default(),
+            policy_tab: false,
+            policy: None,
+            policy_draft: None,
+            explain: (TextEdit::new(""), TextEdit::new(""), TextEdit::new("")),
             knob: None,
             why: TextEdit::new(""),
             new_repo: TextEdit::new(""),
@@ -1431,7 +1506,8 @@ impl crate::App {
             providers: on(crate::Page::Providers),
             blueprints: on(crate::Page::Blueprints),
             activity: on(crate::Page::Activity),
-            admin: on(crate::Page::Admin),
+            admin: on(crate::Page::Admin) && !self.remote.desk.policy_tab,
+            policy: on(crate::Page::Admin) && self.remote.desk.policy_tab,
             teams: controller,
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
@@ -1520,6 +1596,10 @@ impl crate::App {
                         }
                     }
                     Did::UseBlueprint => self.remote.desk.use_blueprint = None,
+                    Did::CreatePolicy => {
+                        self.remote.desk.policy_draft = None;
+                        self.remote.desk.policy = view.stored_policy.clone();
+                    }
                     Did::SetOverrides => {
                         self.remote.desk.knob = None;
                         self.remote.desk.why = TextEdit::new("");
@@ -1564,7 +1644,9 @@ impl crate::App {
                     | Did::PreviewWebhook
                     | Did::Reconcile
                     | Did::PauseRepo
-                    | Did::UnwatchRepo => {}
+                    | Did::UnwatchRepo
+                    | Did::ActivatePolicy
+                    | Did::Explain => {}
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =
@@ -2367,6 +2449,73 @@ mod tests {
                 "{sent} was not sent"
             );
         }
+    }
+
+    #[test]
+    fn the_policy_tab_reads_the_sets_stores_activates_and_explains() {
+        const SET: &str = r#"{"digest":"abc123","text":"permit(principal, action, resource);",
+            "created_at":"2026-11-04T21:28:21Z","active":true}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/authz/policy-sets"] => format!("[{SET}]"),
+            ["POST", "/api/authz/policy-sets"] => SET.replace("abc123", "def456"),
+            ["GET", "/api/authz/explain?login=wynn&action=team%3Aread"] => {
+                r#"{"login":"wynn","action":"team:read","allowed":false,"rules":[]}"#.into()
+            }
+            _ => "{}".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(Watch {
+            admin: true,
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.config.is_some());
+        assert!(view.policy_sets.is_none(), "policy was read off its tab");
+
+        client.watch(Watch {
+            policy: true,
+            ..elsewhere.clone()
+        });
+        let view = until(&client, |view| view.policy_sets.is_some());
+        assert!(view.policy_sets.unwrap().unwrap()[0].active);
+
+        client.act(Action::CreatePolicy {
+            text: "permit(principal, action, resource);".into(),
+        });
+        let view = until(&client, |view| view.stored_policy.is_some());
+        assert_eq!(view.stored_policy.as_deref(), Some("def456"));
+        client.act(Action::ActivatePolicy {
+            digest: "def456".into(),
+        });
+        until(&client, |view| {
+            view.acted
+                .as_ref()
+                .is_some_and(|a| a.did == Did::ActivatePolicy)
+        });
+        client.act(Action::Explain {
+            login: "wynn".into(),
+            action: "team:read".into(),
+            resource: None,
+        });
+        let view = until(&client, |view| view.explained.is_some());
+        assert!(!view.explained.unwrap().allowed);
+        let sent = requests.lock().unwrap().clone();
+        for change in [
+            "POST /api/authz/policy-sets",
+            "POST /api/authz/policy-sets/def456/activate",
+        ] {
+            assert!(sent.iter().any(|r| r == change), "{change} was not sent");
+        }
+
+        client.watch(elsewhere);
+        until(&client, |view| {
+            view.stored_policy.is_none() && view.explained.is_none()
+        });
     }
 
     fn summary(id: &str) -> dto::DecisionSummary {

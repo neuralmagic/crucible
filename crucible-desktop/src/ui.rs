@@ -18,6 +18,7 @@ mod launcher;
 mod log;
 mod pack;
 mod palette;
+mod policy;
 mod profiles;
 mod providers;
 mod runs;
