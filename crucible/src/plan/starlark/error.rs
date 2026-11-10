@@ -71,6 +71,17 @@ impl From<&FileSpan> for SourceAnchor {
     }
 }
 
+fn listed(errors: &[CompileError]) -> String {
+    errors
+        .iter()
+        .map(|error| match error {
+            CompileError::At { at, inner } => format!("{at}: {}", inner.message()),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CompileError {
     /// An error located at its authoring site. The innermost site wins.
@@ -80,6 +91,9 @@ pub enum CompileError {
         #[source]
         inner: Box<CompileError>,
     },
+    /// Every error one compile found, each located where it was written.
+    #[error("{}", listed(.errors))]
+    Many { errors: Vec<CompileError> },
     #[error(transparent)]
     File(#[from] FileError),
     #[error("prompt files must be UTF-8")]

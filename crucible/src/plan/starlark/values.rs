@@ -645,3 +645,60 @@ impl Display for TaskDefaultsValue {
 
 #[starlark_value(type = "task_defaults")]
 impl<'v> StarlarkValue<'v> for TaskDefaultsValue {}
+
+/// What a constructor hands back once its error is recorded, so evaluation goes on and later
+/// errors are found too. Anything read off it, called on it, or added to it is the same value.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct PoisonValue;
+
+starlark_simple_value!(PoisonValue);
+
+impl Display for PoisonValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<error>")
+    }
+}
+
+#[starlark_value(type = "error")]
+impl<'v> StarlarkValue<'v> for PoisonValue {
+    fn get_attr(&self, _attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        Some(heap.alloc(PoisonValue))
+    }
+
+    fn invoke(
+        &self,
+        _me: Value<'v>,
+        _args: &Arguments<'v, '_>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        Ok(eval.heap().alloc(PoisonValue))
+    }
+
+    fn add(&self, _rhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
+        Some(Ok(heap.alloc(PoisonValue)))
+    }
+
+    fn radd(&self, _lhs: Value<'v>, heap: Heap<'v>) -> Option<starlark::Result<Value<'v>>> {
+        Some(Ok(heap.alloc(PoisonValue)))
+    }
+}
+
+/// A task whose constructor failed, kept by name so the tasks that depend on it are still
+/// checked. Its fields are [`PoisonValue`].
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct BrokenTask(#[allocative(skip)] pub(crate) TaskName);
+
+starlark_simple_value!(BrokenTask);
+
+impl Display for BrokenTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "task({})", self.0)
+    }
+}
+
+#[starlark_value(type = "task")]
+impl<'v> StarlarkValue<'v> for BrokenTask {
+    fn get_attr(&self, _attribute: &str, heap: Heap<'v>) -> Option<Value<'v>> {
+        Some(heap.alloc(PoisonValue))
+    }
+}

@@ -129,19 +129,22 @@ fn placeholders(source: &str, entry: &Path) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// One finding per anchor, by file. An unanchored error lands at the top of the entry.
+/// One finding per anchor of each error, by file. An unanchored error lands at the top of the
+/// entry.
 pub fn findings(error: &CompileError, entry: &Path) -> BTreeMap<PathBuf, Vec<Finding>> {
-    let anchors = error.anchors();
     let mut out: BTreeMap<PathBuf, Vec<Finding>> = BTreeMap::new();
-    if anchors.is_empty() {
-        out.entry(entry.to_path_buf())
-            .or_default()
-            .push(compile_finding(error, None));
-    }
-    for anchor in &anchors {
-        out.entry(PathBuf::from(&anchor.file))
-            .or_default()
-            .push(compile_finding(error, Some(anchor)));
+    for error in error.each() {
+        let anchors = error.anchors();
+        if anchors.is_empty() {
+            out.entry(entry.to_path_buf())
+                .or_default()
+                .push(compile_finding(error, None));
+        }
+        for anchor in &anchors {
+            out.entry(PathBuf::from(&anchor.file))
+                .or_default()
+                .push(compile_finding(error, Some(anchor)));
+        }
     }
     out
 }
@@ -226,6 +229,42 @@ mod tests {
                       workflow(type = \"playbook\", tasks = [a])\n";
         let root = pack(&[("workflow.star", source)]);
         assert_eq!(compile(&entry(&root), source), BTreeMap::new());
+    }
+
+    #[test]
+    fn every_error_of_one_compile_is_a_finding_in_its_own_file() {
+        let lib = "shared = command(name = \"shared\", run = \"true\", bogus = 1)\n";
+        let source = "load(\"lib.star\", \"shared\")\n\
+                      a = agent(name = \"a\", prompt = \"p\", effort = \"hgih\")\n\
+                      b = command(name = \"b\", run = \"true\", depends_on = [a, shared])\n\
+                      c = command(name = \"c\", run = \"true\", join = \"some\")\n\
+                      workflow(type = \"playbook\", tasks = [shared, a, b, c])\n";
+        let root = pack(&[("workflow.star", source), ("lib.star", lib)]);
+        let entry = entry(&root);
+        let found = compile(&entry, source);
+        let said = |path: &Path| -> Vec<(usize, &str)> {
+            found
+                .get(path)
+                .unwrap_or_else(|| panic!("no findings for {}", path.display()))
+                .iter()
+                .map(|f| match f.at {
+                    At::Chars { begin, .. } => (begin.0, f.message.as_str()),
+                    At::Bytes(_) => (usize::MAX, f.message.as_str()),
+                })
+                .collect()
+        };
+        let in_entry = said(&entry);
+        assert_eq!(in_entry.len(), 2, "b only follows a's error: {in_entry:#?}");
+        assert_eq!(in_entry[0].0, 1);
+        assert!(
+            in_entry[0].1.contains("unknown effort \"hgih\""),
+            "{in_entry:#?}"
+        );
+        assert_eq!(in_entry[1].0, 3);
+        assert!(in_entry[1].1.contains("\"some\""), "{in_entry:#?}");
+        let in_lib = said(&entry.with_file_name("lib.star"));
+        assert_eq!(in_lib.len(), 1, "{in_lib:#?}");
+        assert!(in_lib[0].1.contains("bogus"), "{in_lib:#?}");
     }
 
     #[test]
