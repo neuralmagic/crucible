@@ -428,7 +428,10 @@ mod tests {
         assert!(validate(params(&[("release", "3.9")])).is_err());
         let unconfirmed = validate(params(&[("release", "3.7")])).unwrap_err();
         assert_eq!(
-            unconfirmed.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+            unconfirmed
+                .iter()
+                .map(|e| e.field.as_str())
+                .collect::<Vec<_>>(),
             ["accept"],
             "a flagged release needs its confirmation"
         );

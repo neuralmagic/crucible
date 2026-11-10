@@ -6407,7 +6407,10 @@ workflow(type = "playbook", tasks = [options])
             );
         }
         assert!(matches!(
-            decl(r#""type": "bool", "default": False, "confirm_from": {"task": "t", "field": "f"}"#.to_owned()),
+            decl(
+                r#""type": "bool", "default": False, "confirm_from": {"task": "t", "field": "f"}"#
+                    .to_owned()
+            ),
             Err(CompileError::ParamFieldWrongShape {
                 field: "confirm_from",
                 ..

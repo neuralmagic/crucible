@@ -374,6 +374,19 @@ show a value greyed out in its empty input, the one the pack would choose itself
 
 The field is an object from each release to one string. It is only shown, never submitted.
 
+A bool can ask the launcher to confirm a value the task flags:
+
+```python
+"accept_tentative_release": {"type": "bool", "default": False,
+                             "confirm_from": {"task": "release_options", "field": "tentative",
+                                              "keyed_by": "target_release"}},
+```
+
+The field is an object from each release to true or false. The form shows the checkbox only for
+a release flagged true, and the control plane refuses that launch until it is checked. Before the
+task has passed once, the checkbox is shown and optional. The pack should still check at run time,
+since the sheet can change after the last refresh.
+
 The launch form offers the list as a select and says how old it is. With `allow_other`, the
 select ends in "Other…", which opens a text input.
 
