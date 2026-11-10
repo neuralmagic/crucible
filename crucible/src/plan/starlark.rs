@@ -2316,6 +2316,19 @@ pub fn compile_file_with(
     compile_source_with(&source, path, pack_dir, supplied)
 }
 
+/// [`compile_file_with`] for a launch. It skips the producer-closure probe, which registration
+/// and a choices refresh run.
+#[tracing::instrument(skip_all, fields(source = %path.display(), params = supplied.len()), err)]
+pub fn compile_launch_file(
+    path: &Path,
+    pack_dir: &Path,
+    supplied: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
+    let source =
+        std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
+    on_compile_stack(|| compile_source_here(&source, path, pack_dir, Binding::Launch(supplied)))
+}
+
 /// Compile `workflow.star` into the manifest's `[workflow]` block.
 ///
 /// A source that declares no parameters is a constant, so its graph is frozen into the manifest
@@ -2543,7 +2556,129 @@ pub fn compile_source_with(
     pack_dir: &Path,
     supplied: &BTreeMap<String, String>,
 ) -> Result<CompiledWorkflow> {
-    on_compile_stack(|| compile_source_here(source, filename, pack_dir, supplied))
+    on_compile_stack(|| {
+        compile_source_here(source, filename, pack_dir, Binding::Supplied(supplied))
+    })
+}
+
+/// Compile only the tasks that produce launch-form choices and their dependencies, with no
+/// parameters ([ADR-0074]). Command tasks of such a graph read an empty `params` entry.
+///
+/// [ADR-0074]: ../../../docs/adr/ADR-0074.md
+pub fn compile_refresh_file(path: &Path, pack_dir: &Path) -> Result<CompiledWorkflow> {
+    let source =
+        std::fs::read_to_string(path).map_err(FileError::at("reading workflow source", path))?;
+    on_compile_stack(|| {
+        let declared = read_params(&source, path)?;
+        let producers = choice_producers(&declared);
+        if producers.is_empty() {
+            return Err(CompileError::RefreshWithoutProducers);
+        }
+        let probed = probe_choice_producers(&source, path, pack_dir, &producers)?;
+        let mut workflow = probed.workflow;
+        let keep: BTreeSet<String> = closure(&workflow, producers.keys().map(String::as_str))
+            .into_iter()
+            .map(|t| t.name.0.clone())
+            .collect();
+        workflow.tasks.retain(|t| keep.contains(&t.name.0));
+        workflow.params = BTreeMap::new();
+        workflow.result = workflow.result.filter(|r| keep.contains(&r.0));
+        workflow.history_record = workflow.history_record.filter(|r| keep.contains(&r.0));
+        let canonical_json = serde_json::to_string_pretty(&workflow)? + "\n";
+        Ok(CompiledWorkflow {
+            workflow,
+            canonical_json,
+            declares_params: false,
+            ..probed
+        })
+    })
+}
+
+/// How a compile binds the declared parameters.
+#[derive(Clone, Copy)]
+enum Binding<'a> {
+    /// The values a launcher supplied, parsed and constrained by the declaration.
+    Supplied(&'a BTreeMap<String, String>),
+    /// As [`Binding::Supplied`], without probing the producer closure.
+    Launch(&'a BTreeMap<String, String>),
+    /// A value each declaration admits, for comparing two compiles that differ only in their
+    /// parameters.
+    Probe(bool),
+}
+
+/// Each choices_from and placeholder_from producer task, with a parameter it supplies.
+fn choice_producers(declared: &params::Params) -> BTreeMap<String, String> {
+    declared
+        .specs()
+        .iter()
+        .flat_map(|spec| {
+            spec.sources()
+                .map(|from| (from.task.clone(), spec.name.clone()))
+        })
+        .collect()
+}
+
+/// `roots` and every task they depend on, transitively.
+fn closure<'a, 'r>(
+    workflow: &'a WorkflowCfg,
+    roots: impl IntoIterator<Item = &'r str>,
+) -> Vec<&'a Task> {
+    let mut wanted: BTreeSet<&str> = roots.into_iter().collect();
+    loop {
+        let before = wanted.len();
+        for task in &workflow.tasks {
+            if wanted.contains(task.name.0.as_str()) {
+                wanted.extend(task.depends_on.iter().map(|d| d.0.as_str()));
+            }
+        }
+        if wanted.len() == before {
+            break;
+        }
+    }
+    workflow
+        .tasks
+        .iter()
+        .filter(|t| wanted.contains(t.name.0.as_str()))
+        .collect()
+}
+
+/// Compile under both probes and refuse a producer closure that differs between them, which is
+/// a closure built from something param() returned. Returns the first probe's compile.
+fn probe_choice_producers(
+    source: &str,
+    filename: &Path,
+    pack_dir: &Path,
+    producers: &BTreeMap<String, String>,
+) -> Result<CompiledWorkflow> {
+    let probe = |second| {
+        compile_source_here(source, filename, pack_dir, Binding::Probe(second)).map_err(|inner| {
+            CompileError::ChoiceProbeFailed {
+                inner: Box::new(inner),
+            }
+        })
+    };
+    let first = probe(false)?;
+    let second = probe(true)?;
+    let json = |task: &Task| serde_json::to_value(task).ok();
+    for (producer, param) in producers {
+        let ours = closure(&first.workflow, [producer.as_str()]);
+        let theirs = closure(&second.workflow, [producer.as_str()]);
+        let differs = ours
+            .iter()
+            .find(|task| !theirs.iter().any(|t| json(t) == json(task)))
+            .or_else(|| {
+                theirs
+                    .iter()
+                    .find(|t| !ours.iter().any(|o| o.name == t.name))
+            });
+        if let Some(task) = differs {
+            return Err(CompileError::ChoiceProducerReadsParams {
+                param: param.clone(),
+                task: task.name.0.clone(),
+            });
+        }
+    }
+    Ok(first)
 }
 
 /// Run `work` on a thread whose stack covers the depths the budgets permit.
@@ -2564,7 +2699,7 @@ fn compile_source_here(
     source: &str,
     filename: &Path,
     pack_dir: &Path,
-    supplied: &BTreeMap<String, String>,
+    binding: Binding<'_>,
 ) -> Result<CompiledWorkflow> {
     if source.len() > MAX_SOURCE_BYTES {
         return Err(CompileError::SourceTooLarge {
@@ -2586,8 +2721,19 @@ fn compile_source_here(
     let declares_params = !declared_params.is_empty();
     {
         let mut context = state.context_mut();
-        context.params = declared_params.bind(supplied)?;
-        context.supplied = supplied.keys().cloned().collect();
+        match binding {
+            Binding::Supplied(supplied) | Binding::Launch(supplied) => {
+                context.params = declared_params.bind(supplied)?;
+                context.supplied = supplied.keys().cloned().collect();
+            }
+            Binding::Probe(second) => {
+                context.params = declared_params
+                    .specs()
+                    .iter()
+                    .map(|spec| (spec.name.clone(), spec.probe(second)))
+                    .collect();
+            }
+        }
     }
     let loader = loader::resolve(&ast, &state, &globals, source.len(), lane)?;
     let mut workflow = catching_panics(|| {
@@ -2623,6 +2769,11 @@ fn compile_source_here(
     if !dropped.is_empty() {
         return Err(CompileError::DroppedTasks { sites: dropped });
     }
+    check_choice_producers(&declared_params, &workflow)?;
+    let producers = choice_producers(&declared_params);
+    if matches!(binding, Binding::Supplied(_)) && !producers.is_empty() {
+        probe_choice_producers(source, filename, pack_dir, &producers)?;
+    }
     if !context.sessions.is_empty() && !context.string_session_refs.is_empty() {
         let refs: Vec<Site> = context
             .string_session_refs
@@ -2649,6 +2800,47 @@ fn compile_source_here(
         canonical_json,
         declares_params,
     })
+}
+
+/// A parameter's choices_from must name an unmapped task in this workflow that promises the field
+/// as a list, so the controller has one value to offer.
+fn check_choice_producers(declared: &params::Params, workflow: &WorkflowCfg) -> Result<()> {
+    use crate::plan::ir::Declared;
+    let sources = declared
+        .specs()
+        .iter()
+        .flat_map(|spec| spec.sources().map(move |from| (spec, from)));
+    for (spec, from) in sources {
+        let keyed = from.keyed_by.is_some();
+        let invalid = |detail| CompileError::ParamChoicesFromInvalid {
+            param: spec.name.clone(),
+            task: from.task.clone(),
+            field: from.field.clone(),
+            detail,
+        };
+        let Some(producer) = workflow.tasks.iter().find(|t| t.name.0 == from.task) else {
+            return Err(invalid("that task is not in the workflow"));
+        };
+        if producer.over.is_some() {
+            return Err(invalid("that task is mapped, so it has no single output"));
+        }
+        let fits = match producer.emits.field(&from.field) {
+            Declared::Untyped => true,
+            Declared::Typed(ty) if keyed => ty.is_object(),
+            Declared::Typed(ty) => ty.is_list(),
+            Declared::Unchecked | Declared::Omitted => {
+                return Err(invalid("that task does not declare the field in emits"));
+            }
+        };
+        if !fits {
+            return Err(invalid(if keyed {
+                "that field is not declared an object, which keyed_by needs"
+            } else {
+                "that field is not declared a list"
+            }));
+        }
+    }
+    Ok(())
 }
 
 /// The evaluation ceilings every module runs under. A budget setter only fails when it is set
@@ -6039,6 +6231,329 @@ params = {
                 crate::errors::report(&error)
             );
         }
+    }
+
+    /// A choice list a task produces at run time: the schema names the producer for the controller,
+    /// and allow_other turns any list into suggestions the engine no longer enforces.
+    #[test]
+    fn choices_from_names_a_producer_and_allow_other_makes_choices_suggestions() {
+        let pack = temp_pack("params-choices-from");
+        let source = r#"
+params = {
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}, "allow_other": True},
+    "size": {"type": "string", "default": "s", "choices": ["s", "m"], "allow_other": True},
+    "mode": {"type": "string", "default": "a", "choices": ["a", "b"]},
+}
+options = command(name = "options", run = "./options.sh", emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [options])
+"#;
+        let path = pack.join("workflow.star");
+        let schema = declared_params(source, &path)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let release = &schema["properties"]["release"];
+        assert_eq!(
+            release["x-choices-from"],
+            serde_json::json!({"task": "options", "field": "releases"})
+        );
+        assert_eq!(release["x-allow-other"], true);
+        assert_eq!(
+            schema["properties"]["size"]["x-choices"],
+            serde_json::json!(["s", "m"])
+        );
+        assert!(schema["properties"]["size"].get("enum").is_none());
+        assert_eq!(
+            schema["properties"]["mode"]["enum"],
+            serde_json::json!(["a", "b"])
+        );
+        let with = |pairs: &[(&str, &str)]| {
+            let supplied = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            compile_source_with(source, &path, &pack, &supplied)
+        };
+        assert!(with(&[("size", "xl"), ("release", "3.9 GA")]).is_ok());
+        assert!(matches!(
+            with(&[("mode", "c")]),
+            Err(CompileError::ParamConstraintFailed { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// keyed_by makes a choices_from field an object of lists per value of another parameter, and
+    /// placeholder_from reads an object of strings the same way; both reach the schema and both
+    /// producers join the refresh.
+    #[test]
+    fn keyed_choices_and_placeholders_read_objects_keyed_by_another_parameter() {
+        let pack = temp_pack("params-keyed");
+        let path = pack.join("workflow.star");
+        let source = r#"
+params = {
+    "release": {"type": "string", "required": True, "choices_from": {"task": "options", "field": "releases"}},
+    "component": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "components", "keyed_by": "release"}},
+    "branch": {"type": "string", "default": "", "placeholder_from": {"task": "branches", "field": "branch", "keyed_by": "release"}},
+}
+options = command(name = "options", run = "./o.sh", emits = {"releases": "list", "components": "object"})
+branches = command(name = "branches", run = "./b.sh", emits = {"branch": "object"})
+workflow(type = "playbook", tasks = [options, branches])
+"#;
+        std::fs::write(&path, source).unwrap();
+        let schema = declared_params(source, &path)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            schema["properties"]["component"]["x-choices-from"],
+            serde_json::json!({"task": "options", "field": "components", "keyed_by": "release"})
+        );
+        assert_eq!(
+            schema["properties"]["branch"]["x-placeholder-from"],
+            serde_json::json!({"task": "branches", "field": "branch", "keyed_by": "release"})
+        );
+        let refresh = compile_refresh_file(&path, &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(refresh.workflow.tasks.len(), 2);
+
+        let decl = |fields: &str| {
+            read_params(
+                &format!("params = {{\"release\": {{\"type\": \"string\", \"default\": \"\"}}, \"n\": {{\"type\": \"int\", \"default\": 1}}, \"p\": {{\"type\": \"string\", \"default\": \"\", {fields}}}}}\n"),
+                &path,
+            )
+            .map(|_| ())
+        };
+        for (fields, detail) in [
+            (
+                r#""choices_from": {"task": "t", "field": "f", "keyed_by": "nope"}"#,
+                "that parameter is not declared",
+            ),
+            (
+                r#""choices_from": {"task": "t", "field": "f", "keyed_by": "p"}"#,
+                "a parameter cannot be keyed by itself",
+            ),
+            (
+                r#""placeholder_from": {"task": "t", "field": "f", "keyed_by": "n"}"#,
+                "that parameter is not a string",
+            ),
+        ] {
+            assert!(
+                matches!(decl(fields), Err(CompileError::ParamKeyedByInvalid { detail: d, .. }) if d == detail),
+                "{fields}"
+            );
+        }
+        assert!(matches!(
+            decl(r#""placeholder_from": {"task": "t", "field": "f"}"#),
+            Err(CompileError::ParamFieldWrongShape {
+                field: "placeholder_from",
+                ..
+            })
+        ));
+
+        let listy = source.replace(r#""components": "object""#, r#""components": "list""#);
+        assert!(matches!(
+            compile_source_with(&listy, &path, &pack, &BTreeMap::from([("release".to_owned(), "a".to_owned())])),
+            Err(CompileError::ParamChoicesFromInvalid { param, .. }) if param == "component"
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A refresh compiles the producer and what it depends on, without the required parameter the
+    /// rest of the graph reads, and hands its command tasks no parameters.
+    #[test]
+    fn a_refresh_compiles_only_the_producer_closure_without_parameters() {
+        let pack = temp_pack("params-choices-refresh");
+        let path = pack.join("workflow.star");
+        std::fs::write(
+            &path,
+            r#"
+params = {
+    "pr": {"type": "int", "required": True},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}
+sheet = command(name = "sheet", run = "./sheet.sh", emits = ["rows"])
+options = command(name = "options", run = "./options.sh", depends_on = [sheet], emits = {"releases": "list"})
+work = agent(name = "work", prompt = "Backport " + str(param("pr")) + " into " + param("release"), depends_on = [options])
+workflow(type = "playbook", tasks = [sheet, options, work])
+"#,
+        )
+        .unwrap();
+        let compiled = compile_refresh_file(&path, &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let names: Vec<&str> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|t| t.name.0.as_str())
+            .collect();
+        assert_eq!(names, ["sheet", "options"]);
+        assert!(compiled.workflow.params.is_empty());
+        assert!(!compiled.declares_params);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// A producer closure built from a parameter, by text or by branching on it, is refused by an
+    /// authoring compile, so the author learns before the first refresh. A launch compile skips
+    /// the check.
+    #[test]
+    fn a_producer_closure_that_reads_a_parameter_is_refused() {
+        let pack = temp_pack("params-choices-reads");
+        let path = pack.join("workflow.star");
+        let decl = r#"params = {
+    "flag": {"type": "bool", "default": False},
+    "topic": {"type": "string", "default": "x"},
+    "release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}},
+}"#;
+        for (tasks, culprit) in [
+            (
+                r#"seed = agent(name = "seed", prompt = "List releases about " + param("topic"))
+options = command(name = "options", run = "./o.sh", depends_on = [seed], emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [seed, options])"#,
+                "seed",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh" if param("flag") else "./p.sh", emits = {"releases": "list"})
+workflow(type = "playbook", tasks = [options])"#,
+                "options",
+            ),
+        ] {
+            let source = format!("{decl}\n{tasks}\n");
+            let error = compile_source_with(&source, &path, &pack, &BTreeMap::new()).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ChoiceProducerReadsParams { task, param } if task == culprit && param == "release"),
+                "{culprit}: {}",
+                crate::errors::report(&error)
+            );
+            std::fs::write(&path, &source).unwrap();
+            compile_launch_file(&path, &pack, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    /// The probe compiles bind values each declaration admits, so a source that relies on its
+    /// own constraints compiles beside a choices_from parameter. One that cannot evaluate without
+    /// launch values says so, since a refresh has none to give it.
+    #[test]
+    fn probe_values_satisfy_the_declared_constraints() {
+        let pack = temp_pack("params-choices-probe");
+        let path = pack.join("workflow.star");
+        let source = |tier: &str| {
+            format!(
+                r##"params = {{
+    "tier": {{"type": "string", "default": "s"{tier}}},
+    "width": {{"type": "int", "default": 2, "min": 1, "max": 4}},
+    "ratio": {{"type": "number", "default": -2.0, "max": -1.5}},
+    "pr": {{"type": "string", "default": "org/repo#1", "pattern": "^[^/]+/[^#]+#[0-9]+$"}},
+    "release": {{"type": "string", "default": "", "choices_from": {{"task": "options", "field": "releases"}}}},
+}}
+MODELS = {{"s": "small", "m": "medium"}}
+options = command(name = "options", run = "./o.sh", emits = {{"releases": "list"}})
+work = agent(
+    name = "work",
+    prompt = "Use " + MODELS[param("tier")] + " at " + str(8 // param("width")) + " on " + param("pr").split("#")[1],
+    depends_on = [options],
+)
+workflow(type = "playbook", tasks = [options, work])
+"##
+            )
+        };
+        let supplied = BTreeMap::from([("ratio".to_owned(), "-2".to_owned())]);
+        compile_source_with(
+            &source(r#", "choices": ["s", "m"]"#),
+            &path,
+            &pack,
+            &supplied,
+        )
+        .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let error = compile_source_with(&source(""), &path, &pack, &supplied).unwrap_err();
+        assert!(
+            matches!(&error, CompileError::ChoiceProbeFailed { .. }),
+            "{}",
+            crate::errors::report(&error)
+        );
+
+        let declared = read_params(&source(r#", "choices": ["s", "m"]"#), &path).unwrap();
+        let probes = |second| -> Vec<ParamValue> {
+            declared
+                .specs()
+                .iter()
+                .map(|spec| spec.probe(second))
+                .collect()
+        };
+        assert_eq!(
+            probes(false),
+            [
+                ParamValue::String("s".to_owned()),
+                ParamValue::Int(1),
+                ParamValue::Number(-1.5),
+                ParamValue::String("org/repo#1".to_owned()),
+                ParamValue::String("crucible-probe-0".to_owned()),
+            ]
+        );
+        assert_eq!(
+            probes(true),
+            [
+                ParamValue::String("m".to_owned()),
+                ParamValue::Int(2),
+                ParamValue::Number(-1.5),
+                ParamValue::String("org/repo#1".to_owned()),
+                ParamValue::String("crucible-probe-1".to_owned()),
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn choices_from_must_name_an_unmapped_task_promising_a_list() {
+        let pack = temp_pack("params-choices-from-invalid");
+        let path = pack.join("workflow.star");
+        let decl = r#"params = {"release": {"type": "string", "default": "", "choices_from": {"task": "options", "field": "releases"}}}"#;
+        for (tasks, detail) in [
+            (
+                r#"other = command(name = "other", run = "./o.sh")
+workflow(type = "playbook", tasks = [other])"#,
+                "that task is not in the workflow",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh", emits = ["ok"])
+workflow(type = "playbook", tasks = [options])"#,
+                "that task does not declare the field in emits",
+            ),
+            (
+                r#"options = command(name = "options", run = "./o.sh", emits = {"releases": "string"})
+workflow(type = "playbook", tasks = [options])"#,
+                "that field is not declared a list",
+            ),
+        ] {
+            let source = format!("{decl}\n{tasks}\n");
+            let error = compile_source_with(&source, &path, &pack, &BTreeMap::new()).unwrap_err();
+            assert!(
+                matches!(&error, CompileError::ParamChoicesFromInvalid { detail: d, .. } if *d == detail),
+                "{detail}: {}",
+                crate::errors::report(&error)
+            );
+        }
+        let declaration = |fields: &str| {
+            read_params(&format!("params = {{\"p\": {{{fields}}}}}\n"), &path).map(|_| ())
+        };
+        assert!(matches!(
+            declaration(
+                r#""type": "string", "default": "", "choices": ["a"], "choices_from": {"task": "t", "field": "f"}"#
+            ),
+            Err(CompileError::ParamChoicesConflict { .. })
+        ));
+        assert!(matches!(
+            declaration(r#""type": "string", "default": "", "allow_other": True"#),
+            Err(CompileError::ParamAllowOtherWithoutChoices { .. })
+        ));
+        assert!(matches!(
+            declaration(
+                r#""type": "int", "default": 1, "choices_from": {"task": "t", "field": "f"}"#
+            ),
+            Err(CompileError::ParamConstraintMismatch { .. })
+        ));
+        assert!(
+            declaration(r#""type": "string", "default": "", "choices_from": {"task": "t"}"#)
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&pack);
     }
 
     /// Values bind before evaluation, so the compiled graph is what they produced rather than a

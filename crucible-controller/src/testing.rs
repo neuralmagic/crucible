@@ -219,6 +219,7 @@ pub(crate) async fn launch_playbook(
         &mut tx,
         key,
         &crate::launches::model::NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/repo",
             title: "survey",

@@ -548,6 +548,10 @@ mod tests {
                 "0084_native_sign_in_codes.sql",
                 "a905630dc8dfe1722c77c790da31758ed0519784ac187cb446e2ef47814d2c5e",
             ),
+            (
+                "0085_launch_choice_snapshots.sql",
+                "1a16cb0896ccc1dab6280ff9bad3a2b3f011b4efda5397727ba82feb05c0215c",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

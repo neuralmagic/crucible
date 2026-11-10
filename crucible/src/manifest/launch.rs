@@ -102,6 +102,17 @@ impl AgentSettings {
 /// The address of the checkout's ref.
 pub const REPO_REF: &str = "repo.ref";
 
+/// The address that makes a launch a choices refresh ([ADR-0074]): it compiles only the tasks
+/// that produce launch-form choices, and takes no parameters.
+///
+/// [ADR-0074]: ../../../docs/adr/ADR-0074.md
+pub const CHOICES_REFRESH: &str = "choices.refresh";
+
+/// Whether the supplied launch values ask for a choices refresh.
+pub fn is_refresh(supplied: &BTreeMap<String, String>) -> bool {
+    supplied.get(CHOICES_REFRESH).map(String::as_str) == Some("true")
+}
+
 /// What one launch set: agent settings by target, and the ref to check out.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct LaunchSettings {
@@ -109,6 +120,8 @@ pub struct LaunchSettings {
     agents: BTreeMap<Target, AgentSettings>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     repo_ref: Option<GitRef>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    refresh: bool,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -253,7 +266,19 @@ impl LaunchSettings {
     pub fn parse(addressed: &BTreeMap<String, String>) -> Result<Self, SettingsError> {
         let mut settings: BTreeMap<Target, AgentSettings> = BTreeMap::new();
         let mut repo_ref = None;
+        let mut refresh = false;
         for (address, raw) in addressed {
+            if address == CHOICES_REFRESH {
+                if raw != "true" {
+                    return Err(SettingsError::BadValue {
+                        address: address.clone(),
+                        got: raw.clone(),
+                        expected: "true",
+                    });
+                }
+                refresh = true;
+                continue;
+            }
             if address == REPO_REF {
                 repo_ref =
                     Some(GitRef::parse(raw).map_err(|source| SettingsError::BadRef { source })?);
@@ -311,11 +336,17 @@ impl LaunchSettings {
         Ok(Self {
             agents: settings,
             repo_ref,
+            refresh,
         })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.agents.is_empty() && self.repo_ref.is_none()
+        self.agents.is_empty() && self.repo_ref.is_none() && !self.refresh
+    }
+
+    /// Whether this launch is a choices refresh.
+    pub fn refresh(&self) -> bool {
+        self.refresh
     }
 
     /// The `*.<setting>` values.

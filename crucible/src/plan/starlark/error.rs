@@ -205,6 +205,41 @@ pub enum CompileError {
     },
     #[error("parameter {param:?} pattern does not compile: {detail}")]
     ParamBadPattern { param: String, detail: String },
+    #[error("parameter {param:?} declares both choices and choices_from; offer one list")]
+    ParamChoicesConflict { param: String },
+    #[error("parameter {param:?} sets allow_other without choices or choices_from")]
+    ParamAllowOtherWithoutChoices { param: String },
+    #[error("parameter {param:?} is keyed by {keyed_by:?}, but {detail}")]
+    ParamKeyedByInvalid {
+        param: String,
+        keyed_by: String,
+        detail: &'static str,
+    },
+    #[error("parameter {param:?} reads its form options from {task}.{field}, but {detail}")]
+    ParamChoicesFromInvalid {
+        param: String,
+        task: String,
+        field: String,
+        detail: &'static str,
+    },
+    #[error(
+        "task {task:?} produces or feeds the choices of parameter {param:?}, but it changes with \
+         the launch values; a choices refresh runs without them, so build {task:?} from nothing \
+         param() returns"
+    )]
+    ChoiceProducerReadsParams { param: String, task: String },
+    #[error(
+        "a source that declares choices_from must compile without launch values, so a choices \
+         refresh can run, but it failed with placeholder values bound: {inner}"
+    )]
+    ChoiceProbeFailed {
+        #[source]
+        inner: Box<CompileError>,
+    },
+    #[error(
+        "a choices refresh needs a parameter that declares choices_from, and this source has none"
+    )]
+    RefreshWithoutProducers,
     #[error("parameter {param:?} is enabled_by {gate:?}, which {detail}")]
     ParamBadEnabledBy {
         param: String,

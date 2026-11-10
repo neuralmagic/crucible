@@ -348,6 +348,47 @@ crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max
 A string parameter that sets `"multiline": True` takes its value in a text area on the control
 plane's launch, schedule and ask forms. The value is still one string.
 
+A string parameter can take its choices from a task's output instead of a written list:
+
+```python
+params = {
+    "release": {"type": "string", "required": True,
+                "choices_from": {"task": "release_options", "field": "releases"}},
+}
+```
+
+The task must be in the same workflow, unmapped, and promise the field in `emits` as a list.
+The control plane offers the list from the latest passing run of that task, and refuses a
+launch value outside it. Add `"allow_other": True` to accept other values too. Before the task
+has passed once, the field takes any value.
+
+Add `"keyed_by": "release"` to make the field an object of lists, one per value of the
+`release` parameter, so the form offers the list for the release entered. A parameter can also
+show a value greyed out in its empty input, the one the pack would choose itself:
+
+```python
+"target_branch": {"type": "string", "default": "",
+                  "placeholder_from": {"task": "release_options", "field": "branches",
+                                       "keyed_by": "target_release"}},
+```
+
+The field is an object from each release to one string. It is only shown, never submitted.
+
+The launch form offers the list as a select and says how old it is. With `allow_other`, the
+select ends in "Other…", which opens a text input.
+
+The task and everything it depends on must not depend on parameters, so they can run alone.
+The compiler checks this when the pack is compiled for authoring, registered, or refreshed, not
+at each launch, and names the task that does. It checks by compiling the source with
+placeholder values that satisfy each declaration (a choice, a number in range, a default where
+there is a pattern), so the source must also compile under those. Launch with `choices.refresh=true` and
+nothing else to run just those tasks and refresh the list. The launch form's "Refresh options"
+button does this; from the command line:
+
+```sh
+crucible plan run --manifest crucible.toml --param choices.refresh=true --max-cost 1 --max-time 10m
+```
+
 An optional parameter that sets `"enabled_by": "<bool param>"` is only taken while that boolean
 is true. The forms grey it out until then, and a launch that supplies it with the boolean false is
 refused before anything compiles:

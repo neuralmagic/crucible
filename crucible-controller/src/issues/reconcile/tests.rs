@@ -6791,6 +6791,7 @@ async fn adopt_launch_with_groups(
                 db.pool(),
                 key,
                 &crate::launches::model::NewPlaybookLaunch {
+                    choice_snapshots: None,
                     playbook: "survey",
                     repo: "owner/repo",
                     title: "a survey",
@@ -6863,6 +6864,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
         db.pool(),
         key,
         &crate::launches::model::NewPlaybookLaunch {
+            choice_snapshots: None,
             playbook: "survey",
             repo: "owner/repo",
             title: "a survey",
