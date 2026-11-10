@@ -1,6 +1,7 @@
 //! The window: live playbooks and local packs on the left, the selected run on the right.
 
 mod activity;
+mod admin;
 mod approvals;
 mod blueprints;
 mod compare;
@@ -670,6 +671,10 @@ fn pages_nav(app: &App, p: &Paint) -> El {
         .child(entry(crate::Page::Providers, &oc::BRAIN, None))
         .child(entry(crate::Page::Blueprints, &oc::GRID_PLUS, None))
         .child(entry(crate::Page::Activity, &oc::CHECKLIST, None))
+        .children(
+            app.is_admin()
+                .then(|| entry(crate::Page::Admin, &oc::SETTINGS_GEAR, None)),
+        )
         .children(crate::SESSION_AUTH.then(|| entry(crate::Page::Keys, &oc::KEYBOARD, None)))
 }
 
@@ -1271,6 +1276,7 @@ fn detail(app: &App, p: &Paint) -> El {
         crate::Page::Providers => return providers::page(app, p),
         crate::Page::Blueprints => return blueprints::page(app, p),
         crate::Page::Activity => return activity::page(app, p),
+        crate::Page::Admin => return admin::page(app, p),
         crate::Page::Keys => return keys::page(app, p),
         crate::Page::Runs => {}
     }

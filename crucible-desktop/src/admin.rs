@@ -49,6 +49,8 @@ pub struct Watch {
     pub providers: bool,
     pub blueprints: bool,
     pub activity: bool,
+    /// The Admin page is shown.
+    pub admin: bool,
 }
 
 /// A change to make on the controller.
@@ -162,6 +164,28 @@ pub enum Action {
     DeleteProvider {
         id: String,
     },
+    /// Replace the controller's whole override set.
+    SetOverrides {
+        overrides: serde_json::Map<String, serde_json::Value>,
+        justification: String,
+    },
+    SetAutopilot {
+        enabled: bool,
+        reason: String,
+    },
+    Reconcile,
+    AddRepo {
+        repo: String,
+        justification: String,
+    },
+    /// Pause discovery for a repo, or resume it.
+    PauseRepo {
+        repo: String,
+        paused: bool,
+    },
+    UnwatchRepo {
+        repo: String,
+    },
     /// Start draft `to` from blueprint `id`.
     UseBlueprint {
         id: String,
@@ -207,6 +231,12 @@ pub enum Did {
     SaveProvider,
     DeleteProvider,
     UseBlueprint,
+    SetOverrides,
+    SetAutopilot,
+    Reconcile,
+    AddRepo,
+    PauseRepo,
+    UnwatchRepo,
 }
 
 impl Action {
@@ -240,6 +270,12 @@ impl Action {
             Action::SaveProvider { .. } => Did::SaveProvider,
             Action::DeleteProvider { .. } => Did::DeleteProvider,
             Action::UseBlueprint { .. } => Did::UseBlueprint,
+            Action::SetOverrides { .. } => Did::SetOverrides,
+            Action::SetAutopilot { .. } => Did::SetAutopilot,
+            Action::Reconcile => Did::Reconcile,
+            Action::AddRepo { .. } => Did::AddRepo,
+            Action::PauseRepo { .. } => Did::PauseRepo,
+            Action::UnwatchRepo { .. } => Did::UnwatchRepo,
         }
     }
 
@@ -283,6 +319,14 @@ impl Action {
             Action::SaveProvider { id: Some(_), .. } => "Saved the provider".to_string(),
             Action::DeleteProvider { id } => format!("Deregistered {id}"),
             Action::UseBlueprint { to, .. } => format!("Started draft {to}"),
+            Action::SetOverrides { .. } => "Saved the overrides".to_string(),
+            Action::SetAutopilot { enabled: true, .. } => "Autopilot on".to_string(),
+            Action::SetAutopilot { .. } => "Autopilot off".to_string(),
+            Action::Reconcile => "Reconcile asked for".to_string(),
+            Action::AddRepo { repo, .. } => format!("Watching {repo}"),
+            Action::PauseRepo { repo, paused: true } => format!("Paused {repo}"),
+            Action::PauseRepo { repo, .. } => format!("Resumed {repo}"),
+            Action::UnwatchRepo { repo } => format!("Stopped watching {repo}"),
         }
     }
 }
@@ -330,6 +374,10 @@ pub struct AdminView {
     /// The draft the last blueprint use started, while the Blueprints page stays open.
     pub used: Option<dto::BlueprintUsed>,
     pub events: Loaded<Vec<dto::Event>>,
+    pub config: Loaded<dto::ControllerConfig>,
+    pub access: Loaded<dto::Access>,
+    pub autopilot: Loaded<dto::Autopilot>,
+    pub repos: Loaded<Vec<dto::WatchedRepo>>,
     /// What the last check and preview of the open webhook form came to.
     pub webhook_check: Option<dto::WebhookCheck>,
     pub webhook_preview: Option<dto::WebhookPreview>,
@@ -485,6 +533,12 @@ impl Worker {
         if let Some(events) = read.events {
             self.view.events = Some(events);
         }
+        if let Some((config, access, autopilot, repos)) = read.admin {
+            self.view.config = Some(config);
+            self.view.access = Some(access);
+            self.view.autopilot = Some(autopilot);
+            self.view.repos = Some(repos);
+        }
         if watch.webhook_form.is_none() {
             self.view.webhook_check = None;
             self.view.webhook_preview = None;
@@ -526,7 +580,16 @@ struct Read {
     providers: Option<Result<Vec<dto::Provider>, String>>,
     blueprints: Option<Result<Vec<dto::Blueprint>, String>>,
     events: Option<Result<Vec<dto::Event>, String>>,
+    admin: Option<Controller>,
 }
+
+/// What the Admin page reads: settings, access lists, the autopilot flag and the watched repos.
+type Controller = (
+    Result<dto::ControllerConfig, String>,
+    Result<dto::Access, String>,
+    Result<dto::Autopilot, String>,
+    Result<Vec<dto::WatchedRepo>, String>,
+);
 
 impl Read {
     fn failed(why: &str, watch: &Watch) -> Read {
@@ -553,6 +616,14 @@ impl Read {
             providers: watch.providers.then(|| Err(why.clone())),
             blueprints: watch.blueprints.then(|| Err(why.clone())),
             events: watch.activity.then(|| Err(why.clone())),
+            admin: watch.admin.then(|| {
+                (
+                    Err(why.clone()),
+                    Err(why.clone()),
+                    Err(why.clone()),
+                    Err(why.clone()),
+                )
+            }),
         }
     }
 }
@@ -624,6 +695,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         providers,
         blueprints,
         events,
+        admin,
     ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
@@ -652,6 +724,14 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
             watch.activity,
             within("the activity", client.events(EVENTS))
         ),
+        when(watch.admin, async {
+            tokio::join!(
+                within("the settings", client.config()),
+                within("the access lists", client.access()),
+                within("the autopilot flag", client.autopilot()),
+                within("the repos", client.repos()),
+            )
+        }),
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -672,6 +752,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         providers,
         blueprints,
         events,
+        admin,
     }
 }
 
@@ -811,6 +892,31 @@ async fn act(c: &Connection, action: &Action, view: &mut AdminView) -> Result<()
         .await
         .map(drop),
         Action::DeleteProvider { id } => within("the delete", client.delete_provider(id)).await,
+        Action::SetOverrides {
+            overrides,
+            justification,
+        } => within(
+            "the overrides",
+            client.set_overrides(overrides, justification),
+        )
+        .await
+        .map(drop),
+        Action::SetAutopilot { enabled, reason } => {
+            within("the autopilot flag", client.set_autopilot(*enabled, reason))
+                .await
+                .map(drop)
+        }
+        Action::Reconcile => within("the reconcile", client.reconcile::<serde_json::Value>())
+            .await
+            .map(drop),
+        Action::AddRepo {
+            repo,
+            justification,
+        } => within("the new repo", client.add_repo(repo, justification)).await,
+        Action::PauseRepo { repo, paused } => {
+            within("the repo", client.pause_repo(repo, *paused)).await
+        }
+        Action::UnwatchRepo { repo } => within("the repo", client.unwatch_repo(repo)).await,
         Action::UseBlueprint {
             id,
             to,
@@ -888,7 +994,8 @@ async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<M
             || watch.webhook_form.is_some()
             || watch.providers
             || watch.blueprints
-            || watch.activity;
+            || watch.activity
+            || watch.admin;
         next = Instant::now() + if shown { SHOWN } else { QUEUE };
     }
 }
@@ -926,6 +1033,12 @@ pub struct Desk {
     pub register: Option<(String, TextEdit, TextEdit)>,
     /// The webhook the Triggers page shows in full.
     pub webhook: Option<String>,
+    /// The setting being overridden on the Admin page, and the value typed for it.
+    pub knob: Option<(String, TextEdit)>,
+    /// Why an admin change is made, which the controller records.
+    pub why: TextEdit,
+    /// The repo typed to start watching.
+    pub new_repo: TextEdit,
     /// The blueprint being used, with the new draft's id and description, while its form is open.
     pub use_blueprint: Option<(String, TextEdit, TextEdit)>,
     /// The provider the Providers page shows, and its form while open.
@@ -965,6 +1078,9 @@ impl Default for Desk {
             move_to: None,
             register: None,
             new_key: crate::apikeys::KeyForm::default(),
+            knob: None,
+            why: TextEdit::new(""),
+            new_repo: TextEdit::new(""),
             use_blueprint: None,
             provider: None,
             provider_form: None,
@@ -1315,6 +1431,7 @@ impl crate::App {
             providers: on(crate::Page::Providers),
             blueprints: on(crate::Page::Blueprints),
             activity: on(crate::Page::Activity),
+            admin: on(crate::Page::Admin),
             teams: controller,
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
@@ -1403,6 +1520,15 @@ impl crate::App {
                         }
                     }
                     Did::UseBlueprint => self.remote.desk.use_blueprint = None,
+                    Did::SetOverrides => {
+                        self.remote.desk.knob = None;
+                        self.remote.desk.why = TextEdit::new("");
+                    }
+                    Did::SetAutopilot => self.remote.desk.why = TextEdit::new(""),
+                    Did::AddRepo => {
+                        self.remote.desk.new_repo = TextEdit::new("");
+                        self.remote.desk.why = TextEdit::new("");
+                    }
                     Did::DeleteProvider => {
                         self.remote.desk.provider = None;
                         self.remote.desk.provider_form = None;
@@ -1435,7 +1561,10 @@ impl crate::App {
                     | Did::EnableWebhook
                     | Did::RotateWebhook
                     | Did::CheckWebhook
-                    | Did::PreviewWebhook => {}
+                    | Did::PreviewWebhook
+                    | Did::Reconcile
+                    | Did::PauseRepo
+                    | Did::UnwatchRepo => {}
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =
@@ -2145,6 +2274,99 @@ mod tests {
 
         client.watch(elsewhere);
         until(&client, |view| view.used.is_none());
+    }
+
+    #[test]
+    fn the_admin_page_reads_settings_access_autopilot_and_repos_and_sends_each_change() {
+        const CONFIG: &str = r#"{"knobs":[{"name":"max_concurrent_pods","value":10,
+            "source":"override","overridable":true,"description":"Pods at once."},
+            {"name":"allow_t3","value":false,"source":"env","overridable":true}]}"#;
+        let (client, requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/config"] | ["PUT", "/api/config/overrides"] => CONFIG.into(),
+            ["GET", "/api/access"] => r#"{"admins":["wynn"],"operators":[]}"#.into(),
+            ["GET", "/api/autopilot"] | ["POST", "/api/autopilot"] => r#"{"enabled":true}"#.into(),
+            ["GET", "/api/repos"] => r#"[{"repo":"llm-d/llm-d","total":9,"watched":true}]"#.into(),
+            _ => "{}".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.config.is_none() && view.repos.is_none());
+
+        client.watch(Watch {
+            admin: true,
+            ..elsewhere
+        });
+        let view = until(&client, |view| view.config.is_some());
+        let knobs = view.config.unwrap().unwrap().knobs;
+        assert_eq!(view.access.unwrap().unwrap().admins, ["wynn"]);
+        assert!(view.autopilot.unwrap().unwrap().enabled);
+        assert_eq!(view.repos.unwrap().unwrap()[0].total, 9);
+
+        let steps = [
+            (
+                Action::SetOverrides {
+                    overrides: crate::overrides::with(&knobs, "allow_t3", "true").unwrap(),
+                    justification: "trial".into(),
+                },
+                "Saved the overrides",
+                "PUT /api/config/overrides",
+            ),
+            (
+                Action::SetAutopilot {
+                    enabled: false,
+                    reason: "deploy".into(),
+                },
+                "Autopilot off",
+                "POST /api/autopilot",
+            ),
+            (
+                Action::Reconcile,
+                "Reconcile asked for",
+                "POST /api/reconcile",
+            ),
+            (
+                Action::AddRepo {
+                    repo: "llm-d/new".into(),
+                    justification: "asked".into(),
+                },
+                "Watching llm-d/new",
+                "POST /api/repos",
+            ),
+            (
+                Action::PauseRepo {
+                    repo: "llm-d/llm-d".into(),
+                    paused: true,
+                },
+                "Paused llm-d/llm-d",
+                "POST /api/repos/llm-d%2Fllm-d/pause",
+            ),
+            (
+                Action::UnwatchRepo {
+                    repo: "llm-d/llm-d".into(),
+                },
+                "Stopped watching llm-d/llm-d",
+                "DELETE /api/repos/llm-d%2Fllm-d",
+            ),
+        ];
+        for (action, said, sent) in steps {
+            client.act(action);
+            until(&client, |view| {
+                view.acted
+                    .as_ref()
+                    .is_some_and(|a| a.result == Ok(said.to_string()))
+            });
+            assert!(
+                requests.lock().unwrap().iter().any(|r| r == sent),
+                "{sent} was not sent"
+            );
+        }
     }
 
     fn summary(id: &str) -> dto::DecisionSummary {

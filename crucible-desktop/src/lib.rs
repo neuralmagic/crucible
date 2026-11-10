@@ -37,6 +37,7 @@ mod model;
 mod net;
 mod notify;
 mod opened;
+mod overrides;
 mod pack;
 mod palette;
 mod preview;
@@ -207,6 +208,7 @@ pub enum Page {
     Providers,
     Blueprints,
     Activity,
+    Admin,
     Keys,
     Settings,
 }
@@ -223,6 +225,7 @@ impl Page {
             Page::Providers => "providers",
             Page::Blueprints => "blueprints",
             Page::Activity => "activity",
+            Page::Admin => "admin",
             Page::Keys => "keys",
             Page::Settings => "settings",
         }
@@ -239,6 +242,7 @@ impl Page {
             Page::Providers => "Providers",
             Page::Blueprints => "Blueprints",
             Page::Activity => "Activity",
+            Page::Admin => "Admin",
             Page::Keys => "API keys",
             Page::Settings => "Settings",
         }
@@ -1397,6 +1401,11 @@ impl App {
     }
 
     /// What the signed-in user may own things as, themself first.
+    /// Whether the signed-in caller administers the controller.
+    pub fn is_admin(&self) -> bool {
+        matches!(&*self.remote.live, LiveView::Ready { identity, .. } if identity.role == "admin")
+    }
+
     pub fn owners(&self) -> Vec<String> {
         match &*self.remote.live {
             LiveView::Ready { identity, .. } if !identity.owners.is_empty() => {
@@ -1739,7 +1748,7 @@ pub fn run() {
                 scene_tab(app);
                 app.page = Page::Settings;
             }),
-            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams, providers, blueprints, activity or keys) against the
+            // `CRUCIBLE_PAGE` opens that page (triggers, secrets, decisions, approvals, teams, providers, blueprints, activity, admin or keys) against the
             // controller crux's config names.
             ("page", |app: &mut App| {
                 app.backend = Backend::Controller;
@@ -1753,6 +1762,7 @@ pub fn run() {
                     Page::Providers,
                     Page::Blueprints,
                     Page::Activity,
+                    Page::Admin,
                     Page::Keys,
                 ]
                 .into_iter()

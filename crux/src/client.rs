@@ -728,6 +728,69 @@ impl Client {
             .await
     }
 
+    pub async fn config(&self) -> Result<dto::ControllerConfig> {
+        self.get("/api/config").await
+    }
+
+    /// Replace the whole override set: a setting left out goes back to its env or default
+    /// value. Admin only, and `justification` is recorded.
+    pub async fn set_overrides(
+        &self,
+        overrides: &serde_json::Map<String, serde_json::Value>,
+        justification: &str,
+    ) -> Result<dto::ControllerConfig> {
+        let mut body = overrides.clone();
+        body.insert("justification".into(), justification.into());
+        self.put("/api/config/overrides", &body).await
+    }
+
+    pub async fn access(&self) -> Result<dto::Access> {
+        self.get("/api/access").await
+    }
+
+    pub async fn autopilot(&self) -> Result<dto::Autopilot> {
+        self.get("/api/autopilot").await
+    }
+
+    /// Turn the controller's own dispatching on or off. Admin only.
+    pub async fn set_autopilot(&self, enabled: bool, reason: &str) -> Result<dto::Autopilot> {
+        let body = serde_json::json!({ "enabled": enabled, "reason": reason });
+        self.post("/api/autopilot", Some(&body)).await
+    }
+
+    pub async fn repos(&self) -> Result<Vec<dto::WatchedRepo>> {
+        self.get("/api/repos").await
+    }
+
+    /// Start watching `repo` (`owner/name`). Admin only.
+    pub async fn add_repo(&self, repo: &str, justification: &str) -> Result<()> {
+        let body = serde_json::json!({ "repo": repo, "justification": justification });
+        self.post::<serde_json::Value>("/api/repos", Some(&body))
+            .await
+            .map(drop)
+    }
+
+    /// Pause discovery for `repo`, or resume it. It stays watched either way.
+    pub async fn pause_repo(&self, repo: &str, paused: bool) -> Result<()> {
+        let action = if paused { "pause" } else { "resume" };
+        self.post::<serde_json::Value>(
+            &format!("/api/repos/{}/{action}", encode(repo)),
+            None::<&serde_json::Value>,
+        )
+        .await
+        .map(drop)
+    }
+
+    pub async fn unwatch_repo(&self, repo: &str) -> Result<()> {
+        self.send(
+            reqwest::Method::DELETE,
+            &format!("/api/repos/{}", encode(repo)),
+            None,
+        )
+        .await
+        .map(drop)
+    }
+
     /// The newest `limit` status transitions across everything the controller works.
     pub async fn events(&self, limit: usize) -> Result<Vec<dto::Event>> {
         self.get(&format!("/api/events?limit={limit}")).await
@@ -2396,6 +2459,130 @@ mod tests {
                     "DELETE /api/providers/lab".to_string(),
                     serde_json::Value::Null
                 ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_calls_carry_their_justification_and_address_a_repo_by_its_whole_name() {
+        use axum::extract::State;
+        use axum::http::{Method, StatusCode, Uri};
+        use axum::routing::{get, post, put};
+        use std::sync::{Arc, Mutex};
+
+        type Seen = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+        const CONFIG: &str = r#"{"knobs":[{"name":"max_concurrent_pods","value":10,
+            "source":"override","overridable":true,"description":"Pods at once."}],
+            "contract":{},"draft_head_schedules_disabled":0}"#;
+
+        async fn note(
+            State(seen): State<Seen>,
+            method: Method,
+            uri: Uri,
+            body: String,
+        ) -> (StatusCode, String) {
+            let sent = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+            seen.lock()
+                .unwrap()
+                .push((format!("{method} {}", uri.path()), sent));
+            let answer = match uri.path() {
+                "/api/config/overrides" => CONFIG,
+                "/api/autopilot" => r#"{"enabled":false,"changed_by":"wynn","reason":"deploy"}"#,
+                _ => r#"{"repo":"llm-d/llm-d","action":"done"}"#,
+            };
+            (StatusCode::OK, answer.to_string())
+        }
+
+        let seen: Seen = Arc::default();
+        let app = axum::Router::new()
+            .route("/api/config", get(|| async { CONFIG }))
+            .route("/api/config/overrides", put(note))
+            .route(
+                "/api/access",
+                get(|| async { r#"{"admins":["wynn"],"operators":[],"allowed_orgs":["llm-d"]}"# }),
+            )
+            .route(
+                "/api/autopilot",
+                get(|| async { r#"{"enabled":true,"changed_by":null}"# }).post(note),
+            )
+            .route(
+                "/api/repos",
+                get(|| async {
+                    r#"[{"repo":"llm-d/llm-d","running":1,"parked":3,"total":9,
+                        "watermark":"2026-10-30T00:15:49Z","watched":true,"paused":false}]"#
+                })
+                .post(note),
+            )
+            .route("/api/repos/{repo}/pause", post(note))
+            .route("/api/repos/{repo}/resume", post(note))
+            .route("/api/repos/{repo}", axum::routing::delete(note))
+            .with_state(seen.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = Client::connect(&crate::config::Config {
+            url,
+            auth: Auth::None,
+        })
+        .expect("connect");
+
+        let config = client.config().await.expect("config");
+        assert_eq!(config.knobs[0].value, serde_json::json!(10));
+        assert_eq!(
+            client.access().await.expect("access").allowed_orgs,
+            ["llm-d"]
+        );
+        assert!(client.autopilot().await.expect("autopilot").enabled);
+        let repos = client.repos().await.expect("repos");
+        assert_eq!((repos[0].total, repos[0].paused), (9, false));
+
+        let overrides = serde_json::json!({ "max_concurrent_pods": 4 });
+        client
+            .set_overrides(overrides.as_object().expect("a map"), "quiet week")
+            .await
+            .expect("overrides");
+        let off = client.set_autopilot(false, "deploy").await.expect("off");
+        assert_eq!(off.changed_by.as_deref(), Some("wynn"));
+        client
+            .add_repo("llm-d/llm-d", "asked for")
+            .await
+            .expect("add");
+        client.pause_repo("llm-d/llm-d", true).await.expect("pause");
+        client
+            .pause_repo("llm-d/llm-d", false)
+            .await
+            .expect("resume");
+        client.unwatch_repo("llm-d/llm-d").await.expect("unwatch");
+
+        let null = serde_json::Value::Null;
+        assert_eq!(
+            *seen.lock().unwrap(),
+            [
+                (
+                    "PUT /api/config/overrides".to_string(),
+                    serde_json::json!({ "max_concurrent_pods": 4, "justification": "quiet week" })
+                ),
+                (
+                    "POST /api/autopilot".to_string(),
+                    serde_json::json!({ "enabled": false, "reason": "deploy" })
+                ),
+                (
+                    "POST /api/repos".to_string(),
+                    serde_json::json!({ "repo": "llm-d/llm-d", "justification": "asked for" })
+                ),
+                (
+                    "POST /api/repos/llm-d%2Fllm-d/pause".to_string(),
+                    serde_json::json!({})
+                ),
+                (
+                    "POST /api/repos/llm-d%2Fllm-d/resume".to_string(),
+                    serde_json::json!({})
+                ),
+                ("DELETE /api/repos/llm-d%2Fllm-d".to_string(), null),
             ]
         );
     }

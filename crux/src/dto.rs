@@ -505,6 +505,75 @@ pub struct McpSignedOut {
     pub revoked: u64,
 }
 
+/// One controller setting: its effective value and where that came from.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Knob {
+    pub name: String,
+    pub value: serde_json::Value,
+    /// `default`, `env` or `override`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub overridable: bool,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// `GET /api/config`: the controller's settings as they are in effect.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ControllerConfig {
+    #[serde(default)]
+    pub knobs: Vec<Knob>,
+}
+
+/// `GET /api/access`: who administers and operates the controller, and the orgs a repo may be
+/// added from.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct Access {
+    #[serde(default)]
+    pub admins: Vec<String>,
+    #[serde(default)]
+    pub operators: Vec<String>,
+    #[serde(default)]
+    pub allowed_orgs: Vec<String>,
+}
+
+/// Whether the controller dispatches on its own, and who last changed that.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Autopilot {
+    pub enabled: bool,
+    #[serde(default)]
+    pub changed_by: Option<String>,
+    #[serde(default)]
+    pub changed_at: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// A repo discovery sweeps, with how many of its issues sit in each state.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct WatchedRepo {
+    pub repo: String,
+    #[serde(default)]
+    pub running: i64,
+    #[serde(default)]
+    pub pr_open: i64,
+    #[serde(default)]
+    pub parked: i64,
+    #[serde(default)]
+    pub done: i64,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub watermark: Option<String>,
+    #[serde(default)]
+    pub watched: bool,
+    #[serde(default)]
+    pub paused: bool,
+    #[serde(default)]
+    pub added_by: Option<String>,
+}
+
 /// A role in a team, least first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
