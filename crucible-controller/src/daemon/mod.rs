@@ -124,7 +124,7 @@ pub async fn assemble(
                 &db,
                 &store,
                 &key.0,
-                cfg.issues_agent_tokens(),
+                cfg.issues_run_tokens(),
             )
             .await?;
             if let Some(ov) = applied

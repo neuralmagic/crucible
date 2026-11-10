@@ -826,6 +826,7 @@ fn constructor(
             edition: Default::default(),
             params: BTreeMap::new(),
             env: crate::host_env::DeclaredEnv::default(),
+            servers: Vec::new(),
             history_record,
         };
         workflow.validate()?;
@@ -1410,6 +1411,7 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         edition: Default::default(),
         params: BTreeMap::new(),
         env: crate::host_env::DeclaredEnv::default(),
+        servers: Vec::new(),
         history_record: None,
     };
     workflow.validate()?;
@@ -2949,6 +2951,8 @@ pub fn materialize_manifest(
         file: &'a str,
         #[serde(skip_serializing_if = "crate::host_env::DeclaredEnv::is_empty")]
         env: &'a crate::host_env::DeclaredEnv,
+        #[serde(skip_serializing_if = "<[_]>::is_empty")]
+        servers: &'a [crucible_contract::agent_servers::ServerName],
     }
 
     #[derive(serde::Serialize)]
@@ -2967,6 +2971,8 @@ pub fn materialize_manifest(
     struct DeclaredWorkflowEnv {
         #[serde(default)]
         env: crate::host_env::DeclaredEnv,
+        #[serde(default)]
+        servers: Vec<crucible_contract::agent_servers::ServerName>,
     }
 
     let manifest = std::fs::read_to_string(manifest_path)
@@ -2978,13 +2984,13 @@ pub fn materialize_manifest(
                 path: manifest_path.to_path_buf(),
                 cause,
             })?;
-    let env = toml::from_str::<DeclaredWorkflow>(&manifest)
+    let (env, servers) = toml::from_str::<DeclaredWorkflow>(&manifest)
         .map_err(|cause| MaterializeError::DeclaredEnv {
             path: manifest_path.to_path_buf(),
             cause,
         })?
         .workflow
-        .map(|workflow| workflow.env)
+        .map(|workflow| (workflow.env, workflow.servers))
         .unwrap_or_default();
 
     let manifest_dir = parent_or_cwd(manifest_path);
@@ -2998,6 +3004,7 @@ pub fn materialize_manifest(
                     workflow_type: compiled.workflow.workflow_type,
                     file: &file,
                     env: &env,
+                    servers: &servers,
                 },
             })?,
         )
@@ -3007,6 +3014,7 @@ pub fn materialize_manifest(
             toml::to_string(&ManifestWorkflow {
                 workflow: &WorkflowCfg {
                     env,
+                    servers,
                     ..compiled.workflow.clone()
                 },
             })?,

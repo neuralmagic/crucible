@@ -802,6 +802,7 @@ pub fn run(
                         agent_cmd,
                         env: crucible::host_env::HostEnv::inherited(),
                         buildit_socket: None,
+                        task_servers: Vec::new(),
                         github: false,
                     }),
                     None,

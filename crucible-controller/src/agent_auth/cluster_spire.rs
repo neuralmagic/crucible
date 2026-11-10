@@ -71,6 +71,14 @@ impl GatewayPrefix {
         &self.raw
     }
 
+    /// The trust domain the prefix is under.
+    pub fn trust_domain(&self) -> &str {
+        self.head
+            .strip_prefix("spiffe://")
+            .and_then(|path| path.split('/').next())
+            .unwrap_or_default()
+    }
+
     /// The tenant (when the prefix has a `{tenant}` segment) and the rest of `spiffe_id` after the
     /// prefix; `None` when the ID is not under it.
     pub fn split<'a>(&self, spiffe_id: &'a str) -> Option<(Option<&'a str>, &'a str)> {

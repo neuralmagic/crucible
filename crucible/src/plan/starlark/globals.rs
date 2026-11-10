@@ -399,6 +399,7 @@ fn call<'v>(
                         edition: Default::default(),
                         params: BTreeMap::new(),
                         env: crate::host_env::DeclaredEnv::default(),
+                        servers: Vec::new(),
                         history_record: None,
                     };
                     workflow.validate()?;

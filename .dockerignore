@@ -9,3 +9,4 @@ examples/*/state/
 book/
 *.jsonl
 crucible-controller/ui/node_modules/
+crucible-kueue-py/.venv/

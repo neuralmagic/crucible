@@ -72,6 +72,7 @@ mod plan {
     pub mod desk;
     pub mod events;
     pub mod harness;
+    pub mod task_tokens;
     pub mod template;
     pub mod transcript;
     pub mod turn_log;

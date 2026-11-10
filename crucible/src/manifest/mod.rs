@@ -1228,6 +1228,7 @@ impl Manifest {
         resolved.resolved_from = Some(file);
         resolved.edition = self.edition;
         resolved.env = workflow.env.clone();
+        resolved.servers = workflow.servers.clone();
         launch.apply(&mut resolved.tasks, &self.agent.overrides)?;
         self.workflow = Some(resolved);
         if !launch.is_empty() {
@@ -1873,6 +1874,34 @@ mod tests {
             format!("{base}[judge]\nmeasure_cmd = \"m\"\ndirection = \"higher\"\nenv = []\n");
         Manifest::parse_variant(&empty, None, "manifest test")
             .expect("an empty list declares nothing to refuse");
+    }
+
+    #[test]
+    fn servers_for_workflow_tasks_are_dns_labels_in_any_edition() {
+        let base = "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"x\"\ngoal = \
+                    \"g\"\n[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"\n";
+        for edition in ["", "edition = 1\n", "edition = 2\n"] {
+            let named = Manifest::parse_variant(
+                &format!("{edition}{base}servers = [\"kueue\"]\n"),
+                None,
+                "manifest test",
+            )
+            .unwrap_or_else(|e| panic!("{edition:?}: {e:#}"));
+            assert_eq!(
+                named.workflow.unwrap().servers,
+                [crucible_contract::agent_servers::ServerName::parse("kueue").unwrap()],
+                "{edition:?}"
+            );
+            assert!(
+                Manifest::parse_variant(
+                    &format!("{edition}{base}servers = [\"Not A Name\"]\n"),
+                    None,
+                    "manifest test",
+                )
+                .is_err(),
+                "{edition:?}: a server name is a DNS label"
+            );
+        }
     }
 
     /// A variant is a manifest of its own, so an `env` list it adds under an edition-1 base is
