@@ -189,7 +189,7 @@ pub(crate) fn refs_containing(dest: &Path, commit: &GitRef) -> Result<Vec<String
 }
 
 /// Copy every non-excluded skill under `p.skills` into the workspace's `skills_dir` (the
-/// harness's discovery path, see [`crate::manifest::Harness::skills_dir`]).
+/// harness's discovery path, see [`crate::knobs::Harness::skills_dir`]).
 /// `exclude` names setup-only skills (deployment config, workload capture) that the loop agent must
 /// never see, see [`manifest::AgentCfg::toolbox_exclude`]. A name in `exclude` that doesn't
 /// exist under the toolbox dir is a manifest bug (the exclusion is silently doing nothing), so

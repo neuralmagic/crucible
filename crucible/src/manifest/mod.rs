@@ -50,6 +50,7 @@ pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
+use crate::knobs::{Harness, ReasoningEffort};
 use crate::manifest::edition::Edition;
 use crate::manifest::variant::{VariantName, Variants};
 use anyhow::{Context, Result};
@@ -658,77 +659,6 @@ pub fn apply_inject(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Which agent harness runs the turn. `claude` is the default everywhere; `codex` (OpenAI's
-/// Codex CLI) is selected per-domain for harness ablations; `opencode` and `pi` are the harnesses
-/// that speak either API family through a provider table.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    PartialEq,
-    Eq,
-    clap::ValueEnum,
-    serde::Deserialize,
-    serde::Serialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum Harness {
-    #[default]
-    Claude,
-    Codex,
-    #[value(name = "opencode")]
-    OpenCode,
-    Pi,
-}
-
-impl Harness {
-    /// The default model when neither the CLI nor the manifest names one.
-    pub const fn default_model(self) -> &'static str {
-        self.spec().default_model
-    }
-
-    /// The manifest and CLI spelling of the harness.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Harness::Claude => "claude",
-            Harness::Codex => "codex",
-            Harness::OpenCode => "opencode",
-            Harness::Pi => "pi",
-        }
-    }
-}
-
-/// The agent's reasoning-effort tier, passed to Claude Code as `--effort <level>`. A closed set
-/// (Claude Code 2.1: low|medium|high|xhigh|max); unset means we don't pass the flag and Claude
-/// Code picks its own default. Per-domain because the right tier is task-dependent (mechanical
-/// remove-deprecated fixes need ~none; algorithmic issues want real reasoning), and it's a harness
-/// hyperparameter worth ablating: does more thinking find better fixes, or just better reward hacks?
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, serde::Deserialize, serde::Serialize,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum ReasoningEffort {
-    Low,
-    Medium,
-    High,
-    Xhigh,
-    Max,
-}
-
-impl ReasoningEffort {
-    /// The exact token Claude Code's `--effort` flag expects.
-    pub fn as_flag(self) -> &'static str {
-        match self {
-            ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-            ReasoningEffort::Xhigh => "xhigh",
-            ReasoningEffort::Max => "max",
-        }
-    }
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCfg {
@@ -998,7 +928,6 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
-        launch::check_agent_knobs(&w.tasks)?;
         validate_task_sandboxes(c.agent, w)?;
     }
     match c.judge {
@@ -2937,7 +2866,7 @@ workflow(type = "playbook", tasks = [options, work])
             .collect()
     }
 
-    fn agent_knobs(m: &Manifest, task: &str) -> (Option<String>, Option<String>) {
+    fn agent_knobs(m: &Manifest, task: &str) -> (Option<String>, Option<ReasoningEffort>) {
         let workflow = m.workflow.as_ref().expect("a workflow");
         let task = workflow
             .tasks
@@ -2945,9 +2874,7 @@ workflow(type = "playbook", tasks = [options, work])
             .find(|t| t.name.0 == task)
             .expect("task exists");
         match &task.task {
-            crate::plan::ir::TaskKind::Agent { model, effort, .. } => {
-                (model.clone(), effort.clone())
-            }
+            crate::plan::ir::TaskKind::Agent { model, effort, .. } => (model.clone(), *effort),
             other => panic!("not an agent task: {other:?}"),
         }
     }
@@ -2977,10 +2904,10 @@ workflow(type = "playbook", tasks = [options, work])
             ]),
         )
         .expect("resolves");
-        assert_eq!(agent_knobs(&m, "plan"), (None, Some("high".into())));
+        assert_eq!(agent_knobs(&m, "plan"), (None, Some(ReasoningEffort::High)));
         assert_eq!(
             agent_knobs(&m, "review"),
-            (Some("launched".into()), Some("high".into()))
+            (Some("launched".into()), Some(ReasoningEffort::High))
         );
         let workflow = serde_json::to_value(m.workflow.as_ref().expect("workflow")).expect("json");
         assert_eq!(workflow["params"]["topic"], "sinks");
@@ -3144,15 +3071,15 @@ workflow(type = "playbook", tasks = [options, work])
         for (source, needle) in [
             (
                 "a = agent(name = \"a\", prompt = \"p\", effort = \"extreme\")\nworkflow(type = \"playbook\", tasks = [a])\n",
-                "sets effort \"extreme\", which is not low, medium, high, xhigh or max",
+                "graph.star:1:5-56: unknown effort \"extreme\"; use one of low, medium, high, xhigh, max",
             ),
             (
                 "a = agent(name = \"a\", prompt = \"p\", harness = \"gpt\")\nworkflow(type = \"playbook\", tasks = [a])\n",
-                "sets harness \"gpt\", which is not claude, codex, opencode or pi",
+                "unknown harness \"gpt\"; use one of claude, codex, opencode, pi",
             ),
             (
                 "s = session(name = \"s\", effort = \"hgih\")\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"playbook\", tasks = [a])\n",
-                "sets effort \"hgih\"",
+                "graph.star:1:5-41: unknown effort \"hgih\"; use one of low, medium, high, xhigh, max. Did you mean \"high\"?",
             ),
         ] {
             std::fs::write(dir.join("graph.star"), source).expect("write source");
@@ -3179,12 +3106,12 @@ workflow(type = "playbook", tasks = [options, work])
         let inline = "[workflow]\ntype = \"playbook\"\n\
              [[workflow.task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"\neffort = \"extreme\"";
         let err = toml::from_str::<Manifest>(&task_manifest(inline))
-            .expect("parses")
-            .validate()
-            .expect_err("an inline graph is checked at load");
+            .map(|_| ())
+            .expect_err("an inline graph is checked as it parses");
         assert!(
-            format!("{err:#}").contains("sets effort \"extreme\""),
-            "{err:#}"
+            err.to_string()
+                .contains("effort \"extreme\" is not low, medium, high, xhigh or max"),
+            "{err}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

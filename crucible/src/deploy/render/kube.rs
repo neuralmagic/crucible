@@ -133,7 +133,7 @@ pub struct RenderOpts {
     pub clusters_file: Option<std::path::PathBuf>,
     /// The agent harness the loop runs, rendered as `--harness=<h>` into the wrapper's `crucible`
     /// invocation. `None` emits no flag, the loop keeps the manifest's `[agent].harness`.
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// The model the loop runs, rendered as `--model=<m>` into the wrapper's `crucible` invocation.
     /// `None` emits no flag, the loop derives the model from the resolved harness.
     pub model: Option<String>,
@@ -2347,7 +2347,7 @@ fn driver_env(profile: &DeployProfile, sandbox_image: Option<&str>) -> Result<Sa
 
 /// Render an optional `--harness <h>` wrapper flag. The value is clap's own `ValueEnum` name, so
 /// the string the wrapper emits is by construction the one the in-pod CLI parses back.
-fn harness_flag(harness: Option<crate::manifest::Harness>, sep: char) -> String {
+fn harness_flag(harness: Option<crate::knobs::Harness>, sep: char) -> String {
     use clap::ValueEnum as _;
     harness
         .and_then(|h| h.to_possible_value())
@@ -2594,7 +2594,7 @@ mod tests {
         let manifest = dir.join("crucible.delta.toml");
         let profile = DeployProfile::load(&fixture_profile("delta")).expect("profile parses");
 
-        let render_with = |harness: Option<crate::manifest::Harness>, model: Option<&str>| {
+        let render_with = |harness: Option<crate::knobs::Harness>, model: Option<&str>| {
             let composite = CompositeManifest::load(&manifest).expect("composite parses");
             let input = RenderInput::from_composite(&composite, &dir).expect("render input");
             render(
@@ -2618,10 +2618,7 @@ mod tests {
             .expect("render")
         };
 
-        let set = render_with(
-            Some(crate::manifest::Harness::OpenCode),
-            Some("qwen-3-8-27b"),
-        );
+        let set = render_with(Some(crate::knobs::Harness::OpenCode), Some("qwen-3-8-27b"));
         assert!(set.contains("--harness=opencode"), "{set}");
         assert!(set.contains("--model=qwen-3-8-27b"), "{set}");
 
@@ -5892,7 +5889,7 @@ mod tests {
     #[test]
     fn playbook_wrapper_emits_harness_and_model_flags_when_set() {
         let manifest = playbook_manifest();
-        let render_with = |harness: Option<crate::manifest::Harness>, model: Option<&str>| {
+        let render_with = |harness: Option<crate::knobs::Harness>, model: Option<&str>| {
             let input = RenderInput::from_playbook_manifest(&manifest, "alpha");
             render(
                 input,
@@ -5914,7 +5911,7 @@ mod tests {
             )
             .expect("render")
         };
-        let set = render_with(Some(crate::manifest::Harness::Codex), Some("gpt-5.6-luna"));
+        let set = render_with(Some(crate::knobs::Harness::Codex), Some("gpt-5.6-luna"));
         assert!(
             set.contains(
                 "--compute-driver=kubernetes --harness=codex --model=gpt-5.6-luna --param"

@@ -25,7 +25,7 @@ use crate::agent::harness::{
 };
 use crate::agent::inference::{InferenceEnv, VertexConfig, WireApi};
 use crate::args::TurnAgent;
-use crate::manifest::{Harness, ReasoningEffort};
+use crate::knobs::{Harness, ReasoningEffort};
 use crate::turn_trace::{self, GenAiRecord, ToolCall, ToolInvocation};
 use crucible::harness::HarnessSpec;
 use crucible_harness::line::LineFormat;

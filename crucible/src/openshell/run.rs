@@ -19,7 +19,7 @@ use crate::agent::sandbox_env::{EnvSource, SandboxEnv};
 use crate::agent::tool_chain::StopReason;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
 use crate::args::{Paths, SandboxTurn};
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};

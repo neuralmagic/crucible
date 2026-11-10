@@ -63,7 +63,7 @@ pub struct RankGroundedArgs {
     pub agent_cmd: Option<String>,
     /// The harness that runs the turn; the claude default when unset.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// Override the turn's model (env fallback: `CRUCIBLE_RANK_MODEL`).
     #[arg(long)]
     pub model: Option<String>,
@@ -358,7 +358,7 @@ fn grounded_paths(scratch: &Path) -> Paths {
 fn turn_args(a: &RankGroundedArgs) -> Result<crate::args::Args> {
     let mut args = crate::args::Args::defaults().context("constructing default args")?;
     args.harness = a.harness;
-    args.reasoning_effort = Some(crate::manifest::ReasoningEffort::Low);
+    args.reasoning_effort = Some(crate::knobs::ReasoningEffort::Low);
     match &a.agent_cmd {
         Some(cmd) => {
             args.agent_backend = AgentBackend::Command;
@@ -893,7 +893,7 @@ mod tests {
         let Some(crate::cli::Cmd::RankGrounded(a)) = cli.command else {
             panic!("rank-grounded parses as its subcommand");
         };
-        assert_eq!(a.harness, Some(crate::manifest::Harness::Claude));
+        assert_eq!(a.harness, Some(crate::knobs::Harness::Claude));
         assert_eq!(a.model.as_deref(), Some("rits/zai-org/glm-5-3"));
     }
 
@@ -902,14 +902,14 @@ mod tests {
         let mut a = args(Path::new("/checkout"), Path::new("/agent.sh"), 1.0);
         a.agent_cmd = None;
         a.agent_backend = AgentBackend::Openshell;
-        a.harness = Some(crate::manifest::Harness::OpenCode);
+        a.harness = Some(crate::knobs::Harness::OpenCode);
         a.model = Some("qwen-3-8-27b".to_string());
         let turn = turn_args(&a).unwrap();
         assert_eq!(
             turn.reasoning_effort,
-            Some(crate::manifest::ReasoningEffort::Low)
+            Some(crate::knobs::ReasoningEffort::Low)
         );
-        assert_eq!(turn.harness(), crate::manifest::Harness::OpenCode);
+        assert_eq!(turn.harness(), crate::knobs::Harness::OpenCode);
         assert_eq!(turn.model(), "qwen-3-8-27b");
         assert_eq!(turn.agent_backend, AgentBackend::Openshell);
     }
@@ -917,10 +917,10 @@ mod tests {
     #[test]
     fn the_grounded_turn_defaults_to_claude_at_low_effort() {
         let turn = turn_args(&args(Path::new("/checkout"), Path::new("/agent.sh"), 1.0)).unwrap();
-        assert_eq!(turn.harness(), crate::manifest::Harness::Claude);
+        assert_eq!(turn.harness(), crate::knobs::Harness::Claude);
         assert_eq!(
             turn.reasoning_effort,
-            Some(crate::manifest::ReasoningEffort::Low)
+            Some(crate::knobs::ReasoningEffort::Low)
         );
         assert_eq!(turn.agent_backend, AgentBackend::Command);
     }

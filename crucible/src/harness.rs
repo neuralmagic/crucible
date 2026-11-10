@@ -2,7 +2,7 @@
 //! makes reads this one table through [`Harness::spec`]; the argv grammar, config file, stream
 //! decoder, and transcript parser that genuinely differ per CLI live in the binary's backends.
 
-use crate::manifest::Harness;
+use crate::knobs::Harness;
 use crate::openshell::policy::{CLAUDE_ENDPOINTS, CODEX_ENDPOINTS, OPENAI_API_ENDPOINTS};
 use crucible_contract::inference::InferenceProtocol;
 use std::time::Duration;
@@ -272,6 +272,11 @@ static PI: HarnessSpec = HarnessSpec {
 };
 
 impl Harness {
+    /// The default model when neither the CLI nor the manifest names one.
+    pub const fn default_model(self) -> &'static str {
+        self.spec().default_model
+    }
+
     /// This harness's table entry.
     pub const fn spec(self) -> &'static HarnessSpec {
         match self {

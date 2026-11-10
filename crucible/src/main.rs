@@ -44,7 +44,7 @@ mod scope;
 mod testing;
 pub(crate) use crucible_harness::stream_json;
 
-use crucible::{deploy, duration, errors, exposure, flow, manifest, outputs, turn_trace};
+use crucible::{deploy, duration, errors, exposure, flow, knobs, manifest, outputs, turn_trace};
 
 /// The OpenShell turn runtime. The gateway client and the egress policy are library code (the
 /// deploy renderer needs their constants); the per-turn flow, provider, and sandbox helpers run

@@ -93,7 +93,7 @@ similar system. The differences are in the loop around the graph and the state u
 Starlark control flow unrolls into tasks at compile time, which means that task level dynamacism interior
 to a workflow run is not supported. Execution over that fixed task set can repeat. 
 A `revise` pair dispatches a settled task again with the reviewer's verdict under `revision`. This continues until the task stops
-failing or `max_rounds` is spent. A scored run repeats the whole graph in each iteration and
+failing or its `rounds` are spent. A scored run repeats the whole graph in each iteration and
 carries the accepted state, the best score, and the remaining budget forward.
 
 A workflow engine would have to host both cycles. Tekton has no loop construct: a pipeline
@@ -345,7 +345,7 @@ read = command(name = "read", run = "./read.sh", emits = ["ticket"])
 gate = route(
     name = "gate",
     depends_on = [read],
-    min_confidence = 0.8,
+    decider = model(min_confidence = 0.8),
     questions = {
         "bucket": choice(
             ask = "Which queue owns this ticket?",
@@ -359,9 +359,9 @@ gate = route(
 )
 
 oncall = command(name = "oncall", run = "./act.sh oncall", depends_on = [gate],
-                 when = gate.bucket, answers = "outage")
+                 when = gate.bucket.any_of("outage"))
 backlog = command(name = "backlog", run = "./act.sh backlog", depends_on = [gate],
-                  when = gate.bucket, otherwise = True)
+                  when = gate.bucket.otherwise())
 
 filed = command(name = "filed", run = "./act.sh filed",
                 depends_on = [oncall, backlog], join = "passed")
@@ -379,7 +379,7 @@ under `revision` until `review` stops failing or the rounds are spent:
 ```python
 author = agent(name = "author", prompt = "Write PROBE.md.", emits_files = ["PROBE.md"])
 review = command(name = "review", run = "./check.sh", depends_on = [author],
-                 revise = author, max_rounds = 3)
+                 revise = send_back(author, rounds = 3))
 
 workflow(type = "playbook", tasks = [author, review])
 ```
