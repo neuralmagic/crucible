@@ -440,6 +440,139 @@ pub struct CancelAck {
     pub reason: String,
 }
 
+/// An API key's public half. Its secret is shown once, when it is minted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ApiKey {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    #[serde(default)]
+    pub revoked_at: Option<String>,
+}
+
+/// `POST /api/keys`: the new key and its secret, which no later response carries.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct MintedKey {
+    #[serde(flatten)]
+    pub key: ApiKey,
+    pub secret: String,
+    /// Where an MCP client reaches this controller, when it serves one.
+    #[serde(default)]
+    pub mcp_url: Option<String>,
+}
+
+/// Who vouches for an MCP client: the operator, the host publishing its document, or nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpClientKind {
+    Registered,
+    Metadata,
+    Dynamic,
+}
+
+/// One MCP client approval whose refresh token is still live.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpSignIn {
+    pub client_id: String,
+    pub client_name: String,
+    #[serde(default)]
+    pub client_host: Option<String>,
+    pub client_kind: McpClientKind,
+    pub resource: String,
+    pub cluster: String,
+    pub approved_at: String,
+    pub last_used_at: String,
+}
+
+/// Whether the controller signs MCP clients in, and the caller's live approvals when it does.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct McpSignIns {
+    pub enabled: bool,
+    #[serde(default)]
+    pub sign_ins: Vec<McpSignIn>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct McpSignedOut {
+    pub revoked: u64,
+}
+
+/// A role in a team, least first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TeamRole {
+    Member,
+    Maintainer,
+    Owner,
+}
+
+/// How a team holds a member: a login, a group claim, another team, or a rule over claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberKind {
+    User,
+    Team,
+    Group,
+    Rule,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct TeamMember {
+    pub kind: MemberKind,
+    pub member: String,
+    pub role: TeamRole,
+    #[serde(default)]
+    pub since: String,
+    #[serde(default)]
+    pub added_by: Option<String>,
+    /// Whether a `user` member has ever signed in.
+    #[serde(default)]
+    pub signed_in: bool,
+}
+
+/// A member as a `PUT /api/teams/{slug}/members` body spells it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TeamMemberBody {
+    pub kind: MemberKind,
+    pub member: String,
+    pub role: TeamRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Team {
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub created_by: Option<String>,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub members: Vec<TeamMember>,
+    /// The caller's role in it, when they are in it.
+    #[serde(default)]
+    pub my_role: Option<TeamRole>,
+    /// Whether any user can reach the team through its members.
+    #[serde(default)]
+    pub reachable: bool,
+}
+
+/// One line of a team's audit trail.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TeamAudit {
+    pub id: i64,
+    pub at: String,
+    pub actor: String,
+    pub action: String,
+    #[serde(default)]
+    pub decision: String,
+    #[serde(default)]
+    pub rule: String,
+}
+
 /// A pack import waiting for an operator to register or discard it.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct PendingImport {
@@ -1436,7 +1569,7 @@ pub struct Watch {
     pub owner_principal: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 pub struct Webhook {
     pub id: String,
     #[serde(default)]
@@ -1453,9 +1586,41 @@ pub struct Webhook {
     pub consecutive_failures: i64,
     #[serde(default)]
     pub owner_principal: Option<String>,
+    /// Where senders deliver, when the controller knows its public address.
+    #[serde(default)]
+    pub delivery_url: Option<String>,
+    /// The CEL a delivery must satisfy to launch.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// The CEL whose value marks two deliveries as the same event.
+    #[serde(default)]
+    pub dedupe: Option<String>,
+    /// Param name to the CEL that derives it from a delivery.
+    #[serde(default)]
+    pub derive: std::collections::BTreeMap<String, String>,
+    /// The fixed values every launch carries.
+    #[serde(default)]
+    pub params: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub max_cost: f64,
+    #[serde(default)]
+    pub max_time: String,
+    #[serde(default)]
+    pub dispatch_target: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// `POST /api/webhooks/{id}/secret`: the webhook with its new secret, which no later response
+/// carries.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct WebhookSecret {
+    pub webhook: Webhook,
+    pub secret: String,
+    /// The delivery URL, token included for a `path_token` webhook.
+    #[serde(default)]
+    pub delivery_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct WebhookDelivery {
     pub id: String,
     #[serde(default)]

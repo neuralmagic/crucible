@@ -11,7 +11,6 @@ clap = { workspace = true, optional = true }
 crucible-contract = { path = "../crucible-contract" }
 serde.workspace = true
 serde_json.workspace = true
-tokio.workspace = true
 # Same major + TLS backend as the controller's own client, so the dependency tree stays one tree.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "zstd"] }
 # The `Transport` trait is behind `dyn`, which native async-fn-in-trait cannot do; async-trait
@@ -21,6 +20,14 @@ async-trait = "0.1"
 rmcp = { workspace = true, features = ["server", "macros"], optional = true }
 # The config file. Same version the controller reads manifests with.
 toml = "1.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { version = "1", features = ["time"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+futures-util = { version = "0.3", default-features = false }
 
 [features]
 default = ["cli"]
