@@ -191,7 +191,7 @@ pub struct PackImportDto {
     pub created_at: String,
     pub resolved_by: Option<String>,
     pub resolved_at: Option<String>,
-    /// Paths under an excluded segment (`state`, `.git`, `workspace`) the fetch did not store.
+    /// Paths under an excluded segment (`state`, `.git`, `workspace`, `__pycache__`) the fetch did not store.
     /// Present only on the response to the proposal that fetched them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored_paths: Option<Vec<String>>,
@@ -643,7 +643,7 @@ pub struct DraftFromGitDto {
     /// The commit the fetch resolved to; the draft's origin rev.
     pub rev: String,
     pub draft: DraftCompileDto,
-    /// Paths under an excluded segment (`state`, `.git`, `workspace`) the fetch did not store.
+    /// Paths under an excluded segment (`state`, `.git`, `workspace`, `__pycache__`) the fetch did not store.
     pub ignored_paths: Vec<String>,
 }
 

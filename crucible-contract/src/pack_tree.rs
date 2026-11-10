@@ -13,8 +13,9 @@ use std::fmt;
 use std::path::{Component, Path};
 use std::str::FromStr;
 
-/// Path segments whose subtree is pod-side runtime or repository metadata, never pack content.
-pub const EXCLUDED_SEGMENTS: [&str; 3] = ["state", ".git", "workspace"];
+/// Path segments whose subtree is runtime or repository byproduct, never pack content: run
+/// state, git metadata, and the bytecode caches an interpreter writes beside the sources it runs.
+pub const EXCLUDED_SEGMENTS: [&str; 4] = ["state", ".git", "workspace", "__pycache__"];
 
 /// The most gzipped bytes a pack may deliver to a run: its [`PackTree::tarball`] rides one
 /// ConfigMap key, and Kubernetes caps a ConfigMap at 1 MiB of decoded values.
@@ -676,6 +677,7 @@ mod tests {
             ("x/state/y", "s"),
             ("a/.git/HEAD", "g"),
             ("workspace/repo/file", "w"),
+            ("__pycache__/plan.cpython-314.pyc", "p"),
         ] {
             let p = root.join(path);
             std::fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
@@ -688,7 +690,7 @@ mod tests {
         assert_eq!(paths, vec!["crucible.toml", "tools/run.sh"]);
         assert_eq!(
             read.ignored,
-            vec!["a/.git", "state", "workspace", "x/state"]
+            vec!["__pycache__", "a/.git", "state", "workspace", "x/state"]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -795,12 +797,16 @@ mod tests {
                 ("crucible.toml", Regular, 0o644, 0, b"m", None),
                 ("state/session.jsonl", Regular, 0o644, 0, b"s", None),
                 ("workspace/repo/a", Regular, 0o644, 0, b"w", None),
+                ("tools/__pycache__/plan.pyc", Regular, 0o644, 0, b"c", None),
                 ("x/.git/link", Symlink, 0o777, 0, b"", Some("../y")),
             ],
         );
         let read = read_tar_gz(&tgz).expect("read");
         assert_eq!(read.tree, tree(&[("crucible.toml", b"m")]));
-        assert_eq!(read.ignored, vec!["state", "workspace", "x/.git"]);
+        assert_eq!(
+            read.ignored,
+            vec!["state", "tools/__pycache__", "workspace", "x/.git"]
+        );
     }
 
     #[test]
