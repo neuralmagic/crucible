@@ -25,7 +25,7 @@ impl App {
             Command::LogStream => self.log_mode = Some(LogMode::Stream),
             Command::LogByTask => self.log_mode = Some(LogMode::ByTask),
             Command::CopyLink => {
-                if let Some(link) = self.link_here(self.expanded.as_deref()) {
+                if let Some(link) = self.link_here(self.run.expanded.as_deref()) {
                     tx.copy(link.url());
                 }
             }
@@ -35,7 +35,7 @@ impl App {
                 }
             }
             Command::FixWithAgent => {
-                let task = self.expanded.clone();
+                let task = self.run.expanded.clone();
                 if let Some(brief) = self.hand_off(task.as_deref()) {
                     tx.copy(brief);
                 }
@@ -46,7 +46,7 @@ impl App {
             }),
             Command::Open(page) => self.toggle_page(page),
             Command::SaveDraft => {
-                if self.working_edited && !self.draft_busy {
+                if self.remote.working_edited && !self.remote.draft_busy {
                     self.save_draft();
                 }
             }
@@ -62,15 +62,15 @@ impl App {
             Command::Back => self.go(-1),
             Command::Forward => self.go(1),
             Command::Reload => {
-                self.live_client.reconnect();
-                self.admin_client.reconnect();
+                self.remote.live_client.reconnect();
+                self.remote.admin_client.reconnect();
             }
             Command::Profile(n) => {
                 self.switch(Backend::Controller);
                 self.use_profile_at(n as usize);
             }
             Command::EditTask => {
-                if let Some(task) = self.expanded.clone() {
+                if let Some(task) = self.run.expanded.clone() {
                     self.edit_task(&task);
                 }
             }
@@ -82,7 +82,7 @@ impl App {
     pub fn shown_preview(&self) -> Option<&crate::preview::Preview> {
         match self.backend {
             Backend::Local => self.selected_pack().map(|pack| &pack.preview),
-            Backend::Controller => self.working_preview.as_ref(),
+            Backend::Controller => self.remote.working_preview.as_ref(),
         }
     }
 
@@ -109,6 +109,7 @@ impl App {
     pub fn palette_entries(&self) -> Vec<Entry> {
         let tasks: Vec<&str> = self.run_tasks().iter().map(|t| t.name.as_str()).collect();
         let playbooks: Vec<&str> = self
+            .remote
             .live
             .playbooks(&self.launch_filter())
             .into_iter()
@@ -117,7 +118,7 @@ impl App {
         let packs: Vec<&str> = self.packs.iter().map(|p| p.name.as_str()).collect();
         let profiles: Vec<String> = crate::profile::usable(&self.settings)
             .into_keys()
-            .filter(|name| *name != self.target.name)
+            .filter(|name| *name != self.remote.target.name)
             .collect();
         let profiles: Vec<&str> = profiles.iter().map(String::as_str).collect();
         palette::entries(&tasks, &playbooks, &packs, &profiles)
@@ -272,9 +273,9 @@ pub fn finder_key(app: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     match ev.key {
         Key::Up => app.step_finder(-1),
         Key::Down => app.step_finder(1),
-        Key::Escape => app.finder = None,
+        Key::Escape => app.remote.finder = None,
         _ if pressed(tx, ev).is_some_and(|s| app.keymap.command(&s) == Some(Command::Search)) => {
-            app.finder = None;
+            app.remote.finder = None;
         }
         _ => return false,
     }

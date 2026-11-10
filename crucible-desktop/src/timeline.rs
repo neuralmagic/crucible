@@ -455,7 +455,7 @@ mod tests {
         let admitted = json!({"v": 1, "kind": "plan_admitted", "plan_version": 1, "budget_usd": 1.0, "tasks": tasks});
         assert!(fold.apply_line(&admitted.to_string()));
         for (kind, task, at, extra) in events {
-            let at = format!("2026-11-08T12:00:{:06.3}Z", at);
+            let at = format!("2026-11-08T12:00:{at:06.3}Z");
             let mut event = match *kind {
                 "start" => {
                     json!({"v": 1, "kind": "task_started", "task": task, "attempt": 1, "estimate_usd": 0.0, "at": at})
@@ -483,7 +483,7 @@ mod tests {
                 ("start", "a", 6.0, json!({"attempt": 2})),
                 ("result", "a", 8.0, json!({"attempts": 2})),
                 ("result", "b", 5.0, none.clone()),
-                ("start", "c", 9.0, none.clone()),
+                ("start", "c", 9.0, none),
             ],
         );
         let s = schedule(&tasks);
@@ -513,7 +513,7 @@ mod tests {
                 ("start", "edit[y]", 4.0, none.clone()),
                 ("result", "edit[x]", 3.0, none.clone()),
                 ("result", "edit[y]", 7.0, none.clone()),
-                ("result", "edit", 7.0, none.clone()),
+                ("result", "edit", 7.0, none),
             ],
         );
         let s = schedule(&tasks);

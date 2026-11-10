@@ -1,16 +1,17 @@
-//! Schedules, secrets, shares and decision requests, read and changed through crux on a worker
-//! thread of their own so a slow call never holds up the launch list.
+//! Schedules, secrets, shares and decision requests, read and changed through crux on a task of
+//! their own so a slow call never holds up the launch list.
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crux::client::Shared;
 use crux::dto;
 use rune::{TextEdit, Waker};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::live::{Cache, Connection};
+use crate::net::{Connection, Connector, Task, within};
 
 /// How often what is on screen is read again.
 const SHOWN: Duration = Duration::from_secs(15);
@@ -185,10 +186,11 @@ enum Msg {
     Reconnect,
 }
 
-/// The UI-side handle to the worker. Dropping it stops the thread.
+/// The UI-side handle to the worker. Dropping it ends its task.
 pub struct Client {
-    tx: Sender<Msg>,
+    tx: UnboundedSender<Msg>,
     shared: Arc<Mutex<Published>>,
+    _task: Option<Task>,
 }
 
 #[derive(Default)]
@@ -199,21 +201,28 @@ struct Published {
 }
 
 impl Client {
-    pub fn spawn(target: crate::profile::Target) -> Self {
-        let (tx, rx) = mpsc::channel();
+    pub fn spawn(connector: Connector) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Mutex::new(Published::default()));
-        let worker = Arc::clone(&shared);
-        if let Err(error) = std::thread::Builder::new()
-            .name("crucible-playbooks-admin".into())
-            .spawn(move || run(target, rx, worker))
-        {
-            let view = AdminView {
-                decisions: Some(Err(format!("starting the admin worker: {error}"))),
-                ..AdminView::default()
-            };
-            publish(&shared, view);
+        let task = match connector.runtime() {
+            Ok(runtime) => Some(Task::spawn(
+                &runtime,
+                run(connector, rx, Arc::clone(&shared)),
+            )),
+            Err(why) => {
+                let view = AdminView {
+                    decisions: Some(Err(why)),
+                    ..AdminView::default()
+                };
+                publish(&shared, view);
+                None
+            }
+        };
+        Client {
+            tx,
+            shared,
+            _task: task,
         }
-        Client { tx, shared }
     }
 
     pub fn set_waker(&self, waker: Waker) {
@@ -255,26 +264,15 @@ fn publish(shared: &Mutex<Published>, view: AdminView) {
 }
 
 struct Worker {
-    target: crate::profile::Target,
-    cache: Option<Cache>,
-    connection: Option<Connection>,
+    connector: Connector,
     view: AdminView,
     acted: u64,
 }
 
 impl Worker {
-    fn connection(&mut self) -> Result<&Connection, String> {
-        if self.connection.is_none() {
-            self.connection = Some(Connection::open(&self.target, self.cache.as_ref())?);
-        }
-        self.connection
-            .as_ref()
-            .ok_or_else(|| "no controller connection".to_string())
-    }
-
-    fn refresh(&mut self, watch: &Watch) {
-        let read = match self.connection() {
-            Ok(c) => read(c, watch),
+    async fn refresh(&mut self, watch: &Watch) {
+        let read = match self.connector.connect().await {
+            Ok(c) => read(&c.client, watch).await,
             Err(why) => Read::failed(&why, watch),
         };
         self.view.decisions = Some(read.decisions);
@@ -290,9 +288,12 @@ impl Worker {
         self.view.decision = read.decision.map(|(id, decision)| (id, Some(decision)));
     }
 
-    fn act(&mut self, action: Action) {
+    async fn act(&mut self, action: Action) {
         let what = action.what();
-        let result = self.connection().and_then(|c| act(c, &action));
+        let result = match self.connector.connect().await {
+            Ok(c) => act(&c, &action).await,
+            Err(why) => Err(why),
+        };
         self.acted += 1;
         self.view.acted = Some(Acted {
             seq: self.acted,
@@ -302,7 +303,7 @@ impl Worker {
     }
 }
 
-/// One pass over what `Watch` asks for.
+/// One pass over what `Watch` asks for, read all at once.
 struct Read {
     decisions: Result<Vec<dto::DecisionSummary>, String>,
     approvals: Result<dto::Approvals, String>,
@@ -328,118 +329,142 @@ impl Read {
     }
 }
 
-fn read(c: &Connection, watch: &Watch) -> Read {
-    let client = &c.client;
+/// `read`'s answer when `on`, and nothing asked otherwise.
+async fn when<T>(on: bool, read: impl Future<Output = T>) -> Option<T> {
+    if on { Some(read.await) } else { None }
+}
+
+async fn read(client: &crux::Client, watch: &Watch) -> Read {
+    let secret = async {
+        let id = watch.secret.as_ref()?;
+        let (detail, audit) = tokio::join!(
+            within("the secret", client.secret(id)),
+            within("its audit trail", client.secret_audit(id)),
+        );
+        let view = detail.and_then(|detail| {
+            Ok(SecretView {
+                detail,
+                audit: audit?,
+            })
+        });
+        Some((id.clone(), view))
+    };
+    let shares = async {
+        let of = watch.shares.as_ref()?;
+        Some((of.clone(), within("the shares", client.shares(of)).await))
+    };
+    let decision = async {
+        let id = watch.decision.as_ref()?;
+        let decision = within("the decision request", client.decision(id)).await;
+        Some((id.clone(), decision))
+    };
+    let (decisions, approvals, schedules, secrets, secret, shares, decision) = tokio::join!(
+        within("the decision queue", client.decisions()),
+        within("the approval queue", client.approvals()),
+        when(watch.schedules, within("the schedules", client.schedules())),
+        when(watch.secrets, within("the secrets", client.secrets())),
+        secret,
+        shares,
+        decision,
+    );
     Read {
-        decisions: c
-            .call("the decision queue", client.decisions())
-            .map(|queue| queue.open),
-        approvals: c.call("the approval queue", client.approvals()),
-        schedules: watch
-            .schedules
-            .then(|| c.call("the schedules", client.schedules())),
-        secrets: watch
-            .secrets
-            .then(|| c.call("the secrets", client.secrets())),
-        secret: watch.secret.clone().map(|id| {
-            let view = c.call("the secret", client.secret(&id)).and_then(|detail| {
-                let audit = c.call("its audit trail", client.secret_audit(&id))?;
-                Ok(SecretView { detail, audit })
-            });
-            (id, view)
-        }),
-        shares: watch.shares.clone().map(|of| {
-            let shares = c.call("the shares", client.shares(&of));
-            (of, shares)
-        }),
-        decision: watch.decision.clone().map(|id| {
-            let decision = c.call("the decision request", client.decision(&id));
-            (id, decision)
-        }),
+        decisions: decisions.map(|queue| queue.open),
+        approvals,
+        schedules,
+        secrets,
+        secret,
+        shares,
+        decision,
     }
 }
 
-fn act(c: &Connection, action: &Action) -> Result<(), String> {
+async fn act(c: &Connection, action: &Action) -> Result<(), String> {
     let client = &c.client;
     match action {
-        Action::Enable { schedule, on } => c
-            .call(
-                "saving the schedule",
-                client.update_schedule::<serde_json::Value>(&schedule.id, &schedule.body(*on)),
-            )
-            .map(drop),
+        Action::Enable { schedule, on } => within(
+            "saving the schedule",
+            client.update_schedule::<serde_json::Value>(&schedule.id, &schedule.body(*on)),
+        )
+        .await
+        .map(drop),
         Action::Grant {
             of,
             grantee,
             role,
             not_after,
-        } => c
-            .call(
-                "the share",
-                client.grant_share(of, grantee, role, not_after.as_deref()),
-            )
-            .map(drop),
-        Action::Revoke { of, grantee } => c.call("the share", client.revoke_share(of, grantee)),
-        Action::Rotate { secret, value } => c
-            .call("the rotation", client.rotate_secret(secret, value))
-            .map(drop),
+        } => within(
+            "the share",
+            client.grant_share(of, grantee, role, not_after.as_deref()),
+        )
+        .await
+        .map(drop),
+        Action::Revoke { of, grantee } => {
+            within("the share", client.revoke_share(of, grantee)).await
+        }
+        Action::Rotate { secret, value } => {
+            within("the rotation", client.rotate_secret(secret, value))
+                .await
+                .map(drop)
+        }
         Action::Unbind { secret, binding } => {
-            c.call("the binding", client.unbind_secret(secret, binding))
+            within("the binding", client.unbind_secret(secret, binding)).await
         }
         Action::Answer {
             id,
             labels,
             digest,
             note,
-        } => c
-            .call(
-                "the answer",
-                client.answer_decision(id, labels, digest, note.as_deref()),
-            )
-            .map(drop),
-        Action::CreateSecret { body } => c
-            .call(
-                "the new secret",
-                client.create_secret::<serde_json::Value>(body),
-            )
-            .map(drop),
-        Action::MoveSecret { secret, owner } => c
-            .call("the owner change", client.transfer_secret(secret, owner))
-            .map(drop),
-        Action::SaveSchedule { id: None, body } => c
-            .call(
-                "the new schedule",
-                client.create_schedule::<serde_json::Value>(body),
-            )
-            .map(drop),
-        Action::SaveSchedule { id: Some(id), body } => c
-            .call(
-                "the schedule",
-                client.update_schedule::<serde_json::Value>(id, body),
-            )
-            .map(drop),
+        } => within(
+            "the answer",
+            client.answer_decision(id, labels, digest, note.as_deref()),
+        )
+        .await
+        .map(drop),
+        Action::CreateSecret { body } => within(
+            "the new secret",
+            client.create_secret::<serde_json::Value>(body),
+        )
+        .await
+        .map(drop),
+        Action::MoveSecret { secret, owner } => {
+            within("the owner change", client.transfer_secret(secret, owner))
+                .await
+                .map(drop)
+        }
+        Action::SaveSchedule { id: None, body } => within(
+            "the new schedule",
+            client.create_schedule::<serde_json::Value>(body),
+        )
+        .await
+        .map(drop),
+        Action::SaveSchedule { id: Some(id), body } => within(
+            "the schedule",
+            client.update_schedule::<serde_json::Value>(id, body),
+        )
+        .await
+        .map(drop),
         Action::RegisterImport {
             import,
             id,
             description,
-        } => c
-            .call(
-                "the registration",
-                client.register_import(import, &dto::RegisterImport { id, description }),
-            )
+        } => within(
+            "the registration",
+            client.register_import(import, &dto::RegisterImport { id, description }),
+        )
+        .await
+        .map(drop),
+        Action::DiscardImport { import } => within("the discard", client.discard_import(import))
+            .await
             .map(drop),
-        Action::DiscardImport { import } => c
-            .call("the discard", client.discard_import(import))
+        Action::CancelLaunch { key } => within("the cancel", client.cancel_launch(key))
+            .await
             .map(drop),
-        Action::CancelLaunch { key } => c.call("the cancel", client.cancel_launch(key)).map(drop),
     }
 }
 
-fn run(target: crate::profile::Target, rx: Receiver<Msg>, shared: Arc<Mutex<Published>>) {
+async fn run(connector: Connector, mut rx: UnboundedReceiver<Msg>, shared: Arc<Mutex<Published>>) {
     let mut worker = Worker {
-        target,
-        cache: Cache::open(),
-        connection: None,
+        connector,
         view: AdminView::default(),
         acted: 0,
     };
@@ -449,27 +474,27 @@ fn run(target: crate::profile::Target, rx: Receiver<Msg>, shared: Arc<Mutex<Publ
         let wait = next
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(500));
-        match rx.recv_timeout(wait) {
-            Ok(Msg::Watch(now)) => {
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(Some(Msg::Watch(now))) => {
                 if now != watch {
                     watch = now;
                     next = Instant::now();
                 }
             }
-            Ok(Msg::Act(action)) => {
-                worker.act(action);
+            Ok(Some(Msg::Act(action))) => {
+                worker.act(action).await;
                 next = Instant::now();
             }
-            Ok(Msg::Reconnect) => {
-                worker.connection = None;
+            Ok(Some(Msg::Reconnect)) => {
+                worker.connector.reset();
                 worker.view = AdminView {
                     acted: worker.view.acted.take(),
                     ..AdminView::default()
                 };
                 next = Instant::now();
             }
-            Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(None) => return,
+            Err(_) => {}
         }
         if Instant::now() < next {
             continue;
@@ -478,7 +503,7 @@ fn run(target: crate::profile::Target, rx: Receiver<Msg>, shared: Arc<Mutex<Publ
             next = Instant::now() + QUEUE;
             continue;
         }
-        worker.refresh(&watch);
+        worker.refresh(&watch).await;
         publish(&shared, worker.view.clone());
         let shown = watch.schedules
             || watch.secrets
@@ -502,7 +527,8 @@ pub struct Desk {
     pub decision: Option<String>,
     pub picks: BTreeMap<String, Vec<String>>,
     pub note: TextEdit,
-    /// The share form.
+    /// Whether the share form is open.
+    pub sharing: bool,
     pub grantee: TextEdit,
     pub role: usize,
     /// `YYYY-MM-DD`, or blank for no end.
@@ -531,6 +557,7 @@ impl Default for Desk {
             decision: None,
             picks: BTreeMap::new(),
             note: TextEdit::new(""),
+            sharing: false,
             grantee: TextEdit::new(""),
             role: 0,
             until: TextEdit::new(""),
@@ -842,20 +869,22 @@ impl crate::App {
             schedules: on(crate::Page::Schedules),
             secrets: on(crate::Page::Secrets),
             secret: self
+                .remote
                 .desk
                 .secret
                 .clone()
                 .filter(|_| on(crate::Page::Secrets)),
             shares: self.shared_here().filter(|_| on(crate::Page::Runs)),
             decision: self
+                .remote
                 .desk
                 .decision
                 .clone()
                 .filter(|_| on(crate::Page::Decisions)),
         };
-        if self.admin_sent.as_ref() != Some(&watch) {
-            self.admin_client.watch(watch.clone());
-            self.admin_sent = Some(watch);
+        if self.remote.admin_sent.as_ref() != Some(&watch) {
+            self.remote.admin_client.watch(watch.clone());
+            self.remote.admin_sent = Some(watch);
         }
     }
 
@@ -869,7 +898,7 @@ impl crate::App {
         else {
             return None;
         };
-        Some(if self.registered.contains(playbook) {
+        Some(if self.remote.registered.contains(playbook) {
             Shared::Playbook(playbook.clone())
         } else {
             Shared::Draft(playbook.clone())
@@ -877,32 +906,39 @@ impl crate::App {
     }
 
     pub fn act(&mut self, action: Action) {
-        self.desk.armed = None;
-        self.desk.sent = Some(self.admin.acted.as_ref().map_or(0, |acted| acted.seq));
-        self.desk.outcome = None;
-        self.admin_client.act(action);
+        self.remote.desk.armed = None;
+        self.remote.desk.sent = Some(
+            self.remote
+                .admin
+                .acted
+                .as_ref()
+                .map_or(0, |acted| acted.seq),
+        );
+        self.remote.desk.outcome = None;
+        self.remote.admin_client.act(action);
     }
 
     pub fn apply_admin(&mut self, view: AdminView) {
-        if let (Some(sent), Some(acted)) = (self.desk.sent, &view.acted)
+        if let (Some(sent), Some(acted)) = (self.remote.desk.sent, &view.acted)
             && acted.seq > sent
         {
-            self.desk.sent = None;
+            self.remote.desk.sent = None;
             if acted.result.is_ok() {
                 match acted.did {
-                    Did::Rotate => self.desk.rotate = None,
+                    Did::Rotate => self.remote.desk.rotate = None,
                     Did::Answer => {
-                        self.desk.picks.clear();
-                        self.desk.note = TextEdit::new("");
+                        self.remote.desk.picks.clear();
+                        self.remote.desk.note = TextEdit::new("");
                     }
                     Did::Grant => {
-                        self.desk.grantee = TextEdit::new("");
-                        self.desk.until = TextEdit::new("");
+                        self.remote.desk.sharing = false;
+                        self.remote.desk.grantee = TextEdit::new("");
+                        self.remote.desk.until = TextEdit::new("");
                     }
-                    Did::CreateSecret => self.desk.new_secret = None,
-                    Did::MoveSecret => self.desk.move_to = None,
+                    Did::CreateSecret => self.remote.desk.new_secret = None,
+                    Did::MoveSecret => self.remote.desk.move_to = None,
                     Did::SaveSchedule => {
-                        self.launcher = None;
+                        self.remote.launcher = None;
                         self.page = crate::Page::Schedules;
                     }
                     Did::Enable
@@ -914,16 +950,16 @@ impl crate::App {
                 }
             }
             if let (Did::SaveSchedule, Err(why), Some(launcher)) =
-                (acted.did, &acted.result, self.launcher.as_mut())
+                (acted.did, &acted.result, self.remote.launcher.as_mut())
             {
                 launcher.stage = crate::Stage::Ready;
                 launcher.refusal = Some(why.clone());
             }
-            self.desk.outcome = Some(acted.result.clone());
+            self.remote.desk.outcome = Some(acted.result.clone());
         }
         if let Some(Ok(open)) = &view.decisions {
             let looking = crate::notify::app_focused() && self.page == crate::Page::Decisions;
-            for decision in self.desk.arrived(open) {
+            for decision in self.remote.desk.arrived(open) {
                 if self.settings.ask
                     && !looking
                     && let Some(notifier) = &self.notifier
@@ -932,12 +968,12 @@ impl crate::App {
                 }
             }
         }
-        self.admin = view;
+        self.remote.admin = view;
     }
 
     /// How many decision requests wait on the signed-in user.
     pub fn waiting(&self) -> usize {
-        match &self.admin.decisions {
+        match &self.remote.admin.decisions {
             Some(Ok(open)) => open.len(),
             _ => 0,
         }
@@ -945,7 +981,7 @@ impl crate::App {
 
     /// Scope packs to approve and imports to settle.
     pub fn approvals_waiting(&self) -> usize {
-        match &self.admin.approvals {
+        match &self.remote.admin.approvals {
             Some(Ok(queue)) => queue.waiting(),
             _ => 0,
         }
@@ -962,7 +998,7 @@ fn fixture() -> Result<dto::Decision, String> {
 pub fn show_fixture(app: &mut crate::App) {
     let decision = fixture();
     if let Ok(d) = &decision {
-        app.admin.decisions = Some(Ok(vec![dto::DecisionSummary {
+        app.remote.admin.decisions = Some(Ok(vec![dto::DecisionSummary {
             id: d.id.clone(),
             run_id: d.run_id.clone(),
             task: d.task.clone(),
@@ -971,10 +1007,10 @@ pub fn show_fixture(app: &mut crate::App) {
             opened_at: d.opened_at.clone(),
             expires_at: d.expires_at.clone(),
         }]));
-        app.desk.pick_decision(&d.id);
-        app.admin.decision = Some((d.id.clone(), Some(Ok(d.clone()))));
+        app.remote.desk.pick_decision(&d.id);
+        app.remote.admin.decision = Some((d.id.clone(), Some(Ok(d.clone()))));
     } else {
-        app.admin.decisions = Some(decision.map(|_| Vec::new()));
+        app.remote.admin.decisions = Some(decision.map(|_| Vec::new()));
     }
 }
 
@@ -993,6 +1029,50 @@ mod tests {
         desk.toggle_pick("ship", "yes", false);
         desk.toggle_pick("repos", "llm-d/llm-d", true);
         assert!(desk.unanswered(&decision).is_empty());
+    }
+
+    #[test]
+    fn everything_watched_is_read_at_once() {
+        let slow = Duration::from_secs(1);
+        let (url, _) = crate::testserver::serve(move |request| {
+            std::thread::sleep(slow);
+            match request.split_whitespace().nth(1) {
+                Some("/api/decisions") => r#"{"open":[]}"#.into(),
+                Some("/api/approvals") => "{}".into(),
+                _ => "[]".into(),
+            }
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client =
+            Client::spawn(net.connector(crate::testserver::target("t", &url, keys.path())));
+        let asked = Instant::now();
+        client.watch(Watch {
+            controller: true,
+            schedules: true,
+            secrets: true,
+            ..Watch::default()
+        });
+        let view = loop {
+            if let Some((_, view)) = client.take(0) {
+                break view;
+            }
+            assert!(
+                asked.elapsed() < Duration::from_secs(10),
+                "nothing was read"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            asked.elapsed() < slow * 3,
+            "four reads of {slow:?} each took {:?}",
+            asked.elapsed()
+        );
+        assert_eq!(view.decisions, Some(Ok(Vec::new())));
+        assert_eq!(view.approvals.map(|a| a.map(|a| a.waiting())), Some(Ok(0)));
+        assert_eq!(view.schedules.map(|s| s.map(|s| s.len())), Some(Ok(0)));
+        assert_eq!(view.secrets.map(|s| s.map(|s| s.len())), Some(Ok(0)));
+        assert!(view.secret.is_none() && view.shares.is_none() && view.decision.is_none());
     }
 
     fn summary(id: &str) -> dto::DecisionSummary {

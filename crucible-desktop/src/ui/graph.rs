@@ -23,16 +23,16 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
             .child(empty_run(pane, p));
     }
     let marks = if pane.previewing && !pane.run_tasks.is_empty() {
-        edits(&pane.run_tasks, &pane.tasks)
+        edits(pane.run_tasks, pane.tasks)
     } else {
         HashMap::new()
     };
     let shown = Shown {
-        open: app.expanded.as_deref(),
-        unfolded: &app.unfolded,
+        open: app.run.expanded.as_deref(),
+        unfolded: &app.run.unfolded,
         marks: &marks,
     };
-    let source = mermaid_source(&pane.tasks, &shown, &Ink::of(p));
+    let source = mermaid_source(pane.tasks, &shown, &Ink::of(p));
     let mut style = rune_mermaid::DiagramStyle::neutral(p.dark);
     style.font = p.mono(11.5, 400.0);
     style.max_width = 1160.0;
@@ -46,7 +46,7 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
     let decorate = |target: &rune_mermaid::Target, spot: El| {
         let pointer = |spot: El, help: String| spot.cursor(rune::Cursor::Pointer).help(help);
         match target {
-            rune_mermaid::Target::Node(id) => match graph_node(&pane.tasks, id) {
+            rune_mermaid::Target::Node(id) => match graph_node(pane.tasks, id) {
                 Some((task, Some(key))) => {
                     let (name, key) = (task.name.clone(), key.to_string());
                     pointer(spot, format!("{name}[{key}]"))
@@ -54,9 +54,9 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
                 }
                 Some((task, None)) => {
                     let name = task.name.clone();
-                    let open = app.expanded.as_deref() == Some(task.name.as_str());
+                    let open = app.run.expanded.as_deref() == Some(task.name.as_str());
                     let help = match (task.instances.is_empty(), open) {
-                        (false, true) if app.unfolded.contains(&name) => {
+                        (false, true) if app.run.unfolded.contains(&name) => {
                             format!("Fold {name}'s instances")
                         }
                         (false, true) => format!("Show {name}'s instances"),
@@ -75,7 +75,7 @@ pub(crate) fn graph_view(pane: &Pane, app: &App, p: &Paint) -> El {
             },
             rune_mermaid::Target::Edge { from, to } => {
                 let (Some((from, _)), Some((task, _))) =
-                    (graph_node(&pane.tasks, from), graph_node(&pane.tasks, to))
+                    (graph_node(pane.tasks, from), graph_node(pane.tasks, to))
                 else {
                     return spot;
                 };
@@ -187,13 +187,15 @@ fn preview_head(pane: &Pane, p: &Paint) -> Option<El> {
             SegmentedControl::new(&["Run", "Working copy"], Some(usize::from(pane.previewing)))
                 .label("Graph source")
                 .width(Some(250.0))
-                .on_pick(|app: &mut App, i: usize, _: &mut Tx| app.graph_source = Some(SOURCES[i]))
+                .on_pick(|app: &mut App, i: usize, _: &mut Tx| {
+                    app.remote.graph_source = Some(SOURCES[i])
+                })
                 .build(p.k)
                 .key("graph-source"),
         );
     }
     if pane.previewing && !pane.run_tasks.is_empty() {
-        let marks = edits(&pane.run_tasks, &pane.tasks);
+        let marks = edits(pane.run_tasks, pane.tasks);
         let added = marks.values().filter(|e| **e == Edit::Added).count();
         let changed = marks.len() - added;
         let removed: Vec<&str> = pane

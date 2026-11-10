@@ -4,9 +4,7 @@
 //! The controller and its key come from the profile in use; see [`crate::profile`].
 
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -14,6 +12,7 @@ use crucible_contract::session::SessionEvent;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::Value;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use rune::Waker;
@@ -21,13 +20,12 @@ use rune::Waker;
 use crate::captured::{Body, Captured, Opened};
 use crate::draft::Working;
 use crate::filter::LaunchFilter;
-use crate::httpcache::{CachedTransport, Store};
 use crate::logline::LogLine;
 use crate::model::Verdict;
+use crate::net::{Connection, Connector, Down, Task, reaching, within};
 use crate::pack::PackFiles;
 use crate::session::RunFold;
 
-const TIMEOUT: Duration = Duration::from_secs(25);
 /// How long streamed session lines gather before they are folded and shown, so a burst of agent
 /// output is one redraw rather than dozens.
 const STREAM_BATCH: Duration = Duration::from_millis(40);
@@ -45,7 +43,7 @@ const FOLLOW_REST: Duration = Duration::from_secs(4);
 pub enum LiveView {
     #[default]
     Loading,
-    Unavailable(String),
+    Unavailable(Down),
     Ready {
         endpoint: String,
         identity: Identity,
@@ -100,7 +98,7 @@ impl LiveView {
             .into_iter()
             .filter(|launch| seen.insert(launch.id.as_str()))
             .collect();
-        rows.sort_by_key(|row| row.status != "running");
+        rows.sort_by_key(|row| !row.status.is_running());
         rows
     }
 
@@ -151,11 +149,11 @@ impl Identity {
 }
 
 /// One launch of a registered playbook.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct LivePlaybook {
     pub id: String,
     pub key: String,
-    pub status: String,
+    pub status: LaunchStatus,
     pub cost: Option<f64>,
     pub cap: f64,
     pub by: String,
@@ -186,11 +184,12 @@ impl LivePlaybook {
     }
 
     pub fn verdict(&self) -> Verdict {
-        match self.status.as_str() {
-            "running" => Verdict::Running,
-            "done" => Verdict::Valid,
-            "error" => Verdict::Error,
-            _ => Verdict::Unfinished,
+        match self.status {
+            LaunchStatus::Running => Verdict::Running,
+            LaunchStatus::Done => Verdict::Valid,
+            LaunchStatus::Error => Verdict::Error,
+            LaunchStatus::Cancelled => Verdict::Cancelled,
+            LaunchStatus::New | LaunchStatus::Other(_) => Verdict::Unfinished,
         }
     }
 }
@@ -230,21 +229,76 @@ pub struct Base {
     pub error: Option<String>,
 }
 
-/// The controller's `parked` token is always a launch error on playbook runs; relabeled here
-/// only, the wire token is unchanged.
-fn shown_status(status: &str) -> &str {
-    match status {
-        "parked" => "error",
-        status => status,
+/// How the controller's reason for parking a cancelled launch starts.
+const CANCELLED: &str = "cancelled by ";
+
+/// Where a launch stands, from the controller's status token.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum LaunchStatus {
+    #[default]
+    New,
+    Running,
+    Done,
+    Error,
+    /// Stopped by a person.
+    Cancelled,
+    Other(String),
+}
+
+impl LaunchStatus {
+    /// The controller's `parked` token is always a launch error on playbook runs, and a cancel
+    /// is one it parks with a reason that starts `cancelled by`.
+    pub fn parse(token: &str, why: Option<&str>) -> Self {
+        match token {
+            "new" => Self::New,
+            "running" => Self::Running,
+            "done" => Self::Done,
+            "error" | "parked" if why.is_some_and(|why| why.starts_with(CANCELLED)) => {
+                Self::Cancelled
+            }
+            "error" | "parked" => Self::Error,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::New => "new",
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+            Self::Other(token) => token,
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        *self == Self::Running
     }
 }
 
-/// What the window and the session streams tell the worker.
+impl std::fmt::Display for LaunchStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What the window, the session streams and finished actions tell the worker.
 enum Msg {
     /// Which launch to keep current; `None` stops reading details.
     Select(Option<String>),
     /// A session stream delivered lines.
     Streamed,
+    /// Read the launch list now.
+    Refresh,
+    /// Drop the connection and who it named, and read crux's config afresh.
+    Reconnect,
+    /// Which launch to read as the base of a comparison; `None` stops.
+    Compare(Option<String>),
+}
+
+/// What the window asks for that runs as a task of its own.
+enum Action {
     /// Read a target's params schema and the admin caps, for a launch form.
     Prepare(Target),
     /// Launch a target with this body (`params`, `max_cost`, `max_time`, maybe `rerun`).
@@ -262,16 +316,376 @@ enum Msg {
     /// Push a pack folder as the next version of the draft named after it, creating the draft on
     /// first drop, and test-fire it under these ceilings.
     Drop {
-        dir: std::path::PathBuf,
+        dir: PathBuf,
         max_cost: f64,
         max_time: String,
     },
-    /// Drop the connection and who it named, and read crux's config afresh.
-    Reconnect,
-    /// Which launch to read as the base of a comparison; `None` stops.
-    Compare(Option<String>),
-    /// Fetch one file a run captured, by its key.
-    File { run: String, key: String },
+    /// Fetch one file a run captured, by its key. `size` is what the listing says it holds, and
+    /// `settled` that its run has stopped, so its copy on disk can stand in for it.
+    File {
+        run: String,
+        key: String,
+        size: u64,
+        settled: bool,
+    },
+}
+
+/// What an [`Action`] came to.
+enum Reply {
+    Prepared {
+        target: Target,
+        result: Result<Form, String>,
+    },
+    Launched {
+        playbook: String,
+        result: Result<String, String>,
+    },
+    Reran {
+        run: String,
+        from: Vec<String>,
+        result: Result<crux::dto::RerunPreview, String>,
+    },
+    Synced {
+        draft: String,
+        result: Result<(Working, Option<String>), String>,
+    },
+    Dropped {
+        dir: PathBuf,
+        draft: String,
+        result: Result<DropOutcome, String>,
+    },
+    File(Opened),
+}
+
+impl Action {
+    /// Whether the launch list changes when this lands.
+    fn launches(&self) -> bool {
+        matches!(self, Action::Launch { .. } | Action::Drop { .. })
+    }
+
+    async fn run(self, c: Connection, dirs: &Dirs) -> Reply {
+        match self {
+            Action::Prepare(target) => {
+                let result = prepare(&c, &target).await;
+                Reply::Prepared { target, result }
+            }
+            Action::Launch { target, body } => {
+                let result = send_launch(&c, &target, &body).await;
+                Reply::Launched {
+                    playbook: target.id().to_string(),
+                    result,
+                }
+            }
+            Action::Rerun { run, from } => {
+                let result = within("the rerun preview", c.client.rerun_preview(&run, &from)).await;
+                Reply::Reran { run, from, result }
+            }
+            Action::Pull { draft, template } => {
+                let result = pull(&c, dirs.drafts.as_deref(), &draft, template.as_deref()).await;
+                Reply::Synced { draft, result }
+            }
+            Action::Save(working) => {
+                let draft = working.draft.clone();
+                let result = save(&c, dirs.drafts.as_deref(), working).await;
+                Reply::Synced { draft, result }
+            }
+            Action::Drop {
+                dir,
+                max_cost,
+                max_time,
+            } => {
+                let draft = draft_id(&dir).unwrap_or_default();
+                let result = drop_pack(&c, &dir, &draft, max_cost, &max_time).await;
+                Reply::Dropped { dir, draft, result }
+            }
+            Action::File {
+                run,
+                key,
+                size,
+                settled,
+            } => {
+                let files = dirs.files.as_deref();
+                let kept =
+                    file_on_disk(files, &run, &key).filter(|(_, bytes)| settled && *bytes == size);
+                Reply::File(match kept {
+                    Some((opened, _)) => opened,
+                    None => fetch_file(&c, files, run, key).await,
+                })
+            }
+        }
+    }
+
+    /// The reply when there is no connection to run on.
+    fn failed(self, why: String, dirs: &Dirs) -> Reply {
+        match self {
+            Action::Prepare(target) => Reply::Prepared {
+                target,
+                result: Err(why),
+            },
+            Action::Launch { target, .. } => Reply::Launched {
+                playbook: target.id().to_string(),
+                result: Err(why),
+            },
+            Action::Rerun { run, from } => Reply::Reran {
+                run,
+                from,
+                result: Err(why),
+            },
+            Action::Pull { draft, .. } => Reply::Synced {
+                draft,
+                result: Err(why),
+            },
+            Action::Save(working) => Reply::Synced {
+                draft: working.draft,
+                result: Err(why),
+            },
+            Action::Drop { dir, .. } => Reply::Dropped {
+                draft: draft_id(&dir).unwrap_or_default(),
+                dir,
+                result: Err(why),
+            },
+            Action::File { run, key, .. } => {
+                Reply::File(match file_on_disk(dirs.files.as_deref(), &run, &key) {
+                    Some((opened, _)) => opened,
+                    None => Opened {
+                        body: Err(why),
+                        run,
+                        key,
+                        disk: None,
+                    },
+                })
+            }
+        }
+    }
+}
+
+async fn prepare(c: &Connection, target: &Target) -> Result<Form, String> {
+    let client = &c.client;
+    let registered = match target {
+        Target::Playbook(id) => Some(id.as_str()),
+        Target::Draft(_) => None,
+    };
+    let schema = async {
+        match target {
+            Target::Playbook(id) => {
+                let schema =
+                    within("the params schema", client.playbook_schema::<Value>(id)).await?;
+                Ok::<_, String>((schema, None))
+            }
+            Target::Draft(id) => {
+                let head: crux::dto::DraftCompile =
+                    within("the draft's schema", client.draft_preview(id, None)).await?;
+                Ok((
+                    head.params_schema.unwrap_or(Value::Null),
+                    head.schema_digest,
+                ))
+            }
+        }
+    };
+    let (schema, caps, targets, providers) = tokio::join!(
+        schema,
+        within("the launch caps", client.playbook_caps()),
+        within("the dispatch targets", client.dispatch_targets(registered)),
+        within("the providers", client.providers()),
+    );
+    let (schema, digest) = schema?;
+    let caps: crux::dto::PlaybookCaps = caps?;
+    Ok(Form {
+        schema,
+        digest,
+        max_cost: caps.max_cost,
+        max_time: caps.max_time,
+        targets: targets?,
+        providers: providers?,
+    })
+}
+
+/// Launch `target` with `body`, for the new launch's key.
+async fn send_launch(c: &Connection, target: &Target, body: &Value) -> Result<String, String> {
+    let ack: crux::dto::LaunchAck = match target {
+        Target::Playbook(id) => within("the launch", c.client.launch(id, body)).await?,
+        Target::Draft(id) => within("the launch", c.client.launch_draft(id, body)).await?,
+    };
+    Ok(ack.key)
+}
+
+/// Pull `draft`'s newest save into its working copy under `drafts`, creating it from `template`
+/// first when the controller has no such draft.
+async fn pull(
+    c: &Connection,
+    drafts: Option<&Path>,
+    draft: &str,
+    template: Option<&str>,
+) -> Result<(Working, Option<String>), String> {
+    let root = drafts.ok_or("no home directory for working copies")?;
+    let newest = within(
+        "the draft",
+        c.client.draft_files::<crux::dto::DraftFiles>(draft, None),
+    )
+    .await;
+    let (files, note) = match (newest, template) {
+        (Ok(files), _) => (files, None),
+        (Err(_), Some(template)) => {
+            let _: crux::dto::DraftCompile = within(
+                "creating the draft",
+                c.client
+                    .create_draft(draft, &format!("Drafted from {template}"), Some(template)),
+            )
+            .await?;
+            let files: crux::dto::DraftFiles =
+                within("the new draft", c.client.draft_files(draft, None)).await?;
+            (
+                files,
+                Some(format!("Created draft {draft} from {template}")),
+            )
+        }
+        (Err(error), None) => return Err(error),
+    };
+    let working = Working::write(root, draft, files.version, &files.files)?;
+    Ok((working, note))
+}
+
+/// Push pack folder `dir` as the next version of `draft`, creating the draft on first drop, and
+/// test-fire that version under `max_cost` and `max_time` where the draft's newest run went.
+async fn drop_pack(
+    c: &Connection,
+    dir: &Path,
+    draft: &str,
+    max_cost: f64,
+    max_time: &str,
+) -> Result<DropOutcome, String> {
+    if draft.is_empty() {
+        return Err(format!(
+            "{} names no draft: its name has no letters or digits",
+            dir.display()
+        ));
+    }
+    let (files, _) = crate::draft::read(dir)?;
+    if files.is_empty() {
+        return Err(format!("{} holds no pack files", dir.display()));
+    }
+    let newest = within(
+        "the draft",
+        c.client.draft_files::<crux::dto::DraftFiles>(draft, None),
+    )
+    .await;
+    let base = match newest {
+        Ok(newest) => newest.version,
+        Err(_) => {
+            let created: crux::dto::DraftCompile = within(
+                "creating the draft",
+                c.client.create_draft(
+                    draft,
+                    &format!("Dropped on Crucible Playbooks from {}", dir.display()),
+                    None,
+                ),
+            )
+            .await?;
+            created.version
+        }
+    };
+    match within("the save", c.client.save_draft(draft, &files, base)).await? {
+        crux::client::DraftSave::Saved(_) => {}
+        crux::client::DraftSave::Stale(stale) => return Err(stale.error),
+    }
+    let launches: Vec<crux::dto::PlaybookRun> = within(
+        "the draft's launches",
+        c.client.playbook_runs(None, Some(draft)),
+    )
+    .await?;
+    let Some(newest) = crate::runs_on::newest_dispatched(&launches) else {
+        return Ok(DropOutcome::Saved);
+    };
+    let newest: crux::dto::PlaybookLaunch =
+        within("the draft's newest launch", c.client.playbook_run(newest)).await?;
+    let Ok(runs_on) = crate::runs_on::RunsOn::try_from(&newest) else {
+        return Ok(DropOutcome::Saved);
+    };
+    let mut body = serde_json::json!({
+        "params": {},
+        "max_cost": max_cost,
+        "max_time": max_time,
+    });
+    runs_on.pin(&mut body);
+    let ack: crux::dto::LaunchAck =
+        within("the launch", c.client.launch_draft(draft, &body)).await?;
+    Ok(DropOutcome::Launched(ack.key))
+}
+
+/// Save a working copy as its draft's next version.
+async fn save(
+    c: &Connection,
+    drafts: Option<&Path>,
+    mut working: Working,
+) -> Result<(Working, Option<String>), String> {
+    let root = drafts.ok_or("no home directory for working copies")?;
+    let (files, digest) = crate::draft::read(&working.dir)?;
+    if files.is_empty() {
+        return Err("The working copy holds no files".to_string());
+    }
+    let saved = within(
+        "the save",
+        c.client.save_draft(&working.draft, &files, working.base),
+    )
+    .await?;
+    match saved {
+        crux::client::DraftSave::Saved(raw) => {
+            let saved: crux::dto::DraftCompile =
+                serde_json::from_value(raw).map_err(|e| format!("reading the save: {e}"))?;
+            working.saved(root, saved.version, digest)?;
+            let errors: Vec<&str> = saved
+                .diagnostics
+                .iter()
+                .map(|d| d.message.as_str())
+                .collect();
+            let note = if saved.schema_digest.is_none() || !errors.is_empty() {
+                format!(
+                    "Saved version {}, which does not compile: {}",
+                    saved.version,
+                    errors.join("; ")
+                )
+            } else {
+                format!("Saved version {}", saved.version)
+            };
+            Ok((working, Some(note)))
+        }
+        crux::client::DraftSave::Stale(stale) => Err(stale.error),
+    }
+}
+
+/// A captured file's copy on disk and its length, when it has been fetched before.
+fn file_on_disk(files: Option<&Path>, run: &str, key: &str) -> Option<(Opened, u64)> {
+    let disk = crate::captured::cache_path(files?, run, key);
+    let bytes = std::fs::read(&disk).ok()?;
+    let length = bytes.len() as u64;
+    let opened = Opened {
+        body: Ok(Body::from_bytes(bytes)),
+        run: run.to_string(),
+        key: key.to_string(),
+        disk: Some(disk),
+    };
+    Some((opened, length))
+}
+
+/// Fetch one captured file and keep a copy under `files`.
+async fn fetch_file(c: &Connection, files: Option<&Path>, run: String, key: String) -> Opened {
+    let bytes = within("the file", c.client.run_file(&run, &key)).await;
+    let path = files.map(|files| crate::captured::cache_path(files, &run, &key));
+    let disk = match (&bytes, path) {
+        (Ok(bytes), Some(path)) => path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|()| std::fs::write(&path, bytes))
+            .ok()
+            .map(|()| path),
+        _ => None,
+    };
+    Opened {
+        body: bytes.map(Body::from_bytes),
+        run,
+        key,
+        disk,
+    }
 }
 
 /// What a launch form starts: a registered playbook, or a draft's newest save.
@@ -361,7 +775,7 @@ pub struct Finished {
     /// The launch's key.
     pub key: String,
     pub playbook: String,
-    pub status: String,
+    pub status: LaunchStatus,
     pub by: String,
     pub why: Option<String>,
     pub cost: Option<f64>,
@@ -385,12 +799,10 @@ pub fn draft_id(dir: &std::path::Path) -> Option<String> {
 /// The controller fetcher. One instance lives on its own worker thread, so a slow controller
 /// query never delays local log tracking.
 struct Fetcher {
-    target: crate::profile::Target,
-    connection: Option<Connection>,
-    cache: Option<Cache>,
+    connector: Connector,
     identity: Option<(String, Identity)>,
     view: LiveView,
-    detail: Option<LiveDetail>,
+    detail: Option<Arc<LiveDetail>>,
     base: Option<Base>,
     launches: HashMap<String, CachedLaunch>,
     packs: HashMap<String, PackFiles>,
@@ -398,98 +810,17 @@ struct Fetcher {
     finished: Vec<Finished>,
     finished_seq: u64,
     /// Handed to each session stream, so new lines wake the worker.
-    wake: Sender<Msg>,
+    wake: UnboundedSender<Msg>,
     /// Registered playbook ids, the ones a launch form can start, and when they were read.
     registered: Vec<String>,
     registered_at: Option<Instant>,
-    prepared: Option<Prepared>,
-    launched: Option<Launched>,
-    reran: Option<Reran>,
-    synced: Option<Synced>,
-    dropped: Option<Dropped>,
-    /// The captured file the Files pane asked for.
-    opened: Option<Opened>,
-    replies: u64,
-    /// Where draft working copies go.
-    drafts: Option<std::path::PathBuf>,
-}
-
-/// What the controller last answered, on disk, and whether answers are coming from it now.
-pub(crate) struct Cache {
-    pub(crate) store: Arc<Store>,
-    offline: Arc<AtomicBool>,
-}
-
-impl Cache {
-    pub(crate) fn open() -> Option<Cache> {
-        let path = crate::httpcache::cache_root()?.join("controller.sqlite");
-        Some(Cache {
-            store: Arc::new(Store::open(&path).ok()?),
-            offline: Arc::new(AtomicBool::new(false)),
-        })
-    }
-
-    fn offline(&self) -> bool {
-        self.offline.load(Ordering::Relaxed)
-    }
-}
-
-/// The crux client and the runtime its calls block on.
-pub(crate) struct Connection {
-    pub(crate) client: crux::Client,
-    runtime: tokio::runtime::Runtime,
-}
-
-impl Connection {
-    /// The controller `target` names, read through `cache` when there is one.
-    pub(crate) fn open(
-        target: &crate::profile::Target,
-        cache: Option<&Cache>,
-    ) -> Result<Self, String> {
-        target.ready()?;
-        let config = target.config()?;
-        let wire = crux::client::HttpTransport::with_client(&config, target.http()?)
-            .map_err(|error| format!("{error:#}"))?;
-        let transport: Arc<dyn crux::client::Transport> = match cache {
-            Some(cache) => Arc::new(CachedTransport::new(
-                Arc::new(wire),
-                cache.store.clone(),
-                cache.offline.clone(),
-            )),
-            None => Arc::new(wire),
-        };
-        let client = crux::Client::new(transport);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("crucible-playbooks-http")
-            .enable_all()
-            .build()
-            .map_err(|error| format!("starting the controller client: {error}"))?;
-        Ok(Connection { client, runtime })
-    }
-
-    /// Run one call to its end or [`TIMEOUT`], whichever comes first.
-    pub(crate) fn call<T, E: std::fmt::Display>(
-        &self,
-        what: &str,
-        call: impl Future<Output = Result<T, E>>,
-    ) -> Result<T, String> {
-        match self
-            .runtime
-            .block_on(async { tokio::time::timeout(TIMEOUT, call).await })
-        {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => Err(format!("{error:#}")),
-            Err(_) => Err(format!("{what} timed out after {}s", TIMEOUT.as_secs())),
-        }
-    }
 }
 
 /// One launch's detail, as of the run count and status the launch list showed when it was read:
 /// a dispatch or a status change is what invalidates it.
 struct CachedLaunch {
     runs: i64,
-    status: String,
+    status: LaunchStatus,
     detail: crux::dto::PlaybookLaunch,
 }
 
@@ -523,9 +854,8 @@ struct SessionFollow {
 }
 
 impl SessionFollow {
-    /// Start the stream as a task on the connection's runtime, the one that drives every pooled
-    /// connection the client holds.
-    fn spawn(connection: &Connection, run_id: &str, wake: Sender<Msg>) -> Self {
+    /// Start the stream as a task on the connection's runtime.
+    fn spawn(connection: &Connection, run_id: &str, wake: UnboundedSender<Msg>) -> Self {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let logs = Arc::new(Mutex::new(Vec::new()));
         let ended = Arc::new(Mutex::new(None));
@@ -534,7 +864,7 @@ impl SessionFollow {
         let log_sink = Arc::clone(&logs);
         let log_wake = wake.clone();
         let (client, run_id) = (connection.client.clone(), run_id.to_string());
-        connection.runtime.spawn(async move {
+        connection.spawn(async move {
             let mut collect = move |line: &str| {
                 if let Ok(mut lines) = sink.lock() {
                     if lines.is_empty() {
@@ -599,11 +929,9 @@ impl Drop for SessionFollow {
 }
 
 impl Fetcher {
-    fn new(target: crate::profile::Target, wake: Sender<Msg>) -> Self {
+    fn new(connector: Connector, wake: UnboundedSender<Msg>) -> Self {
         Fetcher {
-            target,
-            connection: None,
-            cache: Cache::open(),
+            connector,
             identity: None,
             view: LiveView::Loading,
             detail: None,
@@ -616,19 +944,11 @@ impl Fetcher {
             wake,
             registered: Vec::new(),
             registered_at: None,
-            prepared: None,
-            launched: None,
-            reran: None,
-            synced: None,
-            dropped: None,
-            opened: None,
-            replies: 0,
-            drafts: crate::draft::root(),
         }
     }
 
     /// Re-reads the registered playbooks at most once a minute.
-    fn refresh_registered(&mut self) -> bool {
+    async fn refresh_registered(&mut self) -> bool {
         if self
             .registered_at
             .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
@@ -636,13 +956,15 @@ impl Fetcher {
             return false;
         }
         self.registered_at = Some(Instant::now());
-        let Ok(connection) = self.connection() else {
+        let Ok(connection) = self.connection().await else {
             return false;
         };
-        let Ok(playbooks) = connection.call(
+        let Ok(playbooks) = within(
             "the playbooks",
             connection.client.playbooks::<Vec<crux::dto::Playbook>>(),
-        ) else {
+        )
+        .await
+        else {
             return false;
         };
         let mut ids: Vec<String> = playbooks.into_iter().map(|p| p.id).collect();
@@ -652,267 +974,17 @@ impl Fetcher {
         changed
     }
 
-    fn prepare(&mut self, target: Target) {
-        self.replies += 1;
-        let seq = self.replies;
-        let result = self.connection().and_then(|connection| {
-            let (schema, digest) = match &target {
-                Target::Playbook(id) => (
-                    connection.call(
-                        "the params schema",
-                        connection.client.playbook_schema::<Value>(id),
-                    )?,
-                    None,
-                ),
-                Target::Draft(id) => {
-                    let head: crux::dto::DraftCompile = connection.call(
-                        "the draft's schema",
-                        connection.client.draft_preview(id, None),
-                    )?;
-                    (
-                        head.params_schema.unwrap_or(Value::Null),
-                        head.schema_digest,
-                    )
-                }
-            };
-            let caps: crux::dto::PlaybookCaps =
-                connection.call("the launch caps", connection.client.playbook_caps())?;
-            let registered = match &target {
-                Target::Playbook(id) => Some(id.as_str()),
-                Target::Draft(_) => None,
-            };
-            let targets = connection.call(
-                "the dispatch targets",
-                connection.client.dispatch_targets(registered),
-            )?;
-            let providers = connection.call("the providers", connection.client.providers())?;
-            Ok(Form {
-                schema,
-                digest,
-                max_cost: caps.max_cost,
-                max_time: caps.max_time,
-                targets,
-                providers,
-            })
-        });
-        self.prepared = Some(Prepared {
-            seq,
-            target,
-            result,
-        });
-    }
-
-    fn send_launch(&mut self, target: Target, body: Value) {
-        self.replies += 1;
-        let seq = self.replies;
-        let result = self.connection().and_then(|connection| {
-            let ack: crux::dto::LaunchAck = match &target {
-                Target::Playbook(id) => {
-                    connection.call("the launch", connection.client.launch(id, &body))?
-                }
-                Target::Draft(id) => {
-                    connection.call("the launch", connection.client.launch_draft(id, &body))?
-                }
-            };
-            Ok(ack.key)
-        });
-        self.launched = Some(Launched {
-            seq,
-            playbook: target.id().to_string(),
-            result,
-        });
-    }
-
-    fn preview_rerun(&mut self, run: String, from: Vec<String>) {
-        self.replies += 1;
-        let seq = self.replies;
-        let result = self.connection().and_then(|connection| {
-            connection.call(
-                "the rerun preview",
-                connection.client.rerun_preview(&run, &from),
-            )
-        });
-        self.reran = Some(Reran {
-            seq,
-            run,
-            from,
-            result,
-        });
-    }
-
-    /// Pull `draft`'s newest save into its working copy, creating it from `template` first when
-    /// the controller has no such draft.
-    fn pull(&mut self, draft: String, template: Option<String>) {
-        self.replies += 1;
-        let seq = self.replies;
-        let drafts = self.drafts.clone();
-        let result = self.connection().and_then(|connection| {
-            let root = drafts
-                .as_deref()
-                .ok_or("no home directory for working copies")?;
-            let newest = connection.call(
-                "the draft",
-                connection
-                    .client
-                    .draft_files::<crux::dto::DraftFiles>(&draft, None),
-            );
-            let (files, note) = match (newest, &template) {
-                (Ok(files), _) => (files, None),
-                (Err(_), Some(template)) => {
-                    let _: crux::dto::DraftCompile = connection.call(
-                        "creating the draft",
-                        connection.client.create_draft(
-                            &draft,
-                            &format!("Drafted from {template}"),
-                            Some(template),
-                        ),
-                    )?;
-                    let files = connection
-                        .call("the new draft", connection.client.draft_files(&draft, None))?;
-                    (
-                        files,
-                        Some(format!("Created draft {draft} from {template}")),
-                    )
-                }
-                (Err(error), None) => return Err(error),
-            };
-            let working = Working::write(root, &draft, files.version, &files.files)?;
-            Ok((working, note))
-        });
-        self.synced = Some(Synced { seq, draft, result });
-    }
-
-    /// Push pack folder `dir` as the next version of the draft named after it, creating the draft
-    /// on first drop, and test-fire that version under `max_cost` and `max_time` where the
-    /// draft's newest run went.
-    fn drop_pack(&mut self, dir: std::path::PathBuf, max_cost: f64, max_time: &str) {
-        self.replies += 1;
-        let seq = self.replies;
-        let draft = draft_id(&dir).unwrap_or_default();
-        let result = self.connection().and_then(|connection| {
-            if draft.is_empty() {
-                return Err(format!(
-                    "{} names no draft: its name has no letters or digits",
-                    dir.display()
-                ));
-            }
-            let (files, _) = crate::draft::read(&dir)?;
-            if files.is_empty() {
-                return Err(format!("{} holds no pack files", dir.display()));
-            }
-            let base = match connection.call(
-                "the draft",
-                connection
-                    .client
-                    .draft_files::<crux::dto::DraftFiles>(&draft, None),
-            ) {
-                Ok(newest) => newest.version,
-                Err(_) => {
-                    let created: crux::dto::DraftCompile = connection.call(
-                        "creating the draft",
-                        connection.client.create_draft(
-                            &draft,
-                            &format!("Dropped on Crucible Playbooks from {}", dir.display()),
-                            None,
-                        ),
-                    )?;
-                    created.version
-                }
-            };
-            match connection.call(
-                "the save",
-                connection.client.save_draft(&draft, &files, base),
-            )? {
-                crux::client::DraftSave::Saved(_) => {}
-                crux::client::DraftSave::Stale(stale) => return Err(stale.error),
-            }
-            let launches: Vec<crux::dto::PlaybookRun> = connection.call(
-                "the draft's launches",
-                connection.client.playbook_runs(None, Some(&draft)),
-            )?;
-            let Some(newest) = crate::runs_on::newest_dispatched(&launches) else {
-                return Ok(DropOutcome::Saved);
-            };
-            let newest: crux::dto::PlaybookLaunch = connection.call(
-                "the draft's newest launch",
-                connection.client.playbook_run(newest),
-            )?;
-            let Ok(runs_on) = crate::runs_on::RunsOn::try_from(&newest) else {
-                return Ok(DropOutcome::Saved);
-            };
-            let mut body = serde_json::json!({
-                "params": {},
-                "max_cost": max_cost,
-                "max_time": max_time,
-            });
-            runs_on.pin(&mut body);
-            let ack: crux::dto::LaunchAck =
-                connection.call("the launch", connection.client.launch_draft(&draft, &body))?;
-            Ok(DropOutcome::Launched(ack.key))
-        });
-        self.dropped = Some(Dropped {
-            seq,
-            dir,
-            draft,
-            result,
-        });
-    }
-
-    /// Save a working copy as its draft's next version.
-    fn save(&mut self, mut working: Working) {
-        self.replies += 1;
-        let seq = self.replies;
-        let drafts = self.drafts.clone();
-        let draft = working.draft.clone();
-        let result = self.connection().and_then(|connection| {
-            let root = drafts
-                .as_deref()
-                .ok_or("no home directory for working copies")?;
-            let (files, digest) = crate::draft::read(&working.dir)?;
-            if files.is_empty() {
-                return Err("The working copy holds no files".to_string());
-            }
-            match connection.call(
-                "the save",
-                connection.client.save_draft(&draft, &files, working.base),
-            )? {
-                crux::client::DraftSave::Saved(raw) => {
-                    let saved: crux::dto::DraftCompile = serde_json::from_value(raw)
-                        .map_err(|e| format!("reading the save: {e}"))?;
-                    working.saved(root, saved.version, digest)?;
-                    let errors: Vec<&str> = saved
-                        .diagnostics
-                        .iter()
-                        .map(|d| d.message.as_str())
-                        .collect();
-                    let note = if saved.schema_digest.is_none() || !errors.is_empty() {
-                        format!(
-                            "Saved version {}, which does not compile: {}",
-                            saved.version,
-                            errors.join("; ")
-                        )
-                    } else {
-                        format!("Saved version {}", saved.version)
-                    };
-                    Ok((working, Some(note)))
-                }
-                crux::client::DraftSave::Stale(stale) => Err(stale.error),
-            }
-        });
-        self.synced = Some(Synced { seq, draft, result });
-    }
-
     /// Records each launch the new list shows stopped that the old list showed running.
     fn note_finished(&mut self, next: &[LivePlaybook]) {
         let was_running: HashSet<&str> = self
             .view
             .launches()
             .iter()
-            .filter(|launch| launch.status == "running")
+            .filter(|launch| launch.status.is_running())
             .map(|launch| launch.key.as_str())
             .collect();
         for launch in next {
-            if launch.status != "running" && was_running.contains(launch.key.as_str()) {
+            if !launch.status.is_running() && was_running.contains(launch.key.as_str()) {
                 self.finished_seq += 1;
                 self.finished.push(Finished {
                     seq: self.finished_seq,
@@ -929,49 +1001,13 @@ impl Fetcher {
         self.finished.drain(..excess);
     }
 
-    /// Read one captured file from its copy on disk, else fetch it and write that copy.
-    fn open_file(&mut self, run: String, key: String) {
-        let disk = crate::captured::cache_path(&run, &key);
-        if let Some(text) = disk.as_ref().and_then(|path| std::fs::read(path).ok()) {
-            self.opened = Some(Opened {
-                body: Ok(Body::from_bytes(text)),
-                run,
-                key,
-                disk,
-            });
-            return;
-        }
-        let bytes = self.connection().and_then(|connection| {
-            connection.call("the file", connection.client.run_file(&run, &key))
-        });
-        let disk = match (&bytes, disk) {
-            (Ok(bytes), Some(path)) => path
-                .parent()
-                .map_or(Ok(()), std::fs::create_dir_all)
-                .and_then(|()| std::fs::write(&path, bytes))
-                .ok()
-                .map(|()| path),
-            _ => None,
-        };
-        self.opened = Some(Opened {
-            body: bytes.map(Body::from_bytes),
-            run,
-            key,
-            disk,
-        });
-    }
-
     fn view(&self) -> &LiveView {
         &self.view
     }
 
-    fn detail(&self) -> Option<&LiveDetail> {
-        self.detail.as_ref()
-    }
-
     /// Read launch `key`'s run as the comparison base, once: a stopped run never changes, so a
     /// base already read stays. A launch the list does not show yet is tried again later.
-    fn refresh_base(&mut self, key: Option<&str>) -> bool {
+    async fn refresh_base(&mut self, key: Option<&str>) -> bool {
         let Some(key) = key else {
             let changed = self.base.is_some();
             self.base = None;
@@ -989,12 +1025,16 @@ impl Fetcher {
         };
         let run_id = self
             .launch_detail(&launch)
+            .await
             .and_then(|record| record.runs.first().map(|run| run.run_id.clone()));
-        let next = match (&run_id, self.connection.as_ref()) {
+        let connection = self.connection().await.ok();
+        let next = match (&run_id, &connection) {
             (Some(run_id), Some(connection)) => {
                 let run = self.runs.entry(run_id.clone()).or_default();
                 if !run.settled {
-                    settle(run, connection, run_id);
+                    let session =
+                        within("the session", connection.client.run_session(run_id)).await;
+                    settle(run, connection, run_id, session).await;
                 }
                 Base {
                     key: key.to_string(),
@@ -1018,7 +1058,7 @@ impl Fetcher {
         self.view
             .launches()
             .iter()
-            .any(|launch| launch.status == "running")
+            .any(|launch| launch.status.is_running())
     }
 
     /// Whether the selected launch's run can still change: it is running, or it stopped and its
@@ -1027,7 +1067,7 @@ impl Fetcher {
         let Some(launch) = self.launch(selected) else {
             return false;
         };
-        launch.status == "running"
+        launch.status.is_running()
             || self
                 .launches
                 .get(&launch.key)
@@ -1042,10 +1082,10 @@ impl Fetcher {
 
     /// A failed refresh keeps the last list it had and says so; with no list yet, the failure
     /// is all there is to show.
-    fn unavailable(&mut self, error: String) -> bool {
+    fn unavailable(&mut self, error: Down) -> bool {
         match &mut self.view {
             LiveView::Ready { stale, .. } => {
-                let said = format!("Refresh failed; showing the last list. {error}");
+                let said = format!("Refresh failed; showing the last list. {}", error.why());
                 let changed = stale.as_deref() != Some(said.as_str());
                 *stale = Some(said);
                 changed
@@ -1058,29 +1098,26 @@ impl Fetcher {
         }
     }
 
-    fn connection(&mut self) -> Result<&Connection, String> {
-        if self.connection.is_none() {
-            self.connection = Some(Connection::open(&self.target, self.cache.as_ref())?);
-        }
-        self.connection
-            .as_ref()
-            .ok_or_else(|| "no controller connection".to_string())
+    async fn connection(&self) -> Result<Connection, String> {
+        self.connector.connect().await
     }
 
-    fn refresh_list(&mut self) -> Result<bool, String> {
+    async fn refresh_list(&mut self) -> Result<bool, Down> {
         if self.identity.is_none() {
-            let connection = self.connection()?;
-            let whoami = connection.call("whoami", connection.client.whoami())?;
+            let connection = self.connection().await?;
+            let whoami = reaching("whoami", connection.client.whoami()).await?;
             let endpoint = connection.client.base().to_string();
             self.identity = Some((endpoint, identity(whoami)));
         }
         let (endpoint, identity) = self.identity.clone().unwrap_or_default();
 
-        let connection = self.connection()?;
-        let launches: Vec<crux::dto::PlaybookRun> = connection.call(
+        let connection = self.connection().await?;
+        let launches: Vec<crux::dto::PlaybookRun> = reaching(
             "the launch list",
             connection.client.playbook_runs(None, None),
-        )?;
+        )
+        .await?;
+        let zone = TimeZone::system();
         let mut launches: Vec<LivePlaybook> = launches
             .into_iter()
             .map(|launch| {
@@ -1088,7 +1125,7 @@ impl Fetcher {
                 LivePlaybook {
                     id: launch.playbook,
                     key: launch.key,
-                    status: shown_status(&launch.status).to_string(),
+                    status: LaunchStatus::parse(&launch.status, launch.parked_reason.as_deref()),
                     cost: launch.cost_usd,
                     cap: launch.max_cost,
                     by: launch.created_by.unwrap_or_default(),
@@ -1097,9 +1134,9 @@ impl Fetcher {
                         .parked_reason
                         .or(launch.secrets_refusal)
                         .filter(|why| !why.is_empty()),
-                    created: clock(&launch.created_at),
+                    created: clock(&launch.created_at, &zone),
                     landed: epoch(&launch.created_at).unwrap_or_default(),
-                    landed_at: landed_label(&launch.created_at),
+                    landed_at: landed_label(&launch.created_at, &zone),
                     origin: launch.origin,
                     max_time: launch.max_time,
                     runs: launch.runs,
@@ -1117,10 +1154,9 @@ impl Fetcher {
             now: now - now % 60,
             launches,
             stale: self
-                .cache
-                .as_ref()
-                .filter(|cache| cache.offline())
-                .map(|_| "Offline; showing what the controller last answered".to_string()),
+                .connector
+                .offline()
+                .then(|| "Offline; showing what the controller last answered".to_string()),
         };
         let changed = next != self.view;
         self.view = next;
@@ -1128,17 +1164,18 @@ impl Fetcher {
     }
 
     /// The launch's own record, re-read when its run count or status moved.
-    fn launch_detail(&mut self, launch: &LivePlaybook) -> Option<crux::dto::PlaybookLaunch> {
+    async fn launch_detail(&mut self, launch: &LivePlaybook) -> Option<crux::dto::PlaybookLaunch> {
         if let Some(cached) = self.launches.get(&launch.key)
             && cached.runs == launch.runs
             && cached.status == launch.status
         {
             return Some(cached.detail.clone());
         }
-        let connection = self.connection().ok()?;
-        let detail: crux::dto::PlaybookLaunch = connection
-            .call("the launch", connection.client.playbook_run(&launch.key))
-            .ok()?;
+        let connection = self.connection().await.ok()?;
+        let detail: crux::dto::PlaybookLaunch =
+            within("the launch", connection.client.playbook_run(&launch.key))
+                .await
+                .ok()?;
         self.launches.insert(
             launch.key.clone(),
             CachedLaunch {
@@ -1152,7 +1189,11 @@ impl Fetcher {
 
     /// The pack a launch ran: the draft version it was launched from, or the registered pin. A
     /// draft version never changes; a pin is read once per session.
-    fn pack(&mut self, playbook: &str, draft_version: Option<i64>) -> Result<PackFiles, String> {
+    async fn pack(
+        &mut self,
+        playbook: &str,
+        draft_version: Option<i64>,
+    ) -> Result<PackFiles, String> {
         let key = match draft_version {
             Some(version) => format!("{playbook}@draft-{version}"),
             None => format!("{playbook}@pin"),
@@ -1160,13 +1201,14 @@ impl Fetcher {
         if let Some(pack) = self.packs.get(&key) {
             return Ok(pack.clone());
         }
-        let connection = self.connection()?;
+        let connection = self.connection().await?;
         let mut pack = match draft_version {
             Some(version) => {
-                let draft: crux::dto::DraftFiles = connection.call(
+                let draft: crux::dto::DraftFiles = within(
                     "the draft",
                     connection.client.draft_files(playbook, Some(version)),
-                )?;
+                )
+                .await?;
                 let by = draft
                     .saved_by
                     .map(|by| format!(", saved by {by}"))
@@ -1181,7 +1223,7 @@ impl Fetcher {
             }
             None => {
                 let registered: crux::dto::PlaybookDetail =
-                    connection.call("the playbook", connection.client.playbook(playbook))?;
+                    within("the playbook", connection.client.playbook(playbook)).await?;
                 let mut pack = PackFiles::new(
                     pin_label(&registered.playbook),
                     registered
@@ -1198,7 +1240,13 @@ impl Fetcher {
             }
         };
         if let Some(dir) = crate::pack::cache_dir(&key) {
-            let _ = pack.copy_to(&dir);
+            let copied = tokio::task::spawn_blocking(move || {
+                let _ = pack.copy_to(&dir);
+                pack
+            });
+            pack = copied
+                .await
+                .map_err(|error| format!("copying the pack: {error}"))?;
         }
         self.packs.insert(key, pack.clone());
         Ok(pack)
@@ -1207,16 +1255,16 @@ impl Fetcher {
     /// Rebuild the detail pane for the selected launch. A running run streams its session and
     /// re-reads its console; a stopped one reads its stored session once and is then settled.
     /// `poll` also re-reads the console; a streamed batch only folds the new session lines.
-    fn refresh_detail(&mut self, selected: Option<&str>, poll: bool) -> bool {
+    async fn refresh_detail(&mut self, selected: Option<&str>, poll: bool) -> bool {
         let Some(launch) = self.launch(selected).cloned() else {
             let changed = self.detail.is_some();
             self.detail = None;
             return changed;
         };
-        let running = launch.status == "running";
+        let running = launch.status.is_running();
         let record = match (poll, &self.detail) {
             (false, Some(detail)) if detail.key == launch.key => detail.launch.clone(),
-            _ => self.launch_detail(&launch),
+            _ => self.launch_detail(&launch).await,
         };
         let run_id = record
             .as_ref()
@@ -1224,12 +1272,12 @@ impl Fetcher {
             .map(|run| run.run_id.clone());
         let pack = match (poll, &self.detail) {
             (false, Some(detail)) if detail.key == launch.key => detail.pack.clone(),
-            _ => self.pack(
-                &launch.id,
-                record
+            _ => {
+                let version = record
                     .as_ref()
-                    .and_then(|record| record.launch.draft_version),
-            ),
+                    .and_then(|record| record.launch.draft_version);
+                self.pack(&launch.id, version).await
+            }
         };
         for (id, run) in &mut self.runs {
             if Some(id) != run_id.as_ref() {
@@ -1237,37 +1285,46 @@ impl Fetcher {
             }
         }
 
-        if self.connection().is_err() {
+        let Ok(connection) = self.connection().await else {
             return false;
-        }
+        };
+        let connection = &connection;
         let wake = self.wake.clone();
         let (fold, log, source, error, streaming, files) = match &run_id {
             Some(run_id) => {
-                let Some(connection) = self.connection.as_ref() else {
-                    return false;
-                };
                 let run = self.runs.entry(run_id.clone()).or_default();
+                let mut read_files = false;
                 if running {
                     follow_session(run, connection, run_id, wake);
                     if poll
-                        && let Ok(log) = console(connection, run_id)
+                        && run.replaying_log
+                        && let Ok(log) = console(connection, run_id).await
                         && log.len() >= run.log.len().min(1)
                     {
                         run.log = log;
                     }
                 } else if !run.settled {
                     run.follow = None;
-                    settle(run, connection, run_id);
-                    if let Ok(log) = console(connection, run_id)
+                    let client = &connection.client;
+                    let (session, log, files) = tokio::join!(
+                        within("the session", client.run_session(run_id)),
+                        within("the console", client.run_log(run_id)),
+                        within("the captured files", client.run_files(run_id)),
+                    );
+                    settle(run, connection, run_id, session).await;
+                    if let Ok(log) = log.map(typed_log)
                         && log.len() >= run.log.len().min(1)
                     {
                         run.log = log;
                     }
+                    run.files = Some(files.map(captured));
+                    run.files_at = settled_results(&run.fold);
+                    read_files = true;
                 }
                 let results = settled_results(&run.fold);
                 let retry = poll && matches!(run.files, Some(Err(_)));
-                if run.files.is_none() || run.files_at != results || retry {
-                    run.files = Some(captured_files(connection, run_id));
+                if !read_files && (run.files.is_none() || run.files_at != results || retry) {
+                    run.files = Some(captured_files(connection, run_id).await);
                     run.files_at = results;
                 }
                 (
@@ -1289,15 +1346,20 @@ impl Fetcher {
         next.streaming = streaming;
         next.run_id = run_id;
         next.files = files;
-        let changed = self.detail.as_ref() != Some(&next);
-        self.detail = Some(next);
+        let changed = self.detail.as_deref() != Some(&next);
+        self.detail = Some(Arc::new(next));
         changed
     }
 }
 
 /// Keep a session stream on a running run and fold what it has delivered. A stream that ended
 /// cleanly is started again on the next read; one that failed waits [`FOLLOW_RETRY`].
-fn follow_session(run: &mut CachedRun, connection: &Connection, run_id: &str, wake: Sender<Msg>) {
+fn follow_session(
+    run: &mut CachedRun,
+    connection: &Connection,
+    run_id: &str,
+    wake: UnboundedSender<Msg>,
+) {
     if let Some(follow) = &run.follow {
         let (lines, logs) = (follow.drain(), follow.drain_logs());
         // A new stream replays from the start, so its first lines replace what the last one left.
@@ -1336,10 +1398,15 @@ fn follow_session(run: &mut CachedRun, connection: &Connection, run_id: &str, wa
     run.follow = Some(SessionFollow::spawn(connection, run_id, wake));
 }
 
-/// Read a stopped run once: its stored session, or the graph the controller keeps when no
-/// session was stored.
-fn settle(run: &mut CachedRun, connection: &Connection, run_id: &str) {
-    match connection.call("the session", connection.client.run_session(run_id)) {
+/// Fold a stopped run once from its stored `session`, or from the graph the controller keeps
+/// when no session was stored.
+async fn settle(
+    run: &mut CachedRun,
+    connection: &Connection,
+    run_id: &str,
+    session: Result<String, String>,
+) {
+    match session {
         Ok(text) => {
             let mut fold = RunFold::default();
             for line in text.lines() {
@@ -1350,17 +1417,15 @@ fn settle(run: &mut CachedRun, connection: &Connection, run_id: &str) {
             run.settled = true;
             run.error = None;
         }
-        Err(session) => {
-            match connection.call("the graph", connection.client.graph::<Value>(run_id)) {
-                Ok(graph) => {
-                    run.fold = graph_fold(&graph);
-                    run.source = "graph";
-                    run.settled = true;
-                    run.error = None;
-                }
-                Err(_) => run.error = Some(session),
+        Err(session) => match within("the graph", connection.client.graph::<Value>(run_id)).await {
+            Ok(graph) => {
+                run.fold = graph_fold(&graph);
+                run.source = "graph";
+                run.settled = true;
+                run.error = None;
             }
-        }
+            Err(_) => run.error = Some(session),
+        },
     }
 }
 
@@ -1379,10 +1444,14 @@ fn settled_results(fold: &RunFold) -> usize {
         .sum()
 }
 
-fn captured_files(connection: &Connection, run_id: &str) -> Result<Vec<Captured>, String> {
-    let listing: crux::dto::RunFiles =
-        connection.call("the captured files", connection.client.run_files(run_id))?;
-    Ok(listing.files.into_iter().map(Captured::from).collect())
+async fn captured_files(connection: &Connection, run_id: &str) -> Result<Vec<Captured>, String> {
+    within("the captured files", connection.client.run_files(run_id))
+        .await
+        .map(captured)
+}
+
+fn captured(listing: crux::dto::RunFiles) -> Vec<Captured> {
+    listing.files.into_iter().map(Captured::from).collect()
 }
 
 /// A run's graph read as the session it was built from: its plan, then each result. The
@@ -1480,26 +1549,30 @@ fn agent_label(launch: &crux::dto::PlaybookRun) -> String {
 }
 
 /// The run's whole console output as the controller serves it, typed.
-fn console(connection: &Connection, run_id: &str) -> Result<Vec<LogLine>, String> {
-    let log: crux::dto::RunLog =
-        connection.call("the console", connection.client.run_log(run_id))?;
-    Ok(log
-        .text
+async fn console(connection: &Connection, run_id: &str) -> Result<Vec<LogLine>, String> {
+    within("the console", connection.client.run_log(run_id))
+        .await
+        .map(typed_log)
+}
+
+fn typed_log(log: crux::dto::RunLog) -> Vec<LogLine> {
+    log.text
         .map(|text| text.lines().map(LogLine::parse).collect())
-        .unwrap_or_default())
+        .unwrap_or_default()
 }
 
 fn build_detail(launch: &LivePlaybook, fold: RunFold, log: Vec<LogLine>) -> LiveDetail {
     let settled = !fold.tasks.is_empty() && fold.required_settled();
-    let verdict = match launch.status.as_str() {
-        "running" => Verdict::Running,
-        "done" if !settled => Verdict::Unfinished,
-        "done" if fold.required_passed() => Verdict::Valid,
-        "done" => Verdict::Invalid,
-        "error" => Verdict::Error,
-        "new" => Verdict::Unfinished,
-        _ if settled && fold.required_passed() => Verdict::Valid,
-        _ => Verdict::Unfinished,
+    let verdict = match launch.status {
+        LaunchStatus::Running => Verdict::Running,
+        LaunchStatus::Done if !settled => Verdict::Unfinished,
+        LaunchStatus::Done if fold.required_passed() => Verdict::Valid,
+        LaunchStatus::Done => Verdict::Invalid,
+        LaunchStatus::Error => Verdict::Error,
+        LaunchStatus::Cancelled => Verdict::Cancelled,
+        LaunchStatus::New => Verdict::Unfinished,
+        LaunchStatus::Other(_) if settled && fold.required_passed() => Verdict::Valid,
+        LaunchStatus::Other(_) => Verdict::Unfinished,
     };
     let spent = if fold.tasks.iter().all(|task| task.result.is_none()) {
         launch.cost.unwrap_or(0.0)
@@ -1524,11 +1597,11 @@ fn build_detail(launch: &LivePlaybook, fold: RunFold, log: Vec<LogLine>) -> Live
     }
 }
 
-/// `18:00`, the UTC time of day of an RFC 3339 stamp; empty when it does not parse.
-fn clock(stamp: &str) -> String {
+/// `18:00`, the time of day of an RFC 3339 stamp in `zone`; empty when it does not parse.
+fn clock(stamp: &str, zone: &TimeZone) -> String {
     stamp
         .parse::<Timestamp>()
-        .map(|at| at.to_zoned(TimeZone::UTC).strftime("%H:%M").to_string())
+        .map(|at| at.to_zoned(zone.clone()).strftime("%H:%M").to_string())
         .unwrap_or_default()
 }
 
@@ -1541,23 +1614,23 @@ fn epoch(stamp: &str) -> Option<i64> {
     stamp.parse::<Timestamp>().ok().map(|at| at.as_second())
 }
 
-/// `Nov 6 18:00` in UTC; the raw stamp when it does not parse.
-fn landed_label(stamp: &str) -> String {
-    stamp
-        .parse::<Timestamp>()
-        .map(|at| {
-            at.to_zoned(TimeZone::UTC)
+/// `Nov 6 18:00` in `zone`; the raw stamp when it does not parse.
+fn landed_label(stamp: &str, zone: &TimeZone) -> String {
+    stamp.parse::<Timestamp>().map_or_else(
+        |_| stamp.to_string(),
+        |at| {
+            at.to_zoned(zone.clone())
                 .strftime("%b %-d %H:%M")
                 .to_string()
-        })
-        .unwrap_or_else(|_| stamp.to_string())
+        },
+    )
 }
 
-/// What the live worker last read, for the window.
+/// What the live worker last read and what the window's actions last came to.
 #[derive(Clone, Default)]
 pub struct Snapshot {
-    pub view: LiveView,
-    pub detail: Option<LiveDetail>,
+    pub view: Arc<LiveView>,
+    pub detail: Option<Arc<LiveDetail>>,
     /// The launch the selected one is compared against.
     pub base: Option<Base>,
     /// Recently finished launches, oldest first.
@@ -1573,50 +1646,134 @@ pub struct Snapshot {
     pub file: Option<Opened>,
 }
 
-/// The UI-side handle to the live worker. Dropping it stops the thread.
+/// What one pass of the poll loop read.
+struct Polled {
+    view: Arc<LiveView>,
+    detail: Option<Arc<LiveDetail>>,
+    base: Option<Base>,
+    finished: Vec<Finished>,
+    registered: Vec<String>,
+}
+
+/// The UI-side handle to the live worker. Dropping it ends the poll loop and its streams.
+///
+/// ```text
+/// window ── select, compare ──▶ poll loop ──── list, detail ──▶ ┐
+///        ── launch, save, … ──▶ a task each ── its reply ─────▶ ┴ snapshot ──▶ window
+/// ```
 pub struct Client {
-    tx: Sender<Msg>,
+    tx: UnboundedSender<Msg>,
     shared: Arc<Mutex<Shared>>,
+    connector: Connector,
+    dirs: Dirs,
+    /// The poll loop.
+    _poll: Option<Task>,
+}
+
+/// Where the worker's actions keep files.
+#[derive(Clone)]
+struct Dirs {
+    /// Draft working copies.
+    drafts: Option<PathBuf>,
+    /// Copies of fetched captured files.
+    files: Option<PathBuf>,
 }
 
 struct Shared {
     snapshot: Snapshot,
     version: u64,
     waker: Option<Waker>,
+    /// Replies answered so far; each takes the next number as its `seq`.
+    replies: u64,
+}
+
+impl Shared {
+    fn polled(&mut self, polled: Polled) {
+        self.snapshot.view = polled.view;
+        self.snapshot.detail = polled.detail;
+        self.snapshot.base = polled.base;
+        self.snapshot.finished = polled.finished;
+        self.snapshot.registered = polled.registered;
+    }
+
+    fn answered(&mut self, reply: Reply) {
+        self.replies += 1;
+        let seq = self.replies;
+        match reply {
+            Reply::Prepared { target, result } => {
+                self.snapshot.prepared = Some(Prepared {
+                    seq,
+                    target,
+                    result,
+                });
+            }
+            Reply::Launched { playbook, result } => {
+                self.snapshot.launched = Some(Launched {
+                    seq,
+                    playbook,
+                    result,
+                });
+            }
+            Reply::Reran { run, from, result } => {
+                self.snapshot.reran = Some(Reran {
+                    seq,
+                    run,
+                    from,
+                    result,
+                });
+            }
+            Reply::Synced { draft, result } => {
+                self.snapshot.synced = Some(Synced { seq, draft, result });
+            }
+            Reply::Dropped { dir, draft, result } => {
+                self.snapshot.dropped = Some(Dropped {
+                    seq,
+                    dir,
+                    draft,
+                    result,
+                });
+            }
+            Reply::File(opened) => self.snapshot.file = Some(opened),
+        }
+    }
 }
 
 impl Client {
-    pub fn spawn(target: crate::profile::Target) -> Self {
-        let (tx, rx) = mpsc::channel();
+    pub fn spawn(connector: Connector) -> Self {
+        let dirs = Dirs {
+            drafts: crate::draft::root(),
+            files: crate::captured::cache_dir(),
+        };
+        Client::spawn_with(connector, dirs)
+    }
+
+    fn spawn_with(connector: Connector, dirs: Dirs) -> Self {
+        let (tx, rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Mutex::new(Shared {
             snapshot: Snapshot::default(),
             version: 0,
             waker: None,
+            replies: 0,
         }));
-        let worker = Arc::clone(&shared);
-        let wake = tx.clone();
-        if let Err(error) = std::thread::Builder::new()
-            .name("crucible-playbooks-live".into())
-            .spawn(move || run_client(target, rx, wake, worker))
-        {
-            publish(
-                &shared,
-                Snapshot {
-                    view: LiveView::Unavailable(format!("starting the live worker: {error}")),
-                    detail: None,
-                    base: None,
-                    finished: Vec::new(),
-                    registered: Vec::new(),
-                    prepared: None,
-                    launched: None,
-                    reran: None,
-                    synced: None,
-                    dropped: None,
-                    file: None,
-                },
-            );
+        let poll = match connector.runtime() {
+            Ok(runtime) => Some(Task::spawn(
+                &runtime,
+                run_client(connector.clone(), rx, tx.clone(), Arc::clone(&shared)),
+            )),
+            Err(why) => {
+                publish(&shared, |shared| {
+                    shared.snapshot.view = Arc::new(LiveView::Unavailable(Down::Unreached(why)));
+                });
+                None
+            }
+        };
+        Client {
+            tx,
+            shared,
+            connector,
+            dirs,
+            _poll: poll,
         }
-        Client { tx, shared }
     }
 
     pub fn set_waker(&self, waker: Waker) {
@@ -1625,18 +1782,43 @@ impl Client {
         }
     }
 
+    /// Run `action` as a task of its own and publish its reply when it lands.
+    fn start(&self, action: Action) {
+        let runtime = match self.connector.runtime() {
+            Ok(runtime) => runtime,
+            Err(why) => {
+                let reply = action.failed(why, &self.dirs);
+                publish(&self.shared, |shared| shared.answered(reply));
+                return;
+            }
+        };
+        let (connector, dirs) = (self.connector.clone(), self.dirs.clone());
+        let (shared, tx) = (Arc::clone(&self.shared), self.tx.clone());
+        runtime.spawn(async move {
+            let launches = action.launches();
+            let reply = match connector.connect().await {
+                Ok(connection) => action.run(connection, &dirs).await,
+                Err(why) => action.failed(why, &dirs),
+            };
+            publish(&shared, |shared| shared.answered(reply));
+            if launches {
+                let _ = tx.send(Msg::Refresh);
+            }
+        });
+    }
+
     /// Read `target`'s params schema and the caps, for a launch form.
     pub fn prepare(&self, target: Target) {
-        let _ = self.tx.send(Msg::Prepare(target));
+        self.start(Action::Prepare(target));
     }
 
     /// Launch `target`; the result comes back in a snapshot.
     pub fn launch(&self, target: Target, body: Value) {
-        let _ = self.tx.send(Msg::Launch { target, body });
+        self.start(Action::Launch { target, body });
     }
 
-    pub fn drop_pack(&self, dir: std::path::PathBuf, max_cost: f64, max_time: String) {
-        let _ = self.tx.send(Msg::Drop {
+    pub fn drop_pack(&self, dir: PathBuf, max_cost: f64, max_time: String) {
+        self.start(Action::Drop {
             dir,
             max_cost,
             max_time,
@@ -1645,7 +1827,7 @@ impl Client {
 
     /// Ask what rerunning `run` from `from` would reuse.
     pub fn preview_rerun(&self, run: &str, from: Vec<String>) {
-        let _ = self.tx.send(Msg::Rerun {
+        self.start(Action::Rerun {
             run: run.to_string(),
             from,
         });
@@ -1653,7 +1835,7 @@ impl Client {
 
     /// Pull `draft` into its working copy, creating it from `template` when it is missing.
     pub fn pull(&self, draft: &str, template: Option<&str>) {
-        let _ = self.tx.send(Msg::Pull {
+        self.start(Action::Pull {
             draft: draft.to_string(),
             template: template.map(ToString::to_string),
         });
@@ -1661,7 +1843,7 @@ impl Client {
 
     /// Save `working` as its draft's next version.
     pub fn save(&self, working: Working) {
-        let _ = self.tx.send(Msg::Save(working));
+        self.start(Action::Save(working));
     }
 
     /// Connect again with whatever crux's config now holds.
@@ -1678,11 +1860,14 @@ impl Client {
         let _ = self.tx.send(Msg::Compare(base.map(ToString::to_string)));
     }
 
-    /// Fetch the file `run` captured under `key`.
-    pub fn file(&self, run: &str, key: &str) {
-        let _ = self.tx.send(Msg::File {
+    /// Fetch the file `run` captured under `key`. Its copy on disk is used only when the run
+    /// has `settled` and the copy is the `size` the listing gives.
+    pub fn file(&self, run: &str, key: &str, size: u64, settled: bool) {
+        self.start(Action::File {
             run: run.to_string(),
             key: key.to_string(),
+            size,
+            settled,
         });
     }
 
@@ -1692,10 +1877,10 @@ impl Client {
     }
 }
 
-fn publish(shared: &Mutex<Shared>, snapshot: Snapshot) {
+fn publish(shared: &Mutex<Shared>, change: impl FnOnce(&mut Shared)) {
     let waker = match shared.lock() {
         Ok(mut shared) => {
-            shared.snapshot = snapshot;
+            change(&mut shared);
             shared.version += 1;
             shared.waker.clone()
         }
@@ -1706,14 +1891,15 @@ fn publish(shared: &Mutex<Shared>, snapshot: Snapshot) {
     }
 }
 
-fn run_client(
-    target: crate::profile::Target,
-    rx: Receiver<Msg>,
-    wake: Sender<Msg>,
+async fn run_client(
+    connector: Connector,
+    mut rx: UnboundedReceiver<Msg>,
+    wake: UnboundedSender<Msg>,
     shared: Arc<Mutex<Shared>>,
 ) {
-    let mut fetcher = Fetcher::new(target, wake);
+    let mut fetcher = Fetcher::new(connector, wake);
     let mut selected: Option<String> = None;
+    let mut view = Arc::new(LiveView::default());
     let mut compare: Option<String> = None;
     let mut next_list = Instant::now();
     let mut next_detail = Instant::now();
@@ -1726,75 +1912,42 @@ fn run_client(
         let wait = due
             .saturating_duration_since(Instant::now())
             .min(Duration::from_millis(500));
-        match rx.recv_timeout(wait) {
-            Ok(Msg::Select(playbook)) => {
+        match tokio::time::timeout(wait, rx.recv()).await {
+            Ok(Some(Msg::Select(playbook))) => {
                 selected = playbook;
                 next_detail = Instant::now();
             }
-            Ok(Msg::Streamed) => {
+            Ok(Some(Msg::Streamed)) => {
                 next_stream.get_or_insert_with(|| Instant::now() + STREAM_BATCH);
             }
-            Ok(Msg::Prepare(target)) => {
-                fetcher.prepare(target);
-                force = true;
-            }
-            Ok(Msg::Launch { target, body }) => {
-                fetcher.send_launch(target, body);
-                next_list = Instant::now();
-                force = true;
-            }
-            Ok(Msg::Rerun { run, from }) => {
-                fetcher.preview_rerun(run, from);
-                force = true;
-            }
-            Ok(Msg::Pull { draft, template }) => {
-                fetcher.pull(draft, template);
-                force = true;
-            }
-            Ok(Msg::Save(working)) => {
-                fetcher.save(working);
-                force = true;
-            }
-            Ok(Msg::Drop {
-                dir,
-                max_cost,
-                max_time,
-            }) => {
-                fetcher.drop_pack(dir, max_cost, &max_time);
-                next_list = Instant::now();
-                force = true;
-            }
-            Ok(Msg::Compare(base)) => {
+            Ok(Some(Msg::Refresh)) => next_list = Instant::now(),
+            Ok(Some(Msg::Compare(base))) => {
                 compare = base;
-                force = fetcher.refresh_base(compare.as_deref());
+                force = fetcher.refresh_base(compare.as_deref()).await;
             }
-            Ok(Msg::File { run, key }) => {
-                fetcher.open_file(run, key);
-                force = true;
-            }
-            Ok(Msg::Reconnect) => {
-                fetcher.connection = None;
+            Ok(Some(Msg::Reconnect)) => {
+                fetcher.connector.reset();
                 fetcher.identity = None;
                 fetcher.registered_at = None;
                 fetcher.view = LiveView::Loading;
                 next_list = Instant::now();
                 force = true;
             }
-            Err(RecvTimeoutError::Disconnected) => return,
-            Err(RecvTimeoutError::Timeout) => {}
+            Ok(None) => return,
+            Err(_) => {}
         }
 
         let now = Instant::now();
         let mut changed = force;
         if now >= next_list {
-            match fetcher.refresh_list() {
+            match fetcher.refresh_list().await {
                 Ok(list_changed) => changed |= list_changed,
                 Err(error) => changed |= fetcher.unavailable(error),
             }
-            changed |= fetcher.refresh_registered();
-            changed |= fetcher.refresh_base(compare.as_deref());
+            changed |= fetcher.refresh_registered().await;
+            changed |= fetcher.refresh_base(compare.as_deref()).await;
             next_list = now
-                + if fetcher.any_running() {
+                + if fetcher.any_running() || !matches!(fetcher.view, LiveView::Ready { .. }) {
                     Duration::from_secs(2)
                 } else {
                     Duration::from_secs(8)
@@ -1802,7 +1955,7 @@ fn run_client(
             next_detail = now;
         }
         if now >= next_detail {
-            changed |= fetcher.refresh_detail(selected.as_deref(), true);
+            changed |= fetcher.refresh_detail(selected.as_deref(), true).await;
             next_detail = now
                 + if fetcher.selected_live(selected.as_deref()) {
                     Duration::from_secs(2)
@@ -1811,26 +1964,21 @@ fn run_client(
                 };
             next_stream = None;
         } else if next_stream.is_some_and(|at| now >= at) {
-            changed |= fetcher.refresh_detail(selected.as_deref(), false);
+            changed |= fetcher.refresh_detail(selected.as_deref(), false).await;
             next_stream = None;
         }
         if changed {
-            publish(
-                &shared,
-                Snapshot {
-                    view: fetcher.view().clone(),
-                    detail: fetcher.detail().cloned(),
-                    base: fetcher.base.clone(),
-                    finished: fetcher.finished.clone(),
-                    registered: fetcher.registered.clone(),
-                    prepared: fetcher.prepared.clone(),
-                    launched: fetcher.launched.clone(),
-                    reran: fetcher.reran.clone(),
-                    synced: fetcher.synced.clone(),
-                    dropped: fetcher.dropped.clone(),
-                    file: fetcher.opened.clone(),
-                },
-            );
+            if *view != *fetcher.view() {
+                view = Arc::new(fetcher.view().clone());
+            }
+            let polled = Polled {
+                view: Arc::clone(&view),
+                detail: fetcher.detail.clone(),
+                base: fetcher.base.clone(),
+                finished: fetcher.finished.clone(),
+                registered: fetcher.registered.clone(),
+            };
+            publish(&shared, |shared| shared.polled(polled));
         }
     }
 }
@@ -1844,7 +1992,7 @@ mod tests {
         LivePlaybook {
             id: "demo".into(),
             key: "playbook:demo:1".into(),
-            status: status.into(),
+            status: LaunchStatus::parse(status, None),
             cost: Some(0.5),
             cap: 2.0,
             by: "wren".into(),
@@ -1890,8 +2038,9 @@ mod tests {
 
     #[test]
     fn a_launch_that_stops_running_is_noted_once_and_the_list_is_bounded() {
-        let (wake, _rx) = mpsc::channel();
-        let mut fetcher = Fetcher::new(crate::profile::Target::unreachable(), wake);
+        let (wake, _rx) = mpsc::unbounded_channel();
+        let net = crate::net::Net::uncached_for_tests();
+        let mut fetcher = Fetcher::new(net.connector(crate::profile::Target::unreachable()), wake);
         let first = vec![
             firing("a", 1, "draft", "running"),
             firing("b", 2, "draft", "done"),
@@ -1957,13 +2106,14 @@ mod tests {
 
     #[test]
     fn a_failed_refresh_keeps_the_last_list_and_says_why() {
-        let (wake, _rx) = mpsc::channel();
-        let mut fetcher = Fetcher::new(crate::profile::Target::unreachable(), wake);
-        assert!(fetcher.unavailable("dial refused".into()));
+        let (wake, _rx) = mpsc::unbounded_channel();
+        let net = crate::net::Net::uncached_for_tests();
+        let mut fetcher = Fetcher::new(net.connector(crate::profile::Target::unreachable()), wake);
+        assert!(fetcher.unavailable(Down::Unreached("dial refused".into())));
         assert!(matches!(fetcher.view, LiveView::Unavailable(_)));
 
         fetcher.view = ready(vec![firing("nightly", 1, "schedule", "done")]);
-        assert!(fetcher.unavailable("replica b: 502".into()));
+        assert!(fetcher.unavailable(Down::Refused("replica b: 502".into())));
         let LiveView::Ready {
             launches, stale, ..
         } = &fetcher.view
@@ -1976,7 +2126,7 @@ mod tests {
             Some("Refresh failed; showing the last list. replica b: 502")
         );
         assert!(
-            !fetcher.unavailable("replica b: 502".into()),
+            !fetcher.unavailable(Down::Refused("replica b: 502".into())),
             "the same failure again is no change to draw"
         );
     }
@@ -2135,8 +2285,15 @@ mod tests {
     fn a_utc_stamp_becomes_unix_seconds_and_a_short_label() {
         assert_eq!(epoch("1970-01-01T00:00:00Z"), Some(0));
         assert_eq!(epoch("2026-11-06T18:00:00Z"), Some(1_793_988_000));
-        assert_eq!(landed_label("2026-11-06T18:00:00Z"), "Nov 6 18:00");
-        assert_eq!(landed_label("not a stamp"), "not a stamp");
+        let tokyo = TimeZone::get("Asia/Tokyo").unwrap();
+        assert_eq!(
+            landed_label("2026-11-06T18:00:00Z", &TimeZone::UTC),
+            "Nov 6 18:00"
+        );
+        assert_eq!(landed_label("2026-11-06T18:00:00Z", &tokyo), "Nov 7 03:00");
+        assert_eq!(landed_label("not a stamp", &tokyo), "not a stamp");
+        assert_eq!(clock("2026-11-06T18:00:00Z", &tokyo), "03:00");
+        assert_eq!(clock("not a stamp", &tokyo), "");
     }
 
     #[test]
@@ -2217,13 +2374,271 @@ mod tests {
     }
 
     #[test]
+    fn a_launch_parked_by_a_cancel_is_cancelled_not_an_error() {
+        let parse = LaunchStatus::parse;
+        assert_eq!(
+            parse("parked", Some("cancelled by weaton")),
+            LaunchStatus::Cancelled
+        );
+        assert_eq!(
+            parse("error", Some("cancelled by an operator")),
+            LaunchStatus::Cancelled
+        );
+        assert_eq!(
+            parse("parked", Some("image preflight refused")),
+            LaunchStatus::Error
+        );
+        assert_eq!(parse("parked", None), LaunchStatus::Error);
+        assert_eq!(
+            parse("done", Some("cancelled by weaton")),
+            LaunchStatus::Done
+        );
+        assert_eq!(
+            parse("running", Some("cancelled by weaton")),
+            LaunchStatus::Running
+        );
+        assert_eq!(parse("held", None), LaunchStatus::Other("held".into()));
+        let cancelled = LivePlaybook {
+            status: LaunchStatus::Cancelled,
+            ..LivePlaybook::default()
+        };
+        assert_eq!(cancelled.verdict(), Verdict::Cancelled);
+        assert_eq!(cancelled.status.to_string(), "cancelled");
+        let detail = build_detail(&cancelled, RunFold::default(), Vec::new());
+        assert_eq!(detail.verdict, Verdict::Cancelled);
+    }
+
+    #[test]
     fn a_parked_launch_without_a_graph_is_an_error_and_keeps_nothing() {
-        let parked = launch(shown_status("parked"));
+        let parked = launch("parked");
         assert_eq!(parked.verdict(), Verdict::Error);
         let detail = build_detail(&parked, RunFold::default(), Vec::new());
         assert_eq!(detail.verdict, Verdict::Error);
         assert!(detail.fold.tasks.is_empty());
         assert_eq!(detail.spent, 0.5);
+    }
+
+    /// A controller that takes `slow` to answer the launch list and answers everything else at
+    /// once: a launch with its key, `whoami` with a user. `listing` is set once a list read is in.
+    fn slow_list_server(slow: Duration, listing: Arc<std::sync::atomic::AtomicBool>) -> String {
+        let (url, _) = crate::testserver::serve(move |request| {
+            if request.starts_with("POST ") {
+                return r#"{"key":"playbook:demo:7"}"#.into();
+            }
+            if request.starts_with("GET /api/whoami") {
+                return r#"{"user":"wren","role":"user"}"#.into();
+            }
+            if request.starts_with("GET /api/playbook-runs") {
+                listing.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(slow);
+            }
+            "[]".into()
+        });
+        url
+    }
+
+    fn no_dirs() -> Dirs {
+        Dirs {
+            drafts: None,
+            files: None,
+        }
+    }
+
+    #[test]
+    fn a_captured_files_copy_stands_in_only_for_a_settled_run_at_the_listed_size() {
+        let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&fetched);
+        let (url, _) = crate::testserver::serve(move |request| {
+            if request.contains("/files/") || request.contains("/file") {
+                let n = counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return ["v1", "v2", "third"].get(n).unwrap_or(&"late").to_string();
+            }
+            "[]".into()
+        });
+        let (keys, files) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            Dirs {
+                drafts: None,
+                files: Some(files.path().to_path_buf()),
+            },
+        );
+        let count = || fetched.load(std::sync::atomic::Ordering::SeqCst);
+        let shows = |text: &'static str| {
+            let snapshot = snapshot_when(&client, Duration::from_secs(5), |s| {
+                s.file
+                    .as_ref()
+                    .is_some_and(|f| f.body == Ok(Body::Text(text.into())))
+            });
+            snapshot.file.unwrap()
+        };
+
+        client.file("r1", "report/out.md", 2, false);
+        let first = shows("v1");
+        let disk = first.disk.expect("a copy on disk");
+        assert_eq!(std::fs::read_to_string(&disk).unwrap(), "v1");
+
+        client.file("r1", "report/out.md", 2, false);
+        shows("v2");
+        assert_eq!(count(), 2, "a running run's file is fetched again");
+        assert_eq!(std::fs::read_to_string(&disk).unwrap(), "v2");
+
+        client.file("r1", "report/out.md", 2, true);
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            count(),
+            2,
+            "a settled run's copy at the listed size stands in"
+        );
+        shows("v2");
+
+        client.file("r1", "report/out.md", 5, true);
+        shows("third");
+        assert_eq!(count(), 3, "a copy of another size is stale");
+    }
+
+    /// The first snapshot `ready` accepts, within `within`.
+    fn snapshot_when(
+        client: &Client,
+        within: Duration,
+        ready: impl Fn(&Snapshot) -> bool,
+    ) -> Snapshot {
+        let until = Instant::now() + within;
+        let mut seen = 0;
+        loop {
+            if let Some((version, snapshot)) = client.take(seen) {
+                seen = version;
+                if ready(&snapshot) {
+                    return snapshot;
+                }
+            }
+            assert!(Instant::now() < until, "no such snapshot within {within:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_launch_lands_while_the_launch_list_is_still_being_read() {
+        let listing = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let url = slow_list_server(Duration::from_secs(4), Arc::clone(&listing));
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            no_dirs(),
+        );
+        let until = Instant::now() + Duration::from_secs(5);
+        while !listing.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(Instant::now() < until, "the worker never read the list");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let asked = Instant::now();
+        client.launch(
+            Target::Playbook("demo".into()),
+            serde_json::json!({"params": {}}),
+        );
+        client.prepare(Target::Playbook("demo".into()));
+        let snapshot = snapshot_when(&client, Duration::from_secs(2), |s| {
+            s.launched.is_some() && s.prepared.is_some()
+        });
+        assert!(asked.elapsed() < Duration::from_secs(2));
+        assert!(
+            matches!(*snapshot.view, LiveView::Loading),
+            "the list is still being read"
+        );
+        let launched = snapshot.launched.unwrap();
+        assert_eq!(launched.playbook, "demo");
+        assert_eq!(launched.result, Ok("playbook:demo:7".to_string()));
+        let prepared = snapshot.prepared.unwrap();
+        assert_eq!(prepared.target, Target::Playbook("demo".into()));
+        let mut seqs = [launched.seq, prepared.seq];
+        seqs.sort();
+        assert_eq!(seqs, [1, 2], "each reply takes the next number");
+
+        let listed = snapshot_when(&client, Duration::from_secs(8), |s| {
+            matches!(*s.view, LiveView::Ready { .. })
+        });
+        assert_eq!(
+            listed.launched.map(|l| l.seq),
+            Some(launched.seq),
+            "a poll leaves the replies in place"
+        );
+    }
+
+    #[test]
+    fn dropping_the_client_ends_its_polling() {
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&lists);
+        let (url, _) = crate::testserver::serve(move |request| {
+            if request.starts_with("GET /api/whoami") {
+                return r#"{"user":"wren","role":"user"}"#.into();
+            }
+            if request.starts_with("GET /api/playbook-runs") {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                return r#"[{"key":"playbook:demo:1","playbook":"demo","status":"running",
+                    "runs":0,"max_cost":2.0,"max_time":"30m","created_at":"2026-11-09T01:00:00Z"}]"#
+                    .into();
+            }
+            "[]".into()
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(
+            net.connector(crate::testserver::target("t", &url, keys.path())),
+            no_dirs(),
+        );
+        let listed = snapshot_when(&client, Duration::from_secs(5), |s| {
+            matches!(*s.view, LiveView::Ready { .. })
+        });
+        assert_eq!(listed.view.launches().len(), 1);
+        let until = Instant::now() + Duration::from_secs(8);
+        while lists.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < until, "a running launch is polled again");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        drop(client);
+        std::thread::sleep(Duration::from_millis(300));
+        let at_drop = lists.load(std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(Duration::from_secs(5));
+        assert_eq!(
+            lists.load(std::sync::atomic::Ordering::SeqCst),
+            at_drop,
+            "nothing reads the list once the client is gone"
+        );
+    }
+
+    #[test]
+    fn an_action_with_no_connection_to_run_on_is_answered_with_why() {
+        let keys = tempfile::tempdir().unwrap();
+        let mut profile = crate::profile::Profile {
+            url: "http://127.0.0.1:9".into(),
+            ..Default::default()
+        };
+        profile.tunnel = Some("exit 7".into());
+        let target =
+            crate::profile::Target::new("t", profile, &crate::keys::Store::Dir(keys.path().into()));
+        let _keeper = target.start(keys.path(), || Err(std::io::Error::other("no supervisor")));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(target.readiness(), crate::profile::Readiness::Failed(_)) {
+            assert!(std::time::Instant::now() < until, "the start never failed");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let net = crate::net::Net::uncached_for_tests();
+        let client = Client::spawn_with(net.connector(target), no_dirs());
+        client.preview_rerun("run-1", vec!["draft".into()]);
+        client.pull("demo", None);
+        let snapshot = snapshot_when(&client, Duration::from_secs(5), |s| {
+            s.reran.is_some() && s.synced.is_some()
+        });
+        let reran = snapshot.reran.unwrap();
+        assert_eq!((reran.run.as_str(), reran.from.len()), ("run-1", 1));
+        assert!(reran.result.unwrap_err().contains("no supervisor"));
+        let synced = snapshot.synced.unwrap();
+        assert_eq!(synced.draft, "demo");
+        assert!(synced.result.unwrap_err().contains("no supervisor"));
     }
 
     /// Against the controller `crux` is configured for: read a registered pack with its Git
@@ -2235,18 +2650,26 @@ mod tests {
     fn a_live_draft_pulls_into_a_working_copy_and_its_run_previews_a_rerun() {
         let draft =
             std::env::var("CRUCIBLE_E2E_DRAFT").unwrap_or_else(|_| "vllm-agent-fanout".into());
-        let (wake, _rx) = std::sync::mpsc::channel();
+        let (wake, _rx) = mpsc::unbounded_channel();
         let crux = crate::profile::or_default(&std::collections::BTreeMap::new())
             .remove("default")
             .expect("crux's own profile");
-        let target = crate::profile::Target::new("default", crux, "/nonexistent".as_ref());
-        let mut fetcher = Fetcher::new(target, wake);
+        let target = crate::profile::Target::new(
+            "default",
+            crux,
+            &crate::keys::Store::Dir("/nonexistent".into()),
+        );
+        let net = crate::net::Net::uncached_for_tests();
+        let mut fetcher = Fetcher::new(net.connector(target), wake);
         let root = tempfile::tempdir().unwrap();
-        fetcher.drafts = Some(root.path().to_path_buf());
+        let runtime = net.handle().expect("a runtime");
+        let c = runtime
+            .block_on(fetcher.connection())
+            .expect("a connection");
 
-        fetcher.pull(draft.clone(), None);
-        let synced = fetcher.synced.clone().expect("a pull reply");
-        let (working, note) = synced.result.expect("the draft pulls");
+        let (working, note) = c
+            .wait(pull(&c, Some(root.path()), &draft, None))
+            .expect("the draft pulls");
         assert_eq!(note, None, "an existing draft is pulled, not created");
         assert!(working.base > 0);
         assert!(working.dir.join("crucible.toml").is_file());
@@ -2257,8 +2680,8 @@ mod tests {
         );
 
         let registered = std::env::var("CRUCIBLE_E2E_PLAYBOOK").unwrap_or_else(|_| "triage".into());
-        let pinned = fetcher
-            .pack(&registered, None)
+        let pinned = runtime
+            .block_on(fetcher.pack(&registered, None))
             .expect("the registered pack reads");
         assert!(pinned.file("crucible.toml").is_some());
         assert!(
@@ -2269,12 +2692,8 @@ mod tests {
             pinned.web
         );
 
-        fetcher.prepare(Target::Draft(draft.clone()));
-        let form = fetcher
-            .prepared
-            .clone()
-            .unwrap()
-            .result
+        let form = c
+            .wait(prepare(&c, &Target::Draft(draft.clone())))
             .expect("the draft's form");
         assert!(
             form.digest.is_some(),
@@ -2294,19 +2713,25 @@ mod tests {
             "an enabled agent provider is offered besides the default"
         );
 
-        fetcher.refresh_list().expect("the launch list");
+        runtime
+            .block_on(fetcher.refresh_list())
+            .expect("the launch list");
         let launch = fetcher
             .view()
             .launches_of(&draft)
-            .find(|launch| launch.status != "running" && launch.runs > 0)
+            .find(|launch| !launch.status.is_running() && launch.runs > 0)
             .cloned()
             .expect("a finished launch of the draft");
-        let record = fetcher.launch_detail(&launch).expect("the launch detail");
+        let record = runtime
+            .block_on(fetcher.launch_detail(&launch))
+            .expect("the launch detail");
         let run = record.runs.first().expect("a run").run_id.clone();
-        fetcher.preview_rerun(run.clone(), Vec::new());
-        let reran = fetcher.reran.clone().unwrap();
-        assert_eq!(reran.run, run);
-        match reran.result {
+        let preview = c.wait(within(
+            "the rerun preview",
+            c.client
+                .rerun_preview::<crux::dto::RerunPreview>(&run, &Vec::new()),
+        ));
+        match preview {
             Ok(preview) => {
                 assert_eq!(preview.run_id, run);
                 assert_eq!(preview.playbook, draft);

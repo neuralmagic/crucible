@@ -1,18 +1,11 @@
 //! Fixing a pack and running it again from the tracker: a draft's working copy beside the run
 //! that showed the problem, and a rerun of that run that reuses what already passed.
 
-use std::time::{Duration, Instant};
-
 use crux::dto::RerunPreview;
 use serde_json::{Map, Value};
 
-use crate::draft::Working;
 use crate::live::{self, Target};
-use crate::pack::PackFiles;
 use crate::{App, PackSource};
-
-/// How often the working copy is re-read for edits made in the editor.
-const REREAD: Duration = Duration::from_secs(1);
 
 /// A launch form's request to rerun a finished run from some of its tasks.
 #[derive(Clone, Debug, PartialEq)]
@@ -97,7 +90,7 @@ pub fn draft_id(playbook: &str, user: &str) -> String {
 
 impl App {
     fn user(&self) -> Option<&str> {
-        match &self.live {
+        match &*self.remote.live {
             live::LiveView::Ready { identity, .. } if !identity.user.is_empty() => {
                 Some(&identity.user)
             }
@@ -119,7 +112,7 @@ impl App {
         if self.draft_run() {
             return Some((launch.id.clone(), None));
         }
-        if !self.registered.iter().any(|id| id == &launch.id) {
+        if !self.remote.registered.iter().any(|id| id == &launch.id) {
             return None;
         }
         Some((draft_id(&launch.id, self.user()?), Some(launch.id.clone())))
@@ -127,52 +120,46 @@ impl App {
 
     /// Whether the Pack tab shows the working copy rather than the run's own pack.
     pub fn showing_working(&self) -> bool {
-        self.working_pack.is_some()
-            && match self.pack_source {
+        self.remote.working_pack.is_some()
+            && match self.run.pack_source {
                 Some(source) => source == PackSource::Working,
                 None => self.draft_run(),
             }
     }
 
-    /// Keep the working copy in step with the shown run, and re-read it for editor saves.
+    /// Keep the working copy in step with the shown run and with what its watcher last read.
     pub fn refresh_working(&mut self) -> bool {
         let draft = self.draft_target().map(|(draft, _)| draft);
-        if self.working.as_ref().map(|w| &w.draft) != draft.as_ref() {
-            self.working = draft
-                .as_deref()
-                .and_then(|draft| Working::open(&crate::draft::root()?, draft));
-            self.working_pack = None;
-            self.working_preview = None;
-            self.working_read = None;
-            if self.working.is_none() {
-                return true;
+        let mut changed = false;
+        if self.remote.working_sent != draft {
+            self.remote.working_watch.watch(draft.as_deref());
+            self.remote.working_sent = draft;
+            self.remote.working = None;
+            self.remote.working_pack = None;
+            self.remote.working_preview = None;
+            self.remote.working_edited = false;
+            changed = true;
+        }
+        let Some((version, copy)) = self.remote.working_watch.take(self.remote.working_seen) else {
+            return changed;
+        };
+        self.remote.working_seen = version;
+        match copy {
+            Some(copy) if Some(&copy.working.draft) == self.remote.working_sent.as_ref() => {
+                self.remote.working = Some(copy.working.clone());
+                self.remote.working_pack = Some(copy.pack.clone());
+                self.remote.working_preview = Some(copy.preview.clone());
+                self.remote.working_edited = copy.edited;
+            }
+            Some(_) => return changed,
+            None => {
+                self.remote.working = None;
+                self.remote.working_pack = None;
+                self.remote.working_preview = None;
+                self.remote.working_edited = false;
             }
         }
-        let Some(working) = &self.working else {
-            return false;
-        };
-        if self.working_read.is_some_and(|at| at.elapsed() < REREAD) {
-            return false;
-        }
-        self.working_read = Some(Instant::now());
-        let edited = working.edited();
-        let pack = PackFiles {
-            origin: format!(
-                "working copy of draft {} at version {}{}",
-                working.draft,
-                working.base,
-                if edited { ", edited" } else { "" }
-            ),
-            ..PackFiles::read_dir(&working.dir)
-        };
-        let files_moved = self.working_pack.as_ref().map(|p| &p.files) != Some(&pack.files);
-        if files_moved {
-            self.working_preview = Some(crate::preview::compile(&working.dir));
-        }
-        let changed = self.working_pack.as_ref() != Some(&pack) || self.working_edited != edited;
-        self.working_pack = Some(pack);
-        self.working_edited = edited;
-        changed
+        true
     }
 
     /// Pull the shown run's draft into its working copy, creating the draft when it is new.
@@ -180,60 +167,60 @@ impl App {
         let Some((draft, template)) = self.draft_target() else {
             return;
         };
-        self.draft_busy = true;
-        self.draft_note = None;
-        self.draft_after = self.replies;
-        self.live_client.pull(&draft, template.as_deref());
+        self.remote.draft_busy = true;
+        self.run.draft_note = None;
+        self.remote.draft_after = self.remote.replies;
+        self.remote.live_client.pull(&draft, template.as_deref());
     }
 
     /// Save the working copy as its draft's next version.
     pub fn save_draft(&mut self) {
-        let Some(working) = self.working.clone() else {
+        let Some(working) = self.remote.working.clone() else {
             return;
         };
-        self.draft_busy = true;
-        self.draft_note = None;
-        self.draft_after = self.replies;
-        self.live_client.save(working);
+        self.remote.draft_busy = true;
+        self.run.draft_note = None;
+        self.remote.draft_after = self.remote.replies;
+        self.remote.live_client.save(working);
     }
 
     pub fn show_pack(&mut self, source: PackSource) {
-        self.pack_source = Some(source);
-        self.pack_file = None;
+        self.run.pack_source = Some(source);
+        self.run.pack_file = None;
     }
 
     /// Launch the working copy's draft.
     pub fn launch_working(&mut self) {
-        if let Some(working) = &self.working {
+        if let Some(working) = &self.remote.working {
             let target = Target::Draft(working.draft.clone());
             self.open_launcher(target);
         }
     }
 
     pub(crate) fn answer_draft(&mut self, synced: Option<live::Synced>) {
-        let Some(synced) = synced.filter(|s| self.draft_busy && s.seq > self.draft_after) else {
+        let Some(synced) =
+            synced.filter(|s| self.remote.draft_busy && s.seq > self.remote.draft_after)
+        else {
             return;
         };
-        self.replies = self.replies.max(synced.seq);
-        self.draft_busy = false;
+        self.remote.replies = self.remote.replies.max(synced.seq);
+        self.remote.draft_busy = false;
         match synced.result {
             Ok((working, note)) => {
-                self.working = Some(working);
-                self.working_pack = None;
-                self.working_read = None;
-                self.pack_source = Some(PackSource::Working);
-                self.pack_file = None;
-                self.draft_note = note.map(Ok);
-                self.refresh_working();
+                self.remote.working = Some(working);
+                self.remote.working_watch.reread();
+                self.run.pack_source = Some(PackSource::Working);
+                self.run.pack_file = None;
+                self.run.draft_note = note.map(Ok);
             }
-            Err(error) => self.draft_note = Some(Err(error)),
+            Err(error) => self.run.draft_note = Some(Err(error)),
         }
     }
 
     /// What a launch form for `playbook` starts: the registered playbook, or the draft the shown
     /// run came from.
     pub fn launch_target(&self, playbook: &str) -> Option<Target> {
-        if self.registered.iter().any(|id| id == playbook) {
+        if self.remote.registered.iter().any(|id| id == playbook) {
             return Some(Target::Playbook(playbook.to_string()));
         }
         let shown = self.selected_live()?;
@@ -244,14 +231,14 @@ impl App {
     /// and the params it was launched with.
     pub fn rerunnable(&self) -> Option<(Target, String, Value)> {
         let launch = self.selected_live()?;
-        if launch.status == "running" {
+        if launch.status.is_running() {
             return None;
         }
         let record = self.selected_detail()?.launch.as_ref()?;
         let run = record.runs.first()?.run_id.clone();
         let target = match record.launch.draft_version {
             Some(_) => Target::Draft(launch.id.clone()),
-            None if self.registered.iter().any(|id| id == &launch.id) => {
+            None if self.remote.registered.iter().any(|id| id == &launch.id) => {
                 Target::Playbook(launch.id.clone())
             }
             None => return None,
@@ -265,8 +252,8 @@ impl App {
             return;
         };
         self.open_launcher(target);
-        let asked = self.replies;
-        if let Some(launcher) = &mut self.launcher {
+        let asked = self.remote.replies;
+        if let Some(launcher) = &mut self.remote.launcher {
             launcher.rerun = Some(Rerun {
                 run: run.clone(),
                 from: from.clone(),
@@ -275,13 +262,13 @@ impl App {
                 asked,
             });
         }
-        self.live_client.preview_rerun(&run, from);
+        self.remote.live_client.preview_rerun(&run, from);
     }
 
     /// Add the tasks a preview found changed to the rerun, and ask again.
     pub fn widen_rerun(&mut self) {
-        let asked = self.replies;
-        let Some(rerun) = self.launcher.as_mut().and_then(|l| l.rerun.as_mut()) else {
+        let asked = self.remote.replies;
+        let Some(rerun) = self.remote.launcher.as_mut().and_then(|l| l.rerun.as_mut()) else {
             return;
         };
         let Some(Ok(preview)) = &rerun.preview else {
@@ -295,11 +282,11 @@ impl App {
         rerun.preview = None;
         rerun.asked = asked;
         let (run, from) = (rerun.run.clone(), rerun.from.clone());
-        self.live_client.preview_rerun(&run, from);
+        self.remote.live_client.preview_rerun(&run, from);
     }
 
     pub(crate) fn answer_rerun(&mut self, reran: Option<live::Reran>) {
-        let Some(rerun) = self.launcher.as_mut().and_then(|l| l.rerun.as_mut()) else {
+        let Some(rerun) = self.remote.launcher.as_mut().and_then(|l| l.rerun.as_mut()) else {
             return;
         };
         let Some(reran) =
@@ -309,7 +296,7 @@ impl App {
         };
         rerun.asked = reran.seq;
         rerun.preview = Some(reran.result);
-        self.replies = self.replies.max(reran.seq);
+        self.remote.replies = self.remote.replies.max(reran.seq);
     }
 
     /// The shown run written up for a coding agent, about `task` when one is named.
@@ -323,9 +310,10 @@ impl App {
         let record = detail.launch.as_ref()?;
         let (draft, template) = self.draft_target()?;
         let root = crate::draft::root()?;
-        let mine = self.working.as_ref().filter(|w| w.draft == draft);
-        let pulled = mine
-            .is_some_and(|w| !self.working_edited && Some(w.base) == record.launch.draft_version);
+        let mine = self.remote.working.as_ref().filter(|w| w.draft == draft);
+        let pulled = mine.is_some_and(|w| {
+            !self.remote.working_edited && Some(w.base) == record.launch.draft_version
+        });
         let dir = match mine {
             Some(working) if pulled => working.dir.clone(),
             Some(_) => crate::draft::dir(&root, &format!("{draft}-agent")),
@@ -414,11 +402,11 @@ impl App {
     /// for the clipboard.
     pub fn hand_off(&mut self, task: Option<&str>) -> Option<String> {
         let Some(handoff) = self.handoff(task) else {
-            self.handoff_note = Some(Err("This run has no pack to fix".to_string()));
+            self.run.handoff_note = Some(Err("This run has no pack to fix".to_string()));
             return None;
         };
         let text = crate::handoff::brief(&handoff);
-        self.handoff_note = Some(
+        self.run.handoff_note = Some(
             crate::handoff::root()
                 .ok_or_else(|| "no home directory for briefs".to_string())
                 .and_then(|root| {

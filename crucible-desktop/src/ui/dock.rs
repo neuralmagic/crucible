@@ -158,7 +158,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
     match kind {
         PaneKind::Tasks => tasks::task_list(
             app,
-            &pane.tasks,
+            pane.tasks,
             pane.agent_lines(),
             pane.verdict == crate::model::Verdict::Running,
             empty_run(pane, p),
@@ -182,7 +182,12 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
         PaneKind::Files => files::files_view(pane, app, p),
         PaneKind::Transcript => transcript::transcript_view(pane, app, p),
         PaneKind::Compare => compare::compare_view(pane, app, p),
-        PaneKind::Pack => pack::pack_view(&pane.pack, pane.log_font, app, p),
+        PaneKind::Pack => pack::pack_view(
+            pane.pack.as_deref().map_err(String::as_str),
+            pane.log_font,
+            app,
+            p,
+        ),
         PaneKind::Launch if pane.launchable => col()
             .key("launch-local")
             .w_full()
@@ -195,15 +200,10 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
                     .font(p.k.ty.ui)
                     .color(p.c.text_muted),
             ),
-        PaneKind::Launch => launch::launch_view(pane.launch.as_ref(), p),
-        PaneKind::Log => log::log_pane(
-            &pane.transcript,
-            &pane.log,
-            &pane.tasks,
-            pane.log_font,
-            app,
-            p,
-        ),
+        PaneKind::Launch => launch::launch_view(pane.launch, p),
+        PaneKind::Log => {
+            log::log_pane(pane.transcript, pane.log, pane.tasks, pane.log_font, app, p)
+        }
     }
 }
 

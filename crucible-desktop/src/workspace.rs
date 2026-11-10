@@ -493,7 +493,7 @@ fn split(start: f32, next: f32, delta: f32) -> (f32, f32) {
 
 fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
     let mut shares: Vec<&mut f32> = shares.collect();
-    for share in shares.iter_mut() {
+    for share in &mut shares {
         if !share.is_finite() || **share <= 0.0 {
             **share = MIN_SHARE;
         }

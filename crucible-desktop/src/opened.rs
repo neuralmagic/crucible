@@ -14,7 +14,7 @@ impl App {
         for dir in paths.into_iter().filter(|p| p.is_dir()) {
             self.switch(Backend::Controller);
             self.page = crate::Page::Runs;
-            self.live_client.drop_pack(
+            self.remote.live_client.drop_pack(
                 dir,
                 self.settings.drop_max_cost,
                 self.settings.drop_max_time.clone(),
@@ -24,10 +24,10 @@ impl App {
 
     /// Open the launch a drop started, or say why it did not.
     pub(crate) fn answer_drop(&mut self, dropped: Option<crate::live::Dropped>) {
-        let Some(dropped) = dropped.filter(|d| d.seq > self.dropped_seen) else {
+        let Some(dropped) = dropped.filter(|d| d.seq > self.remote.dropped_seen) else {
             return;
         };
-        self.dropped_seen = dropped.seq;
+        self.remote.dropped_seen = dropped.seq;
         let (title, body, link) = match &dropped.result {
             Ok(crate::live::DropOutcome::Saved) => {
                 self.open_launcher(crate::live::Target::Draft(dropped.draft.clone()));
@@ -51,7 +51,7 @@ impl App {
                 };
                 (
                     format!("Launched {}", dropped.draft),
-                    format!("on {}", self.target.name),
+                    format!("on {}", self.remote.target.name),
                     link.url(),
                 )
             }

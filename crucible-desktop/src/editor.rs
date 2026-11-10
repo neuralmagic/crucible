@@ -218,15 +218,15 @@ impl Terminal {
 /// script runs after it.
 const SCRIPT_SPLIT: &str = "--script--";
 
-/// `$VISUAL`, else `$EDITOR`: from this process, or, for an app opened from Finder that never
-/// saw the user's shell setup, from an interactive login shell, which is where shells set them.
-pub fn login_editor() -> Option<String> {
-    let own = ["VISUAL", "EDITOR"]
+/// `$VISUAL`, else `$EDITOR`, as this process has them.
+pub fn env_editor() -> Option<String> {
+    ["VISUAL", "EDITOR"]
         .into_iter()
-        .find_map(|var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()));
-    if own.is_some() {
-        return own;
-    }
+        .find_map(|var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()))
+}
+
+/// `$VISUAL`, else `$EDITOR`, from an interactive login shell. Blocks for up to three seconds.
+pub fn shell_editor() -> Option<String> {
     let shell = Os::HOST.login_shell();
     let mut child = Command::new(&shell)
         .args([
