@@ -18,7 +18,7 @@ use crate::task::{self, Outcome, TaskRef};
 use crucible_mcp_auth::access::AccessReview;
 use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::principal::Principal;
-use k8s_openapi::api::core::v1::{Event, Node, Pod};
+use k8s_openapi::api::core::v1::{Event, Node, Pod, Service};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
@@ -45,7 +45,7 @@ const MAX_REPLICAS: i64 = 1000;
 const MAX_LOG_PODS: usize = 4;
 const DEFAULT_TAIL: i64 = 200;
 const MAX_TAIL: i64 = 2000;
-const MAX_LOG_BYTES: i64 = 64 * 1024;
+const MAX_LOG_BYTES: i64 = 1024 * 1024;
 const DEFAULT_LOG_BUDGET: usize = 16 * 1024;
 const MIN_LOG_BUDGET: usize = 1024;
 const MAX_PROBLEM_PODS: usize = 5;
@@ -90,6 +90,14 @@ pub enum ToolError {
         name: String,
         existing: String,
     },
+    #[error("since_time {got:?} is not an RFC 3339 time: {reason}")]
+    SinceTime { got: String, reason: String },
+    #[error("since_time and since_seconds both given; a log read starts at one of them")]
+    TwoSinces,
+    #[error(
+        "a Service named {name} already exists and is not this {kind}'s; delete it or pick another name"
+    )]
+    ServiceTaken { kind: &'static str, name: String },
     #[error("{kind} {name} cannot be resumed: {detail}")]
     NotStopped {
         kind: &'static str,
@@ -135,6 +143,9 @@ impl ToolError {
             | Self::NotOwned { .. }
             | Self::HashMismatch { .. }
             | Self::Conflict { .. }
+            | Self::ServiceTaken { .. }
+            | Self::SinceTime { .. }
+            | Self::TwoSinces
             | Self::NotStopped { .. }
             | Self::NotScalable { .. }
             | Self::Replicas { .. }
@@ -471,6 +482,11 @@ pub struct PlanArgs {
     /// privilege, another service account, or scheduling fields that bypass Kueue; the server's
     /// allowlist profile (whoami) decides Secrets, volume claims and tolerations.
     pub manifest: Value,
+    /// Ports of a Deployment, StatefulSet or LeaderWorkerSet to expose in the namespace: the
+    /// server creates a Service of the workload's name for them (a LeaderWorkerSet's leaders),
+    /// deleted with the workload, and plan, submit and status report where to reach it.
+    #[serde(default)]
+    pub expose: Vec<u16>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -482,8 +498,11 @@ pub struct SubmitArgs {
     pub queue: String,
     /// The manifest exactly as passed to workload_plan.
     pub manifest: Value,
-    /// plan_hash returned by workload_plan for this queue and manifest.
+    /// plan_hash returned by workload_plan for this queue, manifest and expose.
     pub plan_hash: String,
+    /// The ports exactly as passed to workload_plan.
+    #[serde(default)]
+    pub expose: Vec<u16>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -548,14 +567,27 @@ pub struct LogArgs {
     /// Keep only lines containing this text (case-sensitive), applied before the byte budget.
     #[serde(default)]
     pub grep: Option<String>,
-    /// Total bytes of log text across all pods (default 16384, max 65536). Each pod keeps the
+    /// Total bytes of log text across all pods (default 16384, max 1048576). Each pod keeps the
     /// end of its log; `bytes_omitted` counts what was cut from the front.
     #[serde(default)]
-    #[schemars(range(min = 1024, max = 65536))]
+    #[schemars(range(min = 1024, max = 1048576))]
     pub max_bytes: Option<usize>,
     /// Logs of the previous container instance, after a restart.
     #[serde(default)]
     pub previous: bool,
+    /// Keep reading each pod's log for this many seconds (max 50) and answer what it wrote by
+    /// then, so a pod that dies and is deleted meanwhile is read to its end. A caller that
+    /// repeats the call with since_time reads a log as it is written.
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 50))]
+    pub follow_seconds: Option<u64>,
+    /// Only lines written at or after this RFC 3339 time, in place of since_seconds. Without
+    /// tail_lines it reads every such line.
+    #[serde(default)]
+    pub since_time: Option<String>,
+    /// Start each line with the RFC 3339 time it was written.
+    #[serde(default)]
+    pub timestamps: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -948,10 +980,12 @@ impl KueueMcp {
         caller: &Caller,
         queue: &str,
         manifest: Value,
+        expose: &[u16],
     ) -> Result<(Normalized, ClusterQueue), ToolError> {
         let lq = self.local_queue(caller, queue).await?;
         let queue = QueueName::parse(queue)?;
-        let normalized = manifest::normalize(manifest, caller, &queue, &self.config)?;
+        let normalized =
+            manifest::normalize(manifest, caller, &queue, &self.config)?.exposing(expose)?;
         let cq = self.cluster_queue(&lq).await?;
         Ok((normalized, cq))
     }
@@ -977,6 +1011,107 @@ impl KueueMcp {
             .create(&pp, &object)
             .await
             .map_err(|e| api_rejection(n.kind, e))
+    }
+
+    /// Where the Service exposing `n` is reached: its name, its host in the cluster and its ports.
+    fn endpoint(&self, namespace: &str, name: &str, ports: &[u16]) -> Value {
+        json!({
+            "name": name,
+            "host": format!("{name}.{namespace}.svc.{}", self.config.cluster_domain),
+            "ports": ports,
+        })
+    }
+
+    /// Create the Service exposing `n`'s ports, owned by `owner` so it is deleted with it, and
+    /// answer where it is reached; nothing when `n` exposes none. One that already exists must be
+    /// that workload's own.
+    async fn expose(
+        &self,
+        caller: &Caller,
+        n: &Normalized,
+        owner: Option<&DynamicObject>,
+        dry_run: bool,
+    ) -> Result<Option<Value>, ToolError> {
+        let namespace = caller.namespace.as_str();
+        let owner_uid = owner.and_then(|o| o.metadata.uid.as_deref());
+        let Some(wanted) = n.service(namespace, &self.config.labels.workload, owner_uid) else {
+            return Ok(None);
+        };
+        let service: Service =
+            serde_json::from_value(wanted).map_err(|source| KubeError::Decode {
+                what: format!("the Service of {} {}", n.kind.kind(), n.name),
+                source,
+            })?;
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let pp = PostParams {
+            dry_run,
+            field_manager: Some(self.config.labels.manager.to_string()),
+        };
+        match services.create(&pp, &service).await {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                let existing = services.get(&n.name).await.map_err(|source| {
+                    KubeError::api("get", format!("Service {}", n.name), source)
+                })?;
+                let owned = existing
+                    .metadata
+                    .owner_references
+                    .iter()
+                    .flatten()
+                    .any(|r| owner_uid == Some(r.uid.as_str()));
+                if !owned {
+                    return Err(ToolError::ServiceTaken {
+                        kind: n.kind.kind(),
+                        name: n.name.clone(),
+                    });
+                }
+            }
+            Err(kube::Error::Api(e)) if (400..500).contains(&e.code) && e.code != 404 => {
+                return Err(ToolError::Rejected {
+                    kind: "Service",
+                    code: e.code,
+                    message: e.message,
+                });
+            }
+            Err(source) => {
+                return Err(KubeError::api("create", format!("Service {}", n.name), source).into());
+            }
+        }
+        Ok(Some(self.endpoint(namespace, &n.name, &n.expose)))
+    }
+
+    /// Where `object`'s own Service is reached, when it has one.
+    async fn exposed(
+        &self,
+        namespace: &str,
+        name: &str,
+        object: &DynamicObject,
+    ) -> Result<Option<Value>, ToolError> {
+        let services: Api<Service> = Api::namespaced(self.client.clone(), namespace);
+        let service = services
+            .get_opt(name)
+            .await
+            .map_err(|source| KubeError::api("get", format!("Service {name}"), source))?;
+        let Some(service) = service else {
+            return Ok(None);
+        };
+        let uid = object.metadata.uid.as_deref();
+        let owned = service
+            .metadata
+            .owner_references
+            .iter()
+            .flatten()
+            .any(|r| uid == Some(r.uid.as_str()));
+        if !owned {
+            return Ok(None);
+        }
+        let ports: Vec<u16> = service
+            .spec
+            .iter()
+            .flat_map(|spec| spec.ports.iter().flatten())
+            .filter_map(|port| u16::try_from(port.port).ok())
+            .collect();
+        Ok(Some(self.endpoint(namespace, name, &ports)))
     }
 
     async fn set_replicas(
@@ -1412,6 +1547,13 @@ impl KueueMcp {
         if !wait.is_null() {
             body["wait"] = wait;
         }
+        if !args.kind.is_batch()
+            && let Some(service) = self
+                .exposed(c.namespace.as_str(), &args.name, &snap.object)
+                .await?
+        {
+            body["service"] = service;
+        }
         Ok(body)
     }
 
@@ -1734,7 +1876,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, how long a finished Job or RayJob is kept (finished_retention_seconds), and server_changes: what the server added, such as the image pull secret an image's registry needs.",
+        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, how long a finished Job or RayJob is kept (finished_retention_seconds), and server_changes: what the server added, such as the image pull secret an image's registry needs. Planning a workload already submitted with the same plan answers the same plan again; one of that name with other content is refused. With expose, a Deployment, StatefulSet or LeaderWorkerSet also gets a Service of its name for those ports, and service says where it will be reached.",
         annotations(
             title = "Plan a workload",
             read_only_hint = true,
@@ -1751,8 +1893,33 @@ impl KueueMcp {
             self.explain(&parts, requested.as_deref(), async {
                 let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let actor = identity(&parts)?.actor.as_deref();
-                let (n, cq) = self.plan(&c, &args.queue, args.manifest).await?;
-                self.create(&c, &n, actor, true).await?;
+                let (n, cq) = self.plan(&c, &args.queue, args.manifest, &args.expose).await?;
+                let (dry_run, service) = match self.create(&c, &n, actor, true).await {
+                    Ok(_) => ("accepted", self.expose(&c, &n, None, true).await?),
+                    Err(ToolError::Rejected { .. })
+                        if self.get_object(&c, n.kind, &n.name).await.is_ok() =>
+                    {
+                        let existing = self.owned_object(&c, n.kind, &n.name).await?;
+                        let hash = existing
+                            .metadata
+                            .annotations
+                            .as_ref()
+                            .and_then(|a| a.get(&self.config.labels.plan_hash))
+                            .cloned()
+                            .unwrap_or_default();
+                        if hash != n.plan_hash {
+                            return Err(ToolError::Conflict {
+                                kind: n.kind.kind(),
+                                name: n.name,
+                                existing: hash,
+                            });
+                        }
+                        let service = (!n.expose.is_empty())
+                            .then(|| self.endpoint(c.namespace.as_str(), &n.name, &n.expose));
+                        ("already submitted with this plan", service)
+                    }
+                    Err(e) => return Err(e),
+                };
                 let totals: BTreeMap<String, String> =
                     n.total_requests().into_iter().map(|(k, v)| (k, v.to_string())).collect();
                 let pod_sets: Vec<Value> = n
@@ -1772,11 +1939,12 @@ impl KueueMcp {
                     "plan_hash": n.plan_hash,
                     "finished_retention_seconds": n.retention_seconds(),
                     "server_changes": n.server_changes,
-                    "dry_run": "accepted",
+                    "dry_run": dry_run,
                     "admission": n.kind.admission(),
                     "pod_sets": pod_sets,
                     "total_requests": totals,
                     "fit": kueue::fit(&n.total_requests(), &cq),
+                    "service": service,
                     "manifest": n.object,
                 }))
             }
@@ -1786,7 +1954,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Create a planned workload. The manifest and queue must be the ones passed to workload_plan and plan_hash must match. Resubmitting an identical plan is a no-op.",
+        description = "Create a planned workload. The manifest, queue and expose must be the ones passed to workload_plan and plan_hash must match. Resubmitting an identical plan is a no-op. service says where an exposed workload is reached once its pods are ready.",
         annotations(
             title = "Submit a workload",
             read_only_hint = false,
@@ -1809,7 +1977,7 @@ impl KueueMcp {
                 let parts = parts.ok_or(ToolError::NoCaller)?;
                 let c = self.served_caller(parts, args.namespace.as_deref()).await?;
                 let actor = identity(parts)?.actor.as_deref();
-                let (n, _) = self.plan(&c, &args.queue, args.manifest).await?;
+                let (n, _) = self.plan(&c, &args.queue, args.manifest, &args.expose).await?;
                 if n.plan_hash != args.plan_hash {
                     return Err(ToolError::HashMismatch {
                         got: args.plan_hash,
@@ -1820,7 +1988,8 @@ impl KueueMcp {
                     Ok(obj) => {
                         tracing::info!(kind = n.kind.kind(), name = %n.name, namespace = %c.namespace, run = %c.run_id, "workload submitted");
                         let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &obj));
-                        Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "submitted": true}), task))
+                        let service = self.expose(&c, &n, Some(&obj), false).await?;
+                        Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "service": service, "submitted": true}), task))
                     }
                     Err(ToolError::Rejected { .. }) if self.get_object(&c, n.kind, &n.name).await.is_ok() => {
                         let existing = self.owned_object(&c, n.kind, &n.name).await?;
@@ -1839,7 +2008,8 @@ impl KueueMcp {
                             });
                         }
                         let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &existing));
-                        Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "submitted": false, "note": "already submitted with this plan"}), task))
+                        let service = self.expose(&c, &n, Some(&existing), false).await?;
+                        Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "service": service, "submitted": false, "note": "already submitted with this plan"}), task))
                     }
                     Err(e) => Err(e),
                 }
@@ -1966,7 +2136,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Tail container logs of a workload's pods within a byte budget (16 KiB by default): failed pods first, then a RayJob's head and submitter or a LeaderWorkerSet's leader. Filter with grep and since_seconds.",
+        description = "Tail container logs of a workload's pods within a byte budget (16 KiB by default, up to 1 MiB): failed pods first, then a RayJob's head and submitter or a LeaderWorkerSet's leader. Filter with grep and since_seconds or since_time. With follow_seconds it keeps reading for that long, so a pod that dies meanwhile is read to its end.",
         annotations(
             title = "Workload logs",
             read_only_hint = true,
@@ -2017,8 +2187,27 @@ impl KueueMcp {
                         .max_bytes
                         .unwrap_or(DEFAULT_LOG_BUDGET)
                         .clamp(MIN_LOG_BUDGET, MAX_LOG_BYTES as usize);
-                    let mut fetched = Vec::new();
-                    for p in &pods {
+                    let since_time = match args.since_time.as_deref() {
+                        None => None,
+                        Some(_) if args.since_seconds.is_some() => {
+                            return Err(ToolError::TwoSinces);
+                        }
+                        Some(raw) => Some(raw.parse::<jiff::Timestamp>().map_err(|e| {
+                            ToolError::SinceTime {
+                                got: raw.to_string(),
+                                reason: e.to_string(),
+                            }
+                        })?),
+                    };
+                    let tail_lines = match (args.tail_lines, since_time) {
+                        (None, Some(_)) => None,
+                        (lines, _) => Some(lines.unwrap_or(default_tail).clamp(1, MAX_TAIL)),
+                    };
+                    let follow_until = args.follow_seconds.map(|s| {
+                        tokio::time::Instant::now()
+                            + Duration::from_secs(s.clamp(1, MAX_WAIT_SECONDS))
+                    });
+                    let reads = pods.iter().map(|p| {
                         let name = report::pod_name(p).to_string();
                         let container = args
                             .container
@@ -2026,15 +2215,29 @@ impl KueueMcp {
                             .or_else(|| report::default_container(p));
                         let lp = LogParams {
                             container: container.clone(),
-                            tail_lines: Some(
-                                args.tail_lines.unwrap_or(default_tail).clamp(1, MAX_TAIL),
-                            ),
+                            tail_lines,
                             since_seconds: args.since_seconds.filter(|s| *s > 0),
-                            limit_bytes: Some(MAX_LOG_BYTES),
+                            since_time,
+                            timestamps: args.timestamps,
+                            limit_bytes: follow_until.is_none().then_some(MAX_LOG_BYTES),
                             previous: args.previous,
+                            follow: follow_until.is_some(),
                             ..LogParams::default()
                         };
-                        let text = match api.logs(&name, &lp).await {
+                        let api = &api;
+                        async move {
+                            let read = match follow_until {
+                                None => api.logs(&name, &lp).await,
+                                Some(until) => follow_log(api, &name, &lp, until).await,
+                            };
+                            (name, container, read)
+                        }
+                    });
+                    let mut fetched = Vec::new();
+                    for (p, (name, container, read)) in
+                        pods.iter().zip(futures_util::future::join_all(reads).await)
+                    {
+                        let text = match read {
                             Ok(t) => Ok(match grep {
                                 Some(g) => report::grep(&t, g),
                                 None => t,
@@ -2228,6 +2431,38 @@ impl KueueMcp {
             .await,
         )
     }
+}
+
+/// What `pod` writes to its log until `until` or until its log ends, keeping at most the last
+/// [`MAX_LOG_BYTES`].
+async fn follow_log(
+    api: &Api<Pod>,
+    pod: &str,
+    lp: &LogParams,
+    until: tokio::time::Instant,
+) -> Result<String, kube::Error> {
+    use futures_util::AsyncReadExt;
+    let cap = usize::try_from(MAX_LOG_BYTES).unwrap_or(usize::MAX);
+    let stream = api.log_stream(pod, lp).await?;
+    let mut stream = std::pin::pin!(stream);
+    let mut kept: Vec<u8> = Vec::new();
+    let mut chunk = vec![0u8; 16 * 1024];
+    loop {
+        match tokio::time::timeout_at(until, stream.read(&mut chunk)).await {
+            Err(_) | Ok(Ok(0)) => break,
+            Ok(Ok(n)) => {
+                kept.extend_from_slice(&chunk[..n]);
+                if kept.len() > cap {
+                    kept.drain(..kept.len() - cap);
+                }
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(pod, error = %e, "log stream ended early");
+                break;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&kept).into_owned())
 }
 
 fn duration(seconds: i64) -> String {
@@ -3020,7 +3255,11 @@ mod tests {
         assert_eq!(bounds("workload_logs", "tail_lines"), (Some(1), Some(2000)));
         assert_eq!(
             bounds("workload_logs", "max_bytes"),
-            (Some(1024), Some(65536))
+            (Some(1024), Some(1_048_576))
+        );
+        assert_eq!(
+            bounds("workload_logs", "follow_seconds"),
+            (Some(1), Some(50))
         );
         assert_eq!(bounds("workload_scale", "replicas"), (Some(0), Some(1000)));
         assert_eq!(

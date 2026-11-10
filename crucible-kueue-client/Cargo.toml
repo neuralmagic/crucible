@@ -1,0 +1,23 @@
+[package]
+name = "crucible-kueue-client"
+description = "Client for crucible-kueue's MCP endpoint, for a run's command and evaluate tasks."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crucible-contract = { path = "../crucible-contract" }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { version = "1", features = ["fs", "time"] }
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+crucible-kueue = { path = "../crucible-kueue" }
+crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
+kube = { workspace = true, features = ["client", "rustls-tls"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }

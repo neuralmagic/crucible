@@ -25,6 +25,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+/// The loop pod's volume holding the SPIFFE Workload API socket.
+const LOOP_SPIFFE_VOLUME: &str = "spiffe-workload-api";
+/// The SPIFFE CSI driver, which serves the Workload API socket to a pod.
+const SPIFFE_CSI_DRIVER: &str = "csi.spiffe.io";
+
 #[derive(Debug, thiserror::Error)]
 #[error(
     "{name}: rendering a single-domain manifest needs a [deploy] block (deploy_name and/or \
@@ -882,8 +887,26 @@ impl Renderer<'_> {
     /// engine names only what it itself consumes (`BROKER_*` it reads, forge's `FORGE_*`, the openshell
     /// backend's runtime, mount-path consts); everything domain/environment-specific flows through the
     /// profile's + `[deploy]`'s generic maps, so no domain or Vertex name is baked into the engine.
+    /// The directory the loop pod mounts the SPIFFE Workload API at, when the profile says the
+    /// cluster gives loop pods an SVID.
+    fn loop_spiffe_dir(&self) -> Option<String> {
+        if !self.profile.cluster.loop_svid {
+            return None;
+        }
+        Path::new(self.profile.cluster.spiffe_socket())
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+    }
+
     fn env(&self) -> Result<Vec<core::EnvVar>> {
         let mut env = Vec::new();
+        if self.profile.cluster.loop_svid {
+            env.push(core::EnvVar {
+                name: crucible_contract::task_servers::ENV_LOOP_SPIFFE_SOCKET.to_string(),
+                value: Some(self.profile.cluster.spiffe_socket().to_string()),
+                ..Default::default()
+            });
+        }
 
         // Generic pod env from secrets (e.g. the backend's Vertex ADC), names are the profile's.
         env.extend(secret_env_vars(self.profile));
@@ -1161,6 +1184,9 @@ exit $rc
         }
         mounts.push(ro("kube-api", KUBE_API_DIR, None));
         mounts.push(ro("kubeconfig", KUBECONFIG_DIR, None));
+        if let Some(dir) = self.loop_spiffe_dir() {
+            mounts.push(ro(LOOP_SPIFFE_VOLUME, &dir, None));
+        }
         if self.profile.secrets.push_authfile.is_some() {
             mounts.push(ro("quay-push", PUSH_AUTHFILE_DIR, None));
         }
@@ -1220,6 +1246,18 @@ exit $rc
                 name: "quay-auth".to_string(),
                 secret: Some(core::SecretVolumeSource {
                     secret_name: Some(secret.clone()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        }
+
+        if self.loop_spiffe_dir().is_some() {
+            volumes.push(core::Volume {
+                name: LOOP_SPIFFE_VOLUME.to_string(),
+                csi: Some(core::CSIVolumeSource {
+                    driver: SPIFFE_CSI_DRIVER.to_string(),
+                    read_only: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -5344,6 +5382,59 @@ mod tests {
     /// With `[buildit.cache]` and any writers, the loop pod mounts the token Secret, optional since a
     /// cluster without the cache has none; builder pods may reach the cache either way. A run
     /// learns the cache itself from its buildit site, not the pod.
+    #[test]
+    fn a_cluster_that_gives_loop_pods_an_svid_mounts_the_workload_api() {
+        let manifest = k8s_manifest();
+        let pod = |profile: &DeployProfile| -> serde_json::Value {
+            let yaml = render_k8s_manifest(&manifest, profile);
+            serde_norway::Deserializer::from_str(&yaml)
+                .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+                .find(|d| d["kind"] == "Pod")
+                .unwrap()
+        };
+        let named = |items: &serde_json::Value, name: &str| -> Option<serde_json::Value> {
+            items
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["name"] == name)
+                .cloned()
+        };
+        let socket_env = crucible_contract::task_servers::ENV_LOOP_SPIFFE_SOCKET;
+
+        let mut profile = k8s_profile("");
+        let plain = pod(&profile);
+        assert!(named(&plain["spec"]["volumes"], "spiffe-workload-api").is_none());
+        assert!(named(&plain["spec"]["containers"][0]["env"], socket_env).is_none());
+
+        profile.cluster.loop_svid = true;
+        let with = pod(&profile);
+        assert_eq!(
+            named(&with["spec"]["volumes"], "spiffe-workload-api").unwrap()["csi"],
+            serde_json::json!({"driver": "csi.spiffe.io", "readOnly": true})
+        );
+        let container = &with["spec"]["containers"][0];
+        let mount = named(&container["volumeMounts"], "spiffe-workload-api").unwrap();
+        assert_eq!(mount["mountPath"], "/spiffe-workload-api");
+        assert_eq!(mount["readOnly"], true);
+        assert_eq!(
+            named(&container["env"], socket_env).unwrap()["value"],
+            "/spiffe-workload-api/spire-agent.sock"
+        );
+
+        profile.cluster.sandbox_spiffe_socket = Some("/run/spire/agent.sock".into());
+        let moved = pod(&profile);
+        let container = &moved["spec"]["containers"][0];
+        assert_eq!(
+            named(&container["volumeMounts"], "spiffe-workload-api").unwrap()["mountPath"],
+            "/run/spire"
+        );
+        assert_eq!(
+            named(&container["env"], socket_env).unwrap()["value"],
+            "/run/spire/agent.sock"
+        );
+    }
+
     #[test]
     fn the_shared_buildit_cache_s_token_and_port_reach_the_loop_and_builder_pods() {
         let manifest = k8s_manifest();

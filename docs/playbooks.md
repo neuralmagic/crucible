@@ -288,6 +288,37 @@ from upstream tasks. If a task had a secret, its output, files, and workspace ch
 go to the tasks after it. The capability disclosure lists each sandbox. At launch, the
 controller checks each sandbox image against the catalog.
 
+`command` and `evaluate` tasks run in the loop pod, not in a sandbox. `servers` in `[workflow]`
+names the run's MCP servers they reach, for example `servers = ["kueue"]`. Each task then gets
+`CRUCIBLE_TASK_SERVERS`, a JSON list of `name`, `url` and `token_file`. The token is the run's
+own, minted by the controller for that task and server, and the engine rewrites the file before
+it expires. The server checks each call as it checks an agent's. Only servers that run outside
+the loop pod can be named. Agent turns never get this variable. The capability disclosure lists
+the grant as `task-servers`.
+
+A Python task calls crucible-kueue with the `crucible_kueue` package. `AsyncClient` is for
+asyncio; `Client` has the same methods and blocks.
+
+```python
+import asyncio
+from crucible_kueue import AsyncClient
+
+async def main():
+    kueue = AsyncClient()
+    log = await kueue.run("gpu", job, grep="RESULT ")
+    async with kueue.serving("gpu", deployment, 8000) as url:
+        ...  # reach the workload at url, from this task or from another Job
+
+asyncio.run(main())
+```
+
+`run` submits a Job, waits for it to finish and answers its log; it raises when the Job fails.
+`serving` submits a Deployment, StatefulSet or LeaderWorkerSet with that port exposed, waits
+until it is ready, and deletes it and its Service on the way out. `follow_logs` yields a
+workload's log lines as they are written. Under them are the server's own tools as methods
+(`submit`, `wait`, `workload_status`, `workload_logs`, `workload_delete` and the rest), for
+anything the two do not cover. Cancelling a wait leaves the workload running.
+
 ## MCP servers
 
 With `openshell`, a pack can start MCP servers on the loop pod. Use them for tools that need

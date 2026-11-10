@@ -555,6 +555,11 @@ pub(crate) fn prep_plan_runner_with_params(
         .map(crate::plan::workflow::WorkflowCfg::host_env)
         .transpose()?
         .unwrap_or_default();
+    args.workflow_servers = m
+        .workflow
+        .as_ref()
+        .map(|w| w.servers.clone())
+        .unwrap_or_default();
     args.buildit_socket = Some(p.buildit_socket());
     // A playbook's git memory is per task; the scored loop owns the same repository for
     // keep/discard of whole candidates and must not find per-task commits inside an iteration.

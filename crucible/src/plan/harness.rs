@@ -807,6 +807,21 @@ pub(crate) fn resolved_agent(
     })
 }
 
+/// Tokens for `task` to each of `[workflow].servers`, kept fresh until dropped; none when the
+/// pack names no servers.
+fn task_tokens(
+    servers: &[crucible_contract::agent_servers::ServerName],
+    task: &str,
+) -> Result<Option<crate::plan::task_tokens::TaskTokens>, crate::plan::task_tokens::TaskTokenError>
+{
+    use crate::plan::task_tokens::{TaskTokens, TokenEndpoint, wanted};
+    if servers.is_empty() {
+        return Ok(None);
+    }
+    let wanted = wanted(servers)?;
+    TaskTokens::grant(TokenEndpoint::from_env()?, wanted, task).map(Some)
+}
+
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
 /// tasks run through the real [`crate::agent::run_turn`] with the task's knob overrides.
 fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
@@ -852,12 +867,27 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
                 }
                 _ => false,
             };
+            let tokens = match task.task {
+                TaskKind::Command { .. } | TaskKind::Evaluate { .. } => {
+                    match task_tokens(&args.workflow_servers, &task.name.0) {
+                        Ok(tokens) => tokens,
+                        Err(e) => {
+                            return Attempt::transport(TransportCause::Other, e.to_string());
+                        }
+                    }
+                }
+                _ => None,
+            };
             let mut shell = ShellRunner {
                 workdir: paths.workspace.clone(),
                 agent_cmd: None,
                 env: args.workflow_env.clone(),
                 buildit_socket,
                 github,
+                task_servers: tokens
+                    .as_ref()
+                    .map(|t| t.servers().to_vec())
+                    .unwrap_or_default(),
             };
             return if task.isolation == Some(Isolation::Worktree) {
                 shell.run_in_prepared_worktree(task, inputs, deadline, lane)

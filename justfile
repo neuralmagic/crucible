@@ -210,6 +210,14 @@ kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/p
         PACK={{pack}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
 
+# The kueue e2e's task pack on <name>: a command task with no agent runs GPU Jobs on two queues
+# and serves a LeaderWorkerSet through crucible-kueue with its task token, on loop pods that carry
+# an SVID of their own (scripts/kueue-e2e.sh, TASKS=1).
+kueue-task-e2e name loop_image kueue_image controller_image:
+    set -a && . e2e/kueue/clusters/{{name}}.env && set +a && \
+        TASKS=1 MAX_TIME=60m TIMEOUT_SECS=3600 LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
+        CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
+
 # The verifier of examples/optimize-loop against real report, evidence and image files, and the
 # pack compiled in both variants.
 optimize-loop-test:

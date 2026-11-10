@@ -227,6 +227,9 @@ pub(crate) struct Args {
     /// What `[workflow].env` passes to `command` and `evaluate` tasks.
     #[arg(skip)]
     pub workflow_env: crucible::host_env::HostEnv,
+    /// The run's MCP servers `[workflow].servers` gives `command` and `evaluate` tasks.
+    #[arg(skip)]
+    pub workflow_servers: Vec<crucible_contract::agent_servers::ServerName>,
     /// Where the run's buildit serves the run's own command and evaluate tasks, fixed from the
     /// run's top-level paths so every task and turn starts it the same way.
     #[arg(skip)]

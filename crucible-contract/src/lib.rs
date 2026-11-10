@@ -35,6 +35,7 @@ pub mod report;
 pub mod sandbox;
 pub mod scope;
 pub mod session;
+pub mod task_servers;
 pub mod tier;
 pub mod verdict;
 
