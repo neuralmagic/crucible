@@ -10,7 +10,7 @@
 //! progress/activity beats), and [`cli`] (`ScopeArgs`/`execute`/`run`, the command's entry point).
 
 mod cli;
-mod pack;
+pub(crate) mod pack;
 mod pipeline;
 mod progress;
 mod transcript;

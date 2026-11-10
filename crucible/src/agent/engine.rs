@@ -283,10 +283,13 @@ pub(crate) enum TurnSpanKind {
     Scope,
     /// `crucible rank-grounded`, pairs with the controller's `dispatch_grounded_rank` PRODUCER.
     RankGrounded,
+    /// `crucible draft`, pairs with the controller's draft-generate dispatch PRODUCER.
+    Draft,
 }
 
 #[cfg(feature = "autoresearch")]
-/// The CONSUMER root span for one controller-dispatched agent turn (scope-propose / grounded-rank),
+/// The CONSUMER root span for one controller-dispatched agent turn (scope-propose / grounded-rank /
+/// draft),
 /// parented to the controller's PRODUCER dispatch span exactly like [`run_span`], so the turn's
 /// `openshell_turn` span nests under the dispatch instead of floating as an orphaned trace. Same
 /// contract as [`run_span`]: `None` unless BOTH the OTLP exporter is installed AND a parseable
@@ -306,6 +309,7 @@ pub(crate) fn turn_span(kind: TurnSpanKind, issue: Option<&str>) -> Option<traci
         TurnSpanKind::RankGrounded => {
             tracing::info_span!("rank_grounded", otel.kind = "consumer", issue = issue)
         }
+        TurnSpanKind::Draft => tracing::info_span!("draft", otel.kind = "consumer", issue = issue),
     };
     // Best-effort: a failed link just leaves the turn span self-rooted, never fails the turn.
     if let Err(e) = span.set_parent(parent) {

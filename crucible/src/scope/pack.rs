@@ -82,7 +82,7 @@ pub(super) fn sync_pack_from_workspace(scratch: &Path, pack: &Path) -> Result<()
 
 /// Remove everything inside `dir` without removing `dir` itself (the pipeline holds its
 /// canonicalized path).
-fn clear_dir(dir: &Path) -> Result<()> {
+pub(crate) fn clear_dir(dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
         let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
         let path = entry.path();
@@ -101,7 +101,7 @@ fn clear_dir(dir: &Path) -> Result<()> {
 
 /// Recursively copy `src`'s contents into `dst` (created if missing). `fs::copy` preserves
 /// permissions, which the pack's executable measure scripts depend on.
-fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
     for entry in std::fs::read_dir(src).with_context(|| format!("reading {}", src.display()))? {
         let entry = entry.with_context(|| format!("reading {}", src.display()))?;
@@ -346,7 +346,7 @@ fn src_is_control(src: &str) -> bool {
 }
 
 /// Refuse a non-empty `--out` unless `force`; create it if it doesn't exist yet.
-pub(super) fn ensure_out_dir(out: &Path, force: bool) -> Result<()> {
+pub(crate) fn ensure_out_dir(out: &Path, force: bool) -> Result<()> {
     if !out.exists() {
         std::fs::create_dir_all(out)
             .with_context(|| format!("creating --out {}", out.display()))?;
@@ -365,7 +365,7 @@ pub(super) fn ensure_out_dir(out: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn scratch_dir(prefix: &str) -> PathBuf {
+pub(crate) fn scratch_dir(prefix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "crucible-{prefix}-{}-{}",
         std::process::id(),
