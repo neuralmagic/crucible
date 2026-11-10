@@ -8,6 +8,7 @@
 
 use crucible_contract::session::TaskStatus;
 use serde_json::Value;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 /// Cap on a captured file served inline. Bigger files list their name and size only.
@@ -161,6 +162,78 @@ pub async fn run_session(
         Some(stored) => Ok(Some(stored)),
         None => Ok(local_session(scratch_root, run_id).await),
     }
+}
+
+/// Fold a session log into one chronological, task-prefixed console: every line a task printed
+/// under `[task]`, framed by the lifecycle lines around it. The same prefix the engine log gives a
+/// task's emits, so the two read as one voice. Lines that are not JSON or not task events are
+/// skipped — a session log is append-only evidence, and one unreadable line is no reason to serve
+/// nothing.
+pub fn task_console(session: &str) -> String {
+    fn str_field<'a>(event: &'a serde_json::Map<String, Value>, key: &str) -> Option<&'a str> {
+        event.get(key).and_then(Value::as_str)
+    }
+    fn num_field(event: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
+        event.get(key).and_then(Value::as_f64)
+    }
+
+    let mut out = String::new();
+    for line in session.lines() {
+        let Ok(Value::Object(event)) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match str_field(&event, "kind") {
+            Some("plan_admitted") => {
+                let tasks = event
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                let plan = num_field(&event, "plan_version").unwrap_or_default();
+                let _ = writeln!(out, "plan admitted (v{plan}, {tasks} tasks)");
+            }
+            Some("task_started") => {
+                let Some(task) = str_field(&event, "task") else {
+                    continue;
+                };
+                let attempt = num_field(&event, "attempt").unwrap_or_default();
+                let _ = writeln!(out, "[{task}] attempt {attempt} started");
+            }
+            Some("task_output") => {
+                let (Some(task), Some(lines)) = (
+                    str_field(&event, "task"),
+                    event.get("lines").and_then(Value::as_array),
+                ) else {
+                    continue;
+                };
+                for text in lines.iter().filter_map(Value::as_str) {
+                    let _ = writeln!(out, "[{task}] {text}");
+                }
+            }
+            Some("task_output_dropped") => {
+                let (Some(task), Some(lines)) =
+                    (str_field(&event, "task"), num_field(&event, "lines"))
+                else {
+                    continue;
+                };
+                let _ = writeln!(out, "[{task}] … {lines} more lines past the output cap");
+            }
+            Some("task_result") => {
+                let Some(task) = str_field(&event, "task") else {
+                    continue;
+                };
+                let status = str_field(&event, "status").unwrap_or("unknown");
+                let attempts = num_field(&event, "attempts").unwrap_or_default();
+                let secs = num_field(&event, "secs").unwrap_or_default();
+                let _ = write!(out, "[{task}] {status} ({attempts} attempts, {secs:.1}s)");
+                if let Some(note) = str_field(&event, "note").filter(|n| !n.is_empty()) {
+                    let _ = write!(out, ": {note}");
+                }
+                out.push('\n');
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// How many instances a mapped task was spread over, and `None` when the session cannot say.
@@ -377,5 +450,45 @@ mod tests {
         assert_eq!(fanout_width(empty, "triage", "scan.issues"), Some(0));
         let folded = "{\"kind\":\"task_result\",\"task\":\"triage\",\"status\":\"pass\",\"output\":{\"instances\":0,\"passed\":0,\"failed\":0}}";
         assert_eq!(fanout_width(folded, "triage", "scan.issues"), Some(0));
+    }
+
+    /// The shape a real playbook session writes, task events interleaved with lines the fold
+    /// carries and lines it skips.
+    const PLAYBOOK_SESSION: &str = concat!(
+        "{\"v\":1,\"kind\":\"plan_admitted\",\"plan_version\":1,\"reason\":\"admitted\",\"tasks\":[{\"name\":\"plan\"},{\"name\":\"prep\"}]}\n",
+        "not json at all\n",
+        "{\"v\":1,\"kind\":\"task_started\",\"task\":\"prep\",\"attempt\":1,\"estimate_usd\":0.1}\n",
+        "{\"v\":1,\"kind\":\"task_output\",\"task\":\"prep\",\"attempt\":1,\"stream\":\"stdout\",\"lines\":[\"$ git clone --depth 1\",\"cloned\"]}\n",
+        "{\"v\":1,\"kind\":\"task_output\",\"task\":\"prep\",\"attempt\":1,\"stream\":\"stderr\",\"lines\":[\"warning: shallow\"]}\n",
+        "{\"v\":1,\"kind\":\"task_output_dropped\",\"task\":\"prep\",\"attempt\":1,\"lines\":40}\n",
+        "{\"v\":1,\"kind\":\"task_result\",\"task\":\"prep\",\"status\":\"pass\",\"attempts\":1,\"secs\":8.25,\"note\":\"\"}\n",
+        "{\"v\":1,\"kind\":\"task_result\",\"task\":\"sweep[FLASH_ATTN]\",\"status\":\"fail\",\"attempts\":2,\"secs\":12.0,\"note\":\"exit 1\"}\n",
+        "{\"v\":1,\"kind\":\"history_entry\",\"entry\":{}}\n",
+    );
+
+    #[test]
+    fn the_console_folds_task_lines_under_their_task_in_arrival_order() {
+        assert_eq!(
+            task_console(PLAYBOOK_SESSION),
+            concat!(
+                "plan admitted (v1, 2 tasks)\n",
+                "[prep] attempt 1 started\n",
+                "[prep] $ git clone --depth 1\n",
+                "[prep] cloned\n",
+                "[prep] warning: shallow\n",
+                "[prep] … 40 more lines past the output cap\n",
+                "[prep] pass (1 attempts, 8.2s)\n",
+                "[sweep[FLASH_ATTN]] fail (2 attempts, 12.0s): exit 1\n",
+            )
+        );
+    }
+
+    #[test]
+    fn a_session_without_task_events_folds_to_an_empty_console() {
+        assert_eq!(task_console(""), "");
+        assert_eq!(
+            task_console("not json\n{\"kind\":\"shutdown\",\"outcome\":\"finished\"}\n"),
+            ""
+        );
     }
 }

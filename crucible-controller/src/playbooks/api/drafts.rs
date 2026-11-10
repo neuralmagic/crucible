@@ -184,6 +184,8 @@ dto! {
         pub core_rev: String,
         pub created_by: Option<String>,
         pub created_at: String,
+        /// The intent a generate was handed to write this version; an editor save carries none.
+        pub intent: Option<String>,
     }
 }
 
@@ -283,6 +285,8 @@ dto! {
         pub saved_by: Option<String>,
         pub saved_at: String,
         pub diagnostics: Vec<crate::playbooks::drafts::Diagnostic>,
+        /// The intent a generate was handed to write this version; an editor save carries none.
+        pub intent: Option<String>,
         /// `{path: content}`, every file the pack holds.
         pub files: std::collections::BTreeMap<String, String>,
     }
@@ -784,6 +788,7 @@ pub(crate) async fn save_playbook_draft(
         body.files,
         identity.as_deref(),
         body.base_version,
+        None,
     )
     .await
     {
@@ -941,6 +946,7 @@ pub(crate) async fn generate_playbook_draft(
         generated.files,
         identity.as_deref(),
         base_version,
+        Some(body.intent.trim()),
     )
     .await
     {

@@ -1566,18 +1566,25 @@ mod tests {
             .expect("the draft")
             .files;
         files.insert("NOTES.md".to_string(), "second save".to_string());
-        let second =
-            crate::playbooks::drafts::save_version(&pool, "studio", files.clone(), None, None)
-                .await
-                .expect("second save");
+        let second = crate::playbooks::drafts::save_version(
+            &pool,
+            "studio",
+            files.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("second save");
         assert!(second.schema_digest.is_some(), "the second save compiles");
         files.insert(
             "workflow.star".to_string(),
             "this is not starlark(".to_string(),
         );
-        let broken = crate::playbooks::drafts::save_version(&pool, "studio", files, None, None)
-            .await
-            .expect("third save");
+        let broken =
+            crate::playbooks::drafts::save_version(&pool, "studio", files, None, None, None)
+                .await
+                .expect("third save");
         assert!(
             broken.schema_digest.is_none(),
             "the third save does not compile"
@@ -2430,9 +2437,10 @@ mod tests {
                 crate::playbooks::drafts::SKELETON_WORKFLOW.to_string(),
             ),
         ]);
-        let pinned = crate::playbooks::drafts::save_version(&pool, "studio", files, None, None)
-            .await
-            .expect("save");
+        let pinned =
+            crate::playbooks::drafts::save_version(&pool, "studio", files, None, None, None)
+                .await
+                .expect("save");
         assert!(pinned.schema_digest.is_some(), "{:?}", pinned.diagnostics);
         set_due(&pool, &stale.id, Some("2026-08-23T12:00:00Z")).await;
 

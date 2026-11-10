@@ -48,3 +48,4 @@ crucible-controller/ui/dump-panel.mjs
 crucible-controller/ui/verify-launch-log.mjs
 crucible-controller/ui/recordings/
 test-results/
+crucible-controller/ui/verify-panels.mjs
