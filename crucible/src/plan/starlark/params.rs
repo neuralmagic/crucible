@@ -140,6 +140,10 @@ pub struct ParamSpec {
     /// a launch form shows greyed out in this parameter's empty input.
     #[serde(default)]
     pub placeholder_from: Option<ChoicesFrom>,
+    /// The producer task output, keyed by another parameter's value, that flags the values a
+    /// launcher must confirm by setting this boolean true.
+    #[serde(default)]
+    pub confirm_from: Option<ChoicesFrom>,
     /// The boolean parameter that must be true for this one to be supplied.
     #[serde(default)]
     pub enabled_by: Option<String>,
@@ -156,9 +160,12 @@ pub struct ChoicesFrom {
 }
 
 impl ParamSpec {
-    /// The task outputs this parameter's form reads: its choices and its placeholder.
+    /// The task outputs this parameter's form reads: its choices, placeholder, and confirmation.
     pub fn sources(&self) -> impl Iterator<Item = &ChoicesFrom> {
-        self.choices_from.iter().chain(&self.placeholder_from)
+        self.choices_from
+            .iter()
+            .chain(&self.placeholder_from)
+            .chain(&self.confirm_from)
     }
 
     /// A value the declaration admits, for a compile that has no launch values. The two probes
@@ -218,6 +225,7 @@ pub const FIELDS: &[&str] = &[
     "choices_from",
     "allow_other",
     "placeholder_from",
+    "confirm_from",
     "enabled_by",
 ];
 
@@ -416,6 +424,9 @@ impl Params {
             if let Some(from) = &spec.placeholder_from {
                 property.insert("x-placeholder-from".into(), serde_json::json!(from));
             }
+            if let Some(from) = &spec.confirm_from {
+                property.insert("x-confirm-from".into(), serde_json::json!(from));
+            }
             if spec.allow_other {
                 property.insert("x-allow-other".into(), serde_json::json!(true));
             }
@@ -582,6 +593,30 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
             ty: ty.as_str(),
         });
     }
+    let confirm_from = field(
+        &declared,
+        name,
+        "confirm_from",
+        "a dictionary literal {\"task\": ..., \"field\": ..., \"keyed_by\": ...}",
+        |e| literal_choices_from(e).filter(|f| f.keyed_by.is_some()),
+    )?;
+    if confirm_from.is_some() {
+        let detail = if ty != ParamType::Bool {
+            Some("only a bool can confirm")
+        } else if required {
+            Some("a required parameter is always supplied, so it confirms nothing")
+        } else if default == Some(ParamValue::Bool(true)) {
+            Some("a default of True would confirm every flagged value unasked")
+        } else {
+            None
+        };
+        if let Some(detail) = detail {
+            return Err(CompileError::ParamBadConfirmFrom {
+                param: name.to_owned(),
+                detail,
+            });
+        }
+    }
     let multiline =
         field(&declared, name, "multiline", "True or False", literal_bool)?.unwrap_or(false);
     if multiline && ty != ParamType::String {
@@ -606,6 +641,7 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
         choices_from,
         allow_other,
         placeholder_from,
+        confirm_from,
         enabled_by: field(
             &declared,
             name,

@@ -195,6 +195,53 @@ test.describe('playbook launch form', () => {
     await expect.poll(() => sent).toMatchObject({ params: { 'choices.refresh': 'true' } });
   });
 
+  test('asks for a confirmation only when the picked value is flagged', async ({ page }) => {
+    await stubApi(page);
+    await page.route('**/api/playbooks/survey/schema', (route: Route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          type: 'object',
+          properties: {
+            release: {
+              type: 'string',
+              'x-choices-from': { task: 'release_options', field: 'releases' },
+              'x-choices-snapshot': { value: ['3.6.0 GA', '3.7 Fast-2'], run_id: 'r1', digest: 'd', captured_at: null },
+            },
+            accept_tentative: {
+              type: 'boolean',
+              default: false,
+              'x-confirm-from': { task: 'release_options', field: 'tentative', keyed_by: 'release' },
+              'x-confirm-snapshot': { value: { '3.6.0 GA': false, '3.7 Fast-2': true }, run_id: 'r1', digest: 'd', captured_at: null },
+            },
+          },
+          required: ['release'],
+        }),
+      }),
+    );
+    let sent: unknown = null;
+    await page.route('**/api/playbooks/survey/launch', (route: Route) => {
+      sent = JSON.parse(route.request().postData() ?? '{}');
+      return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ key: 'RUN-0001' }) });
+    });
+    await ready(page, LAUNCH);
+
+    const confirm = page.locator('#launch-param-accept_tentative');
+    await page.locator('#launch-param-release').selectOption('3.6.0 GA');
+    await expect(confirm).toHaveCount(0);
+    await page.locator('#launch-param-release').selectOption('3.7 Fast-2');
+    await expect(confirm).toBeVisible();
+
+    await page.getByRole('button', { name: 'Launch' }).click();
+    await expect(page.getByRole('alert').filter({ hasText: 'Check accept_tentative to launch with release 3.7 Fast-2' })).toBeVisible();
+    expect(sent).toBeNull();
+
+    await page.locator('label[for="launch-param-accept_tentative"]').click();
+    await page.getByRole('button', { name: 'Launch' }).click();
+    await expect.poll(() => sent).toMatchObject({ params: { release: '3.7 Fast-2', accept_tentative: 'true' } });
+  });
+
   test('the registry and the form are accessible', async ({ page }) => {
     await stubApi(page);
     for (const path of ['/playbooks', LAUNCH]) {

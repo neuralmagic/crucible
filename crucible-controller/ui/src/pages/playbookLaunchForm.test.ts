@@ -6,11 +6,13 @@ import {
   launchBody,
   paramBlocks,
   mapServerRejection,
+  confirmation,
   offeredChoices,
   optionSources,
   parseParamsSchema,
   placeholderFor,
   refreshBody,
+  refreshable,
   parseMaxTime,
   previewMatches,
   runSnapshot,
@@ -59,9 +61,9 @@ describe('parseParamsSchema', () => {
         choicesSnapshot: null,
         allowOther: false,
         placeholderFrom: null,
-        placeholderSnapshot: null,
+        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
       },
-      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
       {
         name: 'since',
         valueType: 'string',
@@ -76,9 +78,9 @@ describe('parseParamsSchema', () => {
         choicesSnapshot: null,
         allowOther: false,
         placeholderFrom: null,
-        placeholderSnapshot: null,
+        placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
       },
-      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
     ]);
   });
 
@@ -90,7 +92,7 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null, multiline: false, choices: null, enabledBy: null, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null },
     ]);
   });
 
@@ -258,6 +260,41 @@ describe('parseParamsSchema', () => {
     ]);
   });
 
+  it('asks for a confirmation only for a flagged key value, and requires it then', () => {
+    const tentative = { task: 'options', field: 'tentative', keyed_by: 'release' };
+    const specs = specsOf({
+      type: 'object',
+      properties: {
+        release: { type: 'string' },
+        accept: {
+          type: 'boolean',
+          default: false,
+          'x-confirm-from': tentative,
+          'x-confirm-snapshot': { value: { '3.7': true, '3.6': false } },
+        },
+        unrun: { type: 'boolean', default: false, 'x-confirm-from': tentative },
+      },
+    });
+    const [, accept, unrun] = specs;
+    if (!accept || !unrun) throw new Error('three specs');
+    const values = { release: '3.7', accept: 'false', unrun: 'false' };
+    expect(confirmation(accept, values)).toBe('needed');
+    expect(validateParam(accept, 'false', values)).toBe('Check accept to launch with release 3.7');
+    expect(validateParam(accept, 'true', values)).toBeNull();
+    const settled = { ...values, release: '3.6', accept: 'true' };
+    expect(confirmation(accept, settled)).toBe('hidden');
+    expect(trimmedParams(specs, settled)).toEqual({ release: '3.6', unrun: 'false' });
+    expect(confirmation(unrun, values)).toBe('optional');
+    expect(validateParam(unrun, 'false', values)).toBeNull();
+    expect(refreshable([unrun])).toBe(true);
+
+    const unkeyed = parseParamsSchema({
+      type: 'object',
+      properties: { accept: { type: 'boolean', default: false, 'x-confirm-from': { task: 'o', field: 'f' } } },
+    });
+    expect(unkeyed.kind).toBe('unrenderable');
+  });
+
   it('refreshes with the refresh setting alone', () => {
     expect(refreshBody({ maxCost: 1, maxTime: ' 10m ', schemaDigest: 'sha256:x' })).toEqual({
       params: { 'choices.refresh': 'true' },
@@ -407,7 +444,7 @@ describe('validateParam', () => {
       choicesSnapshot: null,
       allowOther: false,
       placeholderFrom: null,
-      placeholderSnapshot: null,
+      placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
     };
     expect(validateParam(rustOnly, 'whatever')).toBeNull();
   });
@@ -641,7 +678,7 @@ describe('runSnapshot', () => {
 describe('paramBlocks', () => {
   const spec = (name: string, valueType: ParamFieldSpec['valueType'], enabledBy: string | null = null): ParamFieldSpec => ({
     name, valueType, required: false, defaultValue: null, pattern: null, description: null, multiline: false,
-    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null,
+    choices: valueType === 'boolean' ? ['true', 'false'] : null, enabledBy, choicesFrom: null, choicesSnapshot: null, allowOther: false, placeholderFrom: null, placeholderSnapshot: null, confirmFrom: null, confirmSnapshot: null,
   });
 
   it('moves a gate to the head of a group at its first gated field and leaves other booleans alone', () => {

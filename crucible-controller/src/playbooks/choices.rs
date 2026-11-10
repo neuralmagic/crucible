@@ -17,6 +17,9 @@ pub const SNAPSHOT_KEY: &str = "x-choices-snapshot";
 /// `x-placeholder-from`.
 pub const PLACEHOLDER_KEY: &str = "x-placeholder-snapshot";
 
+/// The snapshot key a served schema carries on each property that declares `x-confirm-from`.
+pub const CONFIRM_KEY: &str = "x-confirm-snapshot";
+
 /// How many recent passing outputs to try when the newest is out of bounds, so one bad refresh
 /// keeps the previous list instead of emptying the form.
 const CANDIDATES: i64 = 8;
@@ -30,6 +33,8 @@ pub enum Shape {
     KeyedLists,
     /// An object from another parameter's values to one string each.
     KeyedText,
+    /// An object from another parameter's values to whether a launch must confirm it.
+    KeyedFlags,
 }
 
 impl Shape {
@@ -38,7 +43,7 @@ impl Shape {
     pub fn bounded(self, value: &serde_json::Value) -> Option<serde_json::Value> {
         match self {
             Shape::List => bounded(value).map(|c| serde_json::json!(c)),
-            Shape::KeyedLists | Shape::KeyedText => {
+            Shape::KeyedLists | Shape::KeyedText | Shape::KeyedFlags => {
                 let entries = value.as_object()?;
                 if entries.len() > MAX_CHOICES {
                     return None;
@@ -50,6 +55,7 @@ impl Shape {
                     }
                     let item = match self {
                         Shape::KeyedLists => serde_json::json!(bounded(item)?),
+                        Shape::KeyedFlags => serde_json::json!(item.as_bool()?),
                         _ => serde_json::json!(text(item)?),
                     };
                     out.insert(key.clone(), item);
@@ -152,9 +158,9 @@ fn producer<'p>(property: &'p serde_json::Value, key: &str) -> Option<(&'p str, 
     Some((task, field, from.get("keyed_by").is_some()))
 }
 
-/// `schema` with each `x-choices-from` and `x-placeholder-from` property carrying its snapshot,
-/// and the `{param: {run_id, digest}}` record of the choices a launch stores. A property with no
-/// snapshot yet is left as declared.
+/// `schema` with each `x-choices-from`, `x-placeholder-from`, and `x-confirm-from` property
+/// carrying its snapshot, and the `{param: {run_id, digest}}` record of the choices and
+/// confirmations a launch stores. A property with no snapshot yet is left as declared.
 pub async fn attach(
     pool: &PgPool,
     playbook: &str,
@@ -170,17 +176,20 @@ pub async fn attach(
     };
     let mut by_task: std::collections::BTreeMap<String, Vec<Output>> = Default::default();
     for (name, property) in properties.iter_mut() {
-        for (from, into, placeholder) in [
-            ("x-choices-from", SNAPSHOT_KEY, false),
-            ("x-placeholder-from", PLACEHOLDER_KEY, true),
+        for (from, into) in [
+            ("x-choices-from", SNAPSHOT_KEY),
+            ("x-placeholder-from", PLACEHOLDER_KEY),
+            ("x-confirm-from", CONFIRM_KEY),
         ] {
             let Some((task, field, keyed)) = producer(property, from) else {
                 continue;
             };
-            let shape = match (placeholder, keyed) {
-                (true, _) => Shape::KeyedText,
-                (false, true) => Shape::KeyedLists,
-                (false, false) => Shape::List,
+            let placeholder = into == PLACEHOLDER_KEY;
+            let shape = match into {
+                PLACEHOLDER_KEY => Shape::KeyedText,
+                CONFIRM_KEY => Shape::KeyedFlags,
+                _ if keyed => Shape::KeyedLists,
+                _ => Shape::List,
             };
             if !by_task.contains_key(task) {
                 by_task.insert(task.to_owned(), outputs(pool, playbook, task).await?);
@@ -202,18 +211,32 @@ pub async fn attach(
     Ok((served, serde_json::Value::Object(record)))
 }
 
-/// The value a launch binds for the parameter `property`'s choices are keyed by: the supplied
-/// one, or that parameter's declared default.
+/// The value a launch binds for the parameter `property`'s `from` source is keyed by: the
+/// supplied one, or that parameter's declared default.
 pub fn key_value<'a>(
     schema: &'a serde_json::Value,
     property: &serde_json::Value,
+    from: &str,
     params: &'a std::collections::BTreeMap<String, String>,
 ) -> Option<&'a str> {
-    let key = property.pointer("/x-choices-from/keyed_by")?.as_str()?;
+    let key = property.get(from)?.get("keyed_by")?.as_str()?;
     params
         .get(key)
         .map(String::as_str)
         .or_else(|| schema.get("properties")?.get(key)?.get("default")?.as_str())
+}
+
+/// The key parameter and its value when `property`'s confirmation snapshot flags the value a
+/// launch binds for it, so the launch must set the property true.
+pub fn confirmation_needed<'a>(
+    schema: &'a serde_json::Value,
+    property: &'a serde_json::Value,
+    params: &'a std::collections::BTreeMap<String, String>,
+) -> Option<(&'a str, &'a str)> {
+    let flags = property.get(CONFIRM_KEY)?.get("value")?;
+    let key = property.pointer("/x-confirm-from/keyed_by")?.as_str()?;
+    let value = key_value(schema, property, "x-confirm-from", params)?;
+    (flags.get(value) == Some(&serde_json::Value::Bool(true))).then_some((key, value))
 }
 
 /// The supplied value is outside a closed snapshot. A keyed snapshot offers the list for `key`,
@@ -330,7 +353,11 @@ mod tests {
             "r2",
             "2026-11-02T00:00:00Z",
             "pass",
-            serde_json::json!({"releases": ["3.6", "3.7"], "branch": {"3.7": "sync-v0.33.0"}}),
+            serde_json::json!({
+                "releases": ["3.6", "3.7"],
+                "branch": {"3.7": "sync-v0.33.0"},
+                "tentative": {"3.6": false, "3.7": true},
+            }),
         )
         .await;
         seed(
@@ -371,6 +398,7 @@ mod tests {
             "release": {"type": "string", "x-choices-from": {"task": "options", "field": "releases"}},
             "pr": {"type": "string"},
             "branch": {"type": "string", "x-placeholder-from": {"task": "options", "field": "branch", "keyed_by": "release"}},
+            "accept": {"type": "boolean", "default": false, "x-confirm-from": {"task": "options", "field": "tentative", "keyed_by": "release"}},
         }});
         let (served, record) = attach(&pool, "backport", &schema).await.unwrap();
         assert_eq!(
@@ -388,10 +416,24 @@ mod tests {
         );
         assert_eq!(record["release"]["run_id"], "r2");
         assert_eq!(record["release"]["digest"], snapshot.digest);
-        let params =
-            |v: &str| std::collections::BTreeMap::from([("release".to_owned(), v.to_owned())]);
-        assert!(crate::playbooks::registry::validate_params(&served, &params("3.7")).is_ok());
-        assert!(crate::playbooks::registry::validate_params(&served, &params("3.9")).is_err());
+        assert_eq!(record["accept"]["run_id"], "r2");
+        let params = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect::<std::collections::BTreeMap<String, String>>()
+        };
+        let validate = |p| crate::playbooks::registry::validate_params(&served, &p);
+        assert!(validate(params(&[("release", "3.6")])).is_ok());
+        assert!(validate(params(&[("release", "3.9")])).is_err());
+        let unconfirmed = validate(params(&[("release", "3.7")])).unwrap_err();
+        assert_eq!(
+            unconfirmed.iter().map(|e| e.field.as_str()).collect::<Vec<_>>(),
+            ["accept"],
+            "a flagged release needs its confirmation"
+        );
+        assert!(validate(params(&[("release", "3.7"), ("accept", "false")])).is_err());
+        assert!(validate(params(&[("release", "3.7"), ("accept", "true")])).is_ok());
 
         let (unseeded, record) = attach(&pool, "fresh", &schema).await.unwrap();
         assert_eq!(unseeded, schema);
@@ -437,6 +479,12 @@ mod tests {
         plain["properties"]["release"]["x-placeholder-from"] =
             serde_json::json!({"task": "options", "field": "branch", "keyed_by": "pr"});
         assert!(validate_params(&plain, &refresh).is_ok());
+        let mut confirming = schema.clone();
+        confirming["properties"]["release"] = serde_json::json!({
+            "type": "boolean",
+            "x-confirm-from": {"task": "options", "field": "tentative", "keyed_by": "pr"},
+        });
+        assert!(validate_params(&confirming, &refresh).is_ok());
 
         let dir = tempfile::tempdir().unwrap();
         let root = crate::testing::fixtures::write_playbook_pack(
@@ -489,11 +537,12 @@ workflow(type = "playbook", tasks = [options, work])
         }});
         let component = &schema["properties"]["component"];
         let supplied = std::collections::BTreeMap::from([("release".to_owned(), "3.7".to_owned())]);
-        assert_eq!(key_value(&schema, component, &supplied), Some("3.7"));
+        let from = "x-choices-from";
+        assert_eq!(key_value(&schema, component, from, &supplied), Some("3.7"));
         let defaulted = std::collections::BTreeMap::new();
-        assert_eq!(key_value(&schema, component, &defaulted), Some("3.6"));
+        assert_eq!(key_value(&schema, component, from, &defaulted), Some("3.6"));
         assert_eq!(
-            key_value(&schema, &schema["properties"]["release"], &supplied),
+            key_value(&schema, &schema["properties"]["release"], from, &supplied),
             None
         );
     }
@@ -526,6 +575,14 @@ workflow(type = "playbook", tasks = [options, work])
             .collect();
         assert_eq!(
             Shape::KeyedText.bounded(&serde_json::Value::Object(wide)),
+            None
+        );
+        assert_eq!(
+            Shape::KeyedFlags.bounded(&serde_json::json!({"3.7": true, "3.6": false})),
+            Some(serde_json::json!({"3.6": false, "3.7": true}))
+        );
+        assert_eq!(
+            Shape::KeyedFlags.bounded(&serde_json::json!({"3.7": "true"})),
             None
         );
     }
