@@ -314,6 +314,10 @@ desktop-hot:
     python3.14 vendor/rune/scripts/rune-dev \
         --manifest-path crucible-desktop/Cargo.toml --patch 'src/ui/*.rs' --local -- --scene local
 
+# Build the image the desktop app's drafting agent runs in, for the local OpenShell gateway.
+desktop-agent-image:
+    podman build -t localhost/crucible-agent -f crucible-desktop/sandbox/Containerfile crucible-desktop/sandbox
+
 # Format, lint and test the desktop app.
 desktop-check:
     sh crucible-desktop/rune-patches.sh

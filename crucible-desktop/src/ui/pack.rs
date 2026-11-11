@@ -96,6 +96,10 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
                     None => el().grow(1.0),
                 }),
         )
+        .children(
+            (app.remote.agent.open && app.showing_working())
+                .then(|| crate::ui::agent::panel(font, app, p)),
+        )
 }
 
 /// Where the pack came from, the switch between the run's pack and a working copy, and the
@@ -155,6 +159,19 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
         return bar;
     }
     let edited = app.remote.working_edited;
+    if app.agent_available() {
+        bar = bar.child(
+            Button::new("Agent")
+                .variant(if app.remote.agent.open {
+                    ButtonVariant::Submit
+                } else {
+                    ButtonVariant::Neutral
+                })
+                .on_press(|app: &mut App| app.toggle_agent())
+                .build(p.k)
+                .key("pack-agent"),
+        );
+    }
     bar.child(
         Button::new("Pull")
             .variant(ButtonVariant::Neutral)

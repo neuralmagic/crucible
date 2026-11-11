@@ -204,6 +204,8 @@ pub struct Settings {
     /// The cost and time ceilings a pack folder dropped on the app is test-fired under.
     pub drop_max_cost: f64,
     pub drop_max_time: String,
+    /// The harness a drafting agent runs, and the sandbox it runs in.
+    pub agent: crate::agent::Config,
     /// Why the file on disk did not read. While set, nothing is saved over it.
     pub unreadable: Option<String>,
     path: PathBuf,
@@ -243,6 +245,8 @@ struct Config {
     /// The team each profile acts as, by profile name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     act_as: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<crate::agent::Config>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     profiles: BTreeMap<String, toml::Value>,
 }
@@ -310,6 +314,7 @@ impl Settings {
                 .drop_max_time
                 .filter(|t| crate::form::minutes(t).is_some())
                 .unwrap_or_else(|| "30m".to_string()),
+            agent: config.agent.unwrap_or_default(),
             unreadable,
             path,
         }
@@ -527,6 +532,7 @@ impl Settings {
             profiles: self.profiles.clone(),
             drop_max_cost: Some(self.drop_max_cost),
             drop_max_time: Some(self.drop_max_time.clone()),
+            agent: (self.agent != crate::agent::Config::default()).then(|| self.agent.clone()),
         };
         let Ok(text) = toml::to_string(&config) else {
             return;

@@ -225,6 +225,30 @@ from the failure, reusing what passed. A registered playbook's brief drafts from
 fresh, since the controller reruns a run only as what it ran as. Paste it into an agent, or
 `claude "$(cat <brief>)"`.
 
+## Draft with an agent
+
+`Agent` on a draft's working copy opens a panel: a prompt, and what the agent does as it does it.
+The first prompt starts a session: a sandbox on the local OpenShell gateway (0.1.5 or newer, the
+one the `openshell` CLI has active), reached over its gRPC API, with the harness run in it once
+per prompt. The agent edits, previews, launches and watches the draft through the controller's
+MCP tools, as the signed-in user and the team acted as. The tools reach it through a relay on a
+loopback port that only the session's token opens, so the profile's key stays out of the sandbox.
+A save by the agent pulls the working copy. `Stop` ends the turn; `End` deletes the sandbox, and
+one that outlives the app is deleted by the next session.
+
+The harness is `[agent]` in the config file. With none, it is Claude Code in
+`localhost/crucible-agent` (`just desktop-agent-image`) with the `claude-sub` provider:
+
+```toml
+[agent]
+image = "localhost/my-agent"            # runs as a non-root user that owns its working directory
+providers = ["openrouter"]              # OpenShell providers holding the harness's credentials
+model = "glm-5-3"
+format = "opencode"                     # how stdout reads: claude, codex, opencode, pi or text
+command = ["my-agent", "--mcp", "{mcp_url}", "--mcp-token", "{mcp_token}", "-m", "{model}", "{prompt}"]
+binaries = ["/usr/local/bin/my-agent"]  # what may reach the relay, as the kernel resolves it
+```
+
 ## Links
 
 The app opens `crucible-playbooks://` links, so a run can be handed to someone, or to an agent,

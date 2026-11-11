@@ -4,6 +4,7 @@
 
 mod activity;
 mod admin;
+mod agent;
 mod apikeys;
 mod captured;
 mod commands;
@@ -1780,6 +1781,7 @@ fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
     let place = app.place();
     app.history.saw(place);
     changed |= app.refresh_working();
+    changed |= app.refresh_agent();
     changed |= app.finish_sign_in();
     changed |= app.finish_login_editor();
     changed |= app.finish_release_check();
