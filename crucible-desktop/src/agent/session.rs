@@ -310,6 +310,7 @@ async fn serve(
         };
         let mut argv = vec!["env".to_string()];
         argv.extend(endpoint.env());
+        argv.extend(config.env());
         argv.extend(config.argv(&text, &endpoint, follow_up)?);
         let mut decoder = decoder(config.format, config.model.as_deref().unwrap_or_default());
         let cancel = CancellationToken::new();

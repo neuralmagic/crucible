@@ -20,6 +20,8 @@ pub mod session;
 #[path = "agent/session_web.rs"]
 pub mod session;
 
+use std::collections::BTreeMap;
+
 use rune::TextEdit;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -65,6 +67,9 @@ pub struct Config {
     pub command: Vec<String>,
     /// The executables that may reach the controller's tools, as the kernel resolves them.
     pub binaries: Vec<String>,
+    /// Variables set for the harness, beside the controller's.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -80,6 +85,7 @@ impl Default for Config {
                 "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe".into(),
                 "/usr/local/bin/crux".into(),
             ],
+            env: BTreeMap::new(),
         }
     }
 }
@@ -114,6 +120,13 @@ impl Endpoint {
 const CLAUDE_PLUGIN: &str = "/usr/local/share/crucible-agent/plugin";
 
 impl Config {
+    /// `[agent].env` as `env` takes it.
+    pub fn env(&self) -> impl Iterator<Item = String> + '_ {
+        self.env
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+    }
+
     /// The harness's argv for one prompt; `follow_up` continues the conversation where the
     /// harness can.
     pub fn argv(
@@ -620,6 +633,24 @@ mod tests {
         assert!(toml::from_str::<Config>("imge = \"x\"").is_err());
         let back: Config = toml::from_str(&toml::to_string(&Config::default()).unwrap()).unwrap();
         assert_eq!(back, Config::default());
+    }
+
+    #[test]
+    fn extra_variables_reach_the_harness_in_name_order() {
+        let config: Config = toml::from_str(
+            "providers = [\"model-gateway\"]\n[env]\nB = \"2\"\n\
+             ANTHROPIC_BASE_URL = \"https://models.example.com\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.env().collect::<Vec<_>>(),
+            ["ANTHROPIC_BASE_URL=https://models.example.com", "B=2"]
+        );
+        assert_eq!(config.image, Config::default().image);
+        let back: Config = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+        assert_eq!(back, config);
+        assert_eq!(Config::default().env().count(), 0);
+        assert!(!toml::to_string(&Config::default()).unwrap().contains("env"));
     }
 
     #[test]

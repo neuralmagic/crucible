@@ -1,0 +1,23 @@
+id: model-gateway
+display_name: Model gateway
+description: A model gateway that serves the Anthropic Messages API
+category: inference
+inference_capable: true
+credentials:
+  - name: api_key
+    description: The gateway's API key
+    env_vars: [ANTHROPIC_API_KEY]
+    required: true
+    auth_style: header
+    header_name: x-api-key
+discovery:
+  credentials: [api_key]
+endpoints:
+  - host: models.example.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+binaries:
+  - /usr/local/bin/node
+  - /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe

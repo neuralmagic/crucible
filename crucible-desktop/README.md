@@ -227,6 +227,8 @@ fresh, since the controller reruns a run only as what it ran as. Paste it into a
 
 ## Draft with an agent
 
+Setting up the gateway, provider and image: [Drafting with a local agent](../docs/desktop-agent-local.md).
+
 `Agent` on a draft's working copy opens the Agent pane, which docks, splits and resizes like
 any other pane (also `cmd+9`): a prompt, and each turn the agent takes, drawn
 as the Transcript pane draws one, with every tool call's input and result a click away. The first
@@ -262,6 +264,7 @@ model = "glm-5-3"
 format = "opencode"                     # how stdout reads: claude, codex, opencode, pi or text
 command = ["my-agent", "--mcp", "{mcp_url}", "--mcp-token", "{mcp_token}", "-m", "{model}", "{prompt}"]
 binaries = ["/usr/local/bin/my-agent", "/usr/local/bin/crux"]   # what may reach the relay
+env = { MY_AGENT_BASE_URL = "https://models.example.com" }     # set for the harness
 ```
 
 A harness also finds the relay in its environment: `CONTROLLER_URL` and `CONTROLLER_API_TOKEN`,
