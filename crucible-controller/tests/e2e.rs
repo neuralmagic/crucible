@@ -1091,13 +1091,13 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
     std::fs::write(pack.join("crucible.toml"), LOOP_PACK_MANIFEST)?;
     crucible_controller::playbooks::packs::store_pack_tree(db.pool(), KEY, &pack).await?;
 
-    // Daemon #1: launches the run (the fake writes the session log) but the completion is NEVER
-    // delivered — the pod "finishes" while the controller is down.
+    // Daemon #1: launches the run and dies with the pod still running. The pod "finishes" (its
+    // session log lands) while the controller is down, so the completion is NEVER delivered.
     let (tx1, completions1) = channel_completions();
     let launcher1 = Arc::new(FakePodDispatcher {
         pool: db.pool().clone(),
         deliver: false,
-        held: false,
+        held: true,
         tx: tx1,
         session: SESSION_LOG,
         launches: Mutex::new(Vec::new()),
@@ -1136,6 +1136,13 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
         Status::Running,
         "the crash left the row mid-flight"
     );
+    let run_id = launcher1.launches.lock().expect("launches")[0].clone();
+    crucible_controller::runs::blob_store::put_run_session(
+        db.pool(),
+        &run_id,
+        SESSION_LOG.as_bytes(),
+    )
+    .await?;
 
     // Daemon #2, fresh over the same DB: the startup re-enqueue reconciles the missed completion
     // from evidence. Its launcher must never fire — recovery is ingest, not relaunch.
