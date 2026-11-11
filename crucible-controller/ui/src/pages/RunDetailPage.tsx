@@ -242,6 +242,7 @@ export function RunDetailPage() {
 
       <DetailHeader
         title={runLabel(run)}
+        description={launch?.description ?? undefined}
         badge={
           <span className="flex flex-wrap items-center gap-2">
             <Status status={run.status} tone={statusTone(runStatusColor(run.status))} />

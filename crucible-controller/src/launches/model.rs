@@ -310,7 +310,8 @@ impl LaunchFilter {
 pub(crate) struct PlaybookRun {
     pub key: String,
     pub playbook: String,
-    /// The registry row's description, or `None` when the playbook has since been deregistered.
+    /// The registry row's description; a draft launch has no registry row, so it falls back to the
+    /// issue title the launch froze the draft's description into.
     pub description: Option<String>,
     /// The values exactly as stored, so a prefill re-renders what was launched.
     pub params: serde_json::Value,
