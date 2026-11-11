@@ -179,6 +179,7 @@ pub fn valid_name(name: &str) -> bool {
 
 /// The profiles to offer: those configured, or one named `default` from crux's resolution
 /// (`CONTROLLER_URL`, then crux's config file) when none is.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn or_default(configured: &BTreeMap<String, Profile>) -> BTreeMap<String, Profile> {
     if !configured.is_empty() {
         return configured.clone();
@@ -825,6 +826,7 @@ pub fn tauri_config(config_dir: &Path) -> PathBuf {
 }
 
 /// The profiles that can be used: the configured ones that read, or the default from crux.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn usable(settings: &crate::settings::Settings) -> BTreeMap<String, Profile> {
     let good: BTreeMap<String, Profile> = settings
         .profiles()
@@ -834,23 +836,22 @@ pub fn usable(settings: &crate::settings::Settings) -> BTreeMap<String, Profile>
     or_default(&good)
 }
 
-/// The controller that served this page.
+/// The profiles that can be used: only the controller that served this page.
 #[cfg(target_arch = "wasm32")]
-pub fn pick(_settings: &crate::settings::Settings) -> (String, Profile) {
+pub fn usable(_settings: &crate::settings::Settings) -> BTreeMap<String, Profile> {
     let url = web_sys::window()
         .and_then(|window| window.location().origin().ok())
         .unwrap_or_default();
-    (
-        "controller".into(),
+    BTreeMap::from([(
+        "controller".to_string(),
         Profile {
             url,
             ..Profile::default()
         },
-    )
+    )])
 }
 
 /// The profile to start in: the one last used, else the first.
-#[cfg(not(target_arch = "wasm32"))]
 pub fn pick(settings: &crate::settings::Settings) -> (String, Profile) {
     let mut usable = usable(settings);
     if let Some(name) = &settings.profile
