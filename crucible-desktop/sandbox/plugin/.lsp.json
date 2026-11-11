@@ -1,0 +1,6 @@
+{
+  "crucible": {
+    "command": "crucible-lsp",
+    "extensionToLanguage": { ".star": "starlark" }
+  }
+}

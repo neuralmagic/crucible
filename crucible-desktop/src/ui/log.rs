@@ -411,7 +411,7 @@ fn toggle(
         .child(text(label.to_string()).font(p.k.ty.small_medium).color(ink))
 }
 
-pub(crate) fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {
+fn line_row(line: &LogLine, style: TextStyle, scoped: bool, p: &Paint) -> El {
     let mut lead = row().gap(5.0).center_y();
     if let Some(at) = &line.at {
         lead = lead.child(

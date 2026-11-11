@@ -1,6 +1,18 @@
 # produces: localhost/crucible-agent
-# The default image a drafting agent runs in: Claude Code as a non-root user that owns the
-# working directory, which the OpenShell gateway requires. iproute2 is for its network namespace.
+# The default image a drafting agent runs in: Claude Code, crux to pull and push the draft, and
+# crucible-lsp for the pack's Starlark, as a non-root user that owns the working directory, which
+# the OpenShell gateway requires. iproute2 is for its network namespace. Built from the repo root.
+FROM rust:1-bookworm AS bins
+RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler cmake \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release --locked -p crux -p crucible-lsp --bins \
+    && mkdir /out && cp target/release/crux target/release/crucible-lsp /out/
+
 FROM node:22-bookworm-slim
 
 ARG CLAUDE_VERSION=2.1.322
@@ -10,6 +22,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends iproute2 ca-cer
     && npm install -g "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
     && useradd -m -s /bin/bash sandbox \
     && mkdir -p /workspace && chown sandbox:sandbox /workspace
+
+COPY --from=bins /out/crux /out/crucible-lsp /usr/local/bin/
+COPY crucible-desktop/sandbox/plugin /usr/local/share/crucible-agent/plugin
 
 USER sandbox
 WORKDIR /workspace

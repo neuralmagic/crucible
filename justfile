@@ -316,7 +316,7 @@ desktop-hot:
 
 # Build the image the desktop app's drafting agent runs in, for the local OpenShell gateway.
 desktop-agent-image:
-    podman build -t localhost/crucible-agent -f crucible-desktop/sandbox/Containerfile crucible-desktop/sandbox
+    podman build -t localhost/crucible-agent -f crucible-desktop/sandbox/Containerfile .
 
 # Format, lint and test the desktop app.
 desktop-check:

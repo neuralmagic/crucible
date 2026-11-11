@@ -15,14 +15,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::relay::{self, Passed, Upstream};
 use crate::agent::sandbox;
-use crate::agent::{Endpoint, Entry, Format, Spec, State, Update};
-use crate::logline::LogLine;
+use crate::agent::{Endpoint, Entry, Format, SPEAKER, Spec, State, Update};
 use crate::net::{Handle, Task};
 use crate::profile::Target;
+use crate::session::AgentStep;
 
 const DSL: &str = include_str!("../../../docs/dsl-reference.md");
-/// The task name agent lines carry.
-const SPEAKER: &str = "agent";
 
 enum Ask {
     Prompt(String),
@@ -32,8 +30,20 @@ enum Ask {
 struct Inner {
     version: u64,
     state: State,
+    /// The turn in flight; 0 before the first prompt.
+    turn: u32,
     entries: Vec<Entry>,
+    steps: Vec<AgentStep>,
     saved: bool,
+}
+
+impl Inner {
+    fn note(&mut self, text: impl Into<String>) {
+        self.entries.push(Entry::Note {
+            turn: self.turn,
+            text: text.into(),
+        });
+    }
 }
 
 #[derive(Clone)]
@@ -61,24 +71,47 @@ impl Out {
         self.state(State::Starting(what.to_string()));
     }
 
-    fn entries(&self, entries: Vec<Entry>) {
-        if !entries.is_empty() {
-            self.change(|inner| inner.entries.extend(entries));
+    fn asked(&self, prompt: &str) {
+        self.change(|inner| {
+            inner.turn += 1;
+            inner.state = State::Running;
+            inner.entries.push(Entry::Asked {
+                turn: inner.turn,
+                text: prompt.to_string(),
+            });
+        });
+    }
+
+    fn events(&self, events: Vec<AgentEvent>) {
+        if events.is_empty() {
+            return;
         }
+        self.change(|inner| {
+            for event in events {
+                match event {
+                    AgentEvent::Raw { text, .. } => inner.note(text),
+                    event => inner.steps.push(AgentStep {
+                        task: SPEAKER.to_string(),
+                        attempt: inner.turn,
+                        event,
+                    }),
+                }
+            }
+        });
     }
 
     fn note(&self, text: impl Into<String>) {
-        self.entries(vec![Entry::Note(text.into())]);
+        self.change(|inner| inner.note(text));
     }
 
     fn passed(&self, passed: Passed) {
         self.change(|inner| match passed {
             Passed::Saved => {
                 inner.saved = true;
-                inner.entries.push(Entry::Note("Saved the draft".into()));
+                inner.note("Saved the draft");
             }
-            Passed::Launched => inner.entries.push(Entry::Note("Launched the draft".into())),
-            Passed::Trouble(what) => inner.entries.push(Entry::Note(what)),
+            Passed::Launched => inner.note("Launched the draft"),
+            Passed::Trouble(what) => inner.note(what),
         });
     }
 }
@@ -103,7 +136,9 @@ impl Session {
         let inner = Arc::new(Mutex::new(Inner {
             version: 1,
             state: State::Starting("Starting".into()),
+            turn: 0,
             entries: Vec::new(),
+            steps: Vec::new(),
             saved: false,
         }));
         let out = Out {
@@ -153,6 +188,7 @@ impl Session {
             version: inner.version,
             state: inner.state.clone(),
             entries: std::mem::take(&mut inner.entries),
+            steps: std::mem::take(&mut inner.steps),
             saved: std::mem::take(&mut inner.saved),
         })
     }
@@ -168,21 +204,14 @@ fn decoder(format: Format, model: &str) -> Option<Box<dyn LineFormat + Send>> {
     })
 }
 
-/// One stdout line as panel entries.
-fn decode(decoder: &mut Option<Box<dyn LineFormat + Send>>, line: &str) -> Vec<Entry> {
-    let Some(decoder) = decoder else {
-        return vec![Entry::Agent(LogLine::parse(line))];
-    };
-    decoder
-        .push(line)
-        .iter()
-        .filter_map(|event| match event {
-            AgentEvent::Raw { text, .. } => Some(LogLine::parse(text)),
-            AgentEvent::Tokens(_) => None,
-            event => LogLine::from_agent(SPEAKER, event),
-        })
-        .map(Entry::Agent)
-        .collect()
+/// What one stdout line says the agent did. With no decoder, the line is what it said.
+fn decode(decoder: &mut Option<Box<dyn LineFormat + Send>>, line: &str) -> Vec<AgentEvent> {
+    match decoder {
+        Some(decoder) => decoder.push(line),
+        None => vec![AgentEvent::Text {
+            delta: line.to_string(),
+        }],
+    }
 }
 
 /// What the agent is told before the user's request.
@@ -192,21 +221,24 @@ fn brief(spec: &Spec, prompt: &str) -> String {
          this session and will read your last message.\n\n\
          ## Their request\n\n{prompt}\n\n\
          ## How to work\n\n\
-         - The draft is at version {version}. `crucible_draft_files` reads the newest save and \
-         its version.\n\
-         - `crucible_draft_save` writes the next version from a whole `{{path: content}}` map: \
-         send every file, changed or not, with `base_version` set to the version you read. A \
-         refused save names the version to read again.\n\
-         - `crucible_draft_preview` says how a save compiled. Clear every diagnostic before a \
-         launch.\n\
-         - `crucible_draft_launch` test-fires the newest save and costs money: at most \
-         `max_cost` {max_cost} and `max_time` \"{max_time}\", and only when the request needs a \
-         run to prove the change.\n\
-         - `crucible_playbook_run` follows a launch by its key; `crucible_turns`, \
-         `crucible_turn` and `crucible_run_log` explain a failure.\n\
-         - `DSL.md` in the working directory is the pack language reference.\n\
-         - The tools act as the owner, with everything the owner may do. Touch nothing but \
-         this draft and its runs unless the request says so.\n\n\
+         - The draft is at version {version}. `crux draft-pull {draft} pack` writes the newest \
+         save into `./pack` and prints its version. Edit the files there.\n\
+         - `workflow.star` and the modules it loads are checked by crucible-lsp as you edit; \
+         clear what it reports. `DSL.md` in the working directory is the pack language \
+         reference.\n\
+         - `crux draft-push {draft} pack --base-version <n>` saves the directory as the next \
+         version, `<n>` being the version you pulled. A refused push names the version to pull \
+         and merge onto.\n\
+         - `crux draft-preview {draft}` says how a save compiled. Clear every diagnostic before \
+         a launch.\n\
+         - `crux draft-launch {draft} --max-cost {max_cost} --max-time {max_time}` test-fires \
+         the newest save and costs money: stay at or under those ceilings, and launch only \
+         when the request needs a run to prove the change.\n\
+         - The `crucible_*` tools are the same operations as `crux`; `crux --help` lists them. \
+         Follow a launch with `crux playbook-run`, and explain a failure with `crux turns` and \
+         `crux run-log`.\n\
+         - Both act as the owner, with everything the owner may do. Touch nothing but this \
+         draft and its runs unless the request says so.\n\n\
          Finish with what you changed and what you verified.",
         draft = spec.draft,
         version = spec.version,
@@ -238,7 +270,7 @@ async fn serve(
     let (passed, mut passes) = unbounded_channel();
     let relay = relay::bind(runtime, upstream, &spec.draft, passed).await?;
     let endpoint = Endpoint {
-        url: format!("http://{}:{}/mcp", sandbox::HOST, relay.port),
+        base: format!("http://{}:{}", sandbox::HOST, relay.port),
         token: relay.token.clone(),
     };
 
@@ -266,23 +298,22 @@ async fn serve(
                 None => return Ok(()),
             }
         };
-        out.change(|inner| {
-            inner.state = State::Running;
-            inner.entries.push(Entry::Asked(prompt.clone()));
-        });
+        out.asked(&prompt);
         let follow_up = turns > 0 && config.continues();
         let text = if follow_up {
             prompt
         } else {
             brief(&spec, &prompt)
         };
-        let argv = config.argv(&text, &endpoint, follow_up)?;
+        let mut argv = vec!["env".to_string()];
+        argv.extend(endpoint.env());
+        argv.extend(config.argv(&text, &endpoint, follow_up)?);
         let mut decoder = decoder(config.format, config.model.as_deref().unwrap_or_default());
         let cancel = CancellationToken::new();
         let mut stopped = false;
         let done = {
             let exec = sandbox.exec(&argv, &cancel, |line| {
-                out.entries(decode(&mut decoder, line));
+                out.events(decode(&mut decoder, line));
             });
             tokio::pin!(exec);
             loop {
@@ -306,13 +337,9 @@ async fn serve(
         match done {
             _ if stopped => out.note("Stopped"),
             Ok(done) => {
-                out.entries(
-                    done.stderr_lines
-                        .iter()
-                        .filter(|line| !line.trim().is_empty())
-                        .map(|line| Entry::Agent(LogLine::parse(line)))
-                        .collect(),
-                );
+                for line in done.stderr_lines.iter().filter(|l| !l.trim().is_empty()) {
+                    out.note(line.clone());
+                }
                 match (done.transport_error, done.exit_code) {
                     (Some((_, why)), _) => out.note(format!("The agent's stream broke: {why}")),
                     (None, Some(0)) => {}
@@ -329,9 +356,13 @@ async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::session::{DSL, brief, decode, decoder, sandbox_name};
-    use crate::agent::{Config, Entry, Format, Spec};
-    use crate::logline::Body;
+    use std::sync::{Arc, Mutex};
+
+    use crucible_contract::event::AgentEvent;
+
+    use crate::agent::relay::Passed;
+    use crate::agent::session::{DSL, Inner, Out, brief, decode, decoder, sandbox_name};
+    use crate::agent::{Config, Entry, Format, Spec, State};
 
     #[test]
     fn a_sandbox_name_fits_the_gateways_limit() {
@@ -347,31 +378,97 @@ mod tests {
     }
 
     #[test]
-    fn plain_output_is_kept_line_for_line() {
+    fn plain_output_is_what_the_agent_said() {
         let mut none = decoder(Format::Text, "");
-        let entries = decode(&mut none, "{\"type\":\"whatever\"}");
-        let [Entry::Agent(line)] = entries.as_slice() else {
-            panic!("{entries:?}");
-        };
-        assert_eq!(line.body, Body::Plain("{\"type\":\"whatever\"}".into()));
+        assert_eq!(
+            decode(&mut none, "{\"type\":\"whatever\"}"),
+            [AgentEvent::Text {
+                delta: "{\"type\":\"whatever\"}".into()
+            }]
+        );
     }
 
     #[test]
-    fn claude_stream_json_becomes_agent_lines() {
+    fn claude_stream_json_becomes_agent_events() {
         let mut claude = decoder(Format::Claude, "");
         let init = decode(
             &mut claude,
             r#"{"type":"system","subtype":"init","model":"claude-fable-5-2","tools":["a","b"]}"#,
         );
         assert!(
-            matches!(init.as_slice(), [Entry::Agent(line)] if matches!(line.body, Body::Note(_))),
+            matches!(init.as_slice(), [AgentEvent::Init { model, tools: 2, .. }] if model == "claude-fable-5-2"),
             "{init:?}"
         );
         let stray = decode(&mut claude, "npm warn something");
-        let [Entry::Agent(line)] = stray.as_slice() else {
-            panic!("{stray:?}");
+        assert!(
+            matches!(stray.as_slice(), [AgentEvent::Raw { text, .. }] if text == "npm warn something"),
+            "{stray:?}"
+        );
+    }
+
+    #[test]
+    fn events_join_the_turn_in_flight_and_stray_lines_become_notes() {
+        let out = Out {
+            inner: Arc::new(Mutex::new(Inner {
+                version: 1,
+                state: State::Idle,
+                turn: 0,
+                entries: Vec::new(),
+                steps: Vec::new(),
+                saved: false,
+            })),
+            waker: None,
         };
-        assert_eq!(line.body, Body::Plain("npm warn something".into()));
+        out.note("before anything");
+        out.asked("add a retry");
+        out.events(vec![
+            AgentEvent::Text {
+                delta: "on it".into(),
+            },
+            AgentEvent::Raw {
+                text: "npm warn".into(),
+                stream: crucible_contract::event::RawStream::Stdout,
+            },
+        ]);
+        out.passed(Passed::Saved);
+        out.asked("now the docs");
+        out.events(vec![AgentEvent::Text {
+            delta: "done".into(),
+        }]);
+        let inner = out.inner.lock().unwrap();
+        assert_eq!(inner.state, State::Running);
+        assert!(inner.saved);
+        assert_eq!(
+            inner.entries,
+            [
+                Entry::Note {
+                    turn: 0,
+                    text: "before anything".into()
+                },
+                Entry::Asked {
+                    turn: 1,
+                    text: "add a retry".into()
+                },
+                Entry::Note {
+                    turn: 1,
+                    text: "npm warn".into()
+                },
+                Entry::Note {
+                    turn: 1,
+                    text: "Saved the draft".into()
+                },
+                Entry::Asked {
+                    turn: 2,
+                    text: "now the docs".into()
+                },
+            ]
+        );
+        let said: Vec<(u32, &str)> = inner
+            .steps
+            .iter()
+            .map(|step| (step.attempt, step.task.as_str()))
+            .collect();
+        assert_eq!(said, [(1, "@agent"), (2, "@agent")]);
     }
 
     #[test]
@@ -387,8 +484,9 @@ mod tests {
         assert!(text.contains("draft `triage-wren`"));
         assert!(text.contains("## Their request\n\nAdd a retry to the fetch task.\n"));
         assert!(text.contains("The draft is at version 4."));
-        assert!(text.contains("`max_cost` 1.5 and `max_time` \"30m\""));
-        assert!(text.contains("`{path: content}`"));
+        assert!(text.contains("`crux draft-pull triage-wren pack`"));
+        assert!(text.contains("`crux draft-push triage-wren pack --base-version <n>`"));
+        assert!(text.contains("`crux draft-launch triage-wren --max-cost 1.5 --max-time 30m`"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

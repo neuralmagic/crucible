@@ -1,0 +1,5 @@
+{
+  "name": "crucible-pack",
+  "description": "crucible-lsp for the pack's workflow Starlark",
+  "version": "1"
+}

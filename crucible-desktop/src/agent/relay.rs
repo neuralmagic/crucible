@@ -1,22 +1,24 @@
-//! The controller's `/mcp` on a local port, for an agent in a sandbox.
+//! The controller on a local port, for an agent in a sandbox: its MCP tools at `/mcp` and its
+//! API under `/api`, which is what `crux` speaks.
 //!
 //! ```text
-//! sandbox ──Bearer <session token>──▶ relay ──▶ controller /mcp
-//!                                       │        as the profile's user: its key,
+//! sandbox ──Bearer <session token>──▶ relay ──▶ controller
+//!   MCP client, crux                    │        as the profile's user: its key,
 //!                                       └─ Passed  team, proxy and resolver pins
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
-use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::body::{Body, Bytes};
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use crucible_contract::mcp_message::{self, TOOLS_CALL};
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -24,7 +26,13 @@ use crate::net::{Handle, Task};
 use crate::profile::Target;
 
 const BODY_LIMIT: usize = 32 * 1024 * 1024;
-const PROTOCOL_VERSION: &str = "mcp-protocol-version";
+/// Request headers the protocol defines, which the controller reads.
+const PROTOCOL_HEADERS: &str = "mcp-";
+/// How long one answer may stream: a watched run, not a request.
+const STREAM_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+const CONNECT_WITHIN: Duration = Duration::from_secs(15);
+const MCP: &str = "/mcp";
+const LAST_EVENT_ID: &str = "last-event-id";
 const SAVE: &str = "crucible_draft_save";
 const LAUNCH: &str = "crucible_draft_launch";
 
@@ -41,7 +49,8 @@ pub enum Passed {
 /// Where calls go, and what the profile sends with each.
 pub struct Upstream {
     http: reqwest::Client,
-    url: String,
+    /// The controller's base URL, with no trailing slash.
+    base: String,
     headers: Vec<(&'static str, String)>,
 }
 
@@ -52,6 +61,8 @@ impl Upstream {
         let config = target.config()?;
         let http = target
             .http()?
+            .timeout(STREAM_LIMIT)
+            .connect_timeout(CONNECT_WITHIN)
             .build()
             .map_err(|e| format!("building the relay's client: {e}"))?;
         let mut headers = config.auth.headers();
@@ -60,7 +71,7 @@ impl Upstream {
         }
         Ok(Upstream {
             http,
-            url: format!("{}/mcp", config.url),
+            base: config.url,
             headers,
         })
     }
@@ -120,44 +131,20 @@ pub async fn bind(
 
 fn router(shared: Shared) -> Router {
     Router::new()
-        .route("/mcp", post(relay).fallback(unserved))
-        .fallback(unserved)
+        .fallback(relay)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .with_state(Arc::new(shared))
-}
-
-async fn unserved(State(shared): State<Arc<Shared>>, request: Request) -> StatusCode {
-    let status = if request.uri().path() == "/mcp" {
-        StatusCode::METHOD_NOT_ALLOWED
-    } else {
-        StatusCode::NOT_FOUND
-    };
-    shared.trouble(format!(
-        "The relay answered {} to {} {}",
-        status.as_u16(),
-        request.method(),
-        request.uri().path()
-    ));
-    status
 }
 
 fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Whether a `tools/call` answer says the tool did its work.
+/// Whether a `tools/call` answer says the tool did its work. The controller's tools answer a
+/// failure as text that starts `error:`, not as a result marked `isError`.
 fn succeeded(answer: &Value) -> bool {
-    let Some(result) = answer.get("result") else {
-        return false;
-    };
-    if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return false;
-    }
-    let text = result
-        .pointer("/content/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    !text.starts_with("error:")
+    !mcp_message::call_failed(answer)
+        && !mcp_message::result_text(answer).is_some_and(|text| text.starts_with("error:"))
 }
 
 fn first_line(bytes: &[u8]) -> String {
@@ -166,36 +153,84 @@ fn first_line(bytes: &[u8]) -> String {
     line.chars().take(200).collect()
 }
 
-async fn relay(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bytes) -> Response {
+/// What a request would change if the controller accepts it.
+enum Asks {
+    /// An MCP tool call, which answers 200 whether or not the tool worked.
+    Tool(Passed),
+    /// An API call, which answers 2xx only when it worked.
+    Api(Passed),
+    Nothing,
+}
+
+impl Shared {
+    fn asks(&self, method: &Method, path: &str, body: &[u8]) -> (Asks, String) {
+        if method == Method::POST && path == MCP {
+            let mut message = serde_json::from_slice::<Value>(body).unwrap_or(Value::Null);
+            let named = mcp_message::method(&message).map(str::to_string);
+            let label = named.clone().unwrap_or_else(|| "a request".to_string());
+            if named.as_deref() != Some(TOOLS_CALL) {
+                return (Asks::Nothing, label);
+            }
+            let asks = match mcp_message::tool_call(&mut message) {
+                Ok((tool, arguments)) => {
+                    let own = arguments.get("draft_id").and_then(Value::as_str)
+                        == Some(self.draft.as_str());
+                    match tool.as_str() {
+                        SAVE if own => Asks::Tool(Passed::Saved),
+                        LAUNCH => Asks::Tool(Passed::Launched),
+                        _ => Asks::Nothing,
+                    }
+                }
+                Err(_) => Asks::Nothing,
+            };
+            return (asks, label);
+        }
+        let label = format!("{method} {path}");
+        let draft = format!("/api/playbook-drafts/{}", crux::client::encode(&self.draft));
+        let asks = match path.strip_prefix(&draft) {
+            Some("/versions") if method == Method::POST => Asks::Api(Passed::Saved),
+            Some("/launch") if method == Method::POST => Asks::Api(Passed::Launched),
+            _ => Asks::Nothing,
+        };
+        (asks, label)
+    }
+}
+
+async fn relay(
+    State(shared): State<Arc<Shared>>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     let presented = headers.get(AUTHORIZATION).map(|v| v.as_bytes());
     if !presented.is_some_and(|presented| same(presented, shared.bearer.as_bytes())) {
         shared.trouble("The relay refused a request without the session's token");
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let message = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
-    let method = message.get("method").and_then(Value::as_str);
-    let call = (method == Some("tools/call"))
-        .then(|| message.pointer("/params/name").and_then(Value::as_str))
-        .flatten();
-    let own_draft = message
-        .pointer("/params/arguments/draft_id")
-        .and_then(Value::as_str)
-        == Some(shared.draft.as_str());
-
+    let (asks, label) = shared.asks(&method, uri.path(), &body);
+    let to = uri.path_and_query().map_or(uri.path(), |all| all.as_str());
     let mut request = shared
         .upstream
         .http
-        .post(&shared.upstream.url)
-        .header(CONTENT_TYPE, "application/json")
-        .header(ACCEPT, "application/json, text/event-stream")
-        .body(body);
+        .request(method.clone(), format!("{}{to}", shared.upstream.base));
+    for (name, value) in &headers {
+        let passes = [CONTENT_TYPE.as_str(), ACCEPT.as_str(), LAST_EVENT_ID]
+            .contains(&name.as_str())
+            || name.as_str().starts_with(PROTOCOL_HEADERS);
+        if passes {
+            request = request.header(name, value);
+        }
+    }
+    if uri.path() == MCP {
+        request = request
+            .header(CONTENT_TYPE, "application/json")
+            .header(ACCEPT, "application/json, text/event-stream");
+    }
     for (name, value) in &shared.upstream.headers {
         request = request.header(*name, value);
     }
-    if let Some(version) = headers.get(PROTOCOL_VERSION) {
-        request = request.header(PROTOCOL_VERSION, version);
-    }
-    let answer = match request.send().await {
+    let answer = match request.body(body).send().await {
         Ok(answer) => answer,
         Err(error) => {
             let why = format!("The controller did not answer: {error}");
@@ -210,6 +245,27 @@ async fn relay(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Byte
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
+    let refused = matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN);
+    let read_whole = refused || status.is_server_error() || matches!(asks, Asks::Tool(_));
+    if !read_whole {
+        if let (Asks::Api(passed), true) = (asks, status.is_success()) {
+            let _ = shared.passed.send(passed);
+        }
+        let chunks = futures_util::stream::unfold(Some(answer), |answer| async {
+            let mut answer = answer?;
+            match answer.chunk().await {
+                Ok(Some(chunk)) => Some((Ok(chunk), Some(answer))),
+                Ok(None) => None,
+                Err(error) => Some((Err(error), None)),
+            }
+        });
+        return (
+            status,
+            [(CONTENT_TYPE, content_type)],
+            Body::from_stream(chunks),
+        )
+            .into_response();
+    }
     let bytes = match answer.bytes().await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -218,24 +274,17 @@ async fn relay(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Byte
             return (StatusCode::BAD_GATEWAY, why).into_response();
         }
     };
-    if !status.is_success() {
+    if refused || status.is_server_error() {
         shared.trouble(format!(
-            "The controller answered {} to {}: {}",
+            "The controller answered {} to {label}: {}",
             status.as_u16(),
-            method.unwrap_or("a request"),
             first_line(&bytes)
         ));
-    } else if let Some(tool) = call
+    } else if let Asks::Tool(passed) = asks
+        && status.is_success()
         && serde_json::from_slice::<Value>(&bytes).is_ok_and(|answer| succeeded(&answer))
     {
-        let passed = match tool {
-            SAVE if own_draft => Some(Passed::Saved),
-            LAUNCH => Some(Passed::Launched),
-            _ => None,
-        };
-        if let Some(passed) = passed {
-            let _ = shared.passed.send(passed);
-        }
+        let _ = shared.passed.send(passed);
     }
     (status, [(CONTENT_TYPE, content_type)], bytes).into_response()
 }
@@ -246,82 +295,143 @@ mod tests {
 
     use axum::Router;
     use axum::body::Bytes;
+    use axum::extract::Path;
     use axum::http::HeaderMap;
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use serde_json::{Value, json};
     use tokio::sync::mpsc::unbounded_channel;
 
     use crate::agent::relay::{Passed, Shared, Upstream, router};
 
-    type Asked = Arc<Mutex<Vec<(Option<String>, Option<String>, Value)>>>;
+    type Sent = std::collections::BTreeMap<String, String>;
+    type Asked = Arc<Mutex<Vec<(Option<String>, Option<String>, Value, Sent)>>>;
 
     /// A stand-in controller: records each call's bearer, act-as header and body, and answers
     /// like the hosted tool surface does.
-    async fn controller() -> (String, Asked) {
+    type Feed = tokio::sync::mpsc::UnboundedSender<&'static str>;
+
+    async fn controller() -> (String, Asked, Arc<Mutex<Vec<Option<String>>>>, Feed) {
         let asked = Asked::default();
         let seen = Arc::clone(&asked);
-        let app = Router::new().route(
-            "/mcp",
-            post(move |headers: HeaderMap, body: Bytes| {
-                let seen = Arc::clone(&seen);
-                async move {
-                    let header = |name: &str| {
-                        headers
-                            .get(name)
-                            .and_then(|v| v.to_str().ok())
-                            .map(str::to_string)
-                    };
-                    let message: Value = serde_json::from_slice(&body).unwrap();
-                    seen.lock().unwrap().push((
-                        header("authorization"),
-                        header(crux::client::ACT_AS_HEADER),
-                        message.clone(),
-                    ));
-                    let id = message["id"].clone();
-                    let result = match message["method"].as_str() {
-                        Some("tools/list") => json!({"tools": [
-                            {"name": "crucible_draft_save"},
-                            {"name": "crucible_draft_delete"},
-                            {"name": "crucible_turns"},
-                            {"name": "crucible_secret_bind"},
-                        ]}),
-                        Some("tools/call") => {
-                            let text = match message["params"]["arguments"]["base_version"].as_i64()
-                            {
-                                Some(1) => "error: version 2 was saved since",
-                                _ => "saved",
-                            };
-                            json!({"content": [{"type": "text", "text": text}]})
-                        }
-                        _ => json!({}),
-                    };
-                    json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string()
-                }
-            }),
+        let api: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let bearer = |headers: &HeaderMap| {
+            headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        };
+        let (read, saved) = (Arc::clone(&api), Arc::clone(&api));
+        let files = get(
+            move |Path(draft): Path<String>, uri: axum::http::Uri, headers: HeaderMap| async move {
+                read.lock().unwrap().push(bearer(&headers));
+                format!("files of {draft} at {}", uri.query().unwrap_or_default())
+            },
         );
+        let versions = post(move |headers: HeaderMap, body: Bytes| async move {
+            saved.lock().unwrap().push(bearer(&headers));
+            let save: Value = serde_json::from_slice(&body).unwrap();
+            match save["base_version"].as_i64() {
+                Some(1) => (
+                    axum::http::StatusCode::CONFLICT,
+                    "version 2 was saved since",
+                ),
+                _ => (axum::http::StatusCode::OK, "{}"),
+            }
+        });
+        let (feed, fed) = tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let fed = Arc::new(tokio::sync::Mutex::new(Some(fed)));
+        let live = get(move || async move {
+            let fed = fed.lock().await.take().unwrap();
+            let events = futures_util::stream::unfold(fed, |mut fed| async {
+                let event = fed.recv().await?;
+                Some((Ok::<_, std::convert::Infallible>(event), fed))
+            });
+            (
+                [("content-type", "text/event-stream")],
+                axum::body::Body::from_stream(events),
+            )
+        });
+        let app = Router::new()
+            .route("/api/runs/r1/live", live)
+            .route("/api/playbook-drafts/{draft}/files", files)
+            .route("/api/playbook-drafts/{draft}/versions", versions)
+            .route(
+                "/mcp",
+                post(move |headers: HeaderMap, body: Bytes| {
+                    let seen = Arc::clone(&seen);
+                    async move {
+                        let header = |name: &str| {
+                            headers
+                                .get(name)
+                                .and_then(|v| v.to_str().ok())
+                                .map(str::to_string)
+                        };
+                        let message: Value = serde_json::from_slice(&body).unwrap();
+                        let sent = headers
+                            .iter()
+                            .filter_map(|(name, value)| {
+                                Some((name.to_string(), value.to_str().ok()?.to_string()))
+                            })
+                            .collect();
+                        seen.lock().unwrap().push((
+                            header("authorization"),
+                            header(crux::client::ACT_AS_HEADER),
+                            message.clone(),
+                            sent,
+                        ));
+                        if message["method"] == "forbidden" {
+                            return (axum::http::StatusCode::FORBIDDEN, "no".to_string());
+                        }
+                        let id = message["id"].clone();
+                        let result = match message["method"].as_str() {
+                            Some("tools/list") => json!({"tools": [
+                                {"name": "crucible_draft_save"},
+                                {"name": "crucible_draft_delete"},
+                                {"name": "crucible_turns"},
+                                {"name": "crucible_secret_bind"},
+                            ]}),
+                            Some("tools/call") => {
+                                let text =
+                                    match message["params"]["arguments"]["base_version"].as_i64() {
+                                        Some(1) => "error: version 2 was saved since",
+                                        _ => "saved",
+                                    };
+                                json!({"content": [{"type": "text", "text": text}]})
+                            }
+                            _ => json!({}),
+                        };
+                        let answer = json!({"jsonrpc": "2.0", "id": id, "result": result});
+                        (axum::http::StatusCode::OK, answer.to_string())
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (url, asked)
+        (url, asked, api, feed)
     }
 
     struct Rig {
         url: String,
         asked: Asked,
+        /// The bearer of each request the stand-in controller's API got.
+        api: Arc<Mutex<Vec<Option<String>>>>,
+        /// Sends the next event of the stand-in controller's live stream.
+        feed: Feed,
         passed: tokio::sync::mpsc::UnboundedReceiver<Passed>,
         http: reqwest::Client,
     }
 
     impl Rig {
         async fn start() -> Rig {
-            let (controller, asked) = controller().await;
+            let (controller, asked, api, feed) = controller().await;
             let (sender, passed) = unbounded_channel();
             let app = router(Shared {
                 upstream: Upstream {
                     http: reqwest::Client::new(),
-                    url: format!("{controller}/mcp"),
+                    base: controller,
                     headers: vec![
                         ("authorization", "Bearer crk_profile".into()),
                         (crux::client::ACT_AS_HEADER, "team:paxos".into()),
@@ -339,6 +449,8 @@ mod tests {
             Rig {
                 url,
                 asked,
+                api,
+                feed,
                 passed,
                 http: reqwest::Client::new(),
             }
@@ -436,24 +548,136 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_the_relay_does_not_serve_is_reported() {
+    async fn protocol_headers_reach_the_controller_and_a_refusal_is_reported() {
         let mut rig = Rig::start().await;
-        let get = rig.http.get(&rig.url).send().await.unwrap();
-        assert_eq!(get.status().as_u16(), 405);
-        assert_eq!(
-            rig.passed.try_recv(),
-            Ok(Passed::Trouble("The relay answered 405 to GET /mcp".into()))
-        );
-        let elsewhere = rig
-            .url
-            .replace("/mcp", "/.well-known/oauth-protected-resource");
-        assert_eq!(rig.http.get(&elsewhere).send().await.unwrap().status(), 404);
+        let probe = json!({"jsonrpc": "2.0", "id": 1, "method": "server/discover"});
+        let answer = rig
+            .http
+            .post(&rig.url)
+            .header("authorization", "Bearer session")
+            .header("mcp-method", "server/discover")
+            .header("mcp-protocol-version", "2025-06-18")
+            .header("x-other", "kept out")
+            .body(probe.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(answer.status().as_u16(), 200);
+        {
+            let asked = rig.asked.lock().unwrap();
+            let sent = &asked[0].3;
+            assert_eq!(
+                sent.get("mcp-method").map(String::as_str),
+                Some("server/discover")
+            );
+            assert_eq!(
+                sent.get("mcp-protocol-version").map(String::as_str),
+                Some("2025-06-18")
+            );
+            assert!(!sent.contains_key("x-other"));
+        }
+        assert!(rig.passed.try_recv().is_err());
+
+        let (status, _) = rig
+            .send(
+                "Bearer session",
+                &json!({"jsonrpc": "2.0", "id": 2, "method": "forbidden"}),
+            )
+            .await;
+        assert_eq!(status, 403);
         assert_eq!(
             rig.passed.try_recv(),
             Ok(Passed::Trouble(
-                "The relay answered 404 to GET /.well-known/oauth-protected-resource".into()
+                "The controller answered 403 to forbidden: no".into()
             ))
         );
-        assert_eq!(rig.asked(), 0);
+        let get = rig
+            .http
+            .get(&rig.url)
+            .header("authorization", "Bearer session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.status().as_u16(), 405);
+        assert!(rig.passed.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn the_api_is_served_to_the_token_holder_as_the_profiles_user() {
+        let mut rig = Rig::start().await;
+        let api = |path: &str| rig.url.replace("/mcp", path);
+        let unsigned = rig
+            .http
+            .get(api("/api/playbook-drafts/triage-wren/files?version=3"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unsigned.status().as_u16(), 401);
+        assert!(rig.api.lock().unwrap().is_empty());
+        rig.passed.try_recv().unwrap();
+
+        let read = rig
+            .http
+            .get(api("/api/playbook-drafts/triage-wren/files?version=3"))
+            .header("authorization", "Bearer session")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read.status().as_u16(), 200);
+        assert_eq!(
+            read.text().await.unwrap(),
+            "files of triage-wren at version=3"
+        );
+        assert!(rig.passed.try_recv().is_err());
+
+        let push = |draft: &str, base: i64| {
+            rig.http
+                .post(api(&format!("/api/playbook-drafts/{draft}/versions")))
+                .header("authorization", "Bearer session")
+                .json(&json!({"base_version": base, "files": {}}))
+                .send()
+        };
+        assert_eq!(push("triage-wren", 1).await.unwrap().status().as_u16(), 409);
+        assert_eq!(push("billing", 2).await.unwrap().status().as_u16(), 200);
+        assert!(rig.passed.try_recv().is_err());
+        assert_eq!(push("triage-wren", 2).await.unwrap().status().as_u16(), 200);
+        assert_eq!(rig.passed.try_recv(), Ok(Passed::Saved));
+
+        let asked = rig.api.lock().unwrap();
+        assert_eq!(asked.len(), 4);
+        assert!(
+            asked
+                .iter()
+                .all(|bearer| bearer.as_deref() == Some("Bearer crk_profile"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_answer_arrives_event_by_event() {
+        let rig = Rig::start().await;
+        let mut live = rig
+            .http
+            .get(rig.url.replace("/mcp", "/api/runs/r1/live"))
+            .header("authorization", "Bearer session")
+            .header("accept", "text/event-stream")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(live.status().as_u16(), 200);
+        assert_eq!(
+            live.headers()["content-type"].to_str().unwrap(),
+            "text/event-stream"
+        );
+        let limit = std::time::Duration::from_secs(5);
+
+        rig.feed.send("data: one\n\n").unwrap();
+        let first = tokio::time::timeout(limit, live.chunk()).await.unwrap();
+        assert_eq!(first.unwrap().unwrap(), "data: one\n\n");
+        rig.feed.send("data: two\n\n").unwrap();
+        let second = tokio::time::timeout(limit, live.chunk()).await.unwrap();
+        assert_eq!(second.unwrap().unwrap(), "data: two\n\n");
+        drop(rig.feed);
+        let end = tokio::time::timeout(limit, live.chunk()).await.unwrap();
+        assert_eq!(end.unwrap(), None);
     }
 }

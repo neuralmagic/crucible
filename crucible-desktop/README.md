@@ -227,17 +227,24 @@ fresh, since the controller reruns a run only as what it ran as. Paste it into a
 
 ## Draft with an agent
 
-`Agent` on a draft's working copy opens a panel: a prompt, and what the agent does as it does it.
-The first prompt starts a session: a sandbox on the local OpenShell gateway (0.1.5 or newer, the
-one the `openshell` CLI has active), reached over its gRPC API, with the harness run in it once
-per prompt. The agent edits, previews, launches and watches the draft through the controller's
-MCP tools, as the signed-in user and the team acted as. The tools reach it through a relay on a
-loopback port that only the session's token opens, so the profile's key stays out of the sandbox.
-A save by the agent pulls the working copy. `Stop` ends the turn; `End` deletes the sandbox, and
-one that outlives the app is deleted by the next session.
+`Agent` on a draft's working copy opens a panel: a prompt, and each turn the agent takes, drawn
+as the Transcript pane draws one, with every tool call's input and result a click away. The first
+prompt starts a session: a sandbox on the local OpenShell gateway (0.1.5 or newer, the one the
+`openshell` CLI has active), reached over its gRPC API, with the harness run in it once per
+prompt.
 
-The harness is `[agent]` in the config file. With none, it is Claude Code in
-`localhost/crucible-agent` (`just desktop-agent-image`) with the `claude-sub` provider:
+The agent works as the signed-in user and the team acted as. It pulls the draft into its working
+directory with `crux`, edits the files with crucible-lsp checking the Starlark, pushes the
+directory back as the next version, and previews, launches and watches through `crux` or the
+controller's MCP tools. Both reach the controller through a relay on a loopback port that only
+the session's token opens, so the profile's key stays out of the sandbox. A save by the agent
+pulls the working copy. `Stop` ends the turn; `End` deletes the sandbox, and one that outlives the
+app is deleted by the next session.
+
+The harness is `[agent]` in the config file, read when the app starts. With none, it is Claude
+Code in `localhost/crucible-agent` (`just desktop-agent-image`, which also builds `crux` and
+`crucible-lsp` into it) with the `claude-sub` provider, on `claude-opus-5-5` unless `model` says
+otherwise:
 
 ```toml
 [agent]
@@ -246,8 +253,11 @@ providers = ["openrouter"]              # OpenShell providers holding the harnes
 model = "glm-5-3"
 format = "opencode"                     # how stdout reads: claude, codex, opencode, pi or text
 command = ["my-agent", "--mcp", "{mcp_url}", "--mcp-token", "{mcp_token}", "-m", "{model}", "{prompt}"]
-binaries = ["/usr/local/bin/my-agent"]  # what may reach the relay, as the kernel resolves it
+binaries = ["/usr/local/bin/my-agent", "/usr/local/bin/crux"]   # what may reach the relay
 ```
+
+A harness also finds the relay in its environment: `CONTROLLER_URL` and `CONTROLLER_API_TOKEN`,
+which `crux` reads, and `CRUCIBLE_MCP_URL` and `CRUCIBLE_MCP_TOKEN`.
 
 ## Links
 

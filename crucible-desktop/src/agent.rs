@@ -26,10 +26,15 @@ use serde_json::json;
 
 use crate::App;
 use crate::agent::session::Session;
-use crate::logline::LogLine;
+use crate::session::AgentStep;
 
-/// Entries the panel keeps; older ones are dropped.
-const KEPT: usize = 4000;
+/// Agent events the panel keeps; older ones are dropped.
+const KEPT: usize = 8000;
+/// The task name the session's agent events carry, which no pack task can have.
+pub const SPEAKER: &str = "@agent";
+
+/// The model Claude Code runs when `[agent]` names none.
+const CLAUDE_MODEL: &str = "claude-opus-5-5";
 
 /// The stream a harness writes on stdout.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -72,17 +77,40 @@ impl Default for Config {
             binaries: vec![
                 "/usr/local/bin/node".into(),
                 "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe".into(),
+                "/usr/local/bin/crux".into(),
             ],
         }
     }
 }
 
-/// Where a session's agent reaches the controller's tools.
+/// Where a session's agent reaches the controller, and the token that opens it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Endpoint {
-    pub url: String,
+    /// The controller's base URL as the sandbox sees it; `crux` takes this.
+    pub base: String,
     pub token: String,
 }
+
+impl Endpoint {
+    /// The controller's MCP tools.
+    pub fn mcp(&self) -> String {
+        format!("{}/mcp", self.base)
+    }
+
+    /// What the harness and everything it starts find in their environment: the endpoint as
+    /// `crux` reads it, and as a harness with its own MCP config can.
+    pub fn env(&self) -> Vec<String> {
+        vec![
+            format!("CONTROLLER_URL={}", self.base),
+            format!("CONTROLLER_API_TOKEN={}", self.token),
+            format!("CRUCIBLE_MCP_URL={}", self.mcp()),
+            format!("CRUCIBLE_MCP_TOKEN={}", self.token),
+        ]
+    }
+}
+
+/// Where the default image keeps the Claude Code plugin that runs crucible-lsp.
+const CLAUDE_PLUGIN: &str = "/usr/local/share/crucible-agent/plugin";
 
 impl Config {
     /// The harness's argv for one prompt; `follow_up` continues the conversation where the
@@ -100,7 +128,7 @@ impl Config {
                 .iter()
                 .map(|part| {
                     part.replace("{prompt}", prompt)
-                        .replace("{mcp_url}", &endpoint.url)
+                        .replace("{mcp_url}", &endpoint.mcp())
                         .replace("{mcp_token}", &endpoint.token)
                         .replace("{model}", model)
                 })
@@ -113,7 +141,7 @@ impl Config {
             "mcpServers": {
                 "crucible": {
                     "type": "http",
-                    "url": endpoint.url,
+                    "url": endpoint.mcp(),
                     "headers": {"Authorization": format!("Bearer {}", endpoint.token)},
                 }
             }
@@ -130,13 +158,21 @@ impl Config {
         .map(str::to_string)
         .into();
         argv.push(servers.to_string());
-        argv.extend([
-            "--allowedTools".to_string(),
-            "mcp__crucible,Read,Glob,Grep".to_string(),
-        ]);
-        if !model.is_empty() {
-            argv.extend(["--model".to_string(), model.to_string()]);
-        }
+        argv.extend(
+            [
+                "--permission-mode",
+                "bypassPermissions",
+                "--plugin-dir",
+                CLAUDE_PLUGIN,
+            ]
+            .map(str::to_string),
+        );
+        let model = if model.is_empty() {
+            CLAUDE_MODEL
+        } else {
+            model
+        };
+        argv.extend(["--model".to_string(), model.to_string()]);
         if follow_up {
             argv.push("--continue".to_string());
         }
@@ -170,12 +206,26 @@ pub enum State {
     Failed(String),
 }
 
-/// One row of the panel.
+/// Something the panel shows beside a turn: what was asked, or what the session did.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Entry {
-    Asked(String),
-    Note(String),
-    Agent(LogLine),
+    Asked {
+        turn: u32,
+        text: String,
+    },
+    /// A note from the session during `turn`; 0 is before the first.
+    Note {
+        turn: u32,
+        text: String,
+    },
+}
+
+impl Entry {
+    pub fn turn(&self) -> u32 {
+        match self {
+            Entry::Asked { turn, .. } | Entry::Note { turn, .. } => *turn,
+        }
+    }
 }
 
 /// What a session did since it was last read.
@@ -184,6 +234,8 @@ pub struct Update {
     pub version: u64,
     pub state: State,
     pub entries: Vec<Entry>,
+    /// What the agent did, each event's attempt the turn it belongs to.
+    pub steps: Vec<AgentStep>,
     /// Draft saves that landed since the last read.
     pub saved: bool,
 }
@@ -196,6 +248,7 @@ pub struct Desk {
     seen: u64,
     pub state: Option<State>,
     pub entries: Vec<Entry>,
+    pub steps: Vec<AgentStep>,
     /// A save landed that the working copy has not been pulled to yet.
     pull_due: bool,
 }
@@ -209,6 +262,7 @@ impl Default for Desk {
             seen: 0,
             state: None,
             entries: Vec::new(),
+            steps: Vec::new(),
             pull_due: false,
         }
     }
@@ -277,6 +331,7 @@ impl App {
             );
             let desk = &mut self.remote.agent;
             desk.entries.clear();
+            desk.steps.clear();
             desk.seen = 0;
             desk.pull_due = false;
             desk.state = Some(State::Starting("Starting".into()));
@@ -320,8 +375,9 @@ impl App {
             desk.seen = update.version;
             desk.state = Some(update.state);
             desk.entries.extend(update.entries);
-            let over = desk.entries.len().saturating_sub(KEPT);
-            desk.entries.drain(..over);
+            desk.steps.extend(update.steps);
+            let over = desk.steps.len().saturating_sub(KEPT);
+            desk.steps.drain(..over);
             desk.pull_due |= update.saved;
         }
         if self.remote.agent.pull_due
@@ -342,7 +398,7 @@ mod tests {
 
     fn endpoint() -> Endpoint {
         Endpoint {
-            url: "http://host.openshell.internal:4100/mcp".into(),
+            base: "http://host.openshell.internal:4100".into(),
             token: "tok".into(),
         }
     }
@@ -372,12 +428,32 @@ mod tests {
                 .any(|w| w == ["--model", "claude-fable-5-2"])
         );
         assert!(!argv.contains(&"--continue".to_string()));
-        assert!(!argv.iter().any(|a| a.contains("Bash")));
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--permission-mode", "bypassPermissions"])
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--plugin-dir", "/usr/local/share/crucible-agent/plugin"])
+        );
+        assert_eq!(
+            endpoint().env(),
+            [
+                "CONTROLLER_URL=http://host.openshell.internal:4100",
+                "CONTROLLER_API_TOKEN=tok",
+                "CRUCIBLE_MCP_URL=http://host.openshell.internal:4100/mcp",
+                "CRUCIBLE_MCP_TOKEN=tok",
+            ]
+        );
 
         let next = config.argv("now the docs", &endpoint(), true).unwrap();
         assert!(next.contains(&"--continue".to_string()));
         let plain = Config::default().argv("x", &endpoint(), false).unwrap();
-        assert!(!plain.contains(&"--model".to_string()));
+        assert!(
+            plain
+                .windows(2)
+                .any(|w| w == ["--model", "claude-opus-5-5"])
+        );
     }
 
     #[test]

@@ -1,17 +1,19 @@
-//! The drafting agent's panel in the Pack tab: what it did, and a prompt to send it.
+//! The drafting agent's panel in the Pack tab: each prompt, the turn it started drawn as the
+//! Transcript pane draws one, what the session did beside it, and a prompt to send.
 
 use rune::{El, ScrollSpec, TextStyle, Tx, col, el, row, text};
 use rune_kit::{Button, ButtonVariant, Spinner, TextInput};
 
 use crate::App;
-use crate::agent::{Entry, State};
+use crate::agent::{Entry, SPEAKER, State};
 use crate::settings::LogFont;
+use crate::transcript::turns;
 use crate::ui::Paint;
-use crate::ui::log::line_row;
+use crate::ui::transcript::turn_view;
 
-/// Entries drawn, newest last.
-const SHOWN: usize = 600;
-const HEIGHT: f32 = 300.0;
+/// Turns drawn, newest last.
+const SHOWN: usize = 12;
+const MIN_HEIGHT: f32 = 260.0;
 
 fn status(app: &App, p: &Paint) -> El {
     let desk = &app.remote.agent;
@@ -59,45 +61,62 @@ fn status(app: &App, p: &Paint) -> El {
 }
 
 fn entry_row(entry: &Entry, style: TextStyle, p: &Paint) -> El {
-    let said = |tag: &'static str, body: &str, ink| {
-        row()
-            .w_full()
-            .gap(6.0)
-            .py(1.0)
-            .child(
-                text(tag)
-                    .font(TextStyle::new(9.5, 600.0).lh(12.0).tracking(0.4))
-                    .color(ink)
-                    .w(52.0),
-            )
-            .child(
-                text(body.to_string())
-                    .font(style)
-                    .color(ink)
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .selectable(true)
-                    .selection_color(p.k.selection())
-                    .wrap(),
-            )
+    let (tag, body, ink) = match entry {
+        Entry::Asked { text, .. } => ("YOU", text, p.accent),
+        Entry::Note { text, .. } => ("SESSION", text, p.c.text_muted),
     };
-    match entry {
-        Entry::Asked(prompt) => said("YOU", prompt, p.accent),
-        Entry::Note(note) => said("SESSION", note, p.c.text_muted),
-        Entry::Agent(line) => line_row(line, style, true, p),
-    }
+    row()
+        .w_full()
+        .gap(6.0)
+        .py(1.0)
+        .child(
+            text(tag)
+                .font(TextStyle::new(9.5, 600.0).lh(12.0).tracking(0.4))
+                .color(ink)
+                .w(52.0),
+        )
+        .child(
+            text(body.clone())
+                .font(style)
+                .color(ink)
+                .grow(1.0)
+                .min_w(0.0)
+                .selectable(true)
+                .selection_color(p.k.selection())
+                .wrap(),
+        )
 }
 
 pub(crate) fn panel(font: LogFont, app: &App, p: &Paint) -> El {
     let desk = &app.remote.agent;
     let style = p.sized(TextStyle::new(11.5, 400.0).lh(18.0).family(font.family()));
-    let mut entries = col().gap(0.0).py(8.0);
-    for entry in desk
+    let agent_turns = turns(&desk.steps, SPEAKER);
+    let last = desk
         .entries
         .iter()
-        .skip(desk.entries.len().saturating_sub(SHOWN))
-    {
-        entries = entries.child(entry_row(entry, style, p));
+        .map(Entry::turn)
+        .chain(agent_turns.iter().map(|turn| turn.attempt))
+        .max()
+        .unwrap_or(0);
+    let first = last.saturating_sub(SHOWN as u32 - 1);
+    let mut entries = col().w_full().gap(6.0).py(8.0);
+    for n in std::iter::once(0).chain(first.max(1)..=last) {
+        let beside = |asked: bool| {
+            desk.entries
+                .iter()
+                .filter(move |entry| {
+                    entry.turn() == n && matches!(entry, Entry::Asked { .. }) == asked
+                })
+                .map(|entry| entry_row(entry, style, p))
+        };
+        entries = entries.children(beside(true));
+        entries = entries.children(
+            agent_turns
+                .iter()
+                .filter(|turn| turn.attempt == n)
+                .map(|turn| turn_view(turn, app, p)),
+        );
+        entries = entries.children(beside(false));
     }
     let blocked = app.agent_blocked();
     let send = Button::new("Send")
@@ -113,7 +132,8 @@ pub(crate) fn panel(font: LogFont, app: &App, p: &Paint) -> El {
     col()
         .key("agent")
         .w_full()
-        .h(HEIGHT)
+        .grow(1.5)
+        .min_h(MIN_HEIGHT)
         .gap(6.0)
         .child(status(app, p))
         .child(
