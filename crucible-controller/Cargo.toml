@@ -114,7 +114,7 @@ oauth2 = { version = "5", default-features = false }
 # (API clients POST JSON).
 axum = "0.8"
 # zstd for API responses, for clients that ask for it.
-tower-http = { version = "0.6", features = ["compression-zstd"] }
+tower-http = { version = "0.6", features = ["compression-gzip", "compression-zstd"] }
 # Server-side HTTP sessions (cookie id -> Postgres row) on the human surface. The store is pinned
 # to its sqlx 0.9 main by git until a release carries it; bump tower-sessions with it.
 tower-sessions = { version = "0.15", default-features = false, features = ["axum-core"] }
