@@ -238,11 +238,23 @@ test.describe('draft authoring studio', () => {
     // And it navigates: it opens its file and puts the caret on its position.
     await treeItem(page, 'SKILL.md').click();
     await expect(await editor(page)).toContainText('Read the paper');
-    await diagnostics.getByRole('button').first().click();
+    await diagnostics.getByRole('button', { name: 'workflow.star:2:8' }).click();
     await expect(treeItem(page, 'workflow.star')).toHaveAttribute('aria-selected', 'true');
     await expect(page.getByTestId('draft-editor').locator('.native-edit-context')).toBeFocused();
     // An unanchored one has no line to go to, so it offers no navigation.
-    await expect(diagnostics.getByRole('button')).toHaveCount(1);
+    await expect(diagnostics.getByRole('button', { name: /^workflow\.star:/ })).toHaveCount(1);
+
+    // Each diagnostic copies whole, its location included when it has one.
+    await page.context().grantPermissions(['clipboard-read', 'clipboard-write']);
+    const copy = diagnostics.getByRole('button', { name: 'Copy diagnostic' });
+    await copy.first().click();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+      'workflow.star:2:8\nworkflow.star:2:8: unknown identifier `agnet`',
+    );
+    await copy.nth(1).click();
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(
+      'the pack declares no [workflow] table',
+    );
 
     // The text is selectable with the mouse, so a diagnostic can be copied out.
     const message = diagnostics.getByText('unknown identifier `agnet`');
