@@ -2007,7 +2007,7 @@ checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
 name = "crucible"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "allocative",
  "anyhow",
@@ -2068,7 +2068,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-broker"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2097,7 +2097,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-capability"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "semver",
  "serde",
@@ -2107,7 +2107,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-contract"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -2124,7 +2124,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-controller"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2208,7 +2208,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-git"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "apollo-parser",
@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-harness"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "axum",
  "crucible-contract",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "axum",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue-client"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "axum",
  "crucible-contract",
@@ -2300,7 +2300,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-lsp"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "crucible",
  "crucible-contract",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-mcp-auth"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2343,7 +2343,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-vcs"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "git2",
@@ -2358,7 +2358,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3130,7 +3130,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3405,7 +3405,7 @@ checksum = "aa9a19cbb55df58761df49b23516a86d432839add4af60fc256da840f66ed35b"
 
 [[package]]
 name = "forge"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -8128,7 +8128,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8735,15 +8735,15 @@ dependencies = [
 
 [[package]]
 name = "rustix"
-version = "1.1.5"
+version = "1.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "891efababe418670775f199f0d233d84843c227a0949a883ce15b37c78d6629d"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
 dependencies = [
  "bitflags 2.13.2",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8811,7 +8811,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -10192,7 +10192,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -11530,7 +11530,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -11878,7 +11878,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.6.2"
+version = "0.6.3"
 dependencies = [
  "anyhow",
  "clap",
