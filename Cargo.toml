@@ -24,7 +24,7 @@ exclude = ["crucible-kueue-py", "third_party/dagre_rust", "third_party/graphlib_
 resolver = "3"
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 # Dual-licensed like the repo (LICENSE-MIT / LICENSE-APACHE); the public export's cargo-deny
 # licenses check requires every workspace crate to declare it.
 license = "MIT OR Apache-2.0"
