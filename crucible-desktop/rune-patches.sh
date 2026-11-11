@@ -9,7 +9,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-REV=4ca683561a100e16b1ce32f3576f4ade61bd2924
+REV=0ea75abef0a6caa014067a88f89518b9a04cce2b
 DIR=../vendor/rune
 
 stamp="$REV $(cat patches/rune/*.patch 2>/dev/null | { shasum -a 256 2>/dev/null || sha256sum; } | cut -c1-16)"
