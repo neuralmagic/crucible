@@ -395,9 +395,27 @@ pub struct Repo {
     pub path: Option<String>,
     #[serde(default, rename = "ref")]
     pub git_ref: Option<GitRef>,
+    /// A partial clone: every commit, with file contents fetched as they are needed.
+    #[serde(default)]
+    pub filter: Option<CloneFilter>,
     /// The refs a launch may check out instead of `ref`.
     #[serde(default)]
     pub overrides: RepoOverridesCfg,
+}
+
+/// The `git clone --filter` a `[repo]` may ask for.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloneFilter {
+    #[serde(rename = "blob:none")]
+    BlobNone,
+}
+
+impl CloneFilter {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CloneFilter::BlobNone => "blob:none",
+        }
+    }
 }
 
 impl Repo {
@@ -3901,6 +3919,19 @@ dst = "traces/median_block.txt"
             ),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn a_repo_filter_is_blob_none_or_refused() {
+        let repo =
+            |filter: &str| toml::from_str::<Repo>(&format!("url = \"x\"\nfilter = {filter:?}"));
+        assert_eq!(
+            repo("blob:none").expect("parses").filter,
+            Some(CloneFilter::BlobNone)
+        );
+        for other in ["tree:0", "--upload-pack=x", ""] {
+            assert!(repo(other).is_err(), "{other:?}");
+        }
     }
 
     const VARIANTS: &str = r#"

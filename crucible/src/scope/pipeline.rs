@@ -252,7 +252,7 @@ impl Stage for Propose {
             .context("propose needs a resolved goal (ingest must have run first)")?;
 
         let scratch = scratch_dir("scope-propose-repo");
-        crate::cli::workspace::clone_repo(&self.opts.repo, None, &scratch)
+        crate::cli::workspace::clone_repo(&self.opts.repo, None, None, &scratch)
             .context("checking out --repo for the propose turn")?;
         write_seed_context(&scratch, &goal)?;
         std::fs::create_dir_all(scratch.join(PACK_WORK_DIR))
