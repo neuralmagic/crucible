@@ -29,10 +29,42 @@ env:
   CARGO_NET_RETRY: "10"
 
 jobs:
+  # Picks the jobs a change needs from the paths it touches (scripts/ci-jobs.sh).
+  changes:
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.pick.outputs.rust }}
+      ui: ${{ steps.pick.outputs.ui }}
+      lint: ${{ steps.pick.outputs.lint }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+      - name: Test the path rules
+        run: scripts/ci-jobs-test.sh
+      - name: Pick jobs
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          if [ -n "$BASE" ] &&
+            files=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" \
+              --jq '.files[] | .filename, (.previous_filename // empty)') &&
+            [ "$(wc -l <<<"$files")" -lt 300 ]; then
+            scripts/ci-jobs.sh <<<"$files" | tee -a "$GITHUB_OUTPUT"
+          else
+            scripts/ci-jobs.sh --all | tee -a "$GITHUB_OUTPUT"
+          fi
+
   # Same-repo refs and fork PRs from org members get the org's beefy self-hosted runners (32-core,
   # sccache in S3, baked toolchain); other fork PRs MUST stay on hosted runners — self-hosted
   # instances carry an IAM role, and this is a public repo.
   test-all-features:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     timeout-minutes: 80
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
@@ -173,6 +205,8 @@ jobs:
 
   # Formatting, guards, clippy, and generated docs; beside the test jobs, fmt first.
   lint:
+    needs: changes
+    if: needs.changes.outputs.lint == 'true'
     timeout-minutes: 20
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
@@ -298,6 +332,8 @@ jobs:
   # The default-feature build's tests. Vault and Keycloak suites skip here;
   # test-all-features runs them.
   test-default-features:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     timeout-minutes: 60
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
@@ -339,7 +375,8 @@ jobs:
   # The controller dispatching real pods on a throwaway kind cluster (scripts/kind-e2e.sh). Not in
   # the required check until it has a flake-free record.
   kind-e2e:
-    if: github.event_name != 'merge_group'
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' && github.event_name != 'merge_group'
     timeout-minutes: 45
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-24.04' }}
     steps:
@@ -397,7 +434,7 @@ jobs:
         if: always() && env.PG_CONTAINER != ''
         run: docker rm -f "$PG_CONTAINER" || true
 
-  # The required check: green only when every job it needs is.
+  # The required check: green only when every job it needs passed, or `changes` skipped it.
   # The crucible_kueue Python client, staged as the runtime image ships it, against the real
   # crucible-kueue router (crucible-kueue-client's serve example).
   kueue-python:
@@ -426,21 +463,25 @@ jobs:
           PYTHONPATH="$RUNNER_TEMP/python" "$RUNNER_TEMP/venv/bin/python" -m pytest -q crucible-kueue-py/tests
 
   build-and-test:
-    needs: [lint, test-all-features, test-default-features, ui, audit, kueue-python]
+    needs: [changes, lint, test-all-features, test-default-features, ui, audit, kueue-python]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - run: |
-          [ "${{ needs.lint.result }}" = success ] &&
-            [ "${{ needs.test-all-features.result }}" = success ] &&
-            [ "${{ needs.test-default-features.result }}" = success ] &&
-            [ "${{ needs.ui.result }}" = success ] &&
+          ran() { [ "$1" = success ] || [ "$1" = skipped ]; }
+          [ "${{ needs.changes.result }}" = success ] &&
+            ran "${{ needs.lint.result }}" &&
+            ran "${{ needs.test-all-features.result }}" &&
+            ran "${{ needs.test-default-features.result }}" &&
+            ran "${{ needs.ui.result }}" &&
             [ "${{ needs.audit.result }}" = success ] &&
             [ "${{ needs.kueue-python.result }}" = success ]
 
   # The controller SPA, independent of the Rust build. The package pre-hooks regenerate the
   # OpenAPI spec (from the controller's own bin) and the typed client before check/test/build.
   ui:
+    needs: changes
+    if: needs.changes.outputs.ui == 'true'
     timeout-minutes: 15
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
