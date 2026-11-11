@@ -115,13 +115,13 @@ pub struct DraftArgs {
     pub agent_cmd: Option<String>,
     /// The harness that runs the turns; the claude default when unset.
     #[arg(long, value_enum)]
-    pub harness: Option<crate::manifest::Harness>,
+    pub harness: Option<crate::knobs::Harness>,
     /// Override the turns' model.
     #[arg(long)]
     pub model: Option<String>,
     /// The turns' reasoning-effort tier; unset means the harness picks its own.
     #[arg(long, value_enum)]
-    pub effort: Option<crate::manifest::ReasoningEffort>,
+    pub effort: Option<crate::knobs::ReasoningEffort>,
     /// Compute driver for the turns' gateway. Mirrors the loop's `--compute-driver`.
     #[arg(long, value_enum, default_value_t = crate::openshell::gateway::ComputeDriver::Podman)]
     pub compute_driver: crate::openshell::gateway::ComputeDriver,

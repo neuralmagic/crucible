@@ -195,7 +195,7 @@ pub(crate) fn apply_agent_cfg(
     // turn to the pack's declared surface, and an undeclared one is refused rather than
     // granted full tools. The command backend spawns no claude turn at all.
     if args.agent_backend != manifest::AgentBackend::Command
-        && args.harness() == manifest::Harness::Claude
+        && args.harness() == crate::knobs::Harness::Claude
         && args.allowed_tools.is_empty()
     {
         return Err(UndeclaredToolSurface.into());
