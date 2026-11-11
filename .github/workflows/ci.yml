@@ -1,13 +1,11 @@
 name: CI
 
-# Public-repo CI: plain pull_request validation plus merge_group and the main line. Everything
+# Public-repo CI: plain pull_request validation plus merge_group. Everything
 # on the pull_request path runs from public sources with no org registries or org-pinned
 # images required.
 on:
   pull_request:
   merge_group:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 # Cancel superseded runs on the same ref so pushes don't pile up.
@@ -341,6 +339,7 @@ jobs:
   # The controller dispatching real pods on a throwaway kind cluster (scripts/kind-e2e.sh). Not in
   # the required check until it has a flake-free record.
   kind-e2e:
+    if: github.event_name != 'merge_group'
     timeout-minutes: 45
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false || contains(fromJSON('["MEMBER", "OWNER"]'), github.event.pull_request.author_association)) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-24.04' }}
     steps:
