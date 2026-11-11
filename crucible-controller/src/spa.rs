@@ -81,6 +81,7 @@ pub(crate) fn router(ui: Source, next: Source) -> Router {
         .fallback(get(serve_spa))
         .with_state(Arc::new(ui))
         .merge(next)
+        .layer(tower_http::compression::CompressionLayer::new())
 }
 
 /// The file a request path names under `root`, or `None` when the path does not name one.
@@ -270,6 +271,94 @@ mod tests {
             .await
             .expect("a body");
         (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `/next/app_bg.wasm` from a directory holding `wasm`, asked for in `encoding`.
+    async fn get_wasm(wasm: &[u8], encoding: Option<&str>) -> (Option<String>, Vec<u8>) {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join(NEXT_WASM), wasm).expect("write wasm");
+        let mut request = Request::builder().uri("/next/app_bg.wasm");
+        if let Some(encoding) = encoding {
+            request = request.header(header::ACCEPT_ENCODING, encoding);
+        }
+        let answer = router(Source::Embedded, Source::Dir(dir.path().to_path_buf()))
+            .oneshot(request.body(Body::empty()).expect("a request"))
+            .await
+            .expect("a response");
+        assert_eq!(answer.status(), StatusCode::OK);
+        let encoded = answer
+            .headers()
+            .get(header::CONTENT_ENCODING)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        (encoded, bytes.to_vec())
+    }
+
+    fn wasm() -> Vec<u8> {
+        b"\0asm".iter().copied().cycle().take(64 * 1024).collect()
+    }
+
+    #[tokio::test]
+    async fn the_next_bundle_is_gzipped_for_a_client_that_takes_gzip() {
+        let (encoded, body) = get_wasm(&wasm(), Some("gzip")).await;
+        assert_eq!(encoded.as_deref(), Some("gzip"));
+        assert!(body.len() < wasm().len() / 10, "{} bytes", body.len());
+        let mut plain = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(body.as_slice()),
+            &mut plain,
+        )
+        .expect("gzip");
+        assert_eq!(plain, wasm());
+    }
+
+    #[tokio::test]
+    async fn the_next_bundle_is_zstd_for_a_client_that_takes_zstd() {
+        let (encoded, body) = get_wasm(&wasm(), Some("gzip, deflate, br, zstd")).await;
+        assert_eq!(encoded.as_deref(), Some("zstd"));
+        assert!(body.len() < wasm().len() / 10, "{} bytes", body.len());
+        assert_eq!(zstd::decode_all(body.as_slice()).expect("zstd"), wasm());
+    }
+
+    #[tokio::test]
+    async fn the_next_bundle_is_sent_as_is_to_a_client_that_names_no_encoding() {
+        let (encoded, body) = get_wasm(&wasm(), None).await;
+        assert_eq!(encoded, None);
+        assert_eq!(body, wasm());
+    }
+
+    #[tokio::test]
+    async fn the_spa_is_compressed_too() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let page = "<p>crucible</p>".repeat(100);
+        std::fs::write(dir.path().join("index.html"), &page).expect("write index");
+        let answer = router(Source::Dir(dir.path().to_path_buf()), Source::Embedded)
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(Body::empty())
+                    .expect("a request"),
+            )
+            .await
+            .expect("a response");
+        assert_eq!(
+            answer
+                .headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
+        let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let mut plain = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&body[..]), &mut plain)
+            .expect("gzip");
+        assert_eq!(plain, page);
     }
 
     #[test]
