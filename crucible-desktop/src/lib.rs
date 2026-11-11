@@ -23,6 +23,7 @@ mod httpcache;
 #[cfg(target_arch = "wasm32")]
 #[path = "httpcache_web.rs"]
 mod httpcache;
+mod ignition;
 mod inspect;
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[cfg(not(target_arch = "wasm32"))]
@@ -429,6 +430,8 @@ pub struct App {
     /// The divider being dragged and its neighbours' shares when the drag began.
     pub resizing: Option<(Divider, (f32, f32))>,
     pub geometry: Geometry,
+    /// The flare on the run a launch just started.
+    pub ignition: ignition::Ignition,
     /// Clicks on the molten logo, which slosh it.
     pub logo_clicks: u32,
     /// The logo's top-left on screen, in points; a window move sloshes it.
@@ -1001,6 +1004,7 @@ impl App {
                 Ok(key) => {
                     self.remote.launcher = None;
                     self.backend = Backend::Controller;
+                    self.ignition.launched(launched.playbook.clone());
                     self.select(Selection::Live {
                         playbook: launched.playbook,
                         launch: Some(key),
@@ -1645,6 +1649,7 @@ fn init() -> App {
         pane_drag: None,
         resizing: None,
         geometry: Geometry::default(),
+        ignition: ignition::Ignition::default(),
         logo_clicks: 0,
         logo_screen: [0.0; 2],
         targets: HashMap::from([(name, (target, keeper))]),
@@ -1716,8 +1721,8 @@ fn setup(app: &mut App, waker: Waker) {
 
 /// Nothing here touches a file, a process or the network: the workers own all of that and wake the
 /// loop once per finished snapshot.
-fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
-    let mut changed = false;
+fn poll(app: &mut App, clock: f64, tx: &mut Tx) -> bool {
+    let mut changed = app.ignition.tick(clock);
     if let Some((version, snapshot)) = app.local.take(app.local_seen) {
         app.local_seen = version;
         app.apply_local(snapshot);
@@ -1784,6 +1789,9 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
         changed = true;
     }
     app.sync_checks();
+    if let Some(due) = app.ignition.due(clock) {
+        tx.wake_at(due);
+    }
     changed
 }
 
