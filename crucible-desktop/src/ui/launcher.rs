@@ -325,6 +325,9 @@ fn fact(name: &str, value: String, p: &Paint) -> El {
         )
 }
 
+/// The choice that switches an open list to a typed value; never sent.
+const OTHER: &str = "Other\u{2026}";
+
 fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
     let Some(launcher) = &app.remote.launcher else {
         return el();
@@ -339,28 +342,38 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
             .child(runs_on(app, p, layer))
             .child(ceilings(app, p));
     }
+    let texts: Vec<String> = launcher.answers.iter().map(|a| a.text.clone()).collect();
     let mut fields = col().w_full().gap(14.0);
     for (i, field) in launcher.fields.iter().enumerate() {
-        let answer = launcher
-            .answers
-            .get(i)
-            .map(|a| a.text.as_str())
-            .unwrap_or_default();
+        let answer = texts.get(i).map(String::as_str).unwrap_or_default();
         let issue = launcher
             .problems
             .iter()
             .find(|(at, _)| *at == i)
             .map(|(_, why)| why.clone());
-        let control = match &field.kind {
-            Kind::Bool => Switch::new(answer == "true")
+        let off = !field.enabled(&launcher.fields, &texts);
+        let typed = |id: String| {
+            TextInput::new(launcher.answers.get(i).unwrap_or(&app.scratch))
+                .placeholder(field.placeholder(&launcher.fields, &texts))
+                .width(Some(INNER))
+                .invalid(issue.is_some())
+                .disabled(off)
+                .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
+                .build(p.k)
+                .key(id)
+        };
+        let offered = field.offered(&launcher.fields, &texts);
+        let control = match (&field.kind, offered) {
+            (Kind::Bool, _) => Switch::new(answer == "true")
                 .label(field.name.clone())
                 .hide_label()
+                .disabled(off)
                 .on_toggle(move |app: &mut App| {
                     let on = edit(app, Slot::Answer(i)).text == "true";
                     *edit(app, Slot::Answer(i)) = TextEdit::new(if on { "false" } else { "true" });
                 })
                 .build(p.k),
-            Kind::Choice(values) if values.len() <= 4 => {
+            (Kind::Choice(values), _) if values.len() <= 4 && !field.offer.allow_other && !off => {
                 let picks = values.clone();
                 SegmentedControl::new(values, values.iter().position(|v| v == answer))
                     .label(field.name.clone())
@@ -372,12 +385,58 @@ fn form(app: &App, p: &Paint, layer: &mut Vec<El>) -> El {
                     })
                     .build(p.k)
             }
-            _ => TextInput::new(launcher.answers.get(i).unwrap_or(&app.scratch))
-                .placeholder(field.default.clone())
-                .width(Some(INNER))
-                .invalid(issue.is_some())
-                .on_edit(move |app: &mut App| edit(app, Slot::Answer(i)))
-                .build(p.k),
+            (_, Some(mut values)) => {
+                let listed = values.iter().any(|v| v == answer);
+                let other = field.offer.allow_other
+                    && (launcher.typing.contains(&i) || (!answer.is_empty() && !listed));
+                if field.offer.allow_other {
+                    values.push(OTHER.to_string());
+                }
+                let current = if other {
+                    Some(OTHER)
+                } else {
+                    listed.then_some(answer)
+                };
+                let mut pick = row()
+                    .key(format!("launch-choices-{}", field.name))
+                    .w_full()
+                    .gap(6.0)
+                    .flex_wrap();
+                for (n, value) in values.into_iter().enumerate() {
+                    let chosen = current == Some(value.as_str());
+                    pick = pick.child(
+                        Button::new(value.clone())
+                            .variant(if chosen {
+                                ButtonVariant::Submit
+                            } else {
+                                ButtonVariant::Outline
+                            })
+                            .disabled(off)
+                            .on_press(move |app: &mut App| {
+                                let Some(launcher) = app.remote.launcher.as_mut() else {
+                                    return;
+                                };
+                                let typing = value == OTHER;
+                                if typing {
+                                    launcher.typing.insert(i);
+                                } else {
+                                    launcher.typing.remove(&i);
+                                }
+                                if let Some(slot) = launcher.answers.get_mut(i) {
+                                    *slot = TextEdit::new(if typing { "" } else { value.as_str() });
+                                }
+                            })
+                            .build(p.k)
+                            .key(format!("launch-choice-{}-{n}", field.name)),
+                    );
+                }
+                col()
+                    .w_full()
+                    .gap(6.0)
+                    .child(pick)
+                    .children(other.then(|| typed(format!("launch-other-{}", field.name))))
+            }
+            _ => typed(format!("launch-param-{}", field.name)),
         };
         fields = fields.child(
             col()

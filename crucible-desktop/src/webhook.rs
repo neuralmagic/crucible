@@ -265,6 +265,7 @@ mod tests {
             required: false,
             description: String::new(),
             default: default.into(),
+            offer: Default::default(),
         }
     }
 

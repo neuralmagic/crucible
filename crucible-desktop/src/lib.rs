@@ -178,6 +178,8 @@ pub struct Launcher {
     pub stage: Stage,
     pub fields: Vec<form::Field>,
     pub answers: Vec<TextEdit>,
+    /// Fields that take a typed value in place of their offered choices.
+    pub typing: std::collections::BTreeSet<usize>,
     pub cost: TextEdit,
     pub time: TextEdit,
     /// Where it runs: the dispatch target, and the agent's provider and model.
@@ -887,6 +889,7 @@ impl App {
             stage: Stage::Reading,
             fields: Vec::new(),
             answers: Vec::new(),
+            typing: Default::default(),
             cost: TextEdit::new(""),
             time: TextEdit::new(""),
             runs_on: runs_on::RunsOnForm::default(),
