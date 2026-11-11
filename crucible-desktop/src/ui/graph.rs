@@ -379,6 +379,27 @@ fn critical_path(tasks: &[TaskView]) -> HashSet<(usize, usize)> {
     path
 }
 
+/// For each task, by index, every task it depends on through one or more others.
+fn ancestors(tasks: &[TaskView]) -> Vec<HashSet<usize>> {
+    let index = |name: &str| tasks.iter().position(|task| task.name == name);
+    (0..tasks.len())
+        .map(|i| {
+            let mut seen = HashSet::new();
+            let mut stack: Vec<usize> = tasks[i]
+                .depends_on
+                .iter()
+                .filter_map(|d| index(d))
+                .collect();
+            while let Some(at) = stack.pop() {
+                if at != i && seen.insert(at) {
+                    stack.extend(tasks[at].depends_on.iter().filter_map(|d| index(d)));
+                }
+            }
+            seen
+        })
+        .collect()
+}
+
 /// The most instances an unfolded fan-out draws.
 const UNFOLDED: usize = 24;
 
@@ -397,7 +418,7 @@ struct Shown<'a> {
 ///
 /// ```text
 ///   route  {{◇ name}}   fan-out  [[≡ name ×n]]   agent  (✦ name)   command  [› name]
-///   a --> b             b reads a
+///   a --> b             b reads a, and no other dependency of b already leads back to a
 ///   a ==>|each .f| b    b runs once per element of a.f
 ///   a -->|.k| b         b gets its own entry of a.k
 ///   a -->|yes / no| b   b runs on those answers of route a
@@ -483,6 +504,7 @@ fn mermaid_source(tasks: &[TaskView], shown: &Shown, ink: &Ink) -> String {
         source.push_str("  end\n");
     }
     let critical = critical_path(tasks);
+    let above = ancestors(tasks);
     let (mut faded, mut heavy) = (Vec::new(), Vec::new());
     for (to, task) in tasks.iter().enumerate() {
         let passed_over = matches!(
@@ -518,12 +540,23 @@ fn mermaid_source(tasks: &[TaskView], shown: &Shown, ink: &Ink) -> String {
             } else {
                 "-->"
             };
+            let from = tasks.iter().position(|t| t.name == *dependency);
+            let implied = from.is_some_and(|f| {
+                task.depends_on.iter().any(|other| {
+                    tasks
+                        .iter()
+                        .position(|t| t.name == *other)
+                        .is_some_and(|o| above[o].contains(&f))
+                })
+            });
+            if labels.is_empty() && implied {
+                continue;
+            }
             let label = if labels.is_empty() {
                 String::new()
             } else {
                 format!("|{}|", labels.join(", "))
             };
-            let from = tasks.iter().position(|t| t.name == *dependency);
             let source_id = match from {
                 Some(f) if unfolded(&tasks[f]) => format!("g{f}"),
                 _ => id(dependency),
@@ -834,6 +867,72 @@ mod tests {
         assert!(
             !ran.contains("t0 -.-> t1"),
             "a revise loop is not a passed-over edge"
+        );
+    }
+
+    /// `a` feeds `b`, `b` feeds `c`, and `d` names all three, `a` for its own entry of `a.k`.
+    const IMPLIED: &str = concat!(
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":["#,
+        r#"{"name":"a","kind":"command","required":true},"#,
+        r#"{"name":"b","kind":"command","depends_on":["a"],"required":true},"#,
+        r#"{"name":"c","kind":"command","depends_on":["a","b"],"required":true},"#,
+        r#"{"name":"d","kind":"command","depends_on":["a","b","c"],"required":true,"keyed":["a.k"]},"#,
+        r#"{"name":"e","kind":"command","depends_on":["a","d"],"required":true}"#,
+        r#"]}"#,
+        "\n",
+        r#"{"v":1,"kind":"task_result","task":"e","status":"not_taken","attempts":0,"cost_usd":0.0,"secs":0.0,"note":""}"#,
+        "\n",
+    );
+
+    #[test]
+    fn a_dependency_another_one_leads_back_to_is_not_drawn_unless_it_carries_data() {
+        let source = source(&fold(IMPLIED), None, &[]);
+        let edges: Vec<&str> = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.contains("->"))
+            .collect();
+        assert_eq!(
+            edges,
+            [
+                "t0 --> t1",
+                "t1 --> t2",
+                "t0 -->|.k| t3",
+                "t2 --> t3",
+                "t3 -.-> t4"
+            ],
+            "{source}"
+        );
+        contains_all(&source, &["linkStyle 4 stroke:#000000ff"]);
+    }
+
+    #[test]
+    fn a_task_that_names_everything_before_it_still_lays_out() {
+        let tasks: Vec<String> = (0..36)
+            .map(|i| {
+                let before: Vec<String> = (0..i).map(|d| format!(r#""t{d}""#)).collect();
+                format!(
+                    r#"{{"name":"t{i}","kind":"command","depends_on":[{}],"required":true}}"#,
+                    before.join(",")
+                )
+            })
+            .collect();
+        let plan = format!(
+            r#"{{"v":1,"kind":"plan_admitted","plan_version":1,"budget_usd":1.0,"tasks":[{}]}}"#,
+            tasks.join(",")
+        );
+        let source = source(&fold(&plan), None, &[]);
+        assert_eq!(source.matches("-->").count(), 35, "{source}");
+        let style = rune_mermaid::DiagramStyle::neutral(true);
+        assert!(
+            rune_mermaid::render_with_hover(
+                &source,
+                &style,
+                rune_mermaid::Hover::Off,
+                Color::WHITE
+            )
+            .is_some(),
+            "{source}"
         );
     }
 
