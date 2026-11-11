@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-contract"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue-client"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "crucible-contract",
  "reqwest",
@@ -258,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-kueue-py"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "crucible-kueue-client",
  "pyo3",
