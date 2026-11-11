@@ -1,4 +1,5 @@
-//! What one `crucible draft` turn decided, as the `--json` document its last stdout line carries.
+//! What one `crucible draft` turn decided, as the `--json` document its last stdout line carries,
+//! and what it is doing, as the NDJSON progress lines it writes to stderr while it runs.
 //!
 //! The engine exits nonzero when the pack never compiled or blew the budget but still prints the
 //! document, so the exit status is not the contract: these fields are. The controller decodes this
@@ -24,6 +25,16 @@ pub struct DraftReport {
     /// The drafting agent's own refusal (its `REJECTED.md`): a clean answer, not a failure to run.
     #[serde(default)]
     pub declined: Option<String>,
+}
+
+/// One progress line of a drafting turn, as `crucible draft --json` writes it to stderr while the
+/// turn runs. The engine formats the line from the agent events it already redacted; a consumer
+/// relays it, never interprets it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DraftProgress {
+    /// The drafting round the line belongs to: 1 is the drafting turn, later rounds are refines.
+    pub round: u32,
+    pub line: String,
 }
 
 #[cfg(test)]
@@ -75,5 +86,17 @@ mod tests {
     fn a_document_without_a_cost_is_refused() {
         let no_cost = r#"{"ok":true,"rounds":1,"findings":[]}"#;
         assert!(crate::json::from_str::<DraftReport>(no_cost).is_err());
+    }
+
+    /// A stderr progress line decodes back to itself, round and line intact.
+    #[test]
+    fn a_progress_line_decodes_back_to_itself() {
+        let entry = DraftProgress {
+            round: 2,
+            line: "tool Write: sweep.py".to_string(),
+        };
+        let encoded = serde_json::to_string(&entry).expect("serialize");
+        let decoded: DraftProgress = crate::json::from_str(&encoded).expect("deserialize");
+        assert_eq!(decoded, entry);
     }
 }

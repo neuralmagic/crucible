@@ -22,7 +22,7 @@ use crate::args::Paths;
 use crate::cli::init::MANIFEST_FILE;
 use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
-use crucible_contract::draft::DraftReport;
+use crucible_contract::draft::{DraftProgress, DraftReport};
 use crucible_contract::pack_tree::walk_dir;
 use std::path::{Path, PathBuf};
 
@@ -119,6 +119,9 @@ pub struct DraftArgs {
     /// Override the turns' model.
     #[arg(long)]
     pub model: Option<String>,
+    /// The turns' reasoning-effort tier; unset means the harness picks its own.
+    #[arg(long, value_enum)]
+    pub effort: Option<crate::manifest::ReasoningEffort>,
     /// Compute driver for the turns' gateway. Mirrors the loop's `--compute-driver`.
     #[arg(long, value_enum, default_value_t = crate::openshell::gateway::ComputeDriver::Podman)]
     pub compute_driver: crate::openshell::gateway::ComputeDriver,
@@ -148,6 +151,7 @@ fn turn_args(a: &DraftArgs) -> Result<crate::args::Args> {
     if let Some(model) = &a.model {
         args.model = Some(model.clone());
     }
+    args.reasoning_effort = a.effort;
     // Manifest-less turn: the Vertex agent env normally supplied by `[agent].env` comes from the
     // turn pod's own env instead. Only for a Vertex-authenticated harness.
     if crate::agent::harness::resolve_auth(
@@ -272,33 +276,223 @@ fn render_refine_prompt(goal: &str, out_dir: &Path, findings: &[String], round: 
 }
 
 /// Run one drafting turn in `scratch` and return its outcome. The turn's own narration stays on
-/// stderr; stdout carries only the report `run` prints, the contract the controller parses.
+/// stderr; stdout carries only the report `run` prints, the contract the controller parses. In
+/// `--json` mode the narration is one [`DraftProgress`] NDJSON line per event instead of human
+/// prose, so the controller can relay it to the studio while the turn runs.
 fn run_draft_turn(
     scratch: &Path,
     prompt: &str,
     a: &DraftArgs,
     engine: &tokio::runtime::Handle,
+    round: u32,
 ) -> Result<crate::agent::turn::TurnOutcome> {
     let mut args = turn_args(a)?;
     args.engine = Some(engine.clone());
     let paths = draft_paths(scratch);
     let _ = std::fs::create_dir_all(&paths.state);
+    // The agent works in absolute scratch paths; the studio reads the lines, so the scratch
+    // prefix itself is noise.
+    let scratch_prefix = format!("{}/", scratch.display());
     Ok(agent::run_turn(
         &args,
         &paths,
         prompt,
         false,
         |_line, _stream, ev| {
+            let Some(ev) = ev else { return };
+            if let Some(line) = progress_line(ev)
+                && a.json
+            {
+                emit_progress(round, &line.replace(&scratch_prefix, ""));
+            }
             // A backend that dies at spawn/auth must be visible in the log, not silently a $0 turn.
-            if let Some(AgentEvent::Error {
+            if let AgentEvent::Error {
                 error_type,
                 message,
-            }) = ev
+            } = ev
+                && !a.json
             {
                 eprintln!("[crucible draft] agent error ({error_type}): {message}");
             }
         },
     ))
+}
+
+/// One progress entry on stderr as NDJSON. A serialize failure drops the line: progress is a
+/// lossy view of the turn, never a reason to fail it.
+fn emit_progress(round: u32, line: &str) {
+    if let Ok(json) = serde_json::to_string(&DraftProgress {
+        round,
+        line: line.to_string(),
+    }) {
+        eprintln!("{json}");
+    }
+}
+
+/// The input field that says what a tool call did, for a one-line progress view: the file a
+/// Write/Edit touched, the command a Bash ran, the description a Task carried. Falls back to the
+/// compact JSON so an unfamiliar tool still shows something.
+fn tool_detail(input: Option<&serde_json::Value>) -> String {
+    let Some(input) = input else {
+        return String::new();
+    };
+    const KEYS: &[&str] = &[
+        "file_path",
+        "path",
+        "command",
+        "cmd",
+        "url",
+        "pattern",
+        "query",
+        "description",
+        "prompt",
+    ];
+    for key in KEYS {
+        if let Some(found) = input
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|found| !found.is_empty())
+        {
+            return found.replace('\n', " ");
+        }
+    }
+    input.to_string().replace('\n', " ")
+}
+
+/// A progress line stays one line however long the field it came from was.
+fn cap_line(line: &str) -> String {
+    const CAP: usize = 400;
+    if line.chars().count() <= CAP {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(CAP).collect();
+    format!("{cut}…")
+}
+
+/// One progress line for an already-redacted agent event. `None` for the events that carry nothing
+/// worth a line: streamed deltas, telemetry samples, and raw passthrough.
+fn progress_line(ev: &AgentEvent) -> Option<String> {
+    match ev {
+        AgentEvent::Log { label, value, .. } => {
+            if label.is_empty() {
+                return None;
+            }
+            let line = match value {
+                Some(v) if !v.is_empty() => format!("{label}: {v}"),
+                _ => label.clone(),
+            };
+            Some(cap_line(&line))
+        }
+        AgentEvent::Gate {
+            phase,
+            name,
+            status,
+            error,
+        } => {
+            let mut line = format!("gate {phase} {name}: {status}");
+            if let Some(error) = error.as_deref().filter(|e| !e.is_empty()) {
+                line.push_str(" — ");
+                line.push_str(error);
+            }
+            Some(cap_line(&line))
+        }
+        AgentEvent::Init {
+            model,
+            tools,
+            agents,
+        } => Some(cap_line(&format!(
+            "session started: {model}, {tools} tools, {agents} subagents"
+        ))),
+        AgentEvent::Tool {
+            name,
+            summary,
+            subagent,
+            input,
+            failed,
+            ..
+        } => {
+            // The stream echoes every call's result as a second event (summary "result", no
+            // input); the call half already said what happened, and a failed echo carries
+            // summary "failed" and still gets its line.
+            if input.is_none() && summary == "result" {
+                return None;
+            }
+            let what = if summary.is_empty() {
+                tool_detail(input.as_ref())
+            } else {
+                summary.clone()
+            };
+            let mut line = String::new();
+            if *subagent {
+                line.push_str("subagent ");
+            }
+            line.push_str("tool ");
+            line.push_str(name);
+            if !what.is_empty() {
+                line.push_str(": ");
+                line.push_str(&what);
+            }
+            if *failed && what != "failed" {
+                line.push_str(" — failed");
+            }
+            Some(cap_line(&line))
+        }
+        AgentEvent::Retry {
+            attempt,
+            max,
+            error,
+        } => Some(cap_line(&format!("retry {attempt}/{max}: {error}"))),
+        AgentEvent::Error {
+            error_type,
+            message,
+        } => Some(cap_line(&format!("error ({error_type}): {message}"))),
+        AgentEvent::Result {
+            subtype,
+            is_error,
+            turns,
+            cost_usd,
+            error,
+        } => {
+            let mut line = if *is_error {
+                format!("turn failed ({subtype}) after {turns} turns")
+            } else {
+                format!("turn done: {turns} turns, ${cost_usd:.4}")
+            };
+            if let Some(error) = error.as_deref().filter(|e| !e.is_empty()) {
+                line.push_str(" — ");
+                line.push_str(error);
+            }
+            Some(cap_line(&line))
+        }
+        AgentEvent::Exit { code } => {
+            if *code == 0 {
+                None
+            } else {
+                Some(cap_line(&format!("agent exited with code {code}")))
+            }
+        }
+        AgentEvent::SandboxLog {
+            level,
+            target,
+            message,
+            denial,
+            ..
+        } => {
+            if !*denial
+                && !level.eq_ignore_ascii_case("warn")
+                && !level.eq_ignore_ascii_case("error")
+            {
+                return None;
+            }
+            Some(cap_line(&format!("sandbox {target}: {message}")))
+        }
+        AgentEvent::Meta { .. }
+        | AgentEvent::Thinking { .. }
+        | AgentEvent::Text { .. }
+        | AgentEvent::Tokens(_)
+        | AgentEvent::OtelSummary { .. }
+        | AgentEvent::Raw { .. } => None,
+    }
 }
 
 /// Drive the drafting loop and return its report. Pure of process exit / printing, [`run`] owns
@@ -353,7 +547,7 @@ fn drive(
         } else {
             render_refine_prompt(goal, pack_rel, &findings, round)
         };
-        let turn = run_draft_turn(scratch, &prompt, a, engine)?;
+        let turn = run_draft_turn(scratch, &prompt, a, engine, round)?;
         total_cost += turn.cost_usd;
         sync_pack_from_workspace(scratch, out)?;
         if let Some(reason) = read_rejected(out) {
@@ -495,6 +689,7 @@ mod tests {
             agent_cmd: Some(script.display().to_string()),
             harness: None,
             model: None,
+            effort: None,
             compute_driver: crate::openshell::gateway::ComputeDriver::Podman,
         }
     }
@@ -663,5 +858,120 @@ EOF
             err.to_string().contains("empty"),
             "the refusal says why: {err:#}"
         );
+    }
+
+    fn tool_event(input: serde_json::Value) -> AgentEvent {
+        AgentEvent::Tool {
+            name: "Write".to_string(),
+            summary: String::new(),
+            subagent: false,
+            input: Some(input),
+            result: None,
+            failed: false,
+        }
+    }
+
+    #[test]
+    fn a_tool_progress_line_names_what_the_tool_did() {
+        let ev = tool_event(serde_json::json!({
+            "file_path": "_draft_out/sweep.py",
+            "content": "print()"
+        }));
+        assert_eq!(
+            progress_line(&ev).as_deref(),
+            Some("tool Write: _draft_out/sweep.py")
+        );
+
+        let ev = AgentEvent::Tool {
+            name: "Bash".to_string(),
+            summary: String::new(),
+            subagent: false,
+            input: Some(serde_json::json!({"command": "python plan.py\ncase one"})),
+            result: None,
+            failed: true,
+        };
+        assert_eq!(
+            progress_line(&ev).as_deref(),
+            Some("tool Bash: python plan.py case one — failed")
+        );
+    }
+
+    #[test]
+    fn an_unfamiliar_tool_still_shows_its_input() {
+        let ev = tool_event(serde_json::json!({"whatever": "did a thing"}));
+        assert_eq!(
+            progress_line(&ev).as_deref(),
+            Some(r#"tool Write: {"whatever":"did a thing"}"#)
+        );
+    }
+
+    #[test]
+    fn a_tool_summary_wins_over_the_input() {
+        let ev = AgentEvent::Tool {
+            name: "Edit".to_string(),
+            summary: "crucible.toml: inject".to_string(),
+            subagent: false,
+            input: Some(serde_json::json!({"file_path": "crucible.toml"})),
+            result: None,
+            failed: false,
+        };
+        assert_eq!(
+            progress_line(&ev).as_deref(),
+            Some("tool Edit: crucible.toml: inject")
+        );
+    }
+
+    #[test]
+    fn a_result_echo_is_not_a_progress_line_but_a_failed_one_is() {
+        let echo = AgentEvent::Tool {
+            name: "Read".to_string(),
+            summary: "result".to_string(),
+            subagent: false,
+            input: None,
+            result: Some("ok\n".to_string()),
+            failed: false,
+        };
+        assert_eq!(progress_line(&echo), None);
+
+        let failed_echo = AgentEvent::Tool {
+            name: "Bash".to_string(),
+            summary: "failed".to_string(),
+            subagent: false,
+            input: None,
+            result: Some("boom".to_string()),
+            failed: true,
+        };
+        assert_eq!(
+            progress_line(&failed_echo).as_deref(),
+            Some("tool Bash: failed")
+        );
+    }
+
+    #[test]
+    fn streamed_deltas_and_telemetry_are_not_progress_lines() {
+        for ev in [
+            AgentEvent::Thinking {
+                delta: "hmm".to_string(),
+            },
+            AgentEvent::Text {
+                delta: "text".to_string(),
+            },
+            AgentEvent::Meta {
+                model: "m".to_string(),
+            },
+            AgentEvent::Tokens(crucible_contract::event::Tokens::default()),
+            AgentEvent::Exit { code: 0 },
+        ] {
+            assert_eq!(progress_line(&ev), None, "{ev:?}");
+        }
+    }
+
+    #[test]
+    fn a_very_long_input_is_capped_to_one_line() {
+        let long = "x".repeat(500);
+        let ev = tool_event(serde_json::json!({"command": long}));
+        let line = progress_line(&ev).expect("capped line");
+        assert!(line.chars().count() <= 401, "{}", line.chars().count());
+        assert!(line.ends_with('…'), "{line}");
     }
 }

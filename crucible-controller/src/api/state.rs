@@ -160,6 +160,9 @@ pub struct ApiState {
     pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
     /// The issuer whose people grant the consent page decides; `None` when it serves no people.
     pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
+    /// Each draft's latest generate progress, keyed by draft id, streamed by the drafting turn
+    /// and polled by the studio.
+    pub(crate) draft_progress: Arc<crate::playbooks::generate::DraftProgressRegistry>,
 }
 
 impl ApiState {
@@ -258,6 +261,7 @@ impl ApiState {
             contracts,
             images_refresh: Arc::new(tokio::sync::Notify::new()),
             policy,
+            draft_progress: Arc::new(Default::default()),
         }
     }
 
@@ -390,6 +394,7 @@ impl ApiState {
             cluster_policy: Arc::new(Default::default()),
             policy: crate::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
+            draft_progress: Arc::new(Default::default()),
         }
     }
 }

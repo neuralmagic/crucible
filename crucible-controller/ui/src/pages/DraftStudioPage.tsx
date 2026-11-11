@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useReducer, useState } from 'react';
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { $api, apiClient } from '../api/client';
@@ -96,6 +96,20 @@ function reportOf(dto: GeneratedDto): GenerateReport {
     overBudget: dto.over_budget,
   };
 }
+
+type GenerateProgress = components['schemas']['DraftProgressDto'];
+
+/// The live tail of the drafting turn, read outside the query cache so the panel is its own
+/// cadence, not the page's.
+async function fetchGenerateProgress(id: string): Promise<GenerateProgress> {
+  const { data } = await apiClient.GET('/api/playbook-drafts/{id}/generate/progress', {
+    params: { path: { id } },
+  });
+  return data ?? { lines: [], running: false };
+}
+
+/// How many progress lines the panel shows; older lines slide off the top.
+const PROGRESS_SHOWN = 12;
 
 /// The stored tree, read outside the query cache so the buffers are not reloaded.
 async function fetchDraftFiles(id: string): Promise<Record<string, string>> {
@@ -199,6 +213,46 @@ function DraftStudio({ id }: { id: string }) {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [generate.isPending]);
+
+  const [progress, setProgress] = useState<GenerateProgress>({ lines: [], running: false });
+  /// Set once this page has seen a turn run: the panel keeps a finished turn's tail, but a fresh
+  /// page must not show the lines of a generate that ended long before it loaded.
+  const [watchedTurn, setWatchedTurn] = useState(false);
+  // A refresh drops the mutation's pending state, but the turn runs on: the server's word on
+  // mount is what picks it back up — including the intent the box held, which the refresh
+  // emptied but the turn still runs on.
+  useEffect(() => {
+    void fetchGenerateProgress(id)
+      .then((next) => {
+        setProgress(next);
+        if (next.running) {
+          setWatchedTurn(true);
+          setIntent((previous) => (previous.length === 0 ? next.intent ?? '' : previous));
+        }
+      })
+      .catch(() => undefined);
+  }, [id]);
+  useEffect(() => {
+    if (!generate.isPending && !progress.running) return;
+    const timer = window.setInterval(() => {
+      void fetchGenerateProgress(id).then(setProgress).catch(() => undefined);
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [generate.isPending, progress.running, id]);
+  // A turn this page watched may have been started by a request that died with a refresh; when
+  // the server says it ended, the version it saved is this page's to pick up.
+  const wasRunning = useRef(false);
+  const refetchFiles = files.refetch;
+  const refetchDraft = draft.refetch;
+  const refetchStored = stored.refetch;
+  useEffect(() => {
+    if (wasRunning.current && !progress.running) {
+      void refetchFiles();
+      void refetchDraft();
+      void refetchStored();
+    }
+    wasRunning.current = progress.running;
+  }, [progress.running, refetchFiles, refetchDraft, refetchStored]);
 
   const [gradRepo, setGradRepo] = useState('');
   const [gradPath, setGradPath] = useState('');
@@ -317,6 +371,8 @@ function DraftStudio({ id }: { id: string }) {
     setGenerateError(null);
     setStale(null);
     setGenerateReport(null);
+    setWatchedTurn(true);
+    setProgress({ lines: [], running: true });
     try {
       const dto = await generate.mutateAsync({
         params: { path: { id } },
@@ -338,6 +394,9 @@ function DraftStudio({ id }: { id: string }) {
       } catch {
         setOvertaking({});
       }
+    } finally {
+      // The polling interval stops the moment running flips; this read catches the tail it missed.
+      void fetchGenerateProgress(id).then(setProgress).catch(() => undefined);
     }
   };
 
@@ -503,13 +562,21 @@ function DraftStudio({ id }: { id: string }) {
               variant="filled"
               className="uppercase"
               disabled={
-                !writable || isDirty(state) || generate.isPending || intent.trim().length === 0
+                !writable ||
+                isDirty(state) ||
+                generate.isPending ||
+                progress.running ||
+                intent.trim().length === 0
               }
               onClick={() => {
                 void handleGenerate();
               }}
             >
-              {generate.isPending ? `Drafting… ${genElapsed}s` : 'Generate'}
+              {generate.isPending
+                ? `Drafting… ${genElapsed}s`
+                : progress.running
+                  ? 'Drafting…'
+                  : 'Generate'}
             </Button>
             {isDirty(state) && (
               <Mono size="data" tone="ink-3">
@@ -527,6 +594,21 @@ function DraftStudio({ id }: { id: string }) {
               <Note>The drafting turn ran past its budget; what it wrote is stored as it stood.</Note>
             </SectionBody>
           ) : null}
+          {!watchedTurn || progress.lines.length === 0 ? null : (
+            <SectionBody>
+              <div
+                data-testid="draft-generate-progress"
+                className="max-h-56 overflow-y-auto rounded border border-rule bg-surface p-2 font-mono text-data leading-5"
+              >
+                {progress.lines.slice(-PROGRESS_SHOWN).map((entry, index) => (
+                  <div key={index} className="flex gap-2 whitespace-pre-wrap break-all">
+                    <span className="shrink-0 text-ink-3">r{entry.round}</span>
+                    <span>{entry.line}</span>
+                  </div>
+                ))}
+              </div>
+            </SectionBody>
+          )}
         </Section>
       ) : null}
 
