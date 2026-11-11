@@ -46,8 +46,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # rustflags off: the action's default `-D warnings` reaches the vendored Rune. Clippy below
+      # still holds the app to `-D warnings`.
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
         with:
+          rustflags: ""
           components: rustfmt, clippy
           cache-workspaces: crucible-desktop -> target
 
