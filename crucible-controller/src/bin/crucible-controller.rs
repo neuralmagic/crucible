@@ -850,6 +850,19 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     .with_vault(serve_vault)
     .with_cluster_links(cluster_links)
     .with_people_issuer(agent_auth.clone());
+    tracing::info!(
+        model = serve_state
+            .draft_knobs()
+            .model
+            .as_deref()
+            .unwrap_or("harness default"),
+        effort = serve_state
+            .draft_knobs()
+            .effort
+            .map(crucible::knobs::ReasoningEffort::as_flag)
+            .unwrap_or("harness default"),
+        "studio drafting turns"
+    );
     let images_refresh = serve_state.images_refresh();
     let surface = crucible_controller::Surface::bind(
         serve_state,

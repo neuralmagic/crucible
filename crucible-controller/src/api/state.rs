@@ -104,6 +104,9 @@ pub struct ApiState {
     /// (`CONTROLLER_PLAYBOOK_MAX_COST_USD` / `CONTROLLER_PLAYBOOK_MAX_TIME`). Deploy-pinned like
     /// `broker_contracts`; a pack may not declare either.
     pub(crate) playbook_caps: crate::config::PlaybookCaps,
+    /// The studio's drafting turns run on these engine knobs, read off the parsed
+    /// [`ControllerCfg`](crate::config::ControllerCfg) at startup. Deploy-pinned.
+    pub(crate) draft_knobs: crate::config::DraftKnobs,
     /// What substrate this deployment can dispatch a pack's agent onto, derived from the deploy
     /// profile and the playbook executor. Deploy-pinned; the preview gate warns on it and the
     /// launch endpoints refuse on it.
@@ -177,6 +180,11 @@ impl ApiState {
         crate::launches::jira::trackers(self.jira.clone())
     }
 
+    /// The engine knobs the studio's drafting turns run on, for the serve path's boot log.
+    pub fn draft_knobs(&self) -> &crate::config::DraftKnobs {
+        &self.draft_knobs
+    }
+
     /// Assemble the shared handler state: the runtime handles the daemon owns, plus the
     /// deploy-pinned fields (caps, roles, whitelist, jira, …) read off the parsed [`ControllerCfg`].
     #[allow(clippy::too_many_arguments)]
@@ -238,6 +246,10 @@ impl ApiState {
             playbook_caps: crate::config::PlaybookCaps {
                 max_cost: cfg.playbook_max_cost_cap,
                 max_time: cfg.playbook_max_time_cap.clone(),
+            },
+            draft_knobs: crate::config::DraftKnobs {
+                model: cfg.draft_model.clone(),
+                effort: cfg.draft_effort,
             },
             dispatch: crate::playbooks::dispatch::DispatchCapability::from_cfg(cfg),
             default_cluster: cfg.dispatch_cluster.clone(),
@@ -377,6 +389,7 @@ impl ApiState {
             emission: None,
             broker_contracts: Default::default(),
             playbook_caps: Default::default(),
+            draft_knobs: Default::default(),
             dispatch: crate::playbooks::dispatch::DispatchCapability::new(
                 crate::config::PlaybookExecutor::Pod,
                 true,

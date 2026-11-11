@@ -908,6 +908,7 @@ pub(crate) async fn generate_playbook_draft(
         &context,
         max_cost,
         refine_rounds,
+        &state.draft_knobs,
         Some(progress.log()),
     )
     .await

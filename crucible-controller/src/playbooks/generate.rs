@@ -134,6 +134,7 @@ pub(crate) async fn generate(
     context: &BTreeMap<String, String>,
     max_cost: f64,
     refine_rounds: u32,
+    knobs: &crate::config::DraftKnobs,
     progress: Option<Arc<DraftProgressLog>>,
 ) -> Result<GeneratedDraft> {
     let bin = crate::runs::engine::resolve_bin();
@@ -166,11 +167,11 @@ pub(crate) async fn generate(
         "--refine-rounds",
         &refine_rounds.to_string(),
     ]);
-    if let Some(model) = draft_model() {
+    if let Some(model) = &knobs.model {
         cmd.arg("--model").arg(model);
     }
-    if let Some(effort) = draft_effort() {
-        cmd.arg("--effort").arg(effort);
+    if let Some(effort) = knobs.effort {
+        cmd.arg("--effort").arg(effort.as_flag());
     }
     if !context.is_empty() {
         cmd.arg("--context").arg(&context_dir);
@@ -223,22 +224,6 @@ pub(crate) async fn generate(
         .tree;
     let files = crate::playbooks::packs::text_files(tree).context("reading the drafted pack")?;
     Ok(GeneratedDraft { report, files })
-}
-
-/// `CRUCIBLE_DRAFT_MODEL`: the model this controller's drafting turns run on. Operator
-/// configuration, not per-request input — the studio's Generate stays one button.
-fn draft_model() -> Option<String> {
-    std::env::var("CRUCIBLE_DRAFT_MODEL")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-}
-
-/// `CRUCIBLE_DRAFT_EFFORT`: the turns' reasoning-effort tier, spelled as the engine's
-/// `--effort` value (low|medium|high|xhigh|max).
-fn draft_effort() -> Option<String> {
-    std::env::var("CRUCIBLE_DRAFT_EFFORT")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
 }
 
 /// Parse the last JSON line `crucible draft --json` prints. The engine exits nonzero when the pack
