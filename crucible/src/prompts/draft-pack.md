@@ -15,10 +15,14 @@ reader: name tasks and files so the diff explains itself.
 A playbook is the one-shot, measurement-free workflow: the graph runs once, nothing is scored,
 and the run's verdict is the graph's. The pack is a directory of files:
 
-- `crucible.toml` — `[workspace]` with `inject` naming every pack file the run's tasks need
-  (the pack *is* the workspace; an injected file is copied in before the run), `[agent]` with a
-  `goal` stating what the workflow accomplishes, and `[workflow]` with
-  `type = "playbook"` + `file = "workflow.star"`. No `[judge]`.
+- `crucible.toml` — `edition = 2`; `[workspace]` with `inject` naming every pack file the run's
+  tasks need (the pack *is* the workspace; an injected file is copied in before the run);
+  `[agent]` with `backend = "command"`, `agent_cmd = "true"`, and a `goal` stating what the
+  workflow accomplishes (a goal-only table means a claude turn, which launch refuses without
+  an `allowed_tools` surface); `[workflow]` with `type = "playbook"` + `file =
+  "workflow.star"` and an `env` list naming every engine-environment variable the scripts
+  read past the base (`PATH`, `HOME`): `NAME` when the run cannot proceed without it,
+  `NAME?` when the script has a default. No `[judge]`.
 - `workflow.star` — the graph, authored (never a hand-written `[[workflow.task]]` table; the
   engine compiles the `.star` per run).
 - Every file the graph references: scripts, prompt files, templates, data. A missing file fails
@@ -45,10 +49,16 @@ shape that carries it is three tasks:
    the axis, values, and objective) and `emits` them as a list.
 2. **sweep** — a `command` task with `over = plan.arms`, one `isolated` instance per arm, each
    submitting its own workload and scoring it. `isolated = True` gives every arm its own
-   workspace copy so they run in parallel without colliding; `max_fanout` bounds the
-   concurrency the far side can take; `required = False` on the arms so one failed arm fails
-   the run only as data, not as a verdict. Each instance `emits` its measurements and
-   `emits_files` the evidence a failed arm needs to be diagnosed from.
+   workspace copy so they run in parallel without colliding; `max_fanout` is the instance cap
+   on `over` — a discovery returning more items than it is refused at launch, so declare the
+   widest the experiment can produce, never the concurrency you want (independent instances
+   run concurrently; the engine has no sequencing knob); `required = False` on the arms so one
+   failed arm fails the run only as data, not as a verdict. Each instance `emits` its
+   measurements and `emits_files` the evidence a failed arm needs to be diagnosed from.
+   Arms that must not run at the same time — one cluster, one service name — do not belong in
+   a fan-out: when the far side's runner executes a multi-arm config serially (a campaign
+   recipe with several overlays does), submit one config carrying all arms and let it
+   sequence; otherwise sequence them inside one task.
 3. **rank** (or fold/report) — a `command` task with `join = "settled"` over the sweep that
    folds the settled arms into one table (`emits_files = ["RANK.md"]`).
 
@@ -59,6 +69,10 @@ human reviewing your diff wants to be able to do.
 
 ## Discipline
 
+- The intent's tools are the contract. When it names the machinery to drive — a campaign runner,
+  a just recipe, a fork, a CLI, a benchmark tool — the pack's tasks call exactly that, with the
+  paths, subcommands, and argument shapes the intent gives. The worked example and the sweep
+  shape above are defaults for intents that don't say; they never replace what the intent names.
 - Write only under `{{OUT_DIR}}`, a directory relative to your current working directory
   (create it if it is missing). Anything written outside it is not picked up when the turn ends.
 - Files keep no modes on the way into the draft studio, so invoke scripts through their
