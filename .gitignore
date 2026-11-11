@@ -21,6 +21,8 @@ __pycache__/
 /STEER.md
 # macOS Finder droppings.
 .DS_Store
+# Per-user IDE state (JetBrains).
+.idea/
 # Live example variants (real-model smokes) keep their own workspace dir.
 examples/*/workspace-*/
 # Local MCP server wiring (machine-specific endpoints, tokens pulled at launch).
