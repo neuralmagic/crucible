@@ -358,7 +358,8 @@ mod tests {
             ("# go", Syntax::Comment),
         ] {
             assert!(
-                got.contains(&(want.0.to_string(), want.1)),
+                got.iter()
+                    .any(|(text, kind)| text.trim() == want.0 && *kind == want.1),
                 "{want:?} in {got:?}"
             );
         }

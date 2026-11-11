@@ -337,6 +337,13 @@ desktop-web *args:
     cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --dev --out target/web
     python3 crucible-desktop/web-dev-proxy.py --dir crucible-desktop/target/web {{ args }}
 
+# Build the desktop app for the browser into crucible-controller/next-dist, which the controller
+# serves under /next. Release profile unless `just controller-next --dev`.
+controller-next *args:
+    sh crucible-desktop/rune-patches.sh
+    rustup target add wasm32-unknown-unknown
+    cd crucible-desktop && CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist {{ args }}
+
 # Run a command in the Fedora builder (crucible-desktop/linux/Containerfile) with the repo at /src,
 # for the host's architecture. Cargo's registry and target directory persist in podman volumes.
 [private]

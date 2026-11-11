@@ -2366,6 +2366,7 @@ dependencies = [
  "clap",
  "crucible-contract",
  "futures-util",
+ "gloo-timers",
  "reqwest",
  "rmcp",
  "serde",

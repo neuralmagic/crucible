@@ -504,6 +504,13 @@ export function App() {
         <div className="flex items-stretch">
           {autoresearch ? <AutopilotIndicator /> : null}
           <OwnerSwitcher />
+          <a
+            href="/next/"
+            data-ui="next-ui"
+            className="flex items-center border-l border-rule px-3 font-mono text-data font-medium text-ink-3 hover:bg-hi hover:text-ink"
+          >
+            Next UI
+          </a>
           <IdentityBadge />
           <DisplayPrefs />
         </div>

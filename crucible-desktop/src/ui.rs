@@ -38,6 +38,8 @@ mod webhook_form;
 
 use rune::{Color, Cx, El, Icon, TextStyle, Tx, col, el, icon, row, text};
 use rune_kit::shell::RowStatus;
+
+use crate::ignition::Spark;
 use rune_kit::{
     Badge, Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Palette, RollingText,
     SegmentedControl, SidebarRow, Spinner, StateColors, Switch, TextInput,
@@ -819,7 +821,15 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
                 app.source_menu = false;
                 app.page = crate::Page::Settings;
             }),
-        )
+        );
+    #[cfg(target_arch = "wasm32")]
+    let menu = menu.item(rune_kit::MenuItem::new("Classic UI").on_select_tx(
+        |app: &mut App, tx: &mut Tx| {
+            app.source_menu = false;
+            let _ = tx.open_url_same_tab("/");
+        },
+    ));
+    let menu = menu
         .open(app.source_menu)
         .on_close(|app: &mut App| app.source_menu = false)
         .build(p.k, layer);
@@ -1194,16 +1204,54 @@ fn verdict_status(verdict: Verdict, p: &Paint) -> RowStatus {
     }
 }
 
+/// The flare around a run a launch just started: an ember ring and glow that spring out from its
+/// status mark and fade.
+fn ignited(mark: El, spark: Spark, ember: Color) -> El {
+    let spent = spark == Spark::Spent;
+    let burn = rune::Spring::new(crate::ignition::BURN as f32, 0.0);
+    let flare = |key: &str, grown: f32, lit: f32| {
+        let side = if spent { IGNITION * grown } else { IGNITION };
+        let at = (IGNITION - side) / 2.0;
+        el().key(key)
+            .absolute(at, at)
+            .size(side, side)
+            .radius(side / 2.0)
+            .opacity(if spent { 0.0 } else { lit })
+            .motion(burn)
+            .opacity_motion(burn)
+            .motion_intent(rune::MotionIntent::PULSE)
+            .a11y_hidden()
+    };
+    row()
+        .size(IGNITION, IGNITION)
+        .center()
+        .child(flare("ignition-glow", 2.2, 0.45).fill(ember))
+        .child(flare("ignition-ring", 3.4, 0.9).border(1.5, ember))
+        .child(mark)
+}
+
+/// The side of the status slot the flare starts from.
+const IGNITION: f32 = 12.0;
+
 fn live_rows(app: &App, playbooks: &[&LivePlaybook], now: i64, p: &Paint) -> Vec<El> {
     let current = app.selected_playbook();
     playbooks
         .iter()
         .map(|playbook| {
             let id = playbook.id.clone();
+            let status = match (
+                verdict_status(playbook.verdict(), p),
+                app.ignition.spark(&playbook.id),
+            ) {
+                (RowStatus::Other(mark), Some(spark)) => {
+                    RowStatus::Other(ignited(mark, spark, p.live))
+                }
+                (status, _) => status,
+            };
             let mut item = SidebarRow::new(playbook.id.clone())
                 .subtitle(row_meta(playbook))
                 .height(ROW * p.text)
-                .status(verdict_status(playbook.verdict(), p))
+                .status(status)
                 .selected(current == Some(playbook.id.as_str()))
                 .on_select(move |app: &mut App, _: &mut Tx| app.select(Selection::playbook(&id)));
             if playbook.landed > 0 {
@@ -2254,4 +2302,50 @@ fn banner(message: &str, p: &Paint) -> El {
                 .on_press_tx(move |_: &mut App, tx: &mut Tx| tx.copy(full.clone()))
                 .build(p.k)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use rune::{Color, Cx, El, Env, Runtime, el};
+    use rune_kit::shell::{RowStatus, SidebarRow};
+
+    use crate::ignition::Spark;
+    use crate::ui::{IGNITION, ignited};
+
+    fn row(spark: &Spark, _: &mut Cx<Spark>) -> El {
+        let mark = el().size(7.0, 7.0).radius(3.5).fill(Color::WHITE);
+        SidebarRow::new("triage")
+            .status(RowStatus::Other(ignited(mark, *spark, Color::WHITE)))
+            .build(&rune_kit::Kit::neutral(true))
+            .key("row")
+    }
+
+    #[test]
+    fn a_spent_flare_spreads_past_its_status_mark_and_fades() {
+        let mut rt = Runtime::new(Spark::Lit, row, (320.0, 80.0), Env::new(true, 1.0));
+        rt.frame(0.0);
+        let find = |rt: &Runtime<Spark>, key: &str| {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(key))
+                .unwrap_or_else(|| panic!("no {key}"))
+        };
+        let lit = find(&rt, "ignition-ring");
+        assert_eq!(lit.rect[2], IGNITION);
+        assert!(lit.opacity > 0.8);
+
+        rt.state = Spark::Spent;
+        rt.invalidate();
+        for _ in 0..240 {
+            rt.frame(1.0 / 60.0);
+        }
+        let spent = find(&rt, "ignition-ring");
+        assert!(spent.rect[2] > IGNITION * 3.0, "grown: {:?}", spent.rect);
+        assert!(
+            spent.visible[2] > IGNITION * 2.0,
+            "not clipped to the slot: {:?}",
+            spent.visible
+        );
+        assert!(spent.opacity < 0.05, "faded: {}", spent.opacity);
+    }
 }

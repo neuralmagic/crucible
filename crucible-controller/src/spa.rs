@@ -13,15 +13,29 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderValue, StatusCode, Uri, header};
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use rust_embed::Embed;
+use sha2::Digest;
 
 #[derive(Embed)]
 #[folder = "ui/dist"]
 #[prefix = ""]
 struct SpaAssets;
+
+/// The Rune web build of `crucible-desktop`, served under [`NEXT`].
+#[derive(Embed)]
+#[folder = "next-dist"]
+#[prefix = ""]
+struct NextAssets;
+
+/// Where the Rune web build is mounted.
+const NEXT: &str = "/next";
+
+/// The page that loads the Rune web build. Its `<base>` keeps the bundle's relative imports under
+/// [`NEXT`] from any path the index fallback answers.
+const NEXT_SHELL: &str = include_str!("next.html");
 
 /// Where the SPA is read from.
 #[derive(Debug, Clone)]
@@ -33,11 +47,22 @@ pub(crate) enum Source {
 }
 
 impl Source {
+    /// The React SPA's source: `CONTROLLER_UI_DIR`, else embedded.
     pub(crate) fn from_env() -> Self {
-        match std::env::var_os("CONTROLLER_UI_DIR") {
+        Self::from_var("CONTROLLER_UI_DIR")
+    }
+
+    /// The Rune web build's source: `CONTROLLER_NEXT_DIR`, else embedded. Unlike the SPA's, a
+    /// directory here stands alone.
+    pub(crate) fn next_from_env() -> Self {
+        Self::from_var("CONTROLLER_NEXT_DIR")
+    }
+
+    fn from_var(var: &str) -> Self {
+        match std::env::var_os(var) {
             Some(dir) if !dir.is_empty() => {
                 let dir = PathBuf::from(dir);
-                tracing::info!(dir = %dir.display(), "serving the SPA from a directory");
+                tracing::info!(dir = %dir.display(), var, "serving a UI from a directory");
                 Self::Dir(dir)
             }
             _ => Self::Embedded,
@@ -45,10 +70,17 @@ impl Source {
     }
 }
 
-pub(crate) fn router(source: Source) -> Router {
+/// The React SPA from `ui`, and the Rune web build from `next` under [`NEXT`].
+pub(crate) fn router(ui: Source, next: Source) -> Router {
+    let next = Router::new()
+        .route(NEXT, get(|| async { Redirect::permanent("/next/") }))
+        .route("/next/", get(serve_next))
+        .route("/next/{*path}", get(serve_next))
+        .with_state(Arc::new(next));
     Router::new()
         .fallback(get(serve_spa))
-        .with_state(Arc::new(source))
+        .with_state(Arc::new(ui))
+        .merge(next)
 }
 
 /// The file a request path names under `root`, or `None` when the path does not name one.
@@ -136,12 +168,16 @@ async fn serve_spa(State(source): State<Arc<Source>>, uri: Uri) -> Response {
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    let mut response = match source.as_ref() {
+    let response = match source.as_ref() {
         Source::Embedded => embedded(path),
         Source::Dir(root) => from_dir(root, path).await,
     };
-    // The consent page is one of the SPA's routes: framed by another page, its Allow button could
-    // be clicked through a disguise.
+    unframed(response)
+}
+
+/// The consent page is one of the SPA's routes: framed by another page, its Allow button could
+/// be clicked through a disguise.
+fn unframed(mut response: Response) -> Response {
     let headers = response.headers_mut();
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
@@ -151,15 +187,76 @@ async fn serve_spa(State(source): State<Arc<Source>>, uri: Uri) -> Response {
     response
 }
 
+/// A file of the Rune web build, else the shell for any other path under [`NEXT`]. The bundle's
+/// names carry no content hash, so every file revalidates against its digest.
+async fn serve_next(State(next): State<Arc<Source>>, uri: Uri, request: HeaderMap) -> Response {
+    let path = uri
+        .path()
+        .strip_prefix(NEXT)
+        .unwrap_or_default()
+        .trim_start_matches('/');
+    let response = match next_file(&next, path).await {
+        Some((bytes, digest)) => {
+            let etag = format!("\"{}\"", hex(&digest));
+            let fresh = request
+                .get(header::IF_NONE_MATCH)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v == etag);
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let headers = [
+                (header::CONTENT_TYPE, mime.to_string()),
+                (header::CACHE_CONTROL, "no-cache".to_string()),
+                (header::ETAG, etag),
+            ];
+            if fresh {
+                (StatusCode::NOT_MODIFIED, headers).into_response()
+            } else {
+                (headers, bytes).into_response()
+            }
+        }
+        None if next_file(&next, NEXT_WASM).await.is_some() => {
+            ([(header::CACHE_CONTROL, "no-cache")], Html(NEXT_SHELL)).into_response()
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Next UI not built. Run: just controller-next",
+        )
+            .into_response(),
+    };
+    unframed(response)
+}
+
+/// The module the shell loads; a bundle without it is not built.
+const NEXT_WASM: &str = "app_bg.wasm";
+
+/// A file of the Rune web build and its SHA-256.
+async fn next_file(source: &Source, path: &str) -> Option<(Vec<u8>, [u8; 32])> {
+    match source {
+        Source::Embedded => {
+            let asset = NextAssets::get(path)?;
+            Some((asset.data.into_owned(), asset.metadata.sha256_hash()))
+        }
+        Source::Dir(root) => {
+            let bytes = tokio::fs::read(resolve(root, path)?).await.ok()?;
+            let digest = sha2::Sha256::digest(&bytes).into();
+            Some((bytes, digest))
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::spa::*;
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
 
     async fn get_path(source: Source, path: &str) -> (StatusCode, String) {
-        let answer = router(source)
+        let answer = router(source, Source::Embedded)
             .oneshot(
                 Request::builder()
                     .uri(path)
@@ -303,7 +400,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::write(dir.path().join("index.html"), "<html>shell</html>").expect("index");
         for path in ["/consent?id=abc", "/settings", "/index.html", "/"] {
-            let answer = router(Source::Dir(dir.path().to_path_buf()))
+            let answer = router(Source::Dir(dir.path().to_path_buf()), Source::Embedded)
                 .oneshot(
                     Request::builder()
                         .uri(path)
@@ -320,6 +417,117 @@ mod tests {
                 "frame-ancestors 'none'",
                 "{path}"
             );
+        }
+    }
+
+    async fn get_next(next: &Path, path: &str, etag: Option<&str>) -> Response {
+        let mut request = Request::builder().uri(path);
+        if let Some(etag) = etag {
+            request = request.header(header::IF_NONE_MATCH, etag);
+        }
+        router(Source::Embedded, Source::Dir(next.to_path_buf()))
+            .oneshot(request.body(Body::empty()).expect("a request"))
+            .await
+            .expect("a response")
+    }
+
+    async fn text(answer: Response) -> String {
+        let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    fn built_next() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(dir.path().join("app.js"), "export default 1").expect("write app.js");
+        std::fs::write(dir.path().join(NEXT_WASM), b"\0asm").expect("write wasm");
+        dir
+    }
+
+    #[tokio::test]
+    async fn next_serves_a_bundle_file_with_its_type_and_digest() {
+        let dir = built_next();
+        let answer = get_next(dir.path(), "/next/app.js", None).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        let headers = answer.headers().clone();
+        assert_eq!(headers[header::CONTENT_TYPE], "text/javascript");
+        assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+        assert_eq!(headers[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(text(answer).await, "export default 1");
+
+        let wasm = get_next(dir.path(), "/next/app_bg.wasm", None).await;
+        assert_eq!(wasm.headers()[header::CONTENT_TYPE], "application/wasm");
+
+        let etag = headers[header::ETAG].to_str().expect("an ascii etag");
+        let again = get_next(dir.path(), "/next/app.js", Some(etag)).await;
+        assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(text(again).await, "");
+
+        let stale = get_next(dir.path(), "/next/app.js", Some("\"other\"")).await;
+        assert_eq!(stale.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn next_answers_any_other_path_with_the_shell() {
+        let dir = built_next();
+        for path in ["/next/", "/next/runs/RUN-0412", "/next/index.html"] {
+            let answer = get_next(dir.path(), path, None).await;
+            assert_eq!(answer.status(), StatusCode::OK, "{path}");
+            assert_eq!(answer.headers()[header::X_FRAME_OPTIONS], "DENY", "{path}");
+            let page = text(answer).await;
+            assert!(page.contains(r#"<base href="/next/">"#), "{path}");
+            assert!(page.contains("import init from './app.js'"), "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn next_without_a_slash_redirects_to_the_mount() {
+        let dir = built_next();
+        let answer = get_next(dir.path(), "/next", None).await;
+        assert_eq!(answer.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(answer.headers()[header::LOCATION], "/next/");
+    }
+
+    #[tokio::test]
+    async fn next_refuses_to_climb_out_of_its_directory() {
+        let dir = built_next();
+        let answer = get_next(dir.path(), "/next/../Cargo.toml", None).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        assert!(text(answer).await.contains("<base"));
+    }
+
+    #[tokio::test]
+    async fn next_says_it_is_not_built_when_no_bundle_is_there() {
+        let empty = tempfile::tempdir().expect("a temp dir");
+        let answer = get_next(empty.path(), "/next/", None).await;
+        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(text(answer).await.contains("just controller-next"));
+        let asset = get_next(empty.path(), "/next/app.js", None).await;
+        assert_eq!(asset.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn the_react_spa_still_answers_beside_next() {
+        let ui = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(ui.path().join("index.html"), "<h1>react</h1>").expect("write index");
+        let next = built_next();
+        let app = router(
+            Source::Dir(ui.path().to_path_buf()),
+            Source::Dir(next.path().to_path_buf()),
+        );
+        for (path, wants) in [("/", "<h1>react</h1>"), ("/nextish", "<h1>react</h1>")] {
+            let answer = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("a request"),
+                )
+                .await
+                .expect("a response");
+            assert_eq!(text(answer).await, wants, "{path}");
         }
     }
 }

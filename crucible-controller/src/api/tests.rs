@@ -5845,6 +5845,7 @@ async fn app_with_sessions(db: Db, pool: PgPool) -> Router {
             issuer: None,
         },
         crate::spa::Source::Embedded,
+        crate::spa::Source::Embedded,
     )
 }
 
@@ -11182,6 +11183,7 @@ async fn human_app_over(db: Db, pool: PgPool, scratch: &std::path::Path) -> Rout
             routes: crate::identity::oidc::routes::AuthState { oidc: None, pool },
             issuer: None,
         },
+        crate::spa::Source::Embedded,
         crate::spa::Source::Embedded,
     )
 }

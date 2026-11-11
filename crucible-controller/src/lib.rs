@@ -110,6 +110,7 @@ pub(crate) fn human_router(
     secure_cookies: bool,
     auth: HumanAuth,
     ui: spa::Source,
+    next: spa::Source,
 ) -> axum::Router {
     let link = axum::Extension(auth.guard.clone());
     let both = identity::auth::HumanOrKeyGuard {
@@ -123,7 +124,7 @@ pub(crate) fn human_router(
     });
     let decisions = decisions::run_routes(state.db.clone());
     let router = api::router(state)
-        .merge(spa::router(ui))
+        .merge(spa::router(ui, next))
         .layer(axum::middleware::from_fn_with_state(
             both,
             identity::auth::require_auth_or_api_key,
@@ -229,6 +230,7 @@ impl Surface {
                 issuer: agent_auth.clone(),
             },
             spa::Source::from_env(),
+            spa::Source::next_from_env(),
         );
 
         // The in-cluster client the discovery mirror fetches its upstream through; if it can't be

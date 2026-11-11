@@ -5,6 +5,8 @@
 //! side catches what it can say before a round trip: a missing required field, a number that
 //! is not one, a ceiling over the admin cap.
 
+use std::collections::BTreeMap;
+
 use serde_json::{Map, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +27,34 @@ pub struct Field {
     pub description: String,
     /// The schema's default, as the text the field starts with.
     pub default: String,
+    pub offer: Offer,
+}
+
+/// What a field offers beyond its kind, from the schema's `x-` keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Offer {
+    /// The bool field that must be on for this one to be sent (`x-enabled-by`).
+    pub enabled_by: Option<String>,
+    /// Choices from the latest snapshot of a task output (`x-choices-snapshot`).
+    pub snapshot: Option<Lists>,
+    /// The choices are suggestions and any value is accepted (`x-allow-other`).
+    pub allow_other: bool,
+    /// What the empty field shows for each value of a key field (`x-placeholder-snapshot`).
+    pub placeholder: Option<Keyed<String>>,
+}
+
+/// Choices a task output computed: one list, or one per value of a key field.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Lists {
+    One(Vec<String>),
+    Keyed(Keyed<Vec<String>>),
+}
+
+/// Entries picked by the answer to the field named `by`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Keyed<T> {
+    pub by: String,
+    pub entries: BTreeMap<String, T>,
 }
 
 /// The fields a schema asks for: its `x-order` first, then the rest by name.
@@ -60,14 +90,15 @@ pub fn fields(schema: &Value) -> Vec<Field> {
         .into_iter()
         .filter_map(|name| {
             let prop = props.get(name)?;
-            let kind = match (
-                prop.get("enum").and_then(Value::as_array),
-                prop.get("type").and_then(Value::as_str),
-            ) {
+            let listed = prop
+                .get("enum")
+                .or_else(|| prop.get("x-choices"))
+                .and_then(Value::as_array);
+            let kind = match (listed, prop.get("type").and_then(Value::as_str)) {
+                (_, Some("boolean")) => Kind::Bool,
                 (Some(values), _) => Kind::Choice(values.iter().map(text_of).collect()),
                 (None, Some("integer")) => Kind::Integer,
                 (None, Some("number")) => Kind::Number,
-                (None, Some("boolean")) => Kind::Bool,
                 _ => Kind::Text,
             };
             Some(Field {
@@ -87,9 +118,137 @@ pub fn fields(schema: &Value) -> Vec<Field> {
                         _ => String::new(),
                     }),
                 kind,
+                offer: offer(prop, props),
             })
         })
         .collect()
+}
+
+fn offer(prop: &Value, props: &Map<String, Value>) -> Offer {
+    let enabled_by = prop
+        .get("x-enabled-by")
+        .and_then(Value::as_str)
+        .filter(|gate| {
+            props
+                .get(*gate)
+                .and_then(|g| g.get("type"))
+                .and_then(Value::as_str)
+                == Some("boolean")
+        })
+        .map(str::to_string);
+    let snapshot = prop.get("x-choices-from").and_then(|from| {
+        let value = prop.get("x-choices-snapshot")?.get("value")?;
+        match keyed_by(from, props)? {
+            Some(by) => Some(Lists::Keyed(Keyed {
+                by,
+                entries: entries(value, strings)?,
+            })),
+            None => strings(value).map(Lists::One),
+        }
+    });
+    let placeholder = prop.get("x-placeholder-from").and_then(|from| {
+        Some(Keyed {
+            by: keyed_by(from, props)??,
+            entries: entries(prop.get("x-placeholder-snapshot")?.get("value")?, |v| {
+                v.as_str().map(str::to_string)
+            })?,
+        })
+    });
+    Offer {
+        enabled_by,
+        snapshot,
+        allow_other: prop
+            .get("x-allow-other")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        placeholder,
+    }
+}
+
+/// A task-output source's key field: `Some(None)` when it has none, `None` when the source is
+/// malformed or names a field that is not a declared string.
+fn keyed_by(from: &Value, props: &Map<String, Value>) -> Option<Option<String>> {
+    from.get("task")?.as_str()?;
+    from.get("field")?.as_str()?;
+    match from.get("keyed_by") {
+        None | Some(Value::Null) => Some(None),
+        Some(key) => {
+            let key = key.as_str()?;
+            let typed = props.get(key)?.get("type").and_then(Value::as_str);
+            matches!(typed, None | Some("string")).then(|| Some(key.to_string()))
+        }
+    }
+}
+
+fn strings(value: &Value) -> Option<Vec<String>> {
+    value
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+fn entries<T>(value: &Value, read: impl Fn(&Value) -> Option<T>) -> Option<BTreeMap<String, T>> {
+    value
+        .as_object()?
+        .iter()
+        .map(|(k, v)| Some((k.clone(), read(v)?)))
+        .collect()
+}
+
+/// The trimmed answer to the field named `name`.
+fn answer_to<'a>(fields: &[Field], answers: &'a [String], name: &str) -> &'a str {
+    fields
+        .iter()
+        .position(|f| f.name == name)
+        .and_then(|i| answers.get(i))
+        .map_or("", |a| a.trim())
+}
+
+impl Field {
+    /// Whether this field is sent: it has no gate, or its gate is on.
+    pub fn enabled(&self, fields: &[Field], answers: &[String]) -> bool {
+        self.offer
+            .enabled_by
+            .as_deref()
+            .is_none_or(|gate| answer_to(fields, answers, gate).eq_ignore_ascii_case("true"))
+    }
+
+    /// The values to pick from now: the declared choices, else the snapshot's, narrowed to the
+    /// key field's answer. `None` when the field is typed.
+    pub fn offered(&self, fields: &[Field], answers: &[String]) -> Option<Vec<String>> {
+        if let Kind::Choice(values) = &self.kind {
+            return Some(values.clone());
+        }
+        match self.offer.snapshot.as_ref()? {
+            Lists::One(values) => Some(values.clone()),
+            Lists::Keyed(keyed) => Some(
+                keyed
+                    .entries
+                    .get(answer_to(fields, answers, &keyed.by))
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    /// What the empty field shows: the pack's pick for the key field's answer, else the default.
+    pub fn placeholder(&self, fields: &[Field], answers: &[String]) -> String {
+        self.offer
+            .placeholder
+            .as_ref()
+            .and_then(|keyed| keyed.entries.get(answer_to(fields, answers, &keyed.by)))
+            .unwrap_or(&self.default)
+            .clone()
+    }
+
+    /// The key field whose answer picks this field's choices.
+    fn keyed_by(&self) -> Option<&str> {
+        match self.offer.snapshot.as_ref()? {
+            Lists::Keyed(keyed) => Some(&keyed.by),
+            Lists::One(_) => None,
+        }
+    }
 }
 
 fn text_of(value: &Value) -> String {
@@ -109,6 +268,9 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
     let mut out = Map::new();
     let mut problems = Vec::new();
     for (i, field) in fields.iter().enumerate() {
+        if !field.enabled(fields, answers) {
+            continue;
+        }
         let answer = answers.get(i).map(|a| a.trim()).unwrap_or_default();
         if answer.is_empty() {
             if field.required {
@@ -116,8 +278,22 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
             }
             continue;
         }
+        if !field.offer.allow_other
+            && let Some(values) = field.offered(fields, answers)
+            && !values.iter().any(|v| v == answer)
+        {
+            problems.push((
+                i,
+                match (values.is_empty(), field.keyed_by()) {
+                    (true, Some(key)) => format!("No options for this {key}"),
+                    (true, None) => "No options".to_string(),
+                    (false, _) => format!("One of {}", values.join(", ")),
+                },
+            ));
+            continue;
+        }
         let value = match &field.kind {
-            Kind::Text => Value::String(answer.to_string()),
+            Kind::Text | Kind::Choice(_) => Value::String(answer.to_string()),
             Kind::Integer => match answer.parse::<i64>() {
                 Ok(n) => Value::from(n),
                 Err(_) => {
@@ -133,13 +309,6 @@ pub fn params(fields: &[Field], answers: &[String]) -> Result<Value, Problems> {
                 }
             },
             Kind::Bool => Value::Bool(answer == "true"),
-            Kind::Choice(values) => {
-                if !values.iter().any(|v| v == answer) {
-                    problems.push((i, format!("One of {}", values.join(", "))));
-                    continue;
-                }
-                Value::String(answer.to_string())
-            }
         };
         out.insert(field.name.clone(), value);
     }
@@ -293,7 +462,7 @@ impl From<&str> for Refusal {
 mod tests {
     use serde_json::json;
 
-    use crate::form::{Kind, Refusal, Scale, ceilings, duration, fields, minutes, params};
+    use crate::form::{Field, Kind, Refusal, Scale, ceilings, duration, fields, minutes, params};
 
     #[test]
     fn a_refusal_says_what_the_controller_said_about_each_field() {
@@ -443,5 +612,178 @@ mod tests {
         assert!(ceilings("0", "20m", 50.0, "3h").is_err());
         assert!(ceilings("lots", "20m", 50.0, "3h").is_err());
         assert!(ceilings("3", "soon", 50.0, "3h").is_err());
+    }
+
+    fn release() -> serde_json::Value {
+        json!({
+            "properties": {
+                "release": {
+                    "type": "string",
+                    "x-choices-from": {"task": "sheet", "field": "releases"},
+                    "x-choices-snapshot": {"value": ["3.0", "3.1"], "captured_at": "2026-11-09T10:00:00Z"}
+                },
+                "component": {
+                    "type": "string",
+                    "x-choices-from": {"task": "sheet", "field": "components", "keyed_by": "release"},
+                    "x-choices-snapshot": {"value": {"3.0": ["vllm"], "3.1": ["vllm", "llm-d"], "3.2": []}}
+                },
+                "branch": {
+                    "type": "string",
+                    "x-enabled-by": "override",
+                    "x-placeholder-from": {"task": "sheet", "field": "branches", "keyed_by": "release"},
+                    "x-placeholder-snapshot": {"value": {"3.1": "rhoai-3.1"}}
+                },
+                "override": {"type": "boolean"},
+                "image": {"type": "string", "x-choices": ["ubi9", "fedora"], "x-allow-other": true},
+                "stage": {"type": "string", "x-choices": ["dev", "prod"]},
+                "fresh": {"type": "boolean", "enum": [true, false]},
+                "unread": {
+                    "type": "string",
+                    "x-choices-from": {"task": "sheet", "field": "x"}
+                }
+            },
+            "x-order": ["release", "component", "override", "branch", "image", "stage", "fresh", "unread"]
+        })
+    }
+
+    fn answer(f: &[Field], pairs: &[(&str, &str)]) -> Vec<String> {
+        f.iter()
+            .map(|field| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == field.name)
+                    .map_or(String::new(), |(_, v)| (*v).to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn choices_come_from_x_choices_and_from_a_task_snapshot() {
+        let f = fields(&release());
+        let none = answer(&f, &[]);
+        assert_eq!(
+            f[0].offered(&f, &none),
+            Some(vec!["3.0".into(), "3.1".into()])
+        );
+        assert_eq!(
+            f[4].kind,
+            Kind::Choice(vec!["ubi9".into(), "fedora".into()])
+        );
+        assert!(f[4].offer.allow_other && !f[5].offer.allow_other);
+        assert_eq!(f[6].kind, Kind::Bool, "a bool with an enum stays a switch");
+        assert_eq!(f[7].offered(&f, &none), None, "no snapshot yet: typed");
+        assert_eq!(f[3].offered(&f, &none), None);
+    }
+
+    #[test]
+    fn a_keyed_snapshot_offers_the_list_for_the_key_fields_answer() {
+        let f = fields(&release());
+        let on = |release: &str| f[1].offered(&f, &answer(&f, &[("release", release)]));
+        assert_eq!(on("3.1"), Some(vec!["vllm".into(), "llm-d".into()]));
+        assert_eq!(on(" 3.0 "), Some(vec!["vllm".into()]));
+        assert_eq!(on("9.9"), Some(vec![]));
+    }
+
+    #[test]
+    fn a_keyed_placeholder_follows_the_key_and_falls_back_to_the_default() {
+        let f = fields(&release());
+        assert_eq!(
+            f[3].placeholder(&f, &answer(&f, &[("release", "3.1")])),
+            "rhoai-3.1"
+        );
+        assert_eq!(f[3].placeholder(&f, &answer(&f, &[("release", "3.0")])), "");
+    }
+
+    #[test]
+    fn a_gated_field_is_sent_only_while_its_switch_is_on() {
+        let f = fields(&release());
+        let base = [
+            ("release", "3.1"),
+            ("component", "vllm"),
+            ("branch", "main"),
+        ];
+        let off = answer(&f, &[base.as_slice(), &[("override", "false")]].concat());
+        assert!(!f[3].enabled(&f, &off));
+        let sent = params(&f, &off).unwrap();
+        assert_eq!(sent.get("branch"), None);
+        assert_eq!(sent["override"], json!(false));
+
+        let on = answer(&f, &[base.as_slice(), &[("override", "true")]].concat());
+        assert!(f[3].enabled(&f, &on));
+        assert_eq!(params(&f, &on).unwrap()["branch"], json!("main"));
+        assert!(f[0].enabled(&f, &on), "an ungated field is always sent");
+    }
+
+    #[test]
+    fn a_gate_that_is_not_a_declared_bool_gates_nothing() {
+        let f = fields(&json!({
+            "properties": {
+                "a": {"type": "string", "x-enabled-by": "b"},
+                "b": {"type": "string"}
+            }
+        }));
+        assert_eq!(f[0].offer.enabled_by, None);
+    }
+
+    #[test]
+    fn offered_choices_refuse_other_values_unless_other_is_allowed() {
+        let f = fields(&release());
+        let problems =
+            |pairs: &[(&str, &str)]| params(&f, &answer(&f, pairs)).err().unwrap_or_default();
+        assert_eq!(
+            problems(&[("release", "2.9"), ("stage", "qa")]),
+            vec![
+                (0, "One of 3.0, 3.1".to_string()),
+                (5, "One of dev, prod".to_string()),
+            ]
+        );
+        assert_eq!(
+            problems(&[("release", "3.2"), ("component", "vllm")]),
+            vec![
+                (0, "One of 3.0, 3.1".to_string()),
+                (1, "No options for this release".to_string()),
+            ]
+        );
+        let sent = params(
+            &f,
+            &answer(
+                &f,
+                &[
+                    ("release", "3.1"),
+                    ("component", "llm-d"),
+                    ("image", "alpine"),
+                    ("unread", "anything"),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(sent["image"], json!("alpine"));
+        assert_eq!(sent["component"], json!("llm-d"));
+        assert_eq!(sent["unread"], json!("anything"));
+    }
+
+    #[test]
+    fn a_malformed_snapshot_or_source_offers_nothing() {
+        let f = fields(&json!({
+            "properties": {
+                "a": {
+                    "type": "string",
+                    "x-choices-from": {"task": "t"},
+                    "x-choices-snapshot": {"value": ["x"]}
+                },
+                "b": {
+                    "type": "string",
+                    "x-choices-from": {"task": "t", "field": "f"},
+                    "x-choices-snapshot": {"value": [1, 2]}
+                },
+                "c": {
+                    "type": "string",
+                    "x-choices-from": {"task": "t", "field": "f", "keyed_by": "n"},
+                    "x-choices-snapshot": {"value": {"k": ["x"]}}
+                },
+                "n": {"type": "integer"}
+            }
+        }));
+        assert!(f.iter().all(|field| field.offer.snapshot.is_none()));
     }
 }

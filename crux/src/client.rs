@@ -1435,6 +1435,17 @@ fn parse<T: DeserializeOwned>(body: String, what: &str) -> Result<T> {
 }
 
 /// How long a session follow waits on a running run whose pod is not reachable yet.
+/// Waits `wait` on tokio's timer, or the browser's.
+#[cfg(not(target_arch = "wasm32"))]
+async fn pause(wait: Duration) {
+    tokio::time::sleep(wait).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn pause(wait: Duration) {
+    gloo_timers::future::sleep(wait).await;
+}
+
 const POD_WAITS: u32 = 24;
 const POD_WAIT: Duration = Duration::from_secs(5);
 /// Back-to-back connections that end with nothing on them before a follow gives up.
@@ -1528,7 +1539,7 @@ impl Client {
                     if pod_waits > POD_WAITS {
                         bail!("run {} is running but its pod never came up", run_id);
                     }
-                    tokio::time::sleep(POD_WAIT).await;
+                    pause(POD_WAIT).await;
                 }
                 LiveEnd::Resume => {
                     empty = if events == 0 { empty + 1 } else { 0 };
