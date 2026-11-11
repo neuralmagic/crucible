@@ -27,6 +27,7 @@ use serde_json::json;
 use crate::App;
 use crate::agent::session::Session;
 use crate::session::AgentStep;
+use crate::workspace::PaneKind;
 
 /// Agent events the panel keeps; older ones are dropped.
 const KEPT: usize = 8000;
@@ -238,32 +239,39 @@ pub struct Update {
     pub steps: Vec<AgentStep>,
     /// Draft saves that landed since the last read.
     pub saved: bool,
+    /// The agent launched the draft since the last read.
+    pub launched: bool,
 }
 
 /// The panel's state for the profile in use.
 pub struct Desk {
-    pub open: bool,
     pub prompt: TextEdit,
     session: Option<Session>,
     seen: u64,
     pub state: Option<State>,
     pub entries: Vec<Entry>,
     pub steps: Vec<AgentStep>,
+    /// A prompt sent while the agent worked, held until the turn ends.
+    pub queued: Option<String>,
     /// A save landed that the working copy has not been pulled to yet.
     pull_due: bool,
+    /// The agent launched the draft, and the window has not moved to that launch yet: the
+    /// draft's newest launch when it did.
+    launched_past: Option<Option<String>>,
 }
 
 impl Default for Desk {
     fn default() -> Self {
         Desk {
-            open: false,
             prompt: TextEdit::new(""),
             session: None,
             seen: 0,
             state: None,
             entries: Vec::new(),
             steps: Vec::new(),
+            queued: None,
             pull_due: false,
+            launched_past: None,
         }
     }
 }
@@ -277,6 +285,36 @@ impl Desk {
     pub fn busy(&self) -> bool {
         matches!(self.state, Some(State::Starting(_) | State::Running))
     }
+
+    /// Take a prompt typed now: the prompt to run at once, or `None` when the agent is working
+    /// and it joined the queue.
+    fn submit(&mut self, prompt: String) -> Option<String> {
+        if !self.busy() {
+            return Some(prompt);
+        }
+        self.queued = Some(match self.queued.take() {
+            Some(queued) => format!("{queued}\n\n{prompt}"),
+            None => prompt,
+        });
+        None
+    }
+
+    /// The queued prompt, once the agent is waiting for one.
+    fn due(&mut self) -> Option<String> {
+        matches!(self.state, Some(State::Idle))
+            .then(|| self.queued.take())
+            .flatten()
+    }
+
+    fn run(&mut self, prompt: String) {
+        if let Some(session) = &self.session {
+            session.ask(prompt);
+            self.state = Some(match self.state.take() {
+                Some(State::Idle) | None => State::Running,
+                Some(other) => other,
+            });
+        }
+    }
 }
 
 impl App {
@@ -286,7 +324,13 @@ impl App {
     }
 
     pub fn toggle_agent(&mut self) {
-        self.remote.agent.open = !self.remote.agent.open;
+        if self.workspace().locate(PaneKind::Agent).is_some() {
+            self.shown.retain(|shown| *shown != PaneKind::Agent);
+            self.arrange(|layout| layout.close(PaneKind::Agent));
+            self.save_layout();
+        } else {
+            self.show_pane(PaneKind::Agent);
+        }
     }
 
     /// Why a prompt cannot be sent now.
@@ -295,8 +339,6 @@ impl App {
             Some("Pull the draft first")
         } else if self.remote.working_edited {
             Some("Save your edits first")
-        } else if self.remote.agent.busy() {
-            Some("The agent is working")
         } else if self.remote.agent.prompt.text.trim().is_empty() {
             Some("Say what to change")
         } else {
@@ -304,7 +346,8 @@ impl App {
         }
     }
 
-    /// Send the prompt to the draft's session, starting one when there is none.
+    /// Send the prompt to the draft's session, starting one when there is none. While the agent
+    /// works, the prompt waits for the turn to end.
     pub fn send_agent(&mut self) {
         if self.agent_blocked().is_some() {
             return;
@@ -316,36 +359,57 @@ impl App {
         let usable = self.remote.agent.draft() == Some(working.draft.as_str())
             && !matches!(self.remote.agent.state, Some(State::Failed(_)));
         if !usable {
-            let spec = Spec {
-                draft: working.draft.clone(),
-                version: working.base,
-                config: self.settings.agent.clone(),
-                max_cost: self.settings.drop_max_cost,
-                max_time: self.settings.drop_max_time.clone(),
-            };
-            let session = Session::start(
-                self.net.handle(),
-                self.remote.target.clone(),
-                spec,
-                self.waker.clone(),
-            );
-            let desk = &mut self.remote.agent;
-            desk.entries.clear();
-            desk.steps.clear();
-            desk.seen = 0;
-            desk.pull_due = false;
-            desk.state = Some(State::Starting("Starting".into()));
-            desk.session = Some(session);
+            self.start_agent(&working);
         }
         let desk = &mut self.remote.agent;
-        if let Some(session) = &desk.session {
-            session.ask(prompt);
-            desk.state = Some(match desk.state.take() {
-                Some(State::Idle) | None => State::Running,
-                Some(other) => other,
-            });
-        }
         desk.prompt = TextEdit::new("");
+        if let Some(prompt) = desk.submit(prompt) {
+            desk.run(prompt);
+        }
+    }
+
+    /// A new session for `working`'s draft, in a sandbox of its own. The one before it ends.
+    fn start_agent(&mut self, working: &crate::draft::Working) {
+        let spec = Spec {
+            draft: working.draft.clone(),
+            version: working.base,
+            config: self.settings.agent.clone(),
+            max_cost: self.settings.drop_max_cost,
+            max_time: self.settings.drop_max_time.clone(),
+        };
+        let session = Session::start(
+            self.net.handle(),
+            self.remote.target.clone(),
+            spec,
+            self.waker.clone(),
+        );
+        let desk = &mut self.remote.agent;
+        desk.entries.clear();
+        desk.steps.clear();
+        desk.seen = 0;
+        desk.pull_due = false;
+        desk.launched_past = None;
+        desk.state = Some(State::Starting("Starting".into()));
+        desk.session = Some(session);
+    }
+
+    /// Replace the session with a new one in a new sandbox, keeping a queued prompt.
+    pub fn reset_agent(&mut self) {
+        if let Some(working) = self.remote.working.clone() {
+            self.start_agent(&working);
+        }
+    }
+
+    /// Stop the turn in flight and run the queued prompt.
+    pub fn send_agent_now(&mut self) {
+        let desk = &mut self.remote.agent;
+        if let Some(prompt) = desk.queued.take() {
+            desk.run(prompt);
+        }
+    }
+
+    pub fn drop_queued_prompt(&mut self) {
+        self.remote.agent.queued = None;
     }
 
     /// Stop the turn in flight, keeping the session.
@@ -360,17 +424,57 @@ impl App {
         let desk = &mut self.remote.agent;
         desk.session = None;
         desk.state = None;
+        desk.queued = None;
         desk.pull_due = false;
+        desk.launched_past = None;
     }
 
-    /// Take what the session did, and pull the working copy to a save it made.
+    /// Move the window to the launch the agent started, once the controller lists it, while the
+    /// window still shows that draft.
+    fn show_agent_launch(&mut self) -> bool {
+        let Some(past) = self.remote.agent.launched_past.clone() else {
+            return false;
+        };
+        let Some(draft) = self.remote.agent.draft().map(str::to_string) else {
+            return false;
+        };
+        let Some(newest) = self
+            .newest_launch(&draft)
+            .map(|launch| launch.key.clone())
+            .filter(|key| Some(key) != past.as_ref())
+        else {
+            return false;
+        };
+        self.remote.agent.launched_past = None;
+        if self.selected_live().is_none_or(|shown| shown.id != draft) {
+            return false;
+        }
+        self.ignition.launched(draft.clone());
+        self.select(crate::Selection::Live {
+            playbook: draft,
+            launch: Some(newest),
+        });
+        true
+    }
+
+    /// Take what the session did, pull the working copy to a save it made, and follow a launch
+    /// it started.
     pub(crate) fn refresh_agent(&mut self) -> bool {
         let desk = &mut self.remote.agent;
         let update = desk
             .session
             .as_ref()
             .and_then(|session| session.take(desk.seen));
-        let changed = update.is_some();
+        let mut changed = update.is_some();
+        if update.as_ref().is_some_and(|update| update.launched) {
+            let draft = self.remote.agent.draft().map(str::to_string);
+            let newest = draft
+                .and_then(|draft| self.newest_launch(&draft))
+                .map(|launch| launch.key.clone());
+            self.remote.agent.launched_past = Some(newest);
+        }
+        changed |= self.show_agent_launch();
+        let desk = &mut self.remote.agent;
         if let Some(update) = update {
             desk.seen = update.version;
             desk.state = Some(update.state);
@@ -379,6 +483,9 @@ impl App {
             let over = desk.steps.len().saturating_sub(KEPT);
             desk.steps.drain(..over);
             desk.pull_due |= update.saved;
+            if let Some(prompt) = desk.due() {
+                desk.run(prompt);
+            }
         }
         if self.remote.agent.pull_due
             && !self.remote.draft_busy
@@ -394,7 +501,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::{Config, Endpoint, Format};
+    use crate::agent::{Config, Desk, Endpoint, Format, State};
 
     fn endpoint() -> Endpoint {
         Endpoint {
@@ -513,5 +620,27 @@ mod tests {
         assert!(toml::from_str::<Config>("imge = \"x\"").is_err());
         let back: Config = toml::from_str(&toml::to_string(&Config::default()).unwrap()).unwrap();
         assert_eq!(back, Config::default());
+    }
+
+    #[test]
+    fn a_prompt_sent_while_the_agent_works_waits_for_the_turn_to_end() {
+        let mut desk = Desk::default();
+        assert_eq!(desk.submit("first".into()), Some("first".into()));
+        desk.state = Some(State::Running);
+        assert_eq!(desk.submit("second".into()), None);
+        assert_eq!(desk.submit("third".into()), None);
+        assert_eq!(desk.queued.as_deref(), Some("second\n\nthird"));
+        assert_eq!(desk.due(), None);
+        desk.state = Some(State::Starting("Creating the sandbox".into()));
+        assert_eq!(desk.due(), None);
+        desk.state = Some(State::Failed("gone".into()));
+        assert_eq!(desk.due(), None);
+        assert!(desk.queued.is_some());
+
+        desk.state = Some(State::Idle);
+        assert_eq!(desk.due(), Some("second\n\nthird".into()));
+        assert_eq!(desk.queued, None);
+        assert_eq!(desk.due(), None);
+        assert_eq!(desk.submit("fourth".into()), Some("fourth".into()));
     }
 }

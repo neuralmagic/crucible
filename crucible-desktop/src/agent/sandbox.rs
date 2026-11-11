@@ -14,8 +14,6 @@ use crate::net::Handle;
 
 /// Sandbox names start with this, so a leftover one can be told from someone else's.
 pub const PREFIX: &str = "cr-draft-";
-/// The most one exec argument carries; the gateway refuses 32768 bytes and over.
-const ARGUMENT: usize = 24 * 1024;
 /// This machine as a sandbox reaches it: the name the gateway maps for its own policy.
 pub const HOST: &str = "host.openshell.internal";
 
@@ -189,45 +187,11 @@ impl Sandbox {
             .await
             .map_err(|e| format!("{e:#}"))
     }
-
-    /// Write `text` to `path` in the sandbox's working directory.
-    pub async fn write(&self, path: &str, text: &str) -> Result<(), String> {
-        let mut script = "printf %s \"$2\" > \"$1\"";
-        for piece in pieces(text, ARGUMENT) {
-            let argv = ["sh", "-c", script, "write", path, piece].map(str::to_string);
-            let done = self.exec(&argv, &CancellationToken::new(), |_| {}).await?;
-            if done.exit_code != Some(0) {
-                return Err(format!(
-                    "writing {path} in the sandbox failed: {}",
-                    done.stderr_lines.join(" ")
-                ));
-            }
-            script = "printf %s \"$2\" >> \"$1\"";
-        }
-        Ok(())
-    }
-}
-
-/// `text` cut into pieces of at most `limit` bytes, each ending on a character boundary.
-fn pieces(text: &str, limit: usize) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut rest = text;
-    while rest.len() > limit {
-        let mut at = limit;
-        while !rest.is_char_boundary(at) {
-            at -= 1;
-        }
-        let (piece, tail) = rest.split_at(at);
-        out.push(piece);
-        rest = tail;
-    }
-    out.push(rest);
-    out
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::sandbox::{dial_in, forget, listed, pieces, record, relay_endpoint};
+    use crate::agent::sandbox::{dial_in, forget, listed, record, relay_endpoint};
 
     #[test]
     fn the_active_gateway_is_dialed_with_its_own_certificate() {
@@ -264,17 +228,6 @@ mod tests {
             relay_endpoint(41234),
             "host.openshell.internal:41234:read-write:rest:enforce"
         );
-    }
-
-    #[test]
-    fn a_long_text_is_cut_on_character_boundaries() {
-        assert_eq!(pieces("", 4), [""]);
-        assert_eq!(pieces("abcd", 4), ["abcd"]);
-        assert_eq!(pieces("abcdefghij", 4), ["abcd", "efgh", "ij"]);
-        let accented = "aaa\u{e9}\u{e9}b";
-        let cut = pieces(accented, 4);
-        assert_eq!(cut, ["aaa", "\u{e9}\u{e9}", "b"]);
-        assert_eq!(cut.concat(), accented);
     }
 
     #[test]

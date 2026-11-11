@@ -20,7 +20,10 @@ use crate::net::{Handle, Task};
 use crate::profile::Target;
 use crate::session::AgentStep;
 
-const DSL: &str = include_str!("../../../docs/dsl-reference.md");
+/// Where an agent image keeps the drafting skill.
+const SKILL: &str = "/usr/local/share/crucible-agent/plugin/skills/draft-a-playbook/SKILL.md";
+/// Where an agent image keeps the crucible docs.
+const DOCS: &str = "/usr/local/share/crucible-agent/docs";
 
 enum Ask {
     Prompt(String),
@@ -35,6 +38,7 @@ struct Inner {
     entries: Vec<Entry>,
     steps: Vec<AgentStep>,
     saved: bool,
+    launched: bool,
 }
 
 impl Inner {
@@ -110,7 +114,10 @@ impl Out {
                 inner.saved = true;
                 inner.note("Saved the draft");
             }
-            Passed::Launched => inner.note("Launched the draft"),
+            Passed::Launched => {
+                inner.launched = true;
+                inner.note("Launched the draft");
+            }
             Passed::Trouble(what) => inner.note(what),
         });
     }
@@ -140,6 +147,7 @@ impl Session {
             entries: Vec::new(),
             steps: Vec::new(),
             saved: false,
+            launched: false,
         }));
         let out = Out {
             inner: Arc::clone(&inner),
@@ -172,6 +180,7 @@ impl Session {
         &self.draft
     }
 
+    /// Run `prompt` as the next turn. Mid-turn, the turn in flight is stopped for it.
     pub fn ask(&self, prompt: String) {
         let _ = self.asks.send(Ask::Prompt(prompt));
     }
@@ -190,6 +199,7 @@ impl Session {
             entries: std::mem::take(&mut inner.entries),
             steps: std::mem::take(&mut inner.steps),
             saved: std::mem::take(&mut inner.saved),
+            launched: std::mem::take(&mut inner.launched),
         })
     }
 }
@@ -221,29 +231,21 @@ fn brief(spec: &Spec, prompt: &str) -> String {
          this session and will read your last message.\n\n\
          ## Their request\n\n{prompt}\n\n\
          ## How to work\n\n\
-         - The draft is at version {version}. `crux draft-pull {draft} pack` writes the newest \
-         save into `./pack` and prints its version. Edit the files there.\n\
-         - `workflow.star` and the modules it loads are checked by crucible-lsp as you edit; \
-         clear what it reports. `DSL.md` in the working directory is the pack language \
-         reference.\n\
-         - `crux draft-push {draft} pack --base-version <n>` saves the directory as the next \
-         version, `<n>` being the version you pulled. A refused push names the version to pull \
-         and merge onto.\n\
-         - `crux draft-preview {draft}` says how a save compiled. Clear every diagnostic before \
-         a launch.\n\
-         - `crux draft-launch {draft} --max-cost {max_cost} --max-time {max_time}` test-fires \
-         the newest save and costs money: stay at or under those ceilings, and launch only \
-         when the request needs a run to prove the change.\n\
-         - The `crucible_*` tools are the same operations as `crux`; `crux --help` lists them. \
-         Follow a launch with `crux playbook-run`, and explain a failure with `crux turns` and \
-         `crux run-log`.\n\
-         - Both act as the owner, with everything the owner may do. Touch nothing but this \
-         draft and its runs unless the request says so.\n\n\
+         - Follow the draft-a-playbook skill, `{skill}`: pull the draft into `./pack` with \
+         `crux`, edit there, push it back, and check the compile.\n\
+         - The draft is at version {version} as this session starts.\n\
+         - A launch costs money: at most `--max-cost {max_cost}` and `--max-time {max_time}`, \
+         and only when the request needs a run to prove the change.\n\
+         - The crucible docs are in `{docs}`.\n\
+         - `crux` and the `crucible_*` tools act as the owner, with everything the owner may \
+         do. Touch nothing but this draft and its runs unless the request says so.\n\n\
          Finish with what you changed and what you verified.",
         draft = spec.draft,
         version = spec.version,
         max_cost = spec.max_cost,
         max_time = spec.max_time,
+        docs = DOCS,
+        skill = SKILL,
     )
 }
 
@@ -284,19 +286,20 @@ async fn serve(
         relay.port,
     )
     .await?;
-    if let Err(why) = sandbox.write("DSL.md", DSL).await {
-        out.note(why);
-    }
     out.state(State::Idle);
 
     let mut turns = 0u32;
+    let mut next: Option<String> = None;
     loop {
-        let prompt = loop {
-            match asks.recv().await {
-                Some(Ask::Prompt(prompt)) => break prompt,
-                Some(Ask::Stop) => {}
-                None => return Ok(()),
-            }
+        let prompt = match next.take() {
+            Some(prompt) => prompt,
+            None => loop {
+                match asks.recv().await {
+                    Some(Ask::Prompt(prompt)) => break prompt,
+                    Some(Ask::Stop) => {}
+                    None => return Ok(()),
+                }
+            },
         };
         out.asked(&prompt);
         let follow_up = turns > 0 && config.continues();
@@ -325,7 +328,11 @@ async fn serve(
                             stopped = true;
                             cancel.cancel();
                         }
-                        Some(Ask::Prompt(_)) => {}
+                        Some(Ask::Prompt(prompt)) => {
+                            stopped = true;
+                            cancel.cancel();
+                            next = Some(prompt);
+                        }
                         None => return Ok(()),
                     },
                 }
@@ -335,22 +342,27 @@ async fn serve(
             out.passed(passed);
         }
         match done {
+            _ if next.is_some() => out.note("Interrupted"),
             _ if stopped => out.note("Stopped"),
             Ok(done) => {
                 for line in done.stderr_lines.iter().filter(|l| !l.trim().is_empty()) {
                     out.note(line.clone());
                 }
                 match (done.transport_error, done.exit_code) {
-                    (Some((_, why)), _) => out.note(format!("The agent's stream broke: {why}")),
+                    (Some((_, why)), _) => {
+                        return Err(format!("The sandbox stopped answering: {why}"));
+                    }
                     (None, Some(0)) => {}
                     (None, Some(code)) => out.note(format!("The agent exited {code}")),
                     (None, None) => out.note("The agent ended without an exit code"),
                 }
             }
-            Err(why) => out.note(why),
+            Err(why) => return Err(why),
         }
         turns += 1;
-        out.state(State::Idle);
+        if next.is_none() {
+            out.state(State::Idle);
+        }
     }
 }
 
@@ -361,7 +373,7 @@ mod tests {
     use crucible_contract::event::AgentEvent;
 
     use crate::agent::relay::Passed;
-    use crate::agent::session::{DSL, Inner, Out, brief, decode, decoder, sandbox_name};
+    use crate::agent::session::{DOCS, Inner, Out, SKILL, brief, decode, decoder, sandbox_name};
     use crate::agent::{Config, Entry, Format, Spec, State};
 
     #[test]
@@ -370,11 +382,6 @@ mod tests {
         assert!(name.starts_with("cr-draft-"));
         assert_eq!(name.len(), 17);
         assert_ne!(name, sandbox_name());
-    }
-
-    #[test]
-    fn the_dsl_reference_is_bundled() {
-        assert!(DSL.len() > 10_000);
     }
 
     #[test]
@@ -416,6 +423,7 @@ mod tests {
                 entries: Vec::new(),
                 steps: Vec::new(),
                 saved: false,
+                launched: false,
             })),
             waker: None,
         };
@@ -483,10 +491,12 @@ mod tests {
         let text = brief(&spec, "Add a retry to the fetch task.");
         assert!(text.contains("draft `triage-wren`"));
         assert!(text.contains("## Their request\n\nAdd a retry to the fetch task.\n"));
-        assert!(text.contains("The draft is at version 4."));
-        assert!(text.contains("`crux draft-pull triage-wren pack`"));
-        assert!(text.contains("`crux draft-push triage-wren pack --base-version <n>`"));
-        assert!(text.contains("`crux draft-launch triage-wren --max-cost 1.5 --max-time 30m`"));
+        assert!(text.contains("The draft is at version 4 as this session starts."));
+        assert!(text.contains(
+            "skill, `/usr/local/share/crucible-agent/plugin/skills/draft-a-playbook/SKILL.md`"
+        ));
+        assert!(text.contains("`--max-cost 1.5` and `--max-time 30m`"));
+        assert!(text.contains("docs are in `/usr/local/share/crucible-agent/docs`"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -544,7 +554,6 @@ mod tests {
         )
         .await
         .unwrap();
-        sandbox.write("DSL.md", DSL).await.unwrap();
 
         let run = |argv: Vec<String>| {
             let sandbox = &sandbox;
@@ -563,9 +572,10 @@ mod tests {
                 )
             }
         };
-        let (code, size, _) = run(vec!["wc".into(), "-c".into(), "DSL.md".into()]).await;
-        assert_eq!(code, Some(0));
-        assert!(size.starts_with(&DSL.len().to_string()), "{size}");
+        for carried in [format!("{DOCS}/dsl-reference.md"), SKILL.to_string()] {
+            let (code, _, errors) = run(vec!["test".into(), "-s".into(), carried.clone()]).await;
+            assert_eq!(code, Some(0), "{carried}: {errors}");
+        }
 
         let ask = |bearer: &str| {
             format!(
@@ -585,5 +595,74 @@ mod tests {
 
         let (_, refused, _) = run(node(ask("not-the-token"))).await;
         assert!(refused.starts_with("401 "), "{refused}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs the local OpenShell gateway and localhost/crucible-agent"]
+    async fn a_prompt_sent_mid_turn_stops_the_turn_and_runs_next() {
+        use crate::agent::session::Session;
+        use crate::profile::{Profile, Target};
+
+        let keys = tempfile::tempdir().unwrap();
+        let profile = Profile {
+            url: "http://127.0.0.1:9".into(),
+            ..Profile::default()
+        };
+        let target = Target::new(
+            "test",
+            profile,
+            &crate::keys::Store::Dir(keys.path().into()),
+        );
+        let spec = Spec {
+            draft: "triage-wren".into(),
+            version: 1,
+            config: Config {
+                format: Format::Text,
+                command: ["sh", "-c", "echo began; sleep 300"]
+                    .map(String::from)
+                    .into(),
+                ..Config::default()
+            },
+            max_cost: 1.0,
+            max_time: "30m".into(),
+        };
+        let session = Session::start(Ok(tokio::runtime::Handle::current()), target, spec, None);
+
+        let mut seen = 0;
+        let mut began = 0;
+        let mut notes: Vec<String> = Vec::new();
+        let mut state = State::Starting(String::new());
+        let mut until = async |began_at: usize, note: Option<&str>, idle: bool| {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(150);
+            loop {
+                if let Some(update) = session.take(seen) {
+                    seen = update.version;
+                    state = update.state;
+                    began += update.steps.len();
+                    notes.extend(update.entries.into_iter().filter_map(|entry| match entry {
+                        Entry::Note { text, .. } => Some(text),
+                        Entry::Asked { .. } => None,
+                    }));
+                }
+                let noted = note.is_none_or(|note| notes.iter().any(|n| n == note));
+                if began >= began_at && noted && (!idle || state == State::Idle) {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "began {began}, notes {notes:?}, state {state:?}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        };
+
+        session.ask("one".into());
+        until(1, None, false).await;
+        session.ask("two".into());
+        until(2, Some("Interrupted"), false).await;
+        session.stop();
+        until(2, Some("Stopped"), true).await;
+        drop(session);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
     }
 }

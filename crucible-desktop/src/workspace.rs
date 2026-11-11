@@ -32,10 +32,11 @@ pub enum PaneKind {
     Pack,
     Launch,
     Log,
+    Agent,
 }
 
 impl PaneKind {
-    pub const ALL: [PaneKind; 10] = [
+    pub const ALL: [PaneKind; 11] = [
         PaneKind::Tasks,
         PaneKind::Timeline,
         PaneKind::Graph,
@@ -46,6 +47,7 @@ impl PaneKind {
         PaneKind::Pack,
         PaneKind::Launch,
         PaneKind::Log,
+        PaneKind::Agent,
     ];
 
     pub fn label(self) -> &'static str {
@@ -60,6 +62,7 @@ impl PaneKind {
             PaneKind::Pack => "Pack",
             PaneKind::Launch => "Launch",
             PaneKind::Log => "Log",
+            PaneKind::Agent => "Agent",
         }
     }
 }
@@ -195,10 +198,14 @@ impl Workspace {
     }
 
     /// Shows `kind`: brings it to the front of its group, or reopens it when it was closed,
-    /// beside a pane it shares a group with by default, else in the first group.
+    /// beside a pane it shares a group with by default, else in the first group. The agent
+    /// reopens in a group of its own under the pack.
     pub fn activate(&mut self, kind: PaneKind) {
         let at = match self.locate(kind) {
             Some(at) => at,
+            None if kind == PaneKind::Agent && self.locate(PaneKind::Pack).is_some() => {
+                return self.place(kind, PaneKind::Pack, Some(Edge::Bottom));
+            }
             None => {
                 let default = Workspace::for_depth(0);
                 let home = default
@@ -253,6 +260,11 @@ impl Workspace {
             return;
         };
         self.remove(kind);
+        self.place(kind, anchor, edge);
+    }
+
+    /// Puts `kind`, which is in no group, in `anchor`'s group or on one of its edges.
+    fn place(&mut self, kind: PaneKind, anchor: PaneKind, edge: Option<Edge>) {
         let Some((c, g)) = self.locate(anchor) else {
             return;
         };
@@ -508,7 +520,9 @@ fn normalize<'a>(shares: impl Iterator<Item = &'a mut f32>) {
 mod tests {
     use crate::workspace::{Dock, Edge, MIN_SHARE, PaneKind, Workspace, depth, hit, neighbour};
 
-    use PaneKind::{Compare, Data, Files, Graph, Launch, Log, Pack, Tasks, Timeline, Transcript};
+    use PaneKind::{
+        Agent, Compare, Data, Files, Graph, Launch, Log, Pack, Tasks, Timeline, Transcript,
+    };
 
     #[test]
     fn a_neighbour_is_the_nearest_group_on_that_side_lined_up_first() {
@@ -569,7 +583,7 @@ mod tests {
             ]
         );
         sums_to_one(&w);
-        assert_eq!(w.closed().count(), 0);
+        assert_eq!(w.closed().collect::<Vec<_>>(), vec![Agent]);
     }
 
     #[test]
@@ -686,7 +700,7 @@ mod tests {
         w.close(Compare);
         w.close(Tasks);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks]]]);
-        assert_eq!(w.closed().count(), 9);
+        assert_eq!(w.closed().count(), 10);
         w.activate(Log);
         assert_eq!(tabs(&w), vec![vec![vec![Tasks, Log]]]);
         assert_eq!(w.columns[0].groups[0].active, Log);
@@ -712,6 +726,38 @@ mod tests {
                 vec![Tasks, Compare, Pack, Launch]
             ]]
         );
+    }
+
+    #[test]
+    fn the_agent_opens_under_the_pack_and_docks_like_any_pane() {
+        let mut w = Workspace::for_depth(2);
+        let pack = w.columns[0].groups[1].share;
+        w.activate(Agent);
+        assert_eq!(
+            tabs(&w)[0],
+            vec![
+                vec![Graph, Timeline],
+                vec![Tasks, Compare, Pack, Launch],
+                vec![Agent]
+            ]
+        );
+        assert!(w.showing(Agent));
+        assert_eq!(w.columns[0].groups[2].share, pack / 2.0);
+        sums_to_one(&w);
+        w.activate(Agent);
+        assert_eq!(tabs(&w)[0].len(), 3);
+        w.dock(Agent, Dock::Split(Log, Edge::Right));
+        assert_eq!(tabs(&w)[2], vec![vec![Agent]]);
+        assert_eq!(tabs(&w)[0].len(), 2);
+        sums_to_one(&w);
+        w.close(Agent);
+        assert_eq!(tabs(&w), tabs(&Workspace::for_depth(2)));
+        sums_to_one(&w);
+
+        let mut w = Workspace::for_depth(2);
+        w.close(Pack);
+        w.activate(Agent);
+        assert_eq!(tabs(&w)[0][0], vec![Graph, Timeline, Agent]);
     }
 
     #[test]

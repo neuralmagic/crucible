@@ -983,7 +983,7 @@ impl App {
     }
 
     /// The newest launch of `playbook` the list shows, to prefill a form from.
-    fn newest_launch(&self, playbook: &str) -> Option<&LivePlaybook> {
+    pub(crate) fn newest_launch(&self, playbook: &str) -> Option<&LivePlaybook> {
         self.remote
             .live
             .launches_of(playbook)

@@ -7,8 +7,8 @@ use rune_kit::{Button, ButtonVariant, ControlSize};
 use rune_theme_opencode::icons as oc;
 
 use crate::ui::{
-    Paint, Pane, compare, data, empty_run, files, fx, graph, launch, log, pack, tasks, timeline,
-    transcript, tube,
+    Paint, Pane, agent, compare, data, empty_run, files, fx, graph, launch, log, pack, tasks,
+    timeline, transcript, tube,
 };
 use crate::workspace::{At, Divider, Dock, Edge, Group, PaneDrag, PaneKind, hit};
 use crate::{App, gfx};
@@ -57,7 +57,10 @@ pub(crate) fn workspace(pane: &Pane, app: &App, p: &Paint) -> El {
 pub(crate) fn tools(app: &App, p: &Paint) -> Option<El> {
     let layout = app.layout.as_ref()?;
     let mut bar = row().key("ws-tools").gap(4.0).center_y();
-    for kind in layout.closed() {
+    for kind in layout
+        .closed()
+        .filter(|kind| *kind != PaneKind::Agent || app.agent_available())
+    {
         bar = bar.child(
             Button::new(kind.label())
                 .icon(&oc::PLUS)
@@ -99,6 +102,7 @@ pub(crate) fn glyph(kind: PaneKind) -> &'static Icon {
         PaneKind::Pack => &oc::FOLDER,
         PaneKind::Launch => &oc::GLOBE,
         PaneKind::Log => &oc::CONSOLE,
+        PaneKind::Agent => &oc::SPEECH_BUBBLE,
     }
 }
 
@@ -204,6 +208,7 @@ fn content(kind: PaneKind, pane: &Pane, app: &App, p: &Paint) -> El {
         PaneKind::Log => {
             log::log_pane(pane.transcript, pane.log, pane.tasks, pane.log_font, app, p)
         }
+        PaneKind::Agent => agent::panel(pane.log_font, app, p),
     }
 }
 

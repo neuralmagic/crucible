@@ -1,4 +1,4 @@
-//! The drafting agent's panel in the Pack tab: each prompt, the turn it started drawn as the
+//! The drafting agent's pane: each prompt, the turn it started drawn as the
 //! Transcript pane draws one, what the session did beside it, and a prompt to send.
 
 use rune::{El, ScrollSpec, TextStyle, Tx, col, el, row, text};
@@ -13,7 +13,6 @@ use crate::ui::transcript::turn_view;
 
 /// Turns drawn, newest last.
 const SHOWN: usize = 12;
-const MIN_HEIGHT: f32 = 260.0;
 
 fn status(app: &App, p: &Paint) -> El {
     let desk = &app.remote.agent;
@@ -48,6 +47,14 @@ fn status(app: &App, p: &Paint) -> El {
         );
     }
     if desk.state.is_some() {
+        bar = bar.child(
+            Button::new("Reset")
+                .variant(ButtonVariant::Neutral)
+                .on_press(|app: &mut App| app.reset_agent())
+                .build(p.k)
+                .help("New sandbox")
+                .key("agent-reset"),
+        );
         bar = bar.child(
             Button::new("End")
                 .variant(ButtonVariant::Neutral)
@@ -84,6 +91,45 @@ fn entry_row(entry: &Entry, style: TextStyle, p: &Paint) -> El {
                 .selectable(true)
                 .selection_color(p.k.selection())
                 .wrap(),
+        )
+}
+
+/// The prompt waiting for the turn to end, with the ways out of waiting.
+fn queued(prompt: &str, style: TextStyle, p: &Paint) -> El {
+    row()
+        .key("agent-queued")
+        .w_full()
+        .gap(8.0)
+        .center_y()
+        .child(
+            text("QUEUED")
+                .font(TextStyle::new(9.5, 600.0).lh(12.0).tracking(0.4))
+                .color(p.live)
+                .w(52.0),
+        )
+        .child(
+            text(prompt.to_string())
+                .font(style)
+                .color(p.c.text_base)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate()
+                .help_when_truncated(prompt.to_string()),
+        )
+        .child(
+            Button::new("Send now")
+                .variant(ButtonVariant::Neutral)
+                .on_press(|app: &mut App| app.send_agent_now())
+                .build(p.k)
+                .help("Stop the turn and run this")
+                .key("agent-send-now"),
+        )
+        .child(
+            Button::new("Drop")
+                .variant(ButtonVariant::Neutral)
+                .on_press(|app: &mut App| app.drop_queued_prompt())
+                .build(p.k)
+                .key("agent-drop-queued"),
         )
 }
 
@@ -132,8 +178,8 @@ pub(crate) fn panel(font: LogFont, app: &App, p: &Paint) -> El {
     col()
         .key("agent")
         .w_full()
-        .grow(1.5)
-        .min_h(MIN_HEIGHT)
+        .grow(1.0)
+        .min_h(0.0)
         .gap(6.0)
         .child(status(app, p))
         .child(
@@ -149,6 +195,11 @@ pub(crate) fn panel(font: LogFont, app: &App, p: &Paint) -> El {
                 .scroll(ScrollSpec { stick_bottom: true })
                 .scroll_edge_fade(12.0)
                 .child(entries),
+        )
+        .children(
+            desk.queued
+                .as_deref()
+                .map(|prompt| queued(prompt, style, p)),
         )
         .child(
             row()

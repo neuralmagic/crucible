@@ -14,6 +14,7 @@ use crate::pack::{PackFile, PackFiles};
 use crate::settings::LogFont;
 use crate::syntax;
 use crate::ui::Paint;
+use crate::workspace::PaneKind;
 use crate::{App, PackSource};
 
 /// Lines drawn per file; a longer file says how much it left out.
@@ -96,10 +97,6 @@ pub(crate) fn pack_view(pack: Result<&PackFiles, &str>, font: LogFont, app: &App
                     None => el().grow(1.0),
                 }),
         )
-        .children(
-            (app.remote.agent.open && app.showing_working())
-                .then(|| crate::ui::agent::panel(font, app, p)),
-        )
 }
 
 /// Where the pack came from, the switch between the run's pack and a working copy, and the
@@ -162,7 +159,7 @@ fn toolbar(app: &App, pack: &PackFiles, p: &Paint) -> El {
     if app.agent_available() {
         bar = bar.child(
             Button::new("Agent")
-                .variant(if app.remote.agent.open {
+                .variant(if app.workspace().locate(PaneKind::Agent).is_some() {
                     ButtonVariant::Submit
                 } else {
                     ButtonVariant::Neutral

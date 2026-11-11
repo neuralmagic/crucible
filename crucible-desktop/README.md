@@ -227,23 +227,31 @@ fresh, since the controller reruns a run only as what it ran as. Paste it into a
 
 ## Draft with an agent
 
-`Agent` on a draft's working copy opens a panel: a prompt, and each turn the agent takes, drawn
+`Agent` on a draft's working copy opens the Agent pane, which docks, splits and resizes like
+any other pane (also `cmd+9`): a prompt, and each turn the agent takes, drawn
 as the Transcript pane draws one, with every tool call's input and result a click away. The first
 prompt starts a session: a sandbox on the local OpenShell gateway (0.1.5 or newer, the one the
 `openshell` CLI has active), reached over its gRPC API, with the harness run in it once per
 prompt.
 
 The agent works as the signed-in user and the team acted as. It pulls the draft into its working
-directory with `crux`, edits the files with crucible-lsp checking the Starlark, pushes the
+directory with `crux`, edits the files with crucible-lsp checking the Starlark and the docs in
+the image to read, pushes the
 directory back as the next version, and previews, launches and watches through `crux` or the
 controller's MCP tools. Both reach the controller through a relay on a loopback port that only
 the session's token opens, so the profile's key stays out of the sandbox. A save by the agent
-pulls the working copy. `Stop` ends the turn; `End` deletes the sandbox, and one that outlives the
-app is deleted by the next session.
+pulls the working copy, and a launch by the agent moves the window to that launch once the
+controller lists it.
+
+A prompt sent while the agent works waits for the turn to end; `Send now` on it stops the turn
+and runs it at once, and `Drop` discards it. `Stop` ends the turn. `Reset` starts over in a new
+sandbox, which is also what the next prompt does once a sandbox has stopped answering. `End`
+deletes the sandbox, and one that outlives the app is deleted by the next session.
 
 The harness is `[agent]` in the config file, read when the app starts. With none, it is Claude
 Code in `localhost/crucible-agent` (`just desktop-agent-image`, which also builds `crux` and
-`crucible-lsp` into it) with the `claude-sub` provider, on `claude-opus-5-5` unless `model` says
+`crucible-lsp` into it and copies `docs/` and the `draft-a-playbook` skill under
+`/usr/local/share/crucible-agent`) with the `claude-sub` provider, on `claude-opus-5-5` unless `model` says
 otherwise:
 
 ```toml
