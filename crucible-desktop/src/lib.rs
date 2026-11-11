@@ -64,6 +64,8 @@ mod tray;
 mod tune;
 mod ui;
 mod unfurl;
+mod update;
+mod version;
 mod webhook;
 mod workspace;
 
@@ -454,6 +456,7 @@ pub struct App {
     /// The places the window showed, to go back and forward through.
     history: history::History,
     waker: Option<Waker>,
+    release: update::Check,
     /// Where a text field's edits land once its form has closed.
     pub scratch: TextEdit,
     pub settings: Settings,
@@ -1653,6 +1656,7 @@ fn init() -> App {
         open_wake,
         history: history::History::default(),
         waker: None,
+        release: update::Check::default(),
         scratch: TextEdit::new(""),
         settings,
         editor_command,
@@ -1700,6 +1704,7 @@ fn setup(app: &mut App, waker: Waker) {
     app.remote.set_waker(&waker);
     app.fleet_client.set_waker(waker.clone());
     app.lsp.set_waker(waker);
+    app.check_release();
 }
 
 /// Nothing here touches a file, a process or the network: the workers own all of that and wake the
@@ -1765,6 +1770,7 @@ fn poll(app: &mut App, _clock: f64, _tx: &mut Tx) -> bool {
     changed |= app.refresh_working();
     changed |= app.finish_sign_in();
     changed |= app.finish_login_editor();
+    changed |= app.finish_release_check();
     if let Some((version, view)) = app.lsp.take(app.lsp_seen) {
         app.lsp_seen = version;
         app.checks = view;

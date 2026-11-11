@@ -179,6 +179,8 @@ pub struct Settings {
     pub crt: bool,
     /// Keep profile keys in the system credential store, not in files.
     pub keychain: bool,
+    /// Ask GitHub once a day whether a newer release exists.
+    pub updates: bool,
     /// Announce the signed-in user's runs as they finish.
     pub notify: bool,
     /// Announce decision requests the signed-in user may answer as they open.
@@ -222,6 +224,7 @@ struct Config {
     zoom: Option<f32>,
     crt: Option<bool>,
     keychain: Option<bool>,
+    check_updates: Option<bool>,
     notify: Option<bool>,
     notify_decisions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -288,6 +291,7 @@ impl Settings {
                 .unwrap_or(1.0),
             crt: config.crt.unwrap_or(true),
             keychain: config.keychain.unwrap_or(false),
+            updates: config.check_updates.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
             ask: config.notify_decisions.unwrap_or(true),
             editor: config.editor,
@@ -445,6 +449,11 @@ impl Settings {
         self.save();
     }
 
+    pub fn set_updates(&mut self, on: bool) {
+        self.updates = on;
+        self.save();
+    }
+
     pub fn set_notify(&mut self, on: bool) {
         self.notify = on;
         self.save();
@@ -505,6 +514,7 @@ impl Settings {
             zoom: Some(self.zoom),
             crt: Some(self.crt),
             keychain: Some(self.keychain),
+            check_updates: Some(self.updates),
             notify: Some(self.notify),
             notify_decisions: Some(self.ask),
             editor: self.editor,
@@ -674,6 +684,21 @@ mod tests {
     }
 
     use crate::settings::*;
+
+    #[test]
+    fn the_update_check_is_on_until_turned_off_and_stays_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.updates);
+        settings.set_updates(false);
+        assert!(!Settings::load_from(path.clone()).updates);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("check_updates = false")
+        );
+    }
 
     #[test]
     fn with_no_profiles_of_its_own_the_app_takes_the_tauri_apps() {

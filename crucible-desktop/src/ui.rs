@@ -1,5 +1,6 @@
 //! The window: live playbooks and local packs on the left, the selected run on the right.
 
+mod about;
 mod activity;
 mod admin;
 mod approvals;
@@ -1770,6 +1771,7 @@ fn settings_pane(app: &App, p: &Paint) -> El {
                 ),
         )
         .children(desk::group_tabs(app, p))
+        .child(settings_section("about", "About", about::rows(app, p), p))
         .child(settings_section(
             "profiles",
             "Profiles",

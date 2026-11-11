@@ -53,6 +53,8 @@ pub struct Watch {
     pub admin: bool,
     /// The Admin page's policy tab is shown.
     pub policy: bool,
+    /// The Settings page is shown, with the controller's version on it.
+    pub about: bool,
     /// The Issues page is shown, listing this status or every one.
     pub issues: Option<InStatus>,
     /// The issue the Issues page shows in full.
@@ -412,6 +414,8 @@ pub struct AdminView {
     pub presets: Loaded<Vec<dto::WebhookPreset>>,
     pub providers: Loaded<Vec<dto::Provider>>,
     pub blueprints: Loaded<Vec<dto::Blueprint>>,
+    /// The build the controller is running.
+    pub version: Loaded<dto::Version>,
     /// The issues in the status they were asked for.
     pub issues: Option<(InStatus, Loaded<Vec<dto::Issue>>)>,
     pub issue: Option<(String, Loaded<dto::IssueDetail>)>,
@@ -575,6 +579,9 @@ impl Worker {
         if let Some(blueprints) = read.blueprints {
             self.view.blueprints = Some(blueprints);
         }
+        if let Some(version) = read.version {
+            self.view.version = Some(version);
+        }
         self.view.issues = read.issues.map(|(status, issues)| (status, Some(issues)));
         self.view.issue = read.issue.map(|(key, issue)| (key, Some(issue)));
         if !watch.blueprints {
@@ -641,6 +648,7 @@ struct Read {
     policy_sets: Option<Result<Vec<dto::PolicySet>, String>>,
     issues: Option<(InStatus, Result<Vec<dto::Issue>, String>)>,
     issue: Option<(String, Result<dto::IssueDetail, String>)>,
+    version: Option<Result<dto::Version, String>>,
 }
 
 /// The status an issue list is asked for; none is every status.
@@ -685,6 +693,7 @@ impl Read {
                 .clone()
                 .map(|status| (status, Err(why.clone()))),
             issue: watch.issue.clone().map(|key| (key, Err(why.clone()))),
+            version: watch.about.then(|| Err(why.clone())),
             admin: watch.admin.then(|| {
                 (
                     Err(why.clone()),
@@ -778,6 +787,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         policy_sets,
         issues,
         issue,
+        version,
     ) = tokio::join!(
         within("the decision queue", client.decisions()),
         within("the approval queue", client.approvals()),
@@ -820,6 +830,10 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         ),
         issues,
         issue,
+        when(
+            watch.about,
+            within("the version", client.version::<dto::Version>()),
+        ),
     );
     Read {
         decisions: decisions.map(|queue| queue.open),
@@ -844,6 +858,7 @@ async fn read(client: &crux::Client, watch: &Watch) -> Read {
         policy_sets,
         issues,
         issue,
+        version,
     }
 }
 
@@ -1583,6 +1598,7 @@ impl crate::App {
                 .issue
                 .clone()
                 .filter(|_| on(crate::Page::Issues)),
+            about: on(crate::Page::Settings),
             teams: controller,
             team_audit: self.owned_team().filter(|_| on(crate::Page::Teams)),
         };
@@ -2392,6 +2408,36 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|r| r == "DELETE /api/providers/lab")
+        );
+    }
+
+    #[test]
+    fn the_controllers_version_is_read_while_settings_show_it() {
+        let (client, _requests, _keys) = worker(|line| match line {
+            ["GET", "/api/decisions"] => r#"{"open":[]}"#.into(),
+            ["GET", "/api/approvals"] => "{}".into(),
+            ["GET", "/api/version"] => {
+                r#"{"git_sha":"abc123def456","version":"0.6.1","autoresearch":true}"#.into()
+            }
+            _ => "[]".into(),
+        });
+        let elsewhere = Watch {
+            controller: true,
+            ..Watch::default()
+        };
+        client.watch(elsewhere.clone());
+        let view = until(&client, |view| view.decisions.is_some());
+        assert!(view.version.is_none());
+
+        client.watch(Watch {
+            about: true,
+            ..elsewhere
+        });
+        let view = until(&client, |view| view.version.is_some());
+        let version = view.version.unwrap().unwrap();
+        assert_eq!(
+            (version.version.as_str(), version.git_sha.as_str()),
+            ("0.6.1", "abc123def456")
         );
     }
 
