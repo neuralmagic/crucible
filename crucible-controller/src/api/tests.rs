@@ -9020,6 +9020,86 @@ async fn drafts_list_separately_from_the_registry_with_their_versions(pool: PgPo
     Ok(())
 }
 
+/// A draft's launch form reads its schema from the preview and save responses, so both carry the
+/// latest passing producer output among the draft's own runs, the way the registered schema does.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_serves_its_choices_snapshot_to_its_launch_form(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(
+        "params = {\"release\": {\"type\": \"string\", \"default\": \"\", \"choices_from\": {\"task\": \"options\", \"field\": \"releases\"}}}\n\
+         options = command(name = \"options\", run = \"./options.sh\", emits = {\"releases\": \"list\"})\n\
+         workflow(type = \"playbook\", tasks = [options])\n"
+    );
+    let (status, saved) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    let digest = saved["schema_digest"].clone();
+    assert!(digest.is_string(), "{saved}");
+
+    let key = "playbook:studio:r1";
+    sqlx::query(
+        "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) \
+         VALUES ($1, 'o/r', 0, 'done', 0, 'playbook', 't', now())",
+    )
+    .bind(key)
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, created_at) \
+         VALUES ($1, 'studio', '{}'::jsonb, 'sha256:s', 1.0, '1h', now())",
+    )
+    .bind(key)
+    .execute(&pool)
+    .await?;
+    sqlx::query("INSERT INTO runs (run_id, issue, status) VALUES ('r1', $1, 'done')")
+        .bind(key)
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO run_task_results (run_id, iter, task, status, output) \
+         VALUES ('r1', 0, 'options', 'pass', $1)",
+    )
+    .bind(serde_json::json!({"releases": ["3.6", "3.7"]}))
+    .execute(&pool)
+    .await?;
+
+    let (status, preview) = get_json_object(&app, "/api/playbook-drafts/studio/preview").await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(
+        preview["params_schema"]["properties"]["release"]["x-choices-snapshot"]["value"],
+        serde_json::json!(["3.6", "3.7"]),
+        "{preview}"
+    );
+    assert_eq!(preview["schema_digest"], digest);
+
+    let (status, resaved) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resaved}");
+    assert_eq!(
+        resaved["params_schema"]["properties"]["release"]["x-choices-snapshot"]["run_id"], "r1",
+        "{resaved}"
+    );
+    assert_eq!(resaved["schema_digest"], digest);
+    Ok(())
+}
+
 /// Compile-on-save: the version stores either way, and a refused compile answers 200 carrying the
 /// anchor the editor pins the message to.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
