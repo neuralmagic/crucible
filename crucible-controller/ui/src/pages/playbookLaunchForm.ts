@@ -33,6 +33,9 @@ export interface ParamFieldSpec {
   /// The task output whose value for the key param shows greyed out in the empty input.
   placeholderFrom: ChoicesSource | null;
   placeholderSnapshot: Snapshot<Record<string, string>> | null;
+  /// The task output whose message for the key param's value this bool must confirm.
+  confirmFrom: ChoicesSource | null;
+  confirmSnapshot: Snapshot<Record<string, string>> | null;
 }
 
 export interface ChoicesSource {
@@ -122,6 +125,7 @@ function choicesShape(keyed: boolean) {
 }
 
 const isKeyedText = keyedOf((value: unknown): value is string => typeof value === 'string');
+
 
 function boolField(
   property: Record<string, unknown>,
@@ -260,12 +264,17 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     }
     const choicesSpec = choicesSource(raw['x-choices-from']);
     const placeholderSpec = choicesSource(raw['x-placeholder-from']);
-    if (!choicesSpec.ok || !placeholderSpec.ok) {
+    const confirmSpec = choicesSource(raw['x-confirm-from']);
+    if (!choicesSpec.ok || !placeholderSpec.ok || !confirmSpec.ok) {
       return { kind: 'unrenderable', reason: `param ${name} names its options' task output in a shape this form does not read` };
     }
     const choicesFrom = choicesSpec.value;
     const placeholderFrom = placeholderSpec.value;
-    for (const source of [choicesFrom, placeholderFrom]) {
+    const confirmFrom = confirmSpec.value;
+    if (confirmFrom !== null && (valueType !== 'boolean' || confirmFrom.keyedBy === null)) {
+      return { kind: 'unrenderable', reason: `param ${name} confirms a task output but is not a keyed bool` };
+    }
+    for (const source of [choicesFrom, placeholderFrom, confirmFrom]) {
       const key = source?.keyedBy;
       if (key !== undefined && key !== null && !(isRecord(properties[key]) && valueTypeOf(properties[key]) === 'string')) {
         return { kind: 'unrenderable', reason: `param ${name} is keyed by ${key}, which is not a declared string` };
@@ -293,6 +302,8 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
       allowOther: allowOther.value,
       placeholderFrom,
       placeholderSnapshot: placeholderFrom === null ? null : snapshot(raw['x-placeholder-snapshot'], isKeyedText),
+      confirmFrom,
+      confirmSnapshot: confirmFrom === null ? null : snapshot(raw['x-confirm-snapshot'], isKeyedText),
     });
   }
   if (orderRaw !== undefined) {
@@ -373,6 +384,19 @@ export function placeholderFor(spec: ParamFieldSpec, values: Readonly<Record<str
   return spec.placeholderSnapshot.value[(values[key] ?? '').trim()] ?? null;
 }
 
+export type Confirmation = { kind: 'needed'; message: string } | { kind: 'hidden' } | { kind: 'optional' };
+
+/// Whether a confirming bool is asked for: `needed`, with the message to confirm, when the snapshot
+/// holds one for the key param's value; `hidden` when it does not; `optional` before the task has
+/// passed. Null for any other param.
+export function confirmation(spec: ParamFieldSpec, values: Readonly<Record<string, string>>): Confirmation | null {
+  const key = spec.confirmFrom?.keyedBy;
+  if (key === undefined || key === null) return null;
+  if (spec.confirmSnapshot === null) return { kind: 'optional' };
+  const message = (spec.confirmSnapshot.value[(values[key] ?? '').trim()] ?? '').trim();
+  return message === '' ? { kind: 'hidden' } : { kind: 'needed', message };
+}
+
 /// Each task the form's options come from, with the capture time of its snapshot, or `passed`
 /// false before it has one.
 export function optionSources(specs: readonly ParamFieldSpec[]): OptionSource[] {
@@ -384,6 +408,7 @@ export function optionSources(specs: readonly ParamFieldSpec[]): OptionSource[] 
   for (const spec of specs) {
     note(spec.choicesFrom, spec.choicesSnapshot);
     note(spec.placeholderFrom, spec.placeholderSnapshot);
+    note(spec.confirmFrom, spec.confirmSnapshot);
   }
   return [...byTask.values()];
 }
@@ -396,7 +421,7 @@ export interface OptionSource {
 
 /// Whether the pack has options computed by a task, which a refresh launch recomputes.
 export function refreshable(specs: readonly ParamFieldSpec[]): boolean {
-  return specs.some((spec) => spec.choicesFrom !== null || spec.placeholderFrom !== null);
+  return specs.some((spec) => spec.choicesFrom !== null || spec.placeholderFrom !== null || spec.confirmFrom !== null);
 }
 
 /// Whether a gated param's switch is on, so its value is taken; an ungated param always is.
@@ -413,7 +438,12 @@ export function validateParam(
   values?: Readonly<Record<string, string>>
 ): string | null {
   if (values !== undefined && !isEnabled(spec, values)) return null;
+  const confirm = values === undefined ? null : confirmation(spec, values);
+  if (confirm?.kind === 'hidden') return null;
   const trimmed = value.trim();
+  if (confirm?.kind === 'needed' && trimmed.toLowerCase() !== 'true') {
+    return 'Check this box to launch';
+  }
   if (trimmed.length === 0) {
     return spec.required ? `${spec.name} is required` : null;
   }
@@ -453,7 +483,8 @@ export function trimmedParams(
   const params: Record<string, string> = {};
   for (const spec of specs) {
     const value = (values[spec.name] ?? '').trim();
-    if (!isEnabled(spec, values) || (value.length === 0 && !spec.required)) continue;
+    const hidden = confirmation(spec, values)?.kind === 'hidden';
+    if (!isEnabled(spec, values) || hidden || (value.length === 0 && !spec.required)) continue;
     params[spec.name] = value;
   }
   return params;
