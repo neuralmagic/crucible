@@ -899,12 +899,16 @@ pub(crate) async fn generate_playbook_draft(
             Ok(None) => return not_found(format!("no draft {id:?}")),
             Err(e) => return draft_refusal(e),
         };
+    // Begun before the spawn so every poll during this generate reads this turn, never the tail
+    // of the draft's previous one.
+    let progress = state.draft_progress.begin(&id, body.intent.trim());
     let generated = match crate::playbooks::generate::generate(
         &state.contracts,
         body.intent.trim(),
         &context,
         max_cost,
         refine_rounds,
+        Some(progress.log()),
     )
     .await
     {
@@ -981,6 +985,71 @@ pub(crate) async fn generate_playbook_draft(
         }
         Err(e) => draft_refusal(e),
     }
+}
+
+/// One line of a drafting turn's progress, as the studio polls it: the round it belongs to and
+/// what the agent just did, already redacted by the engine.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftProgressEntryDto {
+    /// The drafting round: 1 is the drafting turn, later rounds are refines.
+    pub round: u32,
+    pub line: String,
+}
+
+/// What the draft's most recent generate did, oldest line first. Empty until the draft has
+/// generated at least once.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftProgressDto {
+    pub lines: Vec<DraftProgressEntryDto>,
+    /// Whether that generate is still running. A page reloaded mid-turn reads this to pick the
+    /// turn back up instead of showing a studio where nothing seems to be happening.
+    pub running: bool,
+    /// The intent that generate was given, so the same reloaded page can restore what the
+    /// operator typed into the box the refresh emptied.
+    pub intent: Option<String>,
+}
+
+/// `GET /api/playbook-drafts/{id}/generate/progress` — the lines of the draft's most recent
+/// generate as the engine reported them, live while the turn runs and kept after it ends so a
+/// poll racing the response still reads the tail. A draft that has never generated answers an
+/// empty list, not a refusal.
+#[utoipa::path(
+    get,
+    path = "/api/playbook-drafts/{id}/generate/progress",
+    params(("id" = String, Path, description = "Draft id")),
+    responses(
+        (status = 200, description = "The latest generate's progress lines, oldest first", body = DraftProgressDto),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No draft with that id", body = ErrorBody)
+    )
+)]
+pub(crate) async fn get_playbook_draft_generate_progress(
+    State(state): State<ApiState>,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+) -> ApiResult<Response> {
+    if let Err(refused) =
+        readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await
+    {
+        return Ok(refused);
+    }
+    let (lines, running, intent) = state
+        .draft_progress
+        .get(&id)
+        .map(|log| (log.snapshot(), log.is_running(), log.intent()))
+        .unwrap_or((Vec::new(), false, None));
+    Ok(Json(DraftProgressDto {
+        lines: lines
+            .into_iter()
+            .map(|entry| DraftProgressEntryDto {
+                round: entry.round,
+                line: entry.line,
+            })
+            .collect(),
+        running,
+        intent,
+    })
+    .into_response())
 }
 
 /// `DELETE /api/playbook-drafts/{id}` — drop a draft, every version it holds, and its secret
