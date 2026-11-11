@@ -27,6 +27,7 @@ edition = 2                                   # pack contract edition; absent = 
 url  = "https://github.com/owner/name.git"   # OR
 path = "."                                    # local path, relative to manifest dir
 ref  = "main"                                 # optional; default: clone default branch
+filter = "blob:none"                          # optional: a partial clone, every commit, file contents on demand
 
 [workspace]
 dir       = "workspace"                       # checkout dir, relative to manifest dir. default "workspace"
@@ -934,6 +935,9 @@ bound a playbook's run will apply, and refuses a malformed one.
 A `plan_admitted` event carries an additive `history_record`, the task a playbook records for
 its series or empty when it names none, and each task an additive `history_depth`, zero when it
 reads no history (contract 1.9.0).
+
+A `plan_admitted` task carries an additive `command` (contract 1.24.0): what a `command` or
+`evaluate` task runs, as the pack wrote it. It is omitted for other kinds.
 
 Additive event kinds beyond the compat set include:
 

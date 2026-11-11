@@ -207,6 +207,8 @@ pub enum CompileError {
     ParamBadPattern { param: String, detail: String },
     #[error("parameter {param:?} declares both choices and choices_from; offer one list")]
     ParamChoicesConflict { param: String },
+    #[error("parameter {param:?} declares confirm_from, but {detail}")]
+    ParamBadConfirmFrom { param: String, detail: &'static str },
     #[error("parameter {param:?} sets allow_other without choices or choices_from")]
     ParamAllowOtherWithoutChoices { param: String },
     #[error("parameter {param:?} is keyed by {keyed_by:?}, but {detail}")]
@@ -237,7 +239,8 @@ pub enum CompileError {
         inner: Box<CompileError>,
     },
     #[error(
-        "a choices refresh needs a parameter that declares choices_from, and this source has none"
+        "a choices refresh needs a parameter that declares choices_from, placeholder_from, or \
+         confirm_from, and this source has none"
     )]
     RefreshWithoutProducers,
     #[error("parameter {param:?} is enabled_by {gate:?}, which {detail}")]

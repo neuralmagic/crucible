@@ -141,6 +141,16 @@ fn form(of: crux::client::Shared, app: &App, p: &Paint) -> El {
                 .build(p.k)
                 .key("share-grantee"),
         )
+        .children(crate::ui::desk::suggestions(
+            "share-grantee-suggest",
+            &app.remote.desk.grantee.text,
+            crate::principals::Want::Principal,
+            |app: &mut App, picked: &str| {
+                app.remote.desk.grantee = rune::TextEdit::new(picked);
+            },
+            app,
+            p,
+        ))
         .child(
             SegmentedControl::new(&ROLES, Some(app.remote.desk.role))
                 .label("Role")

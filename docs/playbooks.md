@@ -410,6 +410,22 @@ show a value greyed out in its empty input, the one the pack would choose itself
 
 The field is an object from each release to one string. It is only shown, never submitted.
 
+A bool can ask the launcher to confirm a value the task has a warning for:
+
+```python
+"accept_tentative_release": {"type": "bool", "default": False,
+                             "confirm_from": {"task": "release_options", "field": "tentative",
+                                              "keyed_by": "target_release"}},
+```
+
+The field is an object from each release to a message, such as `The vLLM version for 3.7 Fast-2
+is marked "0.33.0?" in the release component sheet, so it may still change. Launch anyway?`.
+An empty or missing message means nothing to confirm. The form shows the checkbox, with the
+message beside it, only for a release that has one, and the control plane refuses that launch
+until it is checked. Before the task has passed once, the checkbox is shown with its `doc` and is
+optional. The pack should still check at run time, since the sheet can change after the last
+refresh.
+
 The launch form offers the list as a select and says how old it is. With `allow_other`, the
 select ends in "Other…", which opens a text input.
 

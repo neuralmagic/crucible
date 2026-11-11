@@ -6,7 +6,9 @@ use rune_kit::{Button, ButtonVariant, SidebarRow, Switch, TextArea, TextInput};
 
 use crate::App;
 use crate::admin::{Action, SECRET_KINDS, SecretForm, SecretView, relative};
-use crate::ui::desk::{card, field, frame, heading, landed, list, none, now, pills, reading};
+use crate::ui::desk::{
+    card, confirm, field, frame, heading, landed, list, none, now, pills, reading,
+};
 use crate::ui::{Paint, tag};
 
 const LIST: f32 = 300.0;
@@ -426,8 +428,6 @@ fn bindings(view: &SecretView, app: &App, p: &Paint) -> El {
         if !binding.declared_name.is_empty() {
             projected = format!("{} \u{2192} {projected}", binding.declared_name);
         }
-        let (secret, id) = (binding.secret_id.clone(), binding.id.clone());
-        let armed = app.remote.desk.armed.as_deref() == Some(binding.id.as_str());
         column = column.child(
             row()
                 .key(format!("binding-{}", binding.id))
@@ -447,27 +447,18 @@ fn bindings(view: &SecretView, app: &App, p: &Paint) -> El {
                         .min_w(0.0)
                         .truncate(),
                 )
-                .child(
-                    Button::new(if armed { "Confirm unbind" } else { "Unbind" })
-                        .variant(if armed {
-                            ButtonVariant::Danger
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .disabled(app.remote.desk.busy())
-                        .on_press(move |app: &mut App| {
-                            if app.remote.desk.armed.as_deref() == Some(id.as_str()) {
-                                app.act(Action::Unbind {
-                                    secret: secret.clone(),
-                                    binding: id.clone(),
-                                })
-                            } else {
-                                app.remote.desk.armed = Some(id.clone());
-                            }
-                        })
-                        .build(p.k)
-                        .key(format!("unbind-{}", binding.id)),
-                ),
+                .child(confirm(
+                    format!("unbind-{}", binding.id),
+                    &binding.id,
+                    ("Unbind", "Confirm unbind"),
+                    true,
+                    Action::Unbind {
+                        secret: binding.secret_id.clone(),
+                        binding: binding.id.clone(),
+                    },
+                    app,
+                    p,
+                )),
         );
     }
     column

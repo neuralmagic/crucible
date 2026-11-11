@@ -88,7 +88,7 @@ pub(crate) fn manifest_setup(
             }
         });
     };
-    clone_repo(src, m.repo.git_ref.as_ref(), workspace)
+    clone_repo(src, m.repo.git_ref.as_ref(), m.repo.filter, workspace)
 }
 
 /// `git clone <src> <dest>`, then `git_ref` fetched and checked out detached. A clone whose
@@ -96,10 +96,15 @@ pub(crate) fn manifest_setup(
 pub(crate) fn clone_repo(
     src: &str,
     git_ref: Option<&GitRef>,
+    filter: Option<crate::manifest::CloneFilter>,
     dest: &Path,
 ) -> Result<(), WorkspaceError> {
     let dest_arg = dest.to_string_lossy();
-    if !git(None, &["clone", "--quiet", src, &dest_arg])? {
+    let filter_arg = filter.map(|f| format!("--filter={}", f.as_str()));
+    let mut args = vec!["clone", "--quiet"];
+    args.extend(filter_arg.as_deref());
+    args.extend([src, &dest_arg]);
+    if !git(None, &args)? {
         return Err(WorkspaceError::GitCloneFailed {
             src: src.to_owned(),
             dest: dest.to_path_buf(),
@@ -254,7 +259,7 @@ mod tests {
         let clone = |name: &str, r: Option<&str>| {
             let dest = origin.path.with_extension(name);
             let _ = fs::remove_dir_all(&dest);
-            clone_repo(&src, r.map(at).as_ref(), &dest).map(|()| dest)
+            clone_repo(&src, r.map(at).as_ref(), None, &dest).map(|()| dest)
         };
 
         let plain = clone("plain", None).expect("clones");
@@ -290,10 +295,52 @@ mod tests {
     }
 
     #[test]
+    fn a_filtered_clone_is_partial_and_keeps_every_commit() {
+        let origin = crate::testing::git_origin("clone-filter");
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        assert!(
+            git(&origin.path, &["config", "uploadpack.allowFilter", "true"])
+                .status
+                .success()
+        );
+        let src = format!("file://{}", origin.path.display());
+        let dest = origin.path.with_extension("partial");
+        clone_repo(
+            &src,
+            Some(&at("feature/x")),
+            Some(crate::manifest::CloneFilter::BlobNone),
+            &dest,
+        )
+        .expect("clones");
+        assert_eq!(
+            crate::testing::checked_out(&dest),
+            (origin.feature.clone(), true)
+        );
+        let filter = git(&dest, &["config", "remote.origin.partialclonefilter"]);
+        assert_eq!(String::from_utf8_lossy(&filter.stdout).trim(), "blob:none");
+        assert!(
+            git(
+                &dest,
+                &["merge-base", "--is-ancestor", &origin.main, "HEAD"]
+            )
+            .status
+            .success(),
+            "the partial clone holds the history merge-base walks"
+        );
+    }
+
+    #[test]
     fn a_commit_is_held_by_the_branches_and_tags_whose_history_has_it() {
         let origin = crate::testing::git_origin("clone-contains");
         let dest = origin.path.with_extension("clone");
-        clone_repo(&origin.path.to_string_lossy(), None, &dest).expect("clones");
+        clone_repo(&origin.path.to_string_lossy(), None, None, &dest).expect("clones");
         let held = |commit: &str| refs_containing(&dest, &at(commit)).expect("reads refs");
         assert_eq!(held(&origin.main), ["feature/x", "main", "v1"]);
         assert_eq!(held(&origin.feature), ["feature/x"]);

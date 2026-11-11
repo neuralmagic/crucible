@@ -6986,6 +6986,77 @@ workflow(type = "playbook", tasks = [options, branches])
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    /// confirm_from is an optional bool's keyed object of flags: it reaches the schema, its
+    /// producer joins the refresh, and a declaration that could never ask is refused.
+    #[test]
+    fn a_confirmation_reads_flags_keyed_by_another_parameter() {
+        let pack = temp_pack("params-confirm");
+        let path = pack.join("workflow.star");
+        let source = r#"
+params = {
+    "release": {"type": "string", "required": True},
+    "accept_tentative": {"type": "bool", "default": False, "confirm_from": {"task": "options", "field": "tentative", "keyed_by": "release"}},
+}
+options = command(name = "options", run = "./o.sh", emits = {"tentative": "object"})
+workflow(type = "playbook", tasks = [options])
+"#;
+        std::fs::write(&path, source).unwrap();
+        let schema = declared_params(source, &path)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(
+            schema["properties"]["accept_tentative"]["x-confirm-from"],
+            serde_json::json!({"task": "options", "field": "tentative", "keyed_by": "release"})
+        );
+        let refresh = compile_refresh_file(&path, &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        assert_eq!(refresh.workflow.tasks.len(), 1);
+
+        let from = r#""confirm_from": {"task": "t", "field": "f", "keyed_by": "release"}"#;
+        let decl = |declaration: String| {
+            read_params(
+                &format!("params = {{\"release\": {{\"type\": \"string\", \"default\": \"\"}}, \"c\": {{{declaration}}}}}\n"),
+                &path,
+            )
+            .map(|_| ())
+        };
+        for (declaration, detail) in [
+            (
+                format!(r#""type": "string", "default": "", {from}"#),
+                "only a bool can confirm",
+            ),
+            (
+                format!(r#""type": "bool", "required": True, {from}"#),
+                "a required parameter is always supplied, so it confirms nothing",
+            ),
+            (
+                format!(r#""type": "bool", "default": True, {from}"#),
+                "a default of True would confirm every flagged value unasked",
+            ),
+        ] {
+            assert!(
+                matches!(decl(declaration.clone()), Err(CompileError::ParamBadConfirmFrom { detail: d, .. }) if d == detail),
+                "{declaration}"
+            );
+        }
+        assert!(matches!(
+            decl(
+                r#""type": "bool", "default": False, "confirm_from": {"task": "t", "field": "f"}"#
+                    .to_owned()
+            ),
+            Err(CompileError::ParamFieldWrongShape {
+                field: "confirm_from",
+                ..
+            })
+        ));
+
+        let listy = source.replace(r#""tentative": "object""#, r#""tentative": "list""#);
+        assert!(matches!(
+            compile_source_with(&listy, &path, &pack, &BTreeMap::from([("release".to_owned(), "a".to_owned())])),
+            Err(CompileError::ParamChoicesFromInvalid { param, .. }) if param == "accept_tentative"
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
     /// A refresh compiles the producer and what it depends on, without the required parameter the
     /// rest of the graph reads, and hands its command tasks no parameters.
     #[test]

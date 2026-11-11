@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::net::Handle;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use sha2::{Digest, Sha256};
-use tokio::runtime::Handle;
 
 use crate::profile::Target;
 

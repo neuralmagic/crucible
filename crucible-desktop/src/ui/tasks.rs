@@ -170,6 +170,18 @@ fn card(
     }
 
     let mut body = col().w_full().gap(6.0).child(title);
+    if let Some((first, more)) = task.command_brief().filter(|_| !open) {
+        let more = match more {
+            0 => String::new(),
+            n => format!("  +{n}"),
+        };
+        body = body.child(
+            text(format!("$ {first}{more}"))
+                .font(p.mono(10.5, 400.0))
+                .color(p.c.text_muted)
+                .truncate(),
+        );
+    }
     let facts = facts(task, activity);
     if !facts.is_empty() {
         body = body.child(
@@ -655,6 +667,17 @@ fn expanded(
     }
     panel = panel.child(grid);
 
+    if !task.command.trim().is_empty() {
+        panel = panel.child(section("Runs", p)).child(
+            text(task.command.trim().to_string())
+                .key(format!("task-command-{}", task.name))
+                .font(p.mono(10.5, 400.0))
+                .color(p.c.text_base)
+                .selectable(true)
+                .selection_color(p.k.selection())
+                .wrap(),
+        );
+    }
     if !task.instances.is_empty() {
         panel = panel
             .child(section("Instances", p))

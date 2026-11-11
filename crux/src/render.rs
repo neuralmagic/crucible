@@ -3000,6 +3000,7 @@ mod tests {
                 last_delivery_at: Some("2026-09-29T12:00:00Z".to_string()),
                 consecutive_failures: 0,
                 owner_principal: Some("user:wren".to_string()),
+                ..dto::Webhook::default()
             },
             dto::Webhook {
                 id: "w2".to_string(),
@@ -3010,6 +3011,7 @@ mod tests {
                 last_delivery_at: None,
                 consecutive_failures: 2,
                 owner_principal: None,
+                ..dto::Webhook::default()
             },
         ];
         let out = webhooks(&list);

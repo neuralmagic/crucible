@@ -3,11 +3,13 @@
 
 use std::path::PathBuf;
 
+#[cfg(not(target_arch = "wasm32"))]
 /// The service the system credential store files keys under; the account is the profile's name.
 const SERVICE: &str = "crucible-playbooks";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Store {
+    #[cfg(not(target_arch = "wasm32"))]
     Keychain,
     /// One `<profile>.toml` per key in this folder, in crux's config format.
     Dir(PathBuf),
@@ -17,6 +19,7 @@ impl Store {
     /// `profile`'s key, when one is kept.
     pub fn key(&self, profile: &str) -> Result<Option<String>, String> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Store::Keychain => match entry(profile)?.get_password() {
                 Ok(key) => Ok(Some(key)),
                 Err(keyring::Error::NoEntry) => Ok(None),
@@ -39,6 +42,7 @@ impl Store {
     /// Keep `key` as `profile`'s, the controller at `url`.
     pub fn save(&self, profile: &str, url: &str, key: String) -> Result<(), String> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Store::Keychain => entry(profile)?
                 .set_password(&key)
                 .map_err(|error| format!("keeping {profile}'s key in the keychain: {error}")),
@@ -55,6 +59,7 @@ impl Store {
     /// Drop `profile`'s key. No key kept is not an error.
     pub fn forget(&self, profile: &str) -> Result<(), String> {
         match self {
+            #[cfg(not(target_arch = "wasm32"))]
             Store::Keychain => match entry(profile)?.delete_credential() {
                 Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
                 Err(error) => Err(format!(
@@ -107,6 +112,7 @@ impl Store {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn entry(profile: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(SERVICE, profile).map_err(|error| format!("opening the keychain: {error}"))
 }

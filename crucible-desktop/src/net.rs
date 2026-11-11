@@ -8,24 +8,56 @@
 //! ```
 
 use std::future::Future;
+#[cfg(not(target_arch = "wasm32"))]
 use std::mem::ManuallyDrop;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::runtime::{Handle, Runtime};
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::runtime::Runtime;
 
-use crate::httpcache::{CachedTransport, Store};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::httpcache::CachedTransport;
+use crate::httpcache::Store;
 use crate::profile::Target;
 
 const TIMEOUT: Duration = Duration::from_secs(25);
 
+/// Where tasks run: the shared tokio runtime, or the browser's own loop.
+#[cfg(not(target_arch = "wasm32"))]
+pub type Handle = tokio::runtime::Handle;
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+pub struct Handle;
+
+#[cfg(target_arch = "wasm32")]
+impl Handle {
+    pub fn spawn(&self, task: impl Future<Output = ()> + 'static) {
+        wasm_bindgen_futures::spawn_local(task);
+    }
+}
+
 pub struct Net {
     /// Never shut down.
+    #[cfg(not(target_arch = "wasm32"))]
     runtime: Result<ManuallyDrop<Runtime>, String>,
     store: Option<Arc<Store>>,
 }
 
+#[cfg(target_arch = "wasm32")]
+impl Net {
+    pub fn start() -> Net {
+        Net { store: None }
+    }
+
+    pub fn handle(&self) -> Result<Handle, String> {
+        Ok(Handle)
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 impl Net {
     pub fn start() -> Net {
         let store = crate::httpcache::cache_root()
@@ -57,7 +89,9 @@ impl Net {
             Err(why) => Err(why.clone()),
         }
     }
+}
 
+impl Net {
     /// `target`'s connection, read through the response cache.
     pub fn connector(&self, target: Target) -> Connector {
         Connector::new(target, self.handle(), self.store.clone())
@@ -120,13 +154,25 @@ impl Connector {
         let config = self.target.config()?;
         let wire = crux::client::HttpTransport::with_client(&config, self.target.http()?)
             .map_err(|error| format!("{error:#}"))?;
-        let transport: Arc<dyn crux::client::Transport> = match &self.store {
+        let acting = self.target.act_as().cloned();
+        let cached = self.store.as_ref().filter(|_| acting.is_none());
+        let wire = match acting {
+            Some(act_as) => wire.acting_as(act_as),
+            None => wire,
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let transport: Arc<dyn crux::client::Transport> = match cached {
             Some(store) => Arc::new(CachedTransport::new(
                 Arc::new(wire),
                 Arc::clone(store),
                 Arc::clone(&self.offline),
             )),
             None => Arc::new(wire),
+        };
+        #[cfg(target_arch = "wasm32")]
+        let transport: Arc<dyn crux::client::Transport> = {
+            let _ = cached;
+            Arc::new(wire)
         };
         let connection = Connection {
             client: crux::Client::new(transport),
@@ -143,9 +189,9 @@ impl Connector {
             return Ok(connection);
         }
         let connector = self.clone();
-        tokio::task::spawn_blocking(move || connector.connection())
+        blocking(move || connector.connection())
             .await
-            .map_err(|error| format!("opening the connection: {error}"))?
+            .ok_or_else(|| "opening the connection stopped early".to_string())?
     }
 
     /// Forget the open connection, so the next one reads the profile's key afresh.
@@ -181,17 +227,39 @@ impl Connection {
         self.runtime.block_on(work)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        self.runtime.spawn(task);
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub fn spawn(&self, task: impl Future<Output = ()> + 'static) {
         self.runtime.spawn(task);
     }
 }
 
 /// A task on the shared runtime that ends when this is dropped.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct Task(tokio::task::AbortHandle);
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Task {
     pub fn spawn(runtime: &Handle, work: impl Future<Output = ()> + Send + 'static) -> Task {
         Task(runtime.spawn(work).abort_handle())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub struct Task(futures_util::future::AbortHandle);
+
+#[cfg(target_arch = "wasm32")]
+impl Task {
+    pub fn spawn(runtime: &Handle, work: impl Future<Output = ()> + 'static) -> Task {
+        let (work, handle) = futures_util::future::abortable(work);
+        runtime.spawn(async move {
+            let _ = work.await;
+        });
+        Task(handle)
     }
 }
 
@@ -199,6 +267,44 @@ impl Drop for Task {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+/// `work` on the blocking pool, or in place in the browser. `None` when it stopped early.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> Option<T> {
+    tokio::task::spawn_blocking(work).await.ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn blocking<T: 'static>(work: impl FnOnce() -> T + 'static) -> Option<T> {
+    Some(work())
+}
+
+pub struct Elapsed;
+
+/// `work`'s answer, or [`Elapsed`] when `limit` passed first.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn timeout<F: Future>(limit: Duration, work: F) -> Result<F::Output, Elapsed> {
+    tokio::time::timeout(limit, work).await.map_err(|_| Elapsed)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn timeout<F: Future>(limit: Duration, work: F) -> Result<F::Output, Elapsed> {
+    tokio::select! {
+        answer = work => Ok(answer),
+        () = sleep(limit) => Err(Elapsed),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn sleep(wait: Duration) {
+    tokio::time::sleep(wait).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn sleep(wait: Duration) {
+    let millis = u32::try_from(wait.as_millis()).unwrap_or(u32::MAX);
+    gloo_timers::future::TimeoutFuture::new(millis).await;
 }
 
 /// Why a controller cannot be read.
@@ -230,13 +336,13 @@ pub async fn reaching<T>(
     what: &str,
     call: impl Future<Output = anyhow::Result<T>>,
 ) -> Result<T, Down> {
-    match tokio::time::timeout(TIMEOUT, call).await {
+    match timeout(TIMEOUT, call).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => {
             let unsent = error
                 .chain()
                 .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
-                .any(|sent| sent.is_connect() || sent.is_timeout() || sent.is_request());
+                .any(unsent);
             Err(if unsent {
                 Down::Unreached(error.root_cause().to_string())
             } else {
@@ -250,12 +356,22 @@ pub async fn reaching<T>(
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn unsent(error: &reqwest::Error) -> bool {
+    error.is_connect() || error.is_timeout() || error.is_request()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn unsent(error: &reqwest::Error) -> bool {
+    error.is_timeout() || error.is_request()
+}
+
 /// `call`'s answer, or that it timed out after [`TIMEOUT`].
 pub async fn within<T, E: std::fmt::Display>(
     what: &str,
     call: impl Future<Output = Result<T, E>>,
 ) -> Result<T, String> {
-    match tokio::time::timeout(TIMEOUT, call).await {
+    match timeout(TIMEOUT, call).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(format!("{error:#}")),
         Err(_) => Err(format!("{what} timed out after {}s", TIMEOUT.as_secs())),
@@ -272,6 +388,43 @@ mod tests {
     use crate::net::{Down, Net, reaching};
     use crate::profile::{Profile, Target};
     use crate::testserver::{serve, target};
+
+    #[test]
+    fn a_target_acting_as_a_team_says_so_on_every_request_and_keeps_a_refusal() {
+        use crate::testserver::{Reply, serve_replies};
+
+        let (url, _) = serve_replies(|asked| match asked.header("x-crucible-act-as") {
+            Some("team:closed") => Reply {
+                status: 403,
+                headers: vec![("x-crucible-act-as", "refused".into())],
+                body: r#"{"error":"you are not a member of team:closed"}"#.into(),
+            },
+            Some(team) => Reply::ok(format!(r#"{{"user":"{team}"}}"#)),
+            None => Reply::ok(r#"{"user":"wynn"}"#.into()),
+        });
+        let keys = tempfile::tempdir().unwrap();
+        let net = Net::uncached_for_tests();
+        let whoami = |target: &Target| {
+            let c = net.connector(target.clone()).connection().unwrap();
+            c.call::<serde_json::Value, _>("whoami", c.client.get("/api/whoami"))
+        };
+
+        let me = target("t", &url, keys.path());
+        assert_eq!(whoami(&me).unwrap()["user"], "wynn");
+
+        let infra = me.clone().acting_as(Some("team:infra".into()));
+        assert_eq!(whoami(&infra).unwrap()["user"], "team:infra");
+        assert_eq!(infra.act_as().and_then(|a| a.refused()), None);
+
+        let closed = me.clone().acting_as(Some("team:closed".into()));
+        let refusal = whoami(&closed).unwrap_err();
+        assert!(refusal.contains("not a member"), "{refusal}");
+        assert_eq!(
+            closed.act_as().and_then(|a| a.refused()).as_deref(),
+            Some("you are not a member of team:closed")
+        );
+        assert!(closed.acting_as(None).act_as().is_none());
+    }
 
     #[test]
     fn every_clone_of_a_connector_uses_the_one_connection() {

@@ -61,6 +61,7 @@ added = [
     "a route may put declared JSON files of its dependencies in the decision model's state (C-ROUTE-FILES)",
     "[repo.overrides] and [agent.overrides]: static bounds on the refs and per-task agent settings a launch may change (C-MANIFEST)",
     "a choice may read its options from a dependency's field at run time, per element on a mapped route, bounded at 64 and recorded with the answer; a when on it lists only uncertain or declares otherwise (C-ROUTE-OPTIONS)",
+    "[repo].filter = \"blob:none\": a partial clone that keeps every commit (C-MANIFEST)",
 ]
 changed = [
     "DSL grammar admits dictionaries, conditionals, comprehensions, iteration, user-defined functions, load() and the pure standard library",

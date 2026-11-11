@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Mono } from '../ui';
 import { CheckField, FormGrid, SelectField, TextAreaField, TextField } from './formControls';
 import {
+  confirmation,
   isEnabled,
   offeredChoices,
   paramBlocks,
@@ -64,6 +65,24 @@ export function PlaybookParamFields({
         spec.description ??
         (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined)),
     };
+    const confirm = confirmation(spec, values);
+    if (confirm?.kind === 'hidden') return null;
+    if (confirm !== null) {
+      return (
+        <CheckField
+          key={spec.name}
+          id={field.id}
+          label={field.label}
+          required={confirm.kind === 'needed'}
+          checked={field.value.trim().toLowerCase() === 'true'}
+          onChange={(checked) => {
+            onChange(spec.name, checked ? 'true' : 'false');
+          }}
+          description={confirm.kind === 'needed' ? confirm.message : (spec.description ?? undefined)}
+          error={field.error}
+        />
+      );
+    }
     const offered = offeredChoices(spec, values);
     const placeholder = placeholderFor(spec, values) ?? undefined;
     if (offered !== null) {

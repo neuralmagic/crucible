@@ -139,9 +139,10 @@ impl Client {
             waker: None,
         }));
         let worker = Arc::clone(&shared);
-        if let Err(error) = std::thread::Builder::new()
-            .name("crucible-playbooks".into())
-            .spawn(move || run_client(repo, rx, worker))
+        if crate::LOCAL_PACKS
+            && let Err(error) = std::thread::Builder::new()
+                .name("crucible-playbooks".into())
+                .spawn(move || run_client(repo, rx, worker))
         {
             publish(
                 &shared,

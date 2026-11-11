@@ -12,10 +12,10 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::net::Handle;
 use crucible_contract::pack_tree::walk_dir;
 use rune::Waker;
 use serde::{Deserialize, Serialize};
-use tokio::runtime::Handle;
 use tokio::sync::watch;
 
 use crate::pack::PackFiles;
@@ -276,9 +276,8 @@ async fn watch_copy(
         let next = match draft {
             Some(draft) => {
                 let (root, before) = (root.clone(), last.clone());
-                tokio::task::spawn_blocking(move || WorkingCopy::read(&root, &draft, before))
+                crate::net::blocking(move || WorkingCopy::read(&root, &draft, before))
                     .await
-                    .ok()
                     .flatten()
             }
             None => None,
@@ -308,7 +307,7 @@ async fn watch_copy(
                     return;
                 }
             }
-            () = tokio::time::sleep(REREAD) => {}
+            () = crate::net::sleep(REREAD) => {}
         }
     }
 }

@@ -41,7 +41,8 @@ impl Drop for TelemetryGuard {
 /// default is already set) and returns an inert guard. Call once at startup, inside a tokio runtime
 /// when OTLP might be enabled.
 pub fn init(db_url: &str) -> TelemetryGuard {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rmcp=warn"));
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")

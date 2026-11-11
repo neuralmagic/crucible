@@ -7,6 +7,7 @@ import type { components } from '../api/schema';
 import {
   Breadcrumb,
   Button,
+  CopyButton,
   Empty,
   LoadingBlock,
   Mono,
@@ -592,22 +593,31 @@ function DraftStudio({ id }: { id: string }) {
             <ul className="m-0 grid list-none gap-1 p-0" data-testid="draft-diagnostics">
               {diagnostics.map((diagnostic, index) => {
                 const anchor = anchorOf(diagnostic, paths);
+                const location =
+                  anchor === null ? null : `${anchor.file}:${anchor.line}:${anchor.col}`;
                 return (
-                  <li key={`${diagnostic.message}-${index}`}>
-                    <button
-                      type="button"
-                      disabled={anchor === null}
-                      onClick={() => {
-                        if (anchor === null) return;
-                        dispatch({ kind: 'select', file: anchor.file });
-                        setFocus({ line: anchor.line, col: anchor.col, nonce: Date.now() });
-                      }}
-                      className="w-full cursor-pointer border border-red bg-surface px-3 py-2 text-left font-mono text-data whitespace-pre-wrap text-red hover:bg-hi"
-                    >
-                      {anchor === null
-                        ? diagnostic.message
-                        : `${anchor.file}:${anchor.line}:${anchor.col}\n${diagnostic.message}`}
-                    </button>
+                  <li
+                    key={`${diagnostic.message}-${index}`}
+                    className="relative border border-red bg-surface py-2 pr-9 pl-3 font-mono text-data whitespace-pre-wrap text-red"
+                  >
+                    <CopyButton
+                      value={location === null ? diagnostic.message : `${location}\n${diagnostic.message}`}
+                      label="diagnostic"
+                      className="absolute top-1 right-1"
+                    />
+                    {anchor === null ? null : (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          dispatch({ kind: 'select', file: anchor.file });
+                          setFocus({ line: anchor.line, col: anchor.col, nonce: Date.now() });
+                        }}
+                        className="block cursor-pointer border-0 bg-transparent p-0 text-left font-mono text-data text-red underline hover:text-ink"
+                      >
+                        {location}
+                      </button>
+                    )}
+                    {diagnostic.message}
                   </li>
                 );
               })}

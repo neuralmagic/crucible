@@ -1378,7 +1378,12 @@ pub fn validate_params(
                         if crate::playbooks::choices::outside_snapshot(
                             property,
                             v,
-                            crate::playbooks::choices::key_value(schema, property, params),
+                            crate::playbooks::choices::key_value(
+                                schema,
+                                property,
+                                "x-choices-from",
+                                params,
+                            ),
                         ) =>
                     {
                         errors.push(FieldError {
@@ -1425,6 +1430,20 @@ pub fn validate_params(
             });
         }
     }
+    let properties = schema
+        .get("properties")
+        .and_then(serde_json::Value::as_object);
+    for (name, property) in properties.into_iter().flatten() {
+        if let Some(message) =
+            crate::playbooks::choices::confirmation_needed(schema, property, params)
+            && typed.get(name) != Some(&serde_json::Value::Bool(true))
+        {
+            errors.push(FieldError {
+                field: name.clone(),
+                message: format!("set {name} to true to launch with this value: {message}"),
+            });
+        }
+    }
     let unread: Vec<String> = errors.iter().map(|e| e.field.clone()).collect();
     errors.extend(
         validator
@@ -1448,7 +1467,7 @@ pub fn validate_params(
 }
 
 /// A choices refresh carries `choices.refresh = true` alone, and only a playbook that declares
-/// choices_from or placeholder_from has anything to refresh. The declared params' schema does not apply: a refresh
+/// choices_from, placeholder_from, or confirm_from has anything to refresh. The declared params' schema does not apply: a refresh
 /// compiles without them.
 fn validate_refresh(
     schema: &serde_json::Value,
@@ -1472,8 +1491,8 @@ fn validate_refresh(
     if !refreshable(schema) {
         return refuse(
             CHOICES_REFRESH,
-            "this playbook declares no choices_from or placeholder_from parameter, so there is \
-             nothing to refresh",
+            "this playbook declares no choices_from, placeholder_from, or confirm_from \
+             parameter, so there is nothing to refresh",
         );
     }
     Ok(serde_json::json!({ CHOICES_REFRESH: "true" }))
@@ -1485,8 +1504,11 @@ fn refreshable(schema: &serde_json::Value) -> bool {
         .get("properties")
         .and_then(serde_json::Value::as_object)
         .is_some_and(|p| {
-            p.values()
-                .any(|v| v.get("x-choices-from").is_some() || v.get("x-placeholder-from").is_some())
+            p.values().any(|v| {
+                ["x-choices-from", "x-placeholder-from", "x-confirm-from"]
+                    .iter()
+                    .any(|from| v.get(from).is_some())
+            })
         })
 }
 

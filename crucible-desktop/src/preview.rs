@@ -3,10 +3,13 @@
 //! the admitted plan folds like the first line of a run's session, so the graph, tasks and
 //! declared fields show what a launch would start.
 
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[cfg(not(target_arch = "wasm32"))]
 use crucible::plan::starlark::{compile_file_with, declared_params, parent_or_cwd, placeholder};
+#[cfg(not(target_arch = "wasm32"))]
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -66,17 +69,31 @@ impl Problem {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Deserialize)]
 struct Manifest {
     workflow: Option<WorkflowTable>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Deserialize)]
 struct WorkflowTable {
     file: Option<String>,
 }
 
+#[cfg(target_arch = "wasm32")]
+pub fn compile(pack: &Path) -> Preview {
+    Preview {
+        problems: vec![Problem::new(
+            "packs compile in the desktop app, not the browser".into(),
+            pack,
+        )],
+        ..Preview::default()
+    }
+}
+
 /// Compile the pack at `pack`. Blocking: the engine reads and evaluates its source.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn compile(pack: &Path) -> Preview {
     let mut preview = Preview::default();
     let refuse = |preview: &mut Preview, message: String| {
@@ -145,6 +162,7 @@ pub fn compile(pack: &Path) -> Preview {
 
 /// The value each declared param compiles with: its declared default, else for a required one a
 /// stand-in derived from its declaration, so a pack nobody has filled a form for still compiles.
+#[cfg(not(target_arch = "wasm32"))]
 fn defaults(schema: &Value) -> BTreeMap<String, String> {
     let properties = schema.get("properties").and_then(Value::as_object);
     let mut out: BTreeMap<String, String> = properties
@@ -240,6 +258,8 @@ mod tests {
         assert_eq!(fix.over, "scan.cves");
         assert_eq!(fix.state(), TaskState::Pending);
         assert_eq!(preview.fold.tasks[0].emits[0].field, "cves");
+        assert_eq!(preview.fold.tasks[0].command, "true");
+        assert_eq!(fix.command, "");
     }
 
     #[test]

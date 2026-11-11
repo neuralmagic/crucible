@@ -179,6 +179,8 @@ pub struct Settings {
     pub crt: bool,
     /// Keep profile keys in the system credential store, not in files.
     pub keychain: bool,
+    /// Ask GitHub once a day whether a newer release exists.
+    pub updates: bool,
     /// Announce the signed-in user's runs as they finish.
     pub notify: bool,
     /// Announce decision requests the signed-in user may answer as they open.
@@ -197,6 +199,8 @@ pub struct Settings {
     profiles: BTreeMap<String, toml::Value>,
     /// The profile in use, by name.
     pub profile: Option<String>,
+    /// The team each profile acts as (`team:<slug>`), by profile name.
+    act_as: BTreeMap<String, String>,
     /// The cost and time ceilings a pack folder dropped on the app is test-fired under.
     pub drop_max_cost: f64,
     pub drop_max_time: String,
@@ -220,6 +224,7 @@ struct Config {
     zoom: Option<f32>,
     crt: Option<bool>,
     keychain: Option<bool>,
+    check_updates: Option<bool>,
     notify: Option<bool>,
     notify_decisions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -235,6 +240,9 @@ struct Config {
     drop_max_cost: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     drop_max_time: Option<String>,
+    /// The team each profile acts as, by profile name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    act_as: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     profiles: BTreeMap<String, toml::Value>,
 }
@@ -283,6 +291,7 @@ impl Settings {
                 .unwrap_or(1.0),
             crt: config.crt.unwrap_or(true),
             keychain: config.keychain.unwrap_or(false),
+            updates: config.check_updates.unwrap_or(true),
             notify: config.notify.unwrap_or(true),
             ask: config.notify_decisions.unwrap_or(true),
             editor: config.editor,
@@ -292,6 +301,7 @@ impl Settings {
             checks: config.checks.unwrap_or(true),
             profiles: config.profiles,
             profile: config.profile,
+            act_as: config.act_as,
             drop_max_cost: config
                 .drop_max_cost
                 .filter(|c| c.is_finite() && *c > 0.0)
@@ -356,6 +366,21 @@ impl Settings {
         Ok(())
     }
 
+    /// The team profile `name` acts as.
+    pub fn act_as(&self, name: &str) -> Option<String> {
+        self.act_as.get(name).cloned()
+    }
+
+    pub fn set_act_as(&mut self, name: &str, team: Option<String>) {
+        let changed = match team {
+            Some(team) => self.act_as.insert(name.to_string(), team.clone()) != Some(team),
+            None => self.act_as.remove(name).is_some(),
+        };
+        if changed {
+            self.save();
+        }
+    }
+
     pub fn use_profile(&mut self, name: &str) {
         if self.profile.as_deref() != Some(name) {
             self.profile = Some(name.to_string());
@@ -370,11 +395,13 @@ impl Settings {
 
     /// The system credential store when `keychain`, else the key files.
     pub fn keys_in(&self, keychain: bool) -> crate::keys::Store {
+        #[cfg(not(target_arch = "wasm32"))]
         if keychain {
-            crate::keys::Store::Keychain
-        } else {
-            crate::keys::Store::Dir(self.keys_dir())
+            return crate::keys::Store::Keychain;
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = keychain;
+        crate::keys::Store::Dir(self.keys_dir())
     }
 
     fn keys_dir(&self) -> PathBuf {
@@ -419,6 +446,11 @@ impl Settings {
 
     pub fn set_checks(&mut self, on: bool) {
         self.checks = on;
+        self.save();
+    }
+
+    pub fn set_updates(&mut self, on: bool) {
+        self.updates = on;
         self.save();
     }
 
@@ -482,6 +514,7 @@ impl Settings {
             zoom: Some(self.zoom),
             crt: Some(self.crt),
             keychain: Some(self.keychain),
+            check_updates: Some(self.updates),
             notify: Some(self.notify),
             notify_decisions: Some(self.ask),
             editor: self.editor,
@@ -490,6 +523,7 @@ impl Settings {
             keys: self.keys.clone(),
             checks: Some(self.checks),
             profile: self.profile.clone(),
+            act_as: self.act_as.clone(),
             profiles: self.profiles.clone(),
             drop_max_cost: Some(self.drop_max_cost),
             drop_max_time: Some(self.drop_max_time.clone()),
@@ -652,6 +686,21 @@ mod tests {
     use crate::settings::*;
 
     #[test]
+    fn the_update_check_is_on_until_turned_off_and_stays_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert!(settings.updates);
+        settings.set_updates(false);
+        assert!(!Settings::load_from(path.clone()).updates);
+        assert!(
+            fs::read_to_string(&path)
+                .unwrap()
+                .contains("check_updates = false")
+        );
+    }
+
+    #[test]
     fn with_no_profiles_of_its_own_the_app_takes_the_tauri_apps() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("crucible-playbooks").join("config.toml");
@@ -743,6 +792,27 @@ proxxy = "socks5://127.0.0.1:1080"
             "removing the profile in use forgets it"
         );
         assert!(!after.profiles().contains_key("jump"));
+    }
+
+    #[test]
+    fn the_team_a_profile_acts_as_is_kept_per_profile_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible-playbooks").join("config.toml");
+        let mut settings = Settings::load_from(path.clone());
+        assert_eq!(settings.act_as("mpp"), None);
+
+        settings.set_act_as("mpp", Some("team:infra".into()));
+        settings.set_act_as("local", Some("team:lab".into()));
+        let read = Settings::load_from(path.clone());
+        assert_eq!(read.act_as("mpp").as_deref(), Some("team:infra"));
+        assert_eq!(read.act_as("local").as_deref(), Some("team:lab"));
+
+        settings.set_act_as("mpp", None);
+        let read = Settings::load_from(path.clone());
+        assert_eq!(read.act_as("mpp"), None);
+        assert_eq!(read.act_as("local").as_deref(), Some("team:lab"));
+        settings.set_act_as("local", None);
+        assert!(!fs::read_to_string(&path).unwrap().contains("act_as"));
     }
 
     #[test]

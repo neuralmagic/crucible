@@ -497,6 +497,8 @@ export interface CheckFieldProps {
   checked: boolean;
   onChange: (checked: boolean) => void;
   description?: ReactNode;
+  required?: boolean;
+  error?: string | null;
 }
 
 interface CheckProps {
@@ -520,15 +522,21 @@ export function Check({ id, checked, onChange, label }: CheckProps) {
   );
 }
 
-export function CheckField({ id, label, checked, onChange, description }: CheckFieldProps) {
+export function CheckField({ id, label, checked, onChange, description, required = false, error }: CheckFieldProps) {
   return (
     <div className="grid gap-1.5">
       <div className="flex items-center gap-2">
         <Check id={id} checked={checked} onChange={onChange} />
         <label htmlFor={id} className="cursor-pointer text-ink">
           {label}
+          {required && <span className="ml-1 text-red">*</span>}
         </label>
       </div>
+      {error ? (
+        <p role="alert" className="m-0 max-w-[66ch] pl-5.5 text-data-lg text-red">
+          {error}
+        </p>
+      ) : null}
       {description !== undefined && <p className={cn('m-0 pl-5.5', HINT)}>{description}</p>}
     </div>
   );
