@@ -36,7 +36,9 @@ file there and edit it in place. The seed context is still under `_draft_context
 (`GOAL.md`, `workflow-dsl.md`, `example/`, `current/`).
 
 Do not fix a finding by deleting the task or file that triggered it unless the intent truly
-does not need it; the human's diff shows a hollowed-out pack for what it is.
+does not need it; the human's diff shows a hollowed-out pack for what it is. The same holds for
+the intent's named tools: a fix that swaps the campaign runner, just recipe, or CLI the intent
+calls for something more familiar is a wrong fix, not a simpler one.
 
 If, after diagnosing, you conclude the intent cannot be carried by a playbook pack at all, that
 is a legitimate outcome: write `REJECTED.md` in the output directory explaining specifically
