@@ -855,6 +855,20 @@ pub async fn publish_draft(
     {
         return Err(RegisterError::Conflict(msg));
     }
+    if let PlaybookSource::Draft { draft, .. } = &source {
+        let held =
+            sqlx::query_scalar::<_, String>("SELECT id FROM playbooks WHERE source_draft = $1")
+                .bind(draft)
+                .fetch_optional(pool)
+                .await
+                .context("reading the playbook this draft already publishes into")?;
+        if let Some(held) = held.filter(|held| held != &req.id) {
+            return Err(RegisterError::Conflict(format!(
+                "draft {draft} already publishes into {held}; publish into {held} again or \
+                 delete that playbook before naming another"
+            )));
+        }
+    }
 
     let extracted = tokio::task::spawn_blocking(move || {
         let mut req = req;
@@ -1990,11 +2004,15 @@ mod tests {
     }
 
     fn publication(id: &str, tree: PackTree, replaces: bool) -> PublishDraft {
+        publication_of(id, "studio", tree, replaces)
+    }
+
+    fn publication_of(id: &str, draft: &str, tree: PackTree, replaces: bool) -> PublishDraft {
         PublishDraft {
             id: id.to_string(),
             owner: crate::authz::model::Principal::platform(),
             description: "a published draft".to_string(),
-            draft: "studio".to_string(),
+            draft: draft.to_string(),
             version: 3,
             tree,
             replaces,
@@ -2046,7 +2064,13 @@ mod tests {
             Err(RegisterError::Conflict(msg)) => assert!(msg.contains("registered"), "{msg}"),
             other => panic!("a row that appeared since authorization refuses: {other:?}"),
         }
-        match publish_draft(&pool, publication("fresh", tree.clone(), true), None).await {
+        match publish_draft(
+            &pool,
+            publication_of("fresh", "other", tree.clone(), true),
+            None,
+        )
+        .await
+        {
             Err(RegisterError::Conflict(msg)) => assert!(msg.contains("deleted"), "{msg}"),
             other => panic!("a row that vanished since authorization refuses: {other:?}"),
         }
@@ -2101,6 +2125,29 @@ mod tests {
             other => panic!("expected a compile refusal, got {other:?}"),
         }
         assert!(list(&pool).await.expect("list").is_empty());
+    }
+
+    /// One draft publishes into at most one playbook: naming a second playbook for a draft that
+    /// already holds one is refused naming the playbook it holds, not left to the unique index.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_published_draft_refuses_a_second_playbook_name(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tree = draft_tree(&dir.path().join("draft"));
+
+        publish_draft(&pool, publication("survey", tree.clone(), false), None)
+            .await
+            .expect("publish");
+        match publish_draft(&pool, publication("elsewhere", tree.clone(), false), None).await {
+            Err(RegisterError::Conflict(msg)) => assert!(
+                msg.contains("survey") && msg.contains("studio"),
+                "the refusal names the held playbook and the draft: {msg}"
+            ),
+            other => panic!("a second name for a published draft refuses: {other:?}"),
+        }
+        assert!(get(&pool, "elsewhere").await.expect("get").is_none());
+        publish_draft(&pool, publication("survey", tree, true), None)
+            .await
+            .expect("re-pinning the held playbook still lands");
     }
 
     /// A draft whose delivered tarball is over the delivery budget is refused at publication.
