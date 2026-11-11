@@ -60,6 +60,22 @@ jobs:
           bun install --frozen-lockfile
           bun run build
 
+      # The controller embeds the desktop app's browser build under /next.
+      - name: wasm-bindgen version
+        id: bindgen
+        run: python3 -c 'import tomllib; print("version=" + next(p["version"] for p in tomllib.load(open("crucible-desktop/Cargo.lock","rb"))["package"] if p["name"]=="wasm-bindgen"))' >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
+
+      - name: Build /next
+        run: |
+          sh crucible-desktop/rune-patches.sh
+          rustup target add wasm32-unknown-unknown
+          cd crucible-desktop
+          RUSTFLAGS= CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist
+
       - name: Build release binaries
         env:
           CRUCIBLE_GIT_SHA: ${{ github.sha }}

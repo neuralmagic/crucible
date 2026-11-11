@@ -248,6 +248,7 @@ async fn native_router(pool: &PgPool, provider: Arc<OidcProvider>) -> axum::Rout
             issuer: None,
         },
         crate::spa::Source::Embedded,
+        crate::spa::Source::Embedded,
     )
 }
 
@@ -835,4 +836,45 @@ async fn a_desktop_app_signs_in_through_the_browser_and_gets_a_working_key(pool:
         Some("access_denied")
     );
     assert!(!params.contains_key("code"));
+}
+
+/// The Rune web build under `/next` sits behind the same session as the React SPA: a visitor is
+/// sent to sign in and back, and the session that comes out opens it.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn the_next_ui_needs_the_same_session_as_the_spa(pool: PgPool) {
+    let Some(base) = keycloak().await else { return };
+    let provider = Arc::new(OidcProvider::new(cfg(&base)).expect("provider"));
+    let app = native_router(&pool, provider).await;
+    let page = |cookie: Option<&str>| {
+        let mut b = Request::get("/next/").header(header::ACCEPT, "text/html");
+        if let Some(cookie) = cookie {
+            b = b.header(header::COOKIE, cookie);
+        }
+        b.body(Body::empty()).expect("request")
+    };
+
+    let anonymous = call(&app, page(None)).await;
+    assert_eq!(anonymous.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        anonymous.location.as_deref(),
+        Some("/auth/login?rd=%2Fnext%2F")
+    );
+
+    let session = signed_in(&app).await;
+    let opened = call(&app, page(Some(&session))).await;
+    // The embedded bundle is absent in a checkout that never ran `just controller-next`.
+    assert!(
+        matches!(
+            opened.status,
+            StatusCode::OK | StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "{} {}",
+        opened.status,
+        opened.body
+    );
+    assert!(
+        opened.body.contains(r#"<base href="/next/">"#) || opened.body.contains("not built"),
+        "{}",
+        opened.body
+    );
 }

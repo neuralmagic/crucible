@@ -1,18 +1,11 @@
-// rust-embed's #[folder = "ui/dist"] requires the directory to exist at compile time, but the
-// SPA build output is gitignored — make sure a Node-less debug checkout still compiles (spa.rs
-// then answers 503 "UI not built").
+// rust-embed's #[folder = "ui/dist"] and #[folder = "next-dist"] require the directories to exist
+// at compile time, but both build outputs are gitignored — make sure a Node-less debug checkout
+// still compiles (spa.rs then answers 503 "UI not built").
 fn main() -> Result<(), String> {
     let dist = std::path::Path::new("ui/dist");
-    if !dist.exists() {
-        let created = std::fs::create_dir_all(dist).and_then(|()| {
-            std::fs::File::open(dist)?.set_modified(std::time::SystemTime::UNIX_EPOCH)
-        });
-        if let Err(e) = created {
-            println!("cargo:warning=could not create ui/dist: {e}");
-        }
-    }
-    println!("cargo:rerun-if-changed=ui/dist");
+    ensure_dir(dist);
     require_ui_bundle(dist)?;
+    ensure_dir(std::path::Path::new("next-dist"));
 
     let rev = source_rev();
     println!("cargo:rustc-env=CRUCIBLE_SOURCE_REV={rev}");
@@ -23,6 +16,18 @@ fn main() -> Result<(), String> {
     println!("cargo:rerun-if-env-changed=CRUCIBLE_GIT_SHA");
     println!("cargo:rerun-if-changed=../.git/HEAD");
     Ok(())
+}
+
+fn ensure_dir(dir: &std::path::Path) {
+    if !dir.exists() {
+        let created = std::fs::create_dir_all(dir).and_then(|()| {
+            std::fs::File::open(dir)?.set_modified(std::time::SystemTime::UNIX_EPOCH)
+        });
+        if let Err(e) = created {
+            println!("cargo:warning=could not create {}: {e}", dir.display());
+        }
+    }
+    println!("cargo:rerun-if-changed={}", dir.display());
 }
 
 /// Refuses a build that would embed an empty SPA. rust-embed only embeds when debug assertions

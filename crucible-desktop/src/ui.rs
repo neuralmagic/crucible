@@ -819,7 +819,15 @@ fn account(app: &App, source: String, p: &Paint, layer: &mut Vec<El>) -> El {
                 app.source_menu = false;
                 app.page = crate::Page::Settings;
             }),
-        )
+        );
+    #[cfg(target_arch = "wasm32")]
+    let menu = menu.item(rune_kit::MenuItem::new("Classic UI").on_select_tx(
+        |app: &mut App, tx: &mut Tx| {
+            app.source_menu = false;
+            let _ = tx.open_url_same_tab("/");
+        },
+    ));
+    let menu = menu
         .open(app.source_menu)
         .on_close(|app: &mut App| app.source_menu = false)
         .build(p.k, layer);

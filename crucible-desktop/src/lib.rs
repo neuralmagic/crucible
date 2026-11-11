@@ -1256,10 +1256,14 @@ impl App {
             .copied()
     }
 
-    /// Sign in through the controller's own page, which sets the session cookie and comes back.
+    /// Sign in through the controller's own page, which sets the session cookie and comes back
+    /// to this one.
     #[cfg(target_arch = "wasm32")]
     pub fn sign_in(&mut self) {
-        if let Err(why) = rune::web::open_url_same_tab("/auth/login") {
+        let here = web_sys::window()
+            .and_then(|window| window.location().pathname().ok())
+            .unwrap_or_else(|| "/".into());
+        if let Err(why) = rune::web::open_url_same_tab(&format!("/auth/login?rd={here}")) {
             self.remote.sign_in_error = Some(why);
         }
     }
