@@ -241,7 +241,10 @@ jobs:
       # The controller embeds the desktop app's browser build under /next.
       - name: wasm-bindgen version
         id: bindgen
-        run: python3 -c 'import tomllib; print("version=" + next(p["version"] for p in tomllib.load(open("crucible-desktop/Cargo.lock","rb"))["package"] if p["name"]=="wasm-bindgen"))' >> "$GITHUB_OUTPUT"
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' crucible-desktop/Cargo.lock)
+          [ -n "$version" ]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
