@@ -32,7 +32,8 @@ pub struct PlaybookRunDto {
     /// The issue key the run is tracked under.
     pub key: String,
     pub playbook: String,
-    /// The registry row's description; null when the playbook was deregistered since.
+    /// The registry row's description; a draft launch has none, so it carries the issue title the
+    /// launch froze the draft's description into.
     pub description: Option<String>,
     /// The values exactly as launched — the prefill source.
     #[schema(value_type = Object)]
