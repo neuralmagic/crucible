@@ -200,11 +200,49 @@ jobs:
         run: |
           echo "buildit image: ghcr.io/${{ github.repository }}-buildit@$DIGEST" >> "$GITHUB_STEP_SUMMARY"
 
+  # The desktop app's browser build, which the controller embeds under /next.
+  next-bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          rustflags: ""
+
+      - name: wasm-bindgen version
+        id: bindgen
+        run: |
+          version=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' crucible-desktop/Cargo.lock)
+          [ -n "$version" ]
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+        with:
+          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
+
+      - name: Build /next
+        run: |
+          sh crucible-desktop/rune-patches.sh
+          rustup target add wasm32-unknown-unknown
+          cd crucible-desktop
+          CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: next-dist
+          path: crucible-controller/next-dist
+          if-no-files-found: error
+          retention-days: 1
+
   # The control plane on top of the runtime image this run just published: the controller (with
   # the SPA rust-embed folds in at compile time) and the crux CLI, staged the same way as above
   # and packaged by docker/Containerfile.controller FROM the runtime at its exact digest.
   controller:
-    needs: build-push
+    needs: [build-push, next-bundle]
     runs-on: [self-hosted, linux, x64, beefy, image]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -239,24 +277,10 @@ jobs:
           bun run build
 
       # The controller embeds the desktop app's browser build under /next.
-      - name: wasm-bindgen version
-        id: bindgen
-        run: |
-          version=$(awk '/^name = "wasm-bindgen"$/ { found = 1; next } found && /^version = / { gsub(/"/, "", $3); print $3; exit }' crucible-desktop/Cargo.lock)
-          [ -n "$version" ]
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
-      - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          tool: wasm-bindgen@${{ steps.bindgen.outputs.version }}
-
-      - name: Build /next
-        run: |
-          sh crucible-desktop/rune-patches.sh
-          rustup target add wasm32-unknown-unknown
-          cd crucible-desktop
-          RUSTFLAGS= CARGO="$(command -v cargo)" bash ../vendor/rune/scripts/web-build.sh crucible-playbooks --no-html --out ../crucible-controller/next-dist
-          rm -rf target
+          name: next-dist
+          path: crucible-controller/next-dist
 
       - name: Build release binaries
         env:
