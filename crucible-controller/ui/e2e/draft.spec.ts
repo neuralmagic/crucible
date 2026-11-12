@@ -822,6 +822,14 @@ test.describe('draft authoring studio', () => {
       .filter({ has: page.locator('[data-ui="section-header"]', { hasText: 'Task graph' }) })
       .getByTestId('workflow-graph');
     await expect(runGraph.locator('[data-task="read"]')).toContainText('pass');
+    // The pane holds two graphs now, and a graph's panel split is shared live state in the panels
+    // library: sharing one id between them collapses the task panel to a sliver, so the picked
+    // task's output is hidden behind a five-pixel column.
+    await runGraph.locator('[data-task="read"]').click();
+    const taskPanel = runGraph.locator('aside[aria-label="Task read"]');
+    await expect(taskPanel).toBeVisible();
+    const panelBox = await taskPanel.boundingBox();
+    expect(panelBox?.width ?? 0).toBeGreaterThan(200);
     const files = page.locator('[id="crucible.run-files"]');
     await expect(files.getByRole('button', { name: 'read/NOTES.md' })).toBeVisible();
     await files.getByRole('button', { name: 'read/NOTES.md' }).click();
