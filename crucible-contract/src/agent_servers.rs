@@ -168,21 +168,52 @@ pub struct BuilderPods {
     /// Resource limits, `{ cpu = "32", memory = "64Gi" }`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<BTreeMap<String, String>>,
-    /// Where buildah keeps image layers.
+    /// What builds a Dockerfile when the build names no builder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builder: Option<Builder>,
+    /// Where the builder keeps image layers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_driver: Option<StorageDriver>,
-    /// Extra `buildah bud` arguments for every Dockerfile build, after buildit's own.
+    /// Extra `buildah bud` arguments for every Dockerfile build buildah runs, after buildit's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bud_args: Option<Vec<String>>,
 }
 
-/// The containers-storage driver of buildah in a builder pod.
+/// What builds a Dockerfile in a builder pod.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Builder {
+    /// `buildah bud`.
+    Buildah,
+    /// Rootless BuildKit, the builder `docker build` uses. Experimental.
+    Buildkit,
+}
+
+impl Builder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buildah => "buildah",
+            Self::Buildkit => "buildkit",
+        }
+    }
+}
+
+impl fmt::Display for Builder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How a builder pod stores image layers: buildah's containers-storage driver, or the BuildKit
+/// snapshotter that matches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageDriver {
-    /// A full copy of the filesystem per layer; works wherever a user namespace does.
+    /// A full copy of the filesystem per layer; works wherever a user namespace does. BuildKit's
+    /// `native` snapshotter.
     Vfs,
-    /// Kernel overlayfs mounted in buildah's user namespace; each layer stored once.
+    /// Kernel overlayfs mounted in the builder's user namespace; each layer stored once.
+    /// BuildKit's `overlayfs` snapshotter.
     Overlay,
 }
 
@@ -214,6 +245,7 @@ impl BuilderPods {
             pod_deadline_secs: self.pod_deadline_secs.or(base.pod_deadline_secs),
             requests: self.requests.clone().or_else(|| base.requests.clone()),
             limits: self.limits.clone().or_else(|| base.limits.clone()),
+            builder: self.builder.or(base.builder),
             storage_driver: self.storage_driver.or(base.storage_driver),
             bud_args: self.bud_args.clone().or_else(|| base.bud_args.clone()),
         }
@@ -348,6 +380,7 @@ mod tests {
             pod_deadline_secs: NonZeroU32::new(3600),
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+            builder: Some(Builder::Buildkit),
             storage_driver: Some(StorageDriver::Overlay),
             bud_args: Some(vec!["--retry".into(), "5".into()]),
         });
@@ -360,12 +393,14 @@ mod tests {
                 "pod_deadline_secs": 3600,
                 "requests": {"cpu": "8"},
                 "limits": {"cpu": "32"},
+                "builder": "buildkit",
                 "storage_driver": "overlay",
                 "bud_args": ["--retry", "5"],
             })
         );
         assert_eq!(serde_json::from_value::<BuilditSite>(raw).unwrap(), pinned);
         assert!(serde_json::from_str::<BuilderPods>(r#"{"storage_driver": "zfs"}"#).is_err());
+        assert!(serde_json::from_str::<BuilderPods>(r#"{"builder": "kaniko"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"node_arch": "x86_64"}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"max_builds": 0}"#).is_err());
         assert!(serde_json::from_str::<BuilderPods>(r#"{"cpu": "8"}"#).is_err());
@@ -387,6 +422,7 @@ mod tests {
             pod_deadline_secs: None,
             requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
             limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+            builder: Some(Builder::Buildah),
             storage_driver: Some(StorageDriver::Vfs),
             bud_args: Some(vec!["--retry".into(), "5".into()]),
         };
@@ -394,6 +430,7 @@ mod tests {
             node_arch: Some(NodeArch::Amd64),
             pod_deadline_secs: NonZeroU32::new(600),
             limits: Some(BTreeMap::new()),
+            builder: Some(Builder::Buildkit),
             storage_driver: Some(StorageDriver::Overlay),
             ..BuilderPods::default()
         };
@@ -405,6 +442,7 @@ mod tests {
                 pod_deadline_secs: NonZeroU32::new(600),
                 requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
                 limits: Some(BTreeMap::new()),
+                builder: Some(Builder::Buildkit),
                 storage_driver: Some(StorageDriver::Overlay),
                 bud_args: Some(vec!["--retry".into(), "5".into()]),
             }

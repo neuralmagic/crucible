@@ -349,14 +349,16 @@ pod's `[secrets] push_authfile`; without either, buildit pushes nothing. `queue`
 pods to that Kueue LocalQueue in `namespace`; set it where Kueue manages the namespace and holds
 pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minutes and fail.
 `[buildit.builders]` sizes builder pods on every cluster: `node_arch` (their `kubernetes.io/arch`),
-`max_builds` live per sandbox, `pod_deadline_secs`, `requests`/`limits`, `storage_driver`, and
-`bud_args`.
+`max_builds` live per sandbox, `pod_deadline_secs`, `requests`/`limits`, `builder`,
+`storage_driver`, and `bud_args`.
 `[buildit.cluster_builders.<cluster>]` replaces any of those on one cluster, so a mixed-architecture cluster can pin its builds. Without
 `node_arch`, builder pods run on the loop pod's architecture; unset limits are buildit's defaults
-(4 builds, 7200 s, no requests or limits). `storage_driver` is `vfs` (the default), a full copy
+(4 builds, 7200 s, no requests or limits). `builder` is what builds a Dockerfile when the
+build names no builder: `buildah` (the default) or `buildkit` (experimental), which builds as
+`docker build` does; `buildit/README.md` lists what differs. Apply the builder admission policy of the same release, which admits the BuildKit image. `storage_driver` is `vfs` (the default), a full copy
 of the filesystem per image layer, or `overlay`, each layer stored once with kernel overlayfs in
-buildah's user namespace; `overlay` needs a kernel that allows that (5.13 and later, such as RHEL
-9's). `bud_args` are extra `buildah bud` arguments for every Dockerfile build, placed after
+the builder's user namespace; `overlay` needs a kernel that allows that (5.13 and later, such as
+RHEL 9's). `bud_args` are extra `buildah bud` arguments for every Dockerfile build, placed after
 buildit's own.
 
 ```toml
@@ -379,6 +381,7 @@ bud_args          = ["--retry", "5"]
 
 [buildit.cluster_builders.spoke-b]                  # optional, per cluster
 node_arch = "amd64"
+builder   = "buildkit"
 
 [buildit.cache]                                     # optional, a cache builds share
 clusters     = ["spoke-a"]                          # default the hub; deploy it on each

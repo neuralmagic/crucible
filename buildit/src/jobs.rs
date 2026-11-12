@@ -26,6 +26,7 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+use rmcp::schemars;
 
 use crate::backend::{Resources, StorageDriver};
 use crate::step::State;
@@ -41,6 +42,9 @@ pub const ANNOTATION_CANCELLED: &str = "buildit.dev/cancelled";
 const LABEL_QUEUE: &str = "kueue.x-k8s.io/queue-name";
 
 const BUILDAH_IMAGE: &str = "quay.io/buildah/stable:latest";
+/// Where a BuildKit build's pod copies `buildkitd`, `buildctl`, `buildkit-runc` and `rootlesskit`
+/// from.
+const BUILDKIT_IMAGE: &str = "docker.io/moby/buildkit:v0.35.0-rootless";
 const TOOLS_IMAGE: &str = "gcr.io/go-containerregistry/crane:debug";
 pub const WORKSPACE: &str = "/workspace";
 pub const OUT: &str = "/buildit-out";
@@ -59,6 +63,8 @@ const BUILD_TMP: &str = "/home/build/.local/share/containers/tmp";
 const OUT_LIMIT: &str = "2Gi";
 const FACTS_LIMIT: &str = "256Mi";
 const TOOLS_LIMIT: &str = "64Mi";
+const BUILDKIT_TOOLS_LIMIT: &str = "256Mi";
+const BUILDKIT_DIR: &str = "/tmp/buildkit";
 /// Time the archive sidecar has to upload once the main container exits; each upload takes at
 /// most 120s.
 const GRACE_SECS: i64 = 600;
@@ -99,6 +105,72 @@ impl Registry {
     }
 }
 
+/// What builds a Dockerfile in a build pod.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    clap::ValueEnum,
+    serde::Serialize,
+    serde::Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Builder {
+    /// `buildah bud`, then a push.
+    #[default]
+    Buildah,
+    /// Rootless BuildKit, the builder `docker build` uses: a `buildkitd` for the one build.
+    Buildkit,
+}
+
+impl Builder {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Buildah => "buildah",
+            Self::Buildkit => "buildkit",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        [Self::Buildah, Self::Buildkit]
+            .into_iter()
+            .find(|b| b.as_str() == raw)
+    }
+}
+
+/// A directory or file of the build pod that every `RUN` step of a Dockerfile build sees.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunMount {
+    pub source: String,
+    pub target: String,
+    pub read_only: bool,
+}
+
+impl RunMount {
+    fn mode(&self) -> &'static str {
+        if self.read_only { "ro" } else { "rw" }
+    }
+
+    /// buildah's `--volume` value.
+    pub fn volume(&self) -> String {
+        format!("{}:{}:{}", self.source, self.target, self.mode())
+    }
+
+    /// The bind mount as an OCI runtime config lists it.
+    fn oci(&self) -> serde_json::Value {
+        serde_json::json!({
+            "destination": self.target,
+            "type": "bind",
+            "source": self.source,
+            "options": ["rbind", self.mode()],
+        })
+    }
+}
+
 /// Whose user ids a Job's pod runs under.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum PodUsers {
@@ -115,6 +187,7 @@ pub struct Site {
     pub queue: Option<String>,
     pub node_arch: Option<String>,
     pub resources: Resources,
+    pub builder: Builder,
     pub storage: StorageDriver,
     /// Extra `buildah bud` arguments for every Dockerfile build.
     pub bud_args: Vec<String>,
@@ -149,15 +222,28 @@ pub struct Ident<'a> {
     pub annotations: BTreeMap<String, String>,
 }
 
-/// A build: the context in the shared cache, the runner's arguments, and the tag it pushes.
+/// A build: the context in the shared cache, the runner's arguments, and how its image is built.
 pub struct BuildJob<'a> {
     pub context_digest: &'a str,
     /// The declared caches' directories, made before the runner restores into them.
     pub cache_dirs: &'a [String],
-    /// `step::RUNNER`'s arguments after its log path: `<secs> <term> <steps> ...`.
+    /// `step::RUNNER`'s arguments after its log path: `<secs> <term> <stamps> <steps> ...`.
     pub runner_args: &'a [String],
-    pub local_tag: &'a str,
+    pub engine: Engine<'a>,
     pub limit_secs: i64,
+}
+
+/// What a build's runner drives, and what that needs from the pod.
+pub enum Engine<'a> {
+    /// `buildah bud` to `local_tag`, which the pod then pushes.
+    Buildah { local_tag: &'a str },
+    /// `buildctl build`, which pushes, against a `buildkitd` whose `RUN` steps get `mounts`.
+    Buildkit { mounts: &'a [RunMount] },
+}
+
+/// The reference a build of `sandbox` pushes its image to.
+pub fn build_dest(site: &Site, sandbox: &str, build: &str) -> String {
+    format!("{}:{sandbox}-{build}", site.image_repo)
 }
 
 /// A build that runs a script in an existing image and appends one directory to it as a layer.
@@ -274,14 +360,15 @@ finish() {
 trap 'finish "$@"' TERM
 while :; do sleep 3600 & wait $!; done"#;
 
-/// The build: storage setup, pull access to the registry built images go to, `step::RUNNER` with
-/// its log mirrored to stdout, then on success the push, and the exit record and digest as the
-/// termination message. Arguments: the runner script, the local tag, the destination, then the
-/// runner's arguments.
-const BUILD: &str = r#"trap 'kill -TERM -1 2> /dev/null; exit 143' TERM
+/// A build's main container: [`BUILD_OPEN`], the builder's setup, [`BUILD_RUN`], the builder's
+/// publish step, then [`BUILD_RECORD`]. Arguments: the runner script, the local tag, the
+/// destination, then the runner's arguments.
+const BUILD_OPEN: &str = r#"trap 'kill -TERM -1 2> /dev/null; exit 143' TERM
 runner=$1; tag=$2; dest=$3; shift 3
-log=/tmp/build.log
-mkdir -p /tmp/containers-run /buildit-out/facts "$TMPDIR" $CACHE_DIRS
+log=/tmp/build.log"#;
+
+/// buildah's storage, and pull access to the registry built images go to.
+const BUILDAH_SETUP: &str = r#"mkdir -p /tmp/containers-run /buildit-out/facts "$TMPDIR" $CACHE_DIRS
 printf '[storage]\ndriver = "%s"\ngraphroot = "%s/storage"\nrunroot = "/tmp/containers-run"\n' \
   "$STORAGE_DRIVER" "$STORAGE" > /tmp/storage.conf
 printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf
@@ -292,8 +379,88 @@ if [ -e /buildit-cluster/token ]; then
   buildah login -u buildit --password-stdin "$REGISTRY" < /buildit-cluster/token 2>&1
 else
   printf '[[registry]]\nlocation = "%s"\ninsecure = true\n' "$REGISTRY" >> /tmp/registries.conf
+fi"#;
+
+/// A rootless `buildkitd` for this build, from the binaries the `buildkit` init container left
+/// in /buildit-tools: its state on the storage volume, [`RUNC`] as its runtime, and pull and push
+/// access to the registry built images go to. A daemon that does not come up ends the build.
+const BUILDKIT_SETUP: &str = r#"bk=/tmp/buildkit
+mkdir -p "$bk" "$XDG_RUNTIME_DIR" /buildit-out/facts "$TMPDIR" $CACHE_DIRS
+export PATH="/buildit-tools:$PATH" DOCKER_CONFIG="$bk"
+printf '%s\n' "$RUNC" > "$bk/runc"; chmod +x "$bk/runc"
+printf '%s' "$RUN_MOUNTS" > "$bk/mounts.json"
+printf '%s\n' "$RUN_TARGETS" > "$bk/targets"
+{
+  printf 'root = "%s/buildkit"\n[grpc]\n  address = ["%s"]\n[otel]\n  socketPath = "%s/otel-grpc.sock"\n' \
+    "$STORAGE" "$BUILDKIT_HOST" "$bk"
+  printf '[worker.oci]\n  rootless = true\n  noProcessSandbox = true\n  binary = "%s/runc"\n  snapshotter = "%s"\n' \
+    "$bk" "$SNAPSHOTTER"
+  printf '[worker.containerd]\n  enabled = false\n[registry."%s"]\n' "$REGISTRY"
+  if [ -e /buildit-cluster/token ]; then
+    printf '  ca = ["/buildit-cluster/service-ca.crt"]\n'
+  else
+    printf '  http = true\n'
+  fi
+} > "$bk/buildkitd.toml"
+if [ -e /buildit-cluster/token ]; then
+  export SSL_CERT_DIR=/buildit-cluster
+  printf '{"auths":{"%s":{"auth":"%s"}}}\n' "$REGISTRY" \
+    "$(printf 'buildit:%s' "$(cat /buildit-cluster/token)" | base64 -w 0)" > "$bk/config.json"
+else
+  echo '{}' > "$bk/config.json"
 fi
-for f in ccache.conf cache.json; do [ -e "/buildit-inputs/$f" ] && cp "/buildit-inputs/$f" /buildit-out/facts/; done
+(rootlesskit buildkitd --config "$bk/buildkitd.toml" > "$bk/buildkitd.log" 2>&1 &)
+n=300
+until buildctl debug workers > /dev/null 2>&1; do
+  n=$((n - 1))
+  if [ "$n" -le 0 ]; then
+    echo "buildkitd did not start"; cat "$bk/buildkitd.log"
+    echo 1 > /buildit-out/build.exit; echo 1 > /dev/termination-log
+    exit 0
+  fi
+  sleep 0.1
+done"#;
+
+/// `buildkitd`'s OCI runtime: `buildkit-runc`, after three edits to the config of the `RUN` step
+/// it is about to start. The hostname goes, /dev/pts becomes a bind of the pod's, and the build's
+/// [`RunMount`]s go first in the mounts. Once the step has ended, the mount points the runtime
+/// made for them in the step's root, and the directories it made to hold those, go again where
+/// the step left them empty.
+const RUNC: &str = r#"#!/bin/bash
+b=; prev=
+for a in "$@"; do [ "$prev" = --bundle ] && b=$a; prev=$a; done
+if [ -z "$b" ] || [ ! -f "$b/config.json" ]; then exec /buildit-tools/buildkit-runc "$@"; fi
+sed -i -e 's/"hostname":"[^"]*",//' \
+  -e 's#{"destination":"/dev/pts","type":"devpts","source":"devpts","options":\[[^]]*\]}#{"destination":"/dev/pts","type":"bind","source":"/dev/pts","options":["rbind","nosuid","noexec"]}#' \
+  "$b/config.json"
+c=$(< "$b/config.json"); m=$(< /tmp/buildkit/mounts.json)
+printf '%s' "${c/'"mounts":['/'"mounts":['"$m"}" > "$b/config.json"
+root=$b/rootfs; made=()
+while IFS= read -r t; do
+  [ -n "$t" ] || continue
+  top=; p=$t
+  while [ "$p" != / ] && [ ! -e "$root$p" ] && [ ! -L "$root$p" ]; do top=$p; p=$(dirname "$p"); done
+  [ -n "$top" ] && made+=("$t" "$top")
+done < /tmp/buildkit/targets
+/buildit-tools/buildkit-runc "$@" &
+r=$!
+trap 'kill -TERM "$r" 2> /dev/null' TERM INT
+wait "$r"; code=$?
+while kill -0 "$r" 2> /dev/null; do wait "$r"; code=$?; done
+for ((i = 0; i < ${#made[@]}; i += 2)); do
+  p=${made[i]}; top=${made[i + 1]}
+  while :; do
+    if [ -d "$root$p" ] && [ ! -L "$root$p" ]; then rmdir "$root$p" 2> /dev/null || break
+    elif [ -f "$root$p" ] && [ ! -s "$root$p" ]; then rm -f "$root$p"
+    else break; fi
+    [ "$p" = "$top" ] && break
+    p=$(dirname "$p")
+  done
+done
+exit "$code""#;
+
+/// `step::RUNNER` with its log mirrored to stdout, and its exit record.
+const BUILD_RUN: &str = r#"for f in ccache.conf cache.json; do [ -e "/buildit-inputs/$f" ] && cp "/buildit-inputs/$f" /buildit-out/facts/; done
 : > "$log"
 sh -c "$runner" sh "$log" "$@" &
 r=$!
@@ -301,8 +468,10 @@ tail -n +1 -f -s 0.2 --pid=$r "$log" &
 wait $r
 wait
 rec=$(head -n 1 "$log.exit" 2> /dev/null)
-[ -n "$rec" ] || rec=2
-if [ "$rec" = 0 ]; then
+[ -n "$rec" ] || rec=2"#;
+
+/// The push of what `bud` built.
+const BUILDAH_PUBLISH: &str = r#"if [ "$rec" = 0 ]; then
   auth=/tmp/push-auth.json; echo '{}' > "$auth"
   certs=
   if [ -e /buildit-cluster/token ]; then
@@ -317,9 +486,25 @@ if [ "$rec" = 0 ]; then
     rec=1
     rm -f /buildit-out/image
   fi
-fi
-printf '%s\n' "$rec" > /buildit-out/build.exit
+fi"#;
+
+/// The digest of the image `buildctl` pushed, from the metadata file it wrote.
+const BUILDKIT_PUBLISH: &str = r#"if [ "$rec" = 0 ]; then
+  sed -n 's/.*"containerimage.digest": *"\(sha256:[0-9a-f]*\)".*/\1/p' "$bk/metadata.json" 2> /dev/null \
+    | head -n 1 > /buildit-out/image
+  if [ ! -s /buildit-out/image ]; then
+    echo "the build of $dest left no image digest"
+    rec=1
+    rm -f /buildit-out/image
+  fi
+fi"#;
+
+/// The exit record, and with the digest the termination message.
+const BUILD_RECORD: &str = r#"printf '%s\n' "$rec" > /buildit-out/build.exit
 { printf '%s\n' "$rec"; cat /buildit-out/image 2> /dev/null; } > /dev/termination-log"#;
+
+/// Copies BuildKit's static binaries to where the builder container runs them.
+const BUILDKIT_TOOLS: &str = "cp /usr/bin/buildkitd /usr/bin/buildctl /usr/bin/buildkit-runc /usr/bin/rootlesskit /buildit-tools/";
 
 /// A run: the command under a timeout with its output mirrored to the log, then the fetch_paths
 /// that exist as a tar, and the exit record as the termination message. Arguments: the timeout,
@@ -365,32 +550,89 @@ wait $!
 crane digest $insecure "$DEST" > /dev/termination-log"#;
 
 pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
-    let dest = format!("{}:{}-{}", site.image_repo, id.sandbox, id.build);
-    let mut command = sh(BUILD);
+    let (setup, publish, local_tag) = match b.engine {
+        Engine::Buildah { local_tag } => (BUILDAH_SETUP, BUILDAH_PUBLISH, local_tag),
+        Engine::Buildkit { .. } => (BUILDKIT_SETUP, BUILDKIT_PUBLISH, ""),
+    };
+    let script = [BUILD_OPEN, setup, BUILD_RUN, publish, BUILD_RECORD].join("\n");
+    let mut command = sh(&script);
     command.extend([
         crate::step::RUNNER.to_string(),
-        b.local_tag.to_string(),
-        dest,
+        local_tag.to_string(),
+        build_dest(site, id.sandbox, id.build),
     ]);
     command.extend(b.runner_args.iter().cloned());
     let mut vars = vec![
-        env("BUILDAH_ISOLATION", "chroot"),
-        env("CONTAINERS_REGISTRIES_CONF", "/tmp/registries.conf"),
-        env("CONTAINERS_STORAGE_CONF", "/tmp/storage.conf"),
         env("HOME", "/home/build"),
-        env("STORAGE_DRIVER", site.storage.as_str()),
         env("STORAGE", STORAGE),
         env("REGISTRY", site.registry.host()),
         env("CACHE_DIRS", &b.cache_dirs.join(" ")),
         env("TMPDIR", BUILD_TMP),
     ];
-    vars.sort_by(|a, b| a.name.cmp(&b.name));
     let mut mounts = vec![
         mount("workspace", WORKSPACE, false),
         mount("out", OUT, false),
         mount("storage", STORAGE, false),
         mount("inputs", INPUTS, true),
     ];
+    let fetch = core::Container {
+        name: "fetch".to_string(),
+        image: Some(TOOLS_IMAGE.to_string()),
+        command: Some(busybox_sh(FETCH_BUILD)),
+        env: Some(vec![
+            env("CACHE", &site.cache),
+            env("CTX", &context_key(b.context_digest)),
+        ]),
+        volume_mounts: Some(vec![mount("workspace", WORKSPACE, false)]),
+        ..Default::default()
+    };
+    let mut init = vec![fetch];
+    let mut volumes = vec![
+        empty_dir("workspace"),
+        limited_dir("out", OUT_LIMIT),
+        empty_dir("storage"),
+        inputs_volume(
+            id.name,
+            &["snapshots", "snapshots.auth", "ccache.conf", "cache.json"],
+        ),
+        archive_volume(id.name),
+    ];
+    match b.engine {
+        Engine::Buildah { .. } => vars.extend([
+            env("BUILDAH_ISOLATION", "chroot"),
+            env("CONTAINERS_REGISTRIES_CONF", "/tmp/registries.conf"),
+            env("CONTAINERS_STORAGE_CONF", "/tmp/storage.conf"),
+            env("STORAGE_DRIVER", site.storage.as_str()),
+        ]),
+        Engine::Buildkit { mounts: run_mounts } => {
+            vars.extend([
+                env("BUILDKIT_HOST", &buildkit_host()),
+                env("RUNC", RUNC),
+                env("RUN_MOUNTS", &run_mounts_json(run_mounts)),
+                env(
+                    "RUN_TARGETS",
+                    &run_mounts
+                        .iter()
+                        .map(|m| m.target.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                env("SNAPSHOTTER", snapshotter(site.storage)),
+                env("XDG_RUNTIME_DIR", &format!("{BUILDKIT_DIR}/run")),
+            ]);
+            mounts.push(mount("tools", TOOLS, true));
+            init.push(core::Container {
+                name: "buildkit".to_string(),
+                image: Some(BUILDKIT_IMAGE.to_string()),
+                command: Some(["sh", "-c", BUILDKIT_TOOLS].map(String::from).to_vec()),
+                security_context: Some(as_user(1000)),
+                volume_mounts: Some(vec![mount("tools", TOOLS, false)]),
+                ..Default::default()
+            });
+            volumes.push(limited_dir("tools", BUILDKIT_TOOLS_LIMIT));
+        }
+    }
+    vars.sort_by(|a, b| a.name.cmp(&b.name));
     mounts.extend(cluster_mount(site));
     let builder = core::Container {
         name: BUILDER.to_string(),
@@ -403,44 +645,39 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
         volume_mounts: Some(mounts),
         ..Default::default()
     };
-    let fetch = core::Container {
-        name: "fetch".to_string(),
-        image: Some(TOOLS_IMAGE.to_string()),
-        command: Some(busybox_sh(FETCH_BUILD)),
-        env: Some(vec![
-            env("CACHE", &site.cache),
-            env("CTX", &context_key(b.context_digest)),
-        ]),
-        volume_mounts: Some(vec![mount("workspace", WORKSPACE, false)]),
-        ..Default::default()
-    };
-    let archive = archive(
+    init.push(archive(
         site,
         id,
         "build.exit",
         "build.archive-err",
         &["facts.tar", "image"],
-    );
-    let mut volumes = vec![
-        empty_dir("workspace"),
-        limited_dir("out", OUT_LIMIT),
-        empty_dir("storage"),
-        inputs_volume(
-            id.name,
-            &["snapshots", "snapshots.auth", "ccache.conf", "cache.json"],
-        ),
-        archive_volume(id.name),
-    ];
+    ));
     volumes.extend(cluster_volume(site));
-    job(
-        site,
-        id,
-        Kind::Build,
-        b.limit_secs,
-        vec![fetch, archive],
-        builder,
-        volumes,
-    )
+    job(site, id, Kind::Build, b.limit_secs, init, builder, volumes)
+}
+
+/// Where a build's `buildkitd` listens, which `buildctl` reads from `BUILDKIT_HOST`.
+fn buildkit_host() -> String {
+    format!("unix://{BUILDKIT_DIR}/buildkitd.sock")
+}
+
+/// The file `buildctl` leaves the pushed image's digest in.
+pub fn buildkit_metadata() -> String {
+    format!("{BUILDKIT_DIR}/metadata.json")
+}
+
+/// BuildKit's snapshotter for a storage driver: `native` copies each layer in full, as `vfs` does.
+fn snapshotter(storage: StorageDriver) -> &'static str {
+    match storage {
+        StorageDriver::Vfs => "native",
+        StorageDriver::Overlay => "overlayfs",
+    }
+}
+
+/// `mounts` as [`RUNC`] splices them into a config's `"mounts":[`: each object followed by a
+/// comma.
+fn run_mounts_json(mounts: &[RunMount]) -> String {
+    mounts.iter().map(|m| format!("{},", m.oci())).collect()
 }
 
 pub fn layer_job(site: &Site, id: &Ident<'_>, l: &LayerJob<'_>) -> Job {
@@ -1015,8 +1252,8 @@ mod tests {
 
     use crate::backend::{Resources, StorageDriver};
     use crate::jobs::{
-        BuildJob, Ident, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob, Site, build_job,
-        layer_job, observe, push_job, run_job,
+        BuildJob, Builder, Engine, Ident, LayerJob, Observed, PodUsers, PushJob, Registry, RunJob,
+        RunMount, Site, build_job, layer_job, observe, push_job, run_job,
     };
     use crate::step::State;
 
@@ -1029,6 +1266,7 @@ mod tests {
                 requests: vec![("cpu".to_string(), "8".to_string())],
                 limits: Vec::new(),
             },
+            builder: Builder::Buildah,
             storage: StorageDriver::Overlay,
             bud_args: Vec::new(),
             users: PodUsers::Namespaced,
@@ -1072,7 +1310,9 @@ mod tests {
                 context_digest: "sha256:ab",
                 cache_dirs: &dirs,
                 runner_args: &args,
-                local_tag: "localhost/buildit/x:latest",
+                engine: Engine::Buildah {
+                    local_tag: "localhost/buildit/x:latest",
+                },
                 limit_secs: 7200,
             },
         ))
@@ -1225,7 +1465,7 @@ mod tests {
                 context_digest: "sha256:ab",
                 cache_dirs: &[],
                 runner_args: &args,
-                local_tag: "t",
+                engine: Engine::Buildah { local_tag: "t" },
                 limit_secs: 60,
             },
         ))
@@ -1239,6 +1479,352 @@ mod tests {
                 .iter()
                 .any(|v| v["name"] == "cluster")
         );
+    }
+
+    fn buildkit_job(registry: Registry, storage: StorageDriver) -> serde_json::Value {
+        let labels = labels();
+        let args = ["1800".to_string(), "buildctl".to_string()];
+        let dirs = ["/c/deps".to_string()];
+        let mounts = [
+            RunMount {
+                source: "/c/deps".to_string(),
+                target: "/root/a \"b\"".to_string(),
+                read_only: true,
+            },
+            RunMount {
+                source: "/buildit-out/facts".to_string(),
+                target: "/buildit".to_string(),
+                read_only: false,
+            },
+        ];
+        let site = Site {
+            builder: Builder::Buildkit,
+            storage,
+            ..site(Some("builds"), registry)
+        };
+        serde_json::to_value(build_job(
+            &site,
+            &ident("buildit-00000000000000a1", &labels),
+            &BuildJob {
+                context_digest: "sha256:ab",
+                cache_dirs: &dirs,
+                runner_args: &args,
+                engine: Engine::Buildkit { mounts: &mounts },
+                limit_secs: 600,
+            },
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_buildkit_build_runs_buildkitd_from_copied_binaries_in_the_buildah_builder() {
+        let job = buildkit_job(cluster(), StorageDriver::Overlay);
+        let pod = &job["spec"]["template"]["spec"];
+        assert_eq!(pod["hostUsers"], false);
+        let init: Vec<(&str, &str)> = pod["initContainers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c["name"].as_str().unwrap(), c["image"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            init,
+            [
+                ("fetch", "gcr.io/go-containerregistry/crane:debug"),
+                ("buildkit", "docker.io/moby/buildkit:v0.35.0-rootless"),
+                ("archive", "quay.io/buildah/stable:latest"),
+            ]
+        );
+        let tools = &pod["initContainers"][1];
+        assert_eq!(tools["securityContext"]["runAsUser"], 1000);
+        assert!(tools.get("restartPolicy").is_none(), "{tools}");
+        assert_eq!(
+            tools["command"][2],
+            "cp /usr/bin/buildkitd /usr/bin/buildctl /usr/bin/buildkit-runc /usr/bin/rootlesskit /buildit-tools/"
+        );
+        assert_eq!(
+            tools["volumeMounts"],
+            serde_json::json!([{ "name": "tools", "mountPath": "/buildit-tools" }])
+        );
+        let volumes = pod["volumes"].as_array().unwrap();
+        let dir = volumes.iter().find(|v| v["name"] == "tools").unwrap();
+        assert_eq!(dir["emptyDir"]["sizeLimit"], "256Mi");
+
+        let builder = &pod["containers"][0];
+        assert_eq!(builder["name"], "builder");
+        assert_eq!(builder["image"], "quay.io/buildah/stable:latest");
+        assert_eq!(builder["securityContext"]["runAsUser"], 1000);
+        assert!(builder["securityContext"].get("privileged").is_none());
+        assert!(builder["securityContext"].get("seccompProfile").is_none());
+        let command: Vec<&str> = builder["command"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(command[4], crate::step::RUNNER);
+        assert_eq!(command[5], "", "nothing is tagged in the pod");
+        assert_eq!(
+            command[6],
+            "registry.builds.svc:5000/builds/buildit:sb-a-buildit-00000000000000a1"
+        );
+        assert_eq!(&command[7..], ["1800", "buildctl"]);
+        let script = command[2];
+        for part in [
+            "runner=$1; tag=$2; dest=$3; shift 3",
+            r#"(rootlesskit buildkitd --config "$bk/buildkitd.toml" > "$bk/buildkitd.log" 2>&1 &)"#,
+            "export SSL_CERT_DIR=/buildit-cluster",
+            r#"printf '[worker.oci]\n  rootless = true\n  noProcessSandbox = true\n  binary = "%s/runc"\n  snapshotter = "%s"\n'"#,
+            r#"printf '  ca = ["/buildit-cluster/service-ca.crt"]\n'"#,
+            r#"printf '  http = true\n'"#,
+            r#""$(printf 'buildit:%s' "$(cat /buildit-cluster/token)" | base64 -w 0)" > "$bk/config.json""#,
+            r#"sh -c "$runner" sh "$log" "$@" &"#,
+            r#""$bk/metadata.json""#,
+            r#"printf '%s\n' "$rec" > /buildit-out/build.exit"#,
+        ] {
+            assert!(script.contains(part), "{part}\nis not in\n{script}");
+        }
+        assert!(!script.contains("buildah"), "{script}");
+        let env = |name: &str| {
+            builder["env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["name"] == name)
+                .map(|e| e["value"].as_str().unwrap().to_string())
+        };
+        assert_eq!(
+            env("BUILDKIT_HOST").as_deref(),
+            Some("unix:///tmp/buildkit/buildkitd.sock")
+        );
+        assert_eq!(env("SNAPSHOTTER").as_deref(), Some("overlayfs"));
+        assert_eq!(env("XDG_RUNTIME_DIR").as_deref(), Some("/tmp/buildkit/run"));
+        assert_eq!(env("CACHE_DIRS").as_deref(), Some("/c/deps"));
+        assert_eq!(env("RUNC").as_deref(), Some(crate::jobs::RUNC));
+        assert_eq!(
+            env("RUN_TARGETS").as_deref(),
+            Some("/root/a \"b\"\n/buildit")
+        );
+        let listed = env("RUN_MOUNTS").unwrap();
+        let listed: serde_json::Value =
+            serde_json::from_str(&format!("[{}]", listed.strip_suffix(',').unwrap())).unwrap();
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                { "destination": "/root/a \"b\"", "type": "bind", "source": "/c/deps",
+                  "options": ["rbind", "ro"] },
+                { "destination": "/buildit", "type": "bind", "source": "/buildit-out/facts",
+                  "options": ["rbind", "rw"] },
+            ])
+        );
+        for buildah in [
+            "BUILDAH_ISOLATION",
+            "CONTAINERS_STORAGE_CONF",
+            "STORAGE_DRIVER",
+        ] {
+            assert_eq!(env(buildah), None);
+        }
+        let mounted: Vec<(&str, bool)> = builder["volumeMounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["mountPath"].as_str().unwrap(),
+                    m["readOnly"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        assert_eq!(
+            mounted,
+            [
+                ("/workspace", false),
+                ("/buildit-out", false),
+                ("/home/build/.local/share/containers", false),
+                ("/buildit-inputs", true),
+                ("/buildit-tools", true),
+                ("/buildit-cluster", true),
+            ]
+        );
+
+        let plain = buildkit_job(
+            Registry::Insecure {
+                host: "r:5000".to_string(),
+            },
+            StorageDriver::Vfs,
+        );
+        let builder = &plain["spec"]["template"]["spec"]["containers"][0];
+        let snapshotter = builder["env"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["name"] == "SNAPSHOTTER")
+            .unwrap();
+        assert_eq!(snapshotter["value"], "native");
+        assert!(
+            !builder["volumeMounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"] == "cluster")
+        );
+    }
+
+    /// [`crate::jobs::RUNC`] on a config as `buildkitd` writes one, with the paths it reads moved
+    /// under `dir` and `runtime` for the runtime.
+    #[cfg(target_os = "linux")]
+    fn runc(
+        dir: &std::path::Path,
+        runtime: &str,
+        config: &str,
+        mounts: &[RunMount],
+    ) -> (String, String, Option<i32>) {
+        let bundle = dir.join("bundle");
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(bundle.join("config.json"), config).unwrap();
+        let fragment = dir.join("mounts.json");
+        std::fs::write(&fragment, crate::jobs::run_mounts_json(mounts)).unwrap();
+        let targets = dir.join("targets");
+        let listed: Vec<&str> = mounts.iter().map(|m| m.target.as_str()).collect();
+        std::fs::write(&targets, format!("{}\n", listed.join("\n"))).unwrap();
+        let script = crate::jobs::RUNC
+            .replace("/tmp/buildkit/mounts.json", fragment.to_str().unwrap())
+            .replace("/tmp/buildkit/targets", targets.to_str().unwrap())
+            .replace("/buildit-tools/buildkit-runc", runtime);
+        let out = std::process::Command::new("bash")
+            .args(["-c", &script, "runc", "--log", "l", "run", "--bundle"])
+            .arg(&bundle)
+            .arg("id-1")
+            .output()
+            .unwrap();
+        (
+            std::fs::read_to_string(bundle.join("config.json")).unwrap(),
+            String::from_utf8(out.stdout).unwrap(),
+            out.status.code(),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_buildkit_runtime_drops_the_hostname_binds_the_pods_pts_and_adds_the_run_mounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = concat!(
+            r#"{"ociVersion":"1.2.0","process":{"args":["/bin/sh","-c","echo '\"mounts\":[' '\"hostname\":\"x\",' a&b"],"#,
+            r#""env":["PATH=/bin"],"cwd":"/"},"root":{"path":"rootfs"},"hostname":"buildkitsandbox","#,
+            r#""mounts":[{"destination":"/proc","type":"bind","source":"/proc","options":["rbind"]},"#,
+            r#"{"destination":"/dev/pts","type":"devpts","source":"devpts","options":["nosuid","noexec","newinstance","ptmxmode=0666","mode=0620","gid=5"]},"#,
+            r#"{"destination":"/dev/shm","type":"tmpfs","source":"shm","options":["nosuid"]}],"#,
+            r#""linux":{"namespaces":[{"type":"uts"},{"type":"mount"}]}}"#,
+        );
+        let mounts = [
+            RunMount {
+                source: "/c/a&b".to_string(),
+                target: "/root/it's \"here\"\\n".to_string(),
+                read_only: true,
+            },
+            RunMount {
+                source: "/buildit-out/facts".to_string(),
+                target: "/buildit".to_string(),
+                read_only: false,
+            },
+        ];
+        let (edited, ran, code) = runc(dir.path(), "echo", config, &mounts);
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            ran.trim_end(),
+            format!(
+                "--log l run --bundle {} id-1",
+                dir.path().join("bundle").display()
+            ),
+            "the runtime gets the arguments unchanged"
+        );
+        let edited: serde_json::Value = serde_json::from_str(&edited).unwrap();
+        let original: serde_json::Value = serde_json::from_str(config).unwrap();
+        assert!(edited.get("hostname").is_none(), "{edited}");
+        assert_eq!(edited["process"], original["process"]);
+        assert_eq!(edited["linux"], original["linux"]);
+        assert_eq!(
+            edited["mounts"],
+            serde_json::json!([
+                { "destination": "/root/it's \"here\"\\n", "type": "bind", "source": "/c/a&b",
+                  "options": ["rbind", "ro"] },
+                { "destination": "/buildit", "type": "bind", "source": "/buildit-out/facts",
+                  "options": ["rbind", "rw"] },
+                original["mounts"][0],
+                { "destination": "/dev/pts", "type": "bind", "source": "/dev/pts",
+                  "options": ["rbind", "nosuid", "noexec"] },
+                original["mounts"][2],
+            ])
+        );
+
+        let other = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("bash")
+            .args([
+                "-c",
+                &crate::jobs::RUNC.replace("/buildit-tools/buildkit-runc", "echo"),
+                "runc",
+                "kill",
+                "id-1",
+                "KILL",
+            ])
+            .current_dir(other.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "kill id-1 KILL\n",
+            "a command with no bundle goes straight to the runtime"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_buildkit_runtime_leaves_no_mount_point_it_made_in_the_steps_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("bundle/rootfs");
+        for there in ["etc", "opt/kept", "srv"] {
+            std::fs::create_dir_all(root.join(there)).unwrap();
+        }
+        let fake = dir.path().join("fake-runc");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nr=$5/rootfs\n\
+             mkdir -p $r/buildit $r/root/.cache/ccache $r/var/lib/deps $r/srv/used/cache\n\
+             : > $r/etc/ccache.conf\necho left > $r/srv/used/file\nexit 7\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mounts: Vec<RunMount> = [
+            "/buildit",
+            "/etc/ccache.conf",
+            "/root/.cache/ccache",
+            "/var/lib/deps",
+            "/opt/kept",
+            "/srv/used/cache",
+        ]
+        .iter()
+        .map(|target| RunMount {
+            source: "/s".to_string(),
+            target: target.to_string(),
+            read_only: false,
+        })
+        .collect();
+        let config = r#"{"process":{"args":["true"]},"hostname":"h","mounts":[]}"#;
+        let (_, _, code) = runc(dir.path(), fake.to_str().unwrap(), config, &mounts);
+        assert_eq!(code, Some(7), "the step's exit code");
+        for gone in [
+            "buildit",
+            "etc/ccache.conf",
+            "root",
+            "var",
+            "srv/used/cache",
+        ] {
+            assert!(!root.join(gone).exists(), "{gone} is left");
+        }
+        for kept in ["etc", "opt/kept", "srv/used/file"] {
+            assert!(root.join(kept).exists(), "{kept} is gone");
+        }
     }
 
     #[test]

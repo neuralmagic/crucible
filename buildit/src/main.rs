@@ -266,6 +266,9 @@ pub struct BuildArgs {
     /// Point ccache in every RUN step at the server's shared cache; needs ccache 4.4 or later
     #[arg(long, requires = "server", conflicts_with = "image")]
     pub ccache: bool,
+    /// What builds the Dockerfile on the server (default the server's); buildkit is experimental
+    #[arg(long, value_enum, requires = "server", conflicts_with_all = ["image", "base"])]
+    pub builder: Option<jobs::Builder>,
     /// Run --script in this image instead of building the Dockerfile; the build is the image plus
     /// --path as one new layer
     #[arg(long, requires_all = ["server", "script", "path"], conflicts_with = "image")]
@@ -378,6 +381,7 @@ impl BuildArgs {
             timeout_s: self.timeout,
             caches,
             ccache: self.ccache,
+            builder: self.builder,
             base: self.base.clone(),
             script: self.script.clone(),
             path: self.path.clone(),

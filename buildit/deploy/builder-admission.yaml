@@ -1,8 +1,9 @@
 # The pods `buildit mcp`'s Jobs may run in its builder namespace, as a ValidatingAdmissionPolicy
 # (admissionregistration.k8s.io/v1, Kubernetes 1.30+). Whoever may create Jobs there (a run's loop
-# account) gets only pods shaped like buildit/src/jobs.rs makes: a build (buildah, or a script in
-# an image by digest), a run (a built image by digest) or a push (crane), with the fetch and
-# prepare init containers and the archive sidecar beside them; every pod in a user namespace, so root in a container is no one on the node; no
+# account) gets only pods shaped like buildit/src/jobs.rs makes: a build (buildah, BuildKit run
+# from the buildah image, or a script in an image by digest), a run (a built image by digest) or a
+# push (crane), with the fetch, buildkit and prepare init containers and the archive sidecar beside
+# them; every pod in a user namespace, so root in a container is no one on the node; no
 # privilege, added capability or seccomp Unconfined; emptyDir volumes, the build's own inputs
 # Secret, and a projection of the default account's token and the cluster's service CA; no host
 # namespaces, no service account token mount or other Secret (an OpenShift internal registry's
@@ -61,13 +62,15 @@ spec:
         variables.inits.all(c,
         (c.name == 'fetch' && c.image == 'gcr.io/go-containerregistry/crane:debug' &&
         !has(c.restartPolicy)) ||
+        (c.name == 'buildkit' && c.image == 'docker.io/moby/buildkit:v0.35.0-rootless' &&
+        !has(c.restartPolicy)) ||
         (c.name == 'prepare' && c.image == 'quay.io/buildah/stable:latest' &&
         !has(c.restartPolicy)) ||
         (c.name == 'archive' && c.image == 'quay.io/buildah/stable:latest' &&
         has(c.restartPolicy) && c.restartPolicy == 'Always'))
       message: >-
-        a pod here has init containers fetch (crane), prepare (buildah) and the archive sidecar
-        (buildah) alone
+        a pod here has init containers fetch (crane), buildkit (BuildKit), prepare (buildah) and
+        the archive sidecar (buildah) alone
     - expression: >-
         !has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0
       message: a pod here has no ephemeral containers
@@ -136,12 +139,13 @@ spec:
         a pod here mounts emptyDir volumes, its build's inputs Secret, and the account's token
         and the service CA alone
     - expression: >-
-        variables.all.filter(c, c.name in ['run', 'layer', 'fetch']).all(c, !has(c.volumeMounts) ||
+        variables.all.filter(c, c.name in ['run', 'layer', 'fetch', 'buildkit']).all(c,
+        !has(c.volumeMounts) ||
         c.volumeMounts.all(m, has(object.spec.volumes) &&
         object.spec.volumes.exists(v, v.name == m.name && has(v.emptyDir))))
       message: >-
         a pod here mounts its inputs Secret and the account's token only in the builder and the
-        archive, never in a run, a layer build's script or the fetch
+        archive, never in a run, a layer build's script, the fetch or the buildkit init container
     - expression: >-
         has(object.spec.automountServiceAccountToken) && object.spec.automountServiceAccountToken == false &&
         (!has(object.spec.serviceAccountName) || object.spec.serviceAccountName == 'default')
