@@ -281,6 +281,7 @@ log=/tmp/build.log
 mkdir -p /tmp/containers-run /buildit-out/facts "$TMPDIR" $CACHE_DIRS
 printf '[storage]\ndriver = "%s"\ngraphroot = "%s/storage"\nrunroot = "/tmp/containers-run"\n' \
   "$STORAGE_DRIVER" "$STORAGE" > /tmp/storage.conf
+printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf
 for f in ccache.conf cache.json; do [ -e "/buildit-inputs/$f" ] && cp "/buildit-inputs/$f" /buildit-out/facts/; done
 : > "$log"
 sh -c "$runner" sh "$log" "$@" &
@@ -363,6 +364,7 @@ pub fn build_job(site: &Site, id: &Ident<'_>, b: &BuildJob<'_>) -> Job {
     command.extend(b.runner_args.iter().cloned());
     let mut vars = vec![
         env("BUILDAH_ISOLATION", "chroot"),
+        env("CONTAINERS_REGISTRIES_CONF", "/tmp/registries.conf"),
         env("CONTAINERS_STORAGE_CONF", "/tmp/storage.conf"),
         env("HOME", "/home/build"),
         env("STORAGE_DRIVER", site.storage.as_str()),
@@ -1142,6 +1144,16 @@ mod tests {
         };
         assert_eq!(env("CACHE_DIRS").as_deref(), Some("/c/deps /c/ccache"));
         assert_eq!(env("STORAGE_DRIVER").as_deref(), Some("overlay"));
+        assert_eq!(
+            env("CONTAINERS_REGISTRIES_CONF").as_deref(),
+            Some("/tmp/registries.conf")
+        );
+        assert!(
+            command[2].contains(
+                r#"printf 'unqualified-search-registries = ["docker.io"]\n' > /tmp/registries.conf"#
+            ),
+            "an unqualified FROM resolves to docker.io without a prompt"
+        );
         assert_eq!(
             env("TMPDIR").as_deref(),
             Some("/home/build/.local/share/containers/tmp"),
