@@ -567,7 +567,7 @@ pub(crate) fn fetch_pack(git: &PackGit, req: PackSource<'_>) -> Result<FetchedPa
 
     let root = pack_root(&checkout.path(), req.path)?;
     let pack = crate::playbooks::packs::deliverable(&root)?;
-    let scratch = crate::playbooks::packs::materialize_tree(pack.tree())
+    let scratch = crate::playbooks::packs::materialize_without_deps(pack.tree())
         .context("writing the playbook pack to scratch")
         .map_err(RegisterError::Internal)?;
     Ok(FetchedPack {
@@ -688,18 +688,28 @@ pub(crate) fn compiled_plan(
     params: &std::collections::BTreeMap<String, String>,
     variant: Option<&VariantName>,
 ) -> Result<crucible::plan::ir::ValidPlan, String> {
-    let source = workflow_source(root, variant).map_err(|e| e.to_string())?;
-    let pack_dir = crucible::plan::starlark::parent_or_cwd(&source);
-    let compiled = if is_refresh(params) {
-        crucible::plan::starlark::compile_refresh_file(&source, pack_dir)
-    } else {
-        crucible::plan::starlark::compile_launch_file(&source, pack_dir, params)
-    }
-    .map_err(|e| crucible::errors::report(&e))?;
-    compiled
+    compiled_workflow(root, params, variant)?
         .workflow
         .playbook_plan()
         .map_err(|e| format!("{e:#}"))
+}
+
+/// The pack at `root` compiled as a run with `params` compiles it. `Err` is the engine's own
+/// diagnostic. Blocking.
+pub(crate) fn compiled_workflow(
+    root: &Path,
+    params: &std::collections::BTreeMap<String, String>,
+    variant: Option<&VariantName>,
+) -> Result<crucible::plan::starlark::CompiledWorkflow, String> {
+    let source = workflow_source(root, variant).map_err(|e| e.to_string())?;
+    let pack_dir = crucible::plan::starlark::parent_or_cwd(&source);
+    let (declared, _) = crucible::manifest::launch::split(params);
+    if is_refresh(params) {
+        crucible::plan::starlark::compile_refresh_file(&source, pack_dir)
+    } else {
+        crucible::plan::starlark::compile_launch_file(&source, pack_dir, &declared)
+    }
+    .map_err(|e| crucible::errors::report(&e))
 }
 
 /// Refuse a launch of the pack at `root` the engine would refuse at startup: its graph does not
@@ -724,13 +734,14 @@ pub(crate) fn check_runnable(
 /// [`check_runnable`] against `tree`, off the async runtime. The outer `Err` is a failure to
 /// materialize the tree, not a refusal.
 pub(crate) async fn check_tree_runnable(
+    pool: &PgPool,
     tree: PackTree,
     params: std::collections::BTreeMap<String, String>,
     max_time: crate::model::MaxTime,
     variant: Option<VariantName>,
 ) -> Result<Result<(), FieldError>> {
+    let pack = crate::playbooks::packs::materialize(pool, tree).await?;
     tokio::task::spawn_blocking(move || {
-        let pack = crate::playbooks::packs::materialize_tree(&tree)?;
         Ok(check_runnable(
             pack.path(),
             &params,
@@ -856,14 +867,19 @@ pub async fn publish_draft(
         return Err(RegisterError::Conflict(msg));
     }
 
+    let deps = crate::playbooks::deps::load(pool, &crate::playbooks::deps::locked(&req.tree))
+        .await
+        .map_err(RegisterError::Internal)?;
     let extracted = tokio::task::spawn_blocking(move || {
         let mut req = req;
         let pack = Deliverable::new(ReadPack {
             tree: std::mem::take(&mut req.tree),
             ignored: Vec::new(),
         })?;
-        let scratch = crate::playbooks::packs::materialize_tree(pack.tree())
+        let scratch = crate::playbooks::packs::materialize_without_deps(pack.tree())
             .context("writing the draft pack to scratch")
+            .map_err(RegisterError::Internal)?;
+        crate::playbooks::deps::write_beside(scratch.path(), &deps)
             .map_err(RegisterError::Internal)?;
         let extracted = extract(scratch.path(), None)?;
         Ok::<_, RegisterError>((req, pack, extracted))
@@ -1294,13 +1310,15 @@ pub async fn rederive_stale(pool: &PgPool) -> Result<usize> {
     for row in rows {
         let id: String = row.try_get("id")?;
         let variant = crate::playbooks::packs::variant_from_row(&row)?;
-        let tree = pack(pool, &id).await;
+        let scratch = match pack(pool, &id)
+            .await
+            .and_then(|tree| tree.context("the playbook was deleted"))
+        {
+            Ok(tree) => crate::playbooks::packs::materialize(pool, tree).await,
+            Err(e) => Err(e),
+        };
         let extracted = tokio::task::spawn_blocking(move || {
-            let tree = tree
-                .and_then(|tree| tree.context("the playbook was deleted"))
-                .map_err(RegisterError::Internal)?;
-            let pack = crate::playbooks::packs::materialize_tree(&tree)
-                .map_err(RegisterError::Internal)?;
+            let pack = scratch.map_err(RegisterError::Internal)?;
             let (schema, digest) = extract_params_schema(pack.path(), variant.as_ref())?;
             let exposure = crate::playbooks::exposure::Extraction::Declared(extract_exposure(
                 pack.path(),

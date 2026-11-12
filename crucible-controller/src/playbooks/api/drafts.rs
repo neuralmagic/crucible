@@ -778,6 +778,14 @@ pub(crate) async fn save_playbook_draft(
         Ok(c) => c,
         Err(refusal) => return refusal,
     };
+    let remotes = crate::playbooks::deps::Remotes::Https {
+        github_app: state.pack_pr_app.clone(),
+    };
+    if let Err(e) =
+        crate::playbooks::drafts::resolve_locked(state.db.pool(), &body.files, &remotes).await
+    {
+        return draft_refusal(e);
+    }
     match crate::playbooks::drafts::save_version(
         state.db.pool(),
         &id,

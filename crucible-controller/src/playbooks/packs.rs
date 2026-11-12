@@ -241,8 +241,21 @@ pub(crate) fn write_files(
     Ok(())
 }
 
-/// Write `tree` into a scratch directory. The tempdir guard rides the returned value.
-pub(crate) fn materialize_tree(tree: &PackTree) -> Result<MaterializedPack> {
+/// Write `tree` into a scratch directory, with the stored dependencies its lock pins beside it.
+/// The tempdir guard rides the returned value.
+pub(crate) async fn materialize(pool: &PgPool, tree: PackTree) -> Result<MaterializedPack> {
+    let deps = crate::playbooks::deps::load(pool, &crate::playbooks::deps::locked(&tree)).await?;
+    tokio::task::spawn_blocking(move || {
+        let pack = materialize_without_deps(&tree)?;
+        crate::playbooks::deps::write_beside(pack.path(), &deps)?;
+        Ok(pack)
+    })
+    .await
+    .context("joining the pack materialization worker")?
+}
+
+/// [`materialize`] for a tree whose lock pins nothing, or whose dependencies are not stored yet.
+pub(crate) fn materialize_without_deps(tree: &PackTree) -> Result<MaterializedPack> {
     let guard = tempfile::tempdir().context("pack materialization scratch dir")?;
     let root = guard.path().join("pack");
     write_tree(tree, &root)?;
@@ -259,9 +272,8 @@ pub(crate) async fn materialize_pack(pool: &PgPool, key: &str) -> Result<Option<
     let Some(tree) = crate::runs::blob_store::get_pack(pool, &slug).await? else {
         return Ok(None);
     };
-    tokio::task::spawn_blocking(move || materialize_tree(&tree))
+    materialize(pool, tree)
         .await
-        .context("joining the pack materialization worker")?
         .with_context(|| format!("writing the stored pack for {key}"))
         .map(Some)
 }
@@ -315,9 +327,8 @@ pub(crate) async fn materialize_frozen(
     let tree = crate::playbooks::pack_trees::get_tree(pool, digest)
         .await?
         .with_context(|| format!("the pack tree {digest} {key} froze is not stored"))?;
-    tokio::task::spawn_blocking(move || materialize_tree(&tree))
+    materialize(pool, tree)
         .await
-        .context("joining the pack materialization worker")?
         .with_context(|| format!("writing the frozen pack for {key}"))
         .map(Some)
 }
@@ -334,7 +345,7 @@ pub(crate) async fn materialize_pack_or_empty(
     if let Some(pack) = materialize_frozen(pool, key, frozen).await? {
         return Ok(pack);
     }
-    materialize_tree(&PackTree::default())
+    materialize_without_deps(&PackTree::default())
 }
 
 /// Read one file (by pack-relative path) of `key`'s stored pack. `None` when no pack is stored or
@@ -543,7 +554,7 @@ mod tests {
         let fail = text.find("pick fail-closed").expect("second entry");
         assert!(dup < fail, "seq order preserved");
 
-        let bare = materialize_tree(&PackTree::default()).expect("empty");
+        let bare = materialize_without_deps(&PackTree::default()).expect("empty");
         let second = steer_md(&pool, "owner/repo#7", bare.path())
             .await
             .expect("steer")
@@ -748,7 +759,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tree = PackTree::from_pairs(&[("role.sh", b"#!/bin/sh\n"), ("inbox/a.md", b"a")])
             .expect("tree");
-        let pack = materialize_tree(&tree).expect("materialize");
+        let pack = materialize_without_deps(&tree).expect("materialize");
         assert_eq!(walk_dir(pack.path()).expect("walk").tree, tree);
         for f in ["role.sh", "inbox/a.md"] {
             let mode = std::fs::metadata(pack.path().join(f))

@@ -57,7 +57,7 @@ fn materialized(dir: impl AsRef<Path>) -> crate::playbooks::packs::MaterializedP
     let tree = crucible_contract::pack_tree::walk_dir(dir.as_ref())
         .expect("a fixture pack")
         .tree;
-    crate::playbooks::packs::materialize_tree(&tree).expect("materialize")
+    crate::playbooks::packs::materialize_without_deps(&tree).expect("materialize")
 }
 
 #[test]
@@ -6846,4 +6846,79 @@ fn only_a_cluster_the_hub_has_no_client_for_is_push_only() {
     );
     assert!(!push_only(false, false));
     assert!(!push_only(false, true));
+}
+
+/// A pack whose lock pins a library is compiled at dispatch, with the launch's own parameters, and
+/// a pack with no lock is left for the run to compile.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_pack_with_libraries_is_compiled_at_dispatch(pool: sqlx::PgPool) -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let lock = crate::playbooks::deps::tests::locked_library(root.path(), "dispatch");
+    crate::playbooks::deps::resolve(
+        &pool,
+        &crate::playbooks::deps::tests::locked_in(Some(lock.as_bytes())),
+        &crate::playbooks::deps::Remotes::Any,
+    )
+    .await?;
+    let manifest = crate::playbooks::drafts::SKELETON_MANIFEST.as_bytes();
+    let source = concat!(
+        "params = {\"loud\": {\"type\": \"bool\", \"required\": True}}\n",
+        "load(\"@gates//gates.star\", \"hello\")\n",
+        "greet = hello(\"greet-loud\" if param(\"loud\") else \"greet-quiet\")\n",
+        "workflow(type = \"playbook\", tasks = [greet], result = greet)\n",
+    );
+    let opts = |loud: &str| RunRenderOpts::Playbook {
+        params: vec![
+            ("loud".to_string(), loud.to_string()),
+            ("*.model".to_string(), "launched".to_string()),
+        ],
+        max_cost: 1.0,
+        max_time: crate::model::MaxTime::parse("30m").expect("duration"),
+        agent: AgentSelection::default(),
+        rerun: None,
+        variant: None,
+    };
+
+    let locked = crucible_contract::pack_tree::PackTree::from_pairs(&[
+        ("crucible.toml", manifest),
+        ("workflow.star", source.as_bytes()),
+        (crucible::plan::deps::LOCK_FILE, lock.as_bytes()),
+    ])?;
+    let pack = crate::playbooks::packs::materialize(&pool, locked).await?;
+    let resolved = crate::runs::workpod::run::resolved_workflow(pack.path(), &opts("true"))
+        .await?
+        .expect("a pack with libraries is compiled here");
+    let workflow: crucible::plan::workflow::WorkflowCfg = serde_json::from_slice(&resolved)?;
+    let names: Vec<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
+    assert_eq!(names, ["greet-loud"]);
+
+    let refused = crate::runs::workpod::run::resolved_workflow(
+        pack.path(),
+        &RunRenderOpts::Playbook {
+            params: Vec::new(),
+            max_cost: 1.0,
+            max_time: crate::model::MaxTime::parse("30m").expect("duration"),
+            agent: AgentSelection::default(),
+            rerun: None,
+            variant: None,
+        },
+    )
+    .await
+    .expect_err("a required parameter is missing");
+    assert!(format!("{refused:#}").contains("loud"), "{refused:#}");
+
+    let plain = crucible_contract::pack_tree::PackTree::from_pairs(&[
+        ("crucible.toml", manifest),
+        (
+            "workflow.star",
+            crate::playbooks::drafts::SKELETON_WORKFLOW.as_bytes(),
+        ),
+    ])?;
+    let pack = crate::playbooks::packs::materialize(&pool, plain).await?;
+    assert!(
+        crate::runs::workpod::run::resolved_workflow(pack.path(), &opts("true"))
+            .await?
+            .is_none()
+    );
+    Ok(())
 }

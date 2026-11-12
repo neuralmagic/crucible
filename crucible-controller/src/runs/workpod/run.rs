@@ -278,6 +278,37 @@ pub fn render_run_docs(
     extract_run_docs(&yaml, isolated)
 }
 
+/// The graph a playbook run of the pack at `pack_dir` executes, compiled here so the run does not
+/// compile it. `None` for a pack whose lock pins no dependency, which the run compiles itself.
+pub(crate) async fn resolved_workflow(
+    pack_dir: &Path,
+    opts: &RunRenderOpts,
+) -> Result<Option<Vec<u8>>> {
+    let RunRenderOpts::Playbook {
+        params, variant, ..
+    } = opts
+    else {
+        return Ok(None);
+    };
+    let (pack_dir, params, variant) = (
+        pack_dir.to_path_buf(),
+        params.iter().cloned().collect(),
+        variant.clone(),
+    );
+    tokio::task::spawn_blocking(move || {
+        let locks_deps = crucible::plan::deps::Lock::read(&pack_dir)
+            .is_ok_and(|lock| lock.is_some_and(|lock| !lock.deps.is_empty()));
+        if !locks_deps {
+            return Ok(None);
+        }
+        crate::playbooks::registry::compiled_workflow(&pack_dir, &params, variant.as_ref())
+            .map(|compiled| Some(compiled.canonical_json.into_bytes()))
+            .map_err(|diagnostic| anyhow::anyhow!("compiling the launch's graph: {diagnostic}"))
+    })
+    .await
+    .context("joining the launch graph compile")?
+}
+
 /// Per-run files delivered beside a pack's tree, keyed by the pack-relative path a run reads them
 /// at.
 pub type RunInputs = BTreeMap<PackFilePath, Vec<u8>>;
@@ -696,7 +727,10 @@ pub(crate) async fn dispatch_run(
         None => None,
     };
 
-    let inputs = run_inputs(db, issue_key, pack.path()).await?;
+    let mut inputs = run_inputs(db, issue_key, pack.path()).await?;
+    if let Some(resolved) = resolved_workflow(pack.path(), &opts).await? {
+        inputs.insert(crucible::deploy::RESOLVED_WORKFLOW_INPUT.parse()?, resolved);
+    }
 
     // Resolve the scope's bindings BEFORE anything is written: a refusal must leave no work-pod
     // row, no Secret, and no pod behind.
@@ -913,6 +947,7 @@ pub(crate) async fn dispatch_run(
             } => Some(rerun.run.as_str()),
             _ => None,
         };
+        crate::playbooks::tools::grant(db.pool(), run_id, pack.path()).await?;
         let lifetime = crate::runs::completion::run_pod_deadline(db, cfg, issue_key).await?;
         let token = crate::runs::pod_token::mint(
             db.pool(),

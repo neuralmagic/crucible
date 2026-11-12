@@ -124,8 +124,8 @@ pub(crate) async fn preview(
     let run = run_id.to_string();
     let playbook = launch.playbook.clone();
     let variant = launch.variant.clone();
+    let pack = crate::playbooks::packs::materialize(db.pool(), tree).await?;
     tokio::task::spawn_blocking(move || {
-        let pack = crate::playbooks::packs::materialize_tree(&tree)?;
         let plan =
             crate::playbooks::registry::compiled_plan(pack.path(), &params, variant.as_ref())
                 .map_err(RerunRefusal::Compile)?;

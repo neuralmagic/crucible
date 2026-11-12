@@ -1110,7 +1110,7 @@ mod tests {
         let registered_second = set_exposure("second-row").await;
         let after = fire("2026-08-23T13:00:00Z", "2026-08-23T13:01:00Z").await;
         let extracted = {
-            let pack = crate::playbooks::packs::materialize_tree(&first)?;
+            let pack = crate::playbooks::packs::materialize_without_deps(&first)?;
             crate::playbooks::exposure::extract(pack.path(), None, None)
                 .map_err(|e| anyhow::anyhow!("{e:?}"))?
         };

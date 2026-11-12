@@ -48,6 +48,7 @@ async fn plan_refusal(
         return Ok(None);
     };
     let checked = crate::playbooks::registry::check_tree_runnable(
+        db.pool(),
         tree,
         launch.params.iter().cloned().collect(),
         launch.max_time.clone(),
